@@ -23236,3 +23236,43 @@ Remaining blockers:
 - Do not start production Rust/Zig codegen until the semantic IR boundary,
   MachinePlan v2 / NativeRegionIR design, dependency verifier, and current
   default-readiness gates are in better shape.
+
+## 2026-06-27 - Compiler Boundary Verifier Added
+
+Status: added the Milestone 1 boundary audit gate. The gate is expected to fail
+today because the compatibility facade exists but the full compiler/runtime
+boundary has not been extracted.
+
+What changed:
+
+- Added `verify-compiler-boundaries` to `xtask`.
+- The report proves the facade slice is real:
+  `external_direct_plan_compile_call_count=0` and
+  `facade_call_site_count=13`.
+- The report also keeps production Rust/Zig codegen blocked with
+  `full_milestone_complete=false` and `rust_zig_codegen_allowed=false`.
+- `boon_report_schema` now accepts this command as a schema-validated blocker
+  audit, while still requiring a passing report to mark the full milestone
+  complete.
+
+Evidence before commit:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `cargo check -q -p xtask -p boon_report_schema`: pass, with existing native
+  GPU dead-code warnings.
+- `cargo test -q -p boon_report_schema`: pass, `29` tests.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; wrote a schema-valid blocker report.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Remaining blockers reported by
+`target/reports/compiler/m1-boundaries.json`:
+
+- `boon_plan` still depends on `boon_ir`.
+- `boon_plan` still depends on `boon_parser`.
+- `boon_plan` still imports parser AST types.
+- `boon_runtime` still depends on frontend crates
+  `boon_parser`, `boon_ir`, and `boon_typecheck`.

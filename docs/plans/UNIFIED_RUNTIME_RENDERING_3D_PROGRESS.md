@@ -20264,3 +20264,56 @@ Next executable work:
 - Keep Rust/Zig codegen behind this boundary work; starting codegen directly
   from current `TypedProgram` or v1 `MachinePlan` would deepen the wrong
   dependency shape.
+
+## 2026-06-27 - Compiler Boundary Verifier Added
+
+Status: U1/U11 architecture-readiness tooling improved. This does not complete
+the compiler/runtime split, does not start Rust/Zig/Wasm codegen, and does not
+change the default executor.
+
+What changed:
+
+- Added `verify-compiler-boundaries` as the Milestone 1 dependency-direction
+  audit from the post-speedup compiler/codegen roadmap.
+- The report distinguishes the kept facade progress from the remaining
+  extraction work: external compiler orchestration now goes through
+  `boon_compiler`, but `boon_plan` and `boon_runtime` are still too coupled to
+  frontend crates.
+- `boon_report_schema` validates the command as a blocker report when it fails
+  and requires a passing report to set `full_milestone_complete=true`.
+- The report explicitly keeps `rust_zig_codegen_allowed=false` until the
+  boundary is complete.
+
+Evidence before commit:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `cargo check -q -p xtask -p boon_report_schema`: pass, with existing native
+  GPU dead-code warnings.
+- `cargo test -q -p boon_report_schema`: pass, `29` tests.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; wrote `status=fail`, `compiler_boundary_status=partial`,
+  `full_milestone_complete=false`,
+  `rust_zig_codegen_allowed=false`,
+  `external_direct_plan_compile_call_count=0`, and
+  `facade_call_site_count=13`.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blockers:
+
+- `boon_plan` still depends on `boon_ir`.
+- `boon_plan` still depends on `boon_parser`.
+- `boon_plan` still imports parser AST types.
+- PlanExecutor core is not extracted; `boon_runtime` still depends on
+  `boon_parser`, `boon_ir`, and `boon_typecheck`.
+
+Next executable work:
+
+- Extract the remaining compile orchestration out of `boon_plan` so it becomes
+  schema/verifier focused.
+- Split a runtime-core / PlanExecutor boundary that can execute plans without
+  parser/typechecker/IR dependencies.
+- Only after this gate passes, start NativeRegionIR and Rust/Zig codegen
+  slices from the cleaned compiler API.

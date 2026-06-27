@@ -483,6 +483,12 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_artifact_hashes(&report, path)?;
         return Ok(());
     }
+    if report_command_is(&report, "verify-compiler-boundaries") {
+        verify_compiler_boundaries_report(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
     let status = report.get("status").and_then(JsonValue::as_str);
     if status != Some("pass") {
         if status == Some("fail") && report_is_blocker_audit(&report) {
@@ -2044,6 +2050,164 @@ fn verify_compiled_artifact_sections(report: &JsonValue, path: &Path) -> Runtime
     Ok(())
 }
 
+fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let status = report.get("status").and_then(JsonValue::as_str);
+    if status == Some("fail") {
+        verify_failing_blocker_report_shape(report, report_path)?;
+    } else if status == Some("pass") {
+        verify_common_report_shape(report, report_path)?;
+    } else if status != Some("pass") {
+        return Err(format!(
+            "{} verify-compiler-boundaries status must be pass or fail",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let contract = report
+        .get("compiler_boundary_contract")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} missing compiler_boundary_contract",
+                report_path.display()
+            )
+        })?;
+    if !contract.contains("compiler/runtime boundary") {
+        return Err(format!(
+            "{} compiler_boundary_contract does not name compiler/runtime boundary extraction",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let boundary_status = report
+        .get("compiler_boundary_status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing compiler_boundary_status", report_path.display()))?;
+    if !matches!(boundary_status, "partial" | "complete") {
+        return Err(format!(
+            "{} compiler_boundary_status must be partial or complete",
+            report_path.display()
+        )
+        .into());
+    }
+
+    for key in ["boon_compiler", "dependency_direction", "acceptance"] {
+        if report.get(key).and_then(JsonValue::as_object).is_none() {
+            return Err(format!("{} missing object `{key}`", report_path.display()).into());
+        }
+    }
+
+    let compiler = report
+        .get("boon_compiler")
+        .and_then(JsonValue::as_object)
+        .unwrap();
+    for key in [
+        "crate_present",
+        "workspace_member",
+        "workspace_dependency",
+        "facade_exports_compile_typed_program",
+        "facade_delegates_to_plan_backend",
+    ] {
+        if compiler.get(key).and_then(JsonValue::as_bool).is_none() {
+            return Err(format!(
+                "{} boon_compiler.{key} must be boolean",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let direction = report
+        .get("dependency_direction")
+        .and_then(JsonValue::as_object)
+        .unwrap();
+    for key in [
+        "external_direct_plan_compile_call_count",
+        "facade_call_site_count",
+    ] {
+        if direction.get(key).and_then(JsonValue::as_u64).is_none() {
+            return Err(format!(
+                "{} dependency_direction.{key} must be a count",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "external_direct_plan_compile_calls",
+        "facade_call_sites",
+        "boon_runtime_frontend_dependencies",
+    ] {
+        if direction.get(key).and_then(JsonValue::as_array).is_none() {
+            return Err(format!(
+                "{} dependency_direction.{key} must be an array",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "boon_plan_depends_on_boon_ir",
+        "boon_plan_depends_on_boon_parser",
+        "boon_plan_imports_parser_ast",
+    ] {
+        if direction.get(key).and_then(JsonValue::as_bool).is_none() {
+            return Err(format!(
+                "{} dependency_direction.{key} must be boolean",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let acceptance = report
+        .get("acceptance")
+        .and_then(JsonValue::as_object)
+        .unwrap();
+    let full = acceptance
+        .get("full_milestone_complete")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} acceptance.full_milestone_complete must be boolean",
+                report_path.display()
+            )
+        })?;
+    let codegen_allowed = acceptance
+        .get("rust_zig_codegen_allowed")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} acceptance.rust_zig_codegen_allowed must be boolean",
+                report_path.display()
+            )
+        })?;
+    if codegen_allowed != full {
+        return Err(format!(
+            "{} rust_zig_codegen_allowed must match full_milestone_complete",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == Some("pass") && (!full || boundary_status != "complete") {
+        return Err(format!(
+            "{} passing compiler-boundary report must mark full milestone complete",
+            report_path.display()
+        )
+        .into());
+    }
+    if status == Some("fail") && full {
+        return Err(format!(
+            "{} failing compiler-boundary report cannot mark full milestone complete",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn report_is_blocker_audit(report: &JsonValue) -> bool {
     matches!(
         report.get("command").and_then(JsonValue::as_str),
@@ -2083,6 +2247,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-bytes-machine-plan-adversarial"
                 | "verify-bytes-release-benchmark-reproduction"
                 | "verify-bytes-machine-plan-all"
+                | "verify-compiler-boundaries"
                 | "verify-native-visible-launch"
                 | "verify-native-examples"
                 | "verify-native-dev-window-editor"

@@ -48,6 +48,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-build-bytes-boundary",
     "verify-bytes-machine-plan-all",
     "audit-goal-readiness",
+    "verify-compiler-boundaries",
     "verify-foundation",
     "bench-example",
     "verify-report-schema",
@@ -184,6 +185,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-build-bytes-boundary" => verify_build_bytes_boundary(&args),
         "verify-bytes-machine-plan-all" => verify_bytes_machine_plan_all(&args),
         "audit-goal-readiness" => audit_goal_readiness(&args),
+        "verify-compiler-boundaries" => verify_compiler_boundaries(&args),
         "verify-foundation" => verify_foundation(&args),
         "verify-report-schema" => verify_reports_schema(&args),
         "verify-compiled-artifact" => verify_compiled_artifact(&args),
@@ -6415,6 +6417,401 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
             "human_or_native_visible_evidence_claimed": false
         }),
     )
+}
+
+fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "verify-compiler-boundaries";
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/compiler/m1-boundaries.json"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+
+    let root_cargo = read_toml_file(Path::new("Cargo.toml"))?;
+    let plan_cargo = read_toml_file(Path::new("crates/boon_plan/Cargo.toml"))?;
+    let runtime_cargo = read_toml_file(Path::new("crates/boon_runtime/Cargo.toml"))?;
+    let compiler_cargo = read_toml_file(Path::new("crates/boon_compiler/Cargo.toml"))?;
+    let cli_cargo = read_toml_file(Path::new("crates/boon_cli/Cargo.toml"))?;
+    let schema_cargo = read_toml_file(Path::new("crates/boon_report_schema/Cargo.toml"))?;
+    let xtask_cargo = read_toml_file(Path::new("crates/xtask/Cargo.toml"))?;
+
+    let compiler_crate_present = Path::new("crates/boon_compiler/src/lib.rs").exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-compiler-crate-present",
+        compiler_crate_present,
+        "crates/boon_compiler/src/lib.rs exists",
+        (!compiler_crate_present).then(|| "missing `crates/boon_compiler` facade crate".to_owned()),
+    );
+
+    let workspace_member = toml_workspace_has_member(&root_cargo, "crates/boon_compiler");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:workspace-member",
+        workspace_member,
+        "workspace members include crates/boon_compiler",
+        (!workspace_member).then(|| "workspace does not include `crates/boon_compiler`".to_owned()),
+    );
+
+    let workspace_dependency = toml_workspace_dependency_path(&root_cargo, "boon_compiler")
+        == Some("crates/boon_compiler");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:workspace-dependency",
+        workspace_dependency,
+        "workspace dependency boon_compiler points at crates/boon_compiler",
+        (!workspace_dependency).then(|| {
+            "workspace dependency `boon_compiler` is missing or points elsewhere".to_owned()
+        }),
+    );
+
+    let compiler_lib = fs::read_to_string("crates/boon_compiler/src/lib.rs").unwrap_or_default();
+    let facade_exports_compile = compiler_lib.contains("pub fn compile_typed_program")
+        && compiler_lib.contains("TypedProgram");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-compile",
+        facade_exports_compile,
+        "boon_compiler exports compile_typed_program over TypedProgram",
+        (!facade_exports_compile)
+            .then(|| "`boon_compiler` does not expose the compile_typed_program facade".to_owned()),
+    );
+
+    let facade_delegates_to_plan_backend =
+        compiler_lib.contains("boon_plan::compile_typed_program(program, target_profile)");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-preserves-current-backend",
+        facade_delegates_to_plan_backend,
+        "facade delegates to current boon_plan backend",
+        (!facade_delegates_to_plan_backend).then(|| {
+            "`boon_compiler` facade no longer visibly delegates to the current plan backend"
+                .to_owned()
+        }),
+    );
+
+    let compiler_depends_on_plan = toml_has_dependency(&compiler_cargo, "boon_plan");
+    let compiler_depends_on_ir = toml_has_dependency(&compiler_cargo, "boon_ir");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:compiler-owns-current-ir-adapter",
+        compiler_depends_on_plan && compiler_depends_on_ir,
+        format!(
+            "boon_compiler dependencies: boon_plan={compiler_depends_on_plan}, boon_ir={compiler_depends_on_ir}"
+        ),
+        (!(compiler_depends_on_plan && compiler_depends_on_ir)).then(|| {
+            "`boon_compiler` does not own the current IR-to-plan adapter dependencies".to_owned()
+        }),
+    );
+
+    let external_direct_plan_compile_calls = rust_source_matches(
+        Path::new("crates"),
+        &[
+            "boon_plan::compile_typed_program",
+            "use boon_plan::compile_typed_program",
+            "use boon_plan::{compile_typed_program",
+            "compile_typed_program,",
+        ],
+        &[
+            "crates/boon_plan/src/lib.rs",
+            "crates/boon_compiler/src/lib.rs",
+        ],
+    )?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:external-orchestration-uses-facade",
+        external_direct_plan_compile_calls.is_empty(),
+        format!(
+            "external_direct_plan_compile_call_count={}",
+            external_direct_plan_compile_calls.len()
+        ),
+        (!external_direct_plan_compile_calls.is_empty()).then(|| {
+            "external crates still call boon_plan::compile_typed_program directly".to_owned()
+        }),
+    );
+
+    let facade_call_sites = rust_source_matches(
+        Path::new("crates"),
+        &[
+            "boon_compiler::compile_typed_program",
+            "use boon_compiler::compile_typed_program",
+        ],
+        &["crates/boon_compiler/src/lib.rs"],
+    )?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:external-facade-call-sites-present",
+        !facade_call_sites.is_empty(),
+        format!("facade_call_site_count={}", facade_call_sites.len()),
+        facade_call_sites
+            .is_empty()
+            .then(|| "no external compile call sites use `boon_compiler`".to_owned()),
+    );
+
+    for (crate_name, cargo, source_path) in [
+        ("boon_cli", &cli_cargo, "crates/boon_cli/src/main.rs"),
+        (
+            "boon_runtime",
+            &runtime_cargo,
+            "crates/boon_runtime/src/lib.rs",
+        ),
+        (
+            "boon_report_schema",
+            &schema_cargo,
+            "crates/boon_report_schema/src/lib.rs",
+        ),
+        ("xtask", &xtask_cargo, "crates/xtask/src/main.rs"),
+    ] {
+        let cargo_depends = toml_has_dependency(cargo, "boon_compiler");
+        let source_uses = fs::read_to_string(source_path)
+            .unwrap_or_default()
+            .contains("boon_compiler");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("compiler-boundaries:{crate_name}-uses-facade"),
+            cargo_depends && source_uses,
+            format!("{crate_name}: cargo_depends={cargo_depends}, source_uses={source_uses}"),
+            (!(cargo_depends && source_uses)).then(|| {
+                format!("{crate_name} has not routed compiler orchestration through boon_compiler")
+            }),
+        );
+    }
+
+    let plan_depends_on_ir = toml_has_dependency(&plan_cargo, "boon_ir");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-no-boon-ir-dependency",
+        !plan_depends_on_ir,
+        format!("boon_plan depends on boon_ir={plan_depends_on_ir}"),
+        plan_depends_on_ir.then(|| {
+            "`boon_plan` still depends on `boon_ir`; compiler extraction is incomplete".to_owned()
+        }),
+    );
+
+    let plan_depends_on_parser = toml_has_dependency(&plan_cargo, "boon_parser");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-no-parser-dependency",
+        !plan_depends_on_parser,
+        format!("boon_plan depends on boon_parser={plan_depends_on_parser}"),
+        plan_depends_on_parser.then(|| {
+            "`boon_plan` still depends on `boon_parser`; parser AST is not isolated from plan schema"
+                .to_owned()
+        }),
+    );
+
+    let plan_source = fs::read_to_string("crates/boon_plan/src/lib.rs").unwrap_or_default();
+    let plan_imports_parser_ast =
+        plan_source.contains("use boon_parser::{") || plan_source.contains("AstExpr");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-no-parser-ast-imports",
+        !plan_imports_parser_ast,
+        format!("boon_plan_imports_parser_ast={plan_imports_parser_ast}"),
+        plan_imports_parser_ast.then(|| {
+            "`boon_plan` still imports parser AST types; move lowering orchestration behind boon_compiler"
+                .to_owned()
+        }),
+    );
+
+    let runtime_depends_on_frontend = ["boon_parser", "boon_ir", "boon_typecheck"]
+        .iter()
+        .filter(|dependency| toml_has_dependency(&runtime_cargo, dependency))
+        .copied()
+        .collect::<Vec<_>>();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-core-no-frontend-dependencies",
+        runtime_depends_on_frontend.is_empty(),
+        format!("boon_runtime_frontend_dependencies={runtime_depends_on_frontend:?}"),
+        (!runtime_depends_on_frontend.is_empty()).then(|| {
+            "PlanExecutor core is not extracted; boon_runtime still depends on parser/IR/typecheck crates"
+                .to_owned()
+        }),
+    );
+
+    let artifact_paths = [
+        "Cargo.toml",
+        "crates/boon_compiler/Cargo.toml",
+        "crates/boon_compiler/src/lib.rs",
+        "crates/boon_plan/Cargo.toml",
+        "crates/boon_plan/src/lib.rs",
+        "crates/boon_runtime/Cargo.toml",
+        "crates/boon_runtime/src/lib.rs",
+        "crates/boon_cli/Cargo.toml",
+        "crates/boon_cli/src/main.rs",
+        "crates/boon_report_schema/Cargo.toml",
+        "crates/boon_report_schema/src/lib.rs",
+        "crates/xtask/Cargo.toml",
+        "crates/xtask/src/main.rs",
+        "docs/plans/speedup/22-post-speedup-compiler-codegen-wasm-plan.md",
+    ];
+    let artifact_sha256s = artifact_paths
+        .iter()
+        .map(|path| artifact_hash(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let full_milestone_complete = blockers.is_empty();
+    let extra = json!({
+        "compiler_boundary_contract": "post-speedup Milestone 1 compiler/runtime boundary extraction",
+        "compiler_boundary_status": if full_milestone_complete {
+            "complete"
+        } else {
+            "partial"
+        },
+        "boon_compiler": {
+            "crate_present": compiler_crate_present,
+            "workspace_member": workspace_member,
+            "workspace_dependency": workspace_dependency,
+            "facade_exports_compile_typed_program": facade_exports_compile,
+            "facade_delegates_to_plan_backend": facade_delegates_to_plan_backend,
+            "depends_on_boon_plan": compiler_depends_on_plan,
+            "depends_on_boon_ir": compiler_depends_on_ir,
+        },
+        "dependency_direction": {
+            "external_direct_plan_compile_call_count": external_direct_plan_compile_calls.len(),
+            "external_direct_plan_compile_calls": external_direct_plan_compile_calls,
+            "facade_call_site_count": facade_call_sites.len(),
+            "facade_call_sites": facade_call_sites,
+            "boon_plan_depends_on_boon_ir": plan_depends_on_ir,
+            "boon_plan_depends_on_boon_parser": plan_depends_on_parser,
+            "boon_plan_imports_parser_ast": plan_imports_parser_ast,
+            "boon_runtime_frontend_dependencies": runtime_depends_on_frontend,
+        },
+        "acceptance": {
+            "full_milestone_complete": full_milestone_complete,
+            "compatibility_facade_only": !full_milestone_complete,
+            "rust_zig_codegen_allowed": full_milestone_complete,
+        },
+        "artifact_sha256s": artifact_sha256s,
+    });
+
+    write_static_gate_report(args, COMMAND, report, checks, blockers, extra)
+}
+
+fn read_toml_file(path: &Path) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    Ok(toml::from_str(&text)?)
+}
+
+fn toml_workspace_has_member(value: &toml::Value, member: &str) -> bool {
+    value
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|members| members.iter().any(|item| item.as_str() == Some(member)))
+}
+
+fn toml_workspace_dependency_path<'a>(value: &'a toml::Value, dependency: &str) -> Option<&'a str> {
+    value
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|dependencies| dependencies.get(dependency))
+        .and_then(|dependency| dependency.get("path"))
+        .and_then(toml::Value::as_str)
+}
+
+fn toml_has_dependency(value: &toml::Value, dependency: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .any(|section| {
+            value
+                .get(section)
+                .and_then(toml::Value::as_table)
+                .is_some_and(|dependencies| dependencies.contains_key(dependency))
+        })
+}
+
+fn rust_source_matches(
+    root: &Path,
+    patterns: &[&str],
+    excluded_paths: &[&str],
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    collect_rust_source_files(root, &mut files)?;
+    let mut matches = Vec::new();
+    for file in files {
+        let path = file.display().to_string();
+        if excluded_paths.iter().any(|excluded| path == *excluded) {
+            continue;
+        }
+        let source = fs::read_to_string(&file)?;
+        for (line_index, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('"') || trimmed.starts_with("//") {
+                continue;
+            }
+            let code = rust_line_without_string_literals(line);
+            for pattern in patterns {
+                if code.contains(pattern) {
+                    matches.push(json!({
+                        "path": path,
+                        "line": line_index + 1,
+                        "pattern": pattern,
+                        "text": trimmed,
+                    }));
+                }
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn rust_line_without_string_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in line.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+                out.push('"');
+            } else {
+                out.push(' ');
+            }
+        } else {
+            out.push(character);
+            if character == '"' {
+                in_string = true;
+            }
+        }
+    }
+    out
+}
+
+fn collect_rust_source_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_source_files(&path, files)?;
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn verify_native_platform_contract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

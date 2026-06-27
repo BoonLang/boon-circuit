@@ -4,9 +4,10 @@ use boon_document::{
     render_scene::{
         RenderAssetRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
         RenderScene as DocumentRenderScene, RenderSceneItem as DocumentRenderSceneItem,
-        RenderScenePatch as DocumentRenderScenePatch, RenderScenePatchOperation, RenderTextAlign,
-        RenderTextColumnMeasurer, RenderTextRun, RenderTextVerticalAlign, RenderTextureRef,
-        RenderVisualPrimitive, RenderVisualPrimitiveKind,
+        RenderScenePaintPatch, RenderScenePatch as DocumentRenderScenePatch,
+        RenderScenePatchOperation, RenderTextAlign, RenderTextColumnMeasurer, RenderTextRun,
+        RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
+        RenderVisualPrimitiveKind,
     },
 };
 use boon_host::SurfaceId;
@@ -2643,42 +2644,77 @@ fn render_scene_from_document_scene_with_patch(
         .collect::<Vec<Cow<'_, RenderTextRun>>>();
 
     for operation in &patch.operations {
-        let RenderScenePatchOperation::ReplaceNodeEntries {
-            nodes,
-            items: replacement_items,
-            visual_primitives: replacement_primitives,
-            text_runs: replacement_text_runs,
-        } = operation
-        else {
-            return Err(RenderError {
-                message: "render scene patch encode supports ReplaceNodeEntries only".to_owned(),
-            });
-        };
-        let node_set = nodes.iter().cloned().collect::<BTreeSet<_>>();
-        replace_borrowed_document_entries_for_nodes(
-            &mut items,
-            &node_set,
-            replacement_items,
-            |item| &item.node,
-            |node, nodes| nodes.contains(node),
-            true,
-        )?;
-        replace_borrowed_document_entries_for_nodes(
-            &mut visual_primitives,
-            &node_set,
-            replacement_primitives,
-            |primitive| &primitive.node,
-            |node, nodes| nodes.contains(node),
-            false,
-        )?;
-        replace_borrowed_document_entries_for_nodes(
-            &mut text_runs,
-            &node_set,
-            replacement_text_runs,
-            |text_run| &text_run.node,
-            document_text_run_belongs_to_any_node,
-            false,
-        )?;
+        match operation {
+            RenderScenePatchOperation::Paint {
+                node,
+                paint,
+                style_identity,
+                retained_chunk_id,
+            } => patch_borrowed_document_paint_entries(
+                &mut items,
+                &mut visual_primitives,
+                &mut text_runs,
+                node,
+                paint,
+                *style_identity,
+                retained_chunk_id,
+            )?,
+            RenderScenePatchOperation::TextContent {
+                node,
+                text,
+                retained_chunk_id,
+            } => {
+                patch_borrowed_document_text_content_entries(
+                    &mut items,
+                    &mut text_runs,
+                    node,
+                    text,
+                    retained_chunk_id,
+                )?;
+            }
+            RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes,
+                items: replacement_items,
+                visual_primitives: replacement_primitives,
+                text_runs: replacement_text_runs,
+            } => {
+                let node_set = nodes.iter().cloned().collect::<BTreeSet<_>>();
+                replace_borrowed_document_entries_for_nodes(
+                    &mut items,
+                    &node_set,
+                    replacement_items,
+                    |item| &item.node,
+                    |node, nodes| nodes.contains(node),
+                    true,
+                )?;
+                replace_borrowed_document_entries_for_nodes(
+                    &mut visual_primitives,
+                    &node_set,
+                    replacement_primitives,
+                    |primitive| &primitive.node,
+                    |node, nodes| nodes.contains(node),
+                    false,
+                )?;
+                replace_borrowed_document_entries_for_nodes(
+                    &mut text_runs,
+                    &node_set,
+                    replacement_text_runs,
+                    |text_run| &text_run.node,
+                    document_text_run_belongs_to_any_node,
+                    false,
+                )?;
+            }
+            RenderScenePatchOperation::RetagNodeEntries {
+                items: replacement_items,
+            } => {
+                patch_borrowed_document_retag_entries(
+                    &mut items,
+                    &mut visual_primitives,
+                    &mut text_runs,
+                    replacement_items,
+                )?;
+            }
+        }
     }
 
     let viewport = Rect {
@@ -2721,6 +2757,162 @@ fn render_scene_from_document_scene_with_patch(
             .map(|text_run| text_run.as_ref().clone())
             .collect(),
     })
+}
+
+fn patch_borrowed_document_paint_entries<'a>(
+    items: &mut [Cow<'a, DocumentRenderSceneItem>],
+    visual_primitives: &mut [Cow<'a, RenderVisualPrimitive>],
+    text_runs: &mut [Cow<'a, RenderTextRun>],
+    node: &DocumentNodeId,
+    paint: &RenderScenePaintPatch,
+    style_identity: boon_document::ComputedStyleIdentity,
+    retained_chunk_id: &str,
+) -> Result<(), RenderError> {
+    let mut saw_item = false;
+    for item in items {
+        if item.node == *node {
+            let item = item.to_mut();
+            item.style_identity = style_identity;
+            item.retained_chunk_id = retained_chunk_id.to_owned();
+            saw_item = true;
+        }
+    }
+    if !saw_item {
+        return Err(RenderError {
+            message: format!(
+                "render scene paint patch references missing item `{}`",
+                node.0
+            ),
+        });
+    }
+    match paint {
+        RenderScenePaintPatch::FillColor { color } => {
+            let mut patched = false;
+            for primitive in visual_primitives {
+                if primitive.node == *node && primitive.primitive == RenderVisualPrimitiveKind::Fill
+                {
+                    let primitive = primitive.to_mut();
+                    primitive.color = *color;
+                    primitive.style_identity = style_identity;
+                    primitive.retained_chunk_id = retained_chunk_id.to_owned();
+                    patched = true;
+                }
+            }
+            if !patched {
+                return Err(RenderError {
+                    message: format!(
+                        "render scene paint patch references missing fill primitive `{}`",
+                        node.0
+                    ),
+                });
+            }
+        }
+        RenderScenePaintPatch::TextColor { color } => {
+            let mut patched = false;
+            for text_run in text_runs {
+                if text_run.node == *node {
+                    let text_run = text_run.to_mut();
+                    text_run.color = *color;
+                    text_run.paint_id = style_identity.paint_id;
+                    patched = true;
+                }
+            }
+            if !patched {
+                return Err(RenderError {
+                    message: format!(
+                        "render scene paint patch references missing text run `{}`",
+                        node.0
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn patch_borrowed_document_text_content_entries<'a>(
+    items: &mut [Cow<'a, DocumentRenderSceneItem>],
+    text_runs: &mut [Cow<'a, RenderTextRun>],
+    node: &DocumentNodeId,
+    text: &str,
+    retained_chunk_id: &str,
+) -> Result<(), RenderError> {
+    let mut saw_item = false;
+    for item in items {
+        if item.node == *node {
+            item.to_mut().retained_chunk_id = retained_chunk_id.to_owned();
+            saw_item = true;
+        }
+    }
+    if !saw_item {
+        return Err(RenderError {
+            message: format!(
+                "render scene text-content patch references missing item `{}`",
+                node.0
+            ),
+        });
+    }
+    let mut patched = false;
+    for text_run in text_runs {
+        if text_run.node == *node {
+            text_run.to_mut().text = text.to_owned();
+            patched = true;
+        }
+    }
+    if !patched {
+        return Err(RenderError {
+            message: format!(
+                "render scene text-content patch references missing text run `{}`",
+                node.0
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn patch_borrowed_document_retag_entries<'a>(
+    items: &mut [Cow<'a, DocumentRenderSceneItem>],
+    visual_primitives: &mut [Cow<'a, RenderVisualPrimitive>],
+    text_runs: &mut [Cow<'a, RenderTextRun>],
+    replacements: &'a [DocumentRenderSceneItem],
+) -> Result<(), RenderError> {
+    let mut updates =
+        BTreeMap::<DocumentNodeId, (String, boon_document::ComputedStyleIdentity)>::new();
+    for replacement in replacements {
+        let Some(item) = items.iter_mut().find(|item| item.node == replacement.node) else {
+            return Err(RenderError {
+                message: format!(
+                    "render scene retag patch references missing item `{}`",
+                    replacement.node.0
+                ),
+            });
+        };
+        *item = Cow::Borrowed(replacement);
+        updates.insert(
+            replacement.node.clone(),
+            (
+                replacement.retained_chunk_id.clone(),
+                replacement.style_identity,
+            ),
+        );
+    }
+    for primitive in visual_primitives {
+        let Some((retained_chunk_id, style_identity)) = updates.get(&primitive.node) else {
+            continue;
+        };
+        let primitive = primitive.to_mut();
+        primitive.retained_chunk_id = retained_chunk_id.clone();
+        primitive.style_identity = *style_identity;
+    }
+    for text_run in text_runs {
+        let Some((_, style_identity)) = updates.iter().find_map(|(node, update)| {
+            document_text_run_belongs_to_node(&text_run.node, node).then_some(update)
+        }) else {
+            continue;
+        };
+        text_run.to_mut().paint_id = style_identity.paint_id;
+    }
+    Ok(())
 }
 
 fn replace_borrowed_document_entries_for_nodes<'a, T: Clone>(
@@ -9677,6 +9869,16 @@ mod tests {
     fn document_render_scene_patch_conversion_matches_materialized_apply() {
         let mut replacement_identity = test_style_identity();
         replacement_identity.paint_id = 77;
+        replacement_identity.style_id = 77;
+        let mut fill_identity = test_style_identity();
+        fill_identity.paint_id = 17;
+        fill_identity.style_id = 17;
+        let mut text_paint_identity = test_style_identity();
+        text_paint_identity.paint_id = 29;
+        text_paint_identity.style_id = 29;
+        let mut retag_identity = test_style_identity();
+        retag_identity.paint_id = 41;
+        retag_identity.style_id = 41;
         let item = |node: &str, x: f32, style_identity: ComputedStyleIdentity| {
             boon_document::render_scene::RenderSceneItem {
                 node: DocumentNodeId(node.to_owned()),
@@ -9752,63 +9954,101 @@ mod tests {
             viewport: Rect {
                 x: 0.0,
                 y: 0.0,
-                width: 160.0,
+                width: 220.0,
                 height: 80.0,
             },
             items: vec![
                 item("left", 8.0, base_identity),
                 item("middle", 52.0, base_identity),
                 item("right", 96.0, base_identity),
+                item("replacee", 140.0, base_identity),
             ],
             visual_primitives: vec![
                 primitive("left", 8.0, [20, 40, 60, 255], base_identity),
                 primitive("middle", 52.0, [80, 100, 120, 255], base_identity),
                 primitive("right", 96.0, [140, 160, 180, 255], base_identity),
+                primitive("replacee", 140.0, [30, 60, 90, 255], base_identity),
             ],
             quad_batches: Vec::new(),
             text_runs: vec![
-                text_run("left:label", "L", 8.0, base_identity.paint_id),
+                text_run("left", "L", 8.0, base_identity.paint_id),
                 text_run("middle:label", "M", 52.0, base_identity.paint_id),
-                text_run("right:label", "R", 96.0, base_identity.paint_id),
+                text_run("right", "R", 96.0, base_identity.paint_id),
+                text_run("replacee:label", "X", 140.0, base_identity.paint_id),
             ],
             metrics: boon_document::render_scene::RenderSceneMetrics {
-                visible_source_item_count: 3,
-                visual_primitive_count: 3,
-                rendered_rect_count: 3,
+                visible_source_item_count: 4,
+                visual_primitive_count: 4,
+                rendered_rect_count: 4,
                 cap_hit: false,
             },
         };
         let patch = DocumentRenderScenePatch {
-            operations: vec![RenderScenePatchOperation::ReplaceNodeEntries {
-                nodes: vec![DocumentNodeId("middle".to_owned())],
-                items: vec![item("middle", 52.0, replacement_identity)],
-                visual_primitives: vec![primitive(
-                    "middle",
-                    52.0,
-                    [220, 120, 40, 255],
-                    replacement_identity,
-                )],
-                text_runs: vec![text_run(
-                    "middle:label",
-                    "patched",
-                    52.0,
-                    replacement_identity.paint_id,
-                )],
-            }],
+            operations: vec![
+                RenderScenePatchOperation::Paint {
+                    node: DocumentNodeId("left".to_owned()),
+                    paint: RenderScenePaintPatch::FillColor {
+                        color: [220, 30, 40, 255],
+                    },
+                    style_identity: fill_identity,
+                    retained_chunk_id: "chunk:left:fill-paint".to_owned(),
+                },
+                RenderScenePatchOperation::Paint {
+                    node: DocumentNodeId("right".to_owned()),
+                    paint: RenderScenePaintPatch::TextColor {
+                        color: [10, 220, 90, 255],
+                    },
+                    style_identity: text_paint_identity,
+                    retained_chunk_id: "chunk:right:text-paint".to_owned(),
+                },
+                RenderScenePatchOperation::TextContent {
+                    node: DocumentNodeId("right".to_owned()),
+                    text: "R patched".to_owned(),
+                    retained_chunk_id: "chunk:right:text-content".to_owned(),
+                },
+                RenderScenePatchOperation::RetagNodeEntries {
+                    items: vec![item("middle", 52.0, retag_identity)],
+                },
+                RenderScenePatchOperation::ReplaceNodeEntries {
+                    nodes: vec![DocumentNodeId("replacee".to_owned())],
+                    items: vec![item("replacee", 140.0, replacement_identity)],
+                    visual_primitives: vec![primitive(
+                        "replacee",
+                        140.0,
+                        [220, 120, 40, 255],
+                        replacement_identity,
+                    )],
+                    text_runs: vec![text_run(
+                        "replacee:label",
+                        "patched",
+                        140.0,
+                        replacement_identity.paint_id,
+                    )],
+                },
+            ],
         };
 
         let mut materialized = base_scene.clone();
         materialized.apply_patch(&patch).unwrap();
-        let expected = render_scene_from_document_scene(&materialized, 160, 80);
+        let expected = render_scene_from_document_scene(&materialized, 220, 80);
         let actual =
-            render_scene_from_document_scene_with_patch(&base_scene, &patch, 160, 80).unwrap();
+            render_scene_from_document_scene_with_patch(&base_scene, &patch, 220, 80).unwrap();
 
         assert_eq!(actual.items.len(), expected.items.len());
         for (actual, expected) in actual.items.iter().zip(expected.items.iter()) {
             assert_eq!(actual.node, expected.node);
             assert_eq!(actual.retained_chunk_id, expected.retained_chunk_id);
+            assert_eq!(actual.source_kind, expected.source_kind);
             assert_eq!(actual.bounds, expected.bounds);
+            assert_eq!(actual.clip, expected.clip);
+            assert_eq!(actual.transform, expected.transform);
             assert_eq!(actual.style_identity, expected.style_identity);
+            assert_eq!(actual.dependency_set, expected.dependency_set);
+            assert_eq!(actual.texture_asset_refs, expected.texture_asset_refs);
+            assert_eq!(
+                actual.estimated_vertex_count,
+                expected.estimated_vertex_count
+            );
         }
         assert_eq!(
             flatten_quad_batches(&actual.quad_batches),

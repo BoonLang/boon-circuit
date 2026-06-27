@@ -10709,7 +10709,12 @@ fn native_gpu_app_owned_render_hook(
     );
     let direct_input_overlay_render_scene_patch_enabled =
         input_overlay_render_scene_patch_enabled && skip_app_owned_scene_proof;
+    let direct_layout_render_scene_patch_enabled = !input_overlay_render_scene_patch_enabled
+        && skip_app_owned_scene_proof
+        && layout_render_scene_patch.is_some()
+        && layout_render_scene_patch_base_hash.is_some();
     let mut direct_input_overlay_render_scene_patch = None;
+    let mut direct_layout_render_scene_patch = None;
     let mut render_scene_encode_cache_key = render_scene_cache_key.clone();
     let render_scene_cache_hit: bool;
     if direct_input_overlay_render_scene_patch_enabled {
@@ -10773,10 +10778,51 @@ fn native_gpu_app_owned_render_hook(
         );
         input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
         render_scene_encode_cache_key = base_cache_key;
+    } else if direct_layout_render_scene_patch_enabled {
+        const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
+        let base_cache_key = (
+            render_frame_hash_value.to_owned(),
+            context.width,
+            context.height,
+            current_render_scene_lowering_mode.to_owned(),
+            "none".to_owned(),
+        );
+        render_scene_cache_hit = render_scene_cache.contains_key(&base_cache_key);
+        if !render_scene_cache_hit {
+            let (base_render_scene, _base_lowering_mode) = preview_render_scene_for_frame_hash(
+                layout_render_scene_patch_base_hash.as_deref(),
+                render_frame,
+                context.width,
+                context.height,
+                render_text_columns,
+            )?;
+            let base_scene_hash = render_scene_hash(&base_render_scene);
+            if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
+                && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
+            {
+                render_scene_cache.remove(&oldest_key);
+            }
+            render_scene_cache.insert(
+                base_cache_key.clone(),
+                (
+                    layout_render_scene_patch_base_hash
+                        .as_deref()
+                        .unwrap_or(layout_cache_key)
+                        .to_owned(),
+                    base_scene_hash,
+                    base_render_scene,
+                ),
+            );
+        }
+        direct_layout_render_scene_patch = layout_render_scene_patch.clone();
+        render_scene_encode_cache_key = base_cache_key;
     } else {
         render_scene_cache_hit = render_scene_cache.contains_key(&render_scene_cache_key);
     }
-    if !direct_input_overlay_render_scene_patch_enabled && !render_scene_cache_hit {
+    if !direct_input_overlay_render_scene_patch_enabled
+        && !direct_layout_render_scene_patch_enabled
+        && !render_scene_cache_hit
+    {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
         let patched_cached_scene = if input_overlay_render_scene_patch_enabled {
             let cached_base_scene = render_scene_cache.iter().find_map(
@@ -10932,6 +10978,18 @@ fn native_gpu_app_owned_render_hook(
                 view: context.surface_view,
                 scene: render_scene,
                 patch: &input_overlay_patch.patch,
+                format: context.surface_texture_format,
+                width: context.width,
+                height: context.height,
+            })?
+        } else if let Some(layout_patch) = direct_layout_render_scene_patch.as_ref() {
+            renderer.encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
+                device: context.device,
+                queue: context.queue,
+                encoder: context.encoder,
+                view: context.surface_view,
+                scene: render_scene,
+                patch: layout_patch,
                 format: context.surface_texture_format,
                 width: context.width,
                 height: context.height,
@@ -11111,6 +11169,8 @@ fn native_gpu_app_owned_render_hook(
         "input_overlay_render_scene_patch_direct_encode": direct_input_overlay_render_scene_patch_enabled,
         "input_overlay_render_scene_patch_touched_node_count": input_overlay_touched_nodes.len(),
         "input_overlay_render_scene_patch_built_this_frame": input_overlay_render_scene_patch_build_ms > 0.0,
+        "layout_render_scene_patch_applied": layout_render_scene_patch.is_some(),
+        "layout_render_scene_patch_direct_encode": direct_layout_render_scene_patch_enabled,
         "app_owned_readback_reused": app_owned_readback_reused,
         "offscreen_app_owned_scene_readback_skipped": skip_app_owned_scene_proof,
         "proof": proof,

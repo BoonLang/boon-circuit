@@ -20522,3 +20522,68 @@ Pending verification:
 - Fresh native Cells visible-click, interaction-speed, and scroll reports for
   the current commit if this slice is promoted from focused correctness to
   native 60 FPS evidence.
+
+## 2026-06-28 - Direct WGPU Render-Scene Patch Variants
+
+Status: implemented a focused Phase 4 retained-render slice. Native WGPU
+render-scene patch conversion no longer accepts only `ReplaceNodeEntries`; it
+can now apply the same document render-scene patch variants used by layout
+sidecars.
+
+What changed:
+
+- `boon_native_gpu::render_scene_from_document_scene_with_patch` now handles
+  `Paint`, `TextContent`, `RetagNodeEntries`, and `ReplaceNodeEntries` through
+  copy-on-write document render-scene views before lowering to GPU batches.
+- The mixed patch parity test now compares direct native GPU conversion against
+  materialized document `RenderScene::apply_patch` for fill paint, text color,
+  text content, retag, and replace operations in one patch.
+- `native_gpu_app_owned_render_hook` can use `VisibleLayoutRenderer::encode_scene_patch`
+  for layout/document sidecar patches on the visible-surface interaction path
+  when app-owned proof readback is intentionally skipped for timing.
+- Native render-hook reports now expose
+  `layout_render_scene_patch_direct_encode` so reports can distinguish
+  sidecar-patch presence from direct WGPU patch encoding.
+- `verify-render-patch-contract` now includes the native GPU direct patch
+  variant source check and focused conversion parity test.
+
+Evidence:
+
+- `cargo test -q -p boon_native_gpu document_render_scene_patch_conversion_matches_materialized_apply`:
+  pass.
+- `cargo check -q -p boon_native_gpu`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `target/debug/xtask verify-render-patch-contract --report target/reports/unified/render-patch-contract.json`:
+  pass.
+
+Current interpretation:
+
+- This removes one retained-render fallback where document/layout sidecar
+  patches had to clone/apply/cache a patched render scene before encoding.
+- App-owned proof/readback paths remain conservative and still materialize
+  patched scenes for evidence stability.
+- Fresh native Cells interaction and scroll reports are still needed before
+  claiming this improves end-to-end 60 FPS metrics on the current commit.
+
+Follow-up native report refresh:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- Fresh Cells release report highlights:
+  `target_count=64`, `simple_source_click_count=64`, `generic_fallback_count=0`,
+  `input_wake_to_formula_visible_ms_p95=16.11164099999951`,
+  `click_to_formula_visible_ms_p95=30.172298`, `click_to_formula_visible_ms_max=32.312327`,
+  `retained_update_contract.status="pass"`, `full_document_lower_count=0`,
+  `runtime_work_contract.status="pass"`, and `total_list_find_rows_scanned=0`.
+- Evidence limitation:
+  the refreshed Cells report exercised `native_input_overlay` for all `64`
+  render-scene patches. It exposed the new `layout_render_scene_patch_direct_encode`
+  field, but `true_count=0`, so it is not evidence that layout sidecar direct
+  encoding happened during Cells clicks.
+- `target/debug/xtask verify-native-counter-interaction-speed --example counter --profile release --report target/reports/native-gpu/counter-interaction-speed-release.json`:
+  fail. The report is schema-valid but blocked by role failure, missing final
+  count, and stale headed visual evidence (`git_fresh=false`,
+  `worktree_fresh=false`). Its role artifact also did not exercise
+  `layout_render_scene_patch_direct_encode`.

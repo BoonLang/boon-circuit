@@ -18506,6 +18506,15 @@ fn verify_render_patch_contract(args: &[String]) -> Result<(), Box<dyn std::erro
         rg_count("crates/boon_runtime/src", "generic_render_patch_lowering")?;
     let render_expectation_hits =
         rg_count("crates/boon_runtime/src", "expect_render_delta_contains")?;
+    let native_gpu_patch_variant_hits =
+        rg_count(
+            "crates/boon_native_gpu/src",
+            "patch_borrowed_document_retag_entries",
+        )? + rg_count("crates/boon_native_gpu/src", "RenderScenePaintPatch")?
+            + rg_count(
+                "crates/boon_native_gpu/src",
+                "document_render_scene_patch_conversion_matches_materialized_apply",
+            )?;
     let source_ok =
         render_scene_patch_hits > 0 && runtime_lowering_hits > 0 && render_expectation_hits > 0;
     push_audit_check(
@@ -18518,6 +18527,20 @@ fn verify_render_patch_contract(args: &[String]) -> Result<(), Box<dyn std::erro
         ),
         (!source_ok).then(|| {
             "document and runtime source must expose render-scene patch APIs, generic render patch lowering, and scenario render patch expectations"
+                .to_owned()
+        }),
+    );
+    let native_gpu_patch_variants_ok = native_gpu_patch_variant_hits >= 3;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "render-patch-contract:native-gpu-direct-patch-variants",
+        native_gpu_patch_variants_ok,
+        format!(
+            "native GPU direct patch variant source hits={native_gpu_patch_variant_hits}"
+        ),
+        (!native_gpu_patch_variants_ok).then(|| {
+            "native GPU render-scene patch conversion must support paint/text/retag variants, not only ReplaceNodeEntries"
                 .to_owned()
         }),
     );
@@ -18537,7 +18560,20 @@ fn verify_render_patch_contract(args: &[String]) -> Result<(), Box<dyn std::erro
         "scenario_delta_expectations_reject_missing_semantic_or_render_patch",
         "runtime scenario tests must reject missing render patch evidence",
     )?;
-    let status = if source_ok && document_patch_tests && runtime_patch_tests {
+    let native_gpu_patch_tests = run_focused_cargo_test(
+        &mut checks,
+        &mut blockers,
+        "render-patch-contract:native-gpu-render-scene-patch-tests",
+        "boon_native_gpu",
+        "document_render_scene_patch_conversion_matches_materialized_apply",
+        "native GPU render-scene patch conversion must match materialized document patch apply",
+    )?;
+    let status = if source_ok
+        && native_gpu_patch_variants_ok
+        && document_patch_tests
+        && runtime_patch_tests
+        && native_gpu_patch_tests
+    {
         "render-patch-contract-pass"
     } else {
         "render-patch-contract-proof-incomplete"
@@ -18553,7 +18589,8 @@ fn verify_render_patch_contract(args: &[String]) -> Result<(), Box<dyn std::erro
             "render_patch_contract_scope": "Verifies document RenderScenePatch operations, runtime generic render patch lowering evidence, and scenario checks that reject missing render patch output.",
             "render_scene_patch_source_hits": render_scene_patch_hits,
             "runtime_render_patch_lowering_source_hits": runtime_lowering_hits,
-            "runtime_render_patch_expectation_source_hits": render_expectation_hits
+            "runtime_render_patch_expectation_source_hits": render_expectation_hits,
+            "native_gpu_patch_variant_source_hits": native_gpu_patch_variant_hits
         }),
     )
 }

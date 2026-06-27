@@ -23444,6 +23444,67 @@ Remaining blockers:
 - Fresh current-commit native reports still need to prove visible click,
   interaction speed, and scroll speed.
 - Direct GPU patch encoding for `Paint`, `TextContent`, and `RetagNodeEntries`
-  is still pending.
+  still needed implementation and fresh native report evidence at this point;
+  see the follow-up entry below for the focused implementation slice.
 - Default execution-path and codegen work remain behind typed IR,
   NativeRegionIR, BYTES/MachinePlan parity, and readiness gates.
+
+## 2026-06-28 - Direct WGPU Render-Scene Patch Variants
+
+Status: implemented a retained WGPU slice that supports the current
+runtime/document sidecar patch model more directly. This is not a BYTES
+semantic migration step by itself, but it removes a render-path materialization
+fallback that affects the same Cells/formula-bar interaction budget.
+
+What changed:
+
+- Native GPU document-scene patch conversion now supports `Paint`,
+  `TextContent`, `RetagNodeEntries`, and `ReplaceNodeEntries`.
+- The native GPU parity test now exercises a mixed patch and proves direct
+  conversion matches materialized document-scene patch application.
+- The native playground visible-surface render hook can route layout sidecar
+  patches through `encode_scene_patch` during interaction measurement instead
+  of encoding a pre-materialized patched scene.
+- Native render reports now include `layout_render_scene_patch_direct_encode`.
+- `verify-render-patch-contract` now includes native GPU direct patch variant
+  source coverage and the focused native GPU conversion parity test.
+
+Evidence:
+
+- `cargo test -q -p boon_native_gpu document_render_scene_patch_conversion_matches_materialized_apply`:
+  pass.
+- `cargo check -q -p boon_native_gpu`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `target/debug/xtask verify-render-patch-contract --report target/reports/unified/render-patch-contract.json`:
+  pass.
+
+Remaining blockers:
+
+- Need fresh current-commit native reports to prove visible-click,
+  interaction-speed, and scroll-speed impact.
+- Native input scheduling still has possible extra pre-present/drop boundaries.
+- BYTES/MachinePlan default switch remains gated on typed IR/PlanExecutor
+  parity and readiness evidence.
+
+Follow-up native report refresh:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- Fresh Cells release report highlights:
+  `target_count=64`, `simple_source_click_count=64`, `generic_fallback_count=0`,
+  `input_wake_to_formula_visible_ms_p95=16.11164099999951`,
+  `click_to_formula_visible_ms_p95=30.172298`, `click_to_formula_visible_ms_max=32.312327`,
+  `retained_update_contract.status="pass"`, `full_document_lower_count=0`,
+  `runtime_work_contract.status="pass"`, and `total_list_find_rows_scanned=0`.
+- Evidence limitation:
+  Cells clicks used `native_input_overlay` patches. The report contains
+  `layout_render_scene_patch_direct_encode`, but `true_count=0`; this proves
+  the field exists on the native report path, not that layout sidecar direct
+  encoding was exercised by Cells.
+- `target/debug/xtask verify-native-counter-interaction-speed --example counter --profile release --report target/reports/native-gpu/counter-interaction-speed-release.json`:
+  fail. The report is schema-valid but blocked by the interaction role failure,
+  missing final count, and stale headed visual evidence (`git_fresh=false`,
+  `worktree_fresh=false`). It also did not exercise the direct layout-sidecar
+  field.

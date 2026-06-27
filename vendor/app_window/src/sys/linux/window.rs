@@ -17,9 +17,9 @@ use super::buffer::{AllocatedBuffer, create_shm_buffer_decor};
 use super::cursor::CursorRequest;
 use super::main_thread::MAIN_THREAD_INFO;
 use super::{App, AppState, Configure, FullscreenError, Surface, SurfaceEvents};
-use accesskit::{ActionRequest, TreeUpdate};
 use crate::coordinates::{Position, Size};
 use crate::surface::SurfaceContentReport;
+use accesskit::{ActionRequest, TreeUpdate};
 
 pub struct DebugWrapper(pub Box<dyn Fn(Size) + Send>);
 impl Debug for DebugWrapper {

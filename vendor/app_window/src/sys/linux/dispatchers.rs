@@ -445,7 +445,12 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                 data.wl_pointer_enter_surface = Some(surface);
                 let position = Position::new(surface_x, surface_y);
                 data.wl_pointer_pos.replace(position);
-                crate::input::linux::motion_event(0, surface_x, surface_y);
+                crate::input::linux::motion_event(
+                    0,
+                    surface_x,
+                    surface_y,
+                    data.wl_surface.as_ref().unwrap().id(),
+                );
                 //set cursor?
                 let app = data.app_state.upgrade().expect("App state gone");
                 let cursor_request = app
@@ -493,7 +498,12 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                     parent_surface_x = surface_x;
                     parent_surface_y = surface_y;
                 }
-                crate::input::linux::motion_event(_time, parent_surface_x, parent_surface_y);
+                crate::input::linux::motion_event(
+                    _time,
+                    parent_surface_x,
+                    parent_surface_y,
+                    data.wl_surface.as_ref().unwrap().id(),
+                );
 
                 //get current size
                 let size = data.applied_size();

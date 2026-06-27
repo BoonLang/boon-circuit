@@ -3937,7 +3937,7 @@ fn verify_run_plan_scenario_events_report(
                 report_path.display()
             )
         })?;
-    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
+    for key in ["enabled", "state_match"] {
         if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!(
                 "{} run-plan-scenario-events legacy_comparison.{key} must be true",
@@ -3945,6 +3945,29 @@ fn verify_run_plan_scenario_events_report(
             )
             .into());
         }
+    }
+    let legacy_exact_match = legacy.get("passed").and_then(JsonValue::as_bool) == Some(true)
+        && legacy
+            .get("semantic_delta_match")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let legacy_acceptance = report
+        .get("legacy_comparison_acceptance")
+        .and_then(JsonValue::as_object);
+    let legacy_demand_current_coalesced = legacy_acceptance
+        .and_then(|acceptance| acceptance.get("accepted"))
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+        && legacy_acceptance
+            .and_then(|acceptance| acceptance.get("kind"))
+            .and_then(JsonValue::as_str)
+            == Some("demand-current-coalesced-semantic-deltas");
+    if !(legacy_exact_match || legacy_demand_current_coalesced) {
+        return Err(format!(
+            "{} run-plan-scenario-events legacy comparison must either match exactly or pass the demand-current coalescing policy",
+            report_path.display()
+        )
+        .into());
     }
     if legacy.get("plan_state_summary") != report.get("state_summary")
         || legacy.get("legacy_state_summary") != report.get("state_summary")
@@ -3978,25 +4001,43 @@ fn verify_run_plan_scenario_events_report(
         .zip(executor_steps)
         .zip(expected_event_step_ids.iter())
     {
+        let step_semantic_match = legacy_step
+            .get("semantic_delta_match")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
         if legacy_step.get("state_match").and_then(JsonValue::as_bool) != Some(true)
-            || legacy_step
-                .get("semantic_delta_match")
-                .and_then(JsonValue::as_bool)
-                != Some(true)
             || legacy_step.get("step_id") != Some(expected_step_id)
             || executor_step.get("step_id") != Some(expected_step_id)
             || legacy_step.get("touched_state_summary")
                 != executor_step.get("touched_state_summary")
-            || legacy_step.get("legacy_semantic_delta_signatures")
-                != executor_step.get("semantic_delta_signatures")
             || legacy_step.get("plan_semantic_delta_signatures")
                 != executor_step.get("semantic_delta_signatures")
-            || legacy_step.get("legacy_semantic_deltas") != executor_step.get("semantic_deltas")
             || legacy_step.get("plan_semantic_deltas") != executor_step.get("semantic_deltas")
         {
             return Err(format!(
                 "{} run-plan-scenario-events legacy step comparison does not match executor step",
                 report_path.display()
+            )
+            .into());
+        }
+        if step_semantic_match {
+            if legacy_step.get("legacy_semantic_delta_signatures")
+                != executor_step.get("semantic_delta_signatures")
+                || legacy_step.get("legacy_semantic_deltas") != executor_step.get("semantic_deltas")
+            {
+                return Err(format!(
+                    "{} run-plan-scenario-events exact legacy step comparison does not match executor step",
+                    report_path.display()
+                )
+                .into());
+            }
+        } else if !legacy_demand_current_coalesced
+            || !run_plan_step_matches_demand_current_delta_policy(legacy_step)
+        {
+            return Err(format!(
+                "{} run-plan-scenario-events legacy step `{}` does not satisfy demand-current coalescing policy",
+                report_path.display(),
+                expected_step_id
             )
             .into());
         }
@@ -4023,6 +4064,44 @@ fn verify_run_plan_scenario_events_report(
         .into());
     }
     Ok(())
+}
+
+fn run_plan_step_matches_demand_current_delta_policy(step: &JsonValue) -> bool {
+    if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(legacy_deltas) = step
+        .get("legacy_semantic_deltas")
+        .and_then(JsonValue::as_array)
+    else {
+        return false;
+    };
+    let Some(plan_deltas) = step
+        .get("plan_semantic_deltas")
+        .and_then(JsonValue::as_array)
+    else {
+        return false;
+    };
+    let mut remaining_legacy = legacy_deltas.clone();
+    for plan_delta in plan_deltas {
+        let Some(index) = remaining_legacy
+            .iter()
+            .position(|legacy_delta| legacy_delta == plan_delta)
+        else {
+            return false;
+        };
+        remaining_legacy.remove(index);
+    }
+    if remaining_legacy.is_empty() {
+        return false;
+    }
+    remaining_legacy.iter().all(|missing_delta| {
+        missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet")
+            && matches!(
+                missing_delta.get("field_path").and_then(JsonValue::as_str),
+                Some("display_text" | "value" | "error")
+            )
+    })
 }
 
 fn scenario_assertion_checkpoint_expectation_names(

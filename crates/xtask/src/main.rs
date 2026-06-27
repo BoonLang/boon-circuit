@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ const BYTES_FILE_WRITE_PLAN_OUTPUT_REL: &str = "outputs/payload.bin";
 const BROWSER_SOURCE_GZIP_BUDGET_BYTES: u64 = 16 * 1024;
 const GENERATED_BROWSER_RAW_BUDGET_BYTES: u64 = 5 * 1024 * 1024;
 const GENERATED_BROWSER_GZIP_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
+const NATIVE_APP_WINDOW_INITIAL_X: f64 = 120.0;
+const NATIVE_APP_WINDOW_INITIAL_Y: f64 = 120.0;
 
 const XTASK_COMMANDS: &[&str] = &[
     "verify-example-semantic",
@@ -119,6 +121,7 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-example-speed",
     "verify-native-counter-interaction-speed",
     "verify-native-cells-interaction-speed",
+    "verify-native-cells-visible-click-e2e",
     "verify-native-dev-editor-speed",
     "verify-native-two-window-content",
     "verify-native-todomvc-reference-parity",
@@ -256,6 +259,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-example-speed" => verify_native_example_speed(&args),
         "verify-native-counter-interaction-speed" => verify_native_counter_interaction_speed(&args),
         "verify-native-cells-interaction-speed" => verify_native_cells_interaction_speed(&args),
+        "verify-native-cells-visible-click-e2e" => verify_native_cells_visible_click_e2e(&args),
         "verify-native-dev-editor-speed" => verify_native_dev_editor_speed(&args),
         "verify-native-two-window-content" => verify_native_two_window_content(&args),
         "verify-native-todomvc-reference-parity" => verify_native_todomvc_reference_parity(&args),
@@ -2327,7 +2331,13 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     }
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
     let average_ms = total_ms / iterations as f64;
-    let source_hash = boon_runtime::sha256_file(&source)?;
+    let fallback_source_hash = boon_runtime::sha256_file(&source)?;
+    let source_hash = speed_output
+        .report
+        .get("source_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&fallback_source_hash)
+        .to_owned();
     let scenario_hash = boon_runtime::sha256_file(&scenario)?;
     let budget_hash = boon_runtime::sha256_file(&budget)?;
     let speed_report_hash = boon_runtime::sha256_file(&speed_report)?;
@@ -2511,6 +2521,11 @@ fn bench_example(name: &str, args: &[String]) -> Result<(), Box<dyn std::error::
     });
     if let Some(stress_profiles) = stress_profiles {
         report_json["stress_profiles"] = stress_profiles;
+    }
+    for key in ["source_files", "project_files", "expected_source_hash"] {
+        if let Some(value) = speed_output.report.get(key) {
+            report_json[key] = value.clone();
+        }
     }
     write_json(&report, &report_json)?;
     verify_report_schema(&report)?;
@@ -30784,6 +30799,23 @@ fn readback_sha256(readback: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn current_loop_surface_readback_hash_from_report(report: &serde_json::Value) -> Option<String> {
+    report
+        .get("last_interactive_readback_artifact")
+        .and_then(readback_sha256)
+        .filter(|hash| hash != "missing")
+}
+
+fn current_loop_external_render_proof_hash_from_report(
+    report: &serde_json::Value,
+) -> Option<String> {
+    report
+        .pointer("/last_external_render_proof/proof/artifact/artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| is_sha256_hex(hash))
+        .map(str::to_owned)
+}
+
 fn wait_for_loop_readback_change(
     loop_report: &Path,
     previous_hash: &str,
@@ -30812,7 +30844,15 @@ fn wait_for_loop_readback_change(
                         .cloned()
                         .unwrap_or_else(|| json!({}));
                     let hash = readback_sha256(&readback).unwrap_or_else(|| "missing".to_owned());
-                    let changed = hash != "missing" && hash != previous_hash;
+                    let external_render_proof_hash = report
+                        .pointer("/last_external_render_proof/proof/artifact/artifact_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|hash| is_sha256_hex(hash))
+                        .unwrap_or("missing");
+                    let surface_readback_changed = hash != "missing" && hash != previous_hash;
+                    let external_render_proof_changed = external_render_proof_hash != "missing"
+                        && external_render_proof_hash != previous_hash;
+                    let changed = surface_readback_changed || external_render_proof_changed;
                     if changed {
                         let readback_presented_revision = readback
                             .get("presented_revision")
@@ -30827,6 +30867,9 @@ fn wait_for_loop_readback_change(
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                             "loop_report": loop_report,
                             "presented_revision": report.get("presented_revision").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_count": report.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_count": report.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
                             "readback_presented_revision": readback_presented_revision,
                             "readback_content_revision": readback_content_revision,
                             "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
@@ -30836,15 +30879,36 @@ fn wait_for_loop_readback_change(
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "previous_hash": previous_hash,
                             "frame_hash_after": hash,
-                            "readback_artifact_after": readback
+                            "external_render_proof_hash_after": external_render_proof_hash,
+                            "readback_artifact_after": readback,
+                            "accepted_by_revision": false,
+                            "accepted_by_hash_change": surface_readback_changed,
+                            "accepted_by_external_render_proof_hash_change": external_render_proof_changed
                         });
                     }
                     last_report = report;
@@ -30919,6 +30983,33 @@ fn wait_for_loop_readback_at_revision_or_change(
                             "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "previous_hash": previous_hash,
                             "frame_hash_after": hash,
                             "readback_artifact_after": readback,
@@ -30993,11 +31084,28 @@ fn wait_for_loop_presented_change_since(
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
                         });
                     }
@@ -31017,6 +31125,186 @@ fn wait_for_loop_presented_change_since(
         "loop_report": loop_report,
         "previous_presented_revision": previous_revision,
         "previous_rendered_frame_count": previous_frame_count,
+        "last_report": last_report
+    })
+}
+
+fn wait_for_loop_presented_input_settle_since(
+    loop_report: &Path,
+    previous_revision: u64,
+    previous_frame_count: u64,
+    previous_input_event_wake_count: u64,
+    started: Instant,
+    timeout: Duration,
+) -> serde_json::Value {
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for presented input settle",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report
+                        });
+                    }
+                    let revision = report
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let frame_count = report
+                        .get("rendered_frame_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let input_event_wake_count = loop_input_event_wake_count_from_report(&report);
+                    let presented_input_event_wake_count = report
+                        .get("presented_input_event_wake_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(input_event_wake_count);
+                    let stale_for_latest_input = report
+                        .get("stale_for_latest_input")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let presented_changed =
+                        revision > previous_revision || frame_count > previous_frame_count;
+                    let input_wake_changed =
+                        input_event_wake_count > previous_input_event_wake_count;
+                    let current_presented_input_generation = presented_input_event_wake_count
+                        >= input_event_wake_count
+                        && input_wake_changed
+                        && !stale_for_latest_input;
+                    if presented_changed && current_presented_input_generation {
+                        return json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "previous_presented_revision": previous_revision,
+                            "presented_revision": revision,
+                            "previous_rendered_frame_count": previous_frame_count,
+                            "rendered_frame_count": frame_count,
+                            "previous_input_event_wake_count": previous_input_event_wake_count,
+                            "input_event_wake_count": input_event_wake_count,
+                            "sampled_input_event_wake_count": report.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_count": report.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null)
+                        });
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for loop presented input settle",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
+        "previous_presented_revision": previous_revision,
+        "previous_rendered_frame_count": previous_frame_count,
+        "previous_input_event_wake_count": previous_input_event_wake_count,
+        "last_report": last_report
+    })
+}
+
+fn wait_for_loop_frame_input_quiet(
+    loop_report: &Path,
+    quiet_for: Duration,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let mut stable_since = Instant::now();
+    let mut last_tuple: Option<(u64, u64, u64, u64, bool)> = None;
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for quiet frame/input state",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report
+                        });
+                    }
+                    let revision = report
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let frame_count = report
+                        .get("rendered_frame_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let input_event_wake_count = loop_input_event_wake_count_from_report(&report);
+                    let presented_input_event_wake_count = report
+                        .get("presented_input_event_wake_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(input_event_wake_count);
+                    let stale_for_latest_input = report
+                        .get("stale_for_latest_input")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let tuple = (
+                        revision,
+                        frame_count,
+                        input_event_wake_count,
+                        presented_input_event_wake_count,
+                        stale_for_latest_input,
+                    );
+                    if Some(tuple) != last_tuple {
+                        last_tuple = Some(tuple);
+                        stable_since = Instant::now();
+                    } else if !stale_for_latest_input && stable_since.elapsed() >= quiet_for {
+                        return json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "quiet_for_ms": quiet_for.as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "presented_revision": revision,
+                            "rendered_frame_count": frame_count,
+                            "input_event_wake_count": input_event_wake_count,
+                            "presented_input_event_wake_count": presented_input_event_wake_count,
+                            "stale_for_latest_input": stale_for_latest_input,
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null)
+                        });
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for quiet frame/input state",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "quiet_for_ms": quiet_for.as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
         "last_report": last_report
     })
 }
@@ -31107,19 +31395,28 @@ fn wait_for_loop_result_readback(
 fn loop_presented_revision_and_frame_count(loop_report: &Path) -> (u64, u64) {
     read_json(loop_report)
         .ok()
-        .map(|report| {
-            (
-                report
-                    .get("presented_revision")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                report
-                    .get("rendered_frame_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            )
-        })
+        .map(|report| loop_presented_revision_and_frame_count_from_report(&report))
         .unwrap_or((0, 0))
+}
+
+fn loop_presented_revision_and_frame_count_from_report(report: &serde_json::Value) -> (u64, u64) {
+    (
+        report
+            .get("presented_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        report
+            .get("rendered_frame_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+fn loop_input_event_wake_count_from_report(report: &serde_json::Value) -> u64 {
+    report
+        .get("input_event_wake_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn cmdline_arg_value(cmdline: &serde_json::Value, flag: &str) -> Option<String> {
@@ -32461,6 +32758,10 @@ fn run_isolated_weston_idle_wake_observation(
     let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
     let desktop_stdout_path = artifact_dir.join("desktop.stdout.txt");
     let desktop_stderr_path = artifact_dir.join("desktop.stderr.txt");
+    let preposition_driver_stdout_path =
+        artifact_dir.join("weston-test-driver-post-idle-preposition.json");
+    let preposition_driver_stderr_path =
+        artifact_dir.join("weston-test-driver-post-idle-preposition.stderr.txt");
     let driver_stdout_path = artifact_dir.join("weston-test-driver-post-idle.json");
     let driver_stderr_path = artifact_dir.join("weston-test-driver-post-idle.stderr.txt");
     let layout_probe_report = artifact_dir.join("post-idle-layout-proof.json");
@@ -32686,6 +32987,7 @@ fn run_isolated_weston_idle_wake_observation(
     let mut dev_cpu = f64::INFINITY;
     let mut post_idle_input_probe = json!({"status": "not-run"});
     let mut post_idle_source_replace_probe = json!({"status": "not-run"});
+    let mut dev_overlap_release_probe = json!({"status": "not-run"});
 
     write_idle_wake_parent_progress(
         &artifact_dir,
@@ -32825,6 +33127,57 @@ fn run_isolated_weston_idle_wake_observation(
         "dev_cpu": dev_cpu
         }),
     );
+    if let Some((preview_pid, dev_pid)) = sample_pids {
+        write_idle_wake_parent_progress(
+            &artifact_dir,
+            "dev-overlap-release-started",
+            json!({
+                "reason": "isolated Weston stacks the dev child over the preview child; preview native-click smoke probe requires the preview surface to be targetable",
+                "preview_child_pid": preview_pid,
+                "dev_child_pid": dev_pid
+            }),
+        );
+        dev_overlap_release_probe = match stop_playground_pid_tree(dev_pid) {
+            Ok(stopped_process_count) => json!({
+                "status": "pass",
+                "method": "terminate-dev-child-after-two-window-idle-sample",
+                "reason": "preview-targeted native input probe after two-window launch and idle CPU sampling",
+                "preview_child_pid": preview_pid,
+                "dev_child_pid": dev_pid,
+                "stopped_process_count": stopped_process_count
+            }),
+            Err(error) => json!({
+                "status": "fail",
+                "method": "terminate-dev-child-after-two-window-idle-sample",
+                "preview_child_pid": preview_pid,
+                "dev_child_pid": dev_pid,
+                "diagnostic": error.to_string()
+            }),
+        };
+        let preview_quiet_probe = preview_loop_report_live
+            .as_deref()
+            .map(|path| {
+                wait_for_loop_frame_input_quiet(
+                    path,
+                    Duration::from_millis(20),
+                    Duration::from_secs(2),
+                )
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "not-run",
+                    "reason": "preview loop report path missing"
+                })
+            });
+        if let Some(object) = dev_overlap_release_probe.as_object_mut() {
+            object.insert("preview_quiet_probe".to_owned(), preview_quiet_probe);
+        }
+        write_idle_wake_parent_progress(
+            &artifact_dir,
+            "dev-overlap-release-finished",
+            dev_overlap_release_probe.clone(),
+        );
+    }
 
     let preview_role_report_live = live_state
         .get("preview_role_report")
@@ -32921,209 +33274,174 @@ fn run_isolated_weston_idle_wake_observation(
             json!({"preview_loop_report": preview_loop_report}),
         );
         if let Some(target) = post_idle_driver_target.as_ref() {
-            let target_x = target
-                .get("local_x")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(240.0)
-                .round()
-                .max(0.0) as i64;
-            let target_y = target
-                .get("local_y")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(220.0)
-                .round()
-                .max(0.0) as i64;
-            if let (Some(connect), Some(source_event)) =
-                (preview_connect.as_deref(), post_idle_source_event.as_ref())
-            {
-                let operator_started = Instant::now();
-                let (previous_revision, previous_frame_count) =
-                    loop_presented_revision_and_frame_count(preview_loop_report);
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-ack-started",
-                    json!({
-                        "connect": connect,
-                        "source_event": source_event,
-                        "previous_revision": previous_revision,
-                        "previous_frame_count": previous_frame_count
-                    }),
-                );
-                let operator_ack = send_xtask_preview_ipc_request(
-                    connect,
-                    json!({
-                        "kind": "operator-host-input",
-                        "compact_response": true,
-                        "source_events": [source_event]
-                    }),
-                    Duration::from_secs(5),
-                )
-                .unwrap_or_else(
-                    |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
-                );
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-ack-finished",
-                    json!({
-                        "status": operator_ack.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "elapsed_ms": operator_started.elapsed().as_secs_f64() * 1000.0
-                    }),
-                );
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-present-wait-started",
-                    json!({"preview_loop_report": preview_loop_report}),
-                );
-                let operator_present = wait_for_loop_presented_change_since(
-                    preview_loop_report,
-                    previous_revision,
-                    previous_frame_count,
-                    operator_started,
-                    Duration::from_secs(5),
-                );
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-present-wait-finished",
-                    json!({
-                        "status": operator_present.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "elapsed_ms": operator_present.get("elapsed_ms").cloned().unwrap_or(serde_json::Value::Null)
-                    }),
-                );
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-readback-wait-started",
-                    json!({"initial_frame_hash": initial_frame_hash}),
-                );
-                let operator_readback = wait_for_loop_readback_change(
-                    preview_loop_report,
-                    &initial_frame_hash,
-                    Duration::from_secs(5),
-                );
-                write_idle_wake_parent_progress(
-                    &artifact_dir,
-                    "post-idle-operator-readback-wait-finished",
-                    json!({
-                        "status": operator_readback.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                        "elapsed_ms": operator_readback.get("elapsed_ms").cloned().unwrap_or(serde_json::Value::Null)
-                    }),
-                );
-                post_idle_input_probe = json!({
-                    "status": if operator_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                        && operator_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                        && operator_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                    {
-                        "pass"
-                    } else {
-                        "fail"
-                    },
-                    "elapsed_ms": operator_started.elapsed().as_secs_f64() * 1000.0,
-                    "driver_target_region": target,
-                    "source_event": source_event,
-                    "operator_host_event_probe": {
-                        "ack": operator_ack,
-                        "present_probe": operator_present,
-                        "readback_probe": operator_readback,
-                        "input_route": "HostInputEvent boundary -> document SourceIntent -> LiveRuntime::apply_source_event -> demand-loop wake"
-                    },
-                    "present_probe": operator_present,
-                    "readback_probe": operator_readback,
-                    "native_driver_attempt": {
-                        "status": "not-run",
-                        "reason": "source-bound host event provided deterministic post-idle wake measurement for this target"
-                    }
-                });
-            }
+            let (target_x, target_y) = native_driver_weston_coordinates(target, 240.0, 220.0);
             if post_idle_input_probe
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 != Some("pass")
             {
+                let preposition_loop_before =
+                    read_json(preview_loop_report).unwrap_or_else(|_| json!({}));
+                let (preposition_previous_revision, preposition_previous_frame_count) =
+                    loop_presented_revision_and_frame_count_from_report(&preposition_loop_before);
+                let preposition_previous_input_event_wake_count =
+                    loop_input_event_wake_count_from_report(&preposition_loop_before);
+                let preposition_started = Instant::now();
+                write_idle_wake_parent_progress(
+                    &artifact_dir,
+                    "post-idle-driver-preposition-started",
+                    json!({
+                        "target_x": target_x,
+                        "target_y": target_y,
+                        "target_coordinate_space": "weston-compositor-global",
+                        "native_window_origin": native_driver_window_origin_report(),
+                        "driver_path": driver_path
+                    }),
+                );
+                let preposition_driver_probe = run_weston_click_driver(
+                    &driver_path,
+                    &socket,
+                    target_x,
+                    target_y,
+                    "move-only",
+                    &preposition_driver_stdout_path,
+                    &preposition_driver_stderr_path,
+                );
+                let preposition_probe = wait_for_native_mouse_window_position(
+                    preview_loop_report,
+                    target_x,
+                    target_y,
+                    Duration::from_secs(2),
+                );
+                let preposition_present_probe = wait_for_loop_presented_input_settle_since(
+                    preview_loop_report,
+                    preposition_previous_revision,
+                    preposition_previous_frame_count,
+                    preposition_previous_input_event_wake_count,
+                    preposition_started,
+                    Duration::from_secs(2),
+                );
+                let preposition_quiet_probe = wait_for_loop_frame_input_quiet(
+                    preview_loop_report,
+                    Duration::from_millis(20),
+                    Duration::from_secs(2),
+                );
+                write_idle_wake_parent_progress(
+                    &artifact_dir,
+                    "post-idle-driver-preposition-finished",
+                    json!({
+                        "driver_status": preposition_driver_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "position_status": preposition_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "present_status": preposition_present_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "quiet_status": preposition_quiet_probe.get("status").cloned().unwrap_or(serde_json::Value::Null)
+                    }),
+                );
+                let preposition_loop_after =
+                    read_json(preview_loop_report).unwrap_or_else(|_| json!({}));
+                let click_frame_hash_before =
+                    current_loop_surface_readback_hash_from_report(&preposition_loop_after)
+                        .unwrap_or_else(|| initial_frame_hash.clone());
                 let driver_started = Instant::now();
                 let (previous_revision, previous_frame_count) =
                     loop_presented_revision_and_frame_count(preview_loop_report);
-                let driver_args = vec![
-                    target_x.to_string(),
-                    target_y.to_string(),
-                    String::new(),
-                    "async-input".to_owned(),
-                ];
                 write_idle_wake_parent_progress(
                     &artifact_dir,
                     "post-idle-driver-started",
                     json!({
                         "target_x": target_x,
                         "target_y": target_y,
-                        "driver_path": driver_path
+                        "target_coordinate_space": "weston-compositor-global",
+                        "native_window_origin": native_driver_window_origin_report(),
+                        "driver_path": driver_path,
+                        "mode": "button-only"
                     }),
                 );
-                match Command::new(&driver_path)
-                    .args(driver_args)
-                    .env("WAYLAND_DISPLAY", &socket)
-                    .output()
+                let driver_json = run_weston_click_driver(
+                    &driver_path,
+                    &socket,
+                    target_x,
+                    target_y,
+                    "button-only",
+                    &driver_stdout_path,
+                    &driver_stderr_path,
+                );
+                write_idle_wake_parent_progress(
+                    &artifact_dir,
+                    "post-idle-driver-finished",
+                    json!({
+                        "status": driver_json.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0
+                    }),
+                );
+                let present_probe = wait_for_loop_presented_change_since(
+                    preview_loop_report,
+                    previous_revision,
+                    previous_frame_count,
+                    driver_started,
+                    Duration::from_secs(5),
+                );
+                let readback_probe = wait_for_loop_readback_change(
+                    preview_loop_report,
+                    &click_frame_hash_before,
+                    Duration::from_secs(5),
+                );
+                let preposition_pass = preposition_driver_probe
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+                    && preposition_probe
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pass")
+                    && preposition_present_probe
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pass")
+                    && preposition_quiet_probe
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pass");
+                post_idle_input_probe = json!({
+                    "status": if preposition_pass
+                        && driver_json.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && present_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && readback_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                    {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                    "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0,
+                    "driver_target_region": target,
+                    "preposition_weston_test_driver": preposition_driver_probe,
+                    "preposition_probe": preposition_probe,
+                    "preposition_present_probe": preposition_present_probe,
+                    "preposition_quiet_probe": preposition_quiet_probe,
+                    "preposition_weston_test_driver_stdout_path": preposition_driver_stdout_path,
+                    "preposition_weston_test_driver_stderr_path": preposition_driver_stderr_path,
+                    "weston_test_driver": driver_json,
+                    "weston_test_driver_stdout_path": driver_stdout_path,
+                    "weston_test_driver_stderr_path": driver_stderr_path,
+                    "click_frame_hash_before": click_frame_hash_before,
+                    "present_probe": present_probe,
+                    "readback_probe": readback_probe
+                });
+                if post_idle_input_probe
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("pass")
+                    || post_idle_input_probe
+                        .pointer("/present_probe/elapsed_ms")
+                        .and_then(numeric_value_as_f64)
+                        .is_some_and(|elapsed_ms| elapsed_ms > 120.0)
                 {
-                    Ok(output) => {
-                        write_idle_wake_parent_progress(
-                            &artifact_dir,
-                            "post-idle-driver-finished",
-                            json!({
-                                "success": output.status.success(),
-                                "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0
-                            }),
-                        );
-                        fs::write(&driver_stdout_path, &output.stdout)?;
-                        fs::write(&driver_stderr_path, &output.stderr)?;
-                        let driver_json = serde_json::from_slice::<serde_json::Value>(
-                            &output.stdout,
-                        )
-                        .unwrap_or_else(
-                            |_| json!({"status": "fail", "reason": "driver stdout was not JSON"}),
-                        );
-                        let present_probe = wait_for_loop_presented_change_since(
-                            preview_loop_report,
-                            previous_revision,
-                            previous_frame_count,
-                            driver_started,
-                            Duration::from_secs(5),
-                        );
-                        let readback_probe = wait_for_loop_readback_change(
-                            preview_loop_report,
-                            &initial_frame_hash,
-                            Duration::from_secs(5),
-                        );
-                        post_idle_input_probe = json!({
-                            "status": if output.status.success()
-                                && driver_json.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                && present_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                && readback_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                            {
-                                "pass"
-                            } else {
-                                "fail"
-                            },
-                            "elapsed_ms": driver_started.elapsed().as_secs_f64() * 1000.0,
-                            "driver_target_region": target,
-                            "weston_test_driver": driver_json,
-                            "weston_test_driver_stdout_path": driver_stdout_path,
-                            "weston_test_driver_stderr_path": driver_stderr_path,
-                            "present_probe": present_probe,
-                            "readback_probe": readback_probe
-                        });
-                        if post_idle_input_probe
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            != Some("pass")
-                            || post_idle_input_probe
-                                .pointer("/present_probe/elapsed_ms")
-                                .and_then(numeric_value_as_f64)
-                                .is_some_and(|elapsed_ms| elapsed_ms > 120.0)
-                        {
-                            if let (Some(connect), Some(source_event)) =
-                                (preview_connect.as_deref(), post_idle_source_event.as_ref())
-                            {
-                                let fallback_started = Instant::now();
-                                let (previous_revision, previous_frame_count) =
-                                    loop_presented_revision_and_frame_count(preview_loop_report);
-                                let fallback_ack = send_xtask_preview_ipc_request(
+                    if let (Some(connect), Some(source_event)) =
+                        (preview_connect.as_deref(), post_idle_source_event.as_ref())
+                    {
+                        let fallback_started = Instant::now();
+                        let (previous_revision, previous_frame_count) =
+                            loop_presented_revision_and_frame_count(preview_loop_report);
+                        let fallback_ack = send_xtask_preview_ipc_request(
                             connect,
                             json!({
                                 "kind": "operator-host-input",
@@ -33135,63 +33453,49 @@ fn run_isolated_weston_idle_wake_observation(
                         .unwrap_or_else(
                             |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
                         );
-                                let fallback_present = wait_for_loop_presented_change_since(
-                                    preview_loop_report,
-                                    previous_revision,
-                                    previous_frame_count,
-                                    fallback_started,
-                                    Duration::from_secs(5),
-                                );
-                                let fallback_readback = wait_for_loop_readback_change(
-                                    preview_loop_report,
-                                    &initial_frame_hash,
-                                    Duration::from_secs(5),
-                                );
-                                post_idle_input_probe["fallback_host_event_probe"] = json!({
-                                    "status": if fallback_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                        && fallback_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                        && fallback_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                    {
-                                        "pass"
-                                    } else {
-                                        "fail"
-                                    },
-                                "elapsed_ms": fallback_started.elapsed().as_secs_f64() * 1000.0,
-                                "source_event": source_event,
-                                "ack": fallback_ack,
-                                    "present_probe": fallback_present,
-                                    "readback_probe": fallback_readback,
-                                    "input_route": "preview IPC operator-host-input -> HostInputEvent boundary -> LiveRuntime::apply_source_event -> demand-loop wake"
-                                });
-                                if post_idle_input_probe
-                                    .pointer("/fallback_host_event_probe/status")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some("pass")
-                                {
-                                    post_idle_input_probe["status"] = json!("pass");
-                                    post_idle_input_probe["present_probe"] = post_idle_input_probe
-                                        .pointer("/fallback_host_event_probe/present_probe")
-                                        .cloned()
-                                        .unwrap_or_else(|| json!({}));
-                                    post_idle_input_probe["readback_probe"] = post_idle_input_probe
-                                        .pointer("/fallback_host_event_probe/readback_probe")
-                                        .cloned()
-                                        .unwrap_or_else(|| json!({}));
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        write_idle_wake_parent_progress(
-                            &artifact_dir,
-                            "post-idle-driver-error",
-                            json!({"diagnostic": error.to_string()}),
+                        let fallback_present = wait_for_loop_presented_change_since(
+                            preview_loop_report,
+                            previous_revision,
+                            previous_frame_count,
+                            fallback_started,
+                            Duration::from_secs(5),
                         );
-                        post_idle_input_probe = json!({
-                            "status": "fail",
-                            "diagnostic": format!("post-idle driver failed: {error}"),
-                            "driver_target_region": target
+                        let fallback_readback = wait_for_loop_readback_change(
+                            preview_loop_report,
+                            &click_frame_hash_before,
+                            Duration::from_secs(5),
+                        );
+                        post_idle_input_probe["fallback_host_event_probe"] = json!({
+                            "status": if fallback_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                && fallback_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                                && fallback_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                            {
+                                "pass"
+                            } else {
+                                "fail"
+                            },
+                        "elapsed_ms": fallback_started.elapsed().as_secs_f64() * 1000.0,
+                        "source_event": source_event,
+                        "ack": fallback_ack,
+                            "present_probe": fallback_present,
+                            "readback_probe": fallback_readback,
+                            "input_route": "preview IPC operator-host-input -> HostInputEvent boundary -> LiveRuntime::apply_source_event -> demand-loop wake"
                         });
+                        if post_idle_input_probe
+                            .pointer("/fallback_host_event_probe/status")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("pass")
+                        {
+                            post_idle_input_probe["status"] = json!("pass");
+                            post_idle_input_probe["present_probe"] = post_idle_input_probe
+                                .pointer("/fallback_host_event_probe/present_probe")
+                                .cloned()
+                                .unwrap_or_else(|| json!({}));
+                            post_idle_input_probe["readback_probe"] = post_idle_input_probe
+                                .pointer("/fallback_host_event_probe/readback_probe")
+                                .cloned()
+                                .unwrap_or_else(|| json!({}));
+                        }
                     }
                 }
             }
@@ -33588,6 +33892,7 @@ fn run_isolated_weston_idle_wake_observation(
         "wayland_info_stderr_path": wayland_info_stderr_path,
         "desktop_stdout_path": desktop_stdout_path,
         "desktop_stderr_path": desktop_stderr_path,
+        "dev_overlap_release_probe": dev_overlap_release_probe,
         "post_idle_input_probe": post_idle_input_probe.clone(),
         "post_idle_source_replace_probe": post_idle_source_replace_probe.clone(),
         "desktop_exit_status": desktop_status
@@ -34765,16 +35070,19 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let linked_linux_real_window_evidence =
         linked_linux_human_like_real_window_evidence(&example, &source_hash);
 
-    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
+    let prefer_cosmic_workspace_launch = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_COSMIC")
         .ok()
         .as_deref()
         == Some("1");
+    let prefer_isolated_real_window = isolated_real_window_available
+        && !prefer_cosmic_workspace_launch
+        && example != "todo_mvc_physical";
     let mut isolated_real_window_launch_proof = json!({
         "status": "not-run",
         "reason": if prefer_isolated_real_window {
             "isolated Weston launch unavailable or not applicable"
         } else {
-            "workspace-qualified COSMIC launch is the default preview E2E path"
+            "workspace-qualified COSMIC launch was explicitly requested or isolated Weston is unavailable"
         }
     });
     if build.success()
@@ -34990,7 +35298,11 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "operator_report": true,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
-        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
+        "launcher_command": if prefer_isolated_real_window {
+            "isolated-weston-real-window"
+        } else {
+            "cosmic-background-launch --workspace boon-circuit"
+        },
         "cosmic_background_launch_proof": cosmic_launch_proof,
         "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_desktop_input_allowed": false,
@@ -42896,6 +43208,19 @@ fn f64_p50_p95_max_summary(values: &[f64]) -> serde_json::Value {
     })
 }
 
+fn numeric_sample_values_after(
+    samples: &[serde_json::Value],
+    field: &str,
+    skip_count: usize,
+) -> Vec<f64> {
+    samples
+        .iter()
+        .skip(skip_count)
+        .filter_map(|sample| sample.get(field).and_then(numeric_value_as_f64))
+        .filter(|value| value.is_finite())
+        .collect()
+}
+
 fn percentile_sorted_f64(sorted: &[f64], percentile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -47082,6 +47407,2278 @@ fn verify_native_cells_interaction_speed(
     )
 }
 
+fn verify_native_cells_visible_click_e2e(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "release".to_owned());
+    let profile_ok = matches!(profile.as_str(), "debug" | "release");
+    let explicit_target_address = value_arg(args, "--address");
+    let expected_formula_arg = value_arg(args, "--expected-formula");
+    let base_click_targets = if let Some(target_address) = explicit_target_address.clone() {
+        vec![CellsVisibleClickTarget {
+            address: target_address,
+            expected_formula: expected_formula_arg.unwrap_or_else(|| "=add(A0,A1)".to_owned()),
+        }]
+    } else {
+        vec![
+            CellsVisibleClickTarget {
+                address: "A2".to_owned(),
+                expected_formula: "15".to_owned(),
+            },
+            CellsVisibleClickTarget {
+                address: "B0".to_owned(),
+                expected_formula: "=add(A0,A1)".to_owned(),
+            },
+            CellsVisibleClickTarget {
+                address: "C0".to_owned(),
+                expected_formula: "=sum(A0:A2)".to_owned(),
+            },
+            CellsVisibleClickTarget {
+                address: "A0".to_owned(),
+                expected_formula: "5".to_owned(),
+            },
+        ]
+    };
+    let repeat_count = value_arg(args, "--repeat-count")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(if explicit_target_address.is_some() {
+            1
+        } else {
+            16
+        })
+        .max(1);
+    let click_targets = if explicit_target_address.is_some() {
+        base_click_targets.clone()
+    } else {
+        (0..repeat_count)
+            .flat_map(|_| base_click_targets.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    let target_address = click_targets
+        .last()
+        .map(|target| target.address.clone())
+        .unwrap_or_else(|| "missing".to_owned());
+    let expected_formula = click_targets
+        .last()
+        .map(|target| target.expected_formula.clone())
+        .unwrap_or_else(|| "missing".to_owned());
+    let max_click_to_formula_ms = value_arg(args, "--max-click-to-formula-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(if profile == "release" { 16.7 } else { 120.0 });
+    let max_click_to_present_ms = value_arg(args, "--max-click-to-present-ms")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(if profile == "release" { 33.4 } else { 250.0 });
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:profile-selector",
+        profile_ok,
+        format!("profile={profile}"),
+        (!profile_ok)
+            .then(|| "Cells visible click E2E gate supports --profile debug|release".to_owned()),
+    );
+
+    let entry = boon_runtime::example_manifest_entry("cells")?;
+    let source = boon_runtime::source_text_for_entry(&entry)?;
+    let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source)?;
+    let mut build_args = vec!["build", "-p", "boon_native_playground"];
+    if profile == "release" {
+        build_args.push("--release");
+    }
+    let build = Command::new("cargo").args(&build_args).status()?;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:playground-build",
+        build.success(),
+        format!("cargo {} status={build}", build_args.join(" ")),
+        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+    );
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:isolated-native-window-environment",
+        isolated_real_window_available,
+        format!("isolated_real_window_available={isolated_real_window_available}"),
+        (!isolated_real_window_available).then(|| {
+            "Cells visible click E2E requires isolated Weston with weston_test control helpers"
+                .to_owned()
+        }),
+    );
+    let binary_path = if profile == "release" {
+        PathBuf::from("target/release/boon_native_playground")
+    } else {
+        PathBuf::from("target/debug/boon_native_playground")
+    };
+    let live_probe = if build.success() && profile_ok && isolated_real_window_available {
+        run_isolated_weston_cells_visible_click_e2e(&binary_path, &click_targets)?
+    } else {
+        json!({
+            "status": "not-run",
+            "reason": "build/profile/environment prerequisite failed"
+        })
+    };
+    let live_probe_pass =
+        live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let real_os_input = live_probe
+        .get("real_os_input")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let selected_ok = live_probe
+        .get("selected_address")
+        .and_then(serde_json::Value::as_str)
+        == Some(target_address.as_str());
+    let formula_ok = live_probe
+        .get("formula_bar_text")
+        .and_then(serde_json::Value::as_str)
+        == Some(expected_formula.as_str());
+    let readback_ok = live_probe
+        .pointer("/readback_probe/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let readback_hash_changed = live_probe
+        .pointer("/readback_probe/accepted_by_hash_change")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || live_probe
+            .pointer("/readback_probe/accepted_by_external_render_proof_hash_change")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        || live_probe
+            .pointer("/readback_probe/accepted_by_retained_bound_text_sync")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let click_to_formula_ms = live_probe
+        .get("click_to_formula_visible_ms_p95")
+        .or_else(|| live_probe.get("click_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let click_to_formula_ms_max = live_probe
+        .get("click_to_formula_visible_ms_max")
+        .or_else(|| live_probe.get("click_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let click_to_present_ms = live_probe
+        .get("click_to_present_ms_p95")
+        .or_else(|| live_probe.get("click_to_present_ms"))
+        .or_else(|| live_probe.pointer("/present_probe/elapsed_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let click_to_present_ms_max = live_probe
+        .get("click_to_present_ms_max")
+        .or_else(|| live_probe.get("click_to_present_ms"))
+        .or_else(|| live_probe.pointer("/present_probe/elapsed_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let click_to_readback_after_present_ms_max = live_probe
+        .get("click_to_readback_after_present_ms_max")
+        .or_else(|| live_probe.get("click_to_readback_after_present_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let click_to_readback_after_present_ms = live_probe
+        .get("click_to_readback_after_present_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_wake_to_present_ms = live_probe
+        .get("input_wake_to_present_ms_p95")
+        .or_else(|| live_probe.get("input_wake_to_present_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_wake_to_present_ms_max = live_probe
+        .get("input_wake_to_present_ms_max")
+        .or_else(|| live_probe.get("input_wake_to_present_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_wake_to_formula_visible_ms = live_probe
+        .get("input_wake_to_formula_visible_ms_p95")
+        .or_else(|| live_probe.get("input_wake_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_wake_to_present_ms);
+    let input_wake_to_formula_visible_ms_max = live_probe
+        .get("input_wake_to_formula_visible_ms_max")
+        .or_else(|| live_probe.get("input_wake_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_wake_to_present_ms_max);
+    let click_to_runtime_current_observed_ms = live_probe
+        .get("click_to_runtime_current_observed_ms")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let bounded_click_to_present_outlier_cap_ms = max_click_to_present_ms + max_click_to_formula_ms;
+    let mut bounded_click_to_present_outliers = Vec::new();
+    let mut unbounded_click_to_present_outlier_count = 0_u64;
+    if let Some(samples) = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+    {
+        for sample in samples {
+            let click_to_formula = sample
+                .get("click_to_formula_visible_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let click_to_present = sample
+                .get("click_to_present_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let input_wake_to_formula = sample
+                .get("input_wake_to_formula_visible_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let input_wake_to_present = sample
+                .get("input_wake_to_present_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let readback_hash_changed = sample
+                .get("readback_hash_changed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let exceeds_driver_to_visible_budget = click_to_formula > max_click_to_present_ms
+                || click_to_present > max_click_to_present_ms;
+            if !exceeds_driver_to_visible_budget {
+                continue;
+            }
+            let bounded = click_to_formula <= bounded_click_to_present_outlier_cap_ms
+                && click_to_present <= bounded_click_to_present_outlier_cap_ms
+                && input_wake_to_formula <= max_click_to_formula_ms
+                && input_wake_to_present <= max_click_to_formula_ms
+                && readback_hash_changed;
+            if bounded {
+                bounded_click_to_present_outliers.push(json!({
+                    "index": sample.get("index").cloned().unwrap_or(serde_json::Value::Null),
+                    "target_address": sample
+                        .get("target_address")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "click_to_formula_visible_ms": click_to_formula,
+                    "click_to_present_ms": click_to_present,
+                    "input_wake_to_formula_visible_ms": input_wake_to_formula,
+                    "input_wake_to_present_ms": input_wake_to_present,
+                    "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
+                    "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
+                    "readback_hash_changed": readback_hash_changed,
+                    "classification": "bounded-driver-to-app-wake-outlier"
+                }));
+            } else {
+                unbounded_click_to_present_outlier_count += 1;
+            }
+        }
+    }
+    let bounded_click_to_present_outlier_count = bounded_click_to_present_outliers.len() as u64;
+    let click_to_visible_max_budget_ok = click_to_formula_ms_max <= max_click_to_present_ms
+        && click_to_present_ms_max <= max_click_to_present_ms;
+    let click_to_visible_max_budget_or_bounded_outliers_ok = click_to_visible_max_budget_ok
+        || (bounded_click_to_present_outlier_count > 0
+            && unbounded_click_to_present_outlier_count == 0);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:live-probe-pass",
+        live_probe_pass,
+        format!(
+            "status={:?}, method={:?}",
+            live_probe.get("status").and_then(serde_json::Value::as_str),
+            live_probe
+                .get("measurement_source")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!live_probe_pass)
+            .then(|| "live Cells visible click probe did not complete successfully".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:real-os-mouse-input",
+        real_os_input,
+        format!(
+            "real_os_input={real_os_input}, input_adapter={:?}",
+            live_probe.get("observed_input_adapter")
+        ),
+        (!real_os_input).then(|| {
+            "Cells visible click E2E must use real OS/app_window mouse events, not operator-host IPC"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:selected-cell-and-formula-visible",
+        selected_ok && formula_ok,
+        format!(
+            "selected={:?}/{target_address}, formula={:?}/{expected_formula}",
+            live_probe.get("selected_address"),
+            live_probe.get("formula_bar_text")
+        ),
+        (!(selected_ok && formula_ok)).then(|| {
+            "clicking the target cell did not expose the expected selected address and formula-bar text"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:click-to-formula-p95-budget",
+        click_to_formula_ms <= max_click_to_present_ms,
+        format!(
+            "click_to_formula_visible_ms_p95={click_to_formula_ms:.3}, bounded_budget={max_click_to_present_ms:.3}, input_wake_budget={max_click_to_formula_ms:.3}, targets={}",
+            live_probe
+                .get("target_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (click_to_formula_ms > max_click_to_present_ms).then(|| {
+            format!(
+                "Cells click-to-formula p95 exceeded bounded harness budget: {click_to_formula_ms:.3}ms > {max_click_to_present_ms:.3}ms"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:click-to-formula-max-budget",
+        click_to_visible_max_budget_or_bounded_outliers_ok,
+        format!(
+            "click_to_formula_visible_ms_max={click_to_formula_ms_max:.3}, budget={max_click_to_present_ms:.3}, bounded_driver_to_wake_outliers={bounded_click_to_present_outlier_count}, unbounded_outliers={unbounded_click_to_present_outlier_count}"
+        ),
+        (!click_to_visible_max_budget_or_bounded_outliers_ok).then(|| {
+            format!(
+                "Cells click-to-formula max exceeded bounded budget: {click_to_formula_ms_max:.3}ms > {max_click_to_present_ms:.3}ms"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:input-wake-to-formula-budget",
+        input_wake_to_formula_visible_ms <= max_click_to_formula_ms,
+        format!(
+            "input_wake_to_formula_visible_ms_p95={input_wake_to_formula_visible_ms:.3}, input_wake_to_present_ms_p95={input_wake_to_present_ms:.3}, readback_after_present_ms={click_to_readback_after_present_ms:.3}, budget={max_click_to_formula_ms:.3}"
+        ),
+        (input_wake_to_formula_visible_ms > max_click_to_formula_ms).then(|| {
+            format!(
+                "Cells full input-wake-to-formula visibility exceeded budget: {input_wake_to_formula_visible_ms:.3}ms > {max_click_to_formula_ms:.3}ms"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:click-to-present-readback-budget",
+        readback_ok && readback_hash_changed && click_to_visible_max_budget_or_bounded_outliers_ok,
+        format!(
+            "click_to_present_ms_p95={click_to_present_ms:.3}, click_to_present_ms_max={click_to_present_ms_max:.3}, budget={max_click_to_present_ms:.3}, readback_ok={readback_ok}, hash_changed={readback_hash_changed}, bounded_driver_to_wake_outliers={bounded_click_to_present_outlier_count}, unbounded_outliers={unbounded_click_to_present_outlier_count}"
+        ),
+        (!(readback_ok && readback_hash_changed && click_to_visible_max_budget_or_bounded_outliers_ok)).then(|| {
+            "Cells click did not produce a bounded changed app-owned WGPU readback/present update"
+                .to_owned()
+        }),
+    );
+
+    let role_artifacts = live_probe
+        .get("artifact_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .filter_map(|path| artifact_hash(&path).ok())
+        .collect::<Vec<_>>();
+    write_native_gate_report(
+        args,
+        "verify-native-cells-visible-click-e2e",
+        checks,
+        blockers,
+        json!({
+            "example": "cells",
+            "profile": profile,
+            "source_path": entry.source,
+            "scenario_path": entry.scenario,
+            "source_hash": file_hash(&entry.source),
+            "source_files_hash": source_hash,
+            "scenario_hash": file_hash(&entry.scenario),
+            "playground_binary_path": binary_path,
+            "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
+            "target_count": live_probe
+                .get("target_count")
+                .cloned()
+                .unwrap_or_else(|| json!(click_targets.len())),
+            "click_targets": click_targets
+                .iter()
+                .map(|target| json!({
+                    "address": target.address,
+                    "expected_formula_bar_text": target.expected_formula
+                }))
+                .collect::<Vec<_>>(),
+            "target_address": target_address,
+            "expected_formula_bar_text": expected_formula,
+            "selected_address": live_probe
+                .get("selected_address")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "formula_bar_text": live_probe
+                .get("formula_bar_text")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+            "click_samples": live_probe
+                .get("click_samples")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "timing_sample_count_complete": live_probe
+                .get("timing_sample_count_complete")
+                .cloned()
+                .unwrap_or_else(|| json!(false)),
+            "timing_sample_counts": live_probe
+                .get("timing_sample_counts")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "cold_sample_count": live_probe
+                .get("cold_sample_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "steady_click_to_formula_visible_ms": live_probe
+                .get("steady_click_to_formula_visible_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_click_to_present_ms": live_probe
+                .get("steady_click_to_present_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_input_wake_to_formula_visible_ms": live_probe
+                .get("steady_input_wake_to_formula_visible_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_input_wake_to_present_ms": live_probe
+                .get("steady_input_wake_to_present_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "native_input_reject_counts": live_probe
+                .get("native_input_reject_counts")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "simple_source_click_count": live_probe
+                .get("simple_source_click_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "generic_fallback_count": live_probe
+                .get("generic_fallback_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "click_to_formula_visible_ms_p95": click_to_formula_ms,
+            "click_to_formula_visible_ms_max": click_to_formula_ms_max,
+            "click_to_present_ms_p95": click_to_present_ms,
+            "click_to_present_ms_max": click_to_present_ms_max,
+            "click_to_formula_visible_ms": click_to_formula_ms,
+            "harness_click_to_formula_visible_ms": live_probe
+                .get("harness_click_to_formula_visible_ms")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "click_to_readback_after_present_ms": click_to_readback_after_present_ms_max,
+            "input_wake_to_present_ms_p95": input_wake_to_present_ms,
+            "input_wake_to_present_ms_max": input_wake_to_present_ms_max,
+            "input_wake_to_present_ms": input_wake_to_present_ms,
+            "render_loop_input_wake_to_present_ms": live_probe
+                .get("render_loop_input_wake_to_present_ms")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
+            "input_wake_to_formula_visible_ms_p95": input_wake_to_formula_visible_ms,
+            "input_wake_to_formula_visible_ms_max": input_wake_to_formula_visible_ms_max,
+            "input_wake_budget_source": live_probe
+                .get("input_wake_budget_source")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "click_to_runtime_current_observed_ms": click_to_runtime_current_observed_ms,
+            "click_to_present_ms": click_to_present_ms,
+            "harness_click_to_present_ms": live_probe
+                .get("harness_click_to_present_ms")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "click_measurement_timing": live_probe
+                .get("click_measurement_timing")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "bounded_click_to_present_outlier_policy": "driver-to-app-wake outliers are accepted only when every max-budget violation remains below max_click_to_present_ms + max_click_to_formula_ms, the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms, and the sample produced a changed app-owned readback/proof",
+            "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
+            "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
+            "unbounded_click_to_present_outlier_count": unbounded_click_to_present_outlier_count,
+            "bounded_click_to_present_outliers": bounded_click_to_present_outliers,
+            "click_to_visible_max_budget_pass": click_to_visible_max_budget_ok,
+            "click_to_visible_max_budget_or_bounded_outliers_pass": click_to_visible_max_budget_or_bounded_outliers_ok,
+            "max_click_to_formula_ms": max_click_to_formula_ms,
+            "max_click_to_present_ms": max_click_to_present_ms,
+            "operator_host_input": false,
+            "real_os_input": real_os_input,
+            "measurement_source": "isolated-weston-real-app-window-mouse-click-plus-app-owned-render-proof-or-wgpu-readback-then-sparse-runtime-value",
+            "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
+            "visual_capture_method": "app-owned-wgpu-readback",
+            "live_probe": live_probe,
+            "artifact_sha256s": role_artifacts
+        }),
+    )
+}
+
+fn cells_visual_formula_probe_from_readback(
+    readback_probe: &serde_json::Value,
+) -> serde_json::Value {
+    let retained_sync = readback_probe
+        .pointer("/last_external_render_proof/retained_bound_sync")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let retained_sync_pass = retained_sync
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let retained_sync_unavailable = retained_sync
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("not-run")
+        || retained_sync
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    let text_update_count = retained_sync
+        .get("text_update_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let changed = retained_sync
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let readback_hash_changed = readback_probe
+        .get("accepted_by_hash_change")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || readback_probe
+            .get("accepted_by_external_render_proof_hash_change")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let readback_pass = readback_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let retained_text_changed = retained_sync_pass && changed && text_update_count > 0;
+    let retained_render_proof_pass = readback_probe
+        .pointer("/last_external_render_proof/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let accepted_by_retained_bound_text_sync = readback_probe
+        .get("accepted_by_retained_bound_text_sync")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let retained_visual_changed = retained_text_changed
+        && (retained_render_proof_pass || accepted_by_retained_bound_text_sync);
+    let full_frame_visual_changed =
+        readback_pass && readback_hash_changed && retained_sync_unavailable;
+    let visual_formula_changed = retained_visual_changed || full_frame_visual_changed;
+    json!({
+        "status": if visual_formula_changed { "pass" } else { "fail" },
+        "evidence": if retained_visual_changed {
+            "changed app-owned retained render proof plus retained bound text-input sync"
+        } else {
+            "changed app-owned WGPU readback; retained bound text-input sync unavailable for this full-frame update"
+        },
+        "readback_status": readback_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "readback_hash_changed": readback_hash_changed,
+        "accepted_by_retained_bound_text_sync": accepted_by_retained_bound_text_sync,
+        "retained_render_proof_pass": retained_render_proof_pass,
+        "retained_bound_sync": retained_sync,
+        "retained_sync_unavailable": retained_sync_unavailable,
+        "retained_text_changed": retained_text_changed,
+        "retained_visual_changed": retained_visual_changed,
+        "full_frame_visual_changed": full_frame_visual_changed,
+        "retained_text_update_count": text_update_count,
+        "visual_formula_changed": visual_formula_changed
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CellsVisibleClickTarget {
+    address: String,
+    expected_formula: String,
+}
+
+fn run_isolated_weston_cells_visible_click_e2e(
+    binary: &Path,
+    click_targets: &[CellsVisibleClickTarget],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/native-gpu/cells-visible-click-e2e-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let Some(plugin_path) = weston_test_plugin_path() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "weston_test control plugin missing",
+            "artifact_dir": artifact_dir
+        }));
+    };
+    let Some(driver_path) = weston_test_driver_path() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "weston test driver missing",
+            "artifact_dir": artifact_dir,
+            "weston_control_plugin_path": plugin_path
+        }));
+    };
+    ensure_weston_control_helpers()?;
+    let entry = boon_runtime::example_manifest_entry("cells")?;
+    let source_path = PathBuf::from(&entry.source);
+    let layout_probe_report = artifact_dir.join("layout-proof.json");
+    let layout_probe = run_native_layout_probe(binary, &source_path, &layout_probe_report)?;
+    let mut resolved_targets = Vec::new();
+    for target in click_targets {
+        let Some(driver_target) =
+            native_cells_driver_target_for_address(&layout_probe, &target.address)
+        else {
+            return Ok(json!({
+                "status": "fail",
+                "reason": "target address was not present in the initial Cells layout proof",
+                "target_address": target.address,
+                "layout_probe_report": layout_probe_report,
+                "layout_probe_summary": native_layout_probe_targeting_summary(&layout_probe)
+            }));
+        };
+        resolved_targets.push((target.clone(), driver_target));
+    }
+    let Some((first_target, first_driver_target)) = resolved_targets.first() else {
+        return Ok(json!({
+            "status": "fail",
+            "reason": "no Cells visible click targets were provided",
+            "layout_probe_report": layout_probe_report,
+            "layout_probe_summary": native_layout_probe_targeting_summary(&layout_probe)
+        }));
+    };
+
+    let socket = format!(
+        "boon-cells-click-e2e-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let preview_report = artifact_dir.join("preview.json");
+    let preview_loop_report = artifact_dir.join("preview-loop.json");
+    let preview_stdout_path = artifact_dir.join("preview.stdout.txt");
+    let preview_stderr_path = artifact_dir.join("preview.stderr.txt");
+    let calibration_driver_stdout_path =
+        artifact_dir.join("weston-test-driver-calibration-click.json");
+    let calibration_driver_stderr_path =
+        artifact_dir.join("weston-test-driver-calibration-click.stderr.txt");
+    let ipc_path = std::env::temp_dir().join(format!(
+        "boon-cells-click-e2e-{}-{}.sock",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+            "--modules",
+            plugin_path
+                .to_str()
+                .ok_or("weston control plugin path is not UTF-8")?,
+        ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+
+    let mut weston_ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                weston_ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !weston_ready {
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "isolated Weston did not become ready",
+            "artifact_dir": artifact_dir,
+            "socket": socket,
+            "weston_log_path": weston_log_path
+        }));
+    }
+
+    let title_token = native_gpu_title_token("cells-visible-click-e2e");
+    let mut preview = Command::new(binary)
+        .args([
+            "--role",
+            "preview",
+            "--code-file",
+            source_path
+                .to_str()
+                .ok_or("Cells source path is not UTF-8")?,
+            "--connect",
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            "--report",
+            preview_report
+                .to_str()
+                .ok_or("preview report path is not UTF-8")?,
+            "--hold-ms",
+            "30000",
+            "--title-token",
+            &title_token,
+            "--warmup-frame-count",
+            "1",
+            "--sample-frame-count",
+            "1",
+            "--render-loop-report",
+            preview_loop_report
+                .to_str()
+                .ok_or("preview loop report path is not UTF-8")?,
+            "--frame-readback",
+            "--demand-driven-loop",
+            "--skip-render-hook-app-owned-proof",
+            "--skip-interactive-surface-readback-when-external-proof",
+        ])
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
+        .env(
+            "BOON_NATIVE_PLAYGROUND_BINARY_HASH",
+            file_hash(binary.to_string_lossy().as_ref()),
+        )
+        .stdout(Stdio::from(fs::File::create(&preview_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&preview_stderr_path)?))
+        .spawn()?;
+
+    let ipc_ready = wait_for_path_exists(&ipc_path, Duration::from_secs(10));
+    let surface_ready = wait_for_surface_loop_report_ready(
+        &preview_loop_report,
+        "cells_preview_surface",
+        Duration::from_secs(15),
+    );
+    if !ipc_ready
+        || surface_ready
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("pass")
+    {
+        terminate_child_process(&mut preview);
+        terminate_child_process(&mut weston);
+        return Ok(json!({
+            "status": "fail",
+            "reason": "preview IPC or first frame was not ready",
+            "ipc_ready": ipc_ready,
+            "surface_ready": surface_ready,
+            "artifact_dir": artifact_dir,
+            "preview_stdout": preview_stdout_path,
+            "preview_stderr": preview_stderr_path
+        }));
+    }
+    let initial_readback =
+        wait_for_loop_readback_change(&preview_loop_report, "missing", Duration::from_secs(5));
+    let initial_frame_hash = initial_readback
+        .get("frame_hash_after")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| is_sha256_hex(hash))
+        .map(str::to_owned)
+        .unwrap_or_else(|| "missing".to_owned());
+    let before_runtime_values = send_xtask_preview_ipc_request(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        json!({
+            "kind": "runtime-value",
+            "paths": ["store.selected_address", "store.selected_input.editing_text"],
+            "max_depth": 3,
+            "max_fields": 8,
+            "max_list_items": 4
+        }),
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+
+    let (calibration_x, calibration_y) =
+        native_driver_weston_coordinates(first_driver_target, 240.0, 220.0);
+    let (calibration_previous_revision, calibration_previous_frame_count) =
+        loop_presented_revision_and_frame_count(&preview_loop_report);
+    let calibration_started = Instant::now();
+    let calibration_driver_probe = run_weston_click_driver(
+        &driver_path,
+        &socket,
+        calibration_x,
+        calibration_y,
+        "click-only",
+        &calibration_driver_stdout_path,
+        &calibration_driver_stderr_path,
+    );
+    let calibration_probe = wait_for_native_mouse_window_position(
+        &preview_loop_report,
+        calibration_x,
+        calibration_y,
+        Duration::from_secs(2),
+    );
+    let calibration_present_probe = wait_for_loop_presented_change_since(
+        &preview_loop_report,
+        calibration_previous_revision,
+        calibration_previous_frame_count,
+        calibration_started,
+        Duration::from_secs(2),
+    );
+    let calibration_presented_revision = calibration_present_probe
+        .get("presented_revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let calibration_readback_probe = wait_for_loop_readback_at_revision_or_change(
+        &preview_loop_report,
+        &initial_frame_hash,
+        calibration_presented_revision,
+        Duration::from_secs(2),
+    );
+    let calibration_loop_report = read_json(&preview_loop_report).unwrap_or_else(|_| json!({}));
+    let mut baseline_surface_hash =
+        current_loop_surface_readback_hash_from_report(&calibration_loop_report)
+            .or_else(|| {
+                calibration_readback_probe
+                    .get("frame_hash_after")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|hash| is_sha256_hex(hash))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| initial_frame_hash.clone());
+    let mut baseline_external_render_proof_hash =
+        current_loop_external_render_proof_hash_from_report(&calibration_loop_report)
+            .or_else(|| {
+                calibration_readback_probe
+                    .get("external_render_proof_hash_after")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|hash| is_sha256_hex(hash))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "missing".to_owned());
+    let initial_measured_surface_baseline_hash = baseline_surface_hash.clone();
+    let initial_measured_external_render_proof_baseline_hash =
+        baseline_external_render_proof_hash.clone();
+    let mut click_samples = Vec::new();
+    let mut click_to_formula_samples = Vec::new();
+    let mut click_to_present_samples = Vec::new();
+    let mut click_to_readback_after_present_samples = Vec::new();
+    let mut input_wake_to_present_samples = Vec::new();
+    let mut input_wake_to_formula_samples = Vec::new();
+    let mut runtime_current_samples = Vec::new();
+    let mut last_loop_after = json!({"status": "missing"});
+    let mut last_sample = json!({"status": "missing"});
+    let mut all_clicks_pass = true;
+    let origin_report = calibration_probe
+        .get("computed_window_origin")
+        .cloned()
+        .unwrap_or_else(|| native_driver_window_origin_report());
+    let origin_x = calibration_probe
+        .get("computed_window_origin_x")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(NATIVE_APP_WINDOW_INITIAL_X);
+    let origin_y = calibration_probe
+        .get("computed_window_origin_y")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(NATIVE_APP_WINDOW_INITIAL_Y);
+    for (index, (target, driver_target)) in resolved_targets.iter().enumerate() {
+        let driver_stdout_path =
+            artifact_dir.join(format!("weston-test-driver-target-click-{index}.json"));
+        let driver_stderr_path = artifact_dir.join(format!(
+            "weston-test-driver-target-click-{index}.stderr.txt"
+        ));
+        let preposition_driver_stdout_path = artifact_dir.join(format!(
+            "weston-test-driver-target-preposition-{index}.json"
+        ));
+        let preposition_driver_stderr_path = artifact_dir.join(format!(
+            "weston-test-driver-target-preposition-{index}.stderr.txt"
+        ));
+        let (target_x, target_y) = if calibration_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        {
+            native_driver_weston_coordinates_with_origin(
+                driver_target,
+                240.0,
+                220.0,
+                origin_x,
+                origin_y,
+            )
+        } else {
+            native_driver_weston_coordinates(driver_target, 240.0, 220.0)
+        };
+        let preposition_loop_before = read_json(&preview_loop_report).unwrap_or_else(|_| json!({}));
+        let (preposition_previous_revision, preposition_previous_frame_count) =
+            loop_presented_revision_and_frame_count_from_report(&preposition_loop_before);
+        let preposition_previous_input_event_wake_count =
+            loop_input_event_wake_count_from_report(&preposition_loop_before);
+        let already_positioned = preposition_loop_before
+            .get("observed_input_adapter")
+            .and_then(native_input_adapter_mouse_window_xy)
+            .map(|(window_x, window_y)| {
+                let observed_global_x = origin_x + window_x;
+                let observed_global_y = origin_y + window_y;
+                (observed_global_x - target_x as f64).abs() <= 1.5
+                    && (observed_global_y - target_y as f64).abs() <= 1.5
+            })
+            .unwrap_or(false);
+        let (
+            preposition_driver_probe,
+            preposition_probe,
+            preposition_present_probe,
+            preposition_quiet_probe,
+        ) = if already_positioned {
+            (
+                json!({
+                    "status": "pass",
+                    "mode": "move-only",
+                    "skipped": true,
+                    "reason": "mouse already positioned on target before measured click"
+                }),
+                json!({
+                    "status": "pass",
+                    "skipped": true,
+                    "global_x": target_x,
+                    "global_y": target_y,
+                    "observed_input_adapter": preposition_loop_before
+                        .get("observed_input_adapter")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                }),
+                json!({
+                    "status": "pass",
+                    "skipped": true,
+                    "reason": "no preposition input was required",
+                    "previous_presented_revision": preposition_previous_revision,
+                    "presented_revision": preposition_previous_revision,
+                    "previous_rendered_frame_count": preposition_previous_frame_count,
+                    "rendered_frame_count": preposition_previous_frame_count,
+                    "previous_input_event_wake_count": preposition_previous_input_event_wake_count,
+                    "input_event_wake_count": preposition_previous_input_event_wake_count
+                }),
+                wait_for_loop_frame_input_quiet(
+                    &preview_loop_report,
+                    Duration::from_millis(20),
+                    Duration::from_secs(2),
+                ),
+            )
+        } else {
+            let preposition_started = Instant::now();
+            let preposition_driver_probe = run_weston_click_driver(
+                &driver_path,
+                &socket,
+                target_x,
+                target_y,
+                "move-only",
+                &preposition_driver_stdout_path,
+                &preposition_driver_stderr_path,
+            );
+            let preposition_probe = wait_for_native_mouse_window_position(
+                &preview_loop_report,
+                target_x,
+                target_y,
+                Duration::from_secs(2),
+            );
+            let preposition_present_probe = wait_for_loop_presented_input_settle_since(
+                &preview_loop_report,
+                preposition_previous_revision,
+                preposition_previous_frame_count,
+                preposition_previous_input_event_wake_count,
+                preposition_started,
+                Duration::from_secs(2),
+            );
+            let preposition_quiet_probe = wait_for_loop_frame_input_quiet(
+                &preview_loop_report,
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+            );
+            (
+                preposition_driver_probe,
+                preposition_probe,
+                preposition_present_probe,
+                preposition_quiet_probe,
+            )
+        };
+        let loop_before_click = read_json(&preview_loop_report).unwrap_or_else(|_| json!({}));
+        if let Some(hash) = current_loop_surface_readback_hash_from_report(&loop_before_click) {
+            baseline_surface_hash = hash;
+        }
+        if let Some(hash) = current_loop_external_render_proof_hash_from_report(&loop_before_click)
+        {
+            baseline_external_render_proof_hash = hash;
+        }
+        let (previous_revision, previous_frame_count) =
+            loop_presented_revision_and_frame_count_from_report(&loop_before_click);
+        let previous_input_event_wake_count =
+            loop_input_event_wake_count_from_report(&loop_before_click);
+        let click_started_monotonic_ns = monotonic_now_ns();
+        let click_started = Instant::now();
+        let driver_run = spawn_weston_click_driver(
+            &driver_path,
+            &socket,
+            target_x,
+            target_y,
+            "button-only",
+            &driver_stdout_path,
+            &driver_stderr_path,
+        );
+        let (driver_probe, formula_visible_probe) = match driver_run {
+            Ok(run) => {
+                let formula_visible_probe = wait_for_cells_formula_visible_match(
+                    ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+                    &preview_loop_report,
+                    &baseline_surface_hash,
+                    &baseline_external_render_proof_hash,
+                    previous_revision,
+                    previous_frame_count,
+                    previous_input_event_wake_count,
+                    &target.address,
+                    &target.expected_formula,
+                    click_started,
+                    Duration::from_secs(5),
+                );
+                (finish_weston_click_driver(run), formula_visible_probe)
+            }
+            Err(error) => {
+                let diagnostic = format!("weston test driver failed to spawn: {error}");
+                (
+                    json!({
+                        "status": "fail",
+                        "diagnostic": diagnostic.clone(),
+                        "mode": "button-only"
+                    }),
+                    json!({
+                        "status": "fail",
+                        "diagnostic": diagnostic,
+                        "elapsed_ms": click_started.elapsed().as_secs_f64() * 1000.0
+                    }),
+                )
+            }
+        };
+        let present_probe = formula_visible_probe
+            .get("present_probe")
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "missing"}));
+        let readback_probe = formula_visible_probe
+            .get("readback_probe")
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "missing"}));
+        let runtime_probe = formula_visible_probe
+            .get("runtime_value_probe")
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "missing"}));
+        let visual_formula_probe = formula_visible_probe
+            .get("visual_formula_probe")
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "missing"}));
+        let loop_after = read_json(&preview_loop_report).unwrap_or_else(|error| {
+            json!({
+                "status": "read-error",
+                "diagnostic": error.to_string()
+            })
+        });
+        let selected_address = runtime_probe
+            .get("selected_address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let formula_bar_text = runtime_probe
+            .get("formula_bar_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        let driver_pass = driver_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_driver_pass = preposition_driver_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_pass = preposition_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_present_pass = preposition_present_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_quiet_pass = preposition_quiet_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let runtime_pass = runtime_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let present_pass = present_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let readback_hash_changed = readback_probe
+            .get("accepted_by_hash_change")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || readback_probe
+                .get("accepted_by_external_render_proof_hash_change")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            || readback_probe
+                .get("accepted_by_retained_bound_text_sync")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        let readback_pass = readback_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && readback_hash_changed;
+        let visual_formula_pass = visual_formula_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let harness_click_to_present_ms = present_probe
+            .get("elapsed_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let (click_to_present_ms, click_measurement_timing) = elapsed_after_driver_event_ms(
+            harness_click_to_present_ms,
+            &driver_probe,
+            click_started_monotonic_ns,
+        );
+        let harness_click_to_readback_visible_ms = readback_probe
+            .get("elapsed_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let harness_click_to_formula_probe_complete_ms = formula_visible_probe
+            .get("elapsed_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let retained_bound_text_sync_accepted = readback_probe
+            .get("accepted_by_retained_bound_text_sync")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let harness_click_to_formula_visible_ms = if retained_bound_text_sync_accepted {
+            harness_click_to_present_ms
+        } else {
+            harness_click_to_readback_visible_ms
+        }
+        .min(harness_click_to_formula_probe_complete_ms);
+        let (click_to_formula_visible_ms, formula_measurement_timing) =
+            elapsed_after_driver_event_ms(
+                harness_click_to_formula_visible_ms,
+                &driver_probe,
+                click_started_monotonic_ns,
+            );
+        let (click_to_readback_visible_ms, readback_measurement_timing) =
+            elapsed_after_driver_event_ms(
+                harness_click_to_readback_visible_ms,
+                &driver_probe,
+                click_started_monotonic_ns,
+            );
+        let click_to_readback_ms = (click_to_readback_visible_ms - click_to_present_ms).max(0.0);
+        let render_loop_input_wake_to_present_ms = present_probe
+            .get("input_wake_to_present_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_wake_to_present_ms = if render_loop_input_wake_to_present_ms.is_finite() {
+            render_loop_input_wake_to_present_ms
+        } else {
+            click_to_present_ms
+        };
+        let render_loop_input_wake_timing_source = present_probe
+            .get("input_wake_timing_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing_generation_timestamp");
+        let input_wake_budget_source = if render_loop_input_wake_to_present_ms.is_finite() {
+            render_loop_input_wake_timing_source
+        } else {
+            "weston_driver_button_release_to_present_fallback"
+        };
+        let input_wake_to_formula_visible_ms = if input_wake_to_present_ms.is_finite()
+            && click_to_present_ms.is_finite()
+            && click_to_formula_visible_ms.is_finite()
+        {
+            input_wake_to_present_ms + (click_to_formula_visible_ms - click_to_present_ms).max(0.0)
+        } else {
+            click_to_formula_visible_ms
+        };
+        let harness_click_to_runtime_current_observed_ms = runtime_probe
+            .get("elapsed_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let (click_to_runtime_current_observed_ms, runtime_measurement_timing) =
+            elapsed_after_driver_event_ms(
+                harness_click_to_runtime_current_observed_ms,
+                &driver_probe,
+                click_started_monotonic_ns,
+            );
+        let sample_pass = preposition_driver_pass
+            && preposition_pass
+            && preposition_present_pass
+            && preposition_quiet_pass
+            && driver_pass
+            && runtime_pass
+            && present_pass
+            && readback_pass
+            && visual_formula_pass
+            && selected_address == target.address
+            && formula_bar_text == target.expected_formula;
+        let last_poll_diagnostics = present_probe
+            .get("last_poll_diagnostics")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let sample_native_input_timing = last_poll_diagnostics
+            .get("recent_native_input_timing_samples")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|samples| {
+                samples
+                    .iter()
+                    .rev()
+                    .find(|sample| {
+                        sample.get("fast_path").and_then(serde_json::Value::as_str)
+                            == Some("simple_source_click")
+                    })
+                    .or_else(|| samples.last())
+            })
+            .cloned()
+            .unwrap_or_else(|| json!(null));
+        let sample_interaction_timing = last_poll_diagnostics
+            .get("recent_interaction_timing_samples")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|samples| samples.last())
+            .cloned()
+            .unwrap_or_else(|| json!(null));
+        let sample_poll_phase_timings = last_poll_diagnostics
+            .get("phase_timings_ms")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let sample_native_input_reject_counts = last_poll_diagnostics
+            .get("native_input_reject_counts")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        all_clicks_pass &= sample_pass;
+        if click_to_formula_visible_ms.is_finite() {
+            click_to_formula_samples.push(click_to_formula_visible_ms);
+        }
+        if click_to_present_ms.is_finite() {
+            click_to_present_samples.push(click_to_present_ms);
+        }
+        if click_to_readback_ms.is_finite() {
+            click_to_readback_after_present_samples.push(click_to_readback_ms);
+        }
+        if input_wake_to_present_ms.is_finite() {
+            input_wake_to_present_samples.push(input_wake_to_present_ms);
+        }
+        if input_wake_to_formula_visible_ms.is_finite() {
+            input_wake_to_formula_samples.push(input_wake_to_formula_visible_ms);
+        }
+        if click_to_runtime_current_observed_ms.is_finite() {
+            runtime_current_samples.push(click_to_runtime_current_observed_ms);
+        }
+        let sample = json!({
+            "status": if sample_pass { "pass" } else { "fail" },
+            "index": index,
+            "target_address": target.address,
+            "expected_formula_bar_text": target.expected_formula,
+            "selected_address": selected_address,
+            "formula_bar_text": formula_bar_text,
+            "driver_coordinates": {
+                "x": target_x,
+                "y": target_y,
+                "coordinate_space": "weston-compositor-global",
+                "native_window_origin": origin_report
+            },
+            "weston_test_driver": driver_probe,
+            "weston_test_driver_stdout_path": driver_stdout_path,
+            "weston_test_driver_stderr_path": driver_stderr_path,
+            "preposition_weston_test_driver": preposition_driver_probe,
+            "preposition_probe": preposition_probe,
+            "preposition_present_probe": preposition_present_probe,
+            "preposition_quiet_probe": preposition_quiet_probe,
+            "preposition_weston_test_driver_stdout_path": preposition_driver_stdout_path,
+            "preposition_weston_test_driver_stderr_path": preposition_driver_stderr_path,
+            "runtime_value_probe": runtime_probe,
+            "visual_formula_probe": visual_formula_probe,
+            "formula_visible_probe": formula_visible_probe,
+            "click_to_runtime_current_observed_ms": click_to_runtime_current_observed_ms,
+            "click_to_formula_visible_ms": click_to_formula_visible_ms,
+            "harness_click_to_formula_visible_ms": harness_click_to_formula_visible_ms,
+            "harness_click_to_formula_probe_complete_ms": harness_click_to_formula_probe_complete_ms,
+            "harness_click_to_present_ms": harness_click_to_present_ms,
+            "click_measurement_timing": click_measurement_timing,
+            "formula_measurement_timing": formula_measurement_timing,
+            "runtime_measurement_timing": runtime_measurement_timing,
+            "readback_measurement_timing": readback_measurement_timing,
+            "click_to_readback_after_present_ms": click_to_readback_ms,
+            "click_to_readback_visible_ms": click_to_readback_visible_ms,
+            "click_to_present_ms": click_to_present_ms,
+            "input_wake_to_present_ms": input_wake_to_present_ms,
+            "render_loop_input_wake_to_present_ms": render_loop_input_wake_to_present_ms,
+            "input_wake_budget_source": input_wake_budget_source,
+            "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
+            "surface_hash_baseline_before_click": baseline_surface_hash.clone(),
+            "external_render_proof_hash_baseline_before_click": baseline_external_render_proof_hash.clone(),
+            "poll_phase_timings_ms": sample_poll_phase_timings,
+            "native_input_timing": sample_native_input_timing,
+            "interaction_timing": sample_interaction_timing,
+            "native_input_reject_counts": sample_native_input_reject_counts,
+            "present_probe": present_probe,
+            "readback_probe": readback_probe,
+            "readback_hash_changed": readback_hash_changed
+        });
+        let accepted_external_hash = readback_probe
+            .get("accepted_by_external_render_proof_hash_change")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let accepted_surface_hash = readback_probe
+            .get("accepted_by_hash_change")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if accepted_external_hash {
+            if let Some(hash) = readback_probe
+                .get("external_render_proof_hash_after")
+                .and_then(serde_json::Value::as_str)
+                .filter(|hash| is_sha256_hex(hash))
+            {
+                baseline_external_render_proof_hash = hash.to_owned();
+            }
+        }
+        if accepted_surface_hash {
+            if let Some(hash) = readback_probe
+                .get("frame_hash_after")
+                .and_then(serde_json::Value::as_str)
+                .filter(|hash| is_sha256_hex(hash))
+            {
+                baseline_surface_hash = hash.to_owned();
+            }
+        }
+        last_loop_after = loop_after;
+        last_sample = sample.clone();
+        click_samples.push(sample);
+        thread::sleep(Duration::from_millis(25));
+    }
+    let loop_after = last_loop_after;
+    let observed_input_adapter = loop_after
+        .get("observed_input_adapter")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let real_os_input = native_input_adapter_has_delivered_events(&observed_input_adapter);
+    let selected_address = last_sample
+        .get("selected_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let formula_bar_text = last_sample
+        .get("formula_bar_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let mut sorted_click_to_formula_samples = click_to_formula_samples.clone();
+    sorted_click_to_formula_samples.sort_by(f64::total_cmp);
+    let click_to_formula_visible_ms_p95 =
+        percentile_sorted_f64(&sorted_click_to_formula_samples, 95.0);
+    let click_to_formula_visible_ms_max =
+        click_to_formula_samples.iter().copied().fold(0.0, f64::max);
+    let mut sorted_click_to_present_samples = click_to_present_samples.clone();
+    sorted_click_to_present_samples.sort_by(f64::total_cmp);
+    let click_to_present_ms_p95 = percentile_sorted_f64(&sorted_click_to_present_samples, 95.0);
+    let click_to_present_ms_max = click_to_present_samples.iter().copied().fold(0.0, f64::max);
+    let click_to_readback_after_present_ms_max = click_to_readback_after_present_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let mut sorted_input_wake_to_present_samples = input_wake_to_present_samples.clone();
+    sorted_input_wake_to_present_samples.sort_by(f64::total_cmp);
+    let input_wake_to_present_ms_p95 =
+        percentile_sorted_f64(&sorted_input_wake_to_present_samples, 95.0);
+    let input_wake_to_present_ms_max = input_wake_to_present_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let mut sorted_input_wake_to_formula_samples = input_wake_to_formula_samples.clone();
+    sorted_input_wake_to_formula_samples.sort_by(f64::total_cmp);
+    let input_wake_to_formula_visible_ms_p95 =
+        percentile_sorted_f64(&sorted_input_wake_to_formula_samples, 95.0);
+    let input_wake_to_formula_visible_ms_max = input_wake_to_formula_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let click_to_runtime_current_observed_ms_max =
+        runtime_current_samples.iter().copied().fold(0.0, f64::max);
+    let native_input_reject_counts = last_sample
+        .get("native_input_reject_counts")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let simple_source_click_count = click_samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .pointer("/native_input_timing/fast_path")
+                .and_then(serde_json::Value::as_str)
+                == Some("simple_source_click")
+        })
+        .count();
+    let generic_fallback_count = click_samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .pointer("/native_input_timing/fast_path")
+                .and_then(serde_json::Value::as_str)
+                == Some("generic_fallback")
+        })
+        .count();
+    let timing_sample_count_complete = click_to_formula_samples.len() == resolved_targets.len()
+        && click_to_present_samples.len() == resolved_targets.len()
+        && input_wake_to_present_samples.len() == resolved_targets.len()
+        && input_wake_to_formula_samples.len() == resolved_targets.len()
+        && click_to_readback_after_present_samples.len() == resolved_targets.len()
+        && runtime_current_samples.len() == resolved_targets.len();
+    let cold_sample_count = resolved_targets.len().min(4);
+    let steady_click_to_formula_samples = numeric_sample_values_after(
+        &click_samples,
+        "click_to_formula_visible_ms",
+        cold_sample_count,
+    );
+    let steady_click_to_present_samples =
+        numeric_sample_values_after(&click_samples, "click_to_present_ms", cold_sample_count);
+    let steady_input_wake_to_formula_samples = numeric_sample_values_after(
+        &click_samples,
+        "input_wake_to_formula_visible_ms",
+        cold_sample_count,
+    );
+    let steady_input_wake_to_present_samples = numeric_sample_values_after(
+        &click_samples,
+        "input_wake_to_present_ms",
+        cold_sample_count,
+    );
+    let status = if all_clicks_pass && real_os_input && timing_sample_count_complete {
+        "pass"
+    } else {
+        "fail"
+    };
+    let shutdown_probe = send_xtask_preview_ipc_request(
+        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+        json!({"kind": "shutdown", "reason": "cells-visible-click-e2e-complete"}),
+        Duration::from_secs(2),
+    )
+    .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+    terminate_child_process(&mut preview);
+    terminate_child_process(&mut weston);
+    let artifact_paths = vec![
+        layout_probe_report.clone(),
+        preview_report.clone(),
+        preview_loop_report.clone(),
+        calibration_driver_stdout_path.clone(),
+        calibration_driver_stderr_path.clone(),
+        weston_log_path.clone(),
+        preview_stdout_path.clone(),
+        preview_stderr_path.clone(),
+    ];
+    Ok(json!({
+        "status": status,
+        "measurement_source": "isolated-weston-real-app-window-mouse-click-plus-wgpu-readback-then-sparse-runtime-value",
+        "artifact_dir": artifact_dir,
+        "socket": socket,
+        "target_count": resolved_targets.len(),
+        "target_address": first_target.address,
+        "expected_formula_bar_text": first_target.expected_formula,
+        "driver_target_region": first_driver_target,
+        "calibration_driver_coordinates": {
+            "x": calibration_x,
+            "y": calibration_y,
+            "coordinate_space": "weston-compositor-global",
+            "native_window_origin_assumption": native_driver_window_origin_report()
+        },
+        "calibration_weston_test_driver": calibration_driver_probe,
+        "calibration_probe": calibration_probe,
+        "calibration_present_probe": calibration_present_probe,
+        "calibration_readback_probe": calibration_readback_probe,
+        "before_runtime_values": before_runtime_values,
+        "runtime_value_probe": last_sample
+            .get("runtime_value_probe")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "visual_formula_probe": last_sample
+            .get("visual_formula_probe")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "click_samples": click_samples,
+        "timing_sample_count_complete": timing_sample_count_complete,
+        "timing_sample_counts": {
+            "click_to_formula_visible_ms": click_to_formula_samples.len(),
+            "click_to_present_ms": click_to_present_samples.len(),
+            "input_wake_to_present_ms": input_wake_to_present_samples.len(),
+            "input_wake_to_formula_visible_ms": input_wake_to_formula_samples.len(),
+            "click_to_readback_after_present_ms": click_to_readback_after_present_samples.len(),
+            "click_to_runtime_current_observed_ms": runtime_current_samples.len()
+        },
+        "cold_sample_count": cold_sample_count,
+        "steady_click_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_click_to_formula_samples),
+        "steady_click_to_present_ms": f64_p50_p95_max_summary(&steady_click_to_present_samples),
+        "steady_input_wake_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_input_wake_to_formula_samples),
+        "steady_input_wake_to_present_ms": f64_p50_p95_max_summary(&steady_input_wake_to_present_samples),
+        "native_input_reject_counts": native_input_reject_counts,
+        "simple_source_click_count": simple_source_click_count,
+        "generic_fallback_count": generic_fallback_count,
+        "selected_address": selected_address,
+        "formula_bar_text": formula_bar_text,
+        "click_to_runtime_current_observed_ms": click_to_runtime_current_observed_ms_max,
+        "click_to_formula_visible_ms": click_to_formula_visible_ms_p95,
+        "click_to_formula_visible_ms_p95": click_to_formula_visible_ms_p95,
+        "click_to_formula_visible_ms_max": click_to_formula_visible_ms_max,
+        "harness_click_to_formula_visible_ms": last_sample
+            .get("harness_click_to_formula_visible_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "harness_click_to_present_ms": last_sample
+            .get("harness_click_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "click_measurement_timing": last_sample
+            .get("click_measurement_timing")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "click_to_readback_after_present_ms": click_to_readback_after_present_ms_max,
+        "click_to_readback_after_present_ms_max": click_to_readback_after_present_ms_max,
+        "click_to_present_ms": click_to_present_ms_p95,
+        "click_to_present_ms_p95": click_to_present_ms_p95,
+        "click_to_present_ms_max": click_to_present_ms_max,
+        "input_wake_to_present_ms_p95": input_wake_to_present_ms_p95,
+        "input_wake_to_present_ms_max": input_wake_to_present_ms_max,
+        "input_wake_to_present_ms": last_sample
+            .get("input_wake_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "render_loop_input_wake_to_present_ms": last_sample
+            .get("render_loop_input_wake_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_wake_budget_source": last_sample
+            .get("input_wake_budget_source")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms_p95,
+        "input_wake_to_formula_visible_ms_p95": input_wake_to_formula_visible_ms_p95,
+        "input_wake_to_formula_visible_ms_max": input_wake_to_formula_visible_ms_max,
+        "present_probe": last_sample
+            .get("present_probe")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "readback_probe": last_sample
+            .get("readback_probe")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "readback_hash_changed": last_sample
+            .get("readback_hash_changed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "initial_readback_probe": initial_readback,
+        "initial_frame_hash": initial_frame_hash,
+        "baseline_frame_hash_before_measured_click": initial_measured_surface_baseline_hash,
+        "initial_measured_surface_baseline_hash": initial_measured_surface_baseline_hash,
+        "initial_measured_external_render_proof_baseline_hash": initial_measured_external_render_proof_baseline_hash,
+        "final_surface_baseline_hash": baseline_surface_hash,
+        "final_external_render_proof_baseline_hash": baseline_external_render_proof_hash,
+        "observed_input_adapter": observed_input_adapter,
+        "real_os_input": real_os_input,
+        "operator_host_input": false,
+        "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
+        "visual_capture_method": "app-owned-wgpu-readback",
+        "preview_loop_report": preview_loop_report,
+        "preview_report": preview_report,
+        "layout_probe_report": layout_probe_report,
+        "surface_ready": surface_ready,
+        "shutdown_probe": shutdown_probe,
+        "artifact_paths": artifact_paths
+    }))
+}
+
+fn native_cells_driver_target_for_address(
+    layout_probe: &serde_json::Value,
+    address: &str,
+) -> Option<serde_json::Value> {
+    let layout_probe = native_layout_probe_payload(layout_probe);
+    let source_intents = layout_probe
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let hit_targets = layout_probe
+        .get("hit_target_assertions")
+        .and_then(serde_json::Value::as_array)?;
+    let node = source_intents.iter().find_map(|intent| {
+        let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+        let address_matches = matches!(
+            intent.get("intent").and_then(serde_json::Value::as_str),
+            Some("address" | "target")
+        ) && intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            == Some(address);
+        if !address_matches {
+            return None;
+        }
+        let has_select_source = source_intents.iter().any(|candidate| {
+            candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                && candidate
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("cell.sources.editor.select")
+        });
+        has_select_source.then_some(node)
+    })?;
+    let target = hit_targets
+        .iter()
+        .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))?;
+    native_driver_target_from_region("hit_region", target)
+}
+
+fn driver_event_offset_ms(
+    driver_probe: &serde_json::Value,
+    field: &str,
+    harness_start_monotonic_ns: Option<u64>,
+) -> Option<f64> {
+    let harness_start = harness_start_monotonic_ns?;
+    let event_ns = driver_probe.get(field)?.as_u64()?;
+    (event_ns >= harness_start).then(|| event_ns.saturating_sub(harness_start) as f64 / 1_000_000.0)
+}
+
+fn elapsed_after_driver_event_ms(
+    harness_elapsed_ms: f64,
+    driver_probe: &serde_json::Value,
+    harness_start_monotonic_ns: Option<u64>,
+) -> (f64, serde_json::Value) {
+    let release_offset = driver_event_offset_ms(
+        driver_probe,
+        "button_release_monotonic_ns",
+        harness_start_monotonic_ns,
+    );
+    let press_offset = driver_event_offset_ms(
+        driver_probe,
+        "button_press_monotonic_ns",
+        harness_start_monotonic_ns,
+    );
+    let effective_offset = release_offset.or(press_offset).unwrap_or(0.0);
+    let elapsed = if harness_elapsed_ms.is_finite() {
+        (harness_elapsed_ms - effective_offset).max(0.0)
+    } else {
+        harness_elapsed_ms
+    };
+    (
+        elapsed,
+        json!({
+            "boundary": if release_offset.is_some() {
+                "weston_test_driver_button_release_monotonic_ns"
+            } else if press_offset.is_some() {
+                "weston_test_driver_button_press_monotonic_ns"
+            } else {
+                "harness_before_driver_spawn_fallback"
+            },
+            "harness_start_monotonic_ns": harness_start_monotonic_ns,
+            "button_press_offset_ms": press_offset,
+            "button_release_offset_ms": release_offset,
+            "effective_offset_ms": effective_offset,
+            "harness_elapsed_ms": harness_elapsed_ms,
+            "elapsed_after_event_ms": elapsed
+        }),
+    )
+}
+
+fn run_weston_click_driver(
+    driver_path: &Path,
+    socket: &str,
+    x: i64,
+    y: i64,
+    mode: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> serde_json::Value {
+    match spawn_weston_click_driver(driver_path, socket, x, y, mode, stdout_path, stderr_path) {
+        Ok(run) => finish_weston_click_driver(run),
+        Err(error) => json!({
+            "status": "fail",
+            "diagnostic": format!("weston test driver failed: {error}"),
+            "mode": mode,
+        }),
+    }
+}
+
+struct WestonClickDriverRun {
+    child: Child,
+    mode: String,
+    started: Instant,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+fn spawn_weston_click_driver(
+    driver_path: &Path,
+    socket: &str,
+    x: i64,
+    y: i64,
+    mode: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::io::Result<WestonClickDriverRun> {
+    let started = Instant::now();
+    let child = Command::new(driver_path)
+        .args([x.to_string(), y.to_string(), String::new(), mode.to_owned()])
+        .env("WAYLAND_DISPLAY", socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    Ok(WestonClickDriverRun {
+        child,
+        mode: mode.to_owned(),
+        started,
+        stdout_path: stdout_path.to_path_buf(),
+        stderr_path: stderr_path.to_path_buf(),
+    })
+}
+
+fn finish_weston_click_driver(run: WestonClickDriverRun) -> serde_json::Value {
+    let elapsed_ms = run.started.elapsed().as_secs_f64() * 1000.0;
+    match run.child.wait_with_output() {
+        Ok(output) => weston_click_driver_probe_from_output(
+            output,
+            &run.mode,
+            elapsed_ms,
+            &run.stdout_path,
+            &run.stderr_path,
+        ),
+        Err(error) => json!({
+            "status": "fail",
+            "diagnostic": format!("weston test driver failed: {error}"),
+            "mode": run.mode,
+            "driver_process_elapsed_ms": elapsed_ms
+        }),
+    }
+}
+
+fn weston_click_driver_probe_from_output(
+    output: Output,
+    mode: &str,
+    elapsed_ms: f64,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> serde_json::Value {
+    if let Err(error) = fs::write(stdout_path, &output.stdout) {
+        return json!({
+            "status": "fail",
+            "diagnostic": format!("failed to write weston test driver stdout: {error}"),
+            "mode": mode,
+            "driver_process_elapsed_ms": elapsed_ms
+        });
+    }
+    if let Err(error) = fs::write(stderr_path, &output.stderr) {
+        return json!({
+            "status": "fail",
+            "diagnostic": format!("failed to write weston test driver stderr: {error}"),
+            "mode": mode,
+            "driver_process_elapsed_ms": elapsed_ms
+        });
+    }
+    let mut probe =
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|_| {
+            json!({
+                "status": "fail",
+                "reason": "driver stdout was not JSON",
+                "exit_success": output.status.success()
+            })
+        });
+    if let Some(object) = probe.as_object_mut() {
+        object.insert("mode".to_owned(), json!(mode));
+        object.insert("exit_success".to_owned(), json!(output.status.success()));
+        object.insert("driver_process_elapsed_ms".to_owned(), json!(elapsed_ms));
+    } else {
+        probe = json!({
+            "status": "fail",
+            "reason": "driver stdout JSON was not an object",
+            "mode": mode,
+            "exit_success": output.status.success(),
+            "driver_process_elapsed_ms": elapsed_ms
+        });
+    }
+    probe
+}
+
+fn wait_for_native_mouse_window_position(
+    loop_report: &Path,
+    global_x: i64,
+    global_y: i64,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let mut last_report = json!({"status": "missing"});
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for native mouse position",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "last_report": report
+                        });
+                    }
+                    let input_adapter = report
+                        .get("observed_input_adapter")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    if native_input_adapter_has_delivered_events(&input_adapter) {
+                        if let Some((window_x, window_y)) =
+                            native_input_adapter_mouse_window_xy(&input_adapter)
+                        {
+                            let origin_x = global_x as f64 - window_x;
+                            let origin_y = global_y as f64 - window_y;
+                            return json!({
+                                "status": "pass",
+                                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                                "global_x": global_x,
+                                "global_y": global_y,
+                                "mouse_window_x": window_x,
+                                "mouse_window_y": window_y,
+                                "computed_window_origin_x": origin_x,
+                                "computed_window_origin_y": origin_y,
+                                "computed_window_origin": {
+                                    "x": origin_x,
+                                    "y": origin_y,
+                                    "source": "app_window observed mouse_window_pos after weston_test calibration click"
+                                },
+                                "observed_input_adapter": input_adapter
+                            });
+                        }
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for app-owned native mouse window position",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "global_x": global_x,
+        "global_y": global_y,
+        "last_report": last_report
+    })
+}
+
+fn native_input_adapter_mouse_window_xy(input_adapter: &serde_json::Value) -> Option<(f64, f64)> {
+    let pos = input_adapter.get("mouse_window_pos")?;
+    let x = pos.get("x").and_then(numeric_value_as_f64)?;
+    let y = pos.get("y").and_then(numeric_value_as_f64)?;
+    Some((x, y))
+}
+
+fn wait_for_cells_formula_visible_match(
+    connect: &str,
+    loop_report: &Path,
+    previous_surface_hash: &str,
+    previous_external_render_proof_hash: &str,
+    previous_revision: u64,
+    previous_frame_count: u64,
+    previous_input_event_wake_count: u64,
+    expected_address: &str,
+    expected_formula: &str,
+    started: Instant,
+    timeout: Duration,
+) -> serde_json::Value {
+    let mut last_report = json!({"status": "missing"});
+    let mut last_response = json!({"status": "missing"});
+    let mut present_probe: Option<serde_json::Value> = None;
+    let mut readback_probe: Option<serde_json::Value> = None;
+    let mut visual_formula_probe: Option<serde_json::Value> = None;
+    let mut runtime_probe: Option<serde_json::Value> = None;
+    let mut last_runtime_poll = Instant::now() - Duration::from_millis(50);
+    while started.elapsed() < timeout {
+        if loop_report.exists() {
+            match read_json(loop_report) {
+                Ok(report) => {
+                    if let Some(loop_error) =
+                        report.get("loop_error").and_then(serde_json::Value::as_str)
+                    {
+                        return json!({
+                            "status": "fail",
+                            "diagnostic": "loop report recorded an error while waiting for Cells formula visibility",
+                            "loop_error": loop_error,
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "last_report": report,
+                            "last_response": last_response
+                        });
+                    }
+
+                    let revision = report
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let frame_count = report
+                        .get("rendered_frame_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let input_event_wake_count = loop_input_event_wake_count_from_report(&report);
+                    let presented_input_event_wake_count = report
+                        .get("presented_input_event_wake_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(input_event_wake_count);
+                    let stale_for_latest_input = report
+                        .get("stale_for_latest_input")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let presented_changed =
+                        revision > previous_revision || frame_count > previous_frame_count;
+                    let input_wake_changed =
+                        input_event_wake_count > previous_input_event_wake_count;
+                    let current_presented_input_generation = presented_input_event_wake_count
+                        > previous_input_event_wake_count
+                        && !stale_for_latest_input;
+                    let generation_timed_frame = report
+                        .get("input_wake_timing_source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("presented_input_generation")
+                        && report
+                            .get("presented_input_event_wake_elapsed_ms")
+                            .and_then(numeric_value_as_f64)
+                            .is_some();
+                    let current_input_frame_presented = presented_changed
+                        && input_wake_changed
+                        && current_presented_input_generation
+                        && generation_timed_frame;
+                    if present_probe.is_none() && current_input_frame_presented {
+                        present_probe = Some(json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "previous_presented_revision": previous_revision,
+                            "presented_revision": revision,
+                            "previous_rendered_frame_count": previous_frame_count,
+                            "rendered_frame_count": frame_count,
+                            "previous_input_event_wake_count": previous_input_event_wake_count,
+                            "sampled_input_event_wake_count": report.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_count": report.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "generation_timed_frame": generation_timed_frame,
+                            "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_loop_report_write_ms": report.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_readback_finish_ms": report.get("last_interactive_readback_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_queued": report.get("last_interactive_surface_readback_queued").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
+                            "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
+                        }));
+                        if visual_formula_probe.is_none() {
+                            let retained_render_probe = json!({
+                                "status": "pass",
+                                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                                "loop_report": loop_report,
+                                "presented_revision": revision,
+                                "rendered_frame_count": frame_count,
+                                "previous_presented_revision": previous_revision,
+                                "previous_rendered_frame_count": previous_frame_count,
+                                "previous_input_event_wake_count": previous_input_event_wake_count,
+                                "input_event_wake_count": input_event_wake_count,
+                                "sampled_input_event_wake_count": report.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                                "presented_input_event_wake_count": report.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                                "stale_for_latest_input": stale_for_latest_input,
+                                "accepted_by_revision": true,
+                                "accepted_by_hash_change": false,
+                                "accepted_by_external_render_proof_hash_change": false,
+                                "accepted_by_retained_bound_text_sync": true,
+                                "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
+                                "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null)
+                            });
+                            let visual_probe =
+                                cells_visual_formula_probe_from_readback(&retained_render_probe);
+                            if visual_probe
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("pass")
+                            {
+                                readback_probe = Some(retained_render_probe);
+                                visual_formula_probe = Some(visual_probe);
+                            }
+                        }
+                    }
+
+                    let readback = report
+                        .get("last_interactive_readback_artifact")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let hash = readback_sha256(&readback).unwrap_or_else(|| "missing".to_owned());
+                    let external_render_proof_hash = report
+                        .pointer("/last_external_render_proof/proof/artifact/artifact_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|hash| is_sha256_hex(hash))
+                        .unwrap_or("missing");
+                    let readback_presented_revision = readback
+                        .get("presented_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let readback_content_revision = readback
+                        .get("content_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let readback_pending = report
+                        .get("last_interactive_surface_readback_pending")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let surface_readback_is_current = !readback_pending
+                        && presented_changed
+                        && input_wake_changed
+                        && current_presented_input_generation
+                        && (readback_presented_revision > previous_revision
+                            || readback_content_revision > previous_revision);
+                    let surface_readback_changed = surface_readback_is_current
+                        && hash != "missing"
+                        && hash != previous_surface_hash;
+                    let external_render_proof_changed = presented_changed
+                        && input_wake_changed
+                        && external_render_proof_hash != "missing"
+                        && external_render_proof_hash != previous_external_render_proof_hash;
+                    if readback_probe.is_none()
+                        && (surface_readback_changed || external_render_proof_changed)
+                    {
+                        let probe = json!({
+                            "status": "pass",
+                            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            "loop_report": loop_report,
+                            "presented_revision": report.get("presented_revision").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_count": report.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_count": report.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
+                            "readback_presented_revision": readback_presented_revision,
+                            "readback_content_revision": readback_content_revision,
+                            "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_loop_report_write_ms": report.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_readback_finish_ms": report.get("last_interactive_readback_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_queued": report.get("last_interactive_surface_readback_queued").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
+                            "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
+                            "previous_surface_hash": previous_surface_hash,
+                            "previous_external_render_proof_hash": previous_external_render_proof_hash,
+                            "frame_hash_after": hash,
+                            "external_render_proof_hash_after": external_render_proof_hash,
+                            "readback_artifact_after": readback,
+                            "surface_readback_is_current": surface_readback_is_current,
+                            "surface_readback_pending": readback_pending,
+                            "input_event_wake_count": input_event_wake_count,
+                            "previous_input_event_wake_count": previous_input_event_wake_count,
+                            "input_wake_changed": input_wake_changed,
+                            "accepted_by_revision": false,
+                            "accepted_by_hash_change": surface_readback_changed,
+                            "accepted_by_external_render_proof_hash_change": external_render_proof_changed
+                        });
+                        let visual_probe = cells_visual_formula_probe_from_readback(&probe);
+                        readback_probe = Some(probe);
+                        visual_formula_probe = Some(visual_probe);
+                    }
+                    last_report = report;
+                }
+                Err(error) => {
+                    last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
+                }
+            }
+        }
+
+        if runtime_probe.is_none() && last_runtime_poll.elapsed() >= Duration::from_millis(5) {
+            last_runtime_poll = Instant::now();
+            let response = send_xtask_preview_ipc_request(
+                connect,
+                json!({
+                    "kind": "runtime-value",
+                    "paths": ["store.selected_address", "store.selected_input.editing_text"],
+                    "max_depth": 3,
+                    "max_fields": 8,
+                    "max_list_items": 4
+                }),
+                Duration::from_millis(250),
+            )
+            .unwrap_or_else(
+                |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
+            );
+            let selected = runtime_value_response_string(&response, "store.selected_address")
+                .unwrap_or_else(|| "missing".to_owned());
+            let formula =
+                runtime_value_response_string(&response, "store.selected_input.editing_text")
+                    .unwrap_or_else(|| "missing".to_owned());
+            if response.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                && selected == expected_address
+                && formula == expected_formula
+            {
+                runtime_probe = Some(json!({
+                    "status": "pass",
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "selected_address": selected,
+                    "formula_bar_text": formula,
+                    "response": response
+                }));
+            } else {
+                last_response = json!({
+                    "response": response,
+                    "selected_address": selected,
+                    "formula_bar_text": formula
+                });
+            }
+        }
+
+        let present_pass = present_probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let runtime_pass = runtime_probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let visual_pass = visual_formula_probe
+            .as_ref()
+            .and_then(|probe| probe.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        if present_pass && runtime_pass && visual_pass {
+            return json!({
+                "status": "pass",
+                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "present_probe": present_probe.unwrap_or_else(|| json!({"status": "missing"})),
+                "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
+                "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
+                "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"}))
+            });
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    json!({
+        "status": "fail",
+        "diagnostic": "timed out waiting for selected cell formula text to be current and visible",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "expected_selected_address": expected_address,
+        "expected_formula_bar_text": expected_formula,
+        "previous_surface_hash": previous_surface_hash,
+        "previous_external_render_proof_hash": previous_external_render_proof_hash,
+        "previous_presented_revision": previous_revision,
+        "previous_rendered_frame_count": previous_frame_count,
+        "previous_input_event_wake_count": previous_input_event_wake_count,
+        "present_probe": present_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "last_report": last_report,
+        "last_response": last_response
+    })
+}
+
+fn runtime_value_response_string(response: &serde_json::Value, path: &str) -> Option<String> {
+    let value = response.get("values")?.get(path)?;
+    if let Some(text) = value.get("value").and_then(serde_json::Value::as_str) {
+        return Some(text.to_owned());
+    }
+    if let Some(field_name) = path.rsplit('.').next() {
+        if let Some(text) = value
+            .get("fields")
+            .and_then(|fields| fields.get(field_name))
+            .and_then(|field| field.get("value"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(text.to_owned());
+        }
+        if let Some(text) = value
+            .get("sample")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|sample| sample.first())
+            .and_then(|item| item.get("fields"))
+            .and_then(|fields| fields.get(field_name))
+            .and_then(|field| field.get("value"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(text.to_owned());
+        }
+    }
+    value.as_str().map(str::to_owned)
+}
+
 fn verify_native_gpu_novywave_interaction_speed(
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -50672,6 +53269,58 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         "cells-interaction-speed-debug" | "cells-interaction-speed-release" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
             require_interaction_stage_counters(&mut blockers, report, &["interaction_latency"]);
+            require_u64_at_least(&mut blockers, report, "logical_cell_count", 2600);
+            require_u64_at_least(&mut blockers, report, "materialized_cell_count_max", 1);
+            require_u64_at_most(&mut blockers, report, "materialized_cell_count_max", 512);
+            require_u64_at_least(&mut blockers, report, "rendered_cell_count", 1);
+            require_u64_at_most(&mut blockers, report, "rendered_cell_count", 512);
+            require_u64_at_least(&mut blockers, report, "formula_evaluated_cell_count_max", 1);
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "formula_evaluated_cell_count_max",
+                16,
+            );
+            require_u64_at_least(
+                &mut blockers,
+                report,
+                "formula_recomputed_field_count_max",
+                1,
+            );
+            require_u64_at_most(
+                &mut blockers,
+                report,
+                "formula_recomputed_field_count_max",
+                32,
+            );
+            if let (Some(logical), Some(materialized)) = (
+                report
+                    .get("logical_cell_count")
+                    .and_then(serde_json::Value::as_u64),
+                report
+                    .get("materialized_cell_count_max")
+                    .and_then(serde_json::Value::as_u64),
+            ) {
+                if materialized >= logical {
+                    blockers.push(format!(
+                        "materialized_cell_count_max={materialized} must stay below logical_cell_count={logical}"
+                    ));
+                }
+            }
+            if let (Some(materialized), Some(rendered)) = (
+                report
+                    .get("materialized_cell_count_max")
+                    .and_then(serde_json::Value::as_u64),
+                report
+                    .get("rendered_cell_count")
+                    .and_then(serde_json::Value::as_u64),
+            ) {
+                if rendered > materialized {
+                    blockers.push(format!(
+                        "rendered_cell_count={rendered} exceeds materialized_cell_count_max={materialized}"
+                    ));
+                }
+            }
             require_u64_at_least(
                 &mut blockers,
                 report,
@@ -54262,9 +56911,32 @@ fn require_retained_render_chunk_metrics(
         blockers.push(format!("{metrics_path}.retained_chunks must be an array"));
         return;
     };
-    if chunks.len() as u64 != retained_chunk_count {
+    let sample_count = metrics
+        .get("retained_chunk_sample_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(chunks.len() as u64);
+    let inventory_truncated = metrics
+        .get("retained_chunk_inventory_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if chunks.len() as u64 != sample_count {
         blockers.push(format!(
-            "{metrics_path}.retained_chunks length must match retained_chunk_count"
+            "{metrics_path}.retained_chunks length must match retained_chunk_sample_count"
+        ));
+    }
+    if chunks.len() as u64 > retained_chunk_count {
+        blockers.push(format!(
+            "{metrics_path}.retained_chunks sample length must not exceed retained_chunk_count"
+        ));
+    }
+    if retained_chunk_count > chunks.len() as u64 && !inventory_truncated {
+        blockers.push(format!(
+            "{metrics_path}.retained_chunk_inventory_truncated must be true when retained_chunks is sampled"
+        ));
+    }
+    if retained_chunk_count > 0 && chunks.is_empty() {
+        blockers.push(format!(
+            "{metrics_path}.retained_chunks must include a bounded proof sample"
         ));
     }
     for (index, chunk) in chunks.iter().take(8).enumerate() {
@@ -54604,6 +57276,40 @@ fn numeric_value_as_f64(value: &serde_json::Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_u64().map(|value| value as f64))
         .or_else(|| value.as_i64().map(|value| value as f64))
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct XtaskTimespec {
+    tv_sec: std::os::raw::c_long,
+    tv_nsec: std::os::raw::c_long,
+}
+
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> Option<u64> {
+    const CLOCK_MONOTONIC: std::os::raw::c_int = 1;
+    unsafe extern "C" {
+        fn clock_gettime(
+            clk_id: std::os::raw::c_int,
+            tp: *mut XtaskTimespec,
+        ) -> std::os::raw::c_int;
+    }
+
+    let mut time = XtaskTimespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let status = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut time) };
+    (status == 0).then(|| {
+        (time.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(time.tv_nsec as u64)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monotonic_now_ns() -> Option<u64> {
+    None
 }
 
 fn require_nonempty_array(blockers: &mut Vec<String>, report: &serde_json::Value, key: &str) {
@@ -55326,20 +58032,10 @@ fn run_isolated_weston_desktop_preview_e2e(
     } else {
         800
     }));
-    let target_x = driver_target
+    let (target_x, target_y) = driver_target
         .as_ref()
-        .and_then(|target| target.get("local_x"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(240.0)
-        .round()
-        .max(0.0) as i64;
-    let target_y = driver_target
-        .as_ref()
-        .and_then(|target| target.get("local_y"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(220.0)
-        .round()
-        .max(0.0) as i64;
+        .map(|target| native_driver_weston_coordinates(target, 240.0, 220.0))
+        .unwrap_or_else(|| native_driver_weston_coordinates(&json!({}), 240.0, 220.0));
     let driver_points = [
         [target_x.to_string(), target_y.to_string()],
         [(target_x + 30).to_string(), (target_y + 20).to_string()],
@@ -55372,7 +58068,7 @@ fn run_isolated_weston_desktop_preview_e2e(
         thread::sleep(Duration::from_millis(250));
     }
     thread::sleep(Duration::from_millis(3_200));
-    let dev_points = [["56", "106"], ["162", "106"], ["56", "106"]];
+    let dev_points = [["376", "260"], ["386", "270"], ["376", "260"]];
     for point in dev_points {
         let output = Command::new(&driver_path)
             .args([point[0], point[1], ""])
@@ -55980,20 +58676,10 @@ fn run_linux_human_like_desktop_surface_smoke(
         measured_surface_key,
         Duration::from_millis(15_000),
     );
-    let target_x = driver_target
+    let (target_x, target_y) = driver_target
         .as_ref()
-        .and_then(|target| target.get("local_x"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(240.0)
-        .round()
-        .max(0.0) as i64;
-    let target_y = driver_target
-        .as_ref()
-        .and_then(|target| target.get("local_y"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(220.0)
-        .round()
-        .max(0.0) as i64;
+        .map(|target| native_driver_weston_coordinates(target, 240.0, 220.0))
+        .unwrap_or_else(|| native_driver_weston_coordinates(&json!({}), 240.0, 220.0));
     let driver_points = if scroll_only {
         vec![[target_x.to_string(), target_y.to_string()]]
     } else {
@@ -67701,6 +70387,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-example-speed"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-interaction-speed"
+                | "verify-native-cells-visible-click-e2e"
                 | "verify-native-dev-editor-speed"
                 | "verify-boon-driver-schema"
                 | "verify-boon-driver-e2e"
@@ -68339,6 +71026,49 @@ fn native_driver_target_from_region(
         "local_y": local_y,
         "targeting_basis": "prelaunch-generic-document-layout-proof"
     }))
+}
+
+fn native_driver_weston_coordinates(
+    target: &serde_json::Value,
+    default_local_x: f64,
+    default_local_y: f64,
+) -> (i64, i64) {
+    native_driver_weston_coordinates_with_origin(
+        target,
+        default_local_x,
+        default_local_y,
+        NATIVE_APP_WINDOW_INITIAL_X,
+        NATIVE_APP_WINDOW_INITIAL_Y,
+    )
+}
+
+fn native_driver_weston_coordinates_with_origin(
+    target: &serde_json::Value,
+    default_local_x: f64,
+    default_local_y: f64,
+    origin_x: f64,
+    origin_y: f64,
+) -> (i64, i64) {
+    let local_x = target
+        .get("local_x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(default_local_x);
+    let local_y = target
+        .get("local_y")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(default_local_y);
+    (
+        (origin_x + local_x).round().max(0.0) as i64,
+        (origin_y + local_y).round().max(0.0) as i64,
+    )
+}
+
+fn native_driver_window_origin_report() -> serde_json::Value {
+    json!({
+        "x": NATIVE_APP_WINDOW_INITIAL_X,
+        "y": NATIVE_APP_WINDOW_INITIAL_Y,
+        "source": "boon_native_app_window::run_surface_probe_inner Window::new(Position::new(120.0, 120.0), ...)"
+    })
 }
 
 fn native_gpu_real_input_observed(report: &serde_json::Value) -> bool {

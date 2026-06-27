@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <inttypes.h>
 #include <linux/input-event-codes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,6 +71,13 @@ static void stamp(uint32_t *hi, uint32_t *lo, uint32_t *nsec)
     *nsec = (uint32_t)ts.tv_nsec;
 }
 
+static uint64_t monotonic_nsec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
 static int key_code_for_char(char ch)
 {
     switch (ch) {
@@ -125,6 +133,7 @@ static void send_key_press(struct weston_test *test, int key)
 
 int main(int argc, char **argv)
 {
+    uint64_t process_start_monotonic_ns = monotonic_nsec();
     int x = argc > 1 ? atoi(argv[1]) : 240;
     int y = argc > 2 ? atoi(argv[2]) : 220;
     const char *text = argc > 3 ? argv[3] : NULL;
@@ -134,6 +143,9 @@ int main(int argc, char **argv)
     int vertical_scroll_only = strcmp(mode, "vertical-scroll-only") == 0;
     int horizontal_scroll_only = strcmp(mode, "horizontal-scroll-only") == 0;
     int async_input = strcmp(mode, "async-input") == 0;
+    int click_only = strcmp(mode, "click-only") == 0;
+    int move_only = strcmp(mode, "move-only") == 0;
+    int button_only = strcmp(mode, "button-only") == 0;
     int any_scroll_only = scroll_only || vertical_scroll_only || horizontal_scroll_only;
     struct state state = {0};
     struct wl_display *display = wl_display_connect(NULL);
@@ -152,24 +164,34 @@ int main(int argc, char **argv)
 
     uint32_t hi, lo, ns;
     wl_display_roundtrip(display);
-    stamp(&hi, &lo, &ns);
-    weston_test_move_pointer(state.test, hi, lo, ns, x, y);
-    wl_display_roundtrip(display);
-
-    if (!any_scroll_only) {
+    uint64_t pointer_move_monotonic_ns = 0;
+    if (!button_only) {
         stamp(&hi, &lo, &ns);
-        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-        if (!async_input)
-            wl_display_roundtrip(display);
-        stamp(&hi, &lo, &ns);
-        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-        if (async_input)
-            wl_display_flush(display);
-        else
-            wl_display_roundtrip(display);
+        pointer_move_monotonic_ns = monotonic_nsec();
+        weston_test_move_pointer(state.test, hi, lo, ns, x, y);
+        wl_display_roundtrip(display);
     }
 
-    if (!async_input) {
+    uint64_t button_press_monotonic_ns = 0;
+    uint64_t button_release_monotonic_ns = 0;
+    if (!any_scroll_only && !move_only) {
+        stamp(&hi, &lo, &ns);
+        button_press_monotonic_ns = monotonic_nsec();
+        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+        if (!async_input && !button_only)
+            wl_display_roundtrip(display);
+        stamp(&hi, &lo, &ns);
+        button_release_monotonic_ns = monotonic_nsec();
+        weston_test_send_button(state.test, hi, lo, ns, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+        if (async_input || button_only) {
+            wl_display_flush(display);
+            wl_display_roundtrip(display);
+        } else {
+            wl_display_roundtrip(display);
+        }
+    }
+
+    if (!async_input && !click_only && !move_only && !button_only) {
         stamp(&hi, &lo, &ns);
         if (!horizontal_scroll_only) {
             weston_test_send_axis(
@@ -193,7 +215,7 @@ int main(int argc, char **argv)
         wl_display_roundtrip(display);
     }
 
-    if (text && !any_scroll_only) {
+    if (text && !any_scroll_only && !move_only && !button_only) {
         for (const char *cursor = text; *cursor; cursor++) {
             int key = key_code_for_char(*cursor);
             if (key)
@@ -201,7 +223,7 @@ int main(int argc, char **argv)
         }
         if (send_enter)
             send_key_press(state.test, KEY_ENTER);
-    } else if (!any_scroll_only) {
+    } else if (!any_scroll_only && !click_only && !move_only && !button_only) {
         send_key_press(state.test, KEY_A);
     }
     if (async_input)
@@ -213,7 +235,11 @@ int main(int argc, char **argv)
         stdout,
         "{\"status\":\"pass\",\"x\":%d,\"y\":%d,\"pointer_events\":%u,"
         "\"last_pointer_x\":%d,\"last_pointer_y\":%d,\"typed_text\":\"%s\","
-        "\"sent_enter\":%s,\"scroll_only\":%s,\"scroll_mode\":\"%s\",\"async_input\":%s}\n",
+        "\"sent_enter\":%s,\"scroll_only\":%s,\"scroll_mode\":\"%s\",\"async_input\":%s,"
+        "\"process_start_monotonic_ns\":%" PRIu64 ","
+        "\"pointer_move_monotonic_ns\":%" PRIu64 ","
+        "\"button_press_monotonic_ns\":%" PRIu64 ","
+        "\"button_release_monotonic_ns\":%" PRIu64 "}\n",
         x,
         y,
         state.pointer_events,
@@ -223,7 +249,11 @@ int main(int argc, char **argv)
         send_enter ? "true" : "false",
         any_scroll_only ? "true" : "false",
         mode,
-        async_input ? "true" : "false");
+        async_input ? "true" : "false",
+        process_start_monotonic_ns,
+        pointer_move_monotonic_ns,
+        button_press_monotonic_ns,
+        button_release_monotonic_ns);
 
     weston_test_destroy(state.test);
     wl_registry_destroy(registry);

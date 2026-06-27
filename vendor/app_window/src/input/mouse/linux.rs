@@ -65,10 +65,11 @@ Call this to handle [wayland_client::protocol::wl_pointer::Event::Motion].
 
 Call this from your wayland dispatch queue.
 */
-pub fn motion_event(_time: u32, surface_x: f64, surface_y: f64) {
+pub fn motion_event(_time: u32, surface_x: f64, surface_y: f64, window: ObjectId) {
     let mut lock = MOUSE_STATE.get_or_init(Mutex::default).lock().unwrap();
     lock.recent_x_pos = Some(surface_x);
     lock.recent_y_pos = Some(surface_y);
+    lock.recent_window = Some(window);
     lock.send_events_if_needed();
 }
 

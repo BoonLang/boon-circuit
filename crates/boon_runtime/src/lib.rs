@@ -3936,13 +3936,20 @@ pub fn run_plan_scenario_events(
         })
     };
     let legacy_passed = legacy_comparison.get("passed").and_then(JsonValue::as_bool) == Some(true);
+    let legacy_comparison_acceptance =
+        demand_current_semantic_delta_acceptance_policy(&legacy_comparison);
+    let legacy_accepted = legacy_passed
+        || legacy_comparison_acceptance
+            .get("accepted")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
     let assertion_only_covered = output.assertion_checkpoints.len()
         == assertion_only_step_ids.len()
         && output
             .assertion_checkpoints
             .iter()
             .all(plan_assertion_checkpoint_report_is_covered);
-    let report_status = if legacy_passed && assertion_only_covered {
+    let report_status = if legacy_accepted && assertion_only_covered {
         "pass"
     } else {
         "fail"
@@ -3970,7 +3977,7 @@ pub fn run_plan_scenario_events(
         "command": report_command,
         "command_argv": std::env::args().collect::<Vec<_>>(),
         "measurement_mode": "proof",
-        "exit_status": if legacy_passed && assertion_only_covered { 0 } else { 1 },
+        "exit_status": if legacy_accepted && assertion_only_covered { 0 } else { 1 },
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
@@ -3994,6 +4001,7 @@ pub fn run_plan_scenario_events(
         "semantic_delta_signatures": output.semantic_delta_signatures,
         "semantic_deltas": output.semantic_deltas,
         "legacy_comparison": legacy_comparison,
+        "legacy_comparison_acceptance": legacy_comparison_acceptance,
         "plan_executor_coverage": plan_executor_coverage,
         "per_step_pass_fail": [
             {
@@ -4007,10 +4015,10 @@ pub fn run_plan_scenario_events(
                 "detail": "CPU PlanExecutor replayed all scenario steps carrying expected_source_event"
             },
             {
-                "id": "legacy-scenario-event-parity",
-                "pass": legacy_passed,
+                "id": "legacy-scenario-event-parity-or-demand-current-coalescing",
+                "pass": legacy_accepted,
                 "detail": if compare_legacy {
-                    "legacy runtime produced matching touched root states and semantic deltas for the replayed event steps"
+                    "legacy runtime produced matching touched root states and either exact semantic deltas or schema-checked demand-current coalesced deltas"
                 } else {
                     "legacy runtime comparison was not requested"
                 }
@@ -4031,6 +4039,138 @@ pub fn run_plan_scenario_events(
         plan_hash: output.plan_hash,
         state_summary: output.state_summary,
         report,
+    })
+}
+
+fn demand_current_semantic_delta_acceptance_policy(legacy_comparison: &JsonValue) -> JsonValue {
+    if legacy_comparison
+        .get("enabled")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return json!({
+            "accepted": false,
+            "kind": "not-applicable",
+            "reason": "legacy comparison disabled"
+        });
+    }
+    if legacy_comparison
+        .get("semantic_delta_match")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return json!({
+            "accepted": false,
+            "kind": "not-needed",
+            "reason": "legacy semantic deltas already match"
+        });
+    }
+    if legacy_comparison
+        .get("state_match")
+        .and_then(JsonValue::as_bool)
+        != Some(true)
+    {
+        return json!({
+            "accepted": false,
+            "kind": "demand-current-coalesced-semantic-deltas",
+            "reason": "legacy state parity failed"
+        });
+    }
+
+    let Some(steps) = legacy_comparison
+        .get("step_comparisons")
+        .and_then(JsonValue::as_array)
+    else {
+        return json!({
+            "accepted": false,
+            "kind": "demand-current-coalesced-semantic-deltas",
+            "reason": "legacy step comparisons missing"
+        });
+    };
+
+    let mut mismatched_step_ids = Vec::new();
+    let mut missing_delta_field_paths = BTreeSet::new();
+    let mut missing_delta_count = 0_u64;
+    let mut extra_plan_delta_count = 0_u64;
+    let mut rejected_missing_deltas = Vec::new();
+    for step in steps {
+        if step
+            .get("semantic_delta_match")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
+        let step_id = step
+            .get("step_id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        mismatched_step_ids.push(step_id.clone());
+        if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
+            return json!({
+                "accepted": false,
+                "kind": "demand-current-coalesced-semantic-deltas",
+                "reason": format!("step `{step_id}` did not preserve touched state"),
+                "mismatched_step_ids": mismatched_step_ids
+            });
+        }
+        let legacy_deltas = step
+            .get("legacy_semantic_deltas")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let plan_deltas = step
+            .get("plan_semantic_deltas")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut remaining_legacy = legacy_deltas;
+        for plan_delta in plan_deltas {
+            if let Some(index) = remaining_legacy
+                .iter()
+                .position(|legacy| legacy == &plan_delta)
+            {
+                remaining_legacy.remove(index);
+            } else {
+                extra_plan_delta_count += 1;
+            }
+        }
+        for missing_delta in remaining_legacy {
+            missing_delta_count += 1;
+            let field_path = missing_delta
+                .get("field_path")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("missing")
+                .to_owned();
+            missing_delta_field_paths.insert(field_path.clone());
+            let kind_ok = missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
+            let field_ok = matches!(field_path.as_str(), "display_text" | "value" | "error");
+            if !(kind_ok && field_ok) {
+                rejected_missing_deltas.push(json!({
+                    "step_id": step_id,
+                    "delta": missing_delta,
+                }));
+            }
+        }
+    }
+
+    let accepted = !mismatched_step_ids.is_empty()
+        && extra_plan_delta_count == 0
+        && rejected_missing_deltas.is_empty();
+    json!({
+        "accepted": accepted,
+        "kind": "demand-current-coalesced-semantic-deltas",
+        "reason": if accepted {
+            "PlanExecutor preserved state/assertion parity and emitted a subset of legacy deltas; omitted deltas are transient demand-current FieldSet values"
+        } else {
+            "legacy semantic delta mismatch did not match the demand-current coalescing policy"
+        },
+        "mismatched_step_ids": mismatched_step_ids,
+        "missing_delta_field_paths": missing_delta_field_paths.into_iter().collect::<Vec<_>>(),
+        "missing_delta_count": missing_delta_count,
+        "extra_plan_delta_count": extra_plan_delta_count,
+        "rejected_missing_deltas": rejected_missing_deltas,
     })
 }
 
@@ -17370,6 +17510,35 @@ struct RuntimeStorageIndexedRowInitialReset {
 }
 
 #[derive(Clone, Debug)]
+enum IndexedResetBatchFastPath {
+    RowIndexGridText(RuntimeRowIndexGridTextPlan),
+    ListFindValueText(RuntimeListFindValueTextPlan),
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRowIndexGridTextPlan {
+    index_field: String,
+    column_list: String,
+    column_label_field: String,
+    width: i64,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeListFindValueTextPlan {
+    source_field: String,
+    lookup_list: String,
+    lookup_field: String,
+    target_field: String,
+    fallback: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexedResetBatchFastPathResult {
+    name: &'static str,
+    changed_read_count: usize,
+}
+
+#[derive(Clone, Debug)]
 enum RuntimeInitialValue {
     Text(String),
     Number(i64),
@@ -27590,6 +27759,30 @@ impl ListMemory {
         )
     }
 
+    fn find_textlike_existing_index(&self, field: &str, expected: &str) -> Option<usize> {
+        let field_id = FieldSlotId::from_path(field);
+        let index = self
+            .text_lookup_indexes
+            .iter()
+            .find(|index| index.field_id == field_id)?;
+        let slots = index.values.get(expected)?;
+        let mut selected = None;
+        let mut selected_order = usize::MAX;
+        for slot in slots {
+            if !self.valid.get(*slot).is_some_and(|valid| *valid) {
+                continue;
+            }
+            let Some(order_index) = self.order_slots.get(*slot).copied().flatten() else {
+                continue;
+            };
+            if order_index < selected_order {
+                selected_order = order_index;
+                selected = Some(order_index);
+            }
+        }
+        selected
+    }
+
     fn find_textlike_indices_indexed(
         &mut self,
         field: &str,
@@ -28353,6 +28546,66 @@ impl ListMemory {
             }
         }
         Ok(())
+    }
+
+    fn set_or_replace_text_values(
+        &mut self,
+        field: &str,
+        values: Vec<String>,
+    ) -> RuntimeResult<Vec<usize>> {
+        if values.len() != self.order.len() {
+            return Err(format!(
+                "cannot write {} value(s) into list field `{field}` with {} visible row(s)",
+                values.len(),
+                self.order.len()
+            )
+            .into());
+        }
+        let field_id = FieldSlotId::from_path(field);
+        let mut type_changed = false;
+        let mut value_changed_indices = Vec::new();
+        if let Some(index) = bool_column_index(&self.bool_columns, &field_id) {
+            self.bool_columns.remove(index);
+            type_changed = true;
+        }
+        if let Some(index) = text_column_index(&self.enum_columns, &field_id) {
+            self.enum_columns.remove(index);
+            self.invalidate_lookup_indexes_for_field(&field_id);
+            type_changed = true;
+        }
+        if let Some(index) = json_column_index(&self.json_columns, &field_id) {
+            self.json_columns.remove(index);
+            self.invalidate_lookup_indexes_for_field(&field_id);
+            type_changed = true;
+        }
+        if let Some(index) = bytes_column_index(&self.bytes_columns, &field_id) {
+            self.bytes_columns.remove(index);
+            type_changed = true;
+        }
+        let column_index = text_column_index(&self.text_columns, &field_id)
+            .unwrap_or_else(|| self.insert_text_column(field_id.clone(), false));
+        for (order_index, value) in values.into_iter().enumerate() {
+            let slot = self.order[order_index];
+            if !self.valid.get(slot).is_some_and(|valid| *valid) {
+                continue;
+            }
+            let current = &mut self.text_columns[column_index].values[slot];
+            if current == &value {
+                continue;
+            }
+            current.clear();
+            current.push_str(&value);
+            value_changed_indices.push(order_index);
+        }
+        let changed_indices = if type_changed {
+            (0..self.order.len()).collect::<Vec<_>>()
+        } else {
+            value_changed_indices
+        };
+        if !changed_indices.is_empty() {
+            self.invalidate_lookup_indexes_for_field(&field_id);
+        }
+        Ok(changed_indices)
     }
 
     fn copy_textlike(
@@ -30338,6 +30591,22 @@ impl GenericScheduledRuntime {
         self.indexed_lookup_cache.clear();
     }
 
+    fn invalidate_indexed_lookup_cache_for_list_field(&mut self, list: &str, field: &str) {
+        let field = normalized_field_name(field);
+        self.indexed_lookup_cache
+            .text
+            .retain(|key, _| key.list != list || key.field != field);
+        self.indexed_lookup_cache
+            .text_selection
+            .retain(|key, _| key.list != list || key.field != field);
+        self.indexed_lookup_cache
+            .numeric
+            .retain(|key, _| key.list != list || key.field != field);
+        self.indexed_lookup_cache
+            .numeric_selection
+            .retain(|key, _| key.list != list || key.field != field);
+    }
+
     fn cached_find_list_indices_by_textlike_indexed(
         &mut self,
         list: &str,
@@ -30929,17 +31198,25 @@ impl GenericScheduledRuntime {
             let field_started = Instant::now();
             let len = self.storage.list_len(&list)?;
             let mut changed_read_count = 0usize;
-            for index in 0..len {
-                let key = GenericDerivedKey {
-                    list: list.clone(),
-                    index,
-                    field: field.clone(),
-                };
-                if let (Some(materialization), _) =
-                    self.recompute_generic_derived_key_value(&key, &[])?
-                {
-                    changed_read_count =
-                        changed_read_count.saturating_add(materialization.changed_reads.len());
+            let mut fast_path = "generic_evaluator";
+            if let Some(result) =
+                self.try_initialize_indexed_derived_field_for_storage_reset_batch(&list, &field)?
+            {
+                changed_read_count = result.changed_read_count;
+                fast_path = result.name;
+            } else {
+                for index in 0..len {
+                    let key = GenericDerivedKey {
+                        list: list.clone(),
+                        index,
+                        field: field.clone(),
+                    };
+                    if let (Some(materialization), _) =
+                        self.recompute_generic_derived_key_value(&key, &[])?
+                    {
+                        changed_read_count =
+                            changed_read_count.saturating_add(materialization.changed_reads.len());
+                    }
                 }
             }
             total_key_count = total_key_count.saturating_add(len);
@@ -30949,6 +31226,7 @@ impl GenericScheduledRuntime {
                 json!({
                     "count": len,
                     "changed_read_count": changed_read_count,
+                    "fast_path": fast_path,
                     "total_ms": runtime_elapsed_ms(field_started),
                 }),
             );
@@ -30960,6 +31238,249 @@ impl GenericScheduledRuntime {
             "changed_read_count": total_changed_read_count,
             "fields": field_profiles,
         }))
+    }
+
+    fn try_initialize_indexed_derived_field_for_storage_reset_batch(
+        &mut self,
+        list: &str,
+        field: &str,
+    ) -> RuntimeResult<Option<IndexedResetBatchFastPathResult>> {
+        let Some(fast_path) = self.indexed_reset_batch_fast_path(list, field) else {
+            return Ok(None);
+        };
+        match fast_path {
+            IndexedResetBatchFastPath::RowIndexGridText(plan) => {
+                let Some(values) = self.row_index_grid_text_values(list, &plan)? else {
+                    return Ok(None);
+                };
+                let changed_read_count =
+                    self.apply_indexed_reset_text_values(list, field, values)?;
+                Ok(Some(IndexedResetBatchFastPathResult {
+                    name: "row_index_grid_text",
+                    changed_read_count,
+                }))
+            }
+            IndexedResetBatchFastPath::ListFindValueText(plan) => {
+                let Some(values) = self.list_find_value_text_values(list, &plan)? else {
+                    return Ok(None);
+                };
+                let changed_read_count =
+                    self.apply_indexed_reset_text_values(list, field, values)?;
+                Ok(Some(IndexedResetBatchFastPathResult {
+                    name: "list_find_value_text",
+                    changed_read_count,
+                }))
+            }
+        }
+    }
+
+    fn indexed_reset_batch_fast_path(
+        &self,
+        list: &str,
+        field: &str,
+    ) -> Option<IndexedResetBatchFastPath> {
+        let field_plan = self
+            .generic_derived
+            .indexed_fields
+            .iter()
+            .find(|candidate| candidate.list == list && candidate.field == field)?;
+        if field_plan.kind != DerivedValueKind::Pure {
+            return None;
+        }
+        let runtime_field = self
+            .generic_derived_runtime
+            .indexed_fields
+            .iter()
+            .find(|candidate| candidate.list == list && candidate.field == field)?;
+        let statement = runtime_field.statement.as_ref()?;
+        self.row_index_grid_text_fast_path(&field_plan.row_scope, statement)
+            .map(IndexedResetBatchFastPath::RowIndexGridText)
+            .or_else(|| {
+                self.list_find_value_text_fast_path(statement)
+                    .map(IndexedResetBatchFastPath::ListFindValueText)
+            })
+    }
+
+    fn row_index_grid_text_values(
+        &self,
+        list: &str,
+        plan: &RuntimeRowIndexGridTextPlan,
+    ) -> RuntimeResult<Option<Vec<String>>> {
+        let len = self.storage.list_len(list)?;
+        let mut values = Vec::with_capacity(len);
+        for index in 0..len {
+            let Some(source_index) = self
+                .storage
+                .list_row_textlike_opt(list, index, &plan.index_field)
+                .and_then(|value| value.trim().parse::<i64>().ok())
+            else {
+                return Ok(None);
+            };
+            if source_index < 0 || plan.width <= 0 {
+                return Ok(None);
+            }
+            let column_index = source_index % plan.width;
+            let row_index = source_index / plan.width;
+            let Ok(column_index) = usize::try_from(column_index) else {
+                return Ok(None);
+            };
+            let Some(label) = self.storage.list_row_textlike_opt(
+                &plan.column_list,
+                column_index,
+                &plan.column_label_field,
+            ) else {
+                return Ok(None);
+            };
+            values.push(format!("{label}{row_index}"));
+        }
+        Ok(Some(values))
+    }
+
+    fn list_find_value_text_values(
+        &self,
+        list: &str,
+        plan: &RuntimeListFindValueTextPlan,
+    ) -> RuntimeResult<Option<Vec<String>>> {
+        let lookup_len = self.storage.list_len(&plan.lookup_list)?;
+        let mut lookup = BTreeMap::new();
+        for index in 0..lookup_len {
+            let Some(key) =
+                self.storage
+                    .list_row_textlike_opt(&plan.lookup_list, index, &plan.lookup_field)
+            else {
+                continue;
+            };
+            if lookup.contains_key(key) {
+                continue;
+            }
+            let Some(value) =
+                self.storage
+                    .list_row_textlike_opt(&plan.lookup_list, index, &plan.target_field)
+            else {
+                continue;
+            };
+            lookup.insert(key.to_owned(), value.to_owned());
+        }
+        let len = self.storage.list_len(list)?;
+        let mut values = Vec::with_capacity(len);
+        for index in 0..len {
+            let Some(key) = self
+                .storage
+                .list_row_textlike_opt(list, index, &plan.source_field)
+            else {
+                return Ok(None);
+            };
+            values.push(
+                lookup
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| plan.fallback.clone()),
+            );
+        }
+        Ok(Some(values))
+    }
+
+    fn apply_indexed_reset_text_values(
+        &mut self,
+        list: &str,
+        field: &str,
+        values: Vec<String>,
+    ) -> RuntimeResult<usize> {
+        let len = self.storage.list_len(list)?;
+        if values.len() != len {
+            return Err(format!(
+                "indexed reset batch for `{list}.{field}` produced {} value(s) for {len} row(s)",
+                values.len()
+            )
+            .into());
+        }
+        let changed_indices = self
+            .storage
+            .set_or_replace_list_text_values(list, field, values)?;
+        if !changed_indices.is_empty() {
+            self.invalidate_indexed_lookup_cache_for_list_field(list, field);
+            let mut changed_reads = BTreeSet::new();
+            for index in &changed_indices {
+                insert_changed_list_field_read_keys(&mut changed_reads, list, *index, field);
+            }
+            self.invalidate_derived_value_caches_for_reads(changed_reads);
+        }
+        Ok(changed_indices.len().saturating_mul(2))
+    }
+
+    fn row_index_grid_text_fast_path(
+        &self,
+        row_scope: &str,
+        statement: &RuntimeGenericStatement,
+    ) -> Option<RuntimeRowIndexGridTextPlan> {
+        let (function, args) = runtime_statement_call(statement)?;
+        let index_arg = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some("index"))?;
+        let (arg_scope, index_field) = runtime_row_path_expr(&index_arg.value)?;
+        if arg_scope != row_scope {
+            return None;
+        }
+        let definition = self.generic_derived_runtime.function(function)?;
+        let function_arg = definition.args.first()?;
+        let children = runtime_block_children(&definition.statement)?;
+        let column_index_expr = runtime_binding_expr(children, "column_index")?;
+        let row_index_expr = runtime_binding_expr(children, "row_index")?;
+        let width = runtime_infix_identifier_number(column_index_expr, function_arg, "%")?;
+        if runtime_infix_identifier_number(row_index_expr, function_arg, "/")? != width {
+            return None;
+        }
+        let (column_binding, column_list, column_index_binding) =
+            runtime_list_get_binding(children)?;
+        if column_index_binding != "column_index" {
+            return None;
+        }
+        let output = runtime_block_output_expr(children)?;
+        let column_label_field =
+            runtime_grid_text_output_label_field(output, column_binding, "row_index")?;
+        Some(RuntimeRowIndexGridTextPlan {
+            index_field: index_field.to_owned(),
+            column_list,
+            column_label_field,
+            width,
+        })
+    }
+
+    fn list_find_value_text_fast_path(
+        &self,
+        statement: &RuntimeGenericStatement,
+    ) -> Option<RuntimeListFindValueTextPlan> {
+        let (function, args) = runtime_statement_call(statement)?;
+        let definition = self.generic_derived_runtime.function(function)?;
+        let source_arg = definition.args.first()?;
+        let source_field = runtime_call_arg_raw_value(args, Some(source_arg))?;
+        let body = runtime_statement_expr(&definition.statement)?;
+        let RuntimeGenericExpr::Call {
+            function: body_function,
+            args: body_args,
+        } = body
+        else {
+            return None;
+        };
+        if body_function != "List/find_value" {
+            return None;
+        }
+        let lookup_list = runtime_call_arg_raw_value(body_args, None)?;
+        let lookup_field = runtime_call_arg_raw_value(body_args, Some("field"))?;
+        let value_arg = runtime_call_arg_raw_value(body_args, Some("value"))?;
+        if value_arg != *source_arg {
+            return None;
+        }
+        let target_field = runtime_call_arg_raw_value(body_args, Some("target"))?;
+        let fallback =
+            runtime_call_arg_text_value(body_args, Some("fallback")).unwrap_or_else(String::new);
+        Some(RuntimeListFindValueTextPlan {
+            source_field,
+            lookup_list,
+            lookup_field,
+            target_field,
+            fallback,
+        })
     }
 
     fn bind_initial_list_sources(&mut self) -> RuntimeResult<()> {
@@ -38094,7 +38615,7 @@ impl GenericScheduledRuntime {
                 &key.field,
                 field_value.clone(),
             )?;
-            self.clear_indexed_lookup_cache();
+            self.invalidate_indexed_lookup_cache_for_list_field(&key.list, &key.field);
             self.invalidate_derived_value_caches_for_reads(changed_reads.iter().cloned());
         }
         self.generic_derived_state.insert_value_cache(
@@ -42104,6 +42625,9 @@ impl GenericScheduledRuntime {
             let field = normalized_field_name(field);
             frame.reads.insert(list_read_key(list));
             frame.reads.insert(list_column_read_key(list, &field));
+            frame
+                .reads
+                .insert(list_lookup_text_read_key(list, &field, &expected));
             let (indices, probe) =
                 self.cached_find_list_indices_by_textlike_indexed(list, &field, &expected)?;
             let index = indices.and_then(|indices| indices.into_iter().next());
@@ -42159,6 +42683,9 @@ impl GenericScheduledRuntime {
             let field = normalized_field_name(field);
             frame.reads.insert(list_read_key(list));
             frame.reads.insert(list_column_read_key(list, &field));
+            frame
+                .reads
+                .insert(list_lookup_text_read_key(list, &field, &expected));
             let (output, probe) = self.cached_find_list_indices_in_selection_by_textlike_indexed(
                 list, &field, &expected, indices, true,
             )?;
@@ -46522,6 +47049,7 @@ impl GenericScheduledRuntime {
                 }
                 GenericReadKey::List { .. }
                 | GenericReadKey::ListColumn { .. }
+                | GenericReadKey::ListLookupText { .. }
                 | GenericReadKey::ListField { .. } => Vec::new(),
             })
             .collect::<BTreeSet<_>>();
@@ -47488,6 +48016,7 @@ impl GenericScheduledRuntime {
             }
             GenericReadKey::List { .. }
             | GenericReadKey::ListColumn { .. }
+            | GenericReadKey::ListLookupText { .. }
             | GenericReadKey::ListField { .. } => {}
         }
         paths.into_iter().collect()
@@ -48009,11 +48538,42 @@ impl GenericScheduledRuntime {
         field: &str,
         address: &str,
     ) -> Option<serde_json::Map<String, JsonValue>> {
-        let index = self
-            .storage
-            .find_list_index_by_textlike(list, field, address)
-            .ok()
-            .flatten()?;
+        let field = normalized_field_name(field);
+        let (indices, probe) = self
+            .cached_find_list_indices_by_textlike_indexed(list, &field, address)
+            .ok()?;
+        self.list_scan_counters.row_occurrences_scanned = self
+            .list_scan_counters
+            .row_occurrences_scanned
+            .saturating_add(probe.candidate_count);
+        self.list_scan_counters.route_candidates_visited = self
+            .list_scan_counters
+            .route_candidates_visited
+            .saturating_add(probe.candidate_count);
+        if probe.used_index {
+            self.list_scan_counters.text_lookup_index_hits = self
+                .list_scan_counters
+                .text_lookup_index_hits
+                .saturating_add(1);
+            self.list_scan_counters.text_lookup_index_candidates = self
+                .list_scan_counters
+                .text_lookup_index_candidates
+                .saturating_add(probe.candidate_count);
+        } else {
+            self.list_scan_counters.text_lookup_index_misses = self
+                .list_scan_counters
+                .text_lookup_index_misses
+                .saturating_add(1);
+            self.list_scan_counters.rows_scanned = self
+                .list_scan_counters
+                .rows_scanned
+                .saturating_add(probe.candidate_count);
+            self.list_scan_counters.list_find_rows_scanned = self
+                .list_scan_counters
+                .list_find_rows_scanned
+                .saturating_add(probe.candidate_count);
+        }
+        let index = indices.and_then(|indices| indices.into_iter().next())?;
         self.list_summary_fields
             .iter()
             .find(|summary| summary.list == list)
@@ -49495,7 +50055,11 @@ impl GenericCircuitRuntime {
         let list = self.list_name_for_path(list_path).ok_or_else(|| {
             format!("generic runtime has no list `{list_path}` for List/find_value")
         })?;
-        let Some(index) = self.find_list_index_by_textlike(list, field, expected)? else {
+        let index = match self.find_list_index_by_textlike_existing_index(list, field, expected)? {
+            Some(index) => Some(index),
+            None => self.find_list_index_by_textlike(list, field, expected)?,
+        };
+        let Some(index) = index else {
             return Ok(fallback);
         };
         self.list_row_field_textlike(list, index, target).map(Some)
@@ -49550,6 +50114,19 @@ impl GenericCircuitRuntime {
             }
         }
         Ok(None)
+    }
+
+    fn find_list_index_by_textlike_existing_index(
+        &self,
+        list: &str,
+        field: &str,
+        expected: &str,
+    ) -> RuntimeResult<Option<usize>> {
+        let rows = self
+            .lists
+            .memory(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        Ok(rows.find_textlike_existing_index(field, expected))
     }
 
     fn find_list_index_by_textlike_indexed(
@@ -49898,6 +50475,21 @@ impl GenericCircuitRuntime {
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
                     .into()
+            })
+    }
+
+    fn set_or_replace_list_text_values(
+        &mut self,
+        list: &str,
+        field: &str,
+        values: Vec<String>,
+    ) -> RuntimeResult<Vec<usize>> {
+        self.lists
+            .memory_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .set_or_replace_text_values(field, values)
+            .map_err(|error| {
+                format!("generic list `{list}` set `{field}` batch failed: {error}").into()
             })
     }
 
@@ -51771,6 +52363,7 @@ fn root_stack_contains_runtime_read_key(root_stack: &[String], read: &GenericRea
         }
         GenericReadKey::List { .. }
         | GenericReadKey::ListColumn { .. }
+        | GenericReadKey::ListLookupText { .. }
         | GenericReadKey::ListField { .. } => false,
     }
 }
@@ -56109,6 +56702,11 @@ enum GenericReadKey {
         list: String,
         field: String,
     },
+    ListLookupText {
+        list: String,
+        field: String,
+        expected: String,
+    },
     ListField {
         list: String,
         index: usize,
@@ -56395,10 +56993,19 @@ fn list_column_read_key(list: &str, field: &str) -> GenericReadKey {
     }
 }
 
+fn list_lookup_text_read_key(list: &str, field: &str, expected: &str) -> GenericReadKey {
+    GenericReadKey::ListLookupText {
+        list: list.to_owned(),
+        field: field.to_owned(),
+        expected: expected.to_owned(),
+    }
+}
+
 fn generic_read_key_list(read: &GenericReadKey) -> Option<&str> {
     match read {
         GenericReadKey::List { list }
         | GenericReadKey::ListColumn { list, .. }
+        | GenericReadKey::ListLookupText { list, .. }
         | GenericReadKey::ListField { list, .. } => Some(list),
         GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => None,
     }
@@ -56420,6 +57027,11 @@ fn generic_read_key_affects_list_field(
             list: dirty_list,
             field: dirty_field,
         } => dirty_list == list && dirty_field == field,
+        GenericReadKey::ListLookupText {
+            list: dirty_list,
+            field: dirty_field,
+            ..
+        } => dirty_list == list && dirty_field == field,
         GenericReadKey::ListField {
             list: dirty_list,
             index: dirty_index,
@@ -56440,7 +57052,7 @@ fn generic_read_key_kind_counts(reads: &BTreeSet<GenericReadKey>) -> (usize, usi
                 root_count = root_count.saturating_add(1);
             }
             GenericReadKey::List { .. } => list_count = list_count.saturating_add(1),
-            GenericReadKey::ListColumn { .. } => {
+            GenericReadKey::ListColumn { .. } | GenericReadKey::ListLookupText { .. } => {
                 list_column_count = list_column_count.saturating_add(1);
             }
             GenericReadKey::ListField { .. } => {
@@ -56457,6 +57069,7 @@ fn generic_read_key_kind_label(read: &GenericReadKey) -> &'static str {
         GenericReadKey::RootChild { .. } => "root_child",
         GenericReadKey::List { .. } => "list",
         GenericReadKey::ListColumn { .. } => "list_column",
+        GenericReadKey::ListLookupText { .. } => "list_lookup_text",
         GenericReadKey::ListField { .. } => "list_field",
     }
 }
@@ -56470,6 +57083,13 @@ fn generic_read_key_label(read: &GenericReadKey) -> String {
         GenericReadKey::List { list } => format!("list:{list}"),
         GenericReadKey::ListColumn { list, field } => {
             format!("list_column:{list}.{field}")
+        }
+        GenericReadKey::ListLookupText {
+            list,
+            field,
+            expected,
+        } => {
+            format!("list_lookup_text:{list}.{field}={expected}")
         }
         GenericReadKey::ListField { list, index, field } => {
             format!("list_field:{list}[{index}].{field}")
@@ -56806,6 +57426,7 @@ fn root_scalar_field_depends_on_changed_read(
             GenericReadKey::RootChild { root, path } => format!("{root}.{path}"),
             GenericReadKey::List { .. }
             | GenericReadKey::ListColumn { .. }
+            | GenericReadKey::ListLookupText { .. }
             | GenericReadKey::ListField { .. } => return false,
         };
         root_scalar_read_path_candidates(&dependency)
@@ -56908,6 +57529,7 @@ fn root_read_key_matches_path(read: &GenericReadKey, path: &str) -> bool {
             .is_some_and(|candidate| candidate == read),
         GenericReadKey::List { .. }
         | GenericReadKey::ListColumn { .. }
+        | GenericReadKey::ListLookupText { .. }
         | GenericReadKey::ListField { .. } => false,
     }
 }
@@ -58565,6 +59187,154 @@ fn runtime_generic_raw_arg_name(arg: &RuntimeGenericArg) -> Option<String> {
         RuntimeGenericExpr::Text(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn runtime_statement_expr(statement: &RuntimeGenericStatement) -> Option<&RuntimeGenericExpr> {
+    match statement {
+        RuntimeGenericStatement::Expr(expr) => Some(expr),
+        _ => None,
+    }
+}
+
+fn runtime_statement_call(
+    statement: &RuntimeGenericStatement,
+) -> Option<(&str, &[RuntimeGenericArg])> {
+    let RuntimeGenericExpr::Call { function, args } = runtime_statement_expr(statement)? else {
+        return None;
+    };
+    Some((function.as_str(), args.as_slice()))
+}
+
+fn runtime_block_children(
+    statement: &RuntimeGenericStatement,
+) -> Option<&[RuntimeGenericStatement]> {
+    match statement {
+        RuntimeGenericStatement::Block(statements) if statements.len() == 1 => {
+            runtime_block_children(&statements[0])
+        }
+        RuntimeGenericStatement::ExprWithChildren { expr, children }
+            if runtime_generic_expr_is_block_marker(expr) =>
+        {
+            Some(children)
+        }
+        _ => None,
+    }
+}
+
+fn runtime_binding_expr<'a>(
+    statements: &'a [RuntimeGenericStatement],
+    binding: &str,
+) -> Option<&'a RuntimeGenericExpr> {
+    statements.iter().find_map(|statement| {
+        let RuntimeGenericStatement::Binding { name, value } = statement else {
+            return None;
+        };
+        (name == binding)
+            .then(|| runtime_statement_expr(value))
+            .flatten()
+    })
+}
+
+fn runtime_block_output_expr(
+    statements: &[RuntimeGenericStatement],
+) -> Option<&RuntimeGenericExpr> {
+    statements.iter().rev().find_map(|statement| {
+        if matches!(statement, RuntimeGenericStatement::Binding { .. }) {
+            return None;
+        }
+        runtime_statement_expr(statement)
+    })
+}
+
+fn runtime_row_path_expr(expr: &RuntimeGenericExpr) -> Option<(&str, &str)> {
+    let RuntimeGenericExpr::Path(parts) = expr else {
+        return None;
+    };
+    if parts.len() != 2 {
+        return None;
+    }
+    Some((parts[0].as_str(), parts[1].as_str()))
+}
+
+fn runtime_infix_identifier_number(
+    expr: &RuntimeGenericExpr,
+    identifier: &str,
+    expected_op: &str,
+) -> Option<i64> {
+    let RuntimeGenericExpr::Infix { left, op, right } = expr else {
+        return None;
+    };
+    if op != expected_op {
+        return None;
+    }
+    if !matches!(left.as_ref(), RuntimeGenericExpr::Identifier(name) if name == identifier) {
+        return None;
+    }
+    let RuntimeGenericExpr::Number(value) = right.as_ref() else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn runtime_list_get_binding(
+    statements: &[RuntimeGenericStatement],
+) -> Option<(&str, String, String)> {
+    statements.iter().find_map(|statement| {
+        let RuntimeGenericStatement::Binding { name, value } = statement else {
+            return None;
+        };
+        let RuntimeGenericExpr::Call { function, args } = runtime_statement_expr(value)? else {
+            return None;
+        };
+        if function != "List/get" {
+            return None;
+        }
+        let list = runtime_call_arg_raw_value(args, None)?;
+        let index = runtime_call_arg_raw_value(args, Some("index"))?;
+        Some((name.as_str(), list, index))
+    })
+}
+
+fn runtime_grid_text_output_label_field(
+    expr: &RuntimeGenericExpr,
+    column_binding: &str,
+    row_index_binding: &str,
+) -> Option<String> {
+    let RuntimeGenericExpr::Infix { left, op, right } = expr else {
+        return None;
+    };
+    if op != "+" {
+        return None;
+    }
+    let RuntimeGenericExpr::Path(parts) = left.as_ref() else {
+        return None;
+    };
+    if parts.len() != 2 || parts[0] != column_binding {
+        return None;
+    }
+    if !matches!(right.as_ref(), RuntimeGenericExpr::Identifier(name) if name == row_index_binding)
+    {
+        return None;
+    }
+    Some(parts[1].clone())
+}
+
+fn runtime_call_arg_raw_value(args: &[RuntimeGenericArg], name: Option<&str>) -> Option<String> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == name)
+        .and_then(runtime_generic_raw_arg_name)
+}
+
+fn runtime_call_arg_text_value(args: &[RuntimeGenericArg], name: Option<&str>) -> Option<String> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == name)
+        .and_then(|arg| match &arg.value {
+            RuntimeGenericExpr::Text(value)
+            | RuntimeGenericExpr::Identifier(value)
+            | RuntimeGenericExpr::Enum(value) => Some(value.clone()),
+            RuntimeGenericExpr::Path(parts) => Some(parts.join(".")),
+            _ => None,
+        })
 }
 
 fn runtime_list_call_binding(function: &str, args: &[RuntimeGenericArg]) -> Option<String> {
@@ -69698,6 +70468,7 @@ FUNCTION icon_code(item) {
     #[test]
     fn runtime_generic_user_functions_execute_without_ast_bodies() {
         let source = r#"
+HOLD
 store: [
     sources: [
         noop: SOURCE
@@ -72891,7 +73662,7 @@ FUNCTION new_todo(title) {
             let generic = runtime
                 .runtime
                 .generic
-                .as_ref()
+                .as_mut()
                 .expect("Cells should use the generic runtime");
             assert!(
                 generic
@@ -72899,6 +73670,7 @@ FUNCTION new_todo(title) {
                     .deferred_dirty_root_contains("store.selected_input"),
                 "selecting a cell should leave selected_input demand-current until read"
             );
+            generic.reset_list_scan_counters();
         }
         let values = runtime.document_state_values(&[
             "store.selected_input.address".to_owned(),
@@ -72942,6 +73714,32 @@ FUNCTION new_todo(title) {
     }
 
     #[test]
+    fn cells_window_document_summary_keeps_selected_projection_current() {
+        let source = cells_project_source_for_test();
+        let mut runtime =
+            LiveRuntime::from_source("cells-selected-input-window-summary", &source).unwrap();
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "cell.sources.editor.select".to_owned(),
+                address: Some("B0".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+
+        let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
+        assert_eq!(summary["store"]["selected_address"], "B0");
+        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
+        assert_eq!(
+            summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+        let rows = summary["store"]["sheet_rows"].as_array().unwrap();
+        let cells = rows[0]["cells"].as_array().unwrap();
+        assert_eq!(cells[0]["address"], "A0");
+        assert_eq!(cells[1]["address"], "B0");
+    }
+
+    #[test]
     fn cells_value_and_error_are_demand_current_at_startup() {
         let source = cells_project_source_for_test();
         let (plan, _) =
@@ -72973,6 +73771,63 @@ FUNCTION new_todo(title) {
                 "{field} must be current-on-read instead of eagerly recomputed at startup; profile={field_profiles:?}"
             );
         }
+    }
+
+    #[test]
+    fn cells_indexed_reset_sources_use_batch_fast_paths() {
+        let source = cells_project_source_for_test();
+        let (plan, _) =
+            cached_runtime_plan_from_source_profiled("cells-reset-source-batch-fast-path", &source)
+                .unwrap();
+        let (runtime, profile) =
+            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref()).unwrap();
+        let generic = runtime
+            .generic
+            .as_ref()
+            .expect("Cells should use the generic runtime");
+        assert_eq!(
+            generic
+                .storage
+                .list_row_textlike("cells", 0, "address")
+                .unwrap(),
+            "A0"
+        );
+        assert_eq!(
+            generic
+                .storage
+                .list_row_textlike("cells", 27, "address")
+                .unwrap(),
+            "B1"
+        );
+        assert_eq!(
+            generic
+                .storage
+                .list_row_textlike("cells", 1, "default_formula")
+                .unwrap(),
+            "=add(A0,A1)"
+        );
+        let fields = profile
+            .pointer("/generic/initialize_indexed_reset_sources_profile/fields")
+            .and_then(JsonValue::as_object)
+            .expect("generic startup profile should include reset-source field profiles");
+        for field in ["cells.value", "cells.error"] {
+            assert!(
+                !fields.contains_key(field),
+                "{field} must not be pulled into reset-source startup initialization; fields={fields:?}"
+            );
+        }
+        assert_eq!(
+            fields["cells.address"]["fast_path"],
+            json!("row_index_grid_text"),
+            "cells.address should seed from the generic row-index grid-text batch path; fields={fields:?}"
+        );
+        assert_eq!(
+            fields["cells.default_formula"]["fast_path"],
+            json!("list_find_value_text"),
+            "cells.default_formula should seed from the generic List/find_value text batch path; fields={fields:?}"
+        );
+        assert_eq!(fields["cells.address"]["count"], json!(2600));
+        assert_eq!(fields["cells.default_formula"]["count"], json!(2600));
     }
 
     #[test]
@@ -83478,6 +84333,36 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
+    fn list_existing_text_index_lookup_is_read_only_and_ordered() {
+        let mut list = ListMemory::from_values([
+            todo_generic_row("duplicate"),
+            todo_generic_row("middle"),
+            todo_generic_row("duplicate"),
+        ]);
+
+        assert_eq!(
+            list.find_textlike_existing_index("title", "duplicate"),
+            None,
+            "read-only lookup must not build an index"
+        );
+        assert!(list.text_lookup_indexes.is_empty());
+
+        let (index, probe) = list.find_textlike_indexed("title", "duplicate");
+        assert_eq!(index, Some(0));
+        assert!(probe.used_index);
+
+        assert_eq!(
+            list.find_textlike_existing_index("title", "duplicate"),
+            Some(0)
+        );
+        list.move_index(2, 0).unwrap();
+        assert_eq!(
+            list.find_textlike_existing_index("title", "duplicate"),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn list_index_text_lookup_survives_unrelated_text_field_mutation() {
         fn cell_row(address: &str, formula: &str) -> RuntimeRowSnapshot {
             let mut columns = ValueColumns::default();
@@ -83530,6 +84415,61 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(indices, Some(vec![]));
         assert!(probe.used_index);
         assert_eq!(probe.candidate_count, 0);
+    }
+
+    #[test]
+    fn list_batch_text_write_preserves_unrelated_text_lookup_indexes() {
+        fn cell_row(address: &str, formula: &str) -> RuntimeRowSnapshot {
+            let mut columns = ValueColumns::default();
+            columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
+            columns.insert_value(
+                "formula_text".to_owned(),
+                FieldValue::Text(formula.to_owned()),
+            );
+            RuntimeRowSnapshot { columns }
+        }
+
+        let mut list = ListMemory::from_values([
+            cell_row("A0", "1"),
+            cell_row("B0", "2"),
+            cell_row("C0", "3"),
+        ]);
+
+        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
+        assert_eq!(indices, Some(vec![1]));
+        assert!(probe.used_index);
+        let changed = list
+            .set_or_replace_text_values(
+                "formula_text",
+                vec!["1".to_owned(), "=add(A0,C0)".to_owned(), "3".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(changed, vec![1]);
+        assert_eq!(
+            list.text_lookup_indexes.len(),
+            1,
+            "batch-updating formula_text should not evict the address lookup index"
+        );
+        assert_eq!(
+            list.text_lookup_indexes[0].field_id,
+            FieldSlotId::from_path("address")
+        );
+        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
+        assert_eq!(indices, Some(vec![1]));
+        assert!(probe.used_index);
+        assert_eq!(probe.candidate_count, 1);
+
+        let changed = list
+            .set_or_replace_text_values(
+                "address",
+                vec!["A0".to_owned(), "B1".to_owned(), "C0".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(changed, vec![1]);
+        assert!(
+            list.text_lookup_indexes.is_empty(),
+            "batch-updating address must evict the address lookup index"
+        );
     }
 
     #[test]
@@ -83757,12 +84697,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .unwrap()
             .to_owned();
         generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
         let value = generic
             .list_find(
                 BoonValue::ListRef(list.clone()),
                 "key",
                 BoonValue::Text("row-2".to_owned()),
-                &mut GenericEvalFrame::root(),
+                &mut frame,
             )
             .unwrap();
         assert_eq!(
@@ -83781,6 +84722,101 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(
             generic.list_scan_counters.list_find_rows_scanned, 0,
             "indexed List/find must not scan rows on exact text hits"
+        );
+        assert!(
+            frame
+                .reads
+                .contains(&list_lookup_text_read_key(&list, "key", "row-2")),
+            "List/find should register the exact lookup dependency for formula/currentness fanout"
+        );
+    }
+
+    #[test]
+    fn indexed_lookup_cache_invalidates_only_changed_list_field() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    ready:
+        TEXT { ready } |> HOLD ready { LATEST {} }
+    records:
+        LIST {
+            [key: TEXT { row-1 }, value: TEXT { first }]
+            [key: TEXT { row-2 }, value: TEXT { second }]
+        }
+    defaults:
+        LIST {
+            [address: TEXT { A0 }, value: TEXT { 5 }]
+            [address: TEXT { A1 }, value: TEXT { 7 }]
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("indexed-cache-field-invalidation", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let records = generic
+            .storage
+            .list_name_for_path("store.records")
+            .unwrap()
+            .to_owned();
+        let defaults = generic
+            .storage
+            .list_name_for_path("store.defaults")
+            .unwrap()
+            .to_owned();
+
+        generic
+            .cached_find_list_indices_by_textlike_indexed(&records, "key", "row-2")
+            .unwrap();
+        generic
+            .cached_find_list_indices_by_textlike_indexed(&defaults, "address", "A0")
+            .unwrap();
+
+        let records_key = TextLookupCacheKey {
+            list: records.clone(),
+            field: "key".to_owned(),
+            expected: "row-2".to_owned(),
+        };
+        let defaults_key = TextLookupCacheKey {
+            list: defaults.clone(),
+            field: "address".to_owned(),
+            expected: "A0".to_owned(),
+        };
+        assert!(generic.indexed_lookup_cache.text.contains_key(&records_key));
+        assert!(
+            generic
+                .indexed_lookup_cache
+                .text
+                .contains_key(&defaults_key)
+        );
+
+        generic.invalidate_indexed_lookup_cache_for_list_field(&records, "value");
+        assert!(
+            generic.indexed_lookup_cache.text.contains_key(&records_key),
+            "changing an unrelated field in the same list must not drop key lookups"
+        );
+        assert!(
+            generic
+                .indexed_lookup_cache
+                .text
+                .contains_key(&defaults_key),
+            "changing one list must not drop lookups for another list"
+        );
+
+        generic.invalidate_indexed_lookup_cache_for_list_field(&records, "key");
+        assert!(
+            !generic.indexed_lookup_cache.text.contains_key(&records_key),
+            "changing the indexed field must drop stale lookups for that field"
+        );
+        assert!(
+            generic
+                .indexed_lookup_cache
+                .text
+                .contains_key(&defaults_key),
+            "field-targeted invalidation must still preserve unrelated list lookups"
         );
     }
 
@@ -83870,6 +84906,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .unwrap()
             .to_owned();
         generic.reset_list_scan_counters();
+        let mut frame = GenericEvalFrame::root();
         let value = generic
             .list_find(
                 BoonValue::ListSelection {
@@ -83878,7 +84915,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 },
                 "key",
                 BoonValue::Text("row-2".to_owned()),
-                &mut GenericEvalFrame::root(),
+                &mut frame,
             )
             .unwrap();
         assert_eq!(
@@ -83896,6 +84933,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(
             generic.list_scan_counters.list_find_rows_scanned, 0,
             "List/find over an indexed ListSelection should not scan selected rows"
+        );
+        assert!(
+            frame
+                .reads
+                .contains(&list_lookup_text_read_key(&list, "key", "row-2")),
+            "List/find over selections should register the exact lookup dependency"
         );
     }
 
@@ -87258,6 +88301,22 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     "PlanExecutor should preserve Cells state even when legacy emits extra transient cycle deltas"
                 );
                 assert_eq!(
+                    output.report["status"], "pass",
+                    "Cells event replay report should pass through the explicit demand-current semantic-delta coalescing policy"
+                );
+                assert_eq!(
+                    output.report["legacy_comparison"]["semantic_delta_match"], false,
+                    "raw legacy semantic-delta mismatch should remain visible"
+                );
+                assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["accepted"], true,
+                    "demand-current semantic-delta coalescing should be schema-visible acceptance evidence"
+                );
+                assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["kind"],
+                    "demand-current-coalesced-semantic-deltas"
+                );
+                assert_eq!(
                     output.report["plan_executor_coverage"]["covers_assertion_only_steps"],
                     true
                 );
@@ -90367,6 +91426,46 @@ expected_source_event = {{ source = "store.decode" }}
         assert!(
             value_delta_count >= 4,
             "A0 fanout should emit value deltas for source and dependents"
+        );
+    }
+
+    #[test]
+    fn pure_boon_cells_range_formula_updates_from_member_change() {
+        let mut runtime =
+            LiveRuntime::from_source("cells-range-fanout", &cells_project_source_for_test())
+                .unwrap();
+        commit_cell(&mut runtime, "A3", "20");
+        let output = commit_cell(&mut runtime, "C0", "=sum(A0:A3)");
+        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "50");
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some("30".to_owned()),
+                key: Some("Enter".to_owned()),
+                address: Some("A3".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        let summary = runtime.document_state_summary();
+        assert_eq!(cell_summary(&summary, "A3")["value"], "30");
+        assert_eq!(
+            cell_summary(&summary, "C0")["value"],
+            "60",
+            "range dependencies should invalidate formulas that read the changed member"
+        );
+        assert!(
+            output
+                .recomputed_field_samples
+                .iter()
+                .any(|sample| sample == "cells[2].value"),
+            "C0 value should be recomputed through the generic read dependency index, got {:?}",
+            output.recomputed_field_samples
+        );
+        assert!(
+            output.recomputed_field_samples.len() < 16,
+            "range fanout should stay sparse instead of recomputing the full Cells grid, got {:?}",
+            output.recomputed_field_samples
         );
     }
 

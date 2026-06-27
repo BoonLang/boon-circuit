@@ -285,7 +285,7 @@ impl Dispatch<WlPointer, ObjectId> for AppData {
                 surface_x,
                 surface_y,
             } => {
-                motion_event(time, surface_x, surface_y);
+                motion_event(time, surface_x, surface_y, window.clone());
             }
             wayland_client::protocol::wl_pointer::Event::Button {
                 serial: _,

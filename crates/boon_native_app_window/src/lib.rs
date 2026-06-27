@@ -8,7 +8,7 @@ use app_window::{WGPU_SURFACE_STRATEGY, WGPUStrategy};
 use boon_host::{PhysicalSize, SurfaceId, Viewport, WindowId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +19,7 @@ use wgpu::SurfaceTargetUnsafe;
 const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -234,6 +235,67 @@ pub fn accesskit_tree_update_from_semantic_scene(
     };
     NativeAccessibilitySnapshot {
         tree_update,
+        metrics,
+        semantic_node_ids,
+    }
+}
+
+pub fn accesskit_focus_update_from_semantic_node(
+    focused: &boon_document::SemanticId,
+    node: Option<&boon_document::SemanticNode>,
+) -> NativeAccessibilitySnapshot {
+    let focus = accesskit_node_id_for_semantic_id(focused);
+    let mut id_map = BTreeMap::new();
+    id_map.insert(focused.clone(), focus);
+    if let Some(node) = node {
+        id_map.insert(node.id.clone(), accesskit_node_id_for_semantic_id(&node.id));
+        if let Some(parent) = node.relations.parent.as_ref() {
+            id_map.insert(parent.clone(), accesskit_node_id_for_semantic_id(parent));
+        }
+        for child in &node.relations.children {
+            id_map.insert(child.clone(), accesskit_node_id_for_semantic_id(child));
+        }
+    }
+    let nodes = node
+        .map(|node| {
+            (
+                accesskit_node_id_for_semantic_id(&node.id),
+                accesskit_node_from_semantic_node(node, &id_map),
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let semantic_node_ids = node
+        .map(|node| NativeAccessibilityNodeMapping {
+            semantic_id: node.id.0.clone(),
+            accesskit_node_id: accesskit_node_id_for_semantic_id(&node.id).0,
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let metrics = NativeAccessibilityMetrics {
+        semantic_node_count: node.is_some() as usize,
+        accesskit_node_count: nodes.len(),
+        interactive_node_count: node
+            .filter(|node| node.actions.press || node.actions.set_text)
+            .is_some() as usize,
+        focusable_node_count: node
+            .filter(|node| node.actions.focus || node.state.focused)
+            .is_some() as usize,
+        text_input_node_count: node.filter(|node| node.actions.set_text).is_some() as usize,
+        checked_node_count: node
+            .filter(|node| node.state.checked == Some(true))
+            .is_some() as usize,
+        node_id_collision_count: 0,
+        root_present: false,
+        focus_present: true,
+    };
+    NativeAccessibilitySnapshot {
+        tree_update: accesskit::TreeUpdate {
+            nodes,
+            tree: None,
+            tree_id: accesskit::TreeId::ROOT,
+            focus,
+        },
         metrics,
         semantic_node_ids,
     }
@@ -536,6 +598,7 @@ pub struct NativeWindowOptions {
     pub readback_artifact_dir: Option<String>,
     pub render_loop_state_report: Option<String>,
     pub demand_driven_loop: bool,
+    pub skip_interactive_surface_readback_when_external_proof: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -711,6 +774,7 @@ pub struct NativeRenderLoopState {
     pub last_render_hook_completed_elapsed_ms: Option<f64>,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
+    pub last_poll_diagnostics: Option<serde_json::Value>,
     #[serde(skip)]
     pub next_wake_at: Option<Instant>,
 }
@@ -756,6 +820,7 @@ impl NativeRenderLoopState {
             last_render_hook_completed_elapsed_ms: None,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
+            last_poll_diagnostics: None,
             next_wake_at: None,
         }
     }
@@ -934,6 +999,7 @@ impl NativeRenderLoopState {
     }
 
     pub fn apply_poll_result(&mut self, poll_result: &NativePollResult, real_os_input: bool) {
+        self.last_poll_diagnostics = poll_result.diagnostics.clone();
         if poll_result.dirty {
             self.last_scheduler_reason = poll_result.scheduler_reason.or_else(|| {
                 if real_os_input {
@@ -974,6 +1040,8 @@ pub struct NativePollResult {
     pub next_wake_after_ms: Option<u64>,
     pub wants_animation_frame: bool,
     pub cursor_icon: NativeCursorIcon,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<serde_json::Value>,
     #[serde(skip)]
     pub accessibility_update: Option<accesskit::TreeUpdate>,
 }
@@ -988,6 +1056,7 @@ impl NativePollResult {
             next_wake_after_ms: None,
             wants_animation_frame: false,
             cursor_icon: NativeCursorIcon::Default,
+            diagnostics: None,
             accessibility_update: None,
         }
     }
@@ -1189,6 +1258,7 @@ pub struct AppWindowSurfaceProof {
     pub render_loop_state_at_ready: NativeRenderLoopState,
     pub surface_lifecycle: NativeSurfaceLifecycleReport,
     pub resize_wake_count: u64,
+    pub input_event_wake_count: u64,
     pub app_window_surface_content_report: Option<serde_json::Value>,
     pub input_sample_delay_ms: u64,
     pub frame_timing: NativeFrameTimingProof,
@@ -1560,6 +1630,37 @@ async fn run_surface_probe_inner(
     let window_id = WindowId(format!("{}:{window_hash}", options.role.as_str()));
     let mut mouse = Mouse::coalesced().await;
     let keyboard = Keyboard::coalesced().await;
+    let input_event_wake_count = Arc::new(AtomicU64::new(0));
+    let input_event_last_wake_at = Arc::new(Mutex::new(None::<Instant>));
+    let input_event_wake_timeline = Arc::new(Mutex::new(VecDeque::<(u64, Instant)>::new()));
+    {
+        let input_event_wake_count = Arc::clone(&input_event_wake_count);
+        let input_event_last_wake_at = Arc::clone(&input_event_last_wake_at);
+        let input_event_wake_timeline = Arc::clone(&input_event_wake_timeline);
+        let input_wake_handle = wake_handle.clone();
+        mouse.on_input_event(move || {
+            record_input_event_wake(
+                &input_event_wake_count,
+                &input_event_last_wake_at,
+                &input_event_wake_timeline,
+            );
+            input_wake_handle.wake();
+        });
+    }
+    {
+        let input_event_wake_count = Arc::clone(&input_event_wake_count);
+        let input_event_last_wake_at = Arc::clone(&input_event_last_wake_at);
+        let input_event_wake_timeline = Arc::clone(&input_event_wake_timeline);
+        let input_wake_handle = wake_handle.clone();
+        keyboard.on_input_event(move || {
+            record_input_event_wake(
+                &input_event_wake_count,
+                &input_event_last_wake_at,
+                &input_event_wake_timeline,
+            );
+            input_wake_handle.wake();
+        });
+    }
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     if WGPU_SURFACE_STRATEGY == WGPUStrategy::NotMainThread
@@ -1741,6 +1842,8 @@ async fn run_surface_probe_inner(
                             None,
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
+                                input_event_wake_count.load(Ordering::Relaxed),
+                                None,
                                 &app_surface,
                                 None,
                             ),
@@ -1812,6 +1915,8 @@ async fn run_surface_probe_inner(
                 None,
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
+                    input_event_wake_count.load(Ordering::Relaxed),
+                    None,
                     &app_surface,
                     None,
                 ),
@@ -1981,6 +2086,8 @@ async fn run_surface_probe_inner(
                             None,
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
+                                input_event_wake_count.load(Ordering::Relaxed),
+                                None,
                                 &app_surface,
                                 Some(&input_adapter),
                             ),
@@ -2103,6 +2210,7 @@ async fn run_surface_probe_inner(
         render_loop_state_at_ready: render_loop_state.clone(),
         surface_lifecycle: surface_lifecycle.report().clone(),
         resize_wake_count: resize_wake_count.load(Ordering::Relaxed),
+        input_event_wake_count: input_event_wake_count.load(Ordering::Relaxed),
         app_window_surface_content_report: app_window_surface_content_report(&app_surface),
         input_sample_delay_ms: options.input_sample_delay_ms,
         frame_timing,
@@ -2116,6 +2224,14 @@ async fn run_surface_probe_inner(
     let mut input_cursor = NativeInputCursor::default();
     let mut last_wake_generation = 0;
     let mut last_interactive_readback_artifact: Option<AppWindowReadbackArtifact> = None;
+    let mut last_interactive_readback_finish_ms: Option<f64> = None;
+    let mut last_interactive_readback_completed_elapsed_ms: Option<f64> = None;
+    let mut last_interactive_surface_readback_queued = false;
+    let mut last_interactive_surface_readback_skipped_for_external_proof = false;
+    let mut last_interactive_surface_readback_pending = false;
+    let mut last_render_loop_report_write_ms: Option<f64> = None;
+    let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+    let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     loop {
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
@@ -2173,6 +2289,8 @@ async fn run_surface_probe_inner(
         let input_sample_started = Instant::now();
         let input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
         let input_sample_elapsed = input_sample_started.elapsed();
+        let sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        last_sampled_input_event_wake_count = sampled_input_event_wake_count;
         let accessibility_started = Instant::now();
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
@@ -2214,7 +2332,8 @@ async fn run_surface_probe_inner(
                 render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
-        } else if input.real_os_events_observed {
+        } else if input.real_os_events_observed && !native_input_delta_is_button_press_only(&input)
+        {
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
             render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
         }
@@ -2226,10 +2345,12 @@ async fn run_surface_probe_inner(
                 wake_generation,
                 hold_started.elapsed().as_secs_f64() * 1000.0,
             );
-            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::ExternalWake);
-            render_loop_state.scheduled_wake_count =
-                render_loop_state.scheduled_wake_count.saturating_add(1);
-            continue;
+            if !render_loop_state.should_render(Instant::now(), false) {
+                render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::ExternalWake);
+                render_loop_state.scheduled_wake_count =
+                    render_loop_state.scheduled_wake_count.saturating_add(1);
+                continue;
+            }
         }
         if !render_loop_state.should_render(Instant::now(), false) {
             let bookkeeping_elapsed = bookkeeping_started.elapsed();
@@ -2322,6 +2443,11 @@ async fn run_surface_probe_inner(
                             last_interactive_readback_artifact.as_ref(),
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
+                                input_event_wake_count.load(Ordering::Relaxed),
+                                input_event_last_wake_elapsed_ms(
+                                    &input_event_last_wake_at,
+                                    hold_started,
+                                ),
                                 &app_surface,
                                 Some(&observed_input_adapter),
                             ),
@@ -2362,35 +2488,47 @@ async fn run_surface_probe_inner(
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
         }
-        let interactive_readback = if options.role == NativeWindowRole::Preview {
-            if let Some(artifact_dir) = options.readback_artifact_dir.as_deref() {
-                Some((
-                    artifact_dir.to_owned(),
-                    queue_visible_surface_readback(
-                        &device,
-                        &mut encoder,
-                        &frame.texture,
-                        options.role,
-                        width.min(480),
-                        height.min(260),
-                        config.format,
-                        &options.title,
-                        surface_id.clone(),
-                        surface_lifecycle.epoch(),
-                    )?,
-                ))
+        let skip_interactive_surface_readback = options
+            .skip_interactive_surface_readback_when_external_proof
+            && options.role == NativeWindowRole::Preview
+            && options.readback_artifact_dir.is_some()
+            && external_render_proof_replaces_interactive_readback(external_render_proof.as_ref());
+        let interactive_readback =
+            if options.role == NativeWindowRole::Preview && !skip_interactive_surface_readback {
+                if let Some(artifact_dir) = options.readback_artifact_dir.as_deref() {
+                    Some((
+                        artifact_dir.to_owned(),
+                        queue_visible_surface_readback(
+                            &device,
+                            &mut encoder,
+                            &frame.texture,
+                            options.role,
+                            width.min(480),
+                            height.min(260),
+                            config.format,
+                            &options.title,
+                            surface_id.clone(),
+                            surface_lifecycle.epoch(),
+                        )?,
+                    ))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
+        last_interactive_surface_readback_queued = interactive_readback.is_some();
+        last_interactive_surface_readback_skipped_for_external_proof =
+            skip_interactive_surface_readback;
         queue.submit(Some(encoder.finish()));
         render_loop_state.note_queue_submitted(hold_started.elapsed().as_secs_f64() * 1000.0);
         frame.present();
+        last_presented_input_event_wake_count = sampled_input_event_wake_count;
         render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
         render_loop_state.note_present_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
+        last_interactive_surface_readback_pending = interactive_readback.is_some();
         if let Some(report) = options.render_loop_state_report.as_deref() {
+            let report_write_started = Instant::now();
             write_render_loop_state_report(
                 Path::new(report),
                 options.role,
@@ -2404,20 +2542,51 @@ async fn run_surface_probe_inner(
                 last_interactive_readback_artifact.as_ref(),
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
+                    input_event_wake_count.load(Ordering::Relaxed),
+                    input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                     &app_surface,
                     Some(&observed_input_adapter),
+                )
+                .with_input_generation(
+                    last_sampled_input_event_wake_count,
+                    last_presented_input_event_wake_count,
+                    input_event_wake_elapsed_ms_for_generation(
+                        &input_event_wake_timeline,
+                        last_sampled_input_event_wake_count,
+                        hold_started,
+                    ),
+                    input_event_wake_elapsed_ms_for_generation(
+                        &input_event_wake_timeline,
+                        last_presented_input_event_wake_count,
+                        hold_started,
+                    ),
+                )
+                .with_interactive_timing(
+                    last_render_loop_report_write_ms,
+                    last_interactive_readback_finish_ms,
+                    last_interactive_readback_completed_elapsed_ms,
+                    last_interactive_surface_readback_queued,
+                    last_interactive_surface_readback_skipped_for_external_proof,
+                    last_interactive_surface_readback_pending,
                 )
                 .with_external_render_proof(external_render_proof.as_ref()),
                 None,
             )?;
+            last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
         }
         if let Some((artifact_dir, pending)) = interactive_readback {
+            let readback_finish_started = Instant::now();
             let mut artifact = finish_visible_surface_readback(&device, pending, &artifact_dir)?;
+            last_interactive_readback_finish_ms = Some(elapsed_ms(readback_finish_started));
+            last_interactive_readback_completed_elapsed_ms =
+                Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+            last_interactive_surface_readback_pending = false;
             artifact.presented_revision = Some(render_loop_state.presented_revision);
             artifact.content_revision = Some(render_loop_state.last_render_content_revision);
             artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
             last_interactive_readback_artifact = Some(artifact);
             if let Some(report) = options.render_loop_state_report.as_deref() {
+                let report_write_started = Instant::now();
                 write_render_loop_state_report(
                     Path::new(report),
                     options.role,
@@ -2431,12 +2600,37 @@ async fn run_surface_probe_inner(
                     last_interactive_readback_artifact.as_ref(),
                     render_loop_report_extras(
                         resize_wake_count.load(Ordering::Relaxed),
+                        input_event_wake_count.load(Ordering::Relaxed),
+                        input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                         &app_surface,
                         Some(&observed_input_adapter),
+                    )
+                    .with_input_generation(
+                        last_sampled_input_event_wake_count,
+                        last_presented_input_event_wake_count,
+                        input_event_wake_elapsed_ms_for_generation(
+                            &input_event_wake_timeline,
+                            last_sampled_input_event_wake_count,
+                            hold_started,
+                        ),
+                        input_event_wake_elapsed_ms_for_generation(
+                            &input_event_wake_timeline,
+                            last_presented_input_event_wake_count,
+                            hold_started,
+                        ),
+                    )
+                    .with_interactive_timing(
+                        last_render_loop_report_write_ms,
+                        last_interactive_readback_finish_ms,
+                        last_interactive_readback_completed_elapsed_ms,
+                        last_interactive_surface_readback_queued,
+                        last_interactive_surface_readback_skipped_for_external_proof,
+                        last_interactive_surface_readback_pending,
                     )
                     .with_external_render_proof(external_render_proof.as_ref()),
                     None,
                 )?;
+                last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
             }
         }
         if loop_mode == NativeRenderLoopMode::ContinuousProbe {
@@ -2457,8 +2651,32 @@ async fn run_surface_probe_inner(
             last_interactive_readback_artifact.as_ref(),
             render_loop_report_extras(
                 resize_wake_count.load(Ordering::Relaxed),
+                input_event_wake_count.load(Ordering::Relaxed),
+                input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                 &app_surface,
                 Some(&observed_input_adapter),
+            )
+            .with_input_generation(
+                last_sampled_input_event_wake_count,
+                last_presented_input_event_wake_count,
+                input_event_wake_elapsed_ms_for_generation(
+                    &input_event_wake_timeline,
+                    last_sampled_input_event_wake_count,
+                    hold_started,
+                ),
+                input_event_wake_elapsed_ms_for_generation(
+                    &input_event_wake_timeline,
+                    last_presented_input_event_wake_count,
+                    hold_started,
+                ),
+            )
+            .with_interactive_timing(
+                last_render_loop_report_write_ms,
+                last_interactive_readback_finish_ms,
+                last_interactive_readback_completed_elapsed_ms,
+                last_interactive_surface_readback_queued,
+                last_interactive_surface_readback_skipped_for_external_proof,
+                last_interactive_surface_readback_pending,
             )
             .with_external_render_proof(external_render_proof.as_ref()),
             None,
@@ -2577,12 +2795,57 @@ fn acquire_surface_texture_for_present(
 #[derive(Clone, Debug, Default)]
 struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
+    input_event_wake_count: u64,
+    last_input_event_wake_elapsed_ms: Option<f64>,
+    sampled_input_event_wake_count: Option<u64>,
+    presented_input_event_wake_count: Option<u64>,
+    sampled_input_event_wake_elapsed_ms: Option<f64>,
+    presented_input_event_wake_elapsed_ms: Option<f64>,
+    last_render_loop_report_write_ms: Option<f64>,
+    last_interactive_readback_finish_ms: Option<f64>,
+    last_interactive_readback_completed_elapsed_ms: Option<f64>,
+    last_interactive_surface_readback_queued: bool,
+    last_interactive_surface_readback_skipped_for_external_proof: bool,
+    last_interactive_surface_readback_pending: bool,
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
     external_render_proof: Option<serde_json::Value>,
 }
 
 impl NativeRenderLoopReportExtras {
+    fn with_input_generation(
+        mut self,
+        sampled: u64,
+        presented: u64,
+        sampled_elapsed_ms: Option<f64>,
+        presented_elapsed_ms: Option<f64>,
+    ) -> Self {
+        self.sampled_input_event_wake_count = Some(sampled);
+        self.presented_input_event_wake_count = Some(presented);
+        self.sampled_input_event_wake_elapsed_ms = sampled_elapsed_ms;
+        self.presented_input_event_wake_elapsed_ms = presented_elapsed_ms;
+        self
+    }
+
+    fn with_interactive_timing(
+        mut self,
+        report_write_ms: Option<f64>,
+        readback_finish_ms: Option<f64>,
+        readback_completed_elapsed_ms: Option<f64>,
+        surface_readback_queued: bool,
+        surface_readback_skipped_for_external_proof: bool,
+        surface_readback_pending: bool,
+    ) -> Self {
+        self.last_render_loop_report_write_ms = report_write_ms;
+        self.last_interactive_readback_finish_ms = readback_finish_ms;
+        self.last_interactive_readback_completed_elapsed_ms = readback_completed_elapsed_ms;
+        self.last_interactive_surface_readback_queued = surface_readback_queued;
+        self.last_interactive_surface_readback_skipped_for_external_proof =
+            surface_readback_skipped_for_external_proof;
+        self.last_interactive_surface_readback_pending = surface_readback_pending;
+        self
+    }
+
     fn with_external_render_proof(mut self, proof: Option<&serde_json::Value>) -> Self {
         self.external_render_proof = proof.cloned();
         self
@@ -2591,14 +2854,145 @@ impl NativeRenderLoopReportExtras {
 
 fn render_loop_report_extras(
     resize_wake_count: u64,
+    input_event_wake_count: u64,
+    last_input_event_wake_elapsed_ms: Option<f64>,
     app_surface: &app_window::surface::Surface,
     observed_input_adapter: Option<&NativeInputAdapterProof>,
 ) -> NativeRenderLoopReportExtras {
     NativeRenderLoopReportExtras {
         resize_wake_count,
+        input_event_wake_count,
+        last_input_event_wake_elapsed_ms,
+        sampled_input_event_wake_count: None,
+        presented_input_event_wake_count: None,
+        sampled_input_event_wake_elapsed_ms: None,
+        presented_input_event_wake_elapsed_ms: None,
+        last_render_loop_report_write_ms: None,
+        last_interactive_readback_finish_ms: None,
+        last_interactive_readback_completed_elapsed_ms: None,
+        last_interactive_surface_readback_queued: false,
+        last_interactive_surface_readback_skipped_for_external_proof: false,
+        last_interactive_surface_readback_pending: false,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
         external_render_proof: None,
+    }
+}
+
+fn record_input_event_wake(
+    input_event_wake_count: &AtomicU64,
+    input_event_last_wake_at: &Mutex<Option<Instant>>,
+    input_event_wake_timeline: &Mutex<VecDeque<(u64, Instant)>>,
+) -> u64 {
+    let wake_at = Instant::now();
+    let generation = input_event_wake_count
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if let Ok(mut last_wake_at) = input_event_last_wake_at.lock() {
+        *last_wake_at = Some(wake_at);
+    }
+    if let Ok(mut timeline) = input_event_wake_timeline.lock() {
+        timeline.push_back((generation, wake_at));
+        while timeline.len() > INPUT_EVENT_WAKE_TIMELINE_LIMIT {
+            timeline.pop_front();
+        }
+    }
+    generation
+}
+
+fn input_event_last_wake_elapsed_ms(
+    input_event_last_wake_at: &Arc<Mutex<Option<Instant>>>,
+    hold_started: Instant,
+) -> Option<f64> {
+    let last_wake_at = input_event_last_wake_at
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)?;
+    last_wake_at
+        .checked_duration_since(hold_started)
+        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+}
+
+fn input_event_wake_elapsed_ms_for_generation(
+    input_event_wake_timeline: &Arc<Mutex<VecDeque<(u64, Instant)>>>,
+    generation: u64,
+    hold_started: Instant,
+) -> Option<f64> {
+    if generation == 0 {
+        return None;
+    }
+    let wake_at = input_event_wake_timeline.lock().ok().and_then(|timeline| {
+        timeline
+            .iter()
+            .rev()
+            .find_map(|(recorded_generation, wake_at)| {
+                (*recorded_generation == generation).then_some(*wake_at)
+            })
+    })?;
+    wake_at
+        .checked_duration_since(hold_started)
+        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+}
+
+fn external_render_proof_has_app_owned_readback(proof: Option<&serde_json::Value>) -> bool {
+    let Some(proof) = proof else {
+        return false;
+    };
+    let app_owned_reused = proof
+        .get("app_owned_readback_reused")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let artifact_hash = proof
+        .pointer("/proof/artifact/artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_sha256_hex_string);
+    app_owned_reused && artifact_hash
+}
+
+fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
+    if external_render_proof_has_app_owned_readback(proof) {
+        return true;
+    }
+    let Some(proof) = proof else {
+        return false;
+    };
+    let visible_rendered = proof
+        .get("visible_surface_rendered")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let visible_present_path = proof
+        .get("visible_present_path")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && proof
+            .pointer("/proof/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let retained_text_changed = proof
+        .pointer("/retained_bound_sync/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && proof
+            .pointer("/retained_bound_sync/changed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && proof
+            .pointer("/retained_bound_sync/text_update_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+    visible_rendered && visible_present_path && proof_pass && retained_text_changed
+}
+
+fn is_sha256_hex_string(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn elapsed_delta_ms(start_ms: Option<f64>, end_ms: Option<f64>) -> Option<f64> {
+    match (start_ms, end_ms) {
+        (Some(start), Some(end)) if end >= start => Some(end - start),
+        _ => None,
     }
 }
 
@@ -2671,6 +3065,72 @@ fn write_render_loop_state_report(
     let input_polls_per_second = state.input_poll_count as f64 / elapsed_seconds;
     let renders_per_second = state.rendered_frame_count as f64 / elapsed_seconds;
     let idle_poll_count = state.skipped_idle_poll_count.max(1) as f64;
+    let presented_input_wake_elapsed_ms = extras
+        .presented_input_event_wake_elapsed_ms
+        .or(extras.sampled_input_event_wake_elapsed_ms);
+    let input_wake_to_dirty_poll_ms = elapsed_delta_ms(
+        presented_input_wake_elapsed_ms,
+        state.last_dirty_poll_elapsed_ms,
+    );
+    let input_wake_to_present_ms = elapsed_delta_ms(
+        presented_input_wake_elapsed_ms,
+        state.last_present_completed_elapsed_ms,
+    );
+    let input_wake_to_poll_started_ms = elapsed_delta_ms(
+        presented_input_wake_elapsed_ms,
+        state.last_poll_started_elapsed_ms,
+    );
+    let poll_started_to_dirty_poll_ms = elapsed_delta_ms(
+        state.last_poll_started_elapsed_ms,
+        state.last_dirty_poll_elapsed_ms,
+    );
+    let dirty_poll_to_render_started_ms = elapsed_delta_ms(
+        state.last_dirty_poll_elapsed_ms,
+        state.last_render_started_elapsed_ms,
+    );
+    let render_started_to_surface_acquired_ms = elapsed_delta_ms(
+        state.last_render_started_elapsed_ms,
+        state.last_surface_acquired_elapsed_ms,
+    );
+    let surface_acquired_to_render_hook_completed_ms = elapsed_delta_ms(
+        state.last_surface_acquired_elapsed_ms,
+        state.last_render_hook_completed_elapsed_ms,
+    );
+    let render_hook_to_queue_ms = elapsed_delta_ms(
+        state.last_render_hook_completed_elapsed_ms,
+        state.last_queue_submitted_elapsed_ms,
+    );
+    let poll_started_to_queue_ms = elapsed_delta_ms(
+        state.last_poll_started_elapsed_ms,
+        state.last_queue_submitted_elapsed_ms,
+    );
+    let render_started_to_queue_ms = elapsed_delta_ms(
+        state.last_render_started_elapsed_ms,
+        state.last_queue_submitted_elapsed_ms,
+    );
+    let wake_to_queue_ms = elapsed_delta_ms(
+        presented_input_wake_elapsed_ms,
+        state.last_queue_submitted_elapsed_ms,
+    );
+    let queue_to_present_ms = match (
+        state.last_queue_submitted_elapsed_ms,
+        state.last_present_completed_elapsed_ms,
+    ) {
+        (Some(queue_ms), Some(present_ms)) if present_ms >= queue_ms => Some(present_ms - queue_ms),
+        _ => None,
+    };
+    let present_to_readback_report_ms = match (
+        state.last_present_completed_elapsed_ms,
+        extras.last_interactive_readback_completed_elapsed_ms,
+    ) {
+        (Some(present_ms), Some(readback_ms)) if readback_ms >= present_ms => {
+            Some(readback_ms - present_ms)
+        }
+        _ => None,
+    };
+    let stale_for_latest_input = extras
+        .presented_input_event_wake_count
+        .is_some_and(|presented| presented < extras.input_event_wake_count);
     let active_timer_reason = state.next_wake_at.map(|_| {
         if state.current_scheduler_reason == Some(NativeSchedulerReason::Timer) {
             "timer_due"
@@ -2732,6 +3192,7 @@ fn write_render_loop_state_report(
         "last_render_hook_completed_elapsed_ms": state.last_render_hook_completed_elapsed_ms,
         "last_queue_submitted_elapsed_ms": state.last_queue_submitted_elapsed_ms,
         "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
+        "last_poll_diagnostics": state.last_poll_diagnostics,
         "loop_exit_reason": state.loop_exit_reason,
         "forced_frame_count": state.forced_frame_count,
         "renders_per_second": renders_per_second,
@@ -2739,6 +3200,40 @@ fn write_render_loop_state_report(
         "active_timer_reason": active_timer_reason,
         "passive_input_poll_interval_ms": PASSIVE_INPUT_POLL_INTERVAL.as_millis() as u64,
         "resize_wake_count": extras.resize_wake_count,
+        "input_event_wake_count": extras.input_event_wake_count,
+        "sampled_input_event_wake_count": extras.sampled_input_event_wake_count,
+        "presented_input_event_wake_count": extras.presented_input_event_wake_count,
+        "stale_for_latest_input": stale_for_latest_input,
+        "last_input_event_wake_elapsed_ms": extras.last_input_event_wake_elapsed_ms,
+        "sampled_input_event_wake_elapsed_ms": extras.sampled_input_event_wake_elapsed_ms,
+        "presented_input_event_wake_elapsed_ms": extras.presented_input_event_wake_elapsed_ms,
+        "frame_input_wake_elapsed_ms": presented_input_wake_elapsed_ms,
+        "input_wake_timing_source": if extras.presented_input_event_wake_elapsed_ms.is_some() {
+            "presented_input_generation"
+        } else if extras.sampled_input_event_wake_elapsed_ms.is_some() {
+            "sampled_input_generation"
+        } else {
+            "missing_generation_timestamp"
+        },
+        "input_wake_to_dirty_poll_ms": input_wake_to_dirty_poll_ms,
+        "input_wake_to_poll_started_ms": input_wake_to_poll_started_ms,
+        "poll_started_to_dirty_poll_ms": poll_started_to_dirty_poll_ms,
+        "dirty_poll_to_render_started_ms": dirty_poll_to_render_started_ms,
+        "render_started_to_surface_acquired_ms": render_started_to_surface_acquired_ms,
+        "surface_acquired_to_render_hook_completed_ms": surface_acquired_to_render_hook_completed_ms,
+        "render_hook_to_queue_ms": render_hook_to_queue_ms,
+        "poll_started_to_queue_ms": poll_started_to_queue_ms,
+        "render_started_to_queue_ms": render_started_to_queue_ms,
+        "input_wake_to_present_ms": input_wake_to_present_ms,
+        "wake_to_queue_ms": wake_to_queue_ms,
+        "queue_to_present_ms": queue_to_present_ms,
+        "present_to_readback_report_ms": present_to_readback_report_ms,
+        "last_render_loop_report_write_ms": extras.last_render_loop_report_write_ms,
+        "last_interactive_readback_finish_ms": extras.last_interactive_readback_finish_ms,
+        "last_interactive_readback_completed_elapsed_ms": extras.last_interactive_readback_completed_elapsed_ms,
+        "last_interactive_surface_readback_queued": extras.last_interactive_surface_readback_queued,
+        "last_interactive_surface_readback_skipped_for_external_proof": extras.last_interactive_surface_readback_skipped_for_external_proof,
+        "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
         "last_external_render_proof": extras.external_render_proof,
@@ -3294,6 +3789,16 @@ fn accept_input_cursor(
     cursor.accept(input);
 }
 
+fn native_input_delta_is_button_press_only(input: &NativeInputAdapterProof) -> bool {
+    let has_press = input.mouse_button_events.iter().any(|event| event.pressed);
+    let has_release = input.mouse_button_events.iter().any(|event| !event.pressed);
+    has_press
+        && !has_release
+        && input.keyboard_events.is_empty()
+        && input.scroll_delta_x == 0.0
+        && input.scroll_delta_y == 0.0
+}
+
 fn mouse_button_label(button: u8) -> &'static str {
     match button {
         MOUSE_BUTTON_LEFT => "left",
@@ -3406,7 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn demand_driven_idle_wait_uses_slow_passive_input_poll() {
+    fn demand_driven_idle_wait_uses_frame_class_passive_input_poll() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
         state.mark_presented(state.dirty_revision);
@@ -3414,7 +3919,12 @@ mod tests {
         assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
 
         state.schedule_wake_after(now, Duration::from_millis(30));
-        assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(30));
+        assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
+
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+        state.schedule_wake_after(now, Duration::from_millis(4));
+        assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(4));
     }
 
     #[test]
@@ -3434,6 +3944,32 @@ mod tests {
         assert_eq!(
             state.last_idle_wait_wake_reason.as_deref(),
             Some("external_wake")
+        );
+    }
+
+    #[test]
+    fn elapsed_delta_ms_only_reports_forward_time() {
+        assert_eq!(elapsed_delta_ms(Some(10.0), Some(14.5)), Some(4.5));
+        assert_eq!(elapsed_delta_ms(Some(14.5), Some(10.0)), None);
+        assert_eq!(elapsed_delta_ms(None, Some(10.0)), None);
+        assert_eq!(elapsed_delta_ms(Some(10.0), None), None);
+    }
+
+    #[test]
+    fn input_event_wake_elapsed_ms_uses_generation_timeline() {
+        let hold_started = Instant::now();
+        let timeline = Arc::new(Mutex::new(VecDeque::from([
+            (1, hold_started + Duration::from_millis(3)),
+            (2, hold_started + Duration::from_millis(7)),
+        ])));
+
+        assert_eq!(
+            input_event_wake_elapsed_ms_for_generation(&timeline, 2, hold_started),
+            Some(7.0)
+        );
+        assert_eq!(
+            input_event_wake_elapsed_ms_for_generation(&timeline, 3, hold_started),
+            None
         );
     }
 
@@ -3522,6 +4058,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                diagnostics: None,
                 accessibility_update: None,
             },
             false,
@@ -3536,6 +4073,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                diagnostics: None,
                 accessibility_update: None,
             },
             false,
@@ -3853,6 +4391,7 @@ mod tests {
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
+            diagnostics: None,
             accessibility_update: None,
         };
 
@@ -3885,6 +4424,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                diagnostics: None,
                 accessibility_update: None,
             },
             true,
@@ -3909,6 +4449,7 @@ mod tests {
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
+            diagnostics: None,
             accessibility_update: None,
         };
 
@@ -3939,6 +4480,7 @@ mod tests {
             next_wake_after_ms: Some(16),
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: true,
+            diagnostics: None,
             accessibility_update: None,
         };
 
@@ -4124,6 +4666,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                diagnostics: None,
                 accessibility_update: None,
             },
             false,
@@ -4140,6 +4683,7 @@ mod tests {
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
+                diagnostics: None,
                 accessibility_update: None,
             },
             true,
@@ -4212,6 +4756,39 @@ mod tests {
         assert_eq!(cursor.last_mouse_button_sequence, 7);
         assert_eq!(cursor.last_keyboard_sequence, 11);
         assert_eq!(cursor.last_mouse_scroll_event_count, 3);
+    }
+
+    #[test]
+    fn button_press_only_input_delta_is_coalescible() {
+        let press_only = NativeInputAdapterProof {
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+            }],
+            ..empty_input_adapter_proof(false)
+        };
+        let click_pair = NativeInputAdapterProof {
+            mouse_button_events: vec![
+                NativeMouseButtonEventProof {
+                    sequence: 7,
+                    button: "left".to_owned(),
+                    pressed: true,
+                    window_protocol_id: Some(42),
+                },
+                NativeMouseButtonEventProof {
+                    sequence: 8,
+                    button: "left".to_owned(),
+                    pressed: false,
+                    window_protocol_id: Some(42),
+                },
+            ],
+            ..empty_input_adapter_proof(false)
+        };
+
+        assert!(native_input_delta_is_button_press_only(&press_only));
+        assert!(!native_input_delta_is_button_press_only(&click_pair));
     }
 
     #[test]
@@ -4391,6 +4968,24 @@ mod tests {
                 .map(|mapping| accesskit::NodeId(mapping.accesskit_node_id))
                 .unwrap()
         );
+        let focus_update =
+            accesskit_focus_update_from_semantic_node(&input_id, scene.nodes.get(&input_id));
+        assert_eq!(focus_update.tree_update.focus, snapshot.tree_update.focus);
+        assert!(
+            focus_update.tree_update.tree.is_none(),
+            "focus-only updates must not republish unchanged tree metadata"
+        );
+        assert_eq!(
+            focus_update.tree_update.nodes.len(),
+            1,
+            "focused-node patch should upsert only the changed semantic node"
+        );
+        assert_eq!(
+            focus_update.tree_update.nodes[0].0,
+            snapshot.tree_update.focus
+        );
+        assert_eq!(focus_update.metrics.accesskit_node_count, 1);
+        assert!(focus_update.metrics.focus_present);
 
         let root = snapshot
             .tree_update

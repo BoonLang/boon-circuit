@@ -12,6 +12,23 @@ limitation, fix the engine instead of writing a Boon-level workaround. A
 workaround is acceptable only as a temporary diagnostic step while proving the
 engine bug, and it must not be left as the final implementation.
 
+For Cells/native performance work, do not get trapped in a loop of tiny local
+optimizations after the same gate keeps failing. Once fresh measurements show
+the same class of blocker repeatedly, zoom out and reassess the architecture:
+input scheduling, retained layout/render state, runtime currentness,
+readback/verification design, and the Boon example structure are all valid
+places to change. It is acceptable to simplify or restructure example Boon code
+when that makes the intended app cleaner, but do not hide engine limitations in
+example-specific hacks.
+
+When the user asks for or explicitly permits parallel help, use subagents for
+independent reads before continuing micro-fixes. Good splits include native
+input/event-shape analysis, retained WGPU/render/readback architecture,
+runtime/list/currentness design, and external architecture research on how
+spreadsheet-like apps keep selection, editing, and scrolling at 60 FPS. Fold
+their findings into a larger implementation plan instead of treating each
+finding as another isolated patch.
+
 Do not fabricate human-observation reports. Human testing is a separate
 follow-up after the native GPU gates pass, and it must not be used as a shortcut
 for native GPU verifier evidence.

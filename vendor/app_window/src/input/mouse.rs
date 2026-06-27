@@ -13,6 +13,7 @@ pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) use macos as sys;
 use std::ffi::c_void;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 
 #[cfg(target_arch = "wasm32")]
@@ -31,6 +32,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+
+type InputWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Mouse button constant for the left mouse button.
 ///
@@ -213,7 +216,6 @@ impl MouseWindowLocation {
     }
 }
 
-#[derive(Debug)]
 struct Shared {
     window: std::sync::Mutex<Option<MouseWindowLocation>>,
 
@@ -227,7 +229,36 @@ struct Shared {
     scroll_event_count: AtomicU64,
     total_event_count: AtomicU64,
     recent_button_events: Mutex<VecDeque<MouseButtonEventRecord>>,
+    input_wake_callbacks: Mutex<Vec<InputWakeCallback>>,
 }
+
+impl fmt::Debug for Shared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shared")
+            .field(
+                "last_window_protocol_id",
+                &self.last_window_protocol_id.load(Ordering::Relaxed),
+            )
+            .field(
+                "motion_event_count",
+                &self.motion_event_count.load(Ordering::Relaxed),
+            )
+            .field(
+                "button_event_count",
+                &self.button_event_count.load(Ordering::Relaxed),
+            )
+            .field(
+                "scroll_event_count",
+                &self.scroll_event_count.load(Ordering::Relaxed),
+            )
+            .field(
+                "total_event_count",
+                &self.total_event_count.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl Shared {
     fn new() -> Self {
         Shared {
@@ -242,6 +273,14 @@ impl Shared {
             scroll_event_count: AtomicU64::new(0),
             total_event_count: AtomicU64::new(0),
             recent_button_events: Mutex::new(VecDeque::new()),
+            input_wake_callbacks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn notify_input_event(&self) {
+        let callbacks = self.input_wake_callbacks.lock().unwrap().clone();
+        for callback in callbacks {
+            callback();
         }
     }
 
@@ -251,6 +290,7 @@ impl Shared {
             .store(window as usize as u64, Ordering::Relaxed);
         event_counter.fetch_add(1, Ordering::Relaxed);
         self.total_event_count.fetch_add(1, Ordering::Relaxed);
+        self.notify_input_event();
     }
 
     fn set_window_location(&self, location: MouseWindowLocation) {
@@ -281,6 +321,8 @@ impl Shared {
         while recent_events.len() > 256 {
             recent_events.pop_front();
         }
+        drop(recent_events);
+        self.notify_input_event();
     }
 
     fn add_scroll_delta(&self, delta_x: f64, delta_y: f64, window: *mut c_void) {
@@ -466,6 +508,20 @@ impl Mouse {
                 .copied()
                 .collect(),
         }
+    }
+
+    /// Registers a lightweight callback that runs whenever platform mouse input
+    /// updates the coalesced state. The callback must not consume mouse deltas or
+    /// block; demand-driven render loops use it only to interrupt an idle wait.
+    pub fn on_input_event<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.shared
+            .input_wake_callbacks
+            .lock()
+            .unwrap()
+            .push(Arc::new(callback));
     }
 
     /// Injects a deterministic in-process mouse sample for app-owned window tests.

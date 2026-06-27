@@ -202,9 +202,11 @@ FUNCTION cell_view(cell) {
             width: 80
             height: 24
             background: [color: Oklch[lightness:1]]
+            __selected_background: Oklch[lightness:0.94,chroma:0.045,hue:250]
             border: [color: Oklch[lightness:0.91,chroma:0.02,hue:250]]
+            __selected_border: Oklch[lightness:0.58,chroma:0.18,hue:250]
+            border_width: 1
             selected: cell.address == store.selected_address
-            outline: [color: Oklch[lightness:0.58,chroma:0.18,hue:250]]
             font: [size: 10, color: Oklch[lightness:0.12]]
         ]
         label: cell.display_text

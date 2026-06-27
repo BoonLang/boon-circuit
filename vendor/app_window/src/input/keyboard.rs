@@ -125,13 +125,15 @@ pub(crate) use linux as sys;
 use crate::application::is_main_thread_running;
 use crate::input::keyboard::key::KeyboardKey;
 use crate::input::keyboard::sys::PlatformCoalescedKeyboard;
+use std::fmt;
+
+type InputWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Internal shared state for keyboard tracking.
 ///
 /// This struct is shared between the public `Keyboard` API and the platform-specific
 /// implementations. It maintains the current state of all keyboard keys using atomic
 /// operations for thread safety.
-#[derive(Debug)]
 struct Shared {
     /// Array of atomic booleans tracking the pressed state of each key.
     /// Indexed by the numeric value of `KeyboardKey`.
@@ -141,6 +143,26 @@ struct Shared {
     last_window_protocol_id: AtomicU64,
     key_event_count: AtomicU64,
     recent_events: Mutex<VecDeque<KeyboardEventRecord>>,
+    input_wake_callbacks: Mutex<Vec<InputWakeCallback>>,
+}
+
+impl fmt::Debug for Shared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shared")
+            .field(
+                "last_window_protocol_id",
+                &self
+                    .last_window_protocol_id
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "key_event_count",
+                &self
+                    .key_event_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +195,14 @@ impl Shared {
             last_window_protocol_id: AtomicU64::new(0),
             key_event_count: AtomicU64::new(0),
             recent_events: Mutex::new(VecDeque::new()),
+            input_wake_callbacks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn notify_input_event(&self) {
+        let callbacks = self.input_wake_callbacks.lock().unwrap().clone();
+        for callback in callbacks {
+            callback();
         }
     }
 
@@ -216,7 +246,9 @@ impl Shared {
         while recent_events.len() > 256 {
             recent_events.pop_front();
         }
+        drop(recent_events);
         self.key_states[key as usize].store(state, std::sync::atomic::Ordering::Relaxed);
+        self.notify_input_event();
     }
 }
 
@@ -405,6 +437,20 @@ impl Keyboard {
                 .copied()
                 .collect(),
         }
+    }
+
+    /// Registers a lightweight callback that runs whenever platform keyboard
+    /// input updates the coalesced state. The callback must not block; render
+    /// loops use it only to interrupt an idle wait.
+    pub fn on_input_event<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.shared
+            .input_wake_callbacks
+            .lock()
+            .unwrap()
+            .push(Arc::new(callback));
     }
 
     /// Injects a deterministic in-process keyboard sample for app-owned window

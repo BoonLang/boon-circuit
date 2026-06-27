@@ -1116,6 +1116,19 @@ impl SemanticScene {
         scene
     }
 
+    pub fn node_from_document_layout(
+        document: &DocumentFrame,
+        layout: &LayoutFrame,
+        node_id: &DocumentNodeId,
+    ) -> Option<SemanticNode> {
+        let node = document.nodes.get(node_id)?;
+        let item = layout
+            .display_list
+            .iter()
+            .find(|item| item.node == *node_id);
+        Some(semantic_node_from_document_node(document, node, item))
+    }
+
     pub fn from_world_editor_tree(tree: &boon_scene_model::WorldSemanticEditorTree) -> Self {
         let mut scene = Self {
             root: Some(SemanticId::from_world_editor_node_id(&tree.root)),
@@ -4160,6 +4173,16 @@ impl LayoutBuilder<'_, '_> {
             .as_ref()
             .map(|record| record.identity)
             .unwrap_or_else(|| computed_style_identity(&node.style));
+        let mut display_style = node.style.clone();
+        if matches!(node.kind, DocumentNodeKind::TextInput)
+            && !display_style.contains_key("placeholder")
+            && let Some(placeholder) = layout_text(&node.style, typed_layout, "placeholder")
+        {
+            display_style.insert(
+                "placeholder".to_owned(),
+                StyleValue::Text(placeholder.to_owned()),
+            );
+        }
         let centered = layout_bool(&node.style, typed_layout, "center").unwrap_or(false);
         let align_x = layout_text(&node.style, typed_layout, "align_x").unwrap_or_default();
         let mut node_x = if centered && width < available_width {
@@ -4181,7 +4204,7 @@ impl LayoutBuilder<'_, '_> {
             },
             text,
             style_identity,
-            style: node.style.clone(),
+            style: display_style,
             focused: self.document.focus.as_ref() == Some(&node.id),
         });
         let subtree_display_start = self.display_list.len();

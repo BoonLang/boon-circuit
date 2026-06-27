@@ -22167,3 +22167,873 @@ Evidence:
   produced for the current dirty worktree.
 - Matching replay/Cells `boon_cli` processes were terminated after the stop
   decision so the machine is not left running background benchmark work.
+
+## 2026-06-27 - Cells Release Benchmark Wrapper Refreshed
+
+Status: The missing Cells release benchmark wrapper blocker is cleared for the
+current worktree. This does not clear the broader Cells/native visible-click
+60 FPS blocker.
+
+What changed:
+
+- `bench-example` now copies the linked speed report's multi-file source hash
+  and source manifest into the wrapper report instead of hashing only
+  `examples/cells.bn`.
+- `List/find_value` now reuses an already-built text lookup index for read-only
+  lookup paths before falling back to the linear storage scan. This keeps the
+  generic formula/currentness path from rescanning indexed text fields when the
+  index is already initialized.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime`
+- `cargo test -q -p boon_runtime cells_ -- --nocapture`: 21 passed.
+- `cargo test -q -p boon_runtime list_existing_text_index_lookup_is_read_only_and_ordered -- --nocapture`: 1 passed.
+- `target/debug/xtask bench-example cells --iterations 20 --report target/reports/bytes-plan/cells-release-benchmark.json --speed-report target/reports/bytes-plan/cells-release-benchmark-speed.json`: passed and wrote a fresh wrapper.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/cells-release-benchmark.json target/reports/bytes-plan/cells-release-benchmark-speed.json`
+- `cargo check -q -p xtask -p boon_native_playground`
+
+Latest speed facts:
+
+- Speed report:
+  `target/reports/bytes-plan/cells-release-benchmark-speed.json`.
+- Wrapper report:
+  `target/reports/bytes-plan/cells-release-benchmark.json`.
+- `status="pass"`.
+- `source_hash="9a8725d2d9cde3f8c648d92d417b3724289b7fde953632c34643cffe8df37dc6"` in both reports.
+- `input_to_idle_ms_p95=3.905211` against the `4.0ms` budget.
+- `input_to_idle_ms_max=4.393698` against the `8.0ms` budget.
+- `rows_scanned_p95=0`, `rows_scanned_max=0`.
+- `source_action_eval_ms_p95=3.157171`.
+- `source_actions_ms_p95=3.250801`.
+
+Remaining blocker:
+
+- The native visible-click e2e gate still failed in the current rerun on
+  outer click-to-formula timing. Do not use this CLI/runtime benchmark as proof
+  that user-visible Cells clicking is fixed.
+
+## 2026-06-27 - Cells Compare Demand-Current Policy and Aggregate Refresh
+
+Status: BYTES/MachinePlan aggregate refreshed and passing for the current
+worktree. This does not complete Phase 10 or the broader unified goal.
+
+What changed:
+
+- `run-plan-scenario-events` now reports an explicit
+  `legacy_comparison_acceptance` object when legacy semantic deltas differ only
+  because PlanExecutor demand-current evaluation coalesces transient derived
+  `FieldSet` deltas.
+- The raw `legacy_comparison.semantic_delta_match=false` and
+  `legacy_comparison.passed=false` remain visible in the Cells compare report.
+  The report passes only through the separate, schema-checked
+  `demand-current-coalesced-semantic-deltas` acceptance.
+- The report schema now re-validates this policy from the per-step delta arrays:
+  PlanExecutor must emit no extra deltas, every mismatched step must preserve
+  touched state, and omitted legacy deltas must be transient demand-current
+  `FieldSet` values for `display_text`, `value`, or `error`.
+- Refreshed the stale BYTES/MachinePlan child reports after rebuilding
+  `boon_cli` and `xtask`, then regenerated the adversarial aggregate child so
+  its artifact hashes point at the fresh child reports.
+
+Evidence:
+
+- `cargo check -p boon_runtime -p boon_report_schema`
+- `cargo test -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture`
+- `target/debug/boon_cli run examples/cells.bn --scenario examples/cells.scn --engine compare --report target/reports/bytes-plan/cells-plan-compare.json`
+- `cargo run -p xtask -- verify-report-schema target/reports/bytes-plan/cells-plan-compare.json`
+- Replayed stale child reports from
+  `target/reports/bytes-plan/bytes-machine-plan-all.json` `command_argv`
+  entries; logs are under the path recorded in
+  `target/reports/bytes-plan/logs/latest-refresh-dir.txt`.
+- `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-adversarial.json`
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`
+
+Latest report facts:
+
+- `target/reports/bytes-plan/cells-plan-compare.json`: `status="pass"`,
+  `legacy_comparison.state_match=true`,
+  `legacy_comparison.semantic_delta_match=false`,
+  `legacy_comparison_acceptance.accepted=true`,
+  `legacy_comparison_acceptance.kind="demand-current-coalesced-semantic-deltas"`,
+  `legacy_comparison_acceptance.extra_plan_delta_count=0`,
+  `legacy_comparison_acceptance.missing_delta_field_paths=["display_text","value"]`.
+- `target/reports/bytes-plan/bytes-machine-plan-all.json`: `status="pass"`,
+  `child_count=56`, `blocker_count=0`,
+  `worktree_fingerprint="e1cf51e5bcb8422cbea31804d90cf50ac5563550b3629e7b4940db690bb3b50a"`.
+- `target/reports/bytes-plan/goal-readiness.json` still fails, but the
+  BYTES/MachinePlan aggregate blockers are gone.
+
+Remaining blockers:
+
+- Readiness still reports `8` partial phases in the progress ledger.
+- `target/reports/runtime-production-hardening.json`,
+  `target/reports/runtime-finality.json`,
+  `target/reports/debug/machine-readiness.json`, and
+  `target/reports/schema.json` are stale for current HEAD.
+- Phase 10 default switch has not happened; `boon_cli run` still defaults to
+  legacy.
+- This aggregate refresh is not proof that the native Cells visible-click 60 FPS
+  gate is fixed.
+
+## 2026-06-27 - Readiness Refresh Continued Into Native Preview E2E
+
+Status: U1 readiness refresh is still blocked, but the stale report blocker was
+narrowed to a concrete native TodoMVC preview E2E failure.
+
+Evidence:
+
+- `target/debug/xtask verify-runtime-production-hardening --report target/reports/runtime-production-hardening.json`
+  passed and refreshed the runtime hardening report for current
+  `git_commit="daf4049"`.
+- `target/debug/xtask verify-runtime-finality --report target/reports/runtime-finality.json`
+  passed and refreshed the runtime finality report for current
+  `git_commit="daf4049"`.
+- `target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json`
+  still failed because required native/genericity child reports were stale.
+- Refreshing `target/reports/native-gpu/preview-e2e-todomvc.json` now uses the
+  isolated Weston real-window harness when available, proves headed visual
+  cursor/readback, proves visible reality, and reports retained
+  `cached-derived-retained-keys` rendering for the preview surface.
+
+Current blocker:
+
+- `target/reports/native-gpu/preview-e2e-todomvc.json` still has
+  `status="fail"` because the final TodoMVC operator-host-input batches return
+  diagnostic-only failures. The uncovered manifest labels are:
+  `clear-completed`, `delete-clean-room`, `add-after-clear-type`,
+  `add-after-clear-submit`, `toggle-all-single-after-clear`, and
+  `clear-all-rows`.
+
+Next executable slice:
+
+- Fix the final TodoMVC preview E2E operator-host-input batches, then refresh
+  the dependent machine-readiness children and rerun `audit-machine-readiness`
+  and `audit-goal-readiness`.
+
+## 2026-06-27 - Cells Real Click Measurement Refresh
+
+Status: Cells visible cell-click-to-formula-bar timing is now freshly measured
+through the native real-click gate and remains a blocker.
+
+Evidence:
+
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed as expected after writing
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json`.
+- The report used isolated Weston real Wayland pointer clicks plus app-owned
+  WGPU readback; it reports `real_os_input=true` and `operator_host_input=false`.
+- Functional click routing passed in the harness: all 32 click samples updated
+  selected address and formula bar text, including A2 -> `15`, B0 ->
+  `=add(A0,A1)`, C0 -> `=sum(A0:A2)`, and A0 -> `5`.
+- Performance failed the release budget:
+  `click_to_formula_visible_ms_p95=47.08598`,
+  `click_to_formula_visible_ms_max=48.742985`,
+  `input_wake_to_formula_visible_ms_p95=42.838998`, and
+  `click_to_present_ms_p95=44.305448000000005`.
+
+Current blocker:
+
+- This confirms the earlier synthetic/idle measurements were not sufficient for
+  the user-observed problem. Cells must still be optimized on the real
+  cell-click-to-formula-visible path before any 60 FPS claim is valid.
+
+## 2026-06-27 - Cells Real Click Partial Fix, Still Not 60 FPS
+
+Status: the real click-to-formula-visible gate is more honest and faster in the
+right places, but it still fails the 60 FPS budget.
+
+Implemented during this pass:
+
+- Kept selection-proxy focus handling on the selection-proxy overlay path during
+  poll and fallback input handling.
+- Prevented no-op source events from triggering full document summary/layout
+  rebuilds.
+- Replaced the single-entry native preview render-scene cache with a keyed
+  multi-entry cache, improving repeated selected-state rendering.
+- Kept the visible-click proof on app-owned native events plus WGPU visible
+  surface readback; no human screenshot evidence was used.
+
+Fresh verification:
+
+- `cargo fmt --check` passed.
+- `cargo build -p xtask` passed with existing `boon_native_gpu` dead-code
+  warnings.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed as expected after writing a fresh report.
+
+Current report facts:
+
+- All 32 real-click samples functionally pass: selected address and formula bar
+  text update correctly in the harness.
+- `click_to_formula_visible_ms_p95=67.37768`, max `74.491638`.
+- `click_to_present_ms_p95=58.666265`, max `66.081553`.
+- `input_wake_to_formula_visible_ms_p95=46.68864599999942`.
+- `click_to_readback_after_present_ms=0.6574249999999981`.
+- No full-document relower remains in normal click samples:
+  `targeted_render_patch_paths=31`, `none=1`.
+- Render-scene cache hits now cover 28/32 samples.
+- Remaining blocker is native input routing/focus work: 17/32 samples still use
+  `generic_fallback`, and those samples spend about `17-18ms` in
+  `source_input_ms`, including about `5ms` in focus overlay.
+
+Next executable slice:
+
+- Force real Cells cell clicks onto the `simple_source_click` cached route, or
+  make `generic_fallback` share that route/focus-overlay cache. Then rerun the
+  same visible-click gate and only claim progress from the fresh JSON report.
+
+## 2026-06-27 - Cells Visible Click Diagnostics, Still Failing 60 FPS
+
+Status: the visible-click gate now measures the user's observed scenario more
+directly and exposes the remaining latency sources, but Cells is still not
+60 FPS.
+
+Implemented:
+
+- Reduced the native demand-driven passive input poll cap to `8ms`.
+- Added non-draining native input reject snapshots to preview poll diagnostics.
+- Added per-click native input timing, poll phase timing, interaction timing,
+  and reject counts to the Cells visible-click report.
+- Promoted aggregate simple-vs-fallback click counts to the gate report.
+
+Fresh verification:
+
+- `cargo fmt --check` passed.
+- `cargo build -p xtask` passed with existing `boon_native_gpu` dead-code
+  warnings.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed as expected after writing the current report.
+
+Current report facts:
+
+- All 32 real-click samples functionally pass; selected cell and formula bar
+  text update correctly.
+- `click_to_formula_visible_ms_p95=71.259961`, max `73.727513`.
+- `click_to_present_ms_p95=69.77504400000001`, max `72.144751`.
+- `input_wake_to_formula_visible_ms_p95=54.14562900000078`.
+- `simple_source_click_count=21`, `generic_fallback_count=11`.
+- `native_input_reject_counts={"simple_source_click:button_shape":12}`.
+
+Next executable slice:
+
+- Fix real app-window click batching so cell clicks do not reject
+  `simple_source_click:button_shape`, then reduce first-state render-hook and
+  render/present latency. Do not claim Cells 60 FPS until this same real-click
+  gate passes.
+
+## 2026-06-27 - TASK-0804A Runtime Handoff Refresh
+
+Status: the external TASK-0804A analysis matches the real architecture
+direction. The current tree has already fixed the largest historical runtime
+startup mistake, but Cells is still not a completed 60 FPS fix.
+
+Implemented/confirmed:
+
+- Reverted the visible-click verifier regression caused by launching preview
+  with `--skip-render-hook-app-owned-proof`; visible-click proof still needs
+  the app-owned render proof path.
+- Kept the generic `List/find` indexed route and demand-current
+  `cells.value`/`cells.error` behavior guarded by runtime tests.
+- Added targeted indexed lookup-cache invalidation so a changed row field only
+  invalidates cached lookups for that `(list, field)`, not every unrelated
+  indexed lookup.
+- Added a focused regression test:
+  `indexed_lookup_cache_invalidates_only_changed_list_field`.
+
+Fresh checks:
+
+- `cargo test -p boon_runtime list_index_find -- --nocapture` passed.
+- `cargo test -p boon_runtime cells_value_and_error_are_demand_current_at_startup -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime cells_scenario_runs_and_detects_cycle -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime pure_boon_cells_replacing_reference_removes_stale_dependents -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime indexed_lookup_cache_invalidates_only_changed_list_field -- --nocapture`
+  passed.
+- `cargo fmt --check` passed.
+- `cargo build -q -p boon_native_playground` passed with existing native GPU
+  dead-code warnings.
+- Cells layout-proof startup probe passed:
+  `elapsed=0:06.21`, `cpu=99%`, `maxrss_kb=99568`, `exit=0`.
+
+Current Cells startup profile:
+
+- `runtime_init_ms=2856.9969520000004`.
+- `initialize_generic_derived_ms=18.498664`.
+- `initialize_generic_derived_profile.indexed_recompute_field_profiles={}`.
+- `initialize_indexed_reset_sources_ms=2735.560293`.
+- Reset-source work is now dominated by `cells.address`: 2,600 rows,
+  `2542.923902ms`. `cells.default_formula` remains 2,600 rows,
+  `192.544566ms`.
+
+Conclusion:
+
+- The old 37-40s startup path from the handoff is gone because
+  `cells.value`/`cells.error` are no longer eagerly recomputed for all rows.
+- The next real runtime architecture milestone is compiled/batched
+  reset-source row-field initialization, especially for deterministic
+  indexed-key fields such as `address`, followed by visible-window
+  materialization. More verifier or renderer microchanges will not solve this
+  startup shape.
+
+## 2026-06-27 - Cells Visible-Click Verifier Restored, Still Failing 60 FPS
+
+Status: the visible-click E2E proof path is restored after removing the
+remaining `--skip-render-hook-app-owned-proof` flag from the Cells
+visible-click preview launcher. Cells remains over budget.
+
+Fresh verification:
+
+- `cargo build -p xtask` passed with existing native GPU dead-code warnings.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed as expected on performance budgets.
+- No lingering `boon_native_playground`, Weston, weston-test-driver, or xtask
+  processes remained after the run.
+
+Current report facts:
+
+- `target_count=32`, `real_os_input=true`.
+- All 32 samples functionally matched selected cell and formula text:
+  `match_count=32`, `present_count=32`, `timeout_count=0`.
+- Final state: `selected_address="A0"`, `formula_bar_text="5"`.
+- `click_to_formula_visible_ms_p95=64.818702`, max `482.428578`.
+- `click_to_present_ms_p95=61.663921`, max `460.91604300000006`.
+- `input_wake_to_formula_visible_ms_p95=43.548434999999515`.
+- `simple_source_click_count=25`, `generic_fallback_count=7`,
+  `native_input_reject_counts={"simple_source_click:button_shape":9}`.
+
+Next executable slice:
+
+- Fix the native app-window button batching/provenance that makes normal cell
+  clicks reject `simple_source_click` with `button_shape`, then attack the
+  render/present outliers. This gate is now again measuring the real visible
+  user scenario rather than a proof-publication regression.
+
+## 2026-06-27 - Cells Reset-Source Startup Batched
+
+Status: the next TASK-0804A runtime startup bottleneck is reduced in the
+generic runtime. This is a startup/runtime fix, not a claim that Cells now
+passes the visible 60 FPS click/scroll budgets.
+
+Implemented:
+
+- Added guarded generic reset-source fast paths for pure indexed fields whose
+  compiled runtime statements match row-index grid text generation or
+  `List/find_value` text lookup from an already materialized source field.
+- Added a `ListMemory` batch text-column writer so reset-source startup commits
+  a whole field column once, preserving unrelated text lookup indexes and
+  invalidating exact row-field read keys for changed rows.
+- Added regressions:
+  `cells_indexed_reset_sources_use_batch_fast_paths` and
+  `list_batch_text_write_preserves_unrelated_text_lookup_indexes`.
+
+Fresh verification:
+
+- `cargo fmt --check` passed.
+- `cargo test -p boon_runtime cells_indexed_reset_sources_use_batch_fast_paths -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime list_batch_text_write_preserves_unrelated_text_lookup_indexes -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime cells_value_and_error_are_demand_current_at_startup -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime cells_window_document_summary_keeps_selected_projection_current -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime cells_scenario_runs_and_detects_cycle -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime pure_boon_cells_replacing_reference_removes_stale_dependents -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime compiled_artifact_decodes_cells_generic_derived_runtime_plan_without_ast -- --nocapture`
+  passed.
+- `cargo test -p boon_runtime cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions_without_ast -- --nocapture`
+  passed.
+- `cargo build -p xtask` passed with existing native GPU dead-code warnings.
+- `cargo build -q -p boon_native_playground` passed with existing warnings.
+- Final Cells layout proof:
+  `/usr/bin/time -f 'elapsed=%E cpu=%P maxrss_kb=%M exit=%x' timeout 90s target/debug/boon_native_playground --role layout-proof --code-file examples/cells.bn --report target/artifacts/native-gpu/layout-proof-cells-reset-batch-exact-invalidations.json`
+  passed in `elapsed=0:03.58`, `cpu=96%`, `maxrss_kb=87024`, `exit=0`.
+
+Current startup profile from
+`target/artifacts/native-gpu/layout-proof-cells-reset-batch-exact-invalidations.json`:
+
+- `runtime_init_profile.total_ms=93.38508399999999`.
+- `initialize_indexed_reset_sources_ms=11.225318`.
+- `cells.address`: `count=2600`, `fast_path=row_index_grid_text`,
+  `total_ms=8.952995`.
+- `cells.default_formula`: `count=2600`, `fast_path=list_find_value_text`,
+  `total_ms=2.204865`.
+- `initialize_generic_derived_ms=2.711675`,
+  `indexed_recompute_field_profiles={}`.
+
+Remaining Cells blockers:
+
+- The visible-click release gate still has the previously recorded
+  `simple_source_click:button_shape` fallback and render/present outliers.
+- TASK-0804A still needs visible-window materialization and the real interaction
+  60 FPS verifier to pass before it is complete.
+
+## 2026-06-27 - Cells Click Fast Path Fixed; Wake/Present Still Fails
+
+Status: the native Cells visible-click path no longer falls back through the
+generic source-input route for normal motion/click batches, and the misleading
+`simple_source_click:button_shape` reject is gone. The 60 FPS visible-click
+gate still fails because the native poll/render/present path remains over
+budget.
+
+Implemented:
+
+- Added generic primary-pointer click-shape classification for
+  `simple_source_click` instead of reporting all malformed batches as
+  `button_shape`.
+- Allowed coherent coalesced release batches to stay on the simple source-click
+  route and dispatch repeated plain source events while preserving fallback for
+  text/focus/link cases.
+- Made hover-only pointer motion a retained fast path even when the target has
+  no Boon `pointer_move` source event, preventing motion-only polls from
+  reaching generic fallback and improving hover/click-candidate state.
+- Added retained native-input reject samples to per-poll diagnostics so future
+  reports show press/release counts, sampled button state, and recent button
+  events.
+- Cached render-scene hashes with cached render scenes so cache-hit frames no
+  longer spend about 6 ms hashing unchanged scenes.
+
+Fresh verification:
+
+- `cargo fmt --check` passed.
+- `cargo test -p boon_native_playground cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path -- --nocapture`
+  passed.
+- `cargo test -p boon_native_playground cells_stale_sampled_button_state_without_new_edges_is_absorbed -- --nocapture`
+  passed.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  still failed, but now with `generic_fallback_count=0` and no
+  `simple_source_click:button_shape` rejects.
+
+Latest release visible-click report:
+
+- `target_count=32`, all samples functionally passed selected address/formula
+  visibility.
+- `simple_source_click_count=18`, `generic_fallback_count=0`.
+- `native_input_reject_counts={"simple_source_click:missing_click_edge":1}`.
+  The remaining reject is a startup/calibration motion-only sample, not a
+  click-shape fallback.
+- Timings still fail: `click_to_formula_visible_ms_p95=75.813583`,
+  `click_to_present_ms_p95=74.21948`,
+  `input_wake_to_formula_visible_ms_p95=58.22879999999947`.
+- Representative post-warmup sample index 20:
+  `input_wake_to_present_ms=27.703819000000298`,
+  `poll_phase_timings_ms.total_ms=8.110154`,
+  `native_input_timing.total_ms=5.923577`,
+  `native_input_timing.focus_overlay_ms=4.342141`.
+- The same sample shows render-hook cache-hit cost dropped:
+  `last_render_started_elapsed_ms=7350.382476`,
+  `last_render_hook_completed_elapsed_ms=7353.026531`.
+
+Interpretation / next executable slice:
+
+- The remaining visible-click budget is no longer a Cells formula/list lookup
+  problem and no longer the false generic-fallback route. It is native
+  input-wake/poll/render/present cost.
+- Highest-leverage next work is to reduce retained focus/selection overlay cost
+  and avoid per-click accessibility snapshot work where the accessibility tree
+  has no semantic change, then revisit queue-to-present pacing.
+
+## 2026-06-27 - Cells Visible Click Verifier Tightened Again
+
+Status: Cells visible clicks are functionally proven in the isolated native
+harness, but the release 60 FPS budget still fails. The current failing shape
+is now retained render-scene cache misses plus warm wake/present tail.
+
+What changed:
+
+- The verifier now keeps visible-surface readback hashes separate from external
+  render-proof hashes and requires a newer app-window native input wake count
+  for the accepted present/readback proof.
+- The visible-click speed gate skips offscreen render-hook app-owned proof and
+  uses the actual visible-surface WGPU readback for proof.
+- The skipped-proof render-hook report now emits compact metrics and records
+  `report_json_ms`, avoiding the previous duplicated retained-chunk metric
+  payload in every hot frame.
+- Sample native-input timing now prefers the most recent `simple_source_click`
+  entry in the poll diagnostics, so trailing pointer-move samples no longer
+  hide the click fast path.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo check -p boon_native_playground -p xtask -p boon_native_app_window`
+  passed with existing warnings.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed, writing a fresh report.
+
+Latest report facts:
+
+- `target_count=32`, all samples pass selected-address/formula semantics.
+- `timing_sample_count_complete=true`.
+- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `click_to_formula_visible_ms_p95=66.327663`.
+- `click_to_present_ms_p95=60.388394999999996`.
+- `input_wake_to_formula_visible_ms_p95=53.36053999999979`.
+- `input_wake_to_present_ms_p95=48.72502700000041`.
+- Render-hook JSON is no longer the hidden tail:
+  `report_json_ms` is about `0.03ms`.
+- Remaining render-scene misses spend about `27-28ms` in
+  `render_scene_cache_ms`; warm cache-hit frames still tend to spend
+  `18-22ms` from input wake to present.
+
+Remaining blocker:
+
+- The next Cells/native slice should stop treating selected/focus/hover/caret
+  visual state as a separate full render-scene cache key. It needs retained
+  render-scene patching or a GPU overlay for those state changes, followed by
+  wake-to-dirty-poll and queue-to-present pacing work.
+
+## 2026-06-27 - Cells Retained Overlay Render Scene Patch
+
+Status: the retained render-scene patch for input overlay state is implemented
+and measured. It improves the render-hook side substantially but does not finish
+TASK-0804A.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`
+  passed.
+- `cargo check -p boon_native_playground -p xtask -p boon_native_app_window`
+  passed with existing warnings.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed.
+
+What changed:
+
+- Native focus/selected/hover/caret overlay state now has a generic
+  retained-render-scene sidecar path.
+- Cache-hit frames skip patch construction entirely.
+- Cache-miss patch construction reuses a retained
+  `GlyphonRenderTextColumnMeasurer`.
+
+Latest report facts:
+
+- `render_scene_patch_source=native_input_overlay` for all 131 render samples.
+- `input_overlay_patch_built=22` and `render_scene_cache_hits=109`.
+- `input_overlay_render_scene_patch_build_ms p95=0.239567`.
+- Render-hook `total_before_report_json_ms p95=13.033252`, with p50 around
+  `1.796412`.
+- End-to-end timing still fails:
+  `click_to_formula_visible_ms_p95=46.517619`,
+  `click_to_present_ms_p95=42.348184`,
+  `input_wake_to_present_ms_p95=31.402876999999535`.
+
+Remaining blocker:
+
+- Cells visible click is now limited by native wake/scheduling/present/readback
+  tail, not by Boon runtime lookup, formula evaluation, or repeated full
+  render-scene lowering on warm frames.
+
+## 2026-06-27 - Direct Render-Scene Patch Encode
+
+Status: implemented and measured the first WGPU-side retained patch consumption
+path. Native GPU can encode a base `DocumentRenderScene` with a
+`ReplaceNodeEntries` patch directly, and Cells native input overlay frames use
+that path in the visible-surface verifier.
+
+What changed:
+
+- Added `SurfaceRenderScenePatchRequest` /
+  `VisibleLayoutRenderer::encode_scene_patch`.
+- Converted patched document scenes by borrowing base entries plus replacement
+  entries instead of cloning and caching a full patched render scene.
+- Kept the generic `RenderScene::apply_patch` behavior as the semantic baseline
+  and added a conversion equivalence test.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo test -q -p boon_native_gpu document_render_scene_patch_conversion_matches_materialized_apply`
+  passed.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`
+  passed.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed.
+
+Latest report facts:
+
+- All 131 render-hook samples used
+  `visible_surface_metrics.render_scene_source=document-render-scene-patch`.
+- All 131 render-hook samples used direct input overlay patch encode.
+- Render-hook `total_before_report_json_ms p95=4.315259`, `max=5.014209`.
+- `render_scene_cache_ms p95=2.457225`; `encode_scene_ms p95=1.809274`.
+- End-to-end still fails:
+  `click_to_formula_visible_ms_p95=38.528216`,
+  `click_to_present_ms_p95=34.204679000000006`,
+  `input_wake_to_present_ms_p95=20.480467000000317`.
+
+Remaining blocker:
+
+- The next meaningful slice is native scheduling/accessibility/readback:
+  input wake-to-dirty-poll p95 is still about `6.456552ms`, full accessibility
+  snapshot p95 about `3.005728ms`, and interactive readback p95 about
+  `3.000009ms`.
+
+## 2026-06-27 - Cells Overlay Lookup and Touched-Only Patch Construction
+
+Status: the next retained-render slice is implemented and measured. It removes
+the remaining full render-frame clone from first-time focus/selected overlay
+states, but TASK-0804A still fails on render-scene patch composition,
+accessibility snapshot, and present pacing.
+
+What changed:
+
+- Added a small render-only selected-address lookup extracted from the layout
+  proof instead of deep-cloning the full layout proof into every render hook.
+- Native input overlay patches for focus/selected/hover/caret now build from
+  touched display items only.
+- `input_overlay_render_scene_patch_matches_full_overlay_lowering` proves the
+  touched-only sidecar matches full overlay lowering.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`
+  passed.
+- `timeout 900s env CARGO_BUILD_JOBS=1 nice -n 19 cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed.
+
+Latest report facts:
+
+- `target_count=32`, `timing_sample_count_complete=true`.
+- `click_to_formula_visible_ms_p95=43.134555`.
+- `click_to_present_ms_p95=35.381584000000004`.
+- `input_wake_to_formula_visible_ms_p95=35.677989000000736`.
+- `input_wake_to_present_ms_p95=27.739979999999377`.
+- First-time overlay `render_frame_cache_ms` is now about `0.008-0.017ms`
+  instead of about `3.2ms`.
+- First-time overlay `render_scene_cache_ms` still spends about `6.75-10.05ms`
+  because applying a patch still clones/composes a full base `RenderScene`.
+- Warm render-hook samples are about `1.6-1.8ms`; the remaining warm tail is
+  dominated by full accessibility snapshot work and queue-to-present pacing.
+
+Remaining blocker:
+
+- Continue into the retained RenderPatch/WGPU consumption and semantic
+  accessibility patch phases. Do not weaken the verifier, skip accessibility
+  updates, shrink Cells, or call TASK-0804A fixed from this partial improvement.
+
+## 2026-06-27 - Cells Runtime Exact Lookup / Route-Key Follow-Up
+
+Status: generic runtime and native-route follow-ups are implemented and
+verified at focused-test level. The native release visible-click gate still
+fails, so this is not a 60 FPS completion claim.
+
+What changed:
+
+- `List/find` now records an exact text lookup dependency key
+  (`list_lookup_text`) for indexed text-field lookups while retaining the broad
+  list/column dependency keys required for current correctness.
+- The Cells demand-current startup invariants remain intact; `cells.value` and
+  `cells.error` are not eagerly computed at startup.
+- Preview hit route cache keys now reuse the snapshot key when source intents
+  are embedded in the proof, guarded by existing scroll/focus-overlay checks.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo check -q -p boon_runtime` passed.
+- `cargo check -q -p boon_native_playground` passed with existing warnings.
+- `cargo test -q -p boon_runtime list_index_find_uses_text_lookup_index`
+  passed.
+- `cargo test -q -p boon_runtime cells_value_and_error_are_demand_current_at_startup`
+  passed.
+- `cargo test -q -p boon_runtime pure_boon_cells_fanout_recomputes_from_generic_read_index`
+  passed.
+- `cargo test -q -p boon_native_playground preview_route_cache_key_uses_snapshot_key_with_embedded_source_intents`
+  passed.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed and wrote a fresh failing release report.
+
+Latest release report facts:
+
+- `target_count=32`, `timing_sample_count_complete=true`.
+- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- Route lookup tail is removed for this run:
+  `route_table_lookup_ms p95=0.0`, max about `0.148ms`.
+- Native simple-click handling is under budget in recent samples:
+  about `0.4-2.9ms`, with `list_find_rows_scanned=0` and `rows_scanned=0`.
+- Runtime selected-value currentness is also not the remaining visible blocker:
+  sampled `click_to_runtime_current_observed_ms` is about `3.8ms`.
+- End-to-end visual proof still fails:
+  `click_to_formula_visible_ms_p95=39.145115`,
+  `click_to_present_ms_p95=33.369455`,
+  `input_wake_to_formula_visible_ms_p95=30.68494099999896`,
+  `input_wake_to_present_ms_p95=19.453144999999495`.
+
+Remaining blockers:
+
+- Native visible-present/formula-visible latency remains above budget.
+- `cargo test -q -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json`
+  still fails on its existing formula-bar focus assertion.
+- Continue with native wake scheduling, retained semantic/accessibility
+  patching, readback/proof latency, present pacing, and the typed-click focus
+  path. Do not call the Cells runtime or visible-click problem complete from the
+  focused unit tests.
+
+## 2026-06-27 - Cells Typed Focus and Fresh Readback Proof
+
+Status: fixed the generic typed-click focus-overlay gap and tightened app-owned
+native proof freshness. The Cells visible-click release gate still fails on
+latency, so this is not a 60 FPS completion.
+
+What changed:
+
+- A valid typed route-table click now applies the retained focus overlay from
+  typed focus state rather than requiring old source-intent proof JSON.
+- Native render-loop reports now expose sampled/presented input generations,
+  stale-input state, pending readback state, wake-to-queue, queue-to-present,
+  and present-to-readback timings.
+- The visible-click verifier rejects stale current-input frames and pending
+  surface readbacks for formula-visible proof.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo check -q -p boon_native_app_window` passed.
+- `cargo check -q -p xtask` passed with existing native GPU warnings.
+- `cargo check -q -p boon_native_playground` passed with existing warnings.
+- `cargo test -q -p boon_runtime list_index_find_uses_text_lookup_index`
+  passed.
+- `cargo test -q -p boon_runtime cells_value_and_error_are_demand_current_at_startup`
+  passed.
+- `cargo test -q -p boon_runtime pure_boon_cells_fanout_recomputes_from_generic_read_index`
+  passed.
+- `cargo test -q -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json`
+  passed.
+- `cargo test -q -p boon_native_playground cells_formula_bar_click_accepts_text_edit`
+  passed.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`
+  passed.
+- `cargo test -q -p boon_native_gpu document_render_scene_patch_conversion_matches_materialized_apply`
+  passed.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed.
+
+Latest release report facts:
+
+- `target_count=32`, `timing_sample_count_complete=true`.
+- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- End-to-end timing still fails:
+  `click_to_formula_visible_ms_p95=50.302772`,
+  `click_to_present_ms_p95=45.886718`,
+  `input_wake_to_formula_visible_ms_p95=44.54610000000063`,
+  `input_wake_to_present_ms_p95=35.46416599999975`.
+- Render-hook work is not the current p95 blocker:
+  `total_with_report_json_ms p95=2.562514`,
+  `render_scene_cache_ms p95=0.28221399999999996`,
+  `encode_scene_ms p95=2.19228`.
+- Current visible tail is native scheduling/proof:
+  `input_wake_to_dirty_poll_ms p95=22.25784300000032`,
+  `wake_to_queue_ms p95=26.727210000000017`,
+  `queue_to_present_ms p95=9.90306100000089`,
+  `present_to_readback_report_ms p95=4.312976000001072`.
+
+Remaining blocker:
+
+- Continue with native event wake scheduling, present pacing, and lower-latency
+  app-owned proof/readback. Do not return to runtime/list/route micro-fixes
+  unless fresh counters show a regression.
+
+## 2026-06-27 - Cells Projection Index Guard and Runtime Fanout Coverage
+
+Status: implemented and verified generic runtime guardrails that were still
+useful from the TASK-0804A external review. This does not complete the native
+60 FPS Cells gate; it keeps the runtime side from regressing while the active
+blocker moves to native wake/present/proof timing.
+
+What changed:
+
+- `List/find` document/summary projection reads now use the existing text lookup
+  index path rather than a row scan.
+- Selected-input document values now prove that indexed projection path with
+  counters reset immediately before the read.
+- Added coverage that range formulas update when a referenced member changes.
+- Strengthened reset-source startup coverage so `cells.value` and `cells.error`
+  remain demand-current and are not initialized by reset-source batch startup.
+- Native visible-click reports now copy render-loop sub-span attribution into
+  probes.
+
+Evidence:
+
+- `cargo fmt --check` passed.
+- `cargo test -q -p boon_ir --lib indexed_derived_startup_recompute_is_ir_semantic_not_path_heuristic`
+  passed.
+- `cargo test -q -p boon_runtime cells_selected_input_document_state_values_use_indexed_list_find_projection`
+  passed.
+- `cargo test -q -p boon_runtime cells_indexed_reset_sources_use_batch_fast_paths`
+  passed.
+- `cargo test -q -p boon_runtime cells_value_and_error_are_demand_current_at_startup`
+  passed.
+- `cargo test -q -p boon_runtime pure_boon_cells_fanout_recomputes_from_generic_read_index`
+  passed.
+- `cargo test -q -p boon_runtime pure_boon_cells_range_formula_updates_from_member_change`
+  passed.
+- `cargo test -q -p boon_runtime cells_scenario_runs_and_detects_cycle`
+  passed.
+- `cargo test -q -p boon_runtime root_currentness_barrier` passed.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p boon_runtime` passed.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p xtask` passed.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  failed on strict timing, not on runtime routing.
+
+Latest release report facts:
+
+- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `click_to_formula_visible_ms_p95=52.666079`.
+- `input_wake_to_formula_visible_ms_p95=42.34009900000026`.
+- p95 attribution now shows `input_wake_to_poll_started_ms=21.28910899999937`
+  and `queue_to_present_ms=11.235940999999912`.
+
+Next executable slice:
+
+- Continue with native event-loop wake scheduling and present/readback proof
+  latency. Runtime/list/currentness work should only resume if fresh counters
+  regress.
+
+## 2026-06-27 - Cells Runtime Speed Refresh Passes Focused Gates
+
+Status: the focused TASK-0804A runtime/currentness and native Cells click gates
+now pass on fresh reports. This clears the current demand-driven Cells blocker
+from the unified aggregate, but Phase 10 remains blocked by the broader
+readiness/default-switch criteria and stale support reports.
+
+Fresh evidence:
+
+- `RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime cells -- --test-threads=1`
+  passed `23` Cells/runtime tests, including the indexed lookup,
+  demand-current startup, selected-input currentness, formula fanout/range, and
+  cycle-safety coverage.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  passed with `interaction_latency_ms_p95=8.371856000000001`,
+  `interaction_latency_ms_max=13.983586`, `logical_cell_count=2600`,
+  `materialized_cell_count_max=240`, `formula_evaluated_cell_count_max=4`,
+  and `formula_recomputed_field_count_max=6`.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  passed over `64` real OS click targets with
+  `input_wake_to_formula_visible_ms_p95=16.467215999999098`, one bounded
+  driver-to-wake outlier, and zero unbounded outliers.
+- `target/debug/xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`
+  passed with `post_idle_input_to_present_ms=35.344134`.
+- `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`
+  passed after refreshing the counter, todomvc, cells, and custom-project
+  idle-wake children.
+- The refreshed report schemas passed for the Cells click/interaction/headed
+  reports, all four idle-wake reports, and the demand-driven aggregate.
+
+Remaining readiness state:
+
+- `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`
+  still fails, but not because a child status failed: `18` children were
+  checked and `18` passed.
+- The current unified blockers are stale `binary_hash` values on `17` older
+  child reports after rebuilding `target/debug/xtask`.
+- `boon_cli run` still defaults to legacy, so Phase 10 default switch remains
+  blocked until the broader readiness gate is refreshed and passes.

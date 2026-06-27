@@ -5787,6 +5787,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let frame_readback = synthetic_input_probe
         || args.iter().any(|arg| arg == "--probe")
         || args.iter().any(|arg| arg == "--frame-readback");
+    let skip_interactive_surface_readback_when_external_proof = args
+        .iter()
+        .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
     let skip_render_hook_app_owned_proof = args
         .iter()
         .any(|arg| arg == "--skip-render-hook-app-owned-proof");
@@ -5911,10 +5914,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let role_args = args[1..].to_vec();
     let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
-        let mut app_owned_proof = None;
+        let mut render_text_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let mut app_owned_proof_cache = BTreeMap::new();
         let mut layout_frame_cache = None;
-        let mut render_frame_cache = None;
-        let mut render_scene_cache = None;
+        let mut render_frame_cache = Vec::new();
+        let mut render_scene_cache = BTreeMap::new();
         let shared_render_state = Arc::clone(&shared_render_state);
         let preview_ipc_state = Arc::clone(&preview_ipc_state);
         let poll_shared_render_state = Arc::clone(&shared_render_state);
@@ -5930,27 +5934,46 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         let mut last_rendered_content_revision = 0;
         let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
+            let poll_total_started = Instant::now();
+            let mut poll_phase_timings_ms = serde_json::Map::new();
+            macro_rules! note_poll_phase {
+                ($name:literal, $started:expr) => {
+                    poll_phase_timings_ms.insert($name.to_owned(), json!(elapsed_ms($started)));
+                };
+            }
+            let phase_started = Instant::now();
             let before_update_count = poll_shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned".to_owned())?
                 .update_count;
+            note_poll_phase!("before_update_count_lock_ms", phase_started);
             let mut role_dirty_reason = None;
+            let phase_started = Instant::now();
             let mut input_state = poll_input_state
                 .lock()
                 .map_err(|_| "preview input state mutex poisoned".to_owned())?;
+            input_state.focus_overlay_applied_in_input = false;
+            note_poll_phase!("input_state_lock_ms", phase_started);
+            let phase_started = Instant::now();
             let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
                 .map_err(|error| error.to_string())?;
+            note_poll_phase!("input_runtime_context_ms", phase_started);
+            let phase_started = Instant::now();
             let preview_world_scene = poll_preview_ipc_state
                 .lock()
                 .map_err(|_| "preview IPC state mutex poisoned".to_owned())?
                 .world_scene
                 .clone();
             let preview_has_world_scene = preview_world_scene.is_some();
+            note_poll_phase!("world_scene_lock_ms", phase_started);
+            let phase_started = Instant::now();
             let input_delta = native_input_for_layout_surface(
                 &context.input_delta,
                 context.width,
                 context.height,
             );
+            note_poll_phase!("input_delta_projection_ms", phase_started);
+            let phase_started = Instant::now();
             if !context.accessibility_actions.is_empty() {
                 match preview_apply_accessibility_actions_with_units(
                     &context.accessibility_actions,
@@ -5980,6 +6003,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            note_poll_phase!("accessibility_actions_ms", phase_started);
+            let phase_started = Instant::now();
             if let Some(world_scene) = preview_world_scene.as_ref() {
                 match preview_apply_world_scene_input(
                     &input_delta,
@@ -6003,6 +6028,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else if preview_input_has_unhandled_source_events(&input_delta, &input_state) {
+                let source_input_started = Instant::now();
                 let world_editor_input_result = if let Some(world_editor_session) =
                     input_context.world_editor_session.as_ref()
                 {
@@ -6056,7 +6082,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                note_poll_phase!("source_input_ms", source_input_started);
             }
+            note_poll_phase!("world_or_source_input_ms", phase_started);
+            let phase_started = Instant::now();
             if !preview_has_world_scene
                 && let Err(error) = preview_apply_scroll_input_with_units(
                     &input_delta,
@@ -6074,6 +6103,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
                 }
             }
+            note_poll_phase!("scroll_input_ms", phase_started);
+            let phase_started = Instant::now();
             if !preview_has_world_scene {
                 match preview_relayout_for_viewport(
                     &poll_preview_ipc_state,
@@ -6098,6 +6129,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            note_poll_phase!("viewport_relayout_ms", phase_started);
+            let phase_started = Instant::now();
             let headed_scenario_poll = preview_advance_headed_scenario(
                 &poll_shared_render_state,
                 &mut input_state,
@@ -6111,21 +6144,33 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
             }
+            note_poll_phase!("headed_scenario_ms", phase_started);
+            let phase_started = Instant::now();
             let caret_visible = preview_caret_visible(&input_state, context.now);
-            let focus_changed = if preview_has_world_scene {
-                false
-            } else {
-                preview_apply_focus_overlay(
-                    &poll_shared_render_state,
-                    &mut input_state,
-                    caret_visible,
-                )
-                .map_err(|error| error.to_string())?
-            };
+            let focus_changed =
+                if preview_has_world_scene || input_state.focus_overlay_applied_in_input {
+                    false
+                } else if input_state.focused_selection_proxy {
+                    preview_update_retained_focus_overlay_state(
+                        &poll_shared_render_state,
+                        &mut input_state,
+                        caret_visible,
+                    )
+                    .map_err(|error| error.to_string())?
+                } else {
+                    preview_apply_focus_overlay(
+                        &poll_shared_render_state,
+                        &mut input_state,
+                        caret_visible,
+                    )
+                    .map_err(|error| error.to_string())?
+                };
             if focus_changed && role_dirty_reason.is_none() {
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
             }
+            note_poll_phase!("focus_overlay_ms", phase_started);
+            let phase_started = Instant::now();
             let after_update_count = poll_shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned".to_owned())?
@@ -6145,6 +6190,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 || context.forced_frame
                 || headed_scenario_poll.dirty;
             last_poll_revision = last_poll_revision.max(after_content_revision);
+            note_poll_phase!("dirty_revision_compute_ms", phase_started);
+            let phase_started = Instant::now();
             let scheduler_reason = if context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
             } else if context.input_delta.real_os_events_observed {
@@ -6161,12 +6208,16 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            note_poll_phase!("scheduler_reason_ms", phase_started);
+            let phase_started = Instant::now();
             let cursor_icon = {
                 let shared = poll_shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
                 preview_cursor_icon(&shared.layout_proof, &input_state)
             };
+            note_poll_phase!("cursor_icon_ms", phase_started);
+            let phase_started = Instant::now();
             let preview_text_input_caret_active = {
                 let shared = poll_shared_render_state
                     .lock()
@@ -6176,9 +6227,12 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     &input_state,
                 )
             };
+            note_poll_phase!("text_input_caret_ms", phase_started);
+            let phase_started = Instant::now();
             let accessibility_update = {
                 let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
                     .map_err(|error| error.to_string())?;
+                let focus_overlay = input_state.focus_render_overlay.clone();
                 let shared = poll_shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?;
@@ -6188,9 +6242,42 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     input_context.world_editor_session.as_ref(),
                     &mut accessibility_cache,
                     revision,
+                    Some(&focus_overlay),
                 )
                 .map(|snapshot| snapshot.tree_update)
             };
+            note_poll_phase!("accessibility_snapshot_ms", phase_started);
+            poll_phase_timings_ms
+                .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
+            let poll_diagnostics = json!({
+                "kind": "preview_role_poll",
+                "dirty": dirty,
+                "forced_frame": context.forced_frame,
+                "real_os_events_observed": context.input_delta.real_os_events_observed,
+                "input_delta_real_os_events_observed": input_delta.real_os_events_observed,
+                "preview_has_world_scene": preview_has_world_scene,
+                "role_dirty_reason": role_dirty_reason,
+                "scheduler_reason": scheduler_reason,
+                "before_update_count": before_update_count,
+                "after_update_count": after_update_count,
+                "previous_poll_revision": last_poll_revision,
+                "after_content_revision": after_content_revision,
+                "headed_scenario_dirty": headed_scenario_poll.dirty,
+                "headed_scenario_active": headed_scenario_poll.active,
+                "focus_changed": focus_changed,
+                "text_input_caret_active": preview_text_input_caret_active,
+                "recent_native_input_timing_samples": snapshot_preview_native_input_timings(8)
+                    .iter()
+                    .map(preview_native_input_timing_sample_json)
+                    .collect::<Vec<_>>(),
+                "native_input_reject_counts": snapshot_preview_native_input_reject_counts(),
+                "recent_native_input_reject_samples": snapshot_preview_native_input_reject_samples(8),
+                "recent_interaction_timing_samples": snapshot_preview_interaction_timings(8)
+                    .iter()
+                    .map(preview_interaction_timing_sample_json)
+                    .collect::<Vec<_>>(),
+                "phase_timings_ms": poll_phase_timings_ms
+            });
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_poll_revision,
@@ -6207,6 +6294,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .min(),
                 wants_animation_frame: headed_scenario_poll.active,
                 cursor_icon,
+                diagnostics: Some(poll_diagnostics),
                 accessibility_update,
             })
         });
@@ -6222,9 +6310,14 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     preview_content_revision(shared.update_count),
                 )
             };
-            let render_hover_overlay = render_input_state
+            let (render_hover_overlay, render_focus_overlay) = render_input_state
                 .lock()
-                .map(|input_state| PreviewHoverOverlayState::from_input_state(&input_state))
+                .map(|input_state| {
+                    (
+                        PreviewHoverOverlayState::from_input_state(&input_state),
+                        input_state.focus_render_overlay.clone(),
+                    )
+                })
                 .unwrap_or_default();
             let render_headed_scenario_overlay = preview_headed_scenario_overlay();
             let render_world_scene = render_preview_ipc_state
@@ -6240,9 +6333,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_error.as_deref(),
                 render_status_overlay.as_ref(),
                 &render_hover_overlay,
+                &render_focus_overlay,
                 render_headed_scenario_overlay.as_ref(),
                 &mut visible_renderer,
-                &mut app_owned_proof,
+                &mut render_text_columns,
+                &mut app_owned_proof_cache,
                 &mut layout_frame_cache,
                 &mut render_frame_cache,
                 &mut render_scene_cache,
@@ -6283,6 +6378,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .then(|| "target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
             demand_driven_loop,
+            skip_interactive_surface_readback_when_external_proof,
         },
         hooks,
         wake_handle,
@@ -6351,6 +6447,9 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let probe = args.iter().any(|arg| arg == "--probe");
     let frame_readback =
         probe || synthetic_input_probe || args.iter().any(|arg| arg == "--frame-readback");
+    let skip_interactive_surface_readback_when_external_proof = args
+        .iter()
+        .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
     let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
     let skip_visible_input_probe = args.iter().any(|arg| arg == "--skip-visible-input-probe");
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
@@ -6549,6 +6648,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 next_wake_after_ms,
                 wants_animation_frame: false,
                 cursor_icon: shell.current_cursor_icon(),
+                diagnostics: None,
                 accessibility_update: None,
             })
         });
@@ -6607,6 +6707,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .then(|| "target/artifacts/native-gpu/frames".to_owned()),
             render_loop_state_report,
             demand_driven_loop,
+            skip_interactive_surface_readback_when_external_proof,
         },
         hooks,
         boon_native_app_window::NativeWakeHandle::new(),
@@ -8517,6 +8618,16 @@ struct PreviewInteractionTimingSample {
 struct PreviewNativeInputTimingSample {
     scope: u8,
     fast_path: &'static str,
+    resolve_source: Option<&'static str>,
+    route_table_key_source: Option<&'static str>,
+    shared_lock_wait_ms: f64,
+    route_table_lookup_ms: f64,
+    route_dispatch_ms: f64,
+    hit_test_ms: f64,
+    event_build_ms: f64,
+    live_events_ms: f64,
+    bound_input_sync_ms: f64,
+    selection_proxy_refresh_ms: f64,
     resolve_ms: f64,
     apply_ms: f64,
     hover_overlay_ms: f64,
@@ -8572,6 +8683,23 @@ fn take_preview_interaction_timings() -> Vec<PreviewInteractionTimingSample> {
         .unwrap_or_default()
 }
 
+fn snapshot_preview_interaction_timings(limit: usize) -> Vec<PreviewInteractionTimingSample> {
+    preview_interaction_timings()
+        .lock()
+        .map(|timings| {
+            timings
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn preview_native_input_timings() -> &'static Mutex<VecDeque<PreviewNativeInputTimingSample>> {
     static TIMINGS: OnceLock<Mutex<VecDeque<PreviewNativeInputTimingSample>>> = OnceLock::new();
     TIMINGS.get_or_init(|| Mutex::new(VecDeque::with_capacity(PREVIEW_INTERACTION_PROFILE_LIMIT)))
@@ -8597,6 +8725,23 @@ fn take_preview_native_input_timings() -> Vec<PreviewNativeInputTimingSample> {
         .unwrap_or_default()
 }
 
+fn snapshot_preview_native_input_timings(limit: usize) -> Vec<PreviewNativeInputTimingSample> {
+    preview_native_input_timings()
+        .lock()
+        .map(|timings| {
+            timings
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn preview_native_input_reject_counts() -> &'static Mutex<BTreeMap<String, u64>> {
     static COUNTS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
     COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -8613,10 +8758,55 @@ fn record_preview_native_input_reject(fast_path: &str, reason: &str) {
     *counts.entry(key).or_default() += 1;
 }
 
+fn preview_native_input_reject_samples() -> &'static Mutex<VecDeque<serde_json::Value>> {
+    static SAMPLES: OnceLock<Mutex<VecDeque<serde_json::Value>>> = OnceLock::new();
+    SAMPLES.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn record_preview_native_input_reject_sample(sample: serde_json::Value) {
+    if !preview_compact_timing_enabled() && !preview_profiling_enabled() {
+        return;
+    }
+    let Ok(mut samples) = preview_native_input_reject_samples().lock() else {
+        return;
+    };
+    samples.push_back(sample);
+    while samples.len() > 32 {
+        samples.pop_front();
+    }
+}
+
 fn take_preview_native_input_reject_counts() -> BTreeMap<String, u64> {
+    let _ = preview_native_input_reject_samples()
+        .lock()
+        .map(|mut samples| samples.clear());
     preview_native_input_reject_counts()
         .lock()
         .map(|mut counts| std::mem::take(&mut *counts))
+        .unwrap_or_default()
+}
+
+fn snapshot_preview_native_input_reject_samples(limit: usize) -> Vec<serde_json::Value> {
+    preview_native_input_reject_samples()
+        .lock()
+        .map(|samples| {
+            samples
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_preview_native_input_reject_counts() -> BTreeMap<String, u64> {
+    preview_native_input_reject_counts()
+        .lock()
+        .map(|counts| counts.clone())
         .unwrap_or_default()
 }
 
@@ -8742,6 +8932,16 @@ fn preview_native_input_timing_sample_json(sample: &PreviewNativeInputTimingSamp
     json!({
         "interaction": preview_interaction_timing_scope_name(sample.scope),
         "fast_path": sample.fast_path,
+        "resolve_source": sample.resolve_source,
+        "route_table_key_source": sample.route_table_key_source,
+        "shared_lock_wait_ms": sample.shared_lock_wait_ms,
+        "route_table_lookup_ms": sample.route_table_lookup_ms,
+        "route_dispatch_ms": sample.route_dispatch_ms,
+        "hit_test_ms": sample.hit_test_ms,
+        "event_build_ms": sample.event_build_ms,
+        "live_events_ms": sample.live_events_ms,
+        "bound_input_sync_ms": sample.bound_input_sync_ms,
+        "selection_proxy_refresh_ms": sample.selection_proxy_refresh_ms,
         "resolve_ms": sample.resolve_ms,
         "apply_ms": sample.apply_ms,
         "hover_overlay_ms": sample.hover_overlay_ms,
@@ -10306,24 +10506,21 @@ fn native_gpu_app_owned_render_hook(
     last_error: Option<&str>,
     status_overlay: Option<&PreviewStatusOverlay>,
     hover_overlay: &PreviewHoverOverlayState,
+    focus_overlay: &PreviewFocusOverlayState,
     headed_scenario_overlay: Option<&PreviewHeadedScenarioOverlayState>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
-    app_owned_proof: &mut Option<boon_native_gpu::RenderProof>,
+    render_text_columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
+    app_owned_proof_cache: &mut BTreeMap<String, boon_native_gpu::RenderProof>,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
-    render_frame_cache: &mut Option<(
+    render_frame_cache: &mut Vec<(
         PreviewRenderFrameCacheKey,
         boon_document::LayoutFrame,
         String,
     )>,
-    render_scene_cache: &mut Option<(
-        String,
-        String,
-        u32,
-        u32,
-        String,
-        String,
-        boon_document::RenderScene,
-    )>,
+    render_scene_cache: &mut BTreeMap<
+        (String, u32, u32, String, String),
+        (String, String, boon_document::RenderScene),
+    >,
     skip_app_owned_scene_proof: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     if let Some(world_scene) = world_scene {
@@ -10343,15 +10540,16 @@ fn native_gpu_app_owned_render_hook(
     let render_scene_patch_lookup_started = Instant::now();
     let current_render_scene_lowering_mode =
         preview_render_scene_lowering_mode_for_hash(visible_state.layout_frame_hash.as_deref());
-    let render_scene_patch = visible_state
+    let layout_render_scene_patch = visible_state
         .layout_frame_hash
         .as_deref()
         .and_then(cached_render_scene_patch);
-    let render_scene_patch_base_hash = visible_state
+    let layout_render_scene_patch_base_hash = visible_state
         .layout_frame_hash
         .as_deref()
         .and_then(cached_render_scene_patch_base_hash);
-    let render_scene_patch_hash = render_scene_patch_hash(render_scene_patch.as_deref());
+    let layout_render_scene_patch_hash =
+        render_scene_patch_hash(layout_render_scene_patch.as_deref());
     let render_scene_patch_lookup_ms = elapsed_ms(render_scene_patch_lookup_started);
     let render_frame_layout_cache_key = if visible_state.render_scene_patch_layout_reuse {
         render_scene_patch_geometry_base_hash(visible_state.layout_frame_hash.as_deref())
@@ -10385,7 +10583,28 @@ fn native_gpu_app_owned_render_hook(
         .as_ref()
         .map(|(_, frame)| frame)
         .ok_or("layout frame cache was not initialized")?;
+    let input_overlay_prepare_started = Instant::now();
+    let input_overlay_render_scene_patch_enabled = layout_render_scene_patch.is_none()
+        && last_error.is_none()
+        && status_overlay.is_none()
+        && headed_scenario_overlay.is_none()
+        && (!hover_overlay.is_empty() || !focus_overlay.is_empty());
+    let input_overlay_touched_nodes = if input_overlay_render_scene_patch_enabled {
+        preview_input_overlay_render_scene_touched_nodes(
+            layout_frame,
+            &visible_state.overlay_lookup,
+            hover_overlay,
+            focus_overlay,
+        )
+    } else {
+        BTreeSet::new()
+    };
+    let input_overlay_render_scene_patch_enabled =
+        input_overlay_render_scene_patch_enabled && !input_overlay_touched_nodes.is_empty();
+    let input_overlay_prepare_ms = elapsed_ms(input_overlay_prepare_started);
     let render_frame_cache_started = Instant::now();
+    let overlay_render_frame_hash;
+    let render_frame_cache_hit;
     let render_cache_key = PreviewRenderFrameCacheKey {
         layout_cache_key: render_frame_layout_cache_key.clone(),
         width: context.width,
@@ -10393,53 +10612,84 @@ fn native_gpu_app_owned_render_hook(
         last_error: last_error.map(str::to_owned),
         status_overlay: status_overlay.map(|overlay| (overlay.kind, overlay.message.clone())),
         hover_overlay: hover_overlay.clone(),
+        focus_overlay: focus_overlay.clone(),
         headed_scenario_overlay: headed_scenario_overlay.cloned(),
     };
-    let render_frame_cache_hit = render_frame_cache
-        .as_ref()
-        .is_some_and(|(key, _, _)| key == &render_cache_key);
-    if !render_frame_cache_hit {
-        let mut render_frame = if let Some(error) = last_error {
-            preview_frame_with_status_overlay(
-                layout_frame,
-                PreviewStatusOverlayKind::Error,
-                &format!("Preview input error: {}", single_line_preview_error(error)),
-                context.width as f32,
-                context.height as f32,
+    let (render_frame, render_frame_hash_value) = if input_overlay_render_scene_patch_enabled {
+        render_frame_cache_hit = true;
+        overlay_render_frame_hash = boon_runtime::sha256_bytes(
+            format!(
+                "native-input-overlay-frame:{layout_cache_key}:{}:{}:{hover_overlay:?}:{focus_overlay:?}",
+                context.width, context.height
             )
-        } else if let Some(overlay) = status_overlay {
-            preview_frame_with_status_overlay(
-                layout_frame,
-                overlay.kind,
-                &overlay.message,
-                context.width as f32,
-                context.height as f32,
-            )
-        } else {
-            layout_frame.clone()
-        };
-        preview_apply_hover_overlay_to_render_frame(&mut render_frame, hover_overlay);
-        if let Some(overlay) = headed_scenario_overlay {
-            preview_apply_headed_scenario_overlay_to_render_frame(
+            .as_bytes(),
+        );
+        (layout_frame, overlay_render_frame_hash.as_str())
+    } else {
+        render_frame_cache_hit = render_frame_cache
+            .iter()
+            .any(|(key, _, _)| key == &render_cache_key);
+        if !render_frame_cache_hit {
+            let mut render_frame = if let Some(error) = last_error {
+                preview_frame_with_status_overlay(
+                    layout_frame,
+                    PreviewStatusOverlayKind::Error,
+                    &format!("Preview input error: {}", single_line_preview_error(error)),
+                    context.width as f32,
+                    context.height as f32,
+                )
+            } else if let Some(overlay) = status_overlay {
+                preview_frame_with_status_overlay(
+                    layout_frame,
+                    overlay.kind,
+                    &overlay.message,
+                    context.width as f32,
+                    context.height as f32,
+                )
+            } else {
+                layout_frame.clone()
+            };
+            preview_apply_hover_overlay_to_render_frame(&mut render_frame, hover_overlay);
+            preview_apply_focus_overlay_lookup_to_render_frame(
                 &mut render_frame,
-                overlay,
+                &visible_state.overlay_lookup,
+                focus_overlay,
+            );
+            if let Some(overlay) = headed_scenario_overlay {
+                preview_apply_headed_scenario_overlay_to_render_frame(
+                    &mut render_frame,
+                    overlay,
+                    context.width as f32,
+                    context.height as f32,
+                );
+            }
+            let render_frame = preview_frame_with_viewport_background(
+                &render_frame,
                 context.width as f32,
                 context.height as f32,
             );
+            let render_frame_hash = render_frame_hash(&render_frame);
+            const PREVIEW_RENDER_FRAME_CACHE_CAP: usize = 128;
+            if render_frame_cache.len() >= PREVIEW_RENDER_FRAME_CACHE_CAP {
+                render_frame_cache.remove(0);
+            }
+            render_frame_cache.push((render_cache_key.clone(), render_frame, render_frame_hash));
         }
-        let render_frame = preview_frame_with_viewport_background(
-            &render_frame,
-            context.width as f32,
-            context.height as f32,
-        );
-        let render_frame_hash = render_frame_hash(&render_frame);
-        *render_frame_cache = Some((render_cache_key.clone(), render_frame, render_frame_hash));
-    }
+        render_frame_cache
+            .iter()
+            .find(|(key, _, _)| key == &render_cache_key)
+            .map(|(_, frame, hash)| (frame, hash.as_str()))
+            .ok_or("render frame cache was not initialized")?
+    };
     let render_frame_cache_ms = elapsed_ms(render_frame_cache_started);
-    let (render_frame, render_frame_hash) = render_frame_cache
-        .as_ref()
-        .map(|(_, frame, hash)| (frame, hash))
-        .ok_or("render frame cache was not initialized")?;
+    let effective_render_scene_patch_hash = if input_overlay_render_scene_patch_enabled {
+        boon_runtime::sha256_bytes(
+            format!("native-input-overlay-render-scene-patch:{render_frame_hash_value}").as_bytes(),
+        )
+    } else {
+        layout_render_scene_patch_hash.clone()
+    };
+    let mut input_overlay_render_scene_patch_build_ms = 0.0_f64;
     let renderer_init_started = Instant::now();
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
@@ -10450,101 +10700,260 @@ fn native_gpu_app_owned_render_hook(
     });
     let renderer_init_ms = elapsed_ms(renderer_init_started);
     let render_scene_cache_started = Instant::now();
-    let mut render_scene_cache_hit = true;
-    if render_scene_cache.as_ref().is_none_or(
-        |(
-            _cached_layout_hash,
-            cached_render_hash,
-            cached_width,
-            cached_height,
-            cached_lowering_mode,
-            cached_patch_hash,
-            _,
-        )| {
-            cached_render_hash != render_frame_hash
-                || *cached_width != context.width
-                || *cached_height != context.height
-                || cached_lowering_mode != current_render_scene_lowering_mode
-                || cached_patch_hash != &render_scene_patch_hash
-        },
-    ) {
-        render_scene_cache_hit = false;
-        let patched_cached_scene = if let (
-            Some(render_scene_patch),
-            Some(base_hash),
-            Some((
-                cached_layout_hash,
-                _cached_render_hash,
-                cached_width,
-                cached_height,
-                cached_lowering_mode,
-                _cached_patch_hash,
-                cached_scene,
-            )),
-        ) = (
-            render_scene_patch.as_deref(),
-            render_scene_patch_base_hash.as_deref(),
-            render_scene_cache.as_ref(),
-        ) {
-            if cached_layout_hash == base_hash
-                && *cached_width == context.width
-                && *cached_height == context.height
-                && cached_lowering_mode == current_render_scene_lowering_mode
+    let render_scene_cache_key = (
+        render_frame_hash_value.to_owned(),
+        context.width,
+        context.height,
+        current_render_scene_lowering_mode.to_owned(),
+        effective_render_scene_patch_hash.clone(),
+    );
+    let direct_input_overlay_render_scene_patch_enabled =
+        input_overlay_render_scene_patch_enabled && skip_app_owned_scene_proof;
+    let mut direct_input_overlay_render_scene_patch = None;
+    let mut render_scene_encode_cache_key = render_scene_cache_key.clone();
+    let render_scene_cache_hit: bool;
+    if direct_input_overlay_render_scene_patch_enabled {
+        const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
+        let base_render_frame_hash = boon_runtime::sha256_bytes(
+            format!(
+                "native-input-overlay-base-frame:{render_frame_layout_cache_key}:{}:{}",
+                context.width, context.height
+            )
+            .as_bytes(),
+        );
+        let base_cache_key = (
+            base_render_frame_hash,
+            context.width,
+            context.height,
+            current_render_scene_lowering_mode.to_owned(),
+            "none".to_owned(),
+        );
+        render_scene_cache_hit = render_scene_cache.contains_key(&base_cache_key);
+        if !render_scene_cache_hit {
+            let base_render_frame = preview_frame_with_viewport_background(
+                layout_frame,
+                context.width as f32,
+                context.height as f32,
+            );
+            let (base_render_scene, _base_lowering_mode) = preview_render_scene_for_frame_hash(
+                visible_state.layout_frame_hash.as_deref(),
+                &base_render_frame,
+                context.width,
+                context.height,
+                render_text_columns,
+            )?;
+            let base_scene_hash = render_scene_hash(&base_render_scene);
+            if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
+                && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
             {
-                let mut render_scene = cached_scene.clone();
-                render_scene.apply_patch(render_scene_patch)?;
-                Some((render_scene, cached_lowering_mode.clone()))
-            } else {
-                None
+                render_scene_cache.remove(&oldest_key);
             }
+            render_scene_cache.insert(
+                base_cache_key.clone(),
+                (
+                    layout_cache_key.to_owned(),
+                    base_scene_hash,
+                    base_render_scene,
+                ),
+            );
+        }
+        let patch_build_started = Instant::now();
+        direct_input_overlay_render_scene_patch = Some(
+            preview_input_overlay_render_scene_patch_from_base(
+                layout_frame,
+                &visible_state.overlay_lookup,
+                hover_overlay,
+                focus_overlay,
+                &input_overlay_touched_nodes,
+                context.width,
+                context.height,
+                render_text_columns,
+            )
+            .ok_or("input overlay render scene patch was enabled but produced no patch")?,
+        );
+        input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
+        render_scene_encode_cache_key = base_cache_key;
+    } else {
+        render_scene_cache_hit = render_scene_cache.contains_key(&render_scene_cache_key);
+    }
+    if !direct_input_overlay_render_scene_patch_enabled && !render_scene_cache_hit {
+        const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
+        let patched_cached_scene = if input_overlay_render_scene_patch_enabled {
+            let cached_base_scene = render_scene_cache.iter().find_map(
+                |(
+                    (
+                        _cached_render_hash,
+                        cached_width,
+                        cached_height,
+                        cached_lowering_mode,
+                        cached_patch_hash,
+                    ),
+                    (cached_layout_hash, _cached_scene_hash, cached_scene),
+                )| {
+                    (cached_layout_hash == layout_cache_key
+                        && *cached_width == context.width
+                        && *cached_height == context.height
+                        && cached_lowering_mode == current_render_scene_lowering_mode
+                        && cached_patch_hash == "none")
+                        .then(|| (cached_scene.clone(), cached_lowering_mode.clone()))
+                },
+            );
+            let base_scene = if let Some(base_scene) = cached_base_scene {
+                base_scene
+            } else {
+                let base_render_frame = preview_frame_with_viewport_background(
+                    layout_frame,
+                    context.width as f32,
+                    context.height as f32,
+                );
+                let (base_render_scene, base_lowering_mode) = preview_render_scene_for_frame_hash(
+                    visible_state.layout_frame_hash.as_deref(),
+                    &base_render_frame,
+                    context.width,
+                    context.height,
+                    render_text_columns,
+                )?;
+                let base_scene_hash = render_scene_hash(&base_render_scene);
+                let base_cache_key = (
+                    render_frame_hash(&base_render_frame),
+                    context.width,
+                    context.height,
+                    base_lowering_mode.to_owned(),
+                    "none".to_owned(),
+                );
+                if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
+                    && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
+                {
+                    render_scene_cache.remove(&oldest_key);
+                }
+                render_scene_cache.insert(
+                    base_cache_key,
+                    (
+                        layout_cache_key.to_owned(),
+                        base_scene_hash,
+                        base_render_scene.clone(),
+                    ),
+                );
+                (base_render_scene, base_lowering_mode.to_owned())
+            };
+            let patch_build_started = Instant::now();
+            let input_overlay_patch = preview_input_overlay_render_scene_patch_from_base(
+                layout_frame,
+                &visible_state.overlay_lookup,
+                hover_overlay,
+                focus_overlay,
+                &input_overlay_touched_nodes,
+                context.width,
+                context.height,
+                render_text_columns,
+            )
+            .ok_or("input overlay render scene patch was enabled but produced no patch")?;
+            input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
+            let (mut render_scene, lowering_mode) = base_scene;
+            render_scene.apply_patch(&input_overlay_patch.patch)?;
+            Some((render_scene, lowering_mode))
+        } else if let (Some(render_scene_patch), Some(base_hash)) = (
+            layout_render_scene_patch.as_deref(),
+            layout_render_scene_patch_base_hash.as_deref(),
+        ) {
+            render_scene_cache
+                .iter()
+                .find_map(
+                    |(
+                        (
+                            _cached_render_hash,
+                            cached_width,
+                            cached_height,
+                            cached_lowering_mode,
+                            cached_patch_hash,
+                        ),
+                        (cached_layout_hash, _cached_scene_hash, cached_scene),
+                    )| {
+                        (cached_layout_hash == base_hash
+                            && *cached_width == context.width
+                            && *cached_height == context.height
+                            && cached_lowering_mode == current_render_scene_lowering_mode
+                            && cached_patch_hash == "none")
+                            .then(|| (cached_scene.clone(), cached_lowering_mode.clone()))
+                    },
+                )
+                .map(|(mut render_scene, lowering_mode)| {
+                    render_scene.apply_patch(render_scene_patch)?;
+                    Ok::<_, Box<dyn std::error::Error>>((render_scene, lowering_mode))
+                })
+                .transpose()?
         } else {
             None
         };
-        let (render_scene, render_scene_lowering_mode) =
+        let (render_scene, _render_scene_lowering_mode) =
             if let Some((render_scene, lowering_mode)) = patched_cached_scene {
                 (render_scene, lowering_mode)
             } else {
-                let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
                 let (mut render_scene, render_scene_lowering_mode) =
                     preview_render_scene_for_frame_hash(
                         visible_state.layout_frame_hash.as_deref(),
                         render_frame,
                         context.width,
                         context.height,
-                        &mut columns,
+                        render_text_columns,
                     )?;
-                if let Some(render_scene_patch) = render_scene_patch.as_deref() {
+                if let Some(render_scene_patch) = layout_render_scene_patch.as_deref() {
                     render_scene.apply_patch(render_scene_patch)?;
                 }
                 (render_scene, render_scene_lowering_mode.to_owned())
             };
-        *render_scene_cache = Some((
-            layout_cache_key.to_owned(),
-            render_frame_hash.to_owned(),
-            context.width,
-            context.height,
-            render_scene_lowering_mode.to_owned(),
-            render_scene_patch_hash.clone(),
-            render_scene,
-        ));
+        if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
+            && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
+        {
+            render_scene_cache.remove(&oldest_key);
+        }
+        render_scene_cache.insert(
+            render_scene_cache_key.clone(),
+            (
+                layout_cache_key.to_owned(),
+                render_scene_hash(&render_scene),
+                render_scene,
+            ),
+        );
     }
     let render_scene_cache_ms = elapsed_ms(render_scene_cache_started);
-    let (_, _, _, _, render_scene_lowering_mode, render_scene_patch_hash, render_scene) =
-        render_scene_cache
-            .as_ref()
-            .ok_or("preview render scene cache was not initialized")?;
+    let (render_scene_lowering_mode, render_scene_patch_hash) =
+        (&render_scene_cache_key.3, &render_scene_cache_key.4);
+    let (_, cached_render_scene_hash, render_scene) = render_scene_cache
+        .get(&render_scene_encode_cache_key)
+        .ok_or("preview render scene cache was not initialized")?;
     let encode_scene_started = Instant::now();
-    let visible_metrics = renderer.encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
-        device: context.device,
-        queue: context.queue,
-        encoder: context.encoder,
-        view: context.surface_view,
-        scene: render_scene,
-        format: context.surface_texture_format,
-        width: context.width,
-        height: context.height,
-    })?;
+    let visible_metrics =
+        if let Some(input_overlay_patch) = direct_input_overlay_render_scene_patch.as_ref() {
+            renderer.encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
+                device: context.device,
+                queue: context.queue,
+                encoder: context.encoder,
+                view: context.surface_view,
+                scene: render_scene,
+                patch: &input_overlay_patch.patch,
+                format: context.surface_texture_format,
+                width: context.width,
+                height: context.height,
+            })?
+        } else {
+            renderer.encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
+                device: context.device,
+                queue: context.queue,
+                encoder: context.encoder,
+                view: context.surface_view,
+                scene: render_scene,
+                format: context.surface_texture_format,
+                width: context.width,
+                height: context.height,
+            })?
+        };
     let encode_scene_ms = elapsed_ms(encode_scene_started);
+    let visible_metrics_report = if skip_app_owned_scene_proof {
+        preview_compact_frame_metrics_json(&visible_metrics)
+    } else {
+        serde_json::to_value(&visible_metrics)?
+    };
     let render_scene_hash_started = Instant::now();
     let (rendered_scene_hash, render_scene_hash_status, render_scene_identity) =
         if skip_app_owned_scene_proof {
@@ -10552,30 +10961,32 @@ fn native_gpu_app_owned_render_hook(
                 serde_json::Value::Null,
                 "skipped-visible-surface-proof-path",
                 format!(
-                    "visible-surface-render-frame:{render_frame_hash}:patch:{render_scene_patch_hash}"
+                    "visible-surface-render-frame:{render_frame_hash_value}:patch:{render_scene_patch_hash}"
                 ),
             )
         } else {
-            let hash = render_scene_hash(render_scene);
             (
-                json!(hash.clone()),
+                json!(cached_render_scene_hash.clone()),
                 "computed",
-                format!("render-scene:{hash}"),
+                format!("render-scene:{cached_render_scene_hash}"),
             )
         };
     let render_scene_hash_ms = elapsed_ms(render_scene_hash_started);
     let proof_started = Instant::now();
+    let render_identity_hash = render_scene_identity
+        .strip_prefix("render-scene:")
+        .unwrap_or(&render_scene_identity);
     let app_owned_readback_reused = !skip_app_owned_scene_proof
-        && app_owned_proof.as_ref().is_some_and(|proof| {
-            render_proof_matches_frame_hash(
-                proof,
-                context.width,
-                context.height,
-                render_scene_identity
-                    .strip_prefix("render-scene:")
-                    .unwrap_or(&render_scene_identity),
-            )
-        });
+        && app_owned_proof_cache
+            .get(render_identity_hash)
+            .is_some_and(|proof| {
+                render_proof_matches_frame_hash(
+                    proof,
+                    context.width,
+                    context.height,
+                    render_identity_hash,
+                )
+            });
     let (render_backend_trait, proof) = if skip_app_owned_scene_proof {
         (
             "boon_native_gpu::encode_render_scene_to_surface",
@@ -10585,15 +10996,15 @@ fn native_gpu_app_owned_render_hook(
                 "render_scene_hash": rendered_scene_hash,
                 "render_scene_hash_status": render_scene_hash_status,
                 "render_scene_identity": render_scene_identity,
-                "metrics": visible_metrics.clone(),
+                "metrics": visible_metrics_report.clone(),
                 "offscreen_app_owned_scene_readback": "skipped-for-interaction-measurement",
                 "replacement_proof": "render-loop visible surface readback artifact"
             }),
         )
     } else {
         let proof = if app_owned_readback_reused {
-            app_owned_proof
-                .as_ref()
+            app_owned_proof_cache
+                .get(render_identity_hash)
                 .expect("matching app-owned proof should exist")
                 .clone()
         } else {
@@ -10602,9 +11013,7 @@ fn native_gpu_app_owned_render_hook(
                     device: context.device,
                     queue: context.queue,
                     scene: render_scene,
-                    render_identity_hash: render_scene_identity
-                        .strip_prefix("render-scene:")
-                        .unwrap_or(&render_scene_identity),
+                    render_identity_hash,
                     surface_id: context.surface_id.clone(),
                     surface_epoch: context.surface_epoch,
                     width: context.width,
@@ -10613,7 +11022,13 @@ fn native_gpu_app_owned_render_hook(
                     artifact_label: "preview",
                 },
             )?;
-            *app_owned_proof = Some(proof.clone());
+            const PREVIEW_APP_OWNED_PROOF_CACHE_CAP: usize = 128;
+            if app_owned_proof_cache.len() >= PREVIEW_APP_OWNED_PROOF_CACHE_CAP
+                && let Some(oldest_key) = app_owned_proof_cache.keys().next().cloned()
+            {
+                app_owned_proof_cache.remove(&oldest_key);
+            }
+            app_owned_proof_cache.insert(render_identity_hash.to_owned(), proof.clone());
             proof
         };
         (
@@ -10622,7 +11037,7 @@ fn native_gpu_app_owned_render_hook(
         )
     };
     let proof_ms = elapsed_ms(proof_started);
-    let render_hook_phase_timings_ms = json!({
+    let mut render_hook_phase_timings_ms = json!({
         "total_before_report_json_ms": elapsed_ms(render_hook_started),
         "layout_cache_ms": layout_cache_ms,
         "layout_cache_hit": !cache_stale,
@@ -10630,13 +11045,16 @@ fn native_gpu_app_owned_render_hook(
         "render_frame_cache_hit": render_frame_cache_hit,
         "renderer_init_ms": renderer_init_ms,
         "render_scene_patch_lookup_ms": render_scene_patch_lookup_ms,
+        "input_overlay_render_scene_patch_prepare_ms": input_overlay_prepare_ms,
+        "input_overlay_render_scene_patch_build_ms": input_overlay_render_scene_patch_build_ms,
         "render_scene_cache_ms": render_scene_cache_ms,
         "render_scene_cache_hit": render_scene_cache_hit,
         "encode_scene_ms": encode_scene_ms,
         "render_scene_hash_ms": render_scene_hash_ms,
         "proof_ms": proof_ms
     });
-    Ok(json!({
+    let report_json_started = Instant::now();
+    let mut report = json!({
         "status": "pass",
         "renderer": "boon_native_gpu",
         "render_backend_trait": render_backend_trait,
@@ -10667,21 +11085,111 @@ fn native_gpu_app_owned_render_hook(
             PreviewStatusOverlayKind::Error => "error",
         }),
         "headed_scenario_overlay_visible": headed_scenario_overlay.is_some(),
-        "headed_scenario_overlay": headed_scenario_overlay
-            .map(preview_headed_scenario_overlay_report)
-            .unwrap_or_else(|| json!(null)),
+        "headed_scenario_overlay": if skip_app_owned_scene_proof {
+            serde_json::Value::Null
+        } else {
+            headed_scenario_overlay
+                .map(preview_headed_scenario_overlay_report)
+                .unwrap_or_else(|| json!(null))
+        },
         "visible_surface_rendered": true,
         "visible_present_path": true,
-        "visible_surface_metrics": visible_metrics,
+        "visible_surface_metrics": visible_metrics_report,
+        "retained_bound_sync": preview_retained_bound_sync_stats_json(),
         "render_hook_phase_timings_ms": render_hook_phase_timings_ms,
         "render_scene_lowering_mode": render_scene_lowering_mode,
         "render_scene_patch_hash": render_scene_patch_hash,
         "render_scene_patch_applied": render_scene_patch_hash != "none",
+        "render_scene_patch_source": if input_overlay_render_scene_patch_enabled {
+            "native_input_overlay"
+        } else if layout_render_scene_patch.is_some() {
+            "layout_sidecar"
+        } else {
+            "none"
+        },
+        "input_overlay_render_scene_patch_applied": input_overlay_render_scene_patch_enabled,
+        "input_overlay_render_scene_patch_direct_encode": direct_input_overlay_render_scene_patch_enabled,
+        "input_overlay_render_scene_patch_touched_node_count": input_overlay_touched_nodes.len(),
+        "input_overlay_render_scene_patch_built_this_frame": input_overlay_render_scene_patch_build_ms > 0.0,
         "app_owned_readback_reused": app_owned_readback_reused,
         "offscreen_app_owned_scene_readback_skipped": skip_app_owned_scene_proof,
         "proof": proof,
         "copy_to_present_limitation": serde_json::Value::Null
-    }))
+    });
+    let report_json_ms = elapsed_ms(report_json_started);
+    if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+        timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+        timings.insert(
+            "total_with_report_json_ms".to_owned(),
+            json!(elapsed_ms(render_hook_started)),
+        );
+    }
+    report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+    Ok(report)
+}
+
+fn preview_compact_frame_metrics_json(
+    metrics: &boon_native_gpu::FrameMetrics,
+) -> serde_json::Value {
+    json!({
+        "frame_seq": metrics.frame_seq,
+        "render_scene_source": metrics.render_scene_source,
+        "draw_calls": metrics.draw_calls,
+        "upload_bytes": metrics.upload_bytes,
+        "allocated_gpu_bytes": metrics.allocated_gpu_bytes,
+        "dirty_upload_range_count": metrics.dirty_upload_range_count,
+        "dirty_upload_chunk_count": metrics.dirty_upload_chunk_count,
+        "buffer_reuse_count": metrics.buffer_reuse_count,
+        "staging_wrap_count": metrics.staging_wrap_count,
+        "queue_write_count": metrics.queue_write_count,
+        "quad_cache_eviction_count": metrics.quad_cache_eviction_count,
+        "quad_cache_hit": metrics.quad_cache_hit,
+        "quad_cache_entry_count": metrics.quad_cache_entry_count,
+        "visible_display_item_count": metrics.visible_display_item_count,
+        "rendered_rect_count": metrics.rendered_rect_count,
+        "rect_cap_hit": metrics.rect_cap_hit,
+        "visible_text_runs": metrics.visible_text_runs,
+        "shaped_text_runs": metrics.shaped_text_runs,
+        "text_runs_shaped": metrics.text_runs_shaped,
+        "rendered_text_runs": metrics.rendered_text_runs,
+        "shaped_run_cache_hits": metrics.shaped_run_cache_hits,
+        "shaped_run_cache_misses": metrics.shaped_run_cache_misses,
+        "shaped_run_cache_evictions": metrics.shaped_run_cache_evictions,
+        "shaped_run_cache_entry_count": metrics.shaped_run_cache_entry_count,
+        "shaped_run_cache_capacity": metrics.shaped_run_cache_capacity,
+        "shaped_run_cache_bytes": metrics.shaped_run_cache_bytes,
+        "missing_glyph_count": metrics.missing_glyph_count,
+        "glyph_atlas_prepare_count": metrics.glyph_atlas_prepare_count,
+        "glyph_atlas_evictions_observed": metrics.glyph_atlas_evictions_observed,
+        "text_cap_hit": metrics.text_cap_hit,
+        "glyphon_text_area_count": metrics.glyphon_text_area_count,
+        "color_only_rect_fallback": metrics.color_only_rect_fallback,
+        "preview_blocked_on_ipc_count": metrics.preview_blocked_on_ipc_count,
+        "asset_ref_count": metrics.asset_ref_count,
+        "asset_cache_hits": metrics.asset_cache_hits,
+        "asset_cache_misses": metrics.asset_cache_misses,
+        "asset_cache_evictions": metrics.asset_cache_evictions,
+        "asset_cache_entry_count": metrics.asset_cache_entry_count,
+        "asset_cache_byte_count": metrics.asset_cache_byte_count,
+        "asset_cache_byte_cap": metrics.asset_cache_byte_cap,
+        "asset_cache_byte_cap_hit": metrics.asset_cache_byte_cap_hit,
+        "asset_decode_count": metrics.asset_decode_count,
+        "asset_raster_count": metrics.asset_raster_count,
+        "asset_upload_count": metrics.asset_upload_count,
+        "asset_upload_bytes": metrics.asset_upload_bytes,
+        "asset_failure_count": metrics.asset_failure_diagnostics.len(),
+        "retained_chunk_count": metrics.retained_chunk_count,
+        "retained_chunk_hit_count": metrics.retained_chunk_hit_count,
+        "retained_chunk_miss_count": metrics.retained_chunk_miss_count,
+        "retained_chunk_reuse_count": metrics.retained_chunk_reuse_count,
+        "dirty_chunk_count": metrics.dirty_chunk_count,
+        "retained_chunk_sample_count": metrics.retained_chunk_sample_count,
+        "retained_chunk_inventory_truncated": metrics.retained_chunk_inventory_truncated,
+        "retained_chunk_inventory_omitted": true,
+        "dirty_upload_ranges_omitted": true,
+        "dirty_upload_chunk_ids_omitted": true,
+        "asset_refs_omitted": true
+    })
 }
 
 #[cfg(test)]
@@ -10755,6 +11263,7 @@ struct PreviewRenderFrameCacheKey {
     last_error: Option<String>,
     status_overlay: Option<(PreviewStatusOverlayKind, String)>,
     hover_overlay: PreviewHoverOverlayState,
+    focus_overlay: PreviewFocusOverlayState,
     headed_scenario_overlay: Option<PreviewHeadedScenarioOverlayState>,
 }
 
@@ -10793,7 +11302,265 @@ fn preview_apply_hover_overlay_to_render_frame(
         } else if item.style.contains_key("__hover_paint") {
             remove_display_style_key(&mut item.style, "__hover_paint");
         }
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
     }
+}
+
+fn preview_apply_focus_overlay_state_to_render_frame(
+    frame: &mut boon_document::LayoutFrame,
+    layout_proof: &Value,
+    focus_overlay: &PreviewFocusOverlayState,
+) {
+    if focus_overlay.is_empty()
+        && !frame
+            .display_list
+            .iter()
+            .any(display_item_has_focus_overlay_state)
+    {
+        return;
+    }
+    let selected_address = focus_overlay.selected_address.as_deref();
+    for item in &mut frame.display_list {
+        let next_focused = focus_overlay.focused_node.as_deref() == Some(item.node.0.as_str());
+        if next_focused || item.focused || item.style.contains_key("__focused") {
+            item.focused = next_focused;
+            set_display_style_value(
+                &mut item.style,
+                "__focused",
+                boon_document_model::StyleValue::Bool(next_focused),
+            );
+        }
+        if item.style.contains_key("selected") {
+            let selected = selected_address
+                .and_then(|address| {
+                    focused_raw_address(layout_proof, &item.node.0)
+                        .or_else(|| focused_address(layout_proof, &item.node.0))
+                        .map(|item_address| item_address == address)
+                })
+                .unwrap_or(false);
+            set_display_style_value(
+                &mut item.style,
+                "selected",
+                boon_document_model::StyleValue::Bool(selected),
+            );
+        }
+        if next_focused {
+            if !focus_overlay.replace_focused_text_on_next_edit
+                && item.text.as_deref() != Some(focus_overlay.focused_text.as_str())
+            {
+                item.text = Some(focus_overlay.focused_text.clone());
+            }
+            set_display_style_value(
+                &mut item.style,
+                "caret_column",
+                boon_document_model::StyleValue::Number(focus_overlay.focused_caret_index as f64),
+            );
+            set_display_style_value(
+                &mut item.style,
+                "caret_visible",
+                boon_document_model::StyleValue::Bool(focus_overlay.caret_visible),
+            );
+        } else {
+            remove_display_style_key(&mut item.style, "caret_column");
+            remove_display_style_key(&mut item.style, "caret_visible");
+        }
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+    }
+}
+
+fn preview_apply_focus_overlay_lookup_to_render_frame(
+    frame: &mut boon_document::LayoutFrame,
+    lookup: &PreviewRenderOverlayLookup,
+    focus_overlay: &PreviewFocusOverlayState,
+) {
+    if focus_overlay.is_empty()
+        && !frame
+            .display_list
+            .iter()
+            .any(display_item_has_focus_overlay_state)
+    {
+        return;
+    }
+    let selected_address = focus_overlay.selected_address.as_deref();
+    for item in &mut frame.display_list {
+        let next_focused = focus_overlay.focused_node.as_deref() == Some(item.node.0.as_str());
+        if next_focused || item.focused || item.style.contains_key("__focused") {
+            item.focused = next_focused;
+            set_display_style_value(
+                &mut item.style,
+                "__focused",
+                boon_document_model::StyleValue::Bool(next_focused),
+            );
+        }
+        if item.style.contains_key("selected") {
+            let selected = selected_address
+                .and_then(|address| {
+                    lookup
+                        .address_for_node(&item.node.0)
+                        .map(|item_address| item_address == address)
+                })
+                .unwrap_or(false);
+            set_display_style_value(
+                &mut item.style,
+                "selected",
+                boon_document_model::StyleValue::Bool(selected),
+            );
+        }
+        if next_focused {
+            if !focus_overlay.replace_focused_text_on_next_edit
+                && item.text.as_deref() != Some(focus_overlay.focused_text.as_str())
+            {
+                item.text = Some(focus_overlay.focused_text.clone());
+            }
+            set_display_style_value(
+                &mut item.style,
+                "caret_column",
+                boon_document_model::StyleValue::Number(focus_overlay.focused_caret_index as f64),
+            );
+            set_display_style_value(
+                &mut item.style,
+                "caret_visible",
+                boon_document_model::StyleValue::Bool(focus_overlay.caret_visible),
+            );
+        } else {
+            remove_display_style_key(&mut item.style, "caret_column");
+            remove_display_style_key(&mut item.style, "caret_visible");
+        }
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreviewInputOverlayRenderScenePatch {
+    patch: boon_document::RenderScenePatch,
+}
+
+fn preview_input_overlay_render_scene_touched_nodes(
+    base_frame: &boon_document::LayoutFrame,
+    lookup: &PreviewRenderOverlayLookup,
+    hover_overlay: &PreviewHoverOverlayState,
+    focus_overlay: &PreviewFocusOverlayState,
+) -> BTreeSet<boon_document_model::DocumentNodeId> {
+    let mut nodes = BTreeSet::new();
+    nodes.extend(
+        hover_overlay
+            .hover_nodes
+            .iter()
+            .chain(hover_overlay.paint_nodes.iter())
+            .cloned()
+            .map(boon_document_model::DocumentNodeId),
+    );
+    if let Some(focused_node) = focus_overlay.focused_node.as_ref() {
+        nodes.insert(boon_document_model::DocumentNodeId(focused_node.clone()));
+    }
+    if let Some(selected_address) = focus_overlay.selected_address.as_deref() {
+        let mut selected_nodes = lookup.nodes_for_address(selected_address);
+        if selected_nodes.is_empty() {
+            selected_nodes.extend(
+                base_frame
+                    .display_list
+                    .iter()
+                    .filter(|item| item.style.contains_key("selected"))
+                    .filter(|item| lookup.address_for_node(&item.node.0) == Some(selected_address))
+                    .map(|item| item.node.0.clone()),
+            );
+        }
+        nodes.extend(
+            selected_nodes
+                .into_iter()
+                .map(boon_document_model::DocumentNodeId),
+        );
+    }
+    nodes.retain(|node| {
+        base_frame
+            .display_list
+            .iter()
+            .any(|item| item.node == *node)
+    });
+    nodes
+}
+
+fn preview_input_overlay_render_scene_patch(
+    render_frame: &boon_document::LayoutFrame,
+    touched_nodes: &BTreeSet<boon_document_model::DocumentNodeId>,
+    width: u32,
+    height: u32,
+    columns: &mut impl boon_document::render_scene::RenderTextColumnMeasurer,
+) -> Option<PreviewInputOverlayRenderScenePatch> {
+    if touched_nodes.is_empty() {
+        return None;
+    }
+    let items = boon_document::render_scene::render_scene_items_for_touched_nodes(
+        render_frame,
+        width,
+        height,
+        &touched_nodes,
+    );
+    let visual_primitives = boon_document::render_scene::render_visual_primitives_for_touched_nodes(
+        render_frame,
+        width,
+        height,
+        &mut *columns,
+        &touched_nodes,
+    );
+    let text_runs = boon_document::render_scene::render_text_runs_for_touched_nodes(
+        render_frame,
+        width,
+        height,
+        &mut *columns,
+        &touched_nodes,
+    );
+    if items.is_empty() && visual_primitives.is_empty() && text_runs.is_empty() {
+        return None;
+    }
+    let patch = boon_document::RenderScenePatch {
+        operations: vec![
+            boon_document::RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes: touched_nodes.iter().cloned().collect(),
+                items,
+                visual_primitives,
+                text_runs,
+            },
+        ],
+    };
+    Some(PreviewInputOverlayRenderScenePatch { patch })
+}
+
+fn preview_input_overlay_render_scene_patch_from_base(
+    base_frame: &boon_document::LayoutFrame,
+    lookup: &PreviewRenderOverlayLookup,
+    hover_overlay: &PreviewHoverOverlayState,
+    focus_overlay: &PreviewFocusOverlayState,
+    touched_nodes: &BTreeSet<boon_document_model::DocumentNodeId>,
+    width: u32,
+    height: u32,
+    columns: &mut impl boon_document::render_scene::RenderTextColumnMeasurer,
+) -> Option<PreviewInputOverlayRenderScenePatch> {
+    if touched_nodes.is_empty() {
+        return None;
+    }
+    let mut patch_frame = boon_document::LayoutFrame {
+        display_list: base_frame
+            .display_list
+            .iter()
+            .filter(|item| touched_nodes.contains(&item.node))
+            .cloned()
+            .collect(),
+        hit_regions: Vec::new(),
+        scroll_regions: Vec::new(),
+        accessibility: boon_document::AccessibilityTree::default(),
+        demands: Vec::new(),
+        materialization: Vec::new(),
+        metrics: boon_document::LayoutMetrics::default(),
+    };
+    if patch_frame.display_list.is_empty() {
+        return None;
+    }
+    preview_apply_hover_overlay_to_render_frame(&mut patch_frame, hover_overlay);
+    preview_apply_focus_overlay_lookup_to_render_frame(&mut patch_frame, lookup, focus_overlay);
+    let patch_frame =
+        preview_frame_with_viewport_background(&patch_frame, width as f32, height as f32);
+    preview_input_overlay_render_scene_patch(&patch_frame, touched_nodes, width, height, columns)
 }
 
 fn preview_apply_headed_scenario_overlay_to_render_frame(
@@ -27566,7 +28333,13 @@ fn lower_canonical_element_text(
                 }
             }
             "placeholder" => {
-                if let Some(text) = document_text_or_nested_text(child, expressions, context)
+                if let Some(text) = child
+                    .expr
+                    .and_then(|expr_id| expressions.get(expr_id))
+                    .and_then(|expr| {
+                        document_text_value_for_expr_or_record_text(expr, expressions, context)
+                    })
+                    .or_else(|| document_text_or_nested_text(child, expressions, context))
                     .filter(|text| !text.is_empty())
                 {
                     node.style.insert(
@@ -27609,6 +28382,26 @@ fn lower_canonical_element_call_arg_text(
     let Some(args) = document_call_args(statement, expressions) else {
         return;
     };
+    if let Some(arg) = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("placeholder"))
+    {
+        document_context_clear_data_reads(context);
+        let text = expressions.get(arg.value).and_then(|expr| {
+            document_text_value_for_expr_or_record_text(expr, expressions, context)
+        });
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            let mut reads = document_context_take_data_reads(context);
+            reads.extend(document_expr_origin_paths(arg.value, expressions, context));
+            document_context_record_target_reads(context, node, "placeholder", reads);
+            node.style.insert(
+                "placeholder".to_owned(),
+                boon_document_model::StyleValue::Text(text),
+            );
+        } else {
+            let _ = document_context_take_data_reads(context);
+        }
+    }
     for name in ["label", "text", "value", "display_value", "child", "icon"] {
         if node.text.is_some() {
             return;
@@ -27776,6 +28569,24 @@ fn document_text_value_for_expr(
             .map(|value| json_value_to_document_text(&value))
             .or_else(|| document_expr_value(expr, expressions)),
     }
+}
+
+fn document_text_value_for_expr_or_record_text(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    context: &DocumentEvalContext<'_>,
+) -> Option<String> {
+    document_text_value_for_expr(expr, expressions, context)
+        .filter(|text| !text.is_empty())
+        .or_else(|| match &expr.kind {
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => fields
+                .iter()
+                .find(|field| field.name == "text")
+                .and_then(|field| expressions.get(field.value))
+                .and_then(|expr| document_text_value_for_expr(expr, expressions, context))
+                .filter(|text| !text.is_empty()),
+            _ => None,
+        })
 }
 
 fn document_render_constructor_text_arg(
@@ -29162,9 +29973,20 @@ fn lower_document_element(
             continue;
         };
         document_context_clear_data_reads(context);
-        if matches!(
+        if field == "placeholder" {
+            let text = document_text_value(child, expressions, context, false)
+                .unwrap_or_else(|| value.clone());
+            let reads = document_context_take_data_reads(context);
+            document_context_record_target_reads(context, &node, "placeholder", reads);
+            if !text.is_empty() {
+                node.style.insert(
+                    "placeholder".to_owned(),
+                    boon_document_model::StyleValue::Text(text),
+                );
+            }
+        } else if matches!(
             field.as_str(),
-            "text" | "value" | "display_value" | "placeholder" | "template"
+            "text" | "value" | "display_value" | "template"
         ) && node.text.is_none()
         {
             let text = document_text_value(child, expressions, context, field == "template")
@@ -33792,6 +34614,35 @@ fn json_value_to_document_text(value: &Value) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PreviewFocusOverlayState {
+    focused_node: Option<String>,
+    selected_address: Option<String>,
+    focused_text: String,
+    focused_caret_index: usize,
+    replace_focused_text_on_next_edit: bool,
+    caret_visible: bool,
+    selection_proxy: bool,
+}
+
+impl PreviewFocusOverlayState {
+    fn from_input_state(input_state: &PreviewNativeInputState, caret_visible: bool) -> Self {
+        Self {
+            focused_node: input_state.focused_node.clone(),
+            selected_address: input_state.focused_address.clone(),
+            focused_text: input_state.focused_text.clone(),
+            focused_caret_index: input_state.focused_caret_index,
+            replace_focused_text_on_next_edit: input_state.replace_focused_text_on_next_edit,
+            caret_visible,
+            selection_proxy: input_state.focused_selection_proxy,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.focused_node.is_none() && self.selected_address.is_none()
+    }
+}
+
 #[derive(Default)]
 struct PreviewNativeInputState {
     last_mouse_button_event_count: u64,
@@ -33826,6 +34677,8 @@ struct PreviewNativeInputState {
     caret_blink_started_at: Option<Instant>,
     focus_overlay_nodes: BTreeSet<String>,
     focus_overlay_initialized: bool,
+    focus_overlay_applied_in_input: bool,
+    focus_render_overlay: PreviewFocusOverlayState,
     selected_overlay_nodes: BTreeSet<String>,
     selected_overlay_address: Option<String>,
     held_repeat_key: Option<String>,
@@ -33978,6 +34831,53 @@ fn unix_now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreviewRetainedBoundSyncStats {
+    status: &'static str,
+    reason: Option<String>,
+    target_node_count: usize,
+    item_index_count: usize,
+    source_intent_update_count: usize,
+    source_intent_index_update_count: usize,
+    style_update_count: usize,
+    text_update_count: usize,
+    changed: bool,
+}
+
+fn preview_retained_bound_sync_stats() -> &'static Mutex<Option<PreviewRetainedBoundSyncStats>> {
+    static STATS: OnceLock<Mutex<Option<PreviewRetainedBoundSyncStats>>> = OnceLock::new();
+    STATS.get_or_init(|| Mutex::new(None))
+}
+
+fn record_preview_retained_bound_sync_stats(stats: PreviewRetainedBoundSyncStats) {
+    if let Ok(mut slot) = preview_retained_bound_sync_stats().lock() {
+        *slot = Some(stats);
+    }
+}
+
+fn preview_retained_bound_sync_stats_json() -> Value {
+    let stats = preview_retained_bound_sync_stats()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    match stats {
+        Some(stats) => json!({
+            "status": stats.status,
+            "reason": stats.reason,
+            "target_node_count": stats.target_node_count,
+            "item_index_count": stats.item_index_count,
+            "source_intent_update_count": stats.source_intent_update_count,
+            "source_intent_index_update_count": stats.source_intent_index_update_count,
+            "style_update_count": stats.style_update_count,
+            "text_update_count": stats.text_update_count,
+            "changed": stats.changed
+        }),
+        None => json!({
+            "status": "not-run"
+        }),
+    }
 }
 
 fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefinition {
@@ -34434,6 +35334,43 @@ fn unhandled_primary_mouse_click_edges(
     unhandled_primary_mouse_presses(input, last_press_sequence)
 }
 
+fn preview_simple_click_shape_reject_reason(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    input_state: &PreviewNativeInputState,
+    press_count: usize,
+    release_count: usize,
+    click_edge_count: usize,
+) -> &'static str {
+    if click_edge_count == 0 {
+        if input
+            .mouse_buttons_down
+            .iter()
+            .any(|button| button == "left")
+            && input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
+        {
+            "held_motion_without_click_edge"
+        } else {
+            "missing_click_edge"
+        }
+    } else if release_count == 0 && press_count > 1 {
+        "multiple_press_edges_without_release"
+    } else if press_count > click_edge_count.saturating_add(1) {
+        "ambiguous_primary_press_batch"
+    } else {
+        "ambiguous_primary_click_batch"
+    }
+}
+
+fn push_repeated_live_source_event(
+    events: &mut Vec<boon_runtime::LiveSourceEvent>,
+    event: boon_runtime::LiveSourceEvent,
+    repeat_count: usize,
+) {
+    for _ in 0..repeat_count.max(1) {
+        events.push(event.clone());
+    }
+}
+
 fn preview_input_has_unhandled_source_events(
     input: &boon_native_app_window::NativeInputAdapterProof,
     input_state: &PreviewNativeInputState,
@@ -34463,6 +35400,25 @@ fn preview_input_has_unhandled_source_events(
                     .iter()
                     .any(|pressed| pressed_key_matches_repeat(pressed, key))
         })
+}
+
+fn preview_input_is_unhandled_primary_press_only(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    input_state: &PreviewNativeInputState,
+) -> bool {
+    let presses = unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count);
+    !presses.is_empty()
+        && unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
+            .is_empty()
+        && input.keyboard_events.is_empty()
+        && input.pressed_keys.is_empty()
+        && input.scroll_delta_x.abs() <= f64::EPSILON
+        && input.scroll_delta_y.abs() <= f64::EPSILON
+        && input_state.active_drag.is_none()
+        && input_state.pending_live_events.is_empty()
+        && input.mouse_motion_event_count <= input_state.last_mouse_motion_event_count
+        && preview_mouse_position_key(input.mouse_window_pos)
+            == input_state.last_hover_window_position
 }
 
 fn preview_mouse_position_key(
@@ -35268,6 +36224,7 @@ fn preview_clear_focused_input_state(input_state: &mut PreviewNativeInputState) 
     input_state.replace_focused_text_on_next_edit = false;
     input_state.defer_focused_change_until_commit = false;
     input_state.caret_blink_started_at = None;
+    input_state.focus_render_overlay = PreviewFocusOverlayState::default();
     preview_clear_key_repeat(input_state);
 }
 
@@ -35280,7 +36237,7 @@ fn preview_focus_selected_editor_proxy_from_route_table(
     route_table: &PreviewHitRouteTable,
     node: &str,
     target_text: Option<String>,
-    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    _live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     input_state: &mut PreviewNativeInputState,
 ) -> bool {
     if route_table.change_source(node).is_some() || route_table.key_down_source(node).is_some() {
@@ -35309,12 +36266,9 @@ fn preview_focus_selected_editor_proxy_from_route_table(
     input_state.focused_target_generation = route_table.target_generation(node);
     input_state.focused_selection_proxy = true;
     preview_clear_key_repeat(input_state);
-    input_state.focused_text = route_table
-        .focused_text(node, live_runtime)
-        .or_else(|| route_table.document_value(node))
-        .unwrap_or_default();
+    input_state.focused_text.clear();
     input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
-    input_state.replace_focused_text_on_next_edit = false;
+    input_state.replace_focused_text_on_next_edit = true;
     input_state.defer_focused_change_until_commit = false;
     preview_reset_caret_blink(input_state);
     true
@@ -35347,10 +36301,29 @@ fn preview_focus_selected_editor_proxy_from_candidate(
     preview_clear_key_repeat(input_state);
     input_state.focused_text = candidate.focused_text.clone().unwrap_or_default();
     input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
-    input_state.replace_focused_text_on_next_edit = false;
+    input_state.replace_focused_text_on_next_edit = candidate.focused_text.is_none();
     input_state.defer_focused_change_until_commit = false;
     preview_reset_caret_blink(input_state);
     true
+}
+
+fn preview_refresh_selection_proxy_focused_text_from_selected_input(
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    input_state: &mut PreviewNativeInputState,
+) {
+    if !input_state.focused_selection_proxy {
+        return;
+    }
+    let Some(address) = input_state.focused_address.as_deref() else {
+        return;
+    };
+    let Some(text) = selected_input_editing_text_for_address(live_runtime, address) else {
+        return;
+    };
+    input_state.focused_text = text;
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit = false;
+    preview_reset_caret_blink(input_state);
 }
 
 fn preview_refresh_cached_focus_payloads(
@@ -35870,6 +36843,7 @@ fn preview_try_apply_focused_keyboard_input(
                 let hover_overlay_ms = elapsed_ms(hover_overlay_started);
                 let focus_overlay_started = Instant::now();
                 preview_blur_retained_focus_node(shared_render_state, input_state, &focused_node)?;
+                input_state.focus_overlay_applied_in_input = true;
                 let focus_overlay_ms = elapsed_ms(focus_overlay_started);
                 if carries_text {
                     preview_patch_retained_text_input_text(
@@ -35898,6 +36872,16 @@ fn preview_try_apply_focused_keyboard_input(
                 record_preview_native_input_timing(PreviewNativeInputTimingSample {
                     scope: preview_current_interaction_timing_scope(),
                     fast_path: "focused_keyboard",
+                    resolve_source: None,
+                    route_table_key_source: None,
+                    shared_lock_wait_ms: 0.0,
+                    route_table_lookup_ms: 0.0,
+                    route_dispatch_ms: 0.0,
+                    hit_test_ms: 0.0,
+                    event_build_ms: 0.0,
+                    live_events_ms: 0.0,
+                    bound_input_sync_ms: 0.0,
+                    selection_proxy_refresh_ms: 0.0,
                     resolve_ms: 0.0,
                     apply_ms: keyboard_ms,
                     hover_overlay_ms,
@@ -36194,9 +37178,15 @@ fn preview_try_apply_focused_keyboard_input(
     let focus_overlay_started = Instant::now();
     if let Some(node) = cleared_focus_node.as_deref() {
         preview_blur_retained_focus_node(shared_render_state, input_state, node)?;
+        input_state.focus_overlay_applied_in_input = true;
     } else if applied_event || preview_focus_overlay_may_be_needed(shared_render_state, input_state)
     {
-        preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        if input_state.focused_selection_proxy {
+            preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        } else {
+            preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        }
+        input_state.focus_overlay_applied_in_input = true;
     }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
     if let Some((node, text, source, address)) = post_focus_retained_text_patch {
@@ -36213,6 +37203,16 @@ fn preview_try_apply_focused_keyboard_input(
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "focused_keyboard",
+        resolve_source: None,
+        route_table_key_source: None,
+        shared_lock_wait_ms: 0.0,
+        route_table_lookup_ms: 0.0,
+        route_dispatch_ms: 0.0,
+        hit_test_ms: 0.0,
+        event_build_ms: 0.0,
+        live_events_ms: 0.0,
+        bound_input_sync_ms: 0.0,
+        selection_proxy_refresh_ms: 0.0,
         resolve_ms: layout_clone_ms,
         apply_ms: keyboard_ms,
         hover_overlay_ms,
@@ -36269,6 +37269,55 @@ fn preview_try_apply_simple_source_click_input(
     preview_set_interaction_diagnostic_subphase("simple_source_click.preconditions");
     let reject = |reason: &str, input_state: &PreviewNativeInputState| {
         record_preview_native_input_reject("simple_source_click", reason);
+        let presses =
+            unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count);
+        let releases =
+            unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
+        let click_edges = if releases.is_empty() {
+            unhandled_primary_mouse_click_edges(
+                input,
+                input_state.last_mouse_press_event_count,
+                input_state.last_mouse_button_event_count,
+            )
+        } else {
+            releases.clone()
+        };
+        let recent_button_events = input
+            .mouse_button_events
+            .iter()
+            .rev()
+            .take(8)
+            .map(|event| {
+                json!({
+                    "sequence": event.sequence,
+                    "button": event.button.as_str(),
+                    "pressed": event.pressed,
+                    "window_protocol_id": event.window_protocol_id
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        record_preview_native_input_reject_sample(json!({
+            "fast_path": "simple_source_click",
+            "reason": reason,
+            "mouse_motion_event_count": input.mouse_motion_event_count,
+            "last_mouse_motion_event_count": input_state.last_mouse_motion_event_count,
+            "mouse_button_event_count": input.mouse_button_event_count,
+            "last_mouse_button_event_count": input_state.last_mouse_button_event_count,
+            "last_mouse_press_event_count": input_state.last_mouse_press_event_count,
+            "press_count": presses.len(),
+            "release_count": releases.len(),
+            "click_edge_count": click_edges.len(),
+            "first_click_edge_sequence": click_edges.first().map(|event| event.sequence),
+            "last_click_edge_sequence": click_edges.last().map(|event| event.sequence),
+            "mouse_buttons_down": &input.mouse_buttons_down,
+            "recent_button_events": recent_button_events,
+            "focused_node": input_state.focused_node.as_deref(),
+            "active_drag": input_state.active_drag.is_some(),
+            "pending_live_events": input_state.pending_live_events.len()
+        }));
         if preview_profiling_enabled() && !input.mouse_button_events.is_empty() {
             record_preview_native_input_profile(json!({
                 "source_path": source_path,
@@ -36301,19 +37350,40 @@ fn preview_try_apply_simple_source_click_input(
         return reject("precondition", input_state);
     }
     let presses = unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count);
-    let click_edges = unhandled_primary_mouse_click_edges(
-        input,
-        input_state.last_mouse_press_event_count,
-        input_state.last_mouse_button_event_count,
-    );
+    let releases =
+        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
+    let click_edges = if releases.is_empty() {
+        unhandled_primary_mouse_click_edges(
+            input,
+            input_state.last_mouse_press_event_count,
+            input_state.last_mouse_button_event_count,
+        )
+    } else {
+        releases.clone()
+    };
     if click_edges.len() != 1 || presses.len() > 1 {
-        return reject("button_shape", input_state);
+        let reason = preview_simple_click_shape_reject_reason(
+            input,
+            input_state,
+            presses.len(),
+            releases.len(),
+            click_edges.len(),
+        );
+        let coalesced_release_batch = releases.len() > 1 && presses.len() <= releases.len();
+        if !coalesced_release_batch {
+            return reject(reason, input_state);
+        }
     }
+    let click_event_repeat_count = releases.len().max(1);
+    let coalesced_release_batch = click_event_repeat_count > 1;
     let Some(position) = input.mouse_window_pos else {
         return reject("missing_position", input_state);
     };
     let position_key = preview_mouse_position_key(input.mouse_window_pos);
-    let release_sequence = click_edges[0].sequence;
+    let release_sequence = click_edges
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(input.mouse_button_event_count);
     if presses.len() <= 1
         && preview_try_apply_retained_text_input_focus_click(
             input,
@@ -36338,6 +37408,8 @@ fn preview_try_apply_simple_source_click_input(
     let mut route_table_lookup_ms = 0.0_f64;
     let mut hit_test_ms = 0.0_f64;
     let mut click_event_build_ms = 0.0_f64;
+    let mut shared_lock_wait_ms = 0.0_f64;
+    let mut route_dispatch_ms = 0.0_f64;
     let mut route_table_key_source = "none";
     let cached_candidate = input_state
         .hovered_click_candidate
@@ -36355,13 +37427,19 @@ fn preview_try_apply_simple_source_click_input(
                 .cloned()
         });
     let previous_focused_node = input_state.focused_node.clone();
+    let route_dispatch_started = Instant::now();
     let (events, node, target_text, preserve_focus, focus_state_applied, click_candidate) =
         if let Some(candidate) = cached_candidate {
             if candidate.text_change {
+                if coalesced_release_batch {
+                    return reject("coalesced_text_click_batch", input_state);
+                }
                 click_resolve_source = "hit_test";
+                let shared_lock_started = Instant::now();
                 let shared = shared_render_state
                     .lock()
                     .map_err(|_| "preview render state mutex poisoned")?;
+                shared_lock_wait_ms += elapsed_ms(shared_lock_started);
                 let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
                     return reject("missing_typed_route_table", input_state);
                 };
@@ -36372,6 +37450,7 @@ fn preview_try_apply_simple_source_click_input(
                     return reject("missing_hit_region", input_state);
                 };
                 drop(shared);
+                let event_build_started = Instant::now();
                 let Some((events, node, target_text, preserve_focus)) =
                     preview_prepare_text_input_route_click(
                         &route_table,
@@ -36385,6 +37464,7 @@ fn preview_try_apply_simple_source_click_input(
                 else {
                     return reject("text_change", input_state);
                 };
+                click_event_build_ms += elapsed_ms(event_build_started);
                 (events, node, target_text, preserve_focus, true, None)
             } else if candidate.link {
                 return reject("link", input_state);
@@ -36393,10 +37473,15 @@ fn preview_try_apply_simple_source_click_input(
                     == Some(candidate.node.as_str())
                     && candidate.accepts_key_focus;
                 if candidate.accepts_key_focus && !preserve_focus {
+                    if coalesced_release_batch {
+                        return reject("coalesced_focus_click_batch", input_state);
+                    }
                     click_resolve_source = "hit_test";
+                    let shared_lock_started = Instant::now();
                     let shared = shared_render_state
                         .lock()
                         .map_err(|_| "preview render state mutex poisoned")?;
+                    shared_lock_wait_ms += elapsed_ms(shared_lock_started);
                     let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
                         return reject("missing_typed_route_table", input_state);
                     };
@@ -36406,6 +37491,7 @@ fn preview_try_apply_simple_source_click_input(
                     else {
                         return reject("missing_hit_region", input_state);
                     };
+                    let event_build_started = Instant::now();
                     let Some((events, node, target_text)) = preview_prepare_focusable_route_click(
                         &route_table,
                         hit,
@@ -36418,6 +37504,7 @@ fn preview_try_apply_simple_source_click_input(
                     else {
                         return reject("key_focus", input_state);
                     };
+                    click_event_build_ms += elapsed_ms(event_build_started);
                     (events, node, target_text, preserve_focus, true, None)
                 } else if input_state.focused_selection_proxy && !preserve_focus {
                     click_resolve_source = "cached_click_candidate";
@@ -36441,8 +37528,10 @@ fn preview_try_apply_simple_source_click_input(
                     };
                     let focus_state_applied =
                         preview_focus_selected_editor_proxy_from_candidate(&candidate, input_state);
+                    let mut events = Vec::new();
+                    push_repeated_live_source_event(&mut events, event, click_event_repeat_count);
                     (
-                        vec![event],
+                        events,
                         candidate.node,
                         candidate.target_text,
                         preserve_focus,
@@ -36451,9 +37540,11 @@ fn preview_try_apply_simple_source_click_input(
                     )
                 } else if input_state.focused_node.is_some() && !preserve_focus {
                     click_resolve_source = "hit_test";
+                    let shared_lock_started = Instant::now();
                     let shared = shared_render_state
                         .lock()
                         .map_err(|_| "preview render state mutex poisoned")?;
+                    shared_lock_wait_ms += elapsed_ms(shared_lock_started);
                     let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
                         return reject("missing_typed_route_table", input_state);
                     };
@@ -36474,7 +37565,7 @@ fn preview_try_apply_simple_source_click_input(
                     ) {
                         events.push(blur);
                     }
-                    events.push(event);
+                    push_repeated_live_source_event(&mut events, event, click_event_repeat_count);
                     let focus_state_applied = preview_focus_selected_editor_proxy_from_route_table(
                         &route_table,
                         &node,
@@ -36514,8 +37605,10 @@ fn preview_try_apply_simple_source_click_input(
                         &click_candidate,
                         input_state,
                     );
+                    let mut events = Vec::new();
+                    push_repeated_live_source_event(&mut events, event, click_event_repeat_count);
                     (
-                        vec![event],
+                        events,
                         candidate.node,
                         candidate.target_text,
                         preserve_focus,
@@ -36528,9 +37621,11 @@ fn preview_try_apply_simple_source_click_input(
             preview_set_interaction_diagnostic_subphase(
                 "simple_source_click.resolve.shared_route_table",
             );
+            let shared_lock_started = Instant::now();
             let shared = shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
+            shared_lock_wait_ms += elapsed_ms(shared_lock_started);
             let route_table_lookup_started = Instant::now();
             let route_table = PreviewHitRouteTable::from_shared(&shared);
             route_table_key_source = route_table
@@ -36552,10 +37647,14 @@ fn preview_try_apply_simple_source_click_input(
                 if route_table.source_for_node_intent(node, "change").is_some()
                     && route_table.wants_text_cursor(node)
                 {
+                    if coalesced_release_batch {
+                        return reject("coalesced_text_click_batch", input_state);
+                    }
                     let Some(hit) = route_table.hit_test(position.x, position.y) else {
                         return reject("missing_hit_region", input_state);
                     };
                     drop(shared);
+                    let event_build_started = Instant::now();
                     let Some((events, node, target_text, preserve_focus)) =
                         preview_prepare_text_input_route_click(
                             route_table,
@@ -36569,14 +37668,19 @@ fn preview_try_apply_simple_source_click_input(
                     else {
                         return reject("text_change", input_state);
                     };
+                    click_event_build_ms += elapsed_ms(event_build_started);
                     (events, node, target_text, preserve_focus, true, None)
                 } else {
                     let preserve_focus = input_state.focused_node.as_deref() == Some(node)
                         && route_table.accepts_key_focus(node);
                     if route_table.accepts_key_focus(node) && !preserve_focus {
+                        if coalesced_release_batch {
+                            return reject("coalesced_focus_click_batch", input_state);
+                        }
                         let Some(hit) = route_table.hit_test(position.x, position.y) else {
                             return reject("missing_hit_region", input_state);
                         };
+                        let event_build_started = Instant::now();
                         let Some((events, node, target_text)) =
                             preview_prepare_focusable_route_click(
                                 route_table,
@@ -36590,6 +37694,7 @@ fn preview_try_apply_simple_source_click_input(
                         else {
                             return reject("key_focus", input_state);
                         };
+                        click_event_build_ms += elapsed_ms(event_build_started);
                         (events, node, target_text, preserve_focus, true, None)
                     } else {
                         if route_table.link_url(node).is_some() {
@@ -36621,9 +37726,7 @@ fn preview_try_apply_simple_source_click_input(
                             editor_key_down_source: route_table
                                 .text_editor_source_for_intent("submit")
                                 .or_else(|| route_table.text_editor_source_for_intent("key_down")),
-                            focused_text: route_table
-                                .focused_text(node, live_runtime)
-                                .or_else(|| route_table.document_value(node)),
+                            focused_text: None,
                             accepts_key_focus: route_table.accepts_key_focus(node),
                             text_change: false,
                             link: false,
@@ -36652,7 +37755,11 @@ fn preview_try_apply_simple_source_click_input(
                         {
                             events.push(blur);
                         }
-                        events.push(event);
+                        push_repeated_live_source_event(
+                            &mut events,
+                            event,
+                            click_event_repeat_count,
+                        );
                         let node_owned = node.to_owned();
                         let focus_state_applied =
                             preview_focus_selected_editor_proxy_from_route_table(
@@ -36694,7 +37801,11 @@ fn preview_try_apply_simple_source_click_input(
                     .is_some()
                     && route_table.wants_text_cursor(&node)
                 {
+                    if coalesced_release_batch {
+                        return reject("coalesced_text_click_batch", input_state);
+                    }
                     drop(shared);
+                    let event_build_started = Instant::now();
                     let Some((events, node, target_text, preserve_focus)) =
                         preview_prepare_text_input_route_click(
                             route_table,
@@ -36708,6 +37819,7 @@ fn preview_try_apply_simple_source_click_input(
                     else {
                         return reject("text_change", input_state);
                     };
+                    click_event_build_ms += elapsed_ms(event_build_started);
                     (events, node, target_text, preserve_focus, true, None)
                 } else {
                     preview_set_interaction_diagnostic_subphase(
@@ -36716,9 +37828,13 @@ fn preview_try_apply_simple_source_click_input(
                     let preserve_focus = input_state.focused_node.as_deref() == Some(node.as_str())
                         && route_table.accepts_key_focus(&node);
                     if route_table.accepts_key_focus(&node) && !preserve_focus {
+                        if coalesced_release_batch {
+                            return reject("coalesced_focus_click_batch", input_state);
+                        }
                         preview_set_interaction_diagnostic_subphase(
                             "simple_source_click.resolve.prepare_focusable_click",
                         );
+                        let event_build_started = Instant::now();
                         let Some((events, node, target_text)) =
                             preview_prepare_focusable_route_click(
                                 route_table,
@@ -36732,6 +37848,7 @@ fn preview_try_apply_simple_source_click_input(
                         else {
                             return reject("key_focus", input_state);
                         };
+                        click_event_build_ms += elapsed_ms(event_build_started);
                         (events, node, target_text, preserve_focus, true, None)
                     } else {
                         preview_set_interaction_diagnostic_subphase(
@@ -36764,8 +37881,11 @@ fn preview_try_apply_simple_source_click_input(
                         {
                             events.push(blur);
                         }
-                        events.push(event);
-                        click_event_build_ms += elapsed_ms(event_build_started);
+                        push_repeated_live_source_event(
+                            &mut events,
+                            event,
+                            click_event_repeat_count,
+                        );
                         let focus_state_applied =
                             preview_focus_selected_editor_proxy_from_route_table(
                                 route_table,
@@ -36774,6 +37894,7 @@ fn preview_try_apply_simple_source_click_input(
                                 live_runtime,
                                 input_state,
                             );
+                        click_event_build_ms += elapsed_ms(event_build_started);
                         (
                             events,
                             node,
@@ -36786,8 +37907,12 @@ fn preview_try_apply_simple_source_click_input(
                 }
             }
         };
+    route_dispatch_ms += elapsed_ms(route_dispatch_started);
     let resolve_ms = elapsed_ms(resolve_started);
     let focus_overlay_needed = input_state.focused_selection_proxy
+        || focus_state_applied
+        || input_state.focused_change_source.is_some()
+        || input_state.focused_key_down_source.is_some()
         || input_state
             .focused_node
             .as_deref()
@@ -36802,7 +37927,7 @@ fn preview_try_apply_simple_source_click_input(
         input_state.last_mouse_press_event_count =
             input_state.last_mouse_press_event_count.max(press.sequence);
     }
-    let release = &click_edges[0];
+    let release = click_edges.last().unwrap_or(&click_edges[0]);
     input_state.last_mouse_button_event_count = input_state
         .last_mouse_button_event_count
         .max(release.sequence);
@@ -36822,6 +37947,7 @@ fn preview_try_apply_simple_source_click_input(
     preview_remember_click_candidate(input_state, position_key, &remembered_candidate);
     preview_set_interaction_diagnostic_subphase("simple_source_click.apply_live_events");
     let apply_started = Instant::now();
+    let live_events_started = Instant::now();
     preview_apply_live_events_no_return(
         source_path,
         source_text,
@@ -36830,6 +37956,7 @@ fn preview_try_apply_simple_source_click_input(
         shared_render_state,
         events,
     )?;
+    let live_events_ms = elapsed_ms(live_events_started);
     let mut bound_sync_nodes = BTreeSet::new();
     bound_sync_nodes.insert(node.clone());
     if let Some(previous_focused_node) = previous_focused_node {
@@ -36838,11 +37965,20 @@ fn preview_try_apply_simple_source_click_input(
     if let Some(focused_node) = input_state.focused_node.as_ref() {
         bound_sync_nodes.insert(focused_node.clone());
     }
-    preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
-        shared_render_state,
-        live_runtime,
-        &bound_sync_nodes,
-    )?;
+    let bound_input_sync_started = Instant::now();
+    let skip_post_click_bound_sync =
+        focus_state_applied && input_state.focused_selection_proxy && !preserve_focus;
+    if !skip_post_click_bound_sync {
+        preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
+            shared_render_state,
+            live_runtime,
+            &bound_sync_nodes,
+        )?;
+    }
+    let bound_input_sync_ms = elapsed_ms(bound_input_sync_started);
+    let selection_proxy_refresh_started = Instant::now();
+    preview_refresh_selection_proxy_focused_text_from_selected_input(live_runtime, input_state);
+    let selection_proxy_refresh_ms = elapsed_ms(selection_proxy_refresh_started);
     let apply_ms = elapsed_ms(apply_started);
     preview_set_interaction_diagnostic_subphase("simple_source_click.hover_overlay");
     let hover_overlay_started = Instant::now();
@@ -36851,12 +37987,27 @@ fn preview_try_apply_simple_source_click_input(
     preview_set_interaction_diagnostic_subphase("simple_source_click.focus_overlay");
     let focus_overlay_started = Instant::now();
     if focus_overlay_needed {
-        preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        if input_state.focused_selection_proxy {
+            preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        } else {
+            preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        }
+        input_state.focus_overlay_applied_in_input = true;
     }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "simple_source_click",
+        resolve_source: Some(click_resolve_source),
+        route_table_key_source: Some(route_table_key_source),
+        shared_lock_wait_ms,
+        route_table_lookup_ms,
+        route_dispatch_ms,
+        hit_test_ms,
+        event_build_ms: click_event_build_ms,
+        live_events_ms,
+        bound_input_sync_ms,
+        selection_proxy_refresh_ms,
         resolve_ms,
         apply_ms,
         hover_overlay_ms,
@@ -36939,9 +38090,7 @@ fn preview_try_apply_simple_pointer_move_input(
             return Ok(false);
         };
         let node = hit.node.0.clone();
-        let Some(event) = route_table.pointer_move_event_for_hit(hit, position) else {
-            return Ok(false);
-        };
+        let event = route_table.pointer_move_event_for_hit(hit, position);
         let target_text = route_table.target_text(&node);
         let bounds = Some(typed_bounds_tuple(hit.bounds));
         let click_candidate = bounds.and_then(|bounds| {
@@ -36966,9 +38115,7 @@ fn preview_try_apply_simple_pointer_move_input(
                         editor_key_down_source: route_table
                             .text_editor_source_for_intent("submit")
                             .or_else(|| route_table.text_editor_source_for_intent("key_down")),
-                        focused_text: route_table
-                            .focused_text(&node, live_runtime)
-                            .or_else(|| route_table.document_value(&node)),
+                        focused_text: None,
                         accepts_key_focus: route_table.accepts_key_focus(&node),
                         text_change: route_table
                             .source_for_node_intent(&node, "change")
@@ -36996,26 +38143,40 @@ fn preview_try_apply_simple_pointer_move_input(
         &remembered_candidate,
     );
     let apply_started = Instant::now();
-    preview_apply_live_events_no_return(
-        source_path,
-        source_text,
-        runtime_units,
-        live_runtime,
-        shared_render_state,
-        vec![event],
-    )?;
+    let pointer_move_event_count = usize::from(event.is_some());
+    if let Some(event) = event {
+        preview_apply_live_events_no_return(
+            source_path,
+            source_text,
+            runtime_units,
+            live_runtime,
+            shared_render_state,
+            vec![event],
+        )?;
+    }
     let pointer_move_ms = elapsed_ms(apply_started);
     let hover_overlay_started = Instant::now();
     preview_apply_hover_overlay(shared_render_state, input_state)?;
     let hover_overlay_ms = elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
     if input_state.focused_node.is_some() {
-        preview_apply_focus_overlay(shared_render_state, input_state, false)?;
+        preview_update_retained_focus_overlay_state(shared_render_state, input_state, false)?;
+        input_state.focus_overlay_applied_in_input = true;
     }
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "simple_pointer_move",
+        resolve_source: None,
+        route_table_key_source: None,
+        shared_lock_wait_ms: 0.0,
+        route_table_lookup_ms: 0.0,
+        route_dispatch_ms: 0.0,
+        hit_test_ms: 0.0,
+        event_build_ms: 0.0,
+        live_events_ms: pointer_move_ms,
+        bound_input_sync_ms: 0.0,
+        selection_proxy_refresh_ms: 0.0,
         resolve_ms,
         apply_ms: pointer_move_ms,
         hover_overlay_ms,
@@ -37032,6 +38193,7 @@ fn preview_try_apply_simple_pointer_move_input(
             "mouse_button_events": input.mouse_button_events.len(),
             "keyboard_events": input.keyboard_events.len(),
             "motion_changed": true,
+            "pointer_move_event_count": pointer_move_event_count,
             "layout_clone_ms": 0.0,
             "hover_update_ms": 0.0,
             "pending_live_events_ms": 0.0,
@@ -37110,6 +38272,16 @@ fn preview_try_apply_simple_drag_motion_input(
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "simple_drag_motion",
+        resolve_source: None,
+        route_table_key_source: None,
+        shared_lock_wait_ms: 0.0,
+        route_table_lookup_ms: 0.0,
+        route_dispatch_ms: 0.0,
+        hit_test_ms: 0.0,
+        event_build_ms: 0.0,
+        live_events_ms: apply_ms,
+        bound_input_sync_ms: 0.0,
+        selection_proxy_refresh_ms: 0.0,
         resolve_ms,
         apply_ms,
         hover_overlay_ms: 0.0,
@@ -37344,6 +38516,15 @@ fn preview_handle_mouse_release_for_route_hit(
                 input_state,
             );
             if focused {
+                if input_state.focused_text.is_empty() {
+                    input_state.focused_text = route_table
+                        .focused_text(&node, live_runtime)
+                        .or_else(|| route_table.document_value(&node))
+                        .unwrap_or_default();
+                    input_state.focused_caret_index =
+                        preview_text_char_count(&input_state.focused_text);
+                    input_state.replace_focused_text_on_next_edit = false;
+                }
                 if let Some(event) = route_table.live_source_event_for_hit(hit, position, false) {
                     pending_mouse_events.push(event);
                 }
@@ -37608,10 +38789,21 @@ fn preview_try_apply_retained_text_input_focus_click(
     let hover_overlay_ms = elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
     preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+    input_state.focus_overlay_applied_in_input = true;
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "retained_text_input_focus_click",
+        resolve_source: None,
+        route_table_key_source: None,
+        shared_lock_wait_ms: 0.0,
+        route_table_lookup_ms: 0.0,
+        route_dispatch_ms: 0.0,
+        hit_test_ms: 0.0,
+        event_build_ms: 0.0,
+        live_events_ms: 0.0,
+        bound_input_sync_ms: 0.0,
+        selection_proxy_refresh_ms: 0.0,
         resolve_ms,
         apply_ms,
         hover_overlay_ms,
@@ -37655,6 +38847,12 @@ fn preview_apply_real_window_input_with_units(
     if input.scroll_delta_x.abs() > f64::EPSILON || input.scroll_delta_y.abs() > f64::EPSILON {
         input_state.hovered_click_candidate = None;
         input_state.click_candidate_cache.clear();
+        return Ok(());
+    }
+    if !preview_input_has_unhandled_source_events(input, input_state) {
+        return Ok(());
+    }
+    if preview_input_is_unhandled_primary_press_only(input, input_state) {
         return Ok(());
     }
     if preview_try_apply_simple_drag_motion_input(
@@ -38369,12 +39567,30 @@ fn preview_apply_real_window_input_with_units(
     hover_overlay_ms += elapsed_ms(hover_overlay_started);
     let focus_overlay_started = Instant::now();
     if preview_focus_overlay_may_be_needed(shared_render_state, input_state) {
-        preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+        if input_state.focused_selection_proxy {
+            preview_apply_selection_proxy_focus_overlay(shared_render_state, input_state, true)?;
+        } else {
+            preview_apply_focus_overlay(shared_render_state, input_state, true)?;
+        }
+        input_state.focus_overlay_applied_in_input = true;
     }
     focus_overlay_ms += elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
         fast_path: "generic_fallback",
+        resolve_source: None,
+        route_table_key_source: None,
+        shared_lock_wait_ms: 0.0,
+        route_table_lookup_ms: 0.0,
+        route_dispatch_ms: 0.0,
+        hit_test_ms: 0.0,
+        event_build_ms: 0.0,
+        live_events_ms: pending_live_events_ms
+            + drag_events_ms
+            + pointer_move_ms
+            + mouse_release_ms,
+        bound_input_sync_ms: 0.0,
+        selection_proxy_refresh_ms: 0.0,
         resolve_ms: layout_clone_ms + hover_update_ms,
         apply_ms: pending_live_events_ms
             + drag_events_ms
@@ -38437,7 +39653,10 @@ fn preview_apply_focus_overlay(
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
-    let mut changed = false;
+    let next_render_overlay =
+        PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+    let mut changed = input_state.focus_render_overlay != next_render_overlay;
+    input_state.focus_render_overlay = next_render_overlay;
     if shared.layout_frame_override.is_none() {
         let frame = layout_frame_from_layout_proof(&shared.layout_proof)?;
         if input_state.focused_node.is_none()
@@ -38514,8 +39733,14 @@ fn preview_apply_focus_overlay(
             blurred_text_by_node.insert(item.node.0.clone(), next_text);
         }
     }
-    let layout_proof = shared.layout_proof.clone();
-    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+    let PreviewSharedRenderState {
+        layout_proof,
+        layout_frame_override,
+        update_count,
+        last_dirty_reason,
+        ..
+    } = &mut *shared;
+    let Some(frame) = layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
     let mut next_overlay_nodes = BTreeSet::new();
@@ -38528,7 +39753,7 @@ fn preview_apply_focus_overlay(
         }
         if preview_apply_focus_overlay_to_item(
             item,
-            &layout_proof,
+            layout_proof,
             resolved_focused_node.as_deref(),
             input_state,
             caret_visible,
@@ -38543,6 +39768,25 @@ fn preview_apply_focus_overlay(
     input_state.focus_overlay_nodes = next_overlay_nodes;
     input_state.focus_overlay_initialized = true;
     if changed {
+        *update_count = update_count.saturating_add(1);
+        *last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
+fn preview_update_retained_focus_overlay_state(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    caret_visible: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let next_overlay = PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+    let changed = input_state.focus_render_overlay != next_overlay;
+    input_state.focus_render_overlay = next_overlay;
+    input_state.focus_overlay_initialized = true;
+    if changed {
+        let mut shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_dirty_reason =
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
@@ -38566,44 +39810,50 @@ fn preview_apply_selection_proxy_focus_overlay(
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
-    if shared.layout_frame_override.is_none() {
-        shared.layout_frame_override = Some(Arc::new(layout_frame_from_layout_proof(
-            &shared.layout_proof,
-        )?));
+    let next_render_overlay =
+        PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+    let render_overlay_changed = input_state.focus_render_overlay != next_render_overlay;
+    input_state.focus_render_overlay = next_render_overlay;
+    let PreviewSharedRenderState {
+        layout_proof,
+        layout_frame_override,
+        update_count,
+        last_dirty_reason,
+        ..
+    } = &mut *shared;
+    if layout_frame_override.is_none() {
+        *layout_frame_override = Some(Arc::new(layout_frame_from_layout_proof(layout_proof)?));
     }
     let focused_node = input_state.focused_node.as_deref();
     let focused_text = input_state.focused_text.clone();
     let focused_caret_index = input_state.focused_caret_index;
     let replace_focused_text_on_next_edit = input_state.replace_focused_text_on_next_edit;
     let selected_address = input_state.focused_address.clone();
-    let layout_proof = shared.layout_proof.clone();
-    let selected_address_changed = input_state.selected_overlay_address != selected_address;
-    if selected_address_changed && input_state.selected_overlay_nodes.is_empty() {
-        target_nodes.extend(preview_current_selected_overlay_nodes(
-            shared.layout_frame_override.as_deref(),
-        ));
-    }
     if let Some(address) = selected_address.as_deref() {
         target_nodes.extend(preview_selected_overlay_nodes_for_address(
-            &layout_proof,
-            shared.layout_frame_override.as_deref(),
+            layout_proof,
+            layout_frame_override.as_deref(),
             address,
-            selected_address_changed,
+            false,
         ));
     }
     if target_nodes.is_empty() {
         input_state.focus_overlay_initialized = true;
         input_state.selected_overlay_nodes.clear();
         input_state.selected_overlay_address = selected_address;
-        return Ok(false);
+        if render_overlay_changed {
+            *update_count = update_count.saturating_add(1);
+            *last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+        }
+        return Ok(render_overlay_changed);
     }
-    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+    let Some(frame) = layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
-    let mut changed = false;
+    let mut changed = render_overlay_changed;
     let mut next_overlay_nodes = BTreeSet::new();
     let mut next_selected_overlay_nodes = BTreeSet::new();
-    let item_indexes = preview_display_item_indexes_for_nodes(&layout_proof, frame, &target_nodes);
+    let item_indexes = preview_display_item_indexes_for_nodes(layout_proof, frame, &target_nodes);
     for index in item_indexes {
         let Some(item) = frame.display_list.get_mut(index) else {
             continue;
@@ -38623,7 +39873,7 @@ fn preview_apply_selection_proxy_focus_overlay(
         );
         changed |= preview_apply_address_selected_overlay_to_item(
             item,
-            &layout_proof,
+            layout_proof,
             selected_address.as_deref(),
         );
         if matches!(
@@ -38670,9 +39920,8 @@ fn preview_apply_selection_proxy_focus_overlay(
     input_state.selected_overlay_nodes = next_selected_overlay_nodes;
     input_state.selected_overlay_address = selected_address;
     if changed {
-        shared.update_count = shared.update_count.saturating_add(1);
-        shared.last_dirty_reason =
-            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+        *update_count = update_count.saturating_add(1);
+        *last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
 }
@@ -38799,22 +40048,6 @@ fn preview_apply_address_selected_overlay_to_item(
     )
 }
 
-fn preview_current_selected_overlay_nodes(
-    frame: Option<&boon_document::LayoutFrame>,
-) -> BTreeSet<String> {
-    frame
-        .into_iter()
-        .flat_map(|frame| frame.display_list.iter())
-        .filter(|item| {
-            matches!(
-                item.style.get("selected"),
-                Some(boon_document_model::StyleValue::Bool(true))
-            )
-        })
-        .map(|item| item.node.0.clone())
-        .collect()
-}
-
 fn preview_selected_overlay_nodes_for_address(
     layout_proof: &Value,
     frame: Option<&boon_document::LayoutFrame>,
@@ -38924,18 +40157,32 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     state_summary: &Value,
     target_nodes: Option<&BTreeSet<String>>,
 ) -> bool {
+    let mut stats = PreviewRetainedBoundSyncStats {
+        status: "started",
+        target_node_count: target_nodes.map(BTreeSet::len).unwrap_or(0),
+        ..PreviewRetainedBoundSyncStats::default()
+    };
     let Some(layout_hash) = shared
         .layout_proof
         .get("layout_frame_hash")
         .and_then(serde_json::Value::as_str)
     else {
+        stats.status = "skipped";
+        stats.reason = Some("missing-layout-frame-hash".to_owned());
+        record_preview_retained_bound_sync_stats(stats);
         return false;
     };
     let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        stats.status = "skipped";
+        stats.reason = Some("missing-document-render-snapshot".to_owned());
+        record_preview_retained_bound_sync_stats(stats);
         return false;
     };
     let text_binding_paths = text_binding_paths_by_node(&snapshot);
     let Some(frame) = shared.layout_frame_override.as_ref().map(Arc::as_ref) else {
+        stats.status = "skipped";
+        stats.reason = Some("missing-layout-frame-override".to_owned());
+        record_preview_retained_bound_sync_stats(stats);
         return false;
     };
     let mut source_intent_update_nodes =
@@ -38948,6 +40195,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         state_summary,
         &source_intent_update_nodes,
     );
+    stats.source_intent_update_count = source_intent_updates.len();
     let mut changed = false;
     let mut source_intent_index_updates = Vec::<(String, String, String)>::new();
     if !source_intent_updates.is_empty()
@@ -38989,6 +40237,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             }
         }
     }
+    stats.source_intent_index_update_count = source_intent_index_updates.len();
     if !source_intent_index_updates.is_empty() {
         if let Some((source_intent_index, source_intent_value_index)) =
             patched_source_intent_indexes(&shared.layout_proof, &source_intent_index_updates)
@@ -39025,6 +40274,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     if item_indexes.is_empty() && target_nodes.is_some() {
         item_indexes = (0..frame.display_list.len()).collect::<Vec<_>>();
     }
+    stats.item_index_count = item_indexes.len();
     for index in item_indexes {
         let Some(item) = frame.display_list.get(index) else {
             continue;
@@ -39104,10 +40354,19 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             text_updates.push((index, next_text));
         }
     }
+    stats.style_update_count = style_updates.len();
+    stats.text_update_count = text_updates.len();
     if style_updates.is_empty() && text_updates.is_empty() {
+        stats.status = "pass";
+        stats.changed = changed;
+        record_preview_retained_bound_sync_stats(stats);
         return changed;
     }
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+        stats.status = "skipped";
+        stats.reason = Some("missing-mutable-layout-frame-override".to_owned());
+        stats.changed = changed;
+        record_preview_retained_bound_sync_stats(stats);
         return changed;
     };
     for (index, attr, value) in style_updates {
@@ -39127,6 +40386,9 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             changed = true;
         }
     }
+    stats.status = "pass";
+    stats.changed = changed;
+    record_preview_retained_bound_sync_stats(stats);
     changed
 }
 
@@ -39346,9 +40608,58 @@ fn preview_patch_retained_display_text_for_address(
     Ok(changed)
 }
 
+fn selected_input_editing_text_for_address(
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    address: &str,
+) -> Option<String> {
+    let fast_paths = [
+        "store.selected_input.address",
+        "store.selected_input.editing_text",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let values = live_runtime.lock().ok()?.document_state_values(&fast_paths);
+    if values
+        .get("store.selected_input.address")
+        .and_then(serde_json::Value::as_str)
+        != Some(address)
+    {
+        return None;
+    }
+    document_state_values_text(&values, "store.selected_input.editing_text").or_else(|| {
+        selected_input_text_for_address(
+            live_runtime,
+            address,
+            &[
+                "store.selected_input.formula_text",
+                "store.selected_input.display_text",
+                "store.selected_input.value",
+            ],
+        )
+    })
+}
+
 fn selected_input_display_text_for_address(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     address: &str,
+) -> Option<String> {
+    selected_input_text_for_address(
+        live_runtime,
+        address,
+        &[
+            "store.selected_input.display_text",
+            "store.selected_input.value",
+            "store.selected_input.formula_text",
+            "store.selected_input.editing_text",
+        ],
+    )
+}
+
+fn selected_input_text_for_address(
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    address: &str,
+    preferred_paths: &[&str],
 ) -> Option<String> {
     let paths = [
         "store.selected_input.address",
@@ -39368,14 +40679,10 @@ fn selected_input_display_text_for_address(
     {
         return None;
     }
-    [
-        "store.selected_input.display_text",
-        "store.selected_input.value",
-        "store.selected_input.formula_text",
-        "store.selected_input.editing_text",
-    ]
-    .into_iter()
-    .find_map(|path| document_state_values_text(&values, path))
+    preferred_paths
+        .iter()
+        .copied()
+        .find_map(|path| document_state_values_text(&values, path))
 }
 
 fn document_state_values_text(values: &Value, path: &str) -> Option<String> {
@@ -39428,18 +40735,31 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     target_nodes: &BTreeSet<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let (layout_proof, target_nodes) = {
+    let (layout_proof, target_nodes, binding_projection_prefixes) = {
         let shared = shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
         let mut target_nodes = target_nodes.clone();
-        if let Some(frame) = shared.layout_frame_override.as_deref() {
-            target_nodes.extend(frame.display_list.iter().filter_map(|item| {
-                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
-                    .then(|| item.node.0.clone())
-            }));
+        let mut binding_projection_prefixes = BTreeSet::new();
+        if let Some(layout_hash) = shared
+            .layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
+        {
+            binding_projection_prefixes =
+                document_binding_projection_prefixes_for_nodes(&snapshot, &target_nodes);
+            extend_target_nodes_for_binding_projections(
+                &snapshot,
+                &mut target_nodes,
+                &binding_projection_prefixes,
+            );
         }
-        (shared.layout_proof.clone(), target_nodes)
+        (
+            shared.layout_proof.clone(),
+            target_nodes,
+            binding_projection_prefixes,
+        )
     };
     if target_nodes.is_empty() {
         return Ok(false);
@@ -39448,6 +40768,7 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
         &layout_proof,
         live_runtime,
         &target_nodes,
+        Some(&binding_projection_prefixes),
     ) else {
         return Ok(false);
     };
@@ -39547,6 +40868,7 @@ fn preview_bound_text_input_targeted_state_summary_for_nodes(
     layout_proof: &Value,
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     target_nodes: &BTreeSet<String>,
+    binding_projection_prefixes: Option<&BTreeSet<String>>,
 ) -> Option<Value> {
     let layout_hash = layout_proof
         .get("layout_frame_hash")
@@ -39562,11 +40884,17 @@ fn preview_bound_text_input_targeted_state_summary_for_nodes(
             .get(node)
         {
             for (path, _) in bindings {
+                if !targeted_binding_path_allowed(path, binding_projection_prefixes) {
+                    continue;
+                }
                 remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
             }
         }
         if let Some(text_paths) = text_binding_paths.get(node) {
             for path in text_paths {
+                if !targeted_binding_path_allowed(path, binding_projection_prefixes) {
+                    continue;
+                }
                 remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
             }
         }
@@ -39576,6 +40904,9 @@ fn preview_bound_text_input_targeted_state_summary_for_nodes(
             .get(node)
         {
             for (path, _) in source_bindings {
+                if !targeted_binding_path_allowed(path, binding_projection_prefixes) {
+                    continue;
+                }
                 remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
             }
         }
@@ -39594,6 +40925,98 @@ fn preview_bound_text_input_targeted_state_summary_for_nodes(
     }
     let mut summary = Value::Object(serde_json::Map::new());
     patch_state_summary_values(&mut summary, &values, &paths).then_some(summary)
+}
+
+fn document_binding_projection_prefixes_for_nodes(
+    snapshot: &DocumentRenderSnapshot,
+    target_nodes: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut prefixes = BTreeSet::new();
+    for node in target_nodes {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                if let Some(prefix) = document_state_value_projection_prefix(path) {
+                    prefixes.insert(prefix);
+                }
+            }
+        }
+        if let Some(text_paths) = snapshot
+            .data_binding_targets
+            .text_binding_paths_by_node
+            .get(node)
+        {
+            for path in text_paths {
+                if let Some(prefix) = document_state_value_projection_prefix(path) {
+                    prefixes.insert(prefix);
+                }
+            }
+        }
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                if let Some(prefix) = document_state_value_projection_prefix(path) {
+                    prefixes.insert(prefix);
+                }
+            }
+        }
+    }
+    prefixes
+}
+
+fn extend_target_nodes_for_binding_projections(
+    snapshot: &DocumentRenderSnapshot,
+    target_nodes: &mut BTreeSet<String>,
+    projection_prefixes: &BTreeSet<String>,
+) {
+    if projection_prefixes.is_empty() {
+        return;
+    }
+    for (node, bindings) in &snapshot.data_binding_targets.state_binding_targets_by_node {
+        if bindings
+            .iter()
+            .any(|(path, _)| targeted_binding_path_allowed(path, Some(projection_prefixes)))
+        {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, paths) in &snapshot.data_binding_targets.text_binding_paths_by_node {
+        if paths
+            .iter()
+            .any(|path| targeted_binding_path_allowed(path, Some(projection_prefixes)))
+        {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, bindings) in &snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+    {
+        if bindings
+            .iter()
+            .any(|(path, _)| targeted_binding_path_allowed(path, Some(projection_prefixes)))
+        {
+            target_nodes.insert(node.clone());
+        }
+    }
+}
+
+fn targeted_binding_path_allowed(
+    path: &str,
+    projection_prefixes: Option<&BTreeSet<String>>,
+) -> bool {
+    projection_prefixes.is_none_or(|prefixes| {
+        prefixes.is_empty()
+            || prefixes
+                .iter()
+                .any(|prefix| document_state_value_path_has_projection_prefix(path, prefix))
+    })
 }
 
 fn remember_targeted_document_state_path(
@@ -40694,6 +42117,29 @@ fn scrolled_layout_proof_with_header_scroll(
         "layout_frame_hash_basis": "base-layout-frame-hash-plus-scroll-offset",
         "visual_scroll_applied_before_render": true
     });
+    if let Some(base_snapshot) = cached_document_render_snapshot(base_layout_hash) {
+        let retained_layout_cache = retained_layout_cache_for_document_layout(
+            &base_snapshot.document_frame,
+            &base_snapshot.derived_indexes,
+            &frame,
+        )?;
+        cache_document_render_snapshot(
+            layout_frame_hash,
+            DocumentRenderSnapshot {
+                document_frame: base_snapshot.document_frame.clone(),
+                runtime_document_state_values: base_snapshot.runtime_document_state_values.clone(),
+                derived_indexes: Arc::clone(&base_snapshot.derived_indexes),
+                layout_frame: Arc::new(frame.clone()),
+                display_items_by_node: document_display_items_by_node(&frame),
+                retained_layout_cache,
+                data_binding_targets: base_snapshot.data_binding_targets.clone(),
+                structural_data_reads: base_snapshot.structural_data_reads.clone(),
+                structural_data_read_aliases: base_snapshot.structural_data_read_aliases.clone(),
+                source_intents: base_snapshot.source_intents.clone(),
+                hit_route_static_cache_key: base_snapshot.hit_route_static_cache_key.clone(),
+            },
+        );
+    }
     Ok((proof, frame))
 }
 
@@ -40997,10 +42443,13 @@ fn preview_apply_live_events_internal(
             event_count = event_count.saturating_add(expanded_events.len() as u64);
             for expanded_event in expanded_events {
                 let output = runtime.apply_source_event_turn(expanded_event)?;
-                changed |= !output.semantic_deltas.is_empty()
-                    || !output.render_patches.is_empty()
-                    || output.dirty_key_count > 0
-                    || output.recomputed_field_count > 0;
+                // A routed source event may update demand-current roots without
+                // emitting render patches yet, but a true no-op must not force a
+                // full document summary/layout rebuild.
+                changed |= output.dirty_key_count > 0
+                    || output.recomputed_field_count > 0
+                    || !output.semantic_deltas.is_empty()
+                    || !output.render_patches.is_empty();
                 runtime_step_apply_ms += output.apply_step_ms;
                 runtime_dirty_key_count =
                     runtime_dirty_key_count.saturating_add(output.dirty_key_count as u64);
@@ -41116,6 +42565,26 @@ fn preview_apply_live_events_internal(
                 summary_source = "patched_previous_window";
                 runtime_state_summary_ms += elapsed_ms(patch_started);
                 return patched;
+            }
+            let summary_rejection_allows_targeted_paths =
+                document_patch_fast_path_rejection_for_summary
+                    .as_deref()
+                    .is_some_and(|reason| {
+                        reason.starts_with("semantic_bound_input_text_currentness:")
+                    });
+            if (document_patch_fast_path_rejection_for_summary.is_none()
+                || summary_rejection_allows_targeted_paths)
+                && !render_patches_for_layout.is_empty()
+                && let Some(targeted) = targeted_state_summary_for_render_patches(
+                    &mut runtime,
+                    previous_layout_hash.as_deref(),
+                    previous_state_summary.as_ref(),
+                    &render_patches_for_layout,
+                )
+            {
+                summary_source = "targeted_render_patch_paths";
+                runtime_state_summary_ms += elapsed_ms(patch_started);
+                return targeted;
             }
             if document_patch_fast_path_rejection_for_summary
                 .as_deref()
@@ -43262,11 +44731,40 @@ fn state_summary_value_for_hidden_row_field_path<'a>(
 }
 
 fn focused_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
-    focused_editing_text_for_address_recursive(summary, address)
+    focused_text_field_for_address_in_summary_lists(summary, address, &["editing_text"])
+        .or_else(|| focused_editing_text_for_address_recursive(summary, address))
 }
 
 fn focused_display_text_for_address(summary: &Value, address: &str) -> Option<String> {
-    focused_display_text_for_address_recursive(summary, address)
+    focused_text_field_for_address_in_summary_lists(
+        summary,
+        address,
+        &["display_text", "value", "formula_text", "editing_text"],
+    )
+    .or_else(|| focused_display_text_for_address_recursive(summary, address))
+}
+
+fn focused_text_field_for_address_in_summary_lists(
+    summary: &Value,
+    address: &str,
+    fields: &[&str],
+) -> Option<String> {
+    let object = summary.as_object()?;
+    object.values().find_map(|value| {
+        let rows = value.as_array()?;
+        if !rows.iter().take(8).any(|row| row.get("address").is_some()) {
+            return None;
+        }
+        rows.iter()
+            .find(|row| row.get("address").and_then(serde_json::Value::as_str) == Some(address))
+            .and_then(|row| {
+                fields.iter().find_map(|field| {
+                    row.get(*field)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+            })
+    })
 }
 
 fn focused_display_text_for_address_recursive(summary: &Value, address: &str) -> Option<String> {
@@ -43573,8 +45071,18 @@ struct PreviewSharedRenderState {
 #[derive(Clone, Debug, Default)]
 struct PreviewAccessibilityHostCache {
     last_published_revision: Option<u64>,
+    last_published_layout_key: Option<String>,
+    last_published_focus_signature: Option<PreviewAccessibilityFocusSignature>,
     publish_count: u64,
+    focus_patch_publish_count: u64,
     skipped_unchanged_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreviewAccessibilityFocusSignature {
+    focused_node: Option<String>,
+    selected_address: Option<String>,
+    focused_text: String,
 }
 
 impl PreviewAccessibilityHostCache {
@@ -43586,6 +45094,28 @@ impl PreviewAccessibilityHostCache {
         self.last_published_revision = Some(revision);
         self.publish_count = self.publish_count.saturating_add(1);
         true
+    }
+
+    fn note_full_publish(
+        &mut self,
+        revision: u64,
+        layout_key: String,
+        focus_signature: Option<PreviewAccessibilityFocusSignature>,
+    ) {
+        self.last_published_revision = Some(revision);
+        self.last_published_layout_key = Some(layout_key);
+        self.last_published_focus_signature = focus_signature;
+        self.publish_count = self.publish_count.saturating_add(1);
+    }
+
+    fn note_focus_patch_publish(&mut self, focus_signature: PreviewAccessibilityFocusSignature) {
+        self.last_published_focus_signature = Some(focus_signature);
+        self.focus_patch_publish_count = self.focus_patch_publish_count.saturating_add(1);
+        self.publish_count = self.publish_count.saturating_add(1);
+    }
+
+    fn note_skipped_unchanged(&mut self) {
+        self.skipped_unchanged_count = self.skipped_unchanged_count.saturating_add(1);
     }
 }
 
@@ -43647,12 +45177,98 @@ struct PreviewWorldEditorLayoutSnapshot {
 #[derive(Clone, Debug)]
 struct PreviewVisibleRenderState {
     status: Option<String>,
+    overlay_lookup: PreviewRenderOverlayLookup,
     layout_artifact: String,
     layout_artifact_sha256: Value,
     layout_frame_hash: Option<String>,
     scroll_transform: Value,
     layout_frame_override: Option<Arc<boon_document::LayoutFrame>>,
     render_scene_patch_layout_reuse: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreviewRenderOverlayLookup {
+    address_by_node: BTreeMap<String, String>,
+    nodes_by_address: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PreviewRenderOverlayLookup {
+    fn from_layout_proof(layout_proof: &Value) -> Self {
+        let mut lookup = Self::default();
+        if let Some(index) = layout_proof
+            .get("source_intent_index")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (node, node_index) in index {
+                let Some(raw_address) = node_index.get("address").and_then(Value::as_str) else {
+                    continue;
+                };
+                let address =
+                    resolve_source_intent_payload_value(layout_proof, raw_address.to_owned());
+                lookup.insert_node_address(node, address);
+            }
+        }
+        if let Some(assertions) = layout_proof
+            .get("source_intent_assertions")
+            .and_then(Value::as_array)
+        {
+            for intent in assertions {
+                if intent.get("intent").and_then(Value::as_str) != Some("address") {
+                    continue;
+                }
+                let Some(node) = intent.get("node").and_then(Value::as_str) else {
+                    continue;
+                };
+                if lookup.address_by_node.contains_key(node) {
+                    continue;
+                }
+                let Some(raw_address) = intent.get("source_path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let address =
+                    resolve_source_intent_payload_value(layout_proof, raw_address.to_owned());
+                lookup.insert_node_address(node, address);
+            }
+        }
+        if let Some(value_index) = layout_proof
+            .get("source_intent_value_index")
+            .and_then(|index| index.get("address"))
+            .and_then(Value::as_object)
+        {
+            for (address, nodes) in value_index {
+                let entry = lookup.nodes_by_address.entry(address.clone()).or_default();
+                entry.extend(
+                    nodes
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        lookup
+    }
+
+    fn insert_node_address(&mut self, node: &str, address: String) {
+        self.address_by_node
+            .insert(node.to_owned(), address.clone());
+        self.nodes_by_address
+            .entry(address)
+            .or_default()
+            .insert(node.to_owned());
+    }
+
+    fn address_for_node(&self, node: &str) -> Option<&str> {
+        self.address_by_node.get(node).map(String::as_str)
+    }
+
+    fn nodes_for_address(&self, address: &str) -> BTreeSet<String> {
+        self.nodes_by_address
+            .get(address)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 impl PreviewVisibleRenderState {
@@ -43680,6 +45296,7 @@ impl PreviewVisibleRenderState {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            overlay_lookup: PreviewRenderOverlayLookup::from_layout_proof(&shared.layout_proof),
             layout_artifact,
             layout_artifact_sha256: shared
                 .layout_proof
@@ -43708,28 +45325,52 @@ impl PreviewVisibleRenderState {
     }
 }
 
-fn preview_semantic_scene_for_shared(
+fn preview_semantic_scene_for_shared_with_focus_overlay(
     shared: &PreviewSharedRenderState,
+    focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_document::SemanticScene> {
     let layout_frame_hash = shared
         .layout_proof
         .get("layout_frame_hash")
         .and_then(serde_json::Value::as_str)?;
     let snapshot = cached_document_render_snapshot(layout_frame_hash)?;
-    let layout_frame = shared
+    let base_layout_frame = shared
         .layout_frame_override
         .as_deref()
         .unwrap_or(snapshot.layout_frame.as_ref());
+    let overlay_frame;
+    let layout_frame =
+        if let Some(focus_overlay) = focus_overlay.filter(|overlay| !overlay.is_empty()) {
+            overlay_frame = {
+                let mut frame = base_layout_frame.clone();
+                preview_apply_focus_overlay_state_to_render_frame(
+                    &mut frame,
+                    &shared.layout_proof,
+                    focus_overlay,
+                );
+                frame
+            };
+            &overlay_frame
+        } else {
+            base_layout_frame
+        };
     Some(boon_document::SemanticScene::from_document_layout(
         &snapshot.document_frame,
         layout_frame,
     ))
 }
 
+fn preview_semantic_scene_for_shared(
+    shared: &PreviewSharedRenderState,
+) -> Option<boon_document::SemanticScene> {
+    preview_semantic_scene_for_shared_with_focus_overlay(shared, None)
+}
+
 fn preview_native_accessibility_snapshot_for_shared(
     shared: &PreviewSharedRenderState,
+    focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
-    let scene = preview_semantic_scene_for_shared(shared)?;
+    let scene = preview_semantic_scene_for_shared_with_focus_overlay(shared, focus_overlay)?;
     Some(
         boon_native_app_window::accesskit_tree_update_from_semantic_scene(
             &scene,
@@ -44254,13 +45895,14 @@ fn preview_native_accessibility_snapshot_for_world_editor_session(
 fn preview_native_accessibility_snapshot_for_host(
     shared: &PreviewSharedRenderState,
     world_editor_session: Option<&PreviewWorldEditorSessionStore>,
+    focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
     if let Some(snapshot) = world_editor_session
         .and_then(preview_native_accessibility_snapshot_for_world_editor_session)
     {
         return Some(snapshot);
     }
-    preview_native_accessibility_snapshot_for_shared(shared)
+    preview_native_accessibility_snapshot_for_shared(shared, focus_overlay)
 }
 
 fn preview_native_accessibility_snapshot_for_host_cached(
@@ -44268,11 +45910,99 @@ fn preview_native_accessibility_snapshot_for_host_cached(
     world_editor_session: Option<&PreviewWorldEditorSessionStore>,
     cache: &mut PreviewAccessibilityHostCache,
     content_revision: u64,
+    focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
-    if !cache.should_publish_revision(content_revision) {
+    if world_editor_session.is_some() {
+        if !cache.should_publish_revision(content_revision) {
+            return None;
+        }
+        return preview_native_accessibility_snapshot_for_host(
+            shared,
+            world_editor_session,
+            focus_overlay,
+        );
+    }
+
+    let layout_key = preview_accessibility_layout_key(shared)?;
+    let focus_signature = focus_overlay.and_then(preview_accessibility_focus_signature);
+    if cache.last_published_layout_key.as_deref() == Some(layout_key.as_str()) {
+        if let Some(signature) = focus_signature.as_ref()
+            && cache.last_published_focus_signature.as_ref() != Some(signature)
+            && let Some(snapshot) =
+                preview_native_accessibility_focus_snapshot_for_shared(shared, focus_overlay?)
+        {
+            cache.note_focus_patch_publish(signature.clone());
+            return Some(snapshot);
+        }
+        if cache.last_published_focus_signature == focus_signature {
+            cache.note_skipped_unchanged();
+            return None;
+        }
+    }
+
+    let snapshot = preview_native_accessibility_snapshot_for_host(shared, None, focus_overlay);
+    if snapshot.is_some() {
+        cache.note_full_publish(content_revision, layout_key, focus_signature);
+    } else {
+        cache.note_skipped_unchanged();
+    }
+    snapshot
+}
+
+fn preview_accessibility_layout_key(shared: &PreviewSharedRenderState) -> Option<String> {
+    shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            shared
+                .layout_frame_override
+                .as_deref()
+                .map(render_frame_hash)
+        })
+}
+
+fn preview_accessibility_focus_signature(
+    focus_overlay: &PreviewFocusOverlayState,
+) -> Option<PreviewAccessibilityFocusSignature> {
+    if focus_overlay.is_empty() {
         return None;
     }
-    preview_native_accessibility_snapshot_for_host(shared, world_editor_session)
+    Some(PreviewAccessibilityFocusSignature {
+        focused_node: focus_overlay.focused_node.clone(),
+        selected_address: focus_overlay.selected_address.clone(),
+        focused_text: focus_overlay.focused_text.clone(),
+    })
+}
+
+fn preview_native_accessibility_focus_snapshot_for_shared(
+    shared: &PreviewSharedRenderState,
+    focus_overlay: &PreviewFocusOverlayState,
+) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
+    let focused_node = focus_overlay.focused_node.as_ref()?;
+    let focused_document_node = boon_document::DocumentNodeId(focused_node.clone());
+    let focused = boon_document::SemanticId::from_document_node_id(&focused_document_node);
+    let layout_frame_hash = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)?;
+    let snapshot = cached_document_render_snapshot(layout_frame_hash)?;
+    let layout_frame = shared
+        .layout_frame_override
+        .as_deref()
+        .unwrap_or(snapshot.layout_frame.as_ref());
+    let semantic_node = boon_document::SemanticScene::node_from_document_layout(
+        &snapshot.document_frame,
+        layout_frame,
+        &focused_document_node,
+    )?;
+    Some(
+        boon_native_app_window::accesskit_focus_update_from_semantic_node(
+            &focused,
+            Some(&semantic_node),
+        ),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -45189,12 +46919,7 @@ impl PreviewHitRouteTable {
             editor_key_down_source: self
                 .text_editor_source_for_intent("submit")
                 .or_else(|| self.text_editor_source_for_intent("key_down")),
-            focused_text: self
-                .state_summary
-                .as_deref()
-                .and_then(|summary| self.focused_editing_text_for_node(&source_node, summary))
-                .or_else(|| self.text_input_document_value(&source_node))
-                .or_else(|| self.document_value(&source_node)),
+            focused_text: None,
             accepts_key_focus: self.accepts_key_focus(&source_node),
             text_change,
             link: self.link_url(&source_node).is_some(),
@@ -45679,14 +47404,6 @@ fn preview_hit_route_cache_key(
     if shared.scroll_x_px.abs() > f64::EPSILON || shared.scroll_y_px.abs() > f64::EPSILON {
         return None;
     }
-    if !shared
-        .layout_proof
-        .get("source_intent_assertions")
-        .is_some()
-        && let Some(key) = snapshot.hit_route_static_cache_key.as_ref()
-    {
-        return Some(key.clone());
-    }
     if shared
         .layout_frame_override
         .as_deref()
@@ -45698,6 +47415,9 @@ fn preview_hit_route_cache_key(
         })
     {
         return None;
+    }
+    if let Some(key) = snapshot.hit_route_static_cache_key.as_ref() {
+        return Some(key.clone());
     }
     Some(preview_hit_route_cache_key_for_snapshot(
         snapshot,
@@ -45932,11 +47652,7 @@ impl PreviewOperatorHostInputState {
     fn from_ipc_state(state: &PreviewIpcState) -> Self {
         Self {
             source_path: state.source_path.clone(),
-            runtime_units: if state.live_runtime.is_some() {
-                Vec::new()
-            } else {
-                state.runtime_units.clone()
-            },
+            runtime_units: state.runtime_units.clone(),
             source_sha256: state.source_sha256.clone(),
             shared_render_state: Arc::clone(&state.shared_render_state),
             live_runtime: state.live_runtime.clone(),
@@ -47044,6 +48760,96 @@ fn patched_window_state_summary_for_render_patches(
         }
     }
     Some(next)
+}
+
+fn targeted_state_summary_for_render_patches(
+    runtime: &mut boon_runtime::LiveRuntime,
+    layout_hash: Option<&str>,
+    previous_state_summary: Option<&Value>,
+    patches: &[boon_runtime::RenderPatch<'static>],
+) -> Option<Value> {
+    if patches.is_empty() {
+        return None;
+    }
+    let layout_hash = layout_hash?;
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    let text_binding_paths = text_binding_paths_by_node(&snapshot);
+    let mut paths = BTreeSet::new();
+    let mut required_patch_paths = BTreeSet::new();
+    let mut projection_prefixes = BTreeSet::new();
+    let mut target_nodes = BTreeSet::new();
+    let mut summary = Value::Object(serde_json::Map::new());
+    let summary_root = summary.as_object_mut()?;
+    let mut seeded_patch_value = false;
+    for patch in patches {
+        let (path, value) = document_data_patch_value(patch)?;
+        insert_nested_json_value(summary_root, &path, value.clone());
+        summary_root.insert(field_leaf_name(&path).to_owned(), value.clone());
+        seeded_patch_value = true;
+        remember_targeted_document_state_path(&path, &mut paths, &mut projection_prefixes);
+        if document_state_value_path_can_refresh_targeted(&path) {
+            required_patch_paths.insert(path.clone());
+        }
+        for target in document_snapshot_data_binding_targets_for_patch(
+            &snapshot,
+            &path,
+            previous_state_summary,
+            &value,
+        ) {
+            target_nodes.insert(target.node.0.clone());
+        }
+    }
+    for node in &target_nodes {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+        if let Some(paths_for_node) = text_binding_paths.get(node) {
+            for path in paths_for_node {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+        if let Some(source_bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in source_bindings {
+                remember_targeted_document_state_path(path, &mut paths, &mut projection_prefixes);
+            }
+        }
+    }
+    extend_targeted_document_state_projection_paths(&snapshot, &projection_prefixes, &mut paths);
+    if paths.is_empty() {
+        return seeded_patch_value.then_some(summary);
+    }
+    let values = runtime.document_state_values(&paths.iter().cloned().collect::<Vec<_>>());
+    if !seeded_patch_value
+        && missing_state_summary_value_path(&values, &required_patch_paths).is_some()
+    {
+        return None;
+    }
+    let Some(value_object) = values.as_object() else {
+        return seeded_patch_value.then_some(summary);
+    };
+    let available_paths = paths
+        .iter()
+        .filter(|path| value_object.contains_key(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if available_paths.is_empty() {
+        return seeded_patch_value.then_some(summary);
+    }
+    if patch_state_summary_values(&mut summary, &values, &available_paths) {
+        Some(summary)
+    } else {
+        seeded_patch_value.then_some(summary)
+    }
 }
 
 fn patch_state_summary_values(
@@ -49549,6 +51355,7 @@ fn preview_try_patch_paint_space_for_root_deltas(
     let mut source_intents = None::<Vec<Value>>;
     let mut patched_targets = 0usize;
     let mut targetless_patch_count = 0usize;
+    let mut targetless_layout_patch_count = 0usize;
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
     let mut document_patches = Vec::new();
@@ -49567,6 +51374,9 @@ fn preview_try_patch_paint_space_for_root_deltas(
         );
         if targets.is_empty() {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
+            if patch.invalidation == boon_runtime::RenderInvalidation::Layout {
+                targetless_layout_patch_count = targetless_layout_patch_count.saturating_add(1);
+            }
             continue;
         }
         layout_hash_patches.push(patch.clone());
@@ -49688,6 +51498,10 @@ fn preview_try_patch_paint_space_for_root_deltas(
             )?;
         frame = patched_frame;
         document_change_set = Some(change_set);
+    }
+    if targetless_layout_patch_count > 0 {
+        record_preview_paint_space_patch_reject("targetless_layout_patch");
+        return Ok(None);
     }
     if direct_patch_targets.is_empty() {
         record_preview_paint_space_patch_reject("targetless_patch_set");
@@ -50255,6 +52069,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     layout_patch_profile.source_intents_clone_ms = elapsed_ms(source_intents_clone_started);
     let mut patched_targets = 0usize;
     let mut targetless_patch_count = 0usize;
+    let mut targetless_layout_patch_count = 0usize;
     let mut patched_target_samples = Vec::new();
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
@@ -50277,6 +52092,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
         );
         if targets.is_empty() {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
+            if patch.invalidation == boon_runtime::RenderInvalidation::Layout {
+                targetless_layout_patch_count = targetless_layout_patch_count.saturating_add(1);
+            }
             continue;
         };
         layout_hash_patches.push(patch.clone());
@@ -50378,6 +52196,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
         }
         if !patched_this_path {
             targetless_patch_count = targetless_patch_count.saturating_add(1);
+            if patch.invalidation == boon_runtime::RenderInvalidation::Layout {
+                targetless_layout_patch_count = targetless_layout_patch_count.saturating_add(1);
+            }
         }
     }
     let mut document_change_set = None;
@@ -50399,6 +52220,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
     layout_patch_profile.derived_indexes_ms = elapsed_ms(derived_indexes_started);
     layout_patch_profile.incremental_derived_indexes = incremental_derived_indexes;
     layout_patch_profile.derived_index_changed_node_count = derived_index_changed_node_count;
+    if targetless_layout_patch_count > 0 {
+        return Ok(None);
+    }
     if patched_targets == 0 {
         let mut proof = previous_layout_proof.clone();
         proof["runtime_document_state_snapshot"] = state_summary.clone();
@@ -51728,33 +53552,37 @@ fn preview_runtime_value_response(
     let mut runtime = live_runtime
         .lock()
         .map_err(|_| "preview live runtime mutex poisoned")?;
-    let state_summary = runtime.state_summary();
-    let state_summary_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&state_summary)?);
-    let runtime_summary =
-        preview_runtime_summary_from_state_summary(&source_path, &source_sha256, state_summary);
-    if let Ok(mut state) = state.lock()
-        && state.source_sha256 == source_sha256
-    {
-        state.runtime_summary = runtime_summary;
-    }
+    let mut state_summary_hash = fallback_state_summary_hash.clone();
+    let mut full_state_summary_refreshed = false;
     if let Some(expected_hash) = request
         .get("state_summary_hash")
         .and_then(serde_json::Value::as_str)
-        && expected_hash != state_summary_hash
     {
-        return Ok(json!({
-                "kind": "runtime-value-result",
-                "status": "stale",
-                "source_sha256": source_sha256,
-                "state_summary_hash": state_summary_hash,
-                "fallback_state_summary_hash": fallback_state_summary_hash,
-                "expected_state_summary_hash": expected_hash,
-                "paths": paths,
-                "values": {},
-                "full_state_mirroring_allowed": false,
-            "full_state_mirroring_observed": false,
-            "preview_pid": std::process::id()
-        }));
+        let state_summary = runtime.state_summary();
+        state_summary_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&state_summary)?);
+        let runtime_summary =
+            preview_runtime_summary_from_state_summary(&source_path, &source_sha256, state_summary);
+        full_state_summary_refreshed = true;
+        if let Ok(mut state) = state.lock()
+            && state.source_sha256 == source_sha256
+        {
+            state.runtime_summary = runtime_summary;
+        }
+        if expected_hash != state_summary_hash {
+            return Ok(json!({
+                    "kind": "runtime-value-result",
+                    "status": "stale",
+                    "source_sha256": source_sha256,
+                    "state_summary_hash": state_summary_hash,
+                    "fallback_state_summary_hash": fallback_state_summary_hash,
+                    "expected_state_summary_hash": expected_hash,
+                    "paths": paths,
+                    "values": {},
+                    "full_state_mirroring_allowed": false,
+                "full_state_mirroring_observed": false,
+                "preview_pid": std::process::id()
+            }));
+        }
     }
     let values = runtime.runtime_value_summaries(&paths, max_depth, max_fields, max_list_items);
     Ok(json!({
@@ -51762,11 +53590,13 @@ fn preview_runtime_value_response(
         "status": "pass",
         "source_sha256": source_sha256,
         "state_summary_hash": state_summary_hash,
+        "state_summary_hash_source": if full_state_summary_refreshed { "refreshed-for-expected-hash" } else { "cached" },
         "paths": paths,
         "values": values,
         "max_depth": max_depth,
         "max_fields": max_fields,
         "max_list_items": max_list_items,
+        "full_state_summary_refreshed": full_state_summary_refreshed,
         "full_state_mirroring_allowed": false,
         "full_state_mirroring_observed": false,
         "preview_pid": std::process::id()
@@ -53358,6 +55188,7 @@ fn preview_operator_host_input_response_for_state(
         let mut post_input_layout_profile = serde_json::Value::Null;
         let mut post_input_retained_layout_cache = serde_json::Value::Null;
         let mut post_input_retained_layout_cache_update = serde_json::Value::Null;
+        let mut post_input_full_layout_recompute = serde_json::Value::Null;
         let mut post_input_frame_method = "no-render-patch-or-layout-update";
         let semantic_data_paths_for_report = output
             .semantic_deltas
@@ -53576,58 +55407,91 @@ fn preview_operator_host_input_response_for_state(
                     };
                 } else {
                     let full_document_state_summary = runtime.document_state_summary();
-                    if let Ok((post_input_layout, Some(post_input_frame))) =
-                        native_document_layout_proof_with_project_state_mode(
-                            &state.source_path,
-                            &state.runtime_units,
-                            Some(&full_document_state_summary),
-                            true,
-                        )
-                    {
-                        if post_input_layout
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("pass")
-                        {
-                            if let Ok(mut shared_render_state) = state.shared_render_state.lock() {
-                                shared_render_state.layout_proof = post_input_layout.clone();
-                                shared_render_state.layout_frame_override =
-                                    Some(Arc::new(post_input_frame));
-                                shared_render_state.update_count =
-                                    shared_render_state.update_count.saturating_add(1);
-                                shared_render_update_count = shared_render_state.update_count;
-                                preview_shared_render_state_updated = true;
+                    match native_document_layout_proof_with_project_state_mode(
+                        &state.source_path,
+                        &state.runtime_units,
+                        Some(&full_document_state_summary),
+                        true,
+                    ) {
+                        Ok((post_input_layout, Some(post_input_frame))) => {
+                            post_input_full_layout_recompute = json!({
+                                "status": post_input_layout
+                                    .get("status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("missing"),
+                                "source_unit_count": state.runtime_units.len(),
+                                "source_intent_count": post_input_layout
+                                    .get("source_intent_count")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                                "hit_target_count": post_input_layout
+                                    .get("hit_target_count")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            });
+                            if post_input_layout
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("pass")
+                            {
+                                if let Ok(mut shared_render_state) =
+                                    state.shared_render_state.lock()
+                                {
+                                    shared_render_state.layout_proof = post_input_layout.clone();
+                                    shared_render_state.layout_frame_override =
+                                        Some(Arc::new(post_input_frame));
+                                    shared_render_state.update_count =
+                                        shared_render_state.update_count.saturating_add(1);
+                                    shared_render_update_count = shared_render_state.update_count;
+                                    preview_shared_render_state_updated = true;
+                                }
+                                post_input_layout_artifact = post_input_layout
+                                    .get("artifact_path")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                post_input_layout_hash = post_input_layout
+                                    .get("artifact_sha256")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                post_input_layout_profile = post_input_layout
+                                    .get("layout_profile")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                post_input_retained_layout_cache = post_input_layout
+                                    .get("retained_layout_cache")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                post_input_retained_layout_cache_update = post_input_layout
+                                    .get("retained_layout_cache_update")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                if post_input_retained_layout_cache_update.is_null() {
+                                    post_input_retained_layout_cache_update =
+                                        retained_layout_cache_update_report_for_layout_proofs(
+                                            current_layout_proof.as_ref(),
+                                            &post_input_layout,
+                                        )?;
+                                }
+                                current_layout_proof = Some(post_input_layout);
+                                post_input_frame_method = "render-patch-state-delta-and-full-runtime-backed-layout-recompute";
                             }
-                            post_input_layout_artifact = post_input_layout
-                                .get("artifact_path")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            post_input_layout_hash = post_input_layout
-                                .get("artifact_sha256")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            post_input_layout_profile = post_input_layout
-                                .get("layout_profile")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            post_input_retained_layout_cache = post_input_layout
-                                .get("retained_layout_cache")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            post_input_retained_layout_cache_update = post_input_layout
-                                .get("retained_layout_cache_update")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            if post_input_retained_layout_cache_update.is_null() {
-                                post_input_retained_layout_cache_update =
-                                    retained_layout_cache_update_report_for_layout_proofs(
-                                        current_layout_proof.as_ref(),
-                                        &post_input_layout,
-                                    )?;
-                            }
-                            current_layout_proof = Some(post_input_layout);
-                            post_input_frame_method =
-                                "render-patch-state-delta-and-full-runtime-backed-layout-recompute";
+                        }
+                        Ok((post_input_layout, None)) => {
+                            post_input_full_layout_recompute = json!({
+                                "status": "no-frame",
+                                "layout_status": post_input_layout
+                                    .get("status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("missing"),
+                                "source_unit_count": state.runtime_units.len(),
+                            });
+                        }
+                        Err(error) => {
+                            post_input_full_layout_recompute = json!({
+                                "status": "error",
+                                "reason": error.to_string(),
+                                "source_unit_count": state.runtime_units.len(),
+                            });
                         }
                     }
                 }
@@ -53678,6 +55542,7 @@ fn preview_operator_host_input_response_for_state(
                 "post_input_layout_profile": post_input_layout_profile,
                 "post_input_retained_layout_cache": post_input_retained_layout_cache,
                 "post_input_retained_layout_cache_update": post_input_retained_layout_cache_update,
+                "post_input_full_layout_recompute": post_input_full_layout_recompute,
                 "post_input_frame_method": post_input_frame_method,
                 "semantic_data_paths": semantic_data_paths_for_report,
                 "render_patch_data_paths": render_patch_data_paths_for_report,
@@ -53700,13 +55565,27 @@ fn preview_operator_host_input_response_for_state(
         outputs.push(output_report);
         assertions.push(assertion);
     }
+    let host_route_usable = |assertion: &serde_json::Value| {
+        assertion
+            .get("ipc_only_state_mutation")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+            && (assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
+                || (assertion
+                    .get("runtime_source_binding_resolved")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && assertion
+                        .get("dynamic_layout_after_previous_event")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)))
+    };
     let status = if !assertions.is_empty()
         && assertions.iter().all(|assertion| {
             assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
         })
-        && route_assertions.iter().all(|assertion| {
-            assertion.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-        }) {
+        && route_assertions.iter().all(host_route_usable)
+    {
         "pass"
     } else {
         "fail"
@@ -53714,6 +55593,14 @@ fn preview_operator_host_input_response_for_state(
     Ok(json!({
         "kind": "operator-host-input-ack",
         "status": status,
+        "source_event_batch_index": request
+            .get("source_event_batch_index")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "source_event_batch_count": request
+            .get("source_event_batch_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "preview_pid": std::process::id(),
         "source_path": state.source_path,
         "source_sha256": state.source_sha256,
@@ -54732,6 +56619,7 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
     let mut assertions = Vec::new();
     let mut host_route_assertions = Vec::new();
     let mut outputs = Vec::new();
+    let mut batch_statuses = Vec::new();
     let mut preview_shared_render_update_count = 0_u64;
     let mut status = "pass";
     let mut first = serde_json::Value::Null;
@@ -54748,6 +56636,57 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
         if first.is_null() {
             first = response.clone();
         }
+        batch_statuses.push(json!({
+            "batch_index": response
+                .get("source_event_batch_index")
+                .and_then(serde_json::Value::as_u64),
+            "batch_count": response
+                .get("source_event_batch_count")
+                .and_then(serde_json::Value::as_u64),
+            "status": response
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing"),
+            "error": response
+                .get("error")
+                .or_else(|| response.get("reason"))
+                .or_else(|| response.get("blocked_reason"))
+                .or_else(|| response.get("diagnostic"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "response_keys": response
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "output_count": response
+                .get("outputs")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "assertion_count": response
+                .get("assertions")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            "failed_assertion_count": response
+                .get("assertions")
+                .and_then(serde_json::Value::as_array)
+                .map(|assertions| assertions
+                    .iter()
+                    .filter(|assertion| {
+                        assertion.get("pass").and_then(serde_json::Value::as_bool) != Some(true)
+                    })
+                    .count())
+                .unwrap_or(0),
+            "failed_route_count": response
+                .get("host_route_assertions")
+                .and_then(serde_json::Value::as_array)
+                .map(|assertions| assertions
+                    .iter()
+                    .filter(|assertion| {
+                        assertion.get("pass").and_then(serde_json::Value::as_bool) != Some(true)
+                    })
+                    .count())
+                .unwrap_or(0)
+        }));
         operator_host_input |= response
             .get("operator_host_input")
             .and_then(serde_json::Value::as_bool)
@@ -54838,6 +56777,7 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
     first["assertions"] = json!(assertions);
     first["host_route_assertions"] = json!(host_route_assertions);
     first["outputs"] = json!(outputs);
+    first["batch_statuses"] = json!(batch_statuses);
     first["preview_shared_render_update_count"] = json!(preview_shared_render_update_count);
     first
 }
@@ -56694,6 +58634,112 @@ mod tests {
         assert_ne!(
             scene.items[0].style_identity, before_identity,
             "selected style patch should update the retained scene item identity"
+        );
+    }
+
+    #[test]
+    fn input_overlay_render_scene_patch_matches_full_overlay_lowering() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut frame,
+            root,
+            dev_node(
+                "cell-a",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("A1".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("bg", "#ffffff"),
+                    ("__selected_bg", "#010203"),
+                    ("selected", "false"),
+                ],
+            ),
+        );
+        let layout = layout_frame_for_document_frame(&frame, (320.0, 120.0)).unwrap();
+        let layout_proof = json!({
+            "source_intent_assertions": [
+                {"node": "cell-a", "intent": "address", "source_path": "A1"}
+            ]
+        });
+        let overlay_lookup = PreviewRenderOverlayLookup::from_layout_proof(&layout_proof);
+        let focus_overlay = PreviewFocusOverlayState {
+            focused_node: Some("cell-a".to_owned()),
+            selected_address: Some("A1".to_owned()),
+            focused_text: "42".to_owned(),
+            focused_caret_index: 1,
+            replace_focused_text_on_next_edit: false,
+            caret_visible: true,
+            selection_proxy: true,
+        };
+        let hover_overlay = PreviewHoverOverlayState::default();
+        let mut overlay_frame = layout.clone();
+        preview_apply_focus_overlay_state_to_render_frame(
+            &mut overlay_frame,
+            &layout_proof,
+            &focus_overlay,
+        );
+        let overlay_frame = preview_frame_with_viewport_background(&overlay_frame, 320.0, 120.0);
+
+        let touched_nodes = preview_input_overlay_render_scene_touched_nodes(
+            &layout,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+        );
+        let mut patch_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let sidecar = preview_input_overlay_render_scene_patch_from_base(
+            &layout,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+            &touched_nodes,
+            320,
+            120,
+            &mut patch_columns,
+        )
+        .expect("focus/selected input overlay should produce a render-scene sidecar");
+        assert_eq!(touched_nodes.len(), 1);
+
+        let base_frame = preview_frame_with_viewport_background(&layout, 320.0, 120.0);
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let mut patched_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &base_frame,
+            320,
+            120,
+            &mut columns,
+        );
+        patched_scene.apply_patch(&sidecar.patch).unwrap();
+
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let full_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &overlay_frame,
+            320,
+            120,
+            &mut columns,
+        );
+        assert_eq!(patched_scene.items, full_scene.items);
+        assert_eq!(
+            patched_scene.visual_primitives,
+            full_scene.visual_primitives
+        );
+        assert_eq!(patched_scene.text_runs, full_scene.text_runs);
+        assert!(
+            patched_scene
+                .text_runs
+                .iter()
+                .any(|run| run.node.0 == "cell-a" && run.text == "42"),
+            "input overlay sidecar should carry focused text"
+        );
+        assert!(
+            patched_scene.visual_primitives.iter().any(|primitive| {
+                primitive.node.0 == "cell-a"
+                    && primitive.primitive
+                        == boon_document::render_scene::RenderVisualPrimitiveKind::TextInputCaret
+            }),
+            "input overlay sidecar should carry the focused caret primitive"
         );
     }
 
@@ -69639,8 +71685,12 @@ label:
             .expect("world editor semantic scene");
         let initial_snapshot = {
             let shared = shared_render_state.lock().unwrap();
-            preview_native_accessibility_snapshot_for_host(&shared, Some(&world_editor_session))
-                .expect("preview host should publish world editor accessibility")
+            preview_native_accessibility_snapshot_for_host(
+                &shared,
+                Some(&world_editor_session),
+                None,
+            )
+            .expect("preview host should publish world editor accessibility")
         };
         let node_id_for_name = |scene: &boon_document::SemanticScene,
                                 snapshot: &boon_native_app_window::NativeAccessibilitySnapshot,
@@ -69719,8 +71769,12 @@ label:
         );
         let selected_snapshot = {
             let shared = shared_render_state.lock().unwrap();
-            preview_native_accessibility_snapshot_for_host(&shared, Some(&world_editor_session))
-                .expect("preview host should publish selected world editor accessibility")
+            preview_native_accessibility_snapshot_for_host(
+                &shared,
+                Some(&world_editor_session),
+                None,
+            )
+            .expect("preview host should publish selected world editor accessibility")
         };
         let export_node_id = node_id_for_name(&selected_scene, &selected_snapshot, "Export 3MF");
         let export_report = preview_apply_accessibility_actions_with_units(
@@ -76125,6 +78179,108 @@ document:
     }
 
     #[test]
+    fn todomvc_operator_host_input_keeps_layout_current_after_structural_events() {
+        let handle = std::thread::Builder::new()
+            .name("todomvc-operator-host-input-layout-current".to_owned())
+            .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
+            .spawn(todomvc_operator_host_input_keeps_layout_current_after_structural_events_impl)
+            .expect("TodoMVC operator host input test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn todomvc_operator_host_input_keeps_layout_current_after_structural_events_impl() {
+        let source_path = repo_path("examples/todomvc.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&source_path, &source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let runtime_units = project_units_for_source_text(&source_path, &source);
+        let state = PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units: runtime_units.clone(),
+            source_bytes: source.len() as u64,
+            source_sha256: source_hash.clone(),
+            runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            shared_render_state,
+            live_runtime: boon_runtime::LiveRuntime::from_project(
+                "test-todomvc-preview",
+                &runtime_units,
+            )
+            .ok()
+            .map(|runtime| Arc::new(Mutex::new(runtime))),
+            world_scene: None,
+            world_editor_session: None,
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
+            prewarmed_project_results: BTreeMap::new(),
+            prewarm_worker: PreviewPrewarmWorkerQueue::default(),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+            ipc_counters: PreviewIpcCounterState::default(),
+            shutdown: PreviewShutdownState::default(),
+        };
+        let requests = operator_host_input_probe_requests(&source_path, &source)
+            .expect("TodoMVC should produce operator host input probes");
+
+        let mut saw_structural_refresh = false;
+        let mut saw_edit_input_route = false;
+        for request in requests {
+            let response = preview_operator_host_input_response(&state, &request).unwrap();
+            assert_eq!(response["status"], "pass", "{response}");
+            for output in response["outputs"]
+                .as_array()
+                .expect("operator host input response should expose output proofs")
+            {
+                let evidence = &output["framebuffer_delta_evidence"];
+                if evidence["post_input_frame_method"]
+                    == json!("render-patch-state-delta-and-full-runtime-backed-layout-recompute")
+                {
+                    saw_structural_refresh = true;
+                }
+            }
+            for route in response["host_route_assertions"]
+                .as_array()
+                .expect("operator host input response should expose route assertions")
+            {
+                assert_eq!(route["pass"], json!(true), "{route}");
+                let source_path = route
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if source_path.contains("editing_todo_title_element") {
+                    assert_eq!(
+                        route["hit_test_performed"],
+                        json!(true),
+                        "edit input route must use the refreshed layout hit/source proof: {route}"
+                    );
+                    saw_edit_input_route = true;
+                }
+            }
+        }
+        assert!(
+            saw_structural_refresh,
+            "TodoMVC operator-host input must refresh retained layout after structural list/edit changes"
+        );
+        assert!(
+            saw_edit_input_route,
+            "TodoMVC scenario must cover edit input host routes"
+        );
+    }
+
+    #[test]
     fn novywave_operator_host_input_batches_execute_in_preview_runtime() {
         let handle = std::thread::Builder::new()
             .name("novywave-operator-host-input".to_owned())
@@ -79143,6 +81299,55 @@ document:
     }
 
     #[test]
+    fn preview_route_cache_key_uses_snapshot_key_with_embedded_source_intents() {
+        let source_path = repo_path("examples/counter.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let mut layout_proof = native_document_layout_proof(&source_path, &source).unwrap();
+        let layout_hash = layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .expect("counter layout proof should have a cached layout hash");
+        let snapshot = cached_document_render_snapshot(layout_hash)
+            .expect("counter layout proof should cache the document render snapshot");
+        assert!(
+            snapshot.hit_route_static_cache_key.is_some(),
+            "render snapshots should retain a precomputed route key"
+        );
+        assert!(
+            !snapshot.source_intents.is_empty(),
+            "counter layout should have source intents for route-key coverage"
+        );
+        layout_proof["source_intent_assertions"] = json!(snapshot.source_intents.clone());
+        let shared = PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(Arc::clone(&snapshot.layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        };
+        let source_intents = shared
+            .layout_proof
+            .get("source_intent_assertions")
+            .and_then(serde_json::Value::as_array)
+            .expect("synthetic embedded proof should expose source intents");
+
+        assert_eq!(
+            preview_hit_route_cache_key(
+                &shared,
+                snapshot.as_ref(),
+                shared.layout_frame_override.as_deref().unwrap(),
+                source_intents,
+            ),
+            snapshot.hit_route_static_cache_key.clone(),
+            "embedded source intents must not force per-click route fingerprinting when the snapshot has a valid route key"
+        );
+    }
+
+    #[test]
     fn preview_hover_and_click_use_typed_route_table_without_proof_hit_json() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
@@ -79348,6 +81553,165 @@ document:
             vec![b0_node],
             "clicking B0 should visually select only that cell display item"
         );
+    }
+
+    #[test]
+    fn cells_press_only_input_defers_until_release_batch() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-real-window-press-defers",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (b0_x, b0_y, _b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let mut press = deterministic_click_input(0, b0_x, b0_y);
+        press.mouse_buttons_down = vec!["left".to_owned()];
+        press.mouse_button_event_count = 1;
+        press.mouse_total_event_count = 2;
+        press.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 1,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+        }];
+        input_state.last_mouse_motion_event_count = press.mouse_motion_event_count;
+        input_state.last_hover_window_position = preview_mouse_position_key(press.mouse_window_pos);
+        let _ = take_preview_native_input_timings();
+        let before_update_count = shared_render_state.lock().unwrap().update_count;
+
+        assert!(preview_input_is_unhandled_primary_press_only(
+            &press,
+            &input_state
+        ));
+        preview_apply_real_window_input(
+            &press,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shared_render_state.lock().unwrap().update_count,
+            before_update_count,
+            "press-only input should not dirty the retained preview before release"
+        );
+        assert!(
+            take_preview_native_input_timings().is_empty(),
+            "press-only input should not fall through to generic input timing"
+        );
+        assert_eq!(
+            input_state.last_mouse_press_event_count, 0,
+            "press must remain unconsumed so the release batch can form the click"
+        );
+
+        let click = real_window_shaped_click_input_from_index(0, b0_x, b0_y);
+        preview_apply_real_window_input(
+            &click,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary["store"]["selected_address"], "B0");
+    }
+
+    #[test]
+    fn cells_stale_sampled_button_state_without_new_edges_is_absorbed() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-stale-sampled-button-noop",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (b0_x, b0_y, _b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let _ = take_preview_native_input_timings();
+        let _ = take_preview_native_input_reject_counts();
+
+        let click = real_window_shaped_click_input_from_index(0, b0_x, b0_y);
+        preview_apply_real_window_input(
+            &click,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let summary_after_click = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary_after_click["store"]["selected_address"], "B0");
+        let _ = take_preview_native_input_timings();
+        let _ = take_preview_native_input_reject_counts();
+
+        let mut stale_sample = click;
+        stale_sample.input_injection_method =
+            "deterministic_app_owned_stale_sampled_button_without_new_edges".to_owned();
+        stale_sample.mouse_button_events.clear();
+        stale_sample.real_os_events_observed = true;
+        preview_apply_real_window_input(
+            &stale_sample,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let timings = take_preview_native_input_timings();
+        let rejects = take_preview_native_input_reject_counts();
+        assert_eq!(
+            rejects.get("simple_source_click:button_shape").copied(),
+            None,
+            "stale sampled button state with no new edge should not be treated as a malformed click: {rejects:?}"
+        );
+        assert!(
+            timings.is_empty(),
+            "stale sampled state with no source event should be absorbed before generic fallback: {timings:?}"
+        );
+        let summary_after_stale = live_runtime.lock().unwrap().document_state_summary();
+        assert_eq!(summary_after_stale["store"]["selected_address"], "B0");
     }
 
     #[test]

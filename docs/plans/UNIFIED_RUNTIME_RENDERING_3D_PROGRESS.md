@@ -20409,3 +20409,56 @@ Next executable work:
 - Continue the compiler-boundary extraction before starting Rust/Zig codegen.
 - Continue U5/U6 retained render-scene and sparse `List/chunk` work so the
   Cells improvements become architecture, not only refreshed evidence.
+
+## 2026-06-27 - Lazy Runtime List Chunk Value
+
+Status: implemented a bounded U5/TASK-0804A runtime architecture slice. This
+does not complete the full Cells 60 FPS milestone, but it moves
+`List/chunk(...)` below the summary layer toward spreadsheet-style sparse
+materialization.
+
+What changed:
+
+- Added an internal lazy `BoonValue::ListChunk` for storage-backed
+  `List/chunk` calls.
+- `List/chunk` now preserves `{source, size, item_field, label_field}` instead
+  of immediately expanding storage-backed lists into eager row records.
+- Normal list iteration remains semantically compatible: if generic code truly
+  iterates a chunk value, the runtime expands it through the existing chunk-row
+  record shape.
+- Runtime-aware summaries can serialize a lazy chunk through the existing
+  windowed chunk projection path, including `ListSelection` sources, so visible
+  windows can be emitted without first materializing the whole chunk list.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_list_chunk_keeps_storage_backed_source_lazy_until_iteration`:
+  pass.
+- `cargo test -q -p boon_runtime lazy_list_chunk_summary_windows_storage_rows_without_full_iteration`:
+  pass.
+- `cargo test -q -p boon_runtime chunk`: pass, `6` tests.
+- `cargo test -q -p boon_runtime cells_window_document_summary_keeps_selected_projection_current`:
+  pass.
+- `cargo test -q -p boon_runtime cells_value_and_error_are_demand_current_at_startup`:
+  pass.
+- `cargo test -q -p boon_runtime cells_`: pass, `23` tests.
+
+Current interpretation:
+
+- The runtime now has a first-class lazy chunk value for the common
+  storage-backed shape instead of only windowing final JSON summaries.
+- This is still not a complete spreadsheet virtualization model. Full generic
+  iteration intentionally expands the lazy chunk, and larger range/formula
+  dependency compression remains future work.
+- Native interaction-speed and scroll reports were not refreshed in this slice;
+  this is runtime architecture evidence, not fresh native WGPU latency proof.
+
+Next executable work:
+
+- Extend the retained render-scene patch/revision path so selection and
+  formula-bar overlays explicitly patch old and new selected nodes.
+- Refresh native Cells interaction/scroll reports after the retained-render
+  patch path is hardened.
+- Continue compiler-boundary extraction before starting Rust/Zig codegen.

@@ -39922,7 +39922,29 @@ impl GenericScheduledRuntime {
         let Some(size) = size else {
             return Ok(BoonValue::List(Vec::new()));
         };
+        if matches!(
+            list,
+            BoonValue::List(_) | BoonValue::ListRef(_) | BoonValue::ListSelection { .. }
+        ) {
+            return Ok(BoonValue::ListChunk {
+                source: Box::new(list),
+                size,
+                item_field: item_field.to_owned(),
+                label_field: label_field.to_owned(),
+            });
+        }
         let values = self.list_values_for_iteration(list, frame)?;
+        self.list_chunk_values(values, size, item_field, label_field, frame)
+    }
+
+    fn list_chunk_values(
+        &mut self,
+        values: Vec<BoonValue>,
+        size: usize,
+        item_field: &str,
+        label_field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
         let mut rows = Vec::with_capacity(values.len().div_ceil(size));
         for (row_index, chunk) in values.chunks(size).enumerate() {
             let mut row = BTreeMap::new();
@@ -39939,6 +39961,22 @@ impl GenericScheduledRuntime {
             rows.push(BoonValue::Record(row));
         }
         Ok(BoonValue::List(rows))
+    }
+
+    fn expand_list_chunk(
+        &mut self,
+        source: BoonValue,
+        size: usize,
+        item_field: &str,
+        label_field: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Vec<BoonValue>> {
+        let values = self.list_values_for_iteration(source, frame)?;
+        let chunked = self.list_chunk_values(values, size, item_field, label_field, frame)?;
+        match chunked {
+            BoonValue::List(values) => Ok(values),
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn eval_runtime_user_function(
@@ -44395,6 +44433,12 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<Vec<BoonValue>> {
         match list {
             BoonValue::List(values) => Ok(values),
+            BoonValue::ListChunk {
+                source,
+                size,
+                item_field,
+                label_field,
+            } => self.expand_list_chunk(*source, size, &item_field, &label_field, frame),
             BoonValue::ListSelection { list, indices } => {
                 frame.reads.insert(list_read_key(&list));
                 self.list_scan_counters.row_occurrences_scanned = self
@@ -44476,6 +44520,12 @@ impl GenericScheduledRuntime {
                 }
                 match resolved {
                     Some(BoonValue::List(values)) => Ok(values),
+                    Some(BoonValue::ListChunk {
+                        source,
+                        size,
+                        item_field,
+                        label_field,
+                    }) => self.expand_list_chunk(*source, size, &item_field, &label_field, frame),
                     Some(BoonValue::ListSelection { list, indices }) => {
                         frame.reads.insert(list_read_key(&list));
                         self.list_scan_counters.row_occurrences_scanned = self
@@ -44527,6 +44577,10 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<usize> {
         match list {
             BoonValue::List(values) => Ok(values.len()),
+            BoonValue::ListChunk { source, size, .. } => {
+                let item_count = self.list_len_for_iteration(*source, frame)?;
+                Ok(item_count.div_ceil(size))
+            }
             BoonValue::ListSelection { list, indices } => {
                 frame.reads.insert(list_read_key(&list));
                 Ok(indices.len())
@@ -44573,6 +44627,10 @@ impl GenericScheduledRuntime {
                 }
                 match resolved {
                     Some(BoonValue::List(values)) => Ok(values.len()),
+                    Some(BoonValue::ListChunk { source, size, .. }) => {
+                        let item_count = self.list_len_for_iteration(*source, frame)?;
+                        Ok(item_count.div_ceil(size))
+                    }
                     Some(BoonValue::ListSelection { list, indices }) => {
                         frame.reads.insert(list_read_key(&list));
                         Ok(indices.len())
@@ -47665,9 +47723,12 @@ impl GenericScheduledRuntime {
             return Ok(None);
         }
         match self.root_derived_boon_value(path, frame)? {
-            Some(BoonValue::List(_) | BoonValue::ListRef(_) | BoonValue::ListSelection { .. }) => {
-                Ok(None)
-            }
+            Some(
+                BoonValue::List(_)
+                | BoonValue::ListChunk { .. }
+                | BoonValue::ListRef(_)
+                | BoonValue::ListSelection { .. },
+            ) => Ok(None),
             value => Ok(value),
         }
     }
@@ -48371,6 +48432,18 @@ impl GenericScheduledRuntime {
                     .map(|value| self.boon_value_json_for_summary_with_limits(value, limits))
                     .collect(),
             ),
+            BoonValue::ListChunk {
+                source,
+                size,
+                item_field,
+                label_field,
+            } => self.list_chunk_value_json_for_summary(
+                source,
+                *size,
+                item_field,
+                label_field,
+                limits,
+            ),
             BoonValue::ListRef(list) => self.list_ref_json_for_summary(list, limits),
             BoonValue::ListSelection { list, indices } => JsonValue::Array(
                 indices
@@ -48419,6 +48492,73 @@ impl GenericScheduledRuntime {
                 })
                 .collect(),
         )
+    }
+
+    fn list_chunk_value_json_for_summary(
+        &mut self,
+        source: &BoonValue,
+        size: usize,
+        item_field: &str,
+        label_field: &str,
+        limits: SummaryLimits,
+    ) -> JsonValue {
+        if size == 0 {
+            return JsonValue::Array(Vec::new());
+        }
+        match source {
+            BoonValue::ListRef(list) => JsonValue::Array(self.list_chunk_projection(
+                list,
+                size,
+                0,
+                item_field,
+                label_field,
+                limits,
+            )),
+            BoonValue::ListSelection { list, indices } => {
+                JsonValue::Array(self.list_selection_chunk_projection(
+                    list,
+                    indices,
+                    size,
+                    item_field,
+                    label_field,
+                    limits,
+                ))
+            }
+            BoonValue::List(values) => {
+                let rows = values
+                    .iter()
+                    .map(|value| self.boon_value_json_for_summary_with_limits(value, limits))
+                    .collect::<Vec<_>>();
+                JsonValue::Array(Self::json_array_chunk_projection(
+                    &rows,
+                    size,
+                    0,
+                    item_field,
+                    label_field,
+                    limits,
+                ))
+            }
+            other => {
+                let mut frame = GenericEvalFrame::root();
+                match self.expand_list_chunk(
+                    other.clone(),
+                    size,
+                    item_field,
+                    label_field,
+                    &mut frame,
+                ) {
+                    Ok(values) => JsonValue::Array(
+                        values
+                            .iter()
+                            .map(|value| {
+                                self.boon_value_json_for_summary_with_limits(value, limits)
+                            })
+                            .collect(),
+                    ),
+                    Err(_) => JsonValue::Array(Vec::new()),
+                }
+            }
+        }
     }
 
     fn document_summary(&mut self) -> JsonValue {
@@ -48752,6 +48892,56 @@ impl GenericScheduledRuntime {
                     .as_ref()
                     .and_then(|summary| self.summary_row_json(summary, index).ok())
                     .unwrap_or_default();
+                cells.push(JsonValue::Object(cell));
+            }
+            row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
+            projected_rows.push(JsonValue::Object(row_object));
+        }
+        projected_rows
+    }
+
+    fn list_selection_chunk_projection(
+        &mut self,
+        list: &str,
+        indices: &ListSelectionIndices,
+        columns: usize,
+        item_field: &str,
+        label_field: &str,
+        limits: SummaryLimits,
+    ) -> Vec<JsonValue> {
+        let row_count = if columns == 0 {
+            0
+        } else {
+            indices.len().div_ceil(columns)
+        };
+        let projected_row_count = limits.chunk_rows.map_or(row_count, |limit| {
+            row_count.saturating_sub(limits.chunk_row_start).min(limit)
+        });
+        let projected_columns = limits.chunk_columns.map_or_else(
+            || columns.saturating_sub(limits.chunk_column_start),
+            |limit| columns.saturating_sub(limits.chunk_column_start).min(limit),
+        );
+        let summary = ListSummaryFields {
+            list: list.to_owned(),
+            row_scope: list.to_owned(),
+            fields: Vec::new(),
+        };
+        let mut projected_rows = Vec::with_capacity(projected_row_count);
+        for row_offset in 0..projected_row_count {
+            let row = limits.chunk_row_start.saturating_add(row_offset);
+            let mut row_object = serde_json::Map::new();
+            row_object.insert(label_field.to_owned(), json!(row.to_string()));
+            row_object.insert("index".to_owned(), json!(row));
+            let mut cells = Vec::with_capacity(projected_columns);
+            for column_offset in 0..projected_columns {
+                let column = limits.chunk_column_start.saturating_add(column_offset);
+                let selection_index = row.saturating_mul(columns).saturating_add(column);
+                let Some(source_index) = indices.get(selection_index).copied() else {
+                    break;
+                };
+                let cell = self
+                    .summary_row_json(&summary, source_index)
+                    .unwrap_or_else(|_| serde_json::Map::new());
                 cells.push(JsonValue::Object(cell));
             }
             row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
@@ -49272,6 +49462,7 @@ fn boon_value_field_value(value: &BoonValue) -> FieldValue {
         BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
+        | BoonValue::ListChunk { .. }
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. } => FieldValue::Json(boon_value_json(value)),
@@ -49316,6 +49507,7 @@ fn boon_value_protocol_value(value: &BoonValue) -> ProtocolValue<'static> {
         BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
+        | BoonValue::ListChunk { .. }
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. } => ProtocolValue::Text(Cow::Borrowed("")),
@@ -49327,6 +49519,7 @@ fn boon_value_root_protocol_value(value: &BoonValue) -> Option<ProtocolValue<'st
         BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
+        | BoonValue::ListChunk { .. }
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. } => None,
@@ -52273,6 +52466,18 @@ fn boon_value_json(value: &BoonValue) -> JsonValue {
         ),
         BoonValue::RecordColumns(columns) => value_columns_json(columns),
         BoonValue::List(values) => JsonValue::Array(values.iter().map(boon_value_json).collect()),
+        BoonValue::ListChunk {
+            source,
+            size,
+            item_field,
+            label_field,
+        } => json!({
+            "kind": "list_chunk",
+            "source": boon_value_json(source),
+            "size": size,
+            "item_field": item_field,
+            "label_field": label_field
+        }),
         BoonValue::RowRef { list, index } => json!({ "list": list, "index": index }),
         BoonValue::ListRef(list) => json!(list),
         BoonValue::ListSelection { list, indices } => {
@@ -52335,6 +52540,21 @@ fn push_boon_value_cache_fragment(value: &BoonValue, fragment: &mut String) {
                 push_boon_value_cache_fragment(value, fragment);
             }
             fragment.push(']');
+        }
+        BoonValue::ListChunk {
+            source,
+            size,
+            item_field,
+            label_field,
+        } => {
+            fragment.push_str("list_chunk:");
+            fragment.push_str(&size.to_string());
+            fragment.push(':');
+            push_cache_fragment_escaped(item_field, fragment);
+            fragment.push(':');
+            push_cache_fragment_escaped(label_field, fragment);
+            fragment.push(':');
+            push_boon_value_cache_fragment(source, fragment);
         }
         BoonValue::RowRef { list, index } => {
             fragment.push_str("row:");
@@ -58020,6 +58240,7 @@ fn collect_boon_value_root_read_keys(
         | BoonValue::Bool(_)
         | BoonValue::Bytes(_)
         | BoonValue::RowRef { .. }
+        | BoonValue::ListChunk { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. }
         | BoonValue::NaN
@@ -58132,6 +58353,12 @@ enum BoonValue {
     Record(BTreeMap<String, BoonValue>),
     RecordColumns(ValueColumns),
     List(Vec<BoonValue>),
+    ListChunk {
+        source: Box<BoonValue>,
+        size: usize,
+        item_field: String,
+        label_field: String,
+    },
     RowRef {
         list: String,
         index: usize,
@@ -58158,6 +58385,7 @@ fn boon_value_scalar_text(value: &BoonValue) -> String {
         | BoonValue::Record(_)
         | BoonValue::RecordColumns(_)
         | BoonValue::List(_)
+        | BoonValue::ListChunk { .. }
         | BoonValue::RowRef { .. }
         | BoonValue::ListRef(_)
         | BoonValue::ListSelection { .. } => String::new(),
@@ -58220,7 +58448,10 @@ fn boon_value_kind_label(value: &BoonValue) -> &'static str {
         BoonValue::Bool(_) => "BOOL",
         BoonValue::Bytes(_) => "BYTES",
         BoonValue::Record(_) | BoonValue::RecordColumns(_) => "RECORD",
-        BoonValue::List(_) | BoonValue::ListRef(_) | BoonValue::ListSelection { .. } => "LIST",
+        BoonValue::List(_)
+        | BoonValue::ListChunk { .. }
+        | BoonValue::ListRef(_)
+        | BoonValue::ListSelection { .. } => "LIST",
         BoonValue::RowRef { .. } => "ROW",
         BoonValue::NaN => "NaN",
         BoonValue::Error(_) => "ERROR",
@@ -64012,6 +64243,7 @@ impl BoonValue {
             | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
+            | Self::ListChunk { .. }
             | Self::RowRef { .. }
             | Self::ListRef(_)
             | Self::ListSelection { .. } => None,
@@ -64031,6 +64263,7 @@ impl BoonValue {
             | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
+            | Self::ListChunk { .. }
             | Self::RowRef { .. }
             | Self::ListRef(_)
             | Self::ListSelection { .. } => String::new(),
@@ -64048,6 +64281,7 @@ impl BoonValue {
             | Self::Record(_)
             | Self::RecordColumns(_)
             | Self::List(_)
+            | Self::ListChunk { .. }
             | Self::RowRef { .. }
             | Self::ListRef(_)
             | Self::ListSelection { .. } => String::new(),
@@ -75355,6 +75589,143 @@ FUNCTION new_signal(signal) {
             output.list_scan_counters.list_view_direct_rows >= 1,
             "direct chunk path should report direct row handling: {:?}",
             output.list_scan_counters
+        );
+    }
+
+    #[test]
+    fn runtime_list_chunk_keeps_storage_backed_source_lazy_until_iteration() {
+        let source = r#"
+items:
+    LIST {
+        [name: TEXT { zero }]
+        [name: TEXT { one }]
+        [name: TEXT { two }]
+        [name: TEXT { three }]
+        [name: TEXT { four }]
+    }
+    |> List/map(item, new: new_item(item: item))
+
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { ready } |> HOLD noop {
+            LATEST {
+                elements.noop.text
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Items }))
+
+FUNCTION new_item(item) {
+    [
+        name: item.name
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("lazy-runtime-list-chunk", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut frame = GenericEvalFrame::root();
+        let chunk = generic
+            .runtime_list_chunk(
+                BoonValue::ListRef("items".to_owned()),
+                2,
+                "entries",
+                "row_number",
+                &mut frame,
+            )
+            .unwrap();
+        let BoonValue::ListChunk {
+            source,
+            size,
+            item_field,
+            label_field,
+        } = &chunk
+        else {
+            panic!("storage-backed List/chunk should remain lazy, got {chunk:?}");
+        };
+        assert_eq!(**source, BoonValue::ListRef("items".to_owned()));
+        assert_eq!(*size, 2);
+        assert_eq!(item_field, "entries");
+        assert_eq!(label_field, "row_number");
+        assert_eq!(
+            generic
+                .list_len_for_iteration(chunk.clone(), &mut frame)
+                .unwrap(),
+            3,
+            "chunk length should use source cardinality without materializing rows"
+        );
+
+        let rows = generic
+            .list_values_for_iteration(chunk, &mut frame)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let BoonValue::Record(second_row) = &rows[1] else {
+            panic!("expanded chunk row should be a record: {rows:#?}");
+        };
+        assert_eq!(second_row["row_number"], BoonValue::Text("1".to_owned()));
+        let BoonValue::List(entries) = &second_row["entries"] else {
+            panic!("expanded chunk row should carry entries: {second_row:#?}");
+        };
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn lazy_list_chunk_summary_windows_storage_rows_without_full_iteration() {
+        let source = r#"
+items:
+    LIST {
+        [name: TEXT { zero }]
+        [name: TEXT { one }]
+        [name: TEXT { two }]
+        [name: TEXT { three }]
+        [name: TEXT { four }]
+    }
+    |> List/map(item, new: new_item(item: item))
+
+store: [
+    elements: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { ready } |> HOLD noop {
+            LATEST {
+                elements.noop.text
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Items }))
+
+FUNCTION new_item(item) {
+    [
+        name: item.name
+    ]
+}
+"#;
+        let mut runtime = LiveRuntime::from_source("lazy-chunk-window-summary", source).unwrap();
+        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let chunk = BoonValue::ListChunk {
+            source: Box::new(BoonValue::ListRef("items".to_owned())),
+            size: 2,
+            item_field: "entries".to_owned(),
+            label_field: "row_number".to_owned(),
+        };
+        let before = generic.list_scan_counters.row_occurrences_scanned;
+        let summary = generic.boon_value_json_for_summary_with_limits(
+            &chunk,
+            SummaryLimits::document_preview_window(1, 1, 0, 2),
+        );
+        let rows = summary.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["row_number"], "1");
+        assert_eq!(rows[0]["entries"][0]["name"], "two");
+        assert_eq!(rows[0]["entries"][1]["name"], "three");
+        assert_eq!(
+            generic.list_scan_counters.row_occurrences_scanned, before,
+            "summary windowing should use storage-backed chunk projection, not list_values_for_iteration"
         );
     }
 

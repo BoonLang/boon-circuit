@@ -23351,3 +23351,45 @@ Remaining blockers:
   resample/pre-present boundaries.
 - Selection/formula-bar updates should eventually mutate a first-class retained
   render scene rather than relying on the native input overlay patch path.
+
+## 2026-06-27 - Runtime Lazy List/chunk Value
+
+Status: implemented a generic runtime slice toward sparse `List/chunk`
+materialization. This is not a Cells-specific workaround and does not shrink
+the grid.
+
+What changed:
+
+- Added a lazy `BoonValue::ListChunk` representation for storage-backed
+  `List/chunk(...)`.
+- `List/chunk` keeps the source list/selection plus chunk metadata until generic
+  code actually iterates the result.
+- Runtime summary serialization now windows lazy chunk values directly through
+  storage-backed chunk projections, including selected-list sources.
+- True generic iteration still expands the lazy value into the existing row
+  record shape, preserving current Boon semantics.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_list_chunk_keeps_storage_backed_source_lazy_until_iteration`:
+  pass.
+- `cargo test -q -p boon_runtime lazy_list_chunk_summary_windows_storage_rows_without_full_iteration`:
+  pass.
+- `cargo test -q -p boon_runtime chunk`: pass, `6` tests.
+- `cargo test -q -p boon_runtime cells_window_document_summary_keeps_selected_projection_current`:
+  pass.
+- `cargo test -q -p boon_runtime cells_value_and_error_are_demand_current_at_startup`:
+  pass.
+- `cargo test -q -p boon_runtime cells_`: pass, `23` tests.
+
+Remaining blockers:
+
+- This does not yet prove native 60 FPS interaction/scroll at the current
+  commit; native reports still need a refresh after the next retained-render
+  slice.
+- Formula range dependency compression and exact old/new lookup-key
+  invalidation are still future spreadsheet-engine work.
+- The default execution-path switch remains blocked by the broader
+  BYTES/MachinePlan parity, compiler-boundary, and readiness gates.

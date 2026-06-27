@@ -10535,6 +10535,9 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
 
     let request =
         boon_manufacturing::PrintCompileRequest::default_for_bundle(&runtime_output.bundle);
+    let preparation =
+        boon_manufacturing::prepare_print_job(&runtime_output.bundle, request.clone());
+    let preparation_artifact = boon_manufacturing::preparation_artifact(&preparation);
     let print = boon_manufacturing::compile_print_job(&runtime_output.bundle, request.clone());
     let print_repeat =
         boon_manufacturing::compile_print_job(&runtime_output.bundle, request.clone());
@@ -10572,11 +10575,15 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         }),
     );
 
-    let package = boon_3mf::export_3mf_entry_set(&print);
-    let package_repeat = boon_3mf::export_3mf_entry_set(&print);
+    let package =
+        boon_3mf::export_3mf_entry_set_with_preparation(&print, Some(&preparation_artifact));
+    let package_repeat =
+        boon_3mf::export_3mf_entry_set_with_preparation(&print, Some(&preparation_artifact));
     let package_validation = boon_3mf::validate_3mf_package(&package);
     let importer_smoke = boon_3mf::import_3mf_package_smoke(&package);
-    let three_mf_ok = package.status == boon_3mf::ThreeMfExportStatus::Pass
+    let three_mf_ok = preparation.status == boon_manufacturing::PrintPreparationStatus::Ready
+        && preparation_artifact.status == boon_manufacturing::PrintPreparationArtifactStatus::Pass
+        && package.status == boon_3mf::ThreeMfExportStatus::Pass
         && package.metrics.entry_count > 0
         && package.metrics.opc_zip_container_present
         && package.metrics.opc_zip_byte_count > 0
@@ -10586,6 +10593,8 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && package.metrics.mesh_vertex_count > 0
         && package.metrics.mesh_triangle_count > 0
         && package.metrics.placeholder_mesh_object_count == 0
+        && package.metrics.preparation_metadata_present
+        && package.metrics.preparation_metadata_hash.is_some()
         && package.source_manufacturing_artifact_hash == print.artifact_hash
         && package.artifact_hash == package_repeat.artifact_hash
         && package.opc_zip_hash == package_repeat.opc_zip_hash
@@ -10594,8 +10603,14 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && package_validation.status == boon_3mf::ThreeMfValidationStatus::Pass
         && package_validation.metrics.model_mesh_status
         && package_validation.metrics.model_mesh_reference_status
+        && package_validation.metrics.preparation_metadata_status
         && importer_smoke.status == boon_3mf::ThreeMfValidationStatus::Pass
         && importer_smoke.metrics.source_hash_matches
+        && importer_smoke.metrics.preparation_metadata_present
+        && importer_smoke.metrics.preparation_metadata_decoded
+        && importer_smoke
+            .metrics
+            .preparation_metadata_visual_mesh_status
         && importer_smoke.metrics.resolved_build_item_count
             == importer_smoke.metrics.build_item_count
         && importer_smoke.metrics.mesh_invalid_triangle_reference_count == 0
@@ -10619,26 +10634,37 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
     );
 
     let selected_body_part_instance = boon_solid_model::PartInstanceId(body_instance.0);
+    let selected_body_request = boon_manufacturing::PrintCompileRequest::for_selected_instances(
+        &runtime_output.bundle,
+        [selected_body_part_instance],
+    );
+    let selected_body_preparation = boon_manufacturing::prepare_print_job(
+        &runtime_output.bundle,
+        selected_body_request.clone(),
+    );
+    let selected_body_preparation_artifact =
+        boon_manufacturing::preparation_artifact(&selected_body_preparation);
     let selected_body_print = boon_manufacturing::compile_print_job(
         &runtime_output.bundle,
-        boon_manufacturing::PrintCompileRequest::for_selected_instances(
-            &runtime_output.bundle,
-            [selected_body_part_instance],
-        ),
+        selected_body_request.clone(),
     );
-    let selected_body_print_repeat = boon_manufacturing::compile_print_job(
-        &runtime_output.bundle,
-        boon_manufacturing::PrintCompileRequest::for_selected_instances(
-            &runtime_output.bundle,
-            [selected_body_part_instance],
-        ),
+    let selected_body_print_repeat =
+        boon_manufacturing::compile_print_job(&runtime_output.bundle, selected_body_request);
+    let selected_body_package = boon_3mf::export_3mf_entry_set_with_preparation(
+        &selected_body_print,
+        Some(&selected_body_preparation_artifact),
     );
-    let selected_body_package = boon_3mf::export_3mf_entry_set(&selected_body_print);
-    let selected_body_package_repeat = boon_3mf::export_3mf_entry_set(&selected_body_print);
+    let selected_body_package_repeat = boon_3mf::export_3mf_entry_set_with_preparation(
+        &selected_body_print,
+        Some(&selected_body_preparation_artifact),
+    );
     let selected_body_validation = boon_3mf::validate_3mf_package(&selected_body_package);
     let selected_body_importer_smoke = boon_3mf::import_3mf_package_smoke(&selected_body_package);
     let selected_body_three_mf_ok = selected_body_print.status
         == boon_manufacturing::ManufacturingCompileStatus::Pass
+        && selected_body_preparation.status == boon_manufacturing::PrintPreparationStatus::Ready
+        && selected_body_preparation_artifact.status
+            == boon_manufacturing::PrintPreparationArtifactStatus::Pass
         && selected_body_print.metrics.printable_part_count == 1
         && selected_body_print.metrics.printable_instance_count == 1
         && selected_body_print.metrics.layer_count > 0
@@ -10653,6 +10679,11 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && selected_body_package.metrics.mesh_vertex_count > 0
         && selected_body_package.metrics.mesh_triangle_count > 0
         && selected_body_package.metrics.placeholder_mesh_object_count == 0
+        && selected_body_package.metrics.preparation_metadata_present
+        && selected_body_package
+            .metrics
+            .preparation_metadata_hash
+            .is_some()
         && selected_body_package.source_manufacturing_artifact_hash
             == selected_body_print.artifact_hash
         && selected_body_package.artifact_hash == selected_body_package_repeat.artifact_hash
@@ -10662,8 +10693,18 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && selected_body_validation.status == boon_3mf::ThreeMfValidationStatus::Pass
         && selected_body_validation.metrics.model_mesh_status
         && selected_body_validation.metrics.model_mesh_reference_status
+        && selected_body_validation.metrics.preparation_metadata_status
         && selected_body_importer_smoke.status == boon_3mf::ThreeMfValidationStatus::Pass
         && selected_body_importer_smoke.metrics.source_hash_matches
+        && selected_body_importer_smoke
+            .metrics
+            .preparation_metadata_present
+        && selected_body_importer_smoke
+            .metrics
+            .preparation_metadata_decoded
+        && selected_body_importer_smoke
+            .metrics
+            .preparation_metadata_visual_mesh_status
         && selected_body_importer_smoke
             .metrics
             .resolved_build_item_count
@@ -10779,26 +10820,37 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
     );
 
     let selected_wheel_part_instance = boon_solid_model::PartInstanceId(wheel_instance.0);
+    let selected_wheel_request = boon_manufacturing::PrintCompileRequest::for_selected_instances(
+        &runtime_output.bundle,
+        [selected_wheel_part_instance],
+    );
+    let selected_wheel_preparation = boon_manufacturing::prepare_print_job(
+        &runtime_output.bundle,
+        selected_wheel_request.clone(),
+    );
+    let selected_wheel_preparation_artifact =
+        boon_manufacturing::preparation_artifact(&selected_wheel_preparation);
     let selected_wheel_print = boon_manufacturing::compile_print_job(
         &runtime_output.bundle,
-        boon_manufacturing::PrintCompileRequest::for_selected_instances(
-            &runtime_output.bundle,
-            [selected_wheel_part_instance],
-        ),
+        selected_wheel_request.clone(),
     );
-    let selected_wheel_print_repeat = boon_manufacturing::compile_print_job(
-        &runtime_output.bundle,
-        boon_manufacturing::PrintCompileRequest::for_selected_instances(
-            &runtime_output.bundle,
-            [selected_wheel_part_instance],
-        ),
+    let selected_wheel_print_repeat =
+        boon_manufacturing::compile_print_job(&runtime_output.bundle, selected_wheel_request);
+    let selected_wheel_package = boon_3mf::export_3mf_entry_set_with_preparation(
+        &selected_wheel_print,
+        Some(&selected_wheel_preparation_artifact),
     );
-    let selected_wheel_package = boon_3mf::export_3mf_entry_set(&selected_wheel_print);
-    let selected_wheel_package_repeat = boon_3mf::export_3mf_entry_set(&selected_wheel_print);
+    let selected_wheel_package_repeat = boon_3mf::export_3mf_entry_set_with_preparation(
+        &selected_wheel_print,
+        Some(&selected_wheel_preparation_artifact),
+    );
     let selected_wheel_package_validation = boon_3mf::validate_3mf_package(&selected_wheel_package);
     let selected_wheel_importer_smoke = boon_3mf::import_3mf_package_smoke(&selected_wheel_package);
     let selected_wheel_three_mf_ok = selected_wheel_print.status
         == boon_manufacturing::ManufacturingCompileStatus::Pass
+        && selected_wheel_preparation.status == boon_manufacturing::PrintPreparationStatus::Ready
+        && selected_wheel_preparation_artifact.status
+            == boon_manufacturing::PrintPreparationArtifactStatus::Pass
         && selected_wheel_print.metrics.printable_part_count == 1
         && selected_wheel_print.metrics.printable_instance_count == 1
         && selected_wheel_print.metrics.layer_count > 0
@@ -10813,6 +10865,11 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && selected_wheel_package.metrics.mesh_vertex_count > 0
         && selected_wheel_package.metrics.mesh_triangle_count > 0
         && selected_wheel_package.metrics.placeholder_mesh_object_count == 0
+        && selected_wheel_package.metrics.preparation_metadata_present
+        && selected_wheel_package
+            .metrics
+            .preparation_metadata_hash
+            .is_some()
         && selected_wheel_package.source_manufacturing_artifact_hash
             == selected_wheel_print.artifact_hash
         && selected_wheel_package.artifact_hash == selected_wheel_package_repeat.artifact_hash
@@ -10824,8 +10881,20 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         && selected_wheel_package_validation
             .metrics
             .model_mesh_reference_status
+        && selected_wheel_package_validation
+            .metrics
+            .preparation_metadata_status
         && selected_wheel_importer_smoke.status == boon_3mf::ThreeMfValidationStatus::Pass
         && selected_wheel_importer_smoke.metrics.source_hash_matches
+        && selected_wheel_importer_smoke
+            .metrics
+            .preparation_metadata_present
+        && selected_wheel_importer_smoke
+            .metrics
+            .preparation_metadata_decoded
+        && selected_wheel_importer_smoke
+            .metrics
+            .preparation_metadata_visual_mesh_status
         && selected_wheel_importer_smoke
             .metrics
             .resolved_build_item_count
@@ -11276,8 +11345,15 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "three_mf_mesh_vertex_count": package.metrics.mesh_vertex_count,
         "three_mf_mesh_triangle_count": package.metrics.mesh_triangle_count,
         "three_mf_placeholder_mesh_object_count": package.metrics.placeholder_mesh_object_count,
+        "three_mf_preparation_status": format!("{:?}", preparation.status),
+        "three_mf_preparation_artifact_status": format!("{:?}", preparation_artifact.status),
+        "three_mf_preparation_metadata_present": package.metrics.preparation_metadata_present,
+        "three_mf_preparation_metadata_hash_present": package.metrics.preparation_metadata_hash.is_some(),
+        "three_mf_preparation_validation_status": package_validation.metrics.preparation_metadata_status,
         "three_mf_validation_status": format!("{:?}", package_validation.status),
         "three_mf_importer_smoke_status": format!("{:?}", importer_smoke.status),
+        "three_mf_importer_smoke_preparation_metadata_present": importer_smoke.metrics.preparation_metadata_present,
+        "three_mf_importer_smoke_preparation_metadata_decoded": importer_smoke.metrics.preparation_metadata_decoded,
         "three_mf_importer_smoke_source_hash_matches": importer_smoke.metrics.source_hash_matches,
         "three_mf_visual_mesh_used": package.visual_mesh_used_for_manufacturing,
         "selected_body_three_mf_status": format!("{:?}", selected_body_package.status),
@@ -11289,6 +11365,13 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "selected_body_three_mf_material_count": selected_body_package.metrics.material_count,
         "selected_body_three_mf_mesh_triangle_count": selected_body_package.metrics.mesh_triangle_count,
         "selected_body_three_mf_opc_zip_byte_count": selected_body_package.metrics.opc_zip_byte_count,
+        "selected_body_three_mf_preparation_status": format!("{:?}", selected_body_preparation.status),
+        "selected_body_three_mf_preparation_artifact_status": format!("{:?}", selected_body_preparation_artifact.status),
+        "selected_body_three_mf_preparation_metadata_present": selected_body_package.metrics.preparation_metadata_present,
+        "selected_body_three_mf_preparation_metadata_hash_present": selected_body_package.metrics.preparation_metadata_hash.is_some(),
+        "selected_body_three_mf_preparation_validation_status": selected_body_validation.metrics.preparation_metadata_status,
+        "selected_body_three_mf_importer_smoke_preparation_metadata_present": selected_body_importer_smoke.metrics.preparation_metadata_present,
+        "selected_body_three_mf_importer_smoke_preparation_metadata_decoded": selected_body_importer_smoke.metrics.preparation_metadata_decoded,
         "selected_body_three_mf_artifact_hash": selected_body_package.artifact_hash,
         "selected_body_three_mf_source_manufacturing_artifact_hash": selected_body_package.source_manufacturing_artifact_hash,
         "selected_body_three_mf_visual_mesh_used": selected_body_package.visual_mesh_used_for_manufacturing,
@@ -11320,6 +11403,13 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "selected_wheel_three_mf_material_count": selected_wheel_package.metrics.material_count,
         "selected_wheel_three_mf_mesh_triangle_count": selected_wheel_package.metrics.mesh_triangle_count,
         "selected_wheel_three_mf_opc_zip_byte_count": selected_wheel_package.metrics.opc_zip_byte_count,
+        "selected_wheel_three_mf_preparation_status": format!("{:?}", selected_wheel_preparation.status),
+        "selected_wheel_three_mf_preparation_artifact_status": format!("{:?}", selected_wheel_preparation_artifact.status),
+        "selected_wheel_three_mf_preparation_metadata_present": selected_wheel_package.metrics.preparation_metadata_present,
+        "selected_wheel_three_mf_preparation_metadata_hash_present": selected_wheel_package.metrics.preparation_metadata_hash.is_some(),
+        "selected_wheel_three_mf_preparation_validation_status": selected_wheel_package_validation.metrics.preparation_metadata_status,
+        "selected_wheel_three_mf_importer_smoke_preparation_metadata_present": selected_wheel_importer_smoke.metrics.preparation_metadata_present,
+        "selected_wheel_three_mf_importer_smoke_preparation_metadata_decoded": selected_wheel_importer_smoke.metrics.preparation_metadata_decoded,
         "selected_wheel_three_mf_artifact_hash": selected_wheel_package.artifact_hash,
         "selected_wheel_three_mf_source_manufacturing_artifact_hash": selected_wheel_package.source_manufacturing_artifact_hash,
         "selected_wheel_three_mf_visual_mesh_used": selected_wheel_package.visual_mesh_used_for_manufacturing,
@@ -22463,16 +22553,28 @@ manufacturing: Assembly/new(
     let rich_car_print_request = boon_manufacturing::PrintCompileRequest::default_for_bundle(
         &rich_car_example_output.bundle,
     );
+    let rich_car_preparation = boon_manufacturing::prepare_print_job(
+        &rich_car_example_output.bundle,
+        rich_car_print_request.clone(),
+    );
+    let rich_car_preparation_artifact =
+        boon_manufacturing::preparation_artifact(&rich_car_preparation);
     let rich_car_print_output = boon_manufacturing::compile_print_job(
         &rich_car_example_output.bundle,
         rich_car_print_request,
     );
-    let rich_car_three_mf_package = boon_3mf::export_3mf_entry_set(&rich_car_print_output);
+    let rich_car_three_mf_package = boon_3mf::export_3mf_entry_set_with_preparation(
+        &rich_car_print_output,
+        Some(&rich_car_preparation_artifact),
+    );
     let rich_car_three_mf_validation = boon_3mf::validate_3mf_package(&rich_car_three_mf_package);
     let rich_car_three_mf_importer_smoke =
         boon_3mf::import_3mf_package_smoke(&rich_car_three_mf_package);
     let rich_car_manufacturing_ok = rich_car_print_output.status
         == boon_manufacturing::ManufacturingCompileStatus::Pass
+        && rich_car_preparation.status == boon_manufacturing::PrintPreparationStatus::Ready
+        && rich_car_preparation_artifact.status
+            == boon_manufacturing::PrintPreparationArtifactStatus::Pass
         && rich_car_print_output.metrics.printable_part_count == 2
         && rich_car_print_output.metrics.printable_instance_count == 5
         && rich_car_print_output.metrics.layer_count > 0
@@ -22486,7 +22588,26 @@ manufacturing: Assembly/new(
         && rich_car_three_mf_validation
             .metrics
             .model_mesh_reference_status
+        && rich_car_three_mf_validation
+            .metrics
+            .preparation_metadata_status
+        && rich_car_three_mf_package
+            .metrics
+            .preparation_metadata_present
+        && rich_car_three_mf_package
+            .metrics
+            .preparation_metadata_hash
+            .is_some()
         && rich_car_three_mf_importer_smoke.status == boon_3mf::ThreeMfValidationStatus::Pass
+        && rich_car_three_mf_importer_smoke
+            .metrics
+            .preparation_metadata_present
+        && rich_car_three_mf_importer_smoke
+            .metrics
+            .preparation_metadata_decoded
+        && rich_car_three_mf_importer_smoke
+            .metrics
+            .preparation_metadata_visual_mesh_status
         && rich_car_three_mf_importer_smoke
             .metrics
             .mesh_invalid_triangle_reference_count
@@ -25074,6 +25195,13 @@ manufacturing: Assembly/new(
             "parametric_car_rich_manufacturing_unsupported_operation_count": rich_car_print_output.metrics.unsupported_operation_count,
             "parametric_car_rich_visual_mesh_used_for_manufacturing": rich_car_print_output.visual_mesh_used_for_manufacturing,
             "parametric_car_rich_three_mf_status": format!("{:?}", rich_car_three_mf_package.status),
+            "parametric_car_rich_three_mf_preparation_status": format!("{:?}", rich_car_preparation.status),
+            "parametric_car_rich_three_mf_preparation_artifact_status": format!("{:?}", rich_car_preparation_artifact.status),
+            "parametric_car_rich_three_mf_preparation_metadata_present": rich_car_three_mf_package.metrics.preparation_metadata_present,
+            "parametric_car_rich_three_mf_preparation_metadata_hash_present": rich_car_three_mf_package.metrics.preparation_metadata_hash.is_some(),
+            "parametric_car_rich_three_mf_preparation_validation_status": rich_car_three_mf_validation.metrics.preparation_metadata_status,
+            "parametric_car_rich_three_mf_importer_smoke_preparation_metadata_present": rich_car_three_mf_importer_smoke.metrics.preparation_metadata_present,
+            "parametric_car_rich_three_mf_importer_smoke_preparation_metadata_decoded": rich_car_three_mf_importer_smoke.metrics.preparation_metadata_decoded,
             "parametric_car_rich_three_mf_mesh_vertex_count": rich_car_three_mf_package.metrics.mesh_vertex_count,
             "parametric_car_rich_three_mf_mesh_triangle_count": rich_car_three_mf_package.metrics.mesh_triangle_count,
             "parametric_car_rich_three_mf_validation_model_mesh_reference_status": rich_car_three_mf_validation.metrics.model_mesh_reference_status,

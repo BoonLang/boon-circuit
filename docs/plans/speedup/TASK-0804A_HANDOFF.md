@@ -281,6 +281,14 @@ playground input path works. Treat the real native preview click path,
 app-window coordinate provenance, and Cells source-event routing as still
 unresolved until a fresh app-owned native proof matches manual behavior.
 
+## 2026-06-27 Manual Cells Regression Still Active
+
+Manual user testing again reported that Cells still does not react to mouse
+clicks. Keep this as an open manual-behavior blocker separate from the current
+non-Cells unified-goal slices: the next TASK-0804A return must first prove the
+real visible native click path, selected-cell visual state, and formula/input
+sync with app-owned host events and WGPU/readback evidence.
+
 ## One-Sentence Warning
 
 If the next attempt does not reduce the eager `cells.value` / indexed

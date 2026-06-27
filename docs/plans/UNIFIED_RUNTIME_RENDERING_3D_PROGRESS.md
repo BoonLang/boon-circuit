@@ -18006,3 +18006,255 @@ Next executable task:
 3. Keep U5/TASK-0804A, custom-project demand evidence, top-open pocket, Loft
    STL topology, and U6 WASM-memory proof postponed until they are active/final
    goal pieces.
+
+## 2026-06-26 - U10 Selected 3MF Preparation Metadata Evidence
+
+Status: U10 remains in-progress. This slice strengthens selected printable
+3MF exports so selected body/wheel packages carry the same preparation metadata
+contract already used by split and connector packages.
+
+Files changed:
+
+- `crates/xtask/src/main.rs`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Routed selected body and selected wheel `verify-3d-parametric-car` 3MF
+  exports through `export_3mf_entry_set_with_preparation`.
+- Built selected-instance `PrintCompileRequest`s once, prepared them through
+  `prepare_print_job`, and embedded their `PrintPreparationArtifact`.
+- Strengthened selected body/wheel 3MF checks to require preparation metadata,
+  metadata hashes, validation metadata status, and importer-smoke metadata
+  decoding.
+- Added explicit report fields for selected body/wheel preparation status,
+  preparation artifact status, metadata presence/hash presence, validation
+  status, and importer-smoke metadata decoding.
+
+Commands run:
+
+| Command | Status | Evidence / Notes |
+| --- | --- | --- |
+| `cargo fmt -p xtask` | Pass | Formatted the verifier change. |
+| `cargo fmt -p xtask -- --check` | Pass | Formatting check passed after applying `cargo fmt`. |
+| `git diff --check` | Pass | No whitespace errors. |
+| `cargo check -q -p xtask` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo build -q -p xtask` | Pass | Rebuilt the report-producing binary. |
+| `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json` | Pass | Fresh parametric-car report includes selected 3MF preparation metadata evidence. |
+| `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json` | Pass | Updated parametric-car report schema-validates. |
+| Required passing child-report refresh commands | Pass | Regenerated the unified aggregate's passing child reports after the `xtask`/report-field change. |
+| `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json` | Expected Fail | Demand loop remains blocked by stale/postponed Cells and custom-project idle-wake child reports. |
+| `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json` | Expected Fail | Aggregate still fails only because `demand-driven-render-loop` fails/schema-fails. |
+
+Current report facts:
+
+- `target/reports/unified/3d-parametric-car.json` reports `status=pass`.
+- `selected_body_three_mf_preparation_status="Ready"`.
+- `selected_body_three_mf_preparation_artifact_status="Pass"`.
+- `selected_body_three_mf_preparation_metadata_present=true`.
+- `selected_body_three_mf_preparation_metadata_hash_present=true`.
+- `selected_body_three_mf_preparation_validation_status=true`.
+- `selected_body_three_mf_importer_smoke_preparation_metadata_present=true`.
+- `selected_body_three_mf_importer_smoke_preparation_metadata_decoded=true`.
+- `selected_wheel_three_mf_preparation_status="Ready"`.
+- `selected_wheel_three_mf_preparation_artifact_status="Pass"`.
+- `selected_wheel_three_mf_preparation_metadata_present=true`.
+- `selected_wheel_three_mf_preparation_metadata_hash_present=true`.
+- `selected_wheel_three_mf_preparation_validation_status=true`.
+- `selected_wheel_three_mf_importer_smoke_preparation_metadata_present=true`.
+- `selected_wheel_three_mf_importer_smoke_preparation_metadata_decoded=true`.
+
+Current aggregate facts:
+
+- `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`.
+- `checked_report_count=18`.
+- `missing_report_count=0`.
+- `passed_report_count=17`.
+- `failed_report_count=1`.
+- `schema_valid_report_count=17`.
+- `command_match_report_count=18`.
+- The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+
+Evidence classification:
+
+- This proves selected printable body/wheel 3MF packages now carry validating,
+  importer-decoded preparation metadata and do not use visual mesh authority.
+- This does not fix Cells manual input, TASK-0804A, demand-driven render-loop
+  freshness, final car manufacturing, general CSG, external slicer validation,
+  or full native/browser 3D parity.
+
+Next executable task:
+
+1. Continue another independent U6-U10 implementation slice or a bounded U11
+   cleanup/default task.
+2. Keep U5/TASK-0804A, custom-project demand evidence, top-open pocket, Loft
+   STL topology, and U6 WASM-memory proof postponed until they are active/final
+   goal pieces.
+
+## 2026-06-27 - U10 Rich-Car 3MF Preparation Metadata Evidence
+
+Status: U10 remains in-progress. This slice extends preparation-metadata 3MF
+evidence from the baseline parametric car to the richer loft/revolve/shell car
+fixture in the SolidGraph verifier.
+
+Files changed:
+
+- `crates/xtask/src/main.rs`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Routed the rich parametric-car 3MF package through
+  `export_3mf_entry_set_with_preparation`.
+- Prepared the rich-car print request with `prepare_print_job` and embedded the
+  resulting `PrintPreparationArtifact`.
+- Strengthened the rich-car manufacturing/3MF check to require preparation
+  metadata, metadata hash presence, validation metadata status, and
+  importer-smoke metadata decoding.
+- Added explicit `verify-solid-graph` report fields for rich-car preparation
+  status, preparation artifact status, metadata presence/hash presence,
+  validation status, and importer-smoke metadata decoding.
+
+Commands run:
+
+| Command | Status | Evidence / Notes |
+| --- | --- | --- |
+| `cargo fmt -p xtask -- --check` | Pass | Formatting check passed. |
+| `git diff --check` | Pass | No whitespace errors. |
+| `cargo check -q -p xtask` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo build -q -p xtask` | Pass | Rebuilt the report-producing binary. |
+| `target/debug/xtask verify-solid-graph --report target/reports/unified/solid-graph.json` | Pass | Fresh SolidGraph report includes rich-car 3MF preparation metadata evidence. |
+| `target/debug/xtask verify-report-schema target/reports/unified/solid-graph.json` | Pass | Updated SolidGraph report schema-validates. |
+| Required passing child-report refresh commands | Pass | Regenerated the unified aggregate's passing child reports after the `xtask`/report-field change. |
+| `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json` | Expected Fail | Demand loop remains blocked by stale/postponed Cells and custom-project idle-wake child reports. |
+| `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json` | Expected Fail | Aggregate still fails only because `demand-driven-render-loop` fails/schema-fails. |
+
+Current report facts:
+
+- `target/reports/unified/solid-graph.json` reports `status=pass`.
+- `parametric_car_rich_three_mf_preparation_status="Ready"`.
+- `parametric_car_rich_three_mf_preparation_artifact_status="Pass"`.
+- `parametric_car_rich_three_mf_preparation_metadata_present=true`.
+- `parametric_car_rich_three_mf_preparation_metadata_hash_present=true`.
+- `parametric_car_rich_three_mf_preparation_validation_status=true`.
+- `parametric_car_rich_three_mf_importer_smoke_preparation_metadata_present=true`.
+- `parametric_car_rich_three_mf_importer_smoke_preparation_metadata_decoded=true`.
+
+Current aggregate facts:
+
+- `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`.
+- `checked_report_count=18`.
+- `missing_report_count=0`.
+- `passed_report_count=17`.
+- `failed_report_count=1`.
+- `schema_valid_report_count=17`.
+- `command_match_report_count=18`.
+- The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+
+Evidence classification:
+
+- This proves the richer loft/revolve/shell parametric-car 3MF package now
+  carries validating, importer-decoded preparation metadata and does not use
+  visual mesh authority.
+- This does not fix Cells manual input, TASK-0804A, demand-driven render-loop
+  freshness, final car manufacturing, general CSG, external slicer validation,
+  or full native/browser 3D parity.
+
+Next executable task:
+
+1. Continue another independent U6-U10 implementation slice or a bounded U11
+   cleanup/default task.
+2. Keep U5/TASK-0804A, custom-project demand evidence, top-open pocket, Loft
+   STL topology, and U6 WASM-memory proof postponed until they are active/final
+   goal pieces.
+
+## 2026-06-27 - U10 Whole-Car 3MF Preparation Metadata Evidence
+
+Status: U10 remains in-progress. This slice strengthens the standalone
+parametric-car whole-car 3MF export so it carries validating preparation
+metadata, matching the selected, split, and connector package evidence.
+
+Files changed:
+
+- `crates/xtask/src/main.rs`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
+- `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
+
+What changed:
+
+- Routed the whole-car `verify-3d-parametric-car` package through
+  `export_3mf_entry_set_with_preparation`.
+- Prepared the whole-car print request with `prepare_print_job` and embedded
+  the resulting `PrintPreparationArtifact`.
+- Strengthened the whole-car 3MF check to require preparation metadata,
+  metadata hash presence, validation metadata status, and importer-smoke
+  metadata decoding.
+- Added explicit report fields for whole-car preparation status, preparation
+  artifact status, metadata presence/hash presence, validation status, and
+  importer-smoke metadata decoding.
+
+Commands run:
+
+| Command | Status | Evidence / Notes |
+| --- | --- | --- |
+| `cargo fmt -p xtask` | Pass | Formatted the verifier change. |
+| `cargo fmt -p xtask -- --check` | Pass | Formatting check passed. |
+| `git diff --check` | Pass | No whitespace errors. |
+| `cargo check -q -p xtask` | Pass | Existing native GPU dead-code warnings only. |
+| `cargo build -q -p xtask` | Pass | Rebuilt the report-producing binary. |
+| `target/debug/xtask verify-3d-parametric-car --report target/reports/unified/3d-parametric-car.json` | Pass | Fresh parametric-car report includes whole-car 3MF preparation metadata evidence. |
+| `target/debug/xtask verify-report-schema target/reports/unified/3d-parametric-car.json` | Pass | Updated parametric-car report schema-validates. |
+| Required passing child-report refresh commands | Pass | Regenerated the unified aggregate's passing child reports after the `xtask`/report-field change. |
+| `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json` | Expected Fail | Demand loop remains blocked by stale/postponed Cells and custom-project idle-wake child reports. |
+| `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json` | Expected Fail | Aggregate still fails only because `demand-driven-render-loop` fails/schema-fails. |
+
+Current report facts:
+
+- `target/reports/unified/3d-parametric-car.json` reports `status=pass`.
+- `three_mf_preparation_status="Ready"`.
+- `three_mf_preparation_artifact_status="Pass"`.
+- `three_mf_preparation_metadata_present=true`.
+- `three_mf_preparation_metadata_hash_present=true`.
+- `three_mf_preparation_validation_status=true`.
+- `three_mf_importer_smoke_preparation_metadata_present=true`.
+- `three_mf_importer_smoke_preparation_metadata_decoded=true`.
+- Existing selected body/wheel preparation metadata checks also remain true.
+
+Current aggregate facts:
+
+- `target/reports/unified/unified-architecture-all.json` reports
+  `status="fail"`.
+- `checked_report_count=18`.
+- `missing_report_count=0`.
+- `passed_report_count=17`.
+- `failed_report_count=1`.
+- `schema_valid_report_count=17`.
+- `command_match_report_count=18`.
+- The only blockers are that
+  `target/reports/native-gpu/demand-driven-render-loop.json` failed
+  `verify_report_schema` and did not pass.
+
+Evidence classification:
+
+- This proves the standalone parametric-car whole-car 3MF package now carries
+  validating, importer-decoded preparation metadata and does not use visual mesh
+  authority.
+- This does not fix Cells manual input, TASK-0804A, demand-driven render-loop
+  freshness, final car manufacturing, general CSG, external slicer validation,
+  or full native/browser 3D parity.
+
+Next executable task:
+
+1. Continue another independent U6-U10 implementation slice or a bounded U11
+   cleanup/default task.
+2. Keep U5/TASK-0804A, custom-project demand evidence, top-open pocket, Loft
+   STL topology, and U6 WASM-memory proof postponed until they are active/final
+   goal pieces.

@@ -23393,3 +23393,57 @@ Remaining blockers:
   invalidation are still future spreadsheet-engine work.
 - The default execution-path switch remains blocked by the broader
   BYTES/MachinePlan parity, compiler-boundary, and readiness gates.
+
+## 2026-06-28 - Retained Input Overlay Old/New Selection Patch
+
+Status: implemented a focused native retained-render slice after the lazy
+runtime chunk checkpoint. This does not complete BYTES/MachinePlan migration,
+but it removes a stale-selection risk on the Cells click path without adding a
+Cells-specific Boon workaround.
+
+What changed:
+
+- `PreviewFocusOverlayState` now records the previous selected address alongside
+  the new selected address.
+- Input-overlay render-scene patch targeting includes both old and new selected
+  cell nodes, so a retained sidecar patch can clear the old selected cell and
+  paint the new selected cell without depending on a full overlay-frame scan.
+- Selection overlay mutation now writes `selected=false` when no selected
+  address is active, keeping retained layout state aligned with full overlay
+  lowering.
+- Targeted root `List/find` projection exposure now records the exact
+  `ListLookupText` read key for the selected value, so `store.selected_input`
+  dependency tracking moves from stale/broad lookup state toward current exact
+  indexed reads without forcing root projection materialization.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cells_window_document_summary_keeps_selected_projection_current`:
+  pass.
+- `cargo test -q -p boon_runtime cells_selected_input_document_state_values_use_indexed_list_find_projection`:
+  pass.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`:
+  pass.
+- `cargo check -q -p boon_native_playground`: pass.
+
+Architecture notes:
+
+- Subagent review identified two next options that are larger than this focused
+  patch: collapse native input pre-present resample boundaries for already
+  applied semantic input, and extend direct WGPU patch encoding beyond
+  `ReplaceNodeEntries`.
+- External spreadsheet/grid/incremental-runtime patterns match the existing
+  Boon direction: dependency graph plus dirty fanout, row/column
+  virtualization, retained rendering, and explicit currentness barriers.
+- Rust/Zig codegen remains planned, but the current compiler/codegen plan
+  requires resolving the runtime/root-flush/currentness blocker honestly before
+  treating generated code as the production answer.
+
+Remaining blockers:
+
+- Fresh current-commit native reports still need to prove visible click,
+  interaction speed, and scroll speed.
+- Direct GPU patch encoding for `Paint`, `TextContent`, and `RetagNodeEntries`
+  is still pending.
+- Default execution-path and codegen work remain behind typed IR,
+  NativeRegionIR, BYTES/MachinePlan parity, and readiness gates.

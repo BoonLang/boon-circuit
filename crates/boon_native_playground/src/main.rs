@@ -11453,7 +11453,13 @@ fn preview_input_overlay_render_scene_touched_nodes(
     if let Some(focused_node) = focus_overlay.focused_node.as_ref() {
         nodes.insert(boon_document_model::DocumentNodeId(focused_node.clone()));
     }
-    if let Some(selected_address) = focus_overlay.selected_address.as_deref() {
+    for selected_address in [
+        focus_overlay.previous_selected_address.as_deref(),
+        focus_overlay.selected_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let mut selected_nodes = lookup.nodes_for_address(selected_address);
         if selected_nodes.is_empty() {
             selected_nodes.extend(
@@ -34617,6 +34623,7 @@ fn json_value_to_document_text(value: &Value) -> String {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PreviewFocusOverlayState {
     focused_node: Option<String>,
+    previous_selected_address: Option<String>,
     selected_address: Option<String>,
     focused_text: String,
     focused_caret_index: usize,
@@ -34627,8 +34634,14 @@ struct PreviewFocusOverlayState {
 
 impl PreviewFocusOverlayState {
     fn from_input_state(input_state: &PreviewNativeInputState, caret_visible: bool) -> Self {
+        let previous_selected_address = input_state
+            .selected_overlay_address
+            .as_ref()
+            .filter(|address| Some(address.as_str()) != input_state.focused_address.as_deref())
+            .cloned();
         Self {
             focused_node: input_state.focused_node.clone(),
+            previous_selected_address,
             selected_address: input_state.focused_address.clone(),
             focused_text: input_state.focused_text.clone(),
             focused_caret_index: input_state.focused_caret_index,
@@ -34639,7 +34652,9 @@ impl PreviewFocusOverlayState {
     }
 
     fn is_empty(&self) -> bool {
-        self.focused_node.is_none() && self.selected_address.is_none()
+        self.focused_node.is_none()
+            && self.previous_selected_address.is_none()
+            && self.selected_address.is_none()
     }
 }
 
@@ -40096,18 +40111,17 @@ fn preview_apply_address_selected_overlay_to_item(
     if !item.style.contains_key("selected") {
         return false;
     }
-    let Some(selected_address) = selected_address else {
-        return false;
-    };
-    let Some(item_address) = focused_raw_address(layout_proof, &item.node.0)
-        .or_else(|| focused_address(layout_proof, &item.node.0))
-    else {
-        return false;
-    };
+    let selected = selected_address
+        .and_then(|selected_address| {
+            focused_raw_address(layout_proof, &item.node.0)
+                .or_else(|| focused_address(layout_proof, &item.node.0))
+                .map(|item_address| item_address == selected_address)
+        })
+        .unwrap_or(false);
     set_display_style_value(
         &mut item.style,
         "selected",
-        boon_document_model::StyleValue::Bool(item_address == selected_address),
+        boon_document_model::StyleValue::Bool(selected),
     )
 }
 
@@ -58736,7 +58750,7 @@ mod tests {
         let root = boon_document_model::DocumentNodeId("root".to_owned());
         append_child(
             &mut frame,
-            root,
+            root.clone(),
             dev_node(
                 "cell-a",
                 boon_document_model::DocumentNodeKind::TextInput,
@@ -58751,15 +58765,34 @@ mod tests {
                 ],
             ),
         );
+        append_child(
+            &mut frame,
+            root,
+            dev_node(
+                "cell-b",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("B1".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("bg", "#ffffff"),
+                    ("__selected_bg", "#010203"),
+                    ("selected", "true"),
+                ],
+            ),
+        );
         let layout = layout_frame_for_document_frame(&frame, (320.0, 120.0)).unwrap();
         let layout_proof = json!({
             "source_intent_assertions": [
-                {"node": "cell-a", "intent": "address", "source_path": "A1"}
+                {"node": "cell-a", "intent": "address", "source_path": "A1"},
+                {"node": "cell-b", "intent": "address", "source_path": "B1"}
             ]
         });
         let overlay_lookup = PreviewRenderOverlayLookup::from_layout_proof(&layout_proof);
         let focus_overlay = PreviewFocusOverlayState {
             focused_node: Some("cell-a".to_owned()),
+            previous_selected_address: Some("B1".to_owned()),
             selected_address: Some("A1".to_owned()),
             focused_text: "42".to_owned(),
             focused_caret_index: 1,
@@ -58794,7 +58827,9 @@ mod tests {
             &mut patch_columns,
         )
         .expect("focus/selected input overlay should produce a render-scene sidecar");
-        assert_eq!(touched_nodes.len(), 1);
+        assert_eq!(touched_nodes.len(), 2);
+        assert!(touched_nodes.contains(&boon_document_model::DocumentNodeId("cell-a".to_owned())));
+        assert!(touched_nodes.contains(&boon_document_model::DocumentNodeId("cell-b".to_owned())));
 
         let base_frame = preview_frame_with_viewport_background(&layout, 320.0, 120.0);
         let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();

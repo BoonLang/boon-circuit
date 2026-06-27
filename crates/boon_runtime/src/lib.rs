@@ -37244,6 +37244,11 @@ impl GenericScheduledRuntime {
             .collect::<BTreeSet<_>>();
         reads.insert(list_read_key(&projection.list));
         reads.insert(list_column_read_key(&projection.list, &find_field));
+        reads.insert(list_lookup_text_read_key(
+            &projection.list,
+            &find_field,
+            &selected,
+        ));
         let read_key_prepare_ms = runtime_elapsed_ms(read_key_prepare_started);
 
         let lookup_cache_entry_count = self.indexed_lookup_cache.text.len();
@@ -47196,6 +47201,13 @@ impl GenericScheduledRuntime {
                         .root_textlike_ref(value)
                         .map(str::to_owned)
                         .unwrap_or_else(|_| value.clone());
+                    self.record_root_list_find_projection_reads(
+                        &projection.target,
+                        projection_list,
+                        field,
+                        value,
+                        &selected,
+                    );
                     self.list_find_projection(projection_list, field, &selected)
                         .map(JsonValue::Object)
                 })();
@@ -48804,6 +48816,13 @@ impl GenericScheduledRuntime {
                         .root_textlike_ref(value)
                         .map(str::to_owned)
                         .unwrap_or_else(|_| value.clone());
+                    self.record_root_list_find_projection_reads(
+                        &projection.target,
+                        projection_list,
+                        field,
+                        value,
+                        &selected_address,
+                    );
                     if let Some(value) =
                         self.list_find_projection(projection_list, field, &selected_address)
                     {
@@ -49091,6 +49110,25 @@ impl GenericScheduledRuntime {
             .find(|summary| summary.list == list)
             .cloned()
             .and_then(|summary| self.summary_row_json(&summary, index).ok())
+    }
+
+    fn record_root_list_find_projection_reads(
+        &mut self,
+        target: &str,
+        list: &str,
+        field: &str,
+        selector_path: &str,
+        selected: &str,
+    ) {
+        let field = normalized_field_name(field);
+        let mut reads = root_read_keys_for_path(selector_path)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        reads.insert(list_read_key(list));
+        reads.insert(list_column_read_key(list, &field));
+        reads.insert(list_lookup_text_read_key(list, &field, selected));
+        self.generic_derived_state
+            .replace_root_reads(target.to_owned(), reads);
     }
 
     fn summary_row_json(
@@ -74281,6 +74319,14 @@ FUNCTION new_todo(title) {
                 ..LiveSourceEvent::default()
             })
             .unwrap();
+        {
+            let generic = runtime
+                .runtime
+                .generic
+                .as_mut()
+                .expect("Cells should use the generic runtime");
+            generic.reset_list_scan_counters();
+        }
 
         let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
         assert_eq!(summary["store"]["selected_address"], "B0");
@@ -74293,6 +74339,29 @@ FUNCTION new_todo(title) {
         let cells = rows[0]["cells"].as_array().unwrap();
         assert_eq!(cells[0]["address"], "A0");
         assert_eq!(cells[1]["address"], "B0");
+
+        let generic = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .expect("Cells should use the generic runtime");
+        let selected_reads = generic
+            .generic_derived_state
+            .root_reads_by_field
+            .get("store.selected_input")
+            .expect("selected_input root view should record projection reads");
+        assert!(
+            selected_reads.contains(&list_lookup_text_read_key("cells", "address", "B0")),
+            "root List/find projection should record the exact indexed lookup read; reads={selected_reads:?}"
+        );
+        assert_eq!(
+            generic.list_scan_counters.list_find_rows_scanned, 0,
+            "windowed selected_input summary should use the List/find text index instead of scanning"
+        );
+        assert!(
+            generic.list_scan_counters.text_lookup_index_hits > 0,
+            "windowed selected_input summary should report an indexed lookup hit"
+        );
     }
 
     #[test]

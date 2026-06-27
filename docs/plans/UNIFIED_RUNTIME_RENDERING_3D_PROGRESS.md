@@ -20462,3 +20462,63 @@ Next executable work:
 - Refresh native Cells interaction/scroll reports after the retained-render
   patch path is hardened.
 - Continue compiler-boundary extraction before starting Rust/Zig codegen.
+
+## 2026-06-28 - Retained Cells Selection Patch And Architecture Review
+
+Status: implemented a focused retained-render correctness/performance slice
+after committing the lazy runtime `List/chunk` checkpoint. This is a native
+input/render architecture fix, not a Cells Boon-level styling workaround.
+
+What changed:
+
+- `PreviewFocusOverlayState` now carries the previous selected address when it
+  differs from the newly focused/selected address.
+- Native input overlay render-scene patch targeting now includes nodes for both
+  the previous selected address and the new selected address.
+- The retained selection overlay helper now clears `selected` to `false` when
+  there is no selected address instead of leaving stale selected style in a
+  retained frame.
+- The focused render-scene sidecar test now covers the real old/new selection
+  shape: previous selected `B1`, new selected `A1`, and a patch that touches
+  both cells while still matching full overlay lowering.
+- Root `List/find` projection exposure now records the exact
+  `ListLookupText(list, field, selected)` read key for the projection target
+  even when the value is served through targeted document-state projection
+  helpers instead of root list-view materialization.
+- The selected-input window summary guard now proves `store.selected_input`
+  records the exact `cells.address == B0` lookup dependency, uses the text
+  lookup index, and scans zero rows.
+
+Architecture review:
+
+- The next high-value native slice is direct WGPU patch encoding for document
+  patch variants beyond `ReplaceNodeEntries` (`Paint`, `TextContent`, and
+  `RetagNodeEntries`). That would remove one remaining clone/apply/materialize
+  path for formula-bar text and selected-style sidecar patches.
+- Native input scheduling can still be tightened by presenting an already
+  applied semantic input revision instead of dropping the frame on a late,
+  unrelated pre-present wake.
+- Spreadsheet-engine references support the current direction: keep formula
+  dependency recalculation separate from viewport rendering, virtualize
+  rows/columns, and keep currentness/on-demand barriers explicit.
+- Rust/Zig/Wasm codegen remains a later typed-IR/NativeRegionIR milestone. It
+  must not hide unresolved runtime/root-flush/currentness gates or generate
+  from AST/debug tables.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cells_window_document_summary_keeps_selected_projection_current`:
+  pass.
+- `cargo test -q -p boon_runtime cells_selected_input_document_state_values_use_indexed_list_find_projection`:
+  pass.
+- `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`:
+  pass.
+- `cargo check -q -p boon_native_playground`: pass.
+
+Pending verification:
+
+- `cargo fmt --all -- --check` after the final formatting pass.
+- `git diff --check`.
+- Fresh native Cells visible-click, interaction-speed, and scroll reports for
+  the current commit if this slice is promoted from focused correctness to
+  native 60 FPS evidence.

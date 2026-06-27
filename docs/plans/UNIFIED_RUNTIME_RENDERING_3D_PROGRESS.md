@@ -20633,3 +20633,148 @@ Remaining blockers:
   live verifier scenario that actually exercises it.
 - Full spreadsheet architecture still wants a retained viewport/grid model and
   explicit formula dependency graph before much larger sheets are honest.
+
+## 2026-06-28 - Cells Speed Evidence Refresh and Architecture Options
+
+Status: evidence refreshed; no new code change in this slice. The current
+release interaction verifier passes after refreshing its stale app-owned headed
+visual dependency. This does not close TASK-0804A: manual playground behavior
+still needs human retest, recursive schema still finds stale historical
+reports, and larger spreadsheet architecture remains incomplete.
+
+Current refreshed evidence:
+
+- `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `56/56` required reports, `46` proof reports, and `10`
+  diagnostic reports.
+- `target/debug/xtask verify-runtime-production-hardening --report target/reports/runtime-production-hardening.json`:
+  pass.
+- `target/debug/xtask verify-runtime-finality --report target/reports/runtime-finality.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-headed-scenario --example todomvc --report target/reports/native-gpu/headed-scenario-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-native-two-window-content --report target/reports/native-gpu/todomvc-two-window-content.json`:
+  pass.
+- `target/debug/xtask verify-native-todomvc-reference-parity --report target/reports/native-gpu/todomvc-reference-parity.json`:
+  pass.
+- `target/debug/xtask verify-native-todomvc-input-parity --report target/reports/native-gpu/todomvc-input-parity.json`:
+  pass.
+- `target/debug/xtask verify-playground-genericity --report target/reports/playground-genericity.json`:
+  pass.
+- `target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`:
+  pass.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass.
+
+Cells release interaction metrics from
+`target/reports/native-gpu/cells-interaction-speed-release.json`:
+
+- `logical_cell_count=2600`
+- `rendered_cell_count=210`
+- `runtime_apply.p95=13.832977ms`
+- `runtime_apply.max=21.049258ms`
+- `runtime_step_apply.p95=10.16751ms`
+- `runtime_step_apply.max=14.884318ms`
+- `layout_rebuild.p95=0.907726ms`
+- `runtime_state_summary.p95=2.850759ms`
+- `list_scan_metrics.p95=0.000925ms`
+- Workflow checks pass for literal edit, range formula edit, dependency update,
+  and formula-bar sync.
+
+Open verification blockers:
+
+- `target/debug/xtask verify-report-schema` still fails on stale recursive
+  historical reports. The sweep was refreshed through `bytecode-counter`,
+  `bytes-length-audit`, and `cells-dump-plan-debug`; the next observed stale
+  report is
+  `target/reports/bytes-plan/cells-plan-compare-after-runtime-cache-key.json`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`
+  must be rerun after recursive schema passes. The previous readiness report is
+  stale and still lists old support-report blockers even though the support
+  reports above were refreshed.
+- Phase 10 default switch and the partial phase ledger remain true blockers.
+
+Architecture options for the next Cells/60 FPS round:
+
+1. Native input scheduling:
+   make the app-window input path wake runtime, layout patch, render patch, and
+   readback in one bounded immediate lane. Audit for extra poll/timer/frame
+   boundaries after host input before the first present.
+2. Retained render/layout patching:
+   ensure selection and formula-bar changes update the retained layout/render
+   sidecars directly. Reports should show no full document lower, no full layout
+   frame rebuild, no render-scene rebuild, and live use of
+   `layout_render_scene_patch_direct_encode`.
+3. Spreadsheet runtime:
+   keep the current generic `List/find` index and exact dependency invalidation,
+   then move formulas toward a first-class dependency graph with range nodes.
+   HyperFormula's public architecture uses cell/range dependency nodes and
+   range composition to avoid quadratic range arcs; that matches the next Boon
+   runtime shape better than more per-cell micro-optimizations.
+4. Viewport virtualization:
+   keep `cells` as a logical list and materialize/render only viewport plus
+   selection/dependent rows. AG Grid documents the same row/column
+   virtualization principle: render the visible viewport and dynamically swap
+   cells during scroll. Boon should express this generically through
+   `List/chunk`/layout demand, not an example-specific grid shortcut.
+5. Recalculation policy:
+   keep demand-current barriers and dirty dependent fanout. Excel's public
+   recalculation model distinguishes dirty/dependent recalculation from forced
+   dependency-tree rebuilds; Boon should preserve that distinction in reports
+   so normal clicks cannot hide full tree rebuilds.
+
+Subagent work started for the next round:
+
+- Native input scheduling explorer:
+  - App-window input wake is already immediate through
+    `NativeWakeHandle::wake`, but event data is sampled later through
+    `NativeInputAdapterProof`.
+  - No intentional `16ms` demand-loop sleep exists; the remaining input tail can
+    come from resample/continue boundaries when new input arrives around
+    sampling/render/present, press-only events waiting for release/click,
+    synchronous scroll relayout, accessibility snapshot work in hot polls, and
+    verifier readback blocking the next loop.
+  - Next patch candidates:
+    coalesce/drain input provenance until stable before the poll hook, add
+    same-frame press visual feedback where the document exposes a press intent,
+    keep verifier readback outside interaction latency gates, and gate
+    accessibility snapshots on actual revision/focus changes.
+- Retained WGPU/readback explorer:
+  - Current reports already prove retained chunk reuse for Cells visible-click
+    frames, with typical patch frames using hundreds of retained chunk hits and
+    one dirty upload chunk.
+  - `render_scene_from_document_scene_with_patch` still constructs an internal
+    patched scene before hashing/iterating it, so the evidence proves retained
+    GPU buffer reuse rather than a fully partial render pass.
+  - Next patch candidates:
+    promote selection/focus/formula-bar sync into one retained patch primitive
+    over old selected cell, new selected cell, formula-bar node, and focused
+    node; add counters
+    `selection_formula_retained_patch_count`,
+    `selection_formula_retained_touched_node_count`, and
+    `selection_formula_full_layout_count`.
+- Runtime/list/currentness explorer:
+  - Runtime currentness/list work is already implemented in this checkout:
+    `List/find` uses exact text lookup indexes and records exact
+    `ListLookupText` reads, `List/find_value` delegates through that path,
+    `cells.value` and `cells.error` are demand-current at startup, selected
+    input reads go through currentness barriers, and formula fanout/range/stale
+    dependency/cycle tests exist.
+  - Next slice should not rewrite runtime currentness unless fresh counters
+    regress. Preserve the runtime contracts in native reports while attacking
+    native input/render/present tail.
+
+External references consulted for the architecture options:
+
+- AG Grid DOM virtualisation:
+  `https://www.ag-grid.com/javascript-data-grid/dom-virtualisation/`
+- HyperFormula dependency graph:
+  `https://hyperformula.handsontable.com/docs/guide/dependency-graph.html`
+- Microsoft Excel recalculation:
+  `https://learn.microsoft.com/en-us/office/client-developer/excel/excel-recalculation`

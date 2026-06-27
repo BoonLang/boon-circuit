@@ -965,3 +965,54 @@ the report shows `list_find_rows_scanned=0`, no generic fallback clicks, runtime
 currentness observed in about `4.3ms`, and app-owned visible proof. The p95
 overage is a native wake/render/proof tail of roughly `0.3ms` over the strict
 `16.7ms` input-wake-to-visible budget.
+
+## 2026-06-27 Native Render Architecture Follow-Up
+
+Implemented a generic WGPU retained-quad draw-call coalescing pass in
+`boon_native_gpu`. The previous retained renderer already reused retained chunk
+uploads, but still submitted one draw per retained quad batch. On Cells visible
+selection changes that meant roughly `331` retained chunks and `552` draw calls
+for a one-cell/formula-bar update even though only two retained chunks missed.
+
+The new renderer keeps the existing per-retained-chunk upload/cache identity but
+merges adjacent same-texture, same-upload-ring-generation byte ranges into one
+draw range. This is not a Cells branch and does not change Boon semantics.
+
+Fresh evidence:
+
+- `cargo test -p boon_native_gpu coalesced_quad_draw_ranges_merge_only_adjacent_compatible_batches`
+  passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo build -q -p xtask` passed with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  passed with `target_count=64`, `simple_source_click_count=64`,
+  `generic_fallback_count=0`, `input_wake_to_formula_visible_ms_p95=16.67486799999915`,
+  `click_to_formula_visible_ms_p95=28.815178`, one bounded driver-to-wake
+  outlier, and zero unbounded outliers.
+- The visible-click render-loop proof reports `draw_calls=9`,
+  `retained_chunk_count=331`, `retained_chunk_hit_count=329`,
+  `retained_chunk_miss_count=2`, and
+  `render_hook_to_queue_ms=0.12736299999960465`.
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`
+  passed.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  passed after the headed child refresh.
+- `target/debug/xtask verify-wgpu-retained-arenas --report target/reports/native-gpu/wgpu-retained-arenas.json`
+  passed after refreshing the native/browser world-scene children.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/cells-interaction-speed-release.json target/reports/native-gpu/wgpu-retained-arenas.json`
+  passed.
+
+Remaining architecture options:
+
+- Keep the input-wake resample idea as the next robustness option. A read-only
+  input-path review found a possible press/release sampling boundary in the
+  app-window loop: when a release arrives just after input sampling, the loop
+  can wait for the next turn. The current p95 passes, but the report still has
+  a bounded max outlier, so a generation-aware immediate re-sample remains
+  useful if the gate flakes.
+- A deeper retained renderer would retain a frame texture or chunk atlas and
+  redraw only dirty chunks. The current fix reduces draw-call overhead while
+  still clearing/drawing the visible scene every frame.
+- Runtime/list/currentness work should not resume unless counters regress:
+  latest visible-click evidence still shows targeted patch paths, zero
+  `List/find` scans, no full summary scan, and no generic click fallback.

@@ -20044,3 +20044,60 @@ Remaining aggregate state:
   rebuilding `target/debug/xtask`; only one child report schema-validates
   against the new verifier binary. Refresh those child reports before treating
   the unified aggregate as current milestone evidence.
+
+## 2026-06-27 - WGPU Draw-Range Coalescing Clears Cells Visible-Click Tail
+
+Status: implemented a generic retained WGPU draw-range coalescing pass and
+refreshed the focused Cells/native retained evidence. This is the first fix in
+this sequence that directly addresses the render architecture evidence rather
+than runtime/list work or verifier bookkeeping.
+
+What changed:
+
+- `boon_native_gpu` now coalesces adjacent same-texture,
+  same-upload-ring-generation retained quad ranges into one draw call while
+  preserving per-retained-chunk upload/cache identity.
+- This targets the measured Cells visible-click tail: before the patch, a
+  one-cell/formula-bar update could reuse `329/331` retained chunks but still
+  submit about `552` draw calls.
+- The fresh visible-click proof now reports `draw_calls=9`,
+  `retained_chunk_count=331`, `retained_chunk_hit_count=329`,
+  `retained_chunk_miss_count=2`, `rendered_rect_count=869`, and
+  `render_hook_to_queue_ms=0.12736299999960465`.
+
+Fresh evidence:
+
+- `cargo test -p boon_native_gpu coalesced_quad_draw_ranges_merge_only_adjacent_compatible_batches`
+  passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo build -q -p xtask` passed with existing native GPU warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  passed with `input_wake_to_formula_visible_ms_p95=16.67486799999915`,
+  `click_to_formula_visible_ms_p95=28.815178`, `simple_source_click_count=64`,
+  `generic_fallback_count=0`, one bounded driver-to-wake outlier, and zero
+  unbounded outliers.
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`
+  passed.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  passed after the headed child refresh.
+- `target/debug/xtask verify-native-gpu-world-scene --report target/reports/native-gpu/world-scene.json`
+  passed.
+- `target/debug/xtask verify-browser-webgpu-world-scene --report target/reports/native-gpu/browser-world-scene.json`
+  passed.
+- `target/debug/xtask verify-wgpu-retained-arenas --report target/reports/native-gpu/wgpu-retained-arenas.json`
+  passed.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/cells-interaction-speed-release.json target/reports/native-gpu/wgpu-retained-arenas.json`
+  passed.
+
+Architecture notes from the zoom-out pass:
+
+- Runtime/list/currentness is not the current visible-click blocker. The latest
+  report keeps `List/find` scans at zero, uses targeted render patch paths, and
+  avoids full summary/root materialization.
+- Native input scheduling remains the next robustness option if the click gate
+  flakes. The likely boundary is a release edge arriving just after the render
+  loop samples input; a generation-aware immediate re-sample would target that
+  without marking every wake as dirty.
+- A deeper WGPU milestone is still open: a retained frame texture or chunk
+  atlas that redraws only dirty chunks. The current patch lowers command/draw
+  overhead but still clears and draws the visible scene.

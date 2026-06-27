@@ -1159,6 +1159,16 @@ struct GpuQuadBatch {
     ring_generation: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuQuadDrawRange {
+    texture: QuadTexture,
+    vertex_count: u32,
+    byte_range: std::ops::Range<u64>,
+    ring_generation: u64,
+    first_batch_index: usize,
+    source_batch_count: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct QuadBatchCacheKey {
     retained_chunk_id: String,
@@ -1172,6 +1182,41 @@ struct CachedGpuQuadBatch {
     vertex_buffer: wgpu::Buffer,
     byte_range: std::ops::Range<u64>,
     ring_generation: u64,
+}
+
+fn coalesced_gpu_quad_draw_ranges(gpu_batches: &[GpuQuadBatch]) -> Vec<GpuQuadDrawRange> {
+    coalesced_gpu_quad_draw_ranges_from_parts(gpu_batches.iter().enumerate().map(
+        |(index, batch)| GpuQuadDrawRange {
+            texture: batch.texture.clone(),
+            vertex_count: batch.vertex_count,
+            byte_range: batch.byte_range.clone(),
+            ring_generation: batch.ring_generation,
+            first_batch_index: index,
+            source_batch_count: 1,
+        },
+    ))
+}
+
+fn coalesced_gpu_quad_draw_ranges_from_parts(
+    ranges: impl IntoIterator<Item = GpuQuadDrawRange>,
+) -> Vec<GpuQuadDrawRange> {
+    let mut coalesced = Vec::<GpuQuadDrawRange>::new();
+    for range in ranges {
+        if let Some(previous) = coalesced.last_mut()
+            && previous.texture == range.texture
+            && previous.ring_generation == range.ring_generation
+            && previous.byte_range.end == range.byte_range.start
+        {
+            previous.vertex_count = previous.vertex_count.saturating_add(range.vertex_count);
+            previous.byte_range.end = range.byte_range.end;
+            previous.source_batch_count = previous
+                .source_batch_count
+                .saturating_add(range.source_batch_count);
+            continue;
+        }
+        coalesced.push(range);
+    }
+    coalesced
 }
 
 const NATIVE_GPU_QUAD_VERTEX_STRIDE: wgpu::BufferAddress =
@@ -2284,6 +2329,7 @@ fn encode_internal_scene_to_surface(
             }
             (gpu_batches, rect_metrics, asset_metrics)
         };
+    let draw_ranges = coalesced_gpu_quad_draw_ranges(&gpu_batches);
     {
         let mut pass = request
             .encoder
@@ -2309,18 +2355,20 @@ fn encode_internal_scene_to_surface(
                 multiview_mask: None,
             });
         pass.set_pipeline(pipeline);
-        for batch in &gpu_batches {
+        for range in &draw_ranges {
+            let batch = &gpu_batches[range.first_batch_index];
             let bind_group =
                 textures
-                    .bind_group_for(&batch.texture)
+                    .bind_group_for(&range.texture)
                     .ok_or_else(|| RenderError {
                         message: "native GPU asset texture was not prepared before draw".to_owned(),
                     })?;
             bind_group.set(&mut pass);
-            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(batch.byte_range.clone()));
-            pass.draw(0..batch.vertex_count, 0..1);
+            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(range.byte_range.clone()));
+            pass.draw(0..range.vertex_count, 0..1);
         }
     }
+    let draw_range_count = draw_ranges.len() as u32;
     let retained_chunk_metrics = sampled_retained_render_chunks(
         &scene,
         frame_seq,
@@ -2367,7 +2415,7 @@ fn encode_internal_scene_to_surface(
     Ok(FrameMetrics {
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
-        draw_calls: gpu_batches.len() as u32 + u32::from(rendered_text_runs > 0),
+        draw_calls: draw_range_count + u32::from(rendered_text_runs > 0),
         upload_bytes,
         allocated_gpu_bytes,
         dirty_upload_range_count: dirty_upload_ranges.len() as u32,
@@ -12988,6 +13036,51 @@ mod tests {
             material_vertices > flat_vertices,
             "checkbox shadow/highlight material keys should add rendered pixels, not only style metadata"
         );
+    }
+
+    #[test]
+    fn coalesced_quad_draw_ranges_merge_only_adjacent_compatible_batches() {
+        let ranges = coalesced_gpu_quad_draw_ranges_from_parts([
+            GpuQuadDrawRange {
+                texture: QuadTexture::Solid,
+                vertex_count: 6,
+                byte_range: 0..96,
+                ring_generation: 7,
+                first_batch_index: 0,
+                source_batch_count: 1,
+            },
+            GpuQuadDrawRange {
+                texture: QuadTexture::Solid,
+                vertex_count: 12,
+                byte_range: 96..288,
+                ring_generation: 7,
+                first_batch_index: 1,
+                source_batch_count: 1,
+            },
+            GpuQuadDrawRange {
+                texture: QuadTexture::Solid,
+                vertex_count: 6,
+                byte_range: 320..416,
+                ring_generation: 7,
+                first_batch_index: 2,
+                source_batch_count: 1,
+            },
+            GpuQuadDrawRange {
+                texture: QuadTexture::Solid,
+                vertex_count: 6,
+                byte_range: 416..512,
+                ring_generation: 8,
+                first_batch_index: 3,
+                source_batch_count: 1,
+            },
+        ]);
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].byte_range, 0..288);
+        assert_eq!(ranges[0].vertex_count, 18);
+        assert_eq!(ranges[0].source_batch_count, 2);
+        assert_eq!(ranges[1].byte_range, 320..416);
+        assert_eq!(ranges[2].ring_generation, 8);
     }
 
     #[test]

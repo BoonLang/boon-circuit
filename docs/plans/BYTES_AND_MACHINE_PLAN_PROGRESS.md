@@ -23037,3 +23037,44 @@ Remaining readiness state:
   child reports after rebuilding `target/debug/xtask`.
 - `boon_cli run` still defaults to legacy, so Phase 10 default switch remains
   blocked until the broader readiness gate is refreshed and passes.
+
+## 2026-06-27 - Retained WGPU Coalescing Follow-Up
+
+Status: the native retained-render slice gained a generic draw-call coalescing
+optimization that materially improves Cells visible-click latency without
+changing the Boon example or runtime semantics.
+
+What changed:
+
+- `boon_native_gpu` keeps retained chunk upload/cache identity but coalesces
+  adjacent same-texture, same-upload-ring-generation quad ranges into one WGPU
+  draw call.
+- The change addresses the architecture issue found during the zoom-out pass:
+  retained uploads were reused, but the renderer still submitted hundreds of
+  draw calls for one visible Cells selection/formula-bar update.
+
+Evidence:
+
+- `cargo test -p boon_native_gpu coalesced_quad_draw_ranges_merge_only_adjacent_compatible_batches`
+  passed.
+- `cargo fmt --all -- --check` passed.
+- `cargo build -q -p xtask` passed with existing native GPU warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  passed with `input_wake_to_formula_visible_ms_p95=16.67486799999915`,
+  `simple_source_click_count=64`, and `generic_fallback_count=0`.
+- The associated render-loop proof reports `draw_calls=9` for a frame with
+  `331` retained chunks, `329` retained hits, and `2` misses.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`
+  passed after refreshing `headed-scenario-cells`.
+- `target/debug/xtask verify-wgpu-retained-arenas --report target/reports/native-gpu/wgpu-retained-arenas.json`
+  passed after refreshing native/browser world-scene children.
+- Focused schema validation passed for the Cells visible-click,
+  Cells interaction-speed, and WGPU retained-arena reports.
+
+Remaining broader-goal blockers:
+
+- The default execution engine switch is still Phase 10 work; `boon_cli run`
+  still defaults to legacy.
+- The next broader slices remain MachinePlan/codegen/default-switch readiness,
+  Zig/Rust codegen planning, and the deeper retained WGPU architecture where a
+  retained frame texture or chunk atlas redraws only dirty chunks.

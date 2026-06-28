@@ -2915,6 +2915,17 @@ pub struct LiveSparseStepOutput {
     pub value_summaries: JsonValue,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeChangeBatch<T> {
+    pub program_hash: String,
+    pub runtime_id: String,
+    pub base_epoch: u64,
+    pub next_epoch: u64,
+    pub server_tick: u64,
+    pub step_id: JsonValue,
+    pub changes: Vec<T>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SemanticDelta<'a> {
     pub kind: &'static str,
@@ -25941,6 +25952,8 @@ fn base_example_report(
     let program_hash = report_source_hash_for_parsed(parsed);
     let semantic_delta_protocol_batches =
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
+    let render_patch_protocol_batches =
+        render_patch_protocol_batches(&program_hash, render_patches, &per_step);
     let implementation = "static_graph_interpreter";
     let adapter_blocker = "examples execute through the manifest/source/scenario-driven generic runtime path; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter";
     let generic_runtime_slices = generic_runtime_slices_report(ir, compiled);
@@ -26143,6 +26156,7 @@ fn base_example_report(
         "state_summary": state_summary,
         "semantic_deltas": semantic_deltas,
         "semantic_delta_protocol_batches": semantic_delta_protocol_batches,
+        "render_patch_protocol_batches": render_patch_protocol_batches,
         "render_patches": render_patches,
         "hidden_identity_verified": ir.hidden_identity_verified,
         "static_schedule_verified": ir.static_schedule_verified,
@@ -27054,36 +27068,83 @@ fn semantic_delta_protocol_batches(
     semantic_deltas: &[SemanticDelta<'static>],
     per_step: &[JsonValue],
 ) -> JsonValue {
+    json!(semantic_delta_change_batches(
+        program_hash,
+        semantic_deltas,
+        per_step
+    ))
+}
+
+fn render_patch_protocol_batches(
+    program_hash: &str,
+    render_patches: &[RenderPatch<'static>],
+    per_step: &[JsonValue],
+) -> JsonValue {
+    json!(render_patch_change_batches(
+        program_hash,
+        render_patches,
+        per_step
+    ))
+}
+
+fn semantic_delta_change_batches(
+    program_hash: &str,
+    semantic_deltas: &[SemanticDelta<'static>],
+    per_step: &[JsonValue],
+) -> Vec<RuntimeChangeBatch<SemanticDelta<'static>>> {
+    runtime_change_batches_for_step_counts(
+        program_hash,
+        semantic_deltas,
+        per_step,
+        "semantic_delta_count",
+    )
+}
+
+fn render_patch_change_batches(
+    program_hash: &str,
+    render_patches: &[RenderPatch<'static>],
+    per_step: &[JsonValue],
+) -> Vec<RuntimeChangeBatch<RenderPatch<'static>>> {
+    runtime_change_batches_for_step_counts(
+        program_hash,
+        render_patches,
+        per_step,
+        "render_patch_count",
+    )
+}
+
+fn runtime_change_batches_for_step_counts<T: Clone>(
+    program_hash: &str,
+    changes: &[T],
+    per_step: &[JsonValue],
+    count_field: &str,
+) -> Vec<RuntimeChangeBatch<T>> {
     let runtime_id = format!("local-static-graph:{program_hash}");
     let mut cursor = 0usize;
-    let batches = per_step
+    per_step
         .iter()
         .enumerate()
         .map(|(index, step)| {
             let count = step
-                .get("semantic_delta_count")
+                .get(count_field)
                 .and_then(JsonValue::as_u64)
                 .unwrap_or_default() as usize;
-            let end = (cursor + count).min(semantic_deltas.len());
-            let changes = semantic_deltas[cursor..end]
-                .iter()
-                .map(|delta| json!(delta))
-                .collect::<Vec<_>>();
+            let end = (cursor + count).min(changes.len());
+            let batch_changes = changes[cursor..end].to_vec();
             cursor = end;
             let base_epoch = index as u64;
             let next_epoch = base_epoch + 1;
-            json!({
-                "program_hash": program_hash,
-                "runtime_id": runtime_id,
-                "base_epoch": base_epoch,
-                "next_epoch": next_epoch,
-                "server_tick": next_epoch,
-                "step_id": step.get("id").cloned().unwrap_or(JsonValue::Null),
-                "changes": changes
-            })
+            RuntimeChangeBatch {
+                program_hash: program_hash.to_owned(),
+                runtime_id: runtime_id.clone(),
+                base_epoch,
+                next_epoch,
+                server_tick: next_epoch,
+                step_id: step.get("id").cloned().unwrap_or(JsonValue::Null),
+                changes: batch_changes,
+            }
         })
-        .collect::<Vec<_>>();
-    json!(batches)
+        .collect()
 }
 
 fn runtime_window_size(layer: VerificationLayer) -> JsonValue {
@@ -37638,12 +37699,6 @@ impl GenericScheduledRuntime {
                 let Some(source_index) = source.index_at(target_index) else {
                     continue;
                 };
-                for field in self
-                    .storage
-                    .list_row_field_names(source.list(), source_index)?
-                {
-                    reads.insert(list_column_read_key(source.list(), &field));
-                }
                 items.push(boon_value_json(&BoonValue::RowRef {
                     list: source.list().to_owned(),
                     index: source_index,
@@ -71769,6 +71824,63 @@ FUNCTION decorate(value) {
         .unwrap();
         verify_semantic_delta_protocol_batches(&output.report, Path::new("memory:todomvc"))
             .unwrap();
+        let program_hash = output.report["program_hash"]
+            .as_str()
+            .unwrap_or("test-program");
+        let synthetic_per_step = vec![
+            json!({
+                "id": "first",
+                "semantic_delta_count": output.semantic_deltas.len().min(1),
+                "render_patch_count": output.render_patches.len().min(1)
+            }),
+            json!({
+                "id": "rest",
+                "semantic_delta_count": output.semantic_deltas.len().saturating_sub(1),
+                "render_patch_count": output.render_patches.len().saturating_sub(1)
+            }),
+        ];
+        let semantic_batches = semantic_delta_change_batches(
+            program_hash,
+            &output.semantic_deltas,
+            &synthetic_per_step,
+        );
+        assert_eq!(semantic_batches.len(), 2);
+        assert_eq!(
+            semantic_batches[0].runtime_id,
+            format!("local-static-graph:{program_hash}")
+        );
+        assert_eq!(semantic_batches[0].base_epoch, 0);
+        assert_eq!(semantic_batches[0].next_epoch, 1);
+        assert_eq!(semantic_batches[1].server_tick, 2);
+        assert_eq!(
+            semantic_batches
+                .iter()
+                .map(|batch| batch.changes.len())
+                .sum::<usize>(),
+            output.semantic_deltas.len()
+        );
+        assert!(
+            output
+                .report
+                .get("render_patch_protocol_batches")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|batches| !batches.is_empty()),
+            "runtime report must expose typed render patch batches alongside semantic batches"
+        );
+        let render_batches =
+            render_patch_change_batches(program_hash, &output.render_patches, &synthetic_per_step);
+        assert_eq!(render_batches.len(), 2);
+        assert_eq!(
+            render_batches[0].runtime_id,
+            format!("local-static-graph:{program_hash}")
+        );
+        assert_eq!(
+            render_batches
+                .iter()
+                .map(|batch| batch.changes.len())
+                .sum::<usize>(),
+            output.render_patches.len()
+        );
 
         let mut missing_runtime_id = output.report.clone();
         missing_runtime_id["semantic_delta_protocol_batches"][1]["runtime_id"] = JsonValue::Null;
@@ -74451,6 +74563,64 @@ FUNCTION new_todo(title) {
         assert!(
             generic.list_scan_counters.text_lookup_index_hits > 0,
             "windowed selected_input summary should report an indexed lookup hit"
+        );
+    }
+
+    #[test]
+    fn cells_visible_value_edit_does_not_rematerialize_chunked_sheet_rows() {
+        let source = cells_project_source_for_test();
+        let mut runtime =
+            LiveRuntime::from_source("cells-chunk-row-field-edit-skip", &source).unwrap();
+
+        let initial = runtime.document_state_summary_for_window(0, 24, 0, 10);
+        assert_eq!(initial["store"]["sheet_rows"].as_array().unwrap().len(), 24);
+        {
+            let generic = runtime
+                .runtime
+                .generic
+                .as_ref()
+                .expect("Cells should use the generic runtime");
+            let sheet_row_reads = generic
+                .generic_derived_state
+                .root_reads_by_field
+                .get("store.sheet_rows")
+                .expect("window summary should record sheet_rows root reads");
+            assert!(
+                sheet_row_reads.contains(&list_read_key("cells")),
+                "chunked sheet rows should depend on cells list structure: {sheet_row_reads:?}"
+            );
+            assert!(
+                !sheet_row_reads.iter().any(
+                    |read| matches!(read, GenericReadKey::ListColumn { list, .. } if list == "cells")
+                ),
+                "chunked sheet rows should not subscribe to every cells row field: {sheet_row_reads:?}"
+            );
+        }
+
+        let output = runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some("20".to_owned()),
+                key: Some("Enter".to_owned()),
+                address: Some("A0".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("visible cell commit should apply");
+        assert!(
+            output.semantic_deltas.iter().any(|delta| {
+                delta.list_id.as_deref() == Some("cells")
+                    && delta.field_path.as_deref() == Some("value")
+            }),
+            "A0 commit should still emit the visible cell value delta"
+        );
+        assert!(
+            output
+                .root_materialization_stats
+                .samples
+                .iter()
+                .all(|sample| sample.path != "store.sheet_rows"),
+            "row-field-only cell edits should not rematerialize the chunked sheet_rows root: {:#?}",
+            output.root_materialization_stats.samples
         );
     }
 

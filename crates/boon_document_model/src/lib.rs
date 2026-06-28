@@ -149,6 +149,32 @@ impl StyleValue {
 pub type StyleMap = BTreeMap<String, StyleValue>;
 pub type StylePatch = BTreeMap<String, Option<StyleValue>>;
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayoutStylePatch {
+    pub patch: StylePatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaintStylePatch {
+    pub patch: StylePatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextStylePatch {
+    pub patch: StylePatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MaterialStylePatch {
+    pub patch: StylePatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangeBatch<T> {
+    pub epoch: u64,
+    pub changes: Vec<T>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextValue {
     pub text: String,
@@ -190,6 +216,8 @@ pub struct DocumentNode {
     pub text: Option<TextValue>,
     pub style: StyleMap,
     pub source_binding: Option<SourceBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_bindings: Vec<SourceBinding>,
     pub scroll: Option<ScrollState>,
     pub materialized: Vec<MaterializedRange>,
 }
@@ -204,9 +232,16 @@ impl DocumentNode {
             text: None,
             style: StyleMap::new(),
             source_binding: None,
+            source_bindings: Vec::new(),
             scroll: None,
             materialized: Vec::new(),
         }
+    }
+
+    pub fn source_bindings(&self) -> impl Iterator<Item = &SourceBinding> {
+        self.source_binding
+            .iter()
+            .chain(self.source_bindings.iter())
     }
 }
 
@@ -243,6 +278,11 @@ pub enum DocumentPatch {
         id: DocumentNodeId,
         binding: SourceBinding,
     },
+    SetBindingAt {
+        id: DocumentNodeId,
+        ordinal: u32,
+        binding: SourceBinding,
+    },
     SetScroll {
         id: DocumentNodeId,
         scroll: ScrollState,
@@ -251,6 +291,172 @@ pub enum DocumentPatch {
         id: DocumentNodeId,
         materialized: MaterializedRange,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiSemanticChange {
+    InsertNode {
+        parent: DocumentNodeId,
+        index: usize,
+        node: DocumentNode,
+    },
+    RemoveSubtree {
+        id: DocumentNodeId,
+    },
+    MoveNode {
+        id: DocumentNodeId,
+        parent: DocumentNodeId,
+        index: usize,
+    },
+    SetText {
+        id: DocumentNodeId,
+        text: TextValue,
+    },
+    SetStyle {
+        id: DocumentNodeId,
+        patch: StylePatch,
+    },
+    SetLayoutStyle {
+        id: DocumentNodeId,
+        patch: LayoutStylePatch,
+    },
+    SetPaintStyle {
+        id: DocumentNodeId,
+        patch: PaintStylePatch,
+    },
+    SetTextStyle {
+        id: DocumentNodeId,
+        patch: TextStylePatch,
+    },
+    SetMaterialStyle {
+        id: DocumentNodeId,
+        patch: MaterialStylePatch,
+    },
+    SetBinding {
+        id: DocumentNodeId,
+        binding: SourceBinding,
+    },
+    SetBindingAt {
+        id: DocumentNodeId,
+        ordinal: u32,
+        binding: SourceBinding,
+    },
+    SetVisibility {
+        id: DocumentNodeId,
+        visible: bool,
+    },
+    SetScroll {
+        id: DocumentNodeId,
+        scroll: ScrollState,
+    },
+    SetListWindow {
+        id: DocumentNodeId,
+        materialized: MaterializedRange,
+    },
+}
+
+impl UiSemanticChange {
+    pub fn into_document_patches(self) -> Vec<DocumentPatch> {
+        match self {
+            UiSemanticChange::InsertNode {
+                parent,
+                index,
+                mut node,
+            } => {
+                node.parent = Some(parent.clone());
+                let child = node.id.clone();
+                vec![
+                    DocumentPatch::UpsertNode(node),
+                    DocumentPatch::InsertChild {
+                        parent,
+                        child,
+                        index,
+                    },
+                ]
+            }
+            UiSemanticChange::RemoveSubtree { id } => vec![DocumentPatch::RemoveNode { id }],
+            UiSemanticChange::MoveNode { id, parent, index } => vec![DocumentPatch::MoveChild {
+                child: id,
+                new_parent: parent,
+                index,
+            }],
+            UiSemanticChange::SetText { id, text } => {
+                vec![DocumentPatch::SetText { id, text }]
+            }
+            UiSemanticChange::SetStyle { id, patch } => {
+                vec![DocumentPatch::SetStyle { id, patch }]
+            }
+            UiSemanticChange::SetLayoutStyle { id, patch } => {
+                vec![DocumentPatch::SetStyle {
+                    id,
+                    patch: patch.patch,
+                }]
+            }
+            UiSemanticChange::SetPaintStyle { id, patch } => {
+                vec![DocumentPatch::SetStyle {
+                    id,
+                    patch: patch.patch,
+                }]
+            }
+            UiSemanticChange::SetTextStyle { id, patch } => {
+                vec![DocumentPatch::SetStyle {
+                    id,
+                    patch: patch.patch,
+                }]
+            }
+            UiSemanticChange::SetMaterialStyle { id, patch } => {
+                vec![DocumentPatch::SetStyle {
+                    id,
+                    patch: patch.patch,
+                }]
+            }
+            UiSemanticChange::SetBinding { id, binding } => {
+                vec![DocumentPatch::SetBinding { id, binding }]
+            }
+            UiSemanticChange::SetBindingAt {
+                id,
+                ordinal,
+                binding,
+            } => {
+                vec![DocumentPatch::SetBindingAt {
+                    id,
+                    ordinal,
+                    binding,
+                }]
+            }
+            UiSemanticChange::SetVisibility { id, visible } => {
+                let mut patch = StylePatch::new();
+                patch.insert("visible".to_owned(), Some(StyleValue::Bool(visible)));
+                vec![DocumentPatch::SetStyle { id, patch }]
+            }
+            UiSemanticChange::SetScroll { id, scroll } => {
+                vec![DocumentPatch::SetScroll { id, scroll }]
+            }
+            UiSemanticChange::SetListWindow { id, materialized } => {
+                vec![DocumentPatch::SetListMaterialization { id, materialized }]
+            }
+        }
+    }
+}
+
+impl From<ChangeBatch<UiSemanticChange>> for ChangeBatch<DocumentPatch> {
+    fn from(batch: ChangeBatch<UiSemanticChange>) -> Self {
+        Self {
+            epoch: batch.epoch,
+            changes: batch
+                .changes
+                .into_iter()
+                .flat_map(UiSemanticChange::into_document_patches)
+                .collect(),
+        }
+    }
+}
+
+impl From<ChangeBatch<DocumentPatch>> for Vec<DocumentPatch> {
+    fn from(batch: ChangeBatch<DocumentPatch>) -> Self {
+        batch.changes
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -342,5 +548,59 @@ mod tests {
         .unwrap();
         let decoded_hints = StyleValue::from_legacy_editor_type_hints_json(&hint_payload).unwrap();
         assert!(matches!(decoded_hints, StyleValue::EditorTypeHints(_)));
+    }
+
+    #[test]
+    fn typed_ui_style_changes_lower_to_compatible_style_patches() {
+        let node = DocumentNodeId("node".to_owned());
+        let typed_changes = vec![
+            UiSemanticChange::SetLayoutStyle {
+                id: node.clone(),
+                patch: LayoutStylePatch {
+                    patch: BTreeMap::from([("width".to_owned(), Some(StyleValue::Number(120.0)))]),
+                },
+            },
+            UiSemanticChange::SetPaintStyle {
+                id: node.clone(),
+                patch: PaintStylePatch {
+                    patch: BTreeMap::from([(
+                        "background".to_owned(),
+                        Some(StyleValue::Text("#fff".to_owned())),
+                    )]),
+                },
+            },
+            UiSemanticChange::SetTextStyle {
+                id: node.clone(),
+                patch: TextStylePatch {
+                    patch: BTreeMap::from([(
+                        "font_weight".to_owned(),
+                        Some(StyleValue::Text("bold".to_owned())),
+                    )]),
+                },
+            },
+            UiSemanticChange::SetMaterialStyle {
+                id: node.clone(),
+                patch: MaterialStylePatch {
+                    patch: BTreeMap::from([(
+                        "material".to_owned(),
+                        Some(StyleValue::Text("glass".to_owned())),
+                    )]),
+                },
+            },
+        ];
+        let batch: ChangeBatch<DocumentPatch> = ChangeBatch {
+            epoch: 11,
+            changes: typed_changes,
+        }
+        .into();
+
+        assert_eq!(batch.epoch, 11);
+        assert_eq!(batch.changes.len(), 4);
+        for patch in batch.changes {
+            assert!(
+                matches!(patch, DocumentPatch::SetStyle { id, .. } if id == node),
+                "typed style semantic changes should preserve compatible SetStyle lowering"
+            );
+        }
     }
 }

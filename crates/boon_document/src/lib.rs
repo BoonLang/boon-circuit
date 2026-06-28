@@ -1,7 +1,8 @@
 pub use boon_document_model::{
-    Axis, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind, DocumentPatch,
-    MaterializedRange, ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch,
-    StyleRichTextSpan, StyleValue, TextValue,
+    Axis, ChangeBatch, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind,
+    DocumentPatch, LayoutStylePatch, MaterialStylePatch, MaterializedRange, PaintStylePatch,
+    ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan,
+    StyleValue, TextStylePatch, TextValue, UiSemanticChange,
 };
 pub mod render_scene;
 use boon_host::Viewport;
@@ -143,6 +144,8 @@ pub struct HitSideTableEntry {
     pub source_intent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_binding_refs: Vec<DocumentTypedBindingRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_routes: Vec<DocumentTypedBindingRoute>,
     pub bounds: Rect,
     pub z_depth: u32,
     pub scroll_root: Option<ScrollRootId>,
@@ -191,6 +194,14 @@ impl HitSideTable {
                 source_path: binding.map(|binding| binding.source_path.clone()),
                 source_intent: binding.map(|binding| binding.intent.clone()),
                 source_binding_refs: Vec::new(),
+                source_routes: binding
+                    .map(|binding| {
+                        vec![DocumentTypedBindingRoute {
+                            source_path: binding.source_path.clone(),
+                            intent: binding.intent.clone(),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 bounds: hit.bounds,
                 z_depth: index as u32,
                 scroll_root: scroll_root_for_node(document, &hit.node),
@@ -259,6 +270,10 @@ impl HitSideTable {
                 source_path: primary.map(|binding| binding.route.source_path.clone()),
                 source_intent: primary.map(|binding| binding.route.intent.clone()),
                 source_binding_refs: bindings.iter().map(|binding| binding.reference).collect(),
+                source_routes: bindings
+                    .iter()
+                    .map(|binding| binding.route.clone())
+                    .collect(),
                 bounds: hit.bounds,
                 z_depth: index as u32,
                 scroll_root: scroll_root_for_node(document, &hit.node),
@@ -301,9 +316,13 @@ impl HitSideTable {
     }
 
     pub fn entry_for_source_path(&self, source_path: &str) -> Option<&HitSideTableEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.source_path.as_deref() == Some(source_path))
+        self.entries.iter().find(|entry| {
+            entry.source_path.as_deref() == Some(source_path)
+                || entry
+                    .source_routes
+                    .iter()
+                    .any(|route| route.source_path == source_path)
+        })
     }
 
     pub fn bucket_indices(&self, bucket: HitSpatialBucket) -> Option<&Vec<usize>> {
@@ -1685,6 +1704,7 @@ pub struct DocumentInternedNode {
     pub material: DocumentInternId,
     pub clip: DocumentInternId,
     pub source_binding: Option<DocumentInternId>,
+    pub source_bindings: Vec<DocumentInternId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1946,6 +1966,23 @@ pub struct DocumentDerivedIndexBundle {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DocumentChangeBatch {
     pub patches: Vec<DocumentPatch>,
+}
+
+impl From<ChangeBatch<UiSemanticChange>> for DocumentChangeBatch {
+    fn from(batch: ChangeBatch<UiSemanticChange>) -> Self {
+        let document_batch: ChangeBatch<DocumentPatch> = batch.into();
+        Self {
+            patches: document_batch.changes,
+        }
+    }
+}
+
+impl From<ChangeBatch<DocumentPatch>> for DocumentChangeBatch {
+    fn from(batch: ChangeBatch<DocumentPatch>) -> Self {
+        Self {
+            patches: batch.changes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2310,13 +2347,17 @@ impl DocumentInternIndex {
             &node.style,
             StyleHashCategory::Clip,
         ));
-        let source_binding = node.source_binding.as_ref().map(|binding| {
-            self.source_bindings.intern(stable_source_binding_key(
-                &binding.id.0,
-                &binding.source_path,
-                &binding.intent,
-            ))
-        });
+        let source_bindings = node
+            .source_bindings()
+            .map(|binding| {
+                self.source_bindings.intern(stable_source_binding_key(
+                    &binding.id.0,
+                    &binding.source_path,
+                    &binding.intent,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let source_binding = source_bindings.first().copied();
         self.nodes.insert(
             hot_ref.id,
             DocumentInternedNode {
@@ -2328,6 +2369,7 @@ impl DocumentInternIndex {
                 material,
                 clip,
                 source_binding,
+                source_bindings,
             },
         );
     }
@@ -2885,50 +2927,7 @@ impl DocumentTypedBindingIndex {
                         reference_kind: "hot_id_table",
                         id: node_id.clone(),
                     })?;
-            let Some(binding) = &node.source_binding else {
-                continue;
-            };
-            let interned = intern_index.nodes.get(&node_ref.id).ok_or_else(|| {
-                PatchApplyError::StaleReference {
-                    reference_kind: "document_intern_index",
-                    id: node_id.clone(),
-                }
-            })?;
-            let intern_id =
-                interned
-                    .source_binding
-                    .ok_or_else(|| PatchApplyError::StaleReference {
-                        reference_kind: "document_intern_index_source_binding",
-                        id: node_id.clone(),
-                    })?;
-            let reference = DocumentTypedBindingRef {
-                node: node_ref.id,
-                ordinal: 0,
-            };
-            let route = DocumentTypedBindingRoute {
-                source_path: binding.source_path.clone(),
-                intent: binding.intent.clone(),
-            };
-            let typed = DocumentTypedBinding {
-                node: node_ref,
-                reference,
-                binding_id: binding.id.clone(),
-                route: route.clone(),
-                intern_id,
-            };
-            index.nodes.insert(
-                node_ref.id,
-                DocumentTypedBindingNode {
-                    node: node_ref,
-                    bindings: vec![typed],
-                },
-            );
-            index
-                .by_binding_id
-                .entry(binding.id.clone())
-                .or_default()
-                .push(reference);
-            index.by_route.entry(route).or_default().push(reference);
+            index.insert_node_bindings(node_id, node, node_ref, intern_index)?;
         }
         Ok(index)
     }
@@ -2957,9 +2956,19 @@ impl DocumentTypedBindingIndex {
             }
         }
 
-        let Some(binding) = &node.source_binding else {
+        self.insert_node_bindings(node_id, node, hot_ref, intern_index)
+    }
+
+    fn insert_node_bindings(
+        &mut self,
+        node_id: &DocumentNodeId,
+        node: &DocumentNode,
+        hot_ref: DocumentHotNodeRef,
+        intern_index: &DocumentInternIndex,
+    ) -> Result<(), PatchApplyError> {
+        if node.source_bindings().next().is_none() {
             return Ok(());
-        };
+        }
         let interned =
             intern_index
                 .nodes
@@ -2968,39 +2977,52 @@ impl DocumentTypedBindingIndex {
                     reference_kind: "document_intern_index",
                     id: node_id.clone(),
                 })?;
-        let intern_id = interned
-            .source_binding
-            .ok_or_else(|| PatchApplyError::StaleReference {
-                reference_kind: "document_intern_index_source_binding",
+
+        let mut bindings = Vec::new();
+        for (ordinal, binding) in node.source_bindings().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| PatchApplyError::StaleReference {
+                reference_kind: "document_typed_binding_ordinal",
                 id: node_id.clone(),
             })?;
-        let reference = DocumentTypedBindingRef {
-            node: hot_ref.id,
-            ordinal: 0,
-        };
-        let route = DocumentTypedBindingRoute {
-            source_path: binding.source_path.clone(),
-            intent: binding.intent.clone(),
-        };
-        let typed = DocumentTypedBinding {
-            node: hot_ref,
-            reference,
-            binding_id: binding.id.clone(),
-            route: route.clone(),
-            intern_id,
-        };
-        self.nodes.insert(
-            hot_ref.id,
-            DocumentTypedBindingNode {
+            let intern_id = *interned
+                .source_bindings
+                .get(ordinal as usize)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "document_intern_index_source_binding",
+                    id: node_id.clone(),
+                })?;
+            let reference = DocumentTypedBindingRef {
+                node: hot_ref.id,
+                ordinal,
+            };
+            let route = DocumentTypedBindingRoute {
+                source_path: binding.source_path.clone(),
+                intent: binding.intent.clone(),
+            };
+            let typed = DocumentTypedBinding {
                 node: hot_ref,
-                bindings: vec![typed],
-            },
-        );
-        self.by_binding_id
-            .entry(binding.id.clone())
-            .or_default()
-            .push(reference);
-        self.by_route.entry(route).or_default().push(reference);
+                reference,
+                binding_id: binding.id.clone(),
+                route: route.clone(),
+                intern_id,
+            };
+            self.by_binding_id
+                .entry(binding.id.clone())
+                .or_default()
+                .push(reference);
+            self.by_route.entry(route).or_default().push(reference);
+            bindings.push(typed);
+        }
+
+        if !bindings.is_empty() {
+            self.nodes.insert(
+                hot_ref.id,
+                DocumentTypedBindingNode {
+                    node: hot_ref,
+                    bindings,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -3235,6 +3257,21 @@ impl DocumentState {
         Ok(change_set)
     }
 
+    pub fn apply_ui_semantic_batch(
+        &mut self,
+        batch: ChangeBatch<UiSemanticChange>,
+    ) -> Result<DocumentChangeSet, PatchApplyError> {
+        validate_frame_integrity(&self.frame)?;
+        let node_count_before = self.frame.nodes.len();
+        let mut next_frame = self.frame.clone();
+        let reports = apply_ui_semantic_changes_unchecked(&mut next_frame, batch.changes)?;
+        validate_frame_integrity(&next_frame)?;
+        let change_set =
+            document_change_set_from_reports(reports, node_count_before, next_frame.nodes.len());
+        self.frame = next_frame;
+        Ok(change_set)
+    }
+
     pub fn apply_batch_to_owned_frame(
         mut frame: DocumentFrame,
         batch: DocumentChangeBatch,
@@ -3246,6 +3283,25 @@ impl DocumentState {
             reports.push(apply_document_patch_unchecked(&mut frame, patch)?);
         }
         validate_frame_integrity(&frame)?;
+        let change_set =
+            document_change_set_from_reports(reports, node_count_before, frame.nodes.len());
+        Ok((frame, change_set))
+    }
+
+    pub fn apply_ui_semantic_batch_to_owned_frame(
+        frame: DocumentFrame,
+        batch: ChangeBatch<UiSemanticChange>,
+    ) -> Result<(DocumentFrame, DocumentChangeSet), PatchApplyError> {
+        validate_frame_integrity(&frame)?;
+        Self::apply_ui_semantic_batch_to_valid_owned_frame(frame, batch)
+    }
+
+    pub fn apply_ui_semantic_batch_to_valid_owned_frame(
+        mut frame: DocumentFrame,
+        batch: ChangeBatch<UiSemanticChange>,
+    ) -> Result<(DocumentFrame, DocumentChangeSet), PatchApplyError> {
+        let node_count_before = frame.nodes.len();
+        let reports = apply_ui_semantic_changes_unchecked(&mut frame, batch.changes)?;
         let change_set =
             document_change_set_from_reports(reports, node_count_before, frame.nodes.len());
         Ok((frame, change_set))
@@ -3271,6 +3327,74 @@ impl DocumentState {
     }
 }
 
+fn apply_ui_semantic_changes_unchecked(
+    frame: &mut DocumentFrame,
+    changes: Vec<UiSemanticChange>,
+) -> Result<Vec<PatchApplyReport>, PatchApplyError> {
+    let mut reports = Vec::with_capacity(changes.len());
+    for change in changes {
+        match change {
+            UiSemanticChange::SetLayoutStyle { id, patch } => {
+                reports.push(apply_typed_style_patch_unchecked(
+                    frame,
+                    id,
+                    patch.patch,
+                    "set_layout_style",
+                )?);
+            }
+            UiSemanticChange::SetPaintStyle { id, patch } => {
+                reports.push(apply_typed_style_patch_unchecked(
+                    frame,
+                    id,
+                    patch.patch,
+                    "set_paint_style",
+                )?);
+            }
+            UiSemanticChange::SetTextStyle { id, patch } => {
+                reports.push(apply_typed_style_patch_unchecked(
+                    frame,
+                    id,
+                    patch.patch,
+                    "set_text_style",
+                )?);
+            }
+            UiSemanticChange::SetMaterialStyle { id, patch } => {
+                reports.push(apply_typed_style_patch_unchecked(
+                    frame,
+                    id,
+                    patch.patch,
+                    "set_material_style",
+                )?);
+            }
+            other => {
+                for patch in other.into_document_patches() {
+                    reports.push(apply_document_patch_unchecked(frame, patch)?);
+                }
+            }
+        }
+    }
+    Ok(reports)
+}
+
+fn apply_typed_style_patch_unchecked(
+    frame: &mut DocumentFrame,
+    id: DocumentNodeId,
+    patch: StylePatch,
+    patch_kind: &'static str,
+) -> Result<PatchApplyReport, PatchApplyError> {
+    let node = required_node_mut(frame, patch_kind, &id)?;
+    let changed_keys = apply_style_patch(&mut node.style, patch);
+    let invalidation = style_patch_invalidation(&changed_keys);
+    Ok(PatchApplyReport {
+        patch_kind,
+        target: Some(id),
+        invalidation,
+        removed_nodes: Vec::new(),
+        node_count_after: frame.nodes.len(),
+        materialization: None,
+    })
+}
+
 fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str> {
     match patch {
         DocumentPatch::UpsertNode(_) => Some("upsert_node"),
@@ -3281,6 +3405,7 @@ fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str>
         DocumentPatch::SetText { .. }
         | DocumentPatch::SetStyle { .. }
         | DocumentPatch::SetBinding { .. }
+        | DocumentPatch::SetBindingAt { .. }
         | DocumentPatch::SetScroll { .. }
         | DocumentPatch::SetListMaterialization { .. } => None,
     }
@@ -3414,11 +3539,23 @@ fn apply_document_patch_unchecked(
             Ok(PatchApplyReport {
                 patch_kind: "set_binding",
                 target: Some(id),
-                invalidation: vec![
-                    PatchInvalidationClass::Binding,
-                    PatchInvalidationClass::SourceBinding,
-                    PatchInvalidationClass::HitRegion,
-                ],
+                invalidation: source_binding_invalidation(),
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetBindingAt {
+            id,
+            ordinal,
+            binding,
+        } => {
+            let node = required_node_mut(frame, "set_binding_at", &id)?;
+            apply_source_binding_at(node, ordinal, binding)?;
+            Ok(PatchApplyReport {
+                patch_kind: "set_binding_at",
+                target: Some(id),
+                invalidation: source_binding_invalidation(),
                 removed_nodes: Vec::new(),
                 node_count_after: frame.nodes.len(),
                 materialization: None,
@@ -3472,6 +3609,43 @@ fn structural_child_invalidation() -> Vec<PatchInvalidationClass> {
         PatchInvalidationClass::LayoutOnly,
         PatchInvalidationClass::HitRegion,
     ]
+}
+
+fn source_binding_invalidation() -> Vec<PatchInvalidationClass> {
+    vec![
+        PatchInvalidationClass::Binding,
+        PatchInvalidationClass::SourceBinding,
+        PatchInvalidationClass::HitRegion,
+    ]
+}
+
+fn apply_source_binding_at(
+    node: &mut DocumentNode,
+    ordinal: u32,
+    binding: boon_document_model::SourceBinding,
+) -> Result<(), PatchApplyError> {
+    if ordinal == 0 {
+        if node.source_binding.is_none() {
+            return Err(PatchApplyError::StaleReference {
+                reference_kind: "source_binding_at",
+                id: node.id.clone(),
+            });
+        }
+        node.source_binding = Some(binding);
+        return Ok(());
+    }
+    let index = usize::try_from(ordinal - 1).map_err(|_| PatchApplyError::StaleReference {
+        reference_kind: "source_binding_at",
+        id: node.id.clone(),
+    })?;
+    let Some(slot) = node.source_bindings.get_mut(index) else {
+        return Err(PatchApplyError::StaleReference {
+            reference_kind: "source_binding_at",
+            id: node.id.clone(),
+        });
+    };
+    *slot = binding;
+    Ok(())
 }
 
 fn document_change_set_from_reports(
@@ -6284,6 +6458,191 @@ mod tests {
     }
 
     #[test]
+    fn document_batch_accepts_ui_semantic_change_batch() {
+        let mut state = DocumentState::new("root");
+        let change_set = state
+            .apply_ui_semantic_batch(ChangeBatch {
+                epoch: 7,
+                changes: vec![
+                    UiSemanticChange::InsertNode {
+                        parent: DocumentNodeId("root".to_owned()),
+                        index: 0,
+                        node: node("label", DocumentNodeKind::Text, None),
+                    },
+                    UiSemanticChange::SetText {
+                        id: DocumentNodeId("label".to_owned()),
+                        text: TextValue {
+                            text: "Semantic".to_owned(),
+                        },
+                    },
+                    UiSemanticChange::SetVisibility {
+                        id: DocumentNodeId("label".to_owned()),
+                        visible: false,
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(change_set.patch_count, 4);
+        assert_eq!(change_set.node_count_before, 1);
+        assert_eq!(change_set.node_count_after, 2);
+        assert_eq!(
+            state.frame().nodes[&DocumentNodeId("root".to_owned())].children,
+            vec![DocumentNodeId("label".to_owned())]
+        );
+        let label = &state.frame().nodes[&DocumentNodeId("label".to_owned())];
+        assert_eq!(label.parent, Some(DocumentNodeId("root".to_owned())));
+        assert_eq!(label.text.as_ref().unwrap().text, "Semantic");
+        assert_eq!(label.style.get("visible"), Some(&StyleValue::Bool(false)));
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::Structure)
+        );
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::Text)
+        );
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::Style)
+        );
+    }
+
+    #[test]
+    fn document_batch_set_binding_at_updates_secondary_binding_only() {
+        let mut state = DocumentState::new("root");
+        let mut button = node("button", DocumentNodeKind::Button, Some("root"));
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("source:button:press".to_owned()),
+            source_path: "old.press".to_owned(),
+            intent: "press".to_owned(),
+        });
+        button
+            .source_bindings
+            .push(boon_document_model::SourceBinding {
+                id: SourceBindingId("source:button:change".to_owned()),
+                source_path: "old.change".to_owned(),
+                intent: "change".to_owned(),
+            });
+        state
+            .apply_patch(DocumentPatch::UpsertNode(button))
+            .unwrap();
+
+        let change_set = state
+            .apply_ui_semantic_batch(ChangeBatch {
+                epoch: 12,
+                changes: vec![UiSemanticChange::SetBindingAt {
+                    id: DocumentNodeId("button".to_owned()),
+                    ordinal: 1,
+                    binding: boon_document_model::SourceBinding {
+                        id: SourceBindingId("source:button:change".to_owned()),
+                        source_path: "new.change".to_owned(),
+                        intent: "change".to_owned(),
+                    },
+                }],
+            })
+            .unwrap();
+
+        let button = &state.frame().nodes[&DocumentNodeId("button".to_owned())];
+        assert_eq!(change_set.patch_count, 1);
+        assert_eq!(
+            change_set
+                .reports
+                .iter()
+                .map(|report| report.patch_kind)
+                .collect::<Vec<_>>(),
+            vec!["set_binding_at"]
+        );
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::SourceBinding)
+        );
+        assert_eq!(
+            button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("old.press"),
+            "secondary binding updates must not rewrite the compatibility primary binding"
+        );
+        assert_eq!(
+            button
+                .source_bindings
+                .first()
+                .map(|binding| binding.source_path.as_str()),
+            Some("new.change")
+        );
+    }
+
+    #[test]
+    fn document_batch_ui_semantic_typed_style_preserves_typed_patch_kinds() {
+        let mut state = DocumentState::new("root");
+        state
+            .apply_patch(DocumentPatch::UpsertNode(node(
+                "label",
+                DocumentNodeKind::Text,
+                Some("root"),
+            )))
+            .unwrap();
+
+        let change_set = state
+            .apply_ui_semantic_batch(ChangeBatch {
+                epoch: 8,
+                changes: vec![
+                    UiSemanticChange::SetLayoutStyle {
+                        id: DocumentNodeId("label".to_owned()),
+                        patch: LayoutStylePatch {
+                            patch: BTreeMap::from([(
+                                "width".to_owned(),
+                                Some(StyleValue::Number(120.0)),
+                            )]),
+                        },
+                    },
+                    UiSemanticChange::SetPaintStyle {
+                        id: DocumentNodeId("label".to_owned()),
+                        patch: PaintStylePatch {
+                            patch: BTreeMap::from([(
+                                "background".to_owned(),
+                                Some(StyleValue::Text("#fff".to_owned())),
+                            )]),
+                        },
+                    },
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(change_set.patch_count, 2);
+        assert_eq!(
+            change_set
+                .reports
+                .iter()
+                .map(|report| report.patch_kind)
+                .collect::<Vec<_>>(),
+            vec!["set_layout_style", "set_paint_style"]
+        );
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::Layout)
+        );
+        assert!(
+            change_set
+                .invalidation
+                .contains(&PatchInvalidationClass::PaintOnly)
+        );
+        let label = &state.frame().nodes[&DocumentNodeId("label".to_owned())];
+        assert_eq!(label.style.get("width"), Some(&StyleValue::Number(120.0)));
+        assert_eq!(
+            label.style.get("background"),
+            Some(&StyleValue::Text("#fff".to_owned()))
+        );
+    }
+
+    #[test]
     fn document_batch_rolls_back_when_later_patch_fails() {
         let mut state = DocumentState::new("root");
         let error = state
@@ -7426,6 +7785,133 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn typed_binding_index_preserves_multiple_bindings_per_node() {
+        let mut button = node("button", DocumentNodeKind::Button, Some("root"));
+        button
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        button
+            .style
+            .insert("height".to_owned(), StyleValue::Number(32.0));
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: SourceBindingId("source:button:press".to_owned()),
+            source_path: "controls.primary.press".to_owned(),
+            intent: "press".to_owned(),
+        });
+        button
+            .source_bindings
+            .push(boon_document_model::SourceBinding {
+                id: SourceBindingId("source:button:change".to_owned()),
+                source_path: "controls.primary.change".to_owned(),
+                intent: "change".to_owned(),
+            });
+
+        let mut state = DocumentState::new("root");
+        state
+            .apply_patch(DocumentPatch::UpsertNode(button))
+            .unwrap();
+        let hot_ids = DocumentHotIdTable::from_frame(state.frame()).unwrap();
+        let intern_index = DocumentInternIndex::from_frame(state.frame(), &hot_ids).unwrap();
+        let bindings =
+            DocumentTypedBindingIndex::from_frame(state.frame(), &hot_ids, &intern_index).unwrap();
+        let button_hot = hot_ids
+            .hot_id(&DocumentNodeId("button".to_owned()))
+            .unwrap();
+        let node_bindings = bindings.bindings_for_node(button_hot);
+
+        assert_eq!(node_bindings.len(), 2);
+        assert_eq!(
+            node_bindings
+                .iter()
+                .map(|binding| binding.reference.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            intern_index
+                .nodes
+                .get(&button_hot)
+                .unwrap()
+                .source_bindings
+                .len(),
+            2
+        );
+        assert_eq!(
+            Some(node_bindings[0].intern_id),
+            intern_index.nodes.get(&button_hot).unwrap().source_binding
+        );
+        assert_eq!(
+            bindings.refs_for_route(&DocumentTypedBindingRoute {
+                source_path: "controls.primary.press".to_owned(),
+                intent: "press".to_owned(),
+            }),
+            &[DocumentTypedBindingRef {
+                node: button_hot,
+                ordinal: 0,
+            }]
+        );
+        assert_eq!(
+            bindings.refs_for_route(&DocumentTypedBindingRoute {
+                source_path: "controls.primary.change".to_owned(),
+                intent: "change".to_owned(),
+            }),
+            &[DocumentTypedBindingRef {
+                node: button_hot,
+                ordinal: 1,
+            }]
+        );
+
+        let mut measurer = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: state.frame(),
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: 240.0,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let hit_table = HitSideTable::try_from_document_layout_with_typed_bindings(
+            state.frame(),
+            &hot_ids,
+            &bindings,
+            &layout,
+            64.0,
+        )
+        .unwrap();
+        let entry = hit_table
+            .entry_for_source_path("controls.primary.change")
+            .expect("secondary binding should be discoverable through typed hit routes");
+        assert_eq!(entry.source_path.as_deref(), Some("controls.primary.press"));
+        assert_eq!(
+            entry.source_binding_refs,
+            vec![
+                DocumentTypedBindingRef {
+                    node: button_hot,
+                    ordinal: 0,
+                },
+                DocumentTypedBindingRef {
+                    node: button_hot,
+                    ordinal: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            entry
+                .source_routes
+                .iter()
+                .map(|route| (route.source_path.as_str(), route.intent.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("controls.primary.press", "press"),
+                ("controls.primary.change", "change"),
+            ]
+        );
     }
 
     #[test]

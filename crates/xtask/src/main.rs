@@ -18239,6 +18239,29 @@ fn run_focused_cargo_test(
     Ok(pass)
 }
 
+fn run_focused_cargo_test_any_target(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: &'static str,
+    package: &'static str,
+    filter: &'static str,
+    blocker: &'static str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let status = Command::new("cargo")
+        .args(["test", "-p", package, filter, "--", "--nocapture"])
+        .status()?;
+    let pass = status.success();
+    push_audit_check(
+        checks,
+        blockers,
+        id,
+        pass,
+        format!("cargo test -p {package} {filter} status={status}"),
+        (!pass).then(|| blocker.to_owned()),
+    );
+    Ok(pass)
+}
+
 fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -18247,20 +18270,34 @@ fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error:
 
     let semantic_delta_hits = rg_count("crates/boon_runtime/src", "semantic_deltas")?;
     let render_patch_hits = rg_count("crates/boon_runtime/src", "render_patches")?;
+    let runtime_batch_hits = rg_count("crates/boon_runtime/src", "struct RuntimeChangeBatch")?;
+    let typed_semantic_batch_hits = rg_count(
+        "crates/boon_runtime/src",
+        "RuntimeChangeBatch<SemanticDelta",
+    )?;
+    let typed_render_patch_batch_hits =
+        rg_count("crates/boon_runtime/src", "RuntimeChangeBatch<RenderPatch")?;
+    let render_patch_batch_hits =
+        rg_count("crates/boon_runtime/src", "render_patch_protocol_batches")?;
     let scenario_expectation_hits =
         rg_count("crates/boon_runtime/src", "expect_render_delta_contains")?;
-    let source_ok =
-        semantic_delta_hits > 0 && render_patch_hits > 0 && scenario_expectation_hits > 0;
+    let source_ok = semantic_delta_hits > 0
+        && render_patch_hits > 0
+        && runtime_batch_hits > 0
+        && typed_semantic_batch_hits > 0
+        && typed_render_patch_batch_hits > 0
+        && render_patch_batch_hits > 0
+        && scenario_expectation_hits > 0;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "runtime-change-sets:source-streams-semantic-and-render-deltas",
         source_ok,
         format!(
-            "semantic_delta_hits={semantic_delta_hits}, render_patch_hits={render_patch_hits}, scenario_expectation_hits={scenario_expectation_hits}"
+            "semantic_delta_hits={semantic_delta_hits}, render_patch_hits={render_patch_hits}, runtime_batch_hits={runtime_batch_hits}, typed_semantic_batch_hits={typed_semantic_batch_hits}, typed_render_patch_batch_hits={typed_render_patch_batch_hits}, render_patch_batch_hits={render_patch_batch_hits}, scenario_expectation_hits={scenario_expectation_hits}"
         ),
         (!source_ok).then(|| {
-            "runtime source must expose semantic delta and render patch streams with scenario expectations"
+            "runtime source must expose semantic delta and render patch streams, typed semantic/render runtime change batches, render patch protocol batches, and scenario expectations"
                 .to_owned()
         }),
     );
@@ -18304,6 +18341,10 @@ fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error:
             "runtime_change_sets_scope": "Verifies runtime semantic delta and render patch change streams, protocol batching identity/tick checks, and scenario rejection of missing semantic/render patch evidence.",
             "semantic_delta_source_hits": semantic_delta_hits,
             "render_patch_source_hits": render_patch_hits,
+            "runtime_change_batch_source_hits": runtime_batch_hits,
+            "typed_semantic_runtime_change_batch_source_hits": typed_semantic_batch_hits,
+            "typed_render_patch_runtime_change_batch_source_hits": typed_render_patch_batch_hits,
+            "render_patch_protocol_batch_source_hits": render_patch_batch_hits,
             "scenario_expectation_source_hits": scenario_expectation_hits
         }),
     )
@@ -18317,21 +18358,81 @@ fn verify_document_batch_patches(args: &[String]) -> Result<(), Box<dyn std::err
 
     let batch_type_hits = rg_count("crates/boon_document/src", "struct DocumentChangeBatch")?;
     let change_set_type_hits = rg_count("crates/boon_document/src", "struct DocumentChangeSet")?;
+    let generic_batch_type_hits = rg_count("crates/boon_document_model/src", "struct ChangeBatch")?;
+    let semantic_change_type_hits =
+        rg_count("crates/boon_document_model/src", "enum UiSemanticChange")?;
+    let typed_style_semantic_hits = rg_count("crates/boon_document_model/src", "SetLayoutStyle")?;
+    let direct_ui_semantic_apply_hits = rg_count(
+        "crates/boon_document/src",
+        "apply_ui_semantic_changes_unchecked",
+    )?;
     let rollback_test_hits = rg_count(
         "crates/boon_document/src",
         "document_batch_rolls_back_when_later_patch_fails",
     )?;
-    let source_ok = batch_type_hits > 0 && change_set_type_hits > 0 && rollback_test_hits > 0;
+    let semantic_batch_test_hits = rg_count(
+        "crates/boon_document/src",
+        "document_batch_accepts_ui_semantic_change_batch",
+    )?;
+    let native_bridge_test_hits = rg_count(
+        "crates/boon_native_playground/src",
+        "data_binding_targets_lower_to_atomic_ui_semantic_change_batch",
+    )?;
+    let runtime_bridge_hits = rg_count(
+        "crates/boon_native_playground/src",
+        "runtime_render_patch_target_to_ui_semantic_lowering",
+    )?;
+    let runtime_batch_bridge_hits = rg_count(
+        "crates/boon_native_playground/src",
+        "runtime_render_patch_lowerings_to_ui_semantic_change_batch",
+    )?;
+    let multi_binding_model_hits = rg_count("crates/boon_document_model/src", "source_bindings")?;
+    let typed_hit_source_routes_hits = rg_count("crates/boon_document/src", "source_routes")?;
+    let multi_binding_test_hits = rg_count(
+        "crates/boon_document/src",
+        "typed_binding_index_preserves_multiple_bindings_per_node",
+    )?;
+    let binding_at_model_hits = rg_count("crates/boon_document_model/src", "SetBindingAt")?;
+    let binding_at_document_test_hits = rg_count(
+        "crates/boon_document/src",
+        "document_batch_set_binding_at_updates_secondary_binding_only",
+    )?;
+    let binding_at_native_test_hits = rg_count(
+        "crates/boon_native_playground/src",
+        "source_intent_data_binding_lowers_to_secondary_binding_ordinal",
+    )?;
+    let retained_partial_snapshot_test_hits = rg_count(
+        "crates/boon_native_playground/src",
+        "retained_patch_rejects_cached_snapshot_smaller_than_active_proof",
+    )?;
+    let source_ok = batch_type_hits > 0
+        && change_set_type_hits > 0
+        && generic_batch_type_hits > 0
+        && semantic_change_type_hits > 0
+        && typed_style_semantic_hits > 0
+        && direct_ui_semantic_apply_hits > 0
+        && multi_binding_model_hits > 0
+        && typed_hit_source_routes_hits > 0
+        && multi_binding_test_hits > 0
+        && binding_at_model_hits > 0
+        && binding_at_document_test_hits > 0
+        && binding_at_native_test_hits > 0
+        && retained_partial_snapshot_test_hits > 0
+        && rollback_test_hits > 0
+        && semantic_batch_test_hits > 0
+        && native_bridge_test_hits > 0
+        && runtime_bridge_hits > 0
+        && runtime_batch_bridge_hits > 0;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "document-batch-patches:source-contains-batch-and-change-set",
         source_ok,
         format!(
-            "DocumentChangeBatch={batch_type_hits}, DocumentChangeSet={change_set_type_hits}, rollback_test={rollback_test_hits}"
+            "DocumentChangeBatch={batch_type_hits}, DocumentChangeSet={change_set_type_hits}, ChangeBatch={generic_batch_type_hits}, UiSemanticChange={semantic_change_type_hits}, typed_style_semantic={typed_style_semantic_hits}, direct_ui_semantic_apply={direct_ui_semantic_apply_hits}, multi_binding_model={multi_binding_model_hits}, typed_hit_source_routes={typed_hit_source_routes_hits}, multi_binding_test={multi_binding_test_hits}, binding_at_model={binding_at_model_hits}, binding_at_document_test={binding_at_document_test_hits}, binding_at_native_test={binding_at_native_test_hits}, retained_partial_snapshot_test={retained_partial_snapshot_test_hits}, rollback_test={rollback_test_hits}, semantic_batch_test={semantic_batch_test_hits}, native_bridge_test={native_bridge_test_hits}, runtime_bridge={runtime_bridge_hits}, runtime_batch_bridge={runtime_batch_bridge_hits}"
         ),
         (!source_ok).then(|| {
-            "document source must expose DocumentChangeBatch, DocumentChangeSet, and rollback coverage"
+            "document source must expose DocumentChangeBatch, DocumentChangeSet, generic ChangeBatch, UiSemanticChange, typed style semantic variants, direct UI semantic application, multiple typed interaction bindings, ordinal binding mutation, retained partial-snapshot rejection, rollback coverage, semantic-batch lowering coverage, native preview bridge coverage, and runtime-render-patch single-target plus batch UI-semantic lowering boundaries"
                 .to_owned()
         }),
     );
@@ -18359,7 +18460,56 @@ fn verify_document_batch_patches(args: &[String]) -> Result<(), Box<dyn std::err
         "trusted_nonstructural_owned_frame_batch",
         "trusted nonstructural owned-frame batch tests must pass and reject structural patches",
     )?;
-    let status = if source_ok && batch_tests && owned_batch_tests && trusted_batch_tests {
+    let native_bridge_tests = run_focused_cargo_test_any_target(
+        &mut checks,
+        &mut blockers,
+        "document-batch-patches:native-preview-semantic-bridge-test",
+        "boon_native_playground",
+        "data_binding_targets_lower_to_atomic_ui_semantic_change_batch",
+        "native preview data-binding bridge must lower into UiSemanticChange batches",
+    )?;
+    let multi_binding_tests = run_focused_cargo_test(
+        &mut checks,
+        &mut blockers,
+        "document-batch-patches:multi-binding-typed-routes-test",
+        "boon_document",
+        "typed_binding_index_preserves_multiple_bindings_per_node",
+        "document typed indexes must preserve multiple interaction bindings per node",
+    )?;
+    let binding_at_document_tests = run_focused_cargo_test(
+        &mut checks,
+        &mut blockers,
+        "document-batch-patches:binding-at-document-test",
+        "boon_document",
+        "document_batch_set_binding_at_updates_secondary_binding_only",
+        "document semantic batches must update secondary bindings by ordinal without rewriting the primary binding",
+    )?;
+    let binding_at_native_tests = run_focused_cargo_test_any_target(
+        &mut checks,
+        &mut blockers,
+        "document-batch-patches:binding-at-native-lowering-test",
+        "boon_native_playground",
+        "source_intent_data_binding_lowers_to_secondary_binding_ordinal",
+        "native runtime render-patch lowering must emit ordinal binding updates for secondary source intents",
+    )?;
+    let retained_partial_snapshot_tests = run_focused_cargo_test_any_target(
+        &mut checks,
+        &mut blockers,
+        "document-batch-patches:retained-partial-snapshot-rejection-test",
+        "boon_native_playground",
+        "retained_patch_rejects_cached_snapshot_smaller_than_active_proof",
+        "native retained patching must reject cached partial frames when the active proof expects a larger frame",
+    )?;
+    let status = if source_ok
+        && batch_tests
+        && owned_batch_tests
+        && trusted_batch_tests
+        && native_bridge_tests
+        && multi_binding_tests
+        && binding_at_document_tests
+        && binding_at_native_tests
+        && retained_partial_snapshot_tests
+    {
         "document-batch-patches-pass"
     } else {
         "document-batch-patch-proof-incomplete"
@@ -18375,6 +18525,21 @@ fn verify_document_batch_patches(args: &[String]) -> Result<(), Box<dyn std::err
             "document_batch_patches_scope": "Verifies atomic document batch patching, rollback, owned-frame parity, and trusted nonstructural batch behavior.",
             "document_change_batch_source_hits": batch_type_hits,
             "document_change_set_source_hits": change_set_type_hits,
+            "generic_change_batch_source_hits": generic_batch_type_hits,
+            "ui_semantic_change_source_hits": semantic_change_type_hits,
+            "typed_style_semantic_change_source_hits": typed_style_semantic_hits,
+            "direct_ui_semantic_apply_source_hits": direct_ui_semantic_apply_hits,
+            "multi_binding_model_source_hits": multi_binding_model_hits,
+            "typed_hit_source_routes_source_hits": typed_hit_source_routes_hits,
+            "multi_binding_test_source_hits": multi_binding_test_hits,
+            "binding_at_model_source_hits": binding_at_model_hits,
+            "binding_at_document_test_source_hits": binding_at_document_test_hits,
+            "binding_at_native_test_source_hits": binding_at_native_test_hits,
+            "retained_partial_snapshot_test_source_hits": retained_partial_snapshot_test_hits,
+            "semantic_batch_test_source_hits": semantic_batch_test_hits,
+            "native_preview_semantic_bridge_test_source_hits": native_bridge_test_hits,
+            "runtime_render_patch_semantic_bridge_source_hits": runtime_bridge_hits,
+            "runtime_render_patch_semantic_batch_bridge_source_hits": runtime_batch_bridge_hits,
             "rollback_test_source_hits": rollback_test_hits
         }),
     )
@@ -18719,6 +18884,8 @@ fn verify_unified_architecture_all(args: &[String]) -> Result<(), Box<dyn std::e
     let mut missing_report_count = 0usize;
     let mut schema_valid_report_count = 0usize;
     let mut command_match_report_count = 0usize;
+    let mut git_fresh_report_count = 0usize;
+    let mut worktree_fresh_report_count = 0usize;
     for requirement in unified_architecture_required_reports() {
         let path = Path::new(requirement.path);
         let exists = path.exists();
@@ -18738,6 +18905,8 @@ fn verify_unified_architecture_all(args: &[String]) -> Result<(), Box<dyn std::e
         let mut schema_ok = false;
         let mut schema_error = None;
         let mut command_ok = false;
+        let mut git_fresh = false;
+        let mut worktree_fresh = false;
         let mut sha256 = None;
         if exists {
             checked_report_count += 1;
@@ -18809,6 +18978,50 @@ fn verify_unified_architecture_all(args: &[String]) -> Result<(), Box<dyn std::e
                 format!("{} status={status}", path.display()),
                 (!status_ok).then(|| format!("unified report `{}` did not pass", path.display())),
             );
+            git_fresh = child.get("git_commit").and_then(serde_json::Value::as_str)
+                == Some(git_commit().as_str());
+            if git_fresh {
+                git_fresh_report_count += 1;
+            }
+            worktree_fresh = child
+                .get("worktree_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                == Some(worktree_fingerprint().as_str());
+            if worktree_fresh {
+                worktree_fresh_report_count += 1;
+            }
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!(
+                    "unified-architecture-all:report-git-fresh:{}",
+                    requirement.label
+                ),
+                git_fresh,
+                format!("{} git_fresh={git_fresh}", path.display()),
+                (!git_fresh).then(|| {
+                    format!(
+                        "unified report `{}` is stale for current git commit",
+                        path.display()
+                    )
+                }),
+            );
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!(
+                    "unified-architecture-all:report-worktree-fresh:{}",
+                    requirement.label
+                ),
+                worktree_fresh,
+                format!("{} worktree_fresh={worktree_fresh}", path.display()),
+                (!worktree_fresh).then(|| {
+                    format!(
+                        "unified report `{}` is stale for current worktree fingerprint",
+                        path.display()
+                    )
+                }),
+            );
             let child_artifact = artifact_hash(path)?;
             sha256 = child_artifact
                 .get("sha256")
@@ -18828,7 +19041,9 @@ fn verify_unified_architecture_all(args: &[String]) -> Result<(), Box<dyn std::e
             "observed_status": status,
             "schema_valid": schema_ok,
             "command_matches": command_ok,
-            "status_pass": status_pass
+            "status_pass": status_pass,
+            "git_fresh": git_fresh,
+            "worktree_fresh": worktree_fresh
         });
         if let Some(sha256) = sha256
             && let Some(object) = child_report.as_object_mut()
@@ -18875,6 +19090,8 @@ fn verify_unified_architecture_all(args: &[String]) -> Result<(), Box<dyn std::e
             "failed_report_count": failed_report_count,
             "schema_valid_report_count": schema_valid_report_count,
             "command_match_report_count": command_match_report_count,
+            "git_fresh_report_count": git_fresh_report_count,
+            "worktree_fresh_report_count": worktree_fresh_report_count,
             "aggregate_checks_pass": aggregate_checks_pass,
             "child_reports": required_reports.clone(),
             "required_reports": required_reports,
@@ -48588,6 +48805,8 @@ fn cells_visual_formula_probe_from_readback(
         .and_then(serde_json::Value::as_str)
         == Some("pass");
     let retained_text_changed = retained_sync_pass && changed && text_update_count > 0;
+    let formula_bar_text_input_changed =
+        retained_bound_sync_changed_text_path(&retained_sync, "store.selected_input.editing_text");
     let retained_render_proof_pass = readback_probe
         .pointer("/last_external_render_proof/status")
         .and_then(serde_json::Value::as_str)
@@ -48597,6 +48816,7 @@ fn cells_visual_formula_probe_from_readback(
         .and_then(serde_json::Value::as_bool)
         == Some(true);
     let retained_visual_changed = retained_text_changed
+        && formula_bar_text_input_changed
         && (retained_render_proof_pass || accepted_by_retained_bound_text_sync);
     let full_frame_visual_changed =
         readback_pass && readback_hash_changed && retained_sync_unavailable;
@@ -48615,11 +48835,26 @@ fn cells_visual_formula_probe_from_readback(
         "retained_bound_sync": retained_sync,
         "retained_sync_unavailable": retained_sync_unavailable,
         "retained_text_changed": retained_text_changed,
+        "formula_bar_text_input_changed": formula_bar_text_input_changed,
         "retained_visual_changed": retained_visual_changed,
         "full_frame_visual_changed": full_frame_visual_changed,
         "retained_text_update_count": text_update_count,
         "visual_formula_changed": visual_formula_changed
     })
+}
+
+fn retained_bound_sync_changed_text_path(retained_sync: &serde_json::Value, path: &str) -> bool {
+    retained_sync
+        .get("text_update_binding_paths")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|updates| {
+            updates.iter().any(|update| {
+                update
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(path)))
+            })
+        })
 }
 
 fn cells_visible_click_retained_update_contract_summary(

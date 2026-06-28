@@ -5773,6 +5773,31 @@ fn preview_advance_headed_scenario(
                 );
             }
         }
+        PreviewHeadedScenarioStep::AssertFormulaBarText { expected } => {
+            let (node, actual) = preview_headed_formula_bar_text(shared_render_state)?;
+            if actual == expected {
+                run.overlay.pressed_keys.clear();
+                run.overlay.mouse_down = false;
+                run.overlay.status_text = "Running".to_owned();
+                run.overlay.step_text = format!("Assert formula bar == {expected}");
+                run.advance_step(
+                    now,
+                    json!({
+                        "kind": "assert_formula_bar_text",
+                        "status": "pass",
+                        "node": node,
+                        "expected": expected,
+                        "actual": actual,
+                        "failure_category": "retained_visual_text"
+                    }),
+                );
+            } else {
+                run.fail(
+                    "retained_visual_text",
+                    format!("formula bar node `{node}` expected `{expected}` but retained text was `{actual}`"),
+                );
+            }
+        }
     }
     write_preview_headed_scenario_report(run);
     preview_mark_headed_scenario_dirty(shared_render_state)?;
@@ -5804,6 +5829,29 @@ fn preview_headed_source_target(
         .layout_proof
         .clone();
     source_hit_center_for_target(&layout_proof, source, target_text)
+}
+
+fn preview_headed_formula_bar_text(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (layout_proof, frame) = {
+        let shared = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?;
+        let frame = match shared.layout_frame_override.as_ref() {
+            Some(frame) => frame.as_ref().clone(),
+            None => layout_frame_from_layout_proof(&shared.layout_proof)?,
+        };
+        (shared.layout_proof.clone(), frame)
+    };
+    let (_, _, node) = formula_bar_input_center(&layout_proof)?;
+    let text = frame
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == node)
+        .and_then(|item| item.text.clone())
+        .unwrap_or_default();
+    Ok((node, text))
 }
 
 fn json_scalar_display_text(value: &serde_json::Value) -> String {
@@ -8351,6 +8399,76 @@ struct DocumentDataBindingTarget {
 
 type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>;
 
+const DOCUMENT_SOURCE_INTENT_BINDING_ATTR_PREFIX: &str = "__source_intent:";
+const DOCUMENT_SOURCE_INTENT_BINDING_SELECTOR_ATTR_PREFIX: &str = "__source_intent_selector:";
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct DocumentSourceIntentBindingSelector {
+    intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ordinal: Option<u32>,
+}
+
+impl DocumentSourceIntentBindingSelector {
+    fn legacy(intent: impl Into<String>) -> Self {
+        Self {
+            intent: intent.into(),
+            binding_id: None,
+            ordinal: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_binding_id(intent: impl Into<String>, binding_id: impl Into<String>) -> Self {
+        Self {
+            intent: intent.into(),
+            binding_id: Some(binding_id.into()),
+            ordinal: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_ordinal(intent: impl Into<String>, ordinal: u32) -> Self {
+        Self {
+            intent: intent.into(),
+            binding_id: None,
+            ordinal: Some(ordinal),
+        }
+    }
+
+    fn matches_binding(&self, ordinal: u32, binding: &boon_document_model::SourceBinding) -> bool {
+        binding.intent == self.intent
+            && self
+                .binding_id
+                .as_deref()
+                .is_none_or(|id| binding.id.0 == id)
+            && self.ordinal.is_none_or(|expected| expected == ordinal)
+    }
+
+    fn preserves_hit_route(&self) -> bool {
+        preview_source_intent_payload_attr_preserves_hit_route(&self.intent)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DocumentSourceIntentUpdate {
+    node: String,
+    selector: DocumentSourceIntentBindingSelector,
+    source_path: String,
+}
+
+impl DocumentSourceIntentUpdate {
+    fn legacy_index_tuple(&self) -> (String, String, String) {
+        (
+            self.node.clone(),
+            self.selector.intent.clone(),
+            self.source_path.clone(),
+        )
+    }
+}
+
 type DocumentDataBindingRowFieldIndex =
     BTreeMap<(u64, u64), Vec<(String, Vec<DocumentDataBindingTarget>)>>;
 type DocumentDataBindingStaticEqualityIndex =
@@ -8365,8 +8483,9 @@ struct DocumentDataBindingSnapshotIndex {
     collection_targets: Vec<(String, Vec<DocumentDataBindingTarget>)>,
     state_binding_targets_by_node: BTreeMap<String, Vec<(String, DocumentDataBindingTarget)>>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
-    source_intent_binding_targets: Vec<(String, String, String)>,
-    source_intent_binding_targets_by_node: BTreeMap<String, Vec<(String, String)>>,
+    source_intent_binding_targets: Vec<(String, String, DocumentSourceIntentBindingSelector)>,
+    source_intent_binding_targets_by_node:
+        BTreeMap<String, Vec<(String, DocumentSourceIntentBindingSelector)>>,
 }
 
 impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
@@ -8380,7 +8499,7 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
         let mut text_binding_paths_by_node = BTreeMap::new();
         let mut source_intent_binding_targets = Vec::new();
         let mut source_intent_binding_targets_by_node =
-            BTreeMap::<String, Vec<(String, String)>>::new();
+            BTreeMap::<String, Vec<(String, DocumentSourceIntentBindingSelector)>>::new();
         for (path, path_targets) in &targets {
             for target in path_targets {
                 if let Some((_, static_value)) = parse_document_eq_static_binding_attr(&target.attr)
@@ -8428,16 +8547,16 @@ impl From<DocumentDataBindingIndex> for DocumentDataBindingSnapshotIndex {
                         });
                     }
                 }
-                if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
+                if let Some(selector) = document_source_intent_selector_from_attr(&target.attr) {
                     source_intent_binding_targets.push((
                         path.clone(),
                         target.node.0.clone(),
-                        intent.to_owned(),
+                        selector.clone(),
                     ));
                     source_intent_binding_targets_by_node
                         .entry(target.node.0.clone())
                         .or_default()
-                        .push((path.clone(), intent.to_owned()));
+                        .push((path.clone(), selector));
                 }
             }
         }
@@ -8498,6 +8617,22 @@ impl<'a> IntoIterator for &'a DocumentDataBindingSnapshotIndex {
 struct DocumentDirectLayoutPatchTarget {
     target: DocumentDataBindingTarget,
     value: Value,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeUiSemanticPatchLowering {
+    direct_target: DocumentDirectLayoutPatchTarget,
+    semantic_change: Option<boon_document_model::UiSemanticChange>,
+    source_intent_update: Option<DocumentSourceIntentUpdate>,
+    source_intent_route_changed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeUiSemanticChangeBatchLowering {
+    direct_targets: Vec<DocumentDirectLayoutPatchTarget>,
+    semantic_batch: boon_document_model::ChangeBatch<boon_document_model::UiSemanticChange>,
+    source_intent_updates: Vec<DocumentSourceIntentUpdate>,
+    source_intent_route_changed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -10832,22 +10967,34 @@ fn native_gpu_app_owned_render_hook(
     let render_scene_cache_hit: bool;
     if direct_input_overlay_render_scene_patch_enabled {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
-        let base_render_frame_hash = boon_runtime::sha256_bytes(
-            format!(
-                "native-input-overlay-base-frame:{render_frame_layout_cache_key}:{}:{}",
-                context.width, context.height
-            )
-            .as_bytes(),
-        );
-        let base_cache_key = (
-            base_render_frame_hash,
+        let cached_base_key = preview_cached_render_scene_key_for_layout_hash(
+            render_scene_cache,
+            visible_state
+                .layout_frame_hash
+                .as_deref()
+                .unwrap_or(&layout_cache_key),
             context.width,
             context.height,
-            current_render_scene_lowering_mode.to_owned(),
-            "none".to_owned(),
+            current_render_scene_lowering_mode,
         );
-        render_scene_cache_hit = render_scene_cache.contains_key(&base_cache_key);
-        if !render_scene_cache_hit {
+        render_scene_cache_hit = cached_base_key.is_some();
+        let base_cache_key = if let Some(base_cache_key) = cached_base_key {
+            base_cache_key
+        } else {
+            let base_render_frame_hash = boon_runtime::sha256_bytes(
+                format!(
+                    "native-input-overlay-base-frame:{render_frame_layout_cache_key}:{}:{}",
+                    context.width, context.height
+                )
+                .as_bytes(),
+            );
+            let base_cache_key = (
+                base_render_frame_hash,
+                context.width,
+                context.height,
+                current_render_scene_lowering_mode.to_owned(),
+                "none".to_owned(),
+            );
             let base_render_frame = preview_frame_with_viewport_background(
                 layout_frame,
                 context.width as f32,
@@ -10874,7 +11021,8 @@ fn native_gpu_app_owned_render_hook(
                     base_render_scene,
                 ),
             );
-        }
+            base_cache_key
+        };
         let patch_build_started = Instant::now();
         direct_input_overlay_render_scene_patch = Some(
             preview_input_overlay_render_scene_patch_from_base(
@@ -10893,18 +11041,33 @@ fn native_gpu_app_owned_render_hook(
         render_scene_encode_cache_key = base_cache_key;
     } else if direct_layout_render_scene_patch_enabled {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
-        let base_cache_key = (
-            render_frame_hash_value.to_owned(),
+        let base_hash = layout_render_scene_patch_base_hash
+            .as_deref()
+            .expect("direct layout render-scene patch should carry a base hash");
+        let cached_base_key = preview_cached_render_scene_key_for_layout_hash(
+            render_scene_cache,
+            base_hash,
             context.width,
             context.height,
-            current_render_scene_lowering_mode.to_owned(),
-            "none".to_owned(),
+            current_render_scene_lowering_mode,
         );
-        render_scene_cache_hit = render_scene_cache.contains_key(&base_cache_key);
-        if !render_scene_cache_hit {
+        render_scene_cache_hit = cached_base_key.is_some();
+        let base_cache_key = if let Some(base_cache_key) = cached_base_key {
+            base_cache_key
+        } else {
+            let base_cache_key = (
+                base_hash.to_owned(),
+                context.width,
+                context.height,
+                current_render_scene_lowering_mode.to_owned(),
+                "none".to_owned(),
+            );
+            let base_frame = cached_document_render_snapshot(base_hash)
+                .map(|snapshot| Arc::clone(&snapshot.layout_frame))
+                .unwrap_or_else(|| Arc::new(render_frame.clone()));
             let (base_render_scene, _base_lowering_mode) = preview_render_scene_for_frame_hash(
-                layout_render_scene_patch_base_hash.as_deref(),
-                render_frame,
+                Some(base_hash),
+                base_frame.as_ref(),
                 context.width,
                 context.height,
                 render_text_columns,
@@ -10917,16 +11080,10 @@ fn native_gpu_app_owned_render_hook(
             }
             render_scene_cache.insert(
                 base_cache_key.clone(),
-                (
-                    layout_render_scene_patch_base_hash
-                        .as_deref()
-                        .unwrap_or(layout_cache_key)
-                        .to_owned(),
-                    base_scene_hash,
-                    base_render_scene,
-                ),
+                (base_hash.to_owned(), base_scene_hash, base_render_scene),
             );
-        }
+            base_cache_key
+        };
         direct_layout_render_scene_patch = layout_render_scene_patch.clone();
         render_scene_encode_cache_key = base_cache_key;
     } else {
@@ -10949,7 +11106,7 @@ fn native_gpu_app_owned_render_hook(
                     ),
                     (cached_layout_hash, _cached_scene_hash, cached_scene),
                 )| {
-                    (cached_layout_hash == layout_cache_key
+                    (cached_layout_hash == &layout_cache_key
                         && *cached_width == context.width
                         && *cached_height == context.height
                         && cached_lowering_mode == current_render_scene_lowering_mode
@@ -11438,6 +11595,45 @@ struct PreviewRenderFrameCacheKey {
     hover_overlay: PreviewHoverOverlayState,
     focus_overlay: PreviewFocusOverlayState,
     headed_scenario_overlay: Option<PreviewHeadedScenarioOverlayState>,
+}
+
+type PreviewRenderSceneCacheKey = (String, u32, u32, String, String);
+type PreviewRenderSceneCache =
+    BTreeMap<PreviewRenderSceneCacheKey, (String, String, boon_document::RenderScene)>;
+
+fn preview_layout_cache_key_matches_layout_hash(cache_key: &str, layout_hash: &str) -> bool {
+    cache_key == layout_hash
+        || cache_key
+            .strip_prefix(layout_hash)
+            .is_some_and(|suffix| suffix.starts_with(":retained-content-revision:"))
+}
+
+fn preview_cached_render_scene_key_for_layout_hash(
+    render_scene_cache: &PreviewRenderSceneCache,
+    layout_hash: &str,
+    width: u32,
+    height: u32,
+    lowering_mode: &str,
+) -> Option<PreviewRenderSceneCacheKey> {
+    render_scene_cache.iter().find_map(
+        |(
+            key @ (
+                _cached_render_hash,
+                cached_width,
+                cached_height,
+                cached_lowering_mode,
+                cached_patch_hash,
+            ),
+            (cached_layout_hash, _cached_scene_hash, _cached_scene),
+        )| {
+            (preview_layout_cache_key_matches_layout_hash(cached_layout_hash, layout_hash)
+                && *cached_width == width
+                && *cached_height == height
+                && cached_lowering_mode == lowering_mode
+                && cached_patch_hash == "none")
+                .then(|| key.clone())
+        },
+    )
 }
 
 fn preview_apply_hover_overlay_to_render_frame(
@@ -14466,6 +14662,8 @@ fn typed_hit_entry_to_region_json(entry: &boon_document::HitSideTableEntry) -> s
         "source_binding_id": entry.source_binding_id,
         "source_path": entry.source_path,
         "source_intent": entry.source_intent,
+        "source_binding_refs": entry.source_binding_refs,
+        "source_routes": entry.source_routes,
         "z_depth": entry.z_depth,
         "scroll_root": entry.scroll_root,
         "row_key": entry.row_key,
@@ -14474,14 +14672,33 @@ fn typed_hit_entry_to_region_json(entry: &boon_document::HitSideTableEntry) -> s
     })
 }
 
-fn typed_hit_entry_to_source_intent_json(
+fn typed_hit_entry_to_source_intent_json_for_source_path(
     entry: &boon_document::HitSideTableEntry,
+    requested_source_path: Option<&str>,
 ) -> serde_json::Value {
+    let matched_route = requested_source_path.and_then(|source_path| {
+        entry
+            .source_routes
+            .iter()
+            .find(|route| route.source_path == source_path)
+    });
+    let source_path = matched_route
+        .map(|route| Some(route.source_path.clone()))
+        .unwrap_or_else(|| entry.source_path.clone());
+    let source_intent = matched_route
+        .map(|route| Some(route.intent.clone()))
+        .unwrap_or_else(|| entry.source_intent.clone());
     json!({
         "node": entry.node,
-        "source_path": entry.source_path,
-        "intent": entry.source_intent,
+        "source_path": source_path,
+        "intent": source_intent,
         "binding_id": entry.source_binding_id,
+        "source_binding_refs": entry.source_binding_refs,
+        "source_routes": entry.source_routes,
+        "matched_source_route": matched_route.map(|route| json!({
+            "source_path": route.source_path,
+            "intent": route.intent
+        })).unwrap_or_else(|| json!(null)),
         "row_key": entry.row_key,
         "row_generation": entry.row_generation,
         "scroll_root": entry.scroll_root
@@ -20078,9 +20295,8 @@ impl DevWindowShell {
             .document()
             .nodes
             .values()
-            .filter_map(|node| {
-                node.source_binding
-                    .as_ref()
+            .flat_map(|node| {
+                node.source_bindings()
                     .map(|binding| binding.source_path.clone())
             })
             .collect::<Vec<_>>();
@@ -20102,7 +20318,7 @@ impl DevWindowShell {
             })
             .unwrap_or(false);
         let source_path = button
-            .and_then(|node| node.source_binding.as_ref())
+            .and_then(|node| node.source_bindings().next())
             .map(|binding| binding.source_path.clone());
         json!({
             "node_present": button.is_some(),
@@ -20503,13 +20719,14 @@ impl DevWindowShell {
     ) -> serde_json::Value {
         let document = self.document();
         let fallback_source_intent = document.nodes.values().find_map(|node| {
-            let binding = node.source_binding.as_ref()?;
-            (binding.source_path == source_path).then(|| {
-                json!({
-                    "node": node.id,
-                    "source_path": binding.source_path,
-                    "intent": binding.intent,
-                    "binding_id": binding.id
+            node.source_bindings().find_map(|binding| {
+                (binding.source_path == source_path).then(|| {
+                    json!({
+                        "node": node.id,
+                        "source_path": binding.source_path,
+                        "intent": binding.intent,
+                        "binding_id": binding.id
+                    })
                 })
             })
         });
@@ -20566,7 +20783,9 @@ impl DevWindowShell {
         };
         let target_entry = hit_table.entry_for_source_path(source_path);
         let source_intent = target_entry
-            .map(typed_hit_entry_to_source_intent_json)
+            .map(|entry| {
+                typed_hit_entry_to_source_intent_json_for_source_path(entry, Some(source_path))
+            })
             .or(fallback_source_intent);
         let target_hit_region = target_entry.map(typed_hit_entry_to_region_json);
         let pass = source_intent.is_some() && target_hit_region.is_some();
@@ -21312,14 +21531,15 @@ impl DevWindowShell {
         let source_intents = document
             .nodes
             .values()
-            .filter_map(|node| {
-                let binding = node.source_binding.as_ref()?;
-                Some(json!({
-                    "node": node.id,
-                    "source_path": binding.source_path,
-                    "intent": binding.intent,
-                    "binding_id": binding.id
-                }))
+            .flat_map(|node| {
+                node.source_bindings().map(|binding| {
+                    json!({
+                        "node": node.id,
+                        "source_path": binding.source_path,
+                        "intent": binding.intent,
+                        "binding_id": binding.id
+                    })
+                })
             })
             .collect::<Vec<_>>();
         let hit_table = match derived_indexes.try_hit_side_table(&document, &layout) {
@@ -21492,7 +21712,7 @@ impl DevWindowShell {
                     "text": node.text.as_ref().map(|text| text.text.clone())
                 }));
             }
-            if let Some(binding) = &node.source_binding {
+            for binding in node.source_bindings() {
                 let binding_json = json!({
                     "node": node.id,
                     "kind": kind,
@@ -25064,7 +25284,7 @@ fn lower_canonical_document_element(
         &mut node,
         source_intents,
     );
-    if node.source_binding.is_none() {
+    if node.source_bindings().next().is_none() {
         push_native_node_kind_source_intents(
             context,
             document_node_binding_kind(&node.kind),
@@ -29947,6 +30167,12 @@ fn push_canonical_source_intent_with_fields(
         "source_path": source_path
     });
     if let Some(object) = source_intent.as_object_mut() {
+        if let Some((ordinal, binding)) =
+            source_binding_for_intent_source_path(node, intent, source_path)
+        {
+            object.insert("binding_id".to_owned(), json!(binding.id.0.clone()));
+            object.insert("binding_ordinal".to_owned(), json!(ordinal));
+        }
         object.extend(event_fields.clone());
     }
     source_intents.push(source_intent);
@@ -29957,10 +30183,32 @@ fn push_canonical_source_intent_with_fields(
             "source_path": source_path
         });
         if let Some(object) = submit_intent.as_object_mut() {
+            if let Some((ordinal, binding)) =
+                source_binding_for_intent_source_path(node, intent, source_path)
+            {
+                object.insert("binding_id".to_owned(), json!(binding.id.0.clone()));
+                object.insert("binding_ordinal".to_owned(), json!(ordinal));
+            }
             object.extend(event_fields);
         }
         source_intents.push(submit_intent);
     }
+}
+
+fn source_binding_for_intent_source_path<'a>(
+    node: &'a boon_document_model::DocumentNode,
+    intent: &str,
+    source_path: &str,
+) -> Option<(u32, &'a boon_document_model::SourceBinding)> {
+    node.source_bindings()
+        .enumerate()
+        .find(|(_, binding)| binding.intent == intent && binding.source_path == source_path)
+        .or_else(|| {
+            node.source_bindings()
+                .enumerate()
+                .find(|(_, binding)| binding.intent == intent)
+        })
+        .and_then(|(ordinal, binding)| Some((u32::try_from(ordinal).ok()?, binding)))
 }
 
 fn push_implicit_target_intent_from_node_text(
@@ -30208,6 +30456,12 @@ fn lower_document_element(
             if is_source_binding_field(&field)
                 && let Some(object) = intent.as_object_mut()
             {
+                if let Some((ordinal, binding)) =
+                    source_binding_for_intent_source_path(&node, &field, &source_intent_value)
+                {
+                    object.insert("binding_id".to_owned(), json!(binding.id.0.clone()));
+                    object.insert("binding_ordinal".to_owned(), json!(ordinal));
+                }
                 object.extend(document_source_binding_event_fields_for_statement(
                     child,
                     expressions,
@@ -30841,7 +31095,51 @@ fn document_context_record_equality_expr_target_reads(
 }
 
 fn document_source_intent_binding_attr(intent: &str) -> String {
-    format!("__source_intent:{intent}")
+    format!("{DOCUMENT_SOURCE_INTENT_BINDING_ATTR_PREFIX}{intent}")
+}
+
+#[cfg(test)]
+fn document_source_intent_binding_attr_for_selector(
+    selector: &DocumentSourceIntentBindingSelector,
+) -> String {
+    if selector.binding_id.is_none() && selector.ordinal.is_none() {
+        return document_source_intent_binding_attr(&selector.intent);
+    }
+    let encoded = serde_json::to_string(selector).unwrap_or_else(|_| {
+        serde_json::to_string(&DocumentSourceIntentBindingSelector::legacy(
+            &selector.intent,
+        ))
+        .unwrap_or_else(|_| format!("{{\"intent\":\"{}\"}}", selector.intent))
+    });
+    format!("{DOCUMENT_SOURCE_INTENT_BINDING_SELECTOR_ATTR_PREFIX}{encoded}")
+}
+
+#[cfg(test)]
+fn document_source_intent_binding_attr_for_binding_id(intent: &str, binding_id: &str) -> String {
+    document_source_intent_binding_attr_for_selector(
+        &DocumentSourceIntentBindingSelector::for_binding_id(intent, binding_id),
+    )
+}
+
+#[cfg(test)]
+fn document_source_intent_binding_attr_for_ordinal(intent: &str, ordinal: u32) -> String {
+    document_source_intent_binding_attr_for_selector(
+        &DocumentSourceIntentBindingSelector::for_ordinal(intent, ordinal),
+    )
+}
+
+fn document_source_intent_selector_from_attr(
+    attr: &str,
+) -> Option<DocumentSourceIntentBindingSelector> {
+    if let Some(encoded) = attr.strip_prefix(DOCUMENT_SOURCE_INTENT_BINDING_SELECTOR_ATTR_PREFIX) {
+        return serde_json::from_str(encoded).ok();
+    }
+    attr.strip_prefix(DOCUMENT_SOURCE_INTENT_BINDING_ATTR_PREFIX)
+        .map(DocumentSourceIntentBindingSelector::legacy)
+}
+
+fn document_attr_is_source_intent_binding(attr: &str) -> bool {
+    document_source_intent_selector_from_attr(attr).is_some()
 }
 
 fn document_context_record_source_intent_reads(
@@ -34966,6 +35264,9 @@ enum PreviewHeadedScenarioStep {
         json_pointer: String,
         expected: String,
     },
+    AssertFormulaBarText {
+        expected: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -35031,6 +35332,8 @@ struct PreviewRetainedBoundSyncStats {
     source_intent_index_update_count: usize,
     style_update_count: usize,
     text_update_count: usize,
+    text_update_nodes: Vec<String>,
+    text_update_binding_paths: Vec<(String, Vec<String>)>,
     changed: bool,
 }
 
@@ -35060,6 +35363,14 @@ fn preview_retained_bound_sync_stats_json() -> Value {
             "source_intent_index_update_count": stats.source_intent_index_update_count,
             "style_update_count": stats.style_update_count,
             "text_update_count": stats.text_update_count,
+            "text_update_nodes": stats.text_update_nodes,
+            "text_update_binding_paths": stats.text_update_binding_paths
+                .into_iter()
+                .map(|(node, paths)| json!({
+                    "node": node,
+                    "paths": paths
+                }))
+                .collect::<Vec<_>>(),
             "changed": stats.changed
         }),
         None => json!({
@@ -35138,6 +35449,9 @@ fn preview_headed_cells_scenario_definition() -> PreviewHeadedScenarioDefinition
                 json_pointer: "/store/selected_input/editing_text".to_owned(),
                 expected: "=add(A0,A1)".to_owned(),
             },
+            PreviewHeadedScenarioStep::AssertFormulaBarText {
+                expected: "=add(A0,A1)".to_owned(),
+            },
             PreviewHeadedScenarioStep::MoveToSource {
                 source: "cell.sources.editor.select".to_owned(),
                 target_text: Some("C0".to_owned()),
@@ -35157,6 +35471,9 @@ fn preview_headed_cells_scenario_definition() -> PreviewHeadedScenarioDefinition
             },
             PreviewHeadedScenarioStep::AssertRuntimeText {
                 json_pointer: "/store/selected_input/editing_text".to_owned(),
+                expected: "=sum(A0:A2)".to_owned(),
+            },
+            PreviewHeadedScenarioStep::AssertFormulaBarText {
                 expected: "=sum(A0:A2)".to_owned(),
             },
             PreviewHeadedScenarioStep::Wait { duration_ms: 320 },
@@ -36006,6 +36323,26 @@ fn source_hit_center_for_target(
                     None
                 }
             })
+        })
+        .or_else(|| {
+            let route_table = PreviewHitRouteTable::from_layout_proof(layout_proof)?;
+            route_table
+                .hit_table
+                .entries
+                .iter()
+                .find(|entry| {
+                    let source_matches = entry
+                        .source_routes
+                        .iter()
+                        .any(|route| route.source_path == source_event)
+                        || (entry.source_path.as_deref() == Some(source_event));
+                    source_matches
+                        && target.is_none_or(|target| {
+                            route_table.target_text(&entry.node.0).as_deref() == Some(target)
+                                || route_table.address(&entry.node.0).as_deref() == Some(target)
+                        })
+                })
+                .map(|entry| entry.node.0.clone())
         })
         .ok_or_else(|| {
             let nearby = source_intents
@@ -38210,9 +38547,17 @@ fn preview_try_apply_simple_source_click_input(
         bound_sync_nodes.insert(focused_node.clone());
     }
     let bound_input_sync_started = Instant::now();
-    let skip_post_click_bound_sync =
-        focus_state_applied && input_state.focused_selection_proxy && !preserve_focus;
-    if !skip_post_click_bound_sync {
+    // `preview_apply_live_events_state_summary` already computed the current
+    // post-turn values. Reuse that summary to patch the clicked node and any
+    // binding-dependent controls, such as the Cells formula bar, without a
+    // second runtime read on the hot click path.
+    if let Some(post_turn_state_summary) = post_turn_state_summary.as_ref() {
+        preview_sync_bound_text_inputs_for_nodes_from_state_summary(
+            shared_render_state,
+            post_turn_state_summary,
+            &bound_sync_nodes,
+        )?;
+    } else {
         preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
             shared_render_state,
             live_runtime,
@@ -40447,7 +40792,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     );
     stats.source_intent_update_count = source_intent_updates.len();
     let mut changed = false;
-    let mut source_intent_index_updates = Vec::<(String, String, String)>::new();
+    let mut source_intent_index_updates = Vec::<DocumentSourceIntentUpdate>::new();
     if !source_intent_updates.is_empty()
         && let Some(assertions) = shared
             .layout_proof
@@ -40465,15 +40810,15 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             else {
                 continue;
             };
-            let Some(intent) = object
-                .get("intent")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
+            let Some((selector, next_source_path)) =
+                source_intent_updates
+                    .iter()
+                    .find_map(|((update_node, selector), source_path)| {
+                        (update_node == &node
+                            && source_intent_assertion_matches_selector(object, selector))
+                        .then_some((selector, source_path))
+                    })
             else {
-                continue;
-            };
-            let update_key = (node.clone(), intent.clone());
-            let Some(next_source_path) = source_intent_updates.get(&update_key) else {
                 continue;
             };
             if object
@@ -40482,7 +40827,11 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                 != Some(next_source_path.as_str())
             {
                 object.insert("source_path".to_owned(), json!(next_source_path));
-                source_intent_index_updates.push((node, intent, next_source_path.clone()));
+                source_intent_index_updates.push(DocumentSourceIntentUpdate {
+                    node,
+                    selector: selector.clone(),
+                    source_path: next_source_path.clone(),
+                });
                 changed = true;
             }
         }
@@ -40506,23 +40855,30 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         }
     }
     let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue)>::new();
-    let mut text_updates = Vec::<(usize, String)>::new();
-    let mut item_indexes = if let Some(target_nodes) = target_nodes
-        && !snapshot.display_items_by_node.is_empty()
-    {
-        target_nodes
-            .iter()
-            .filter_map(|node| snapshot.display_items_by_node.get(node))
-            .flatten()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
+    let mut text_updates = Vec::<(usize, String, String, Vec<String>)>::new();
+    let item_indexes = if let Some(target_nodes) = target_nodes {
+        if !snapshot.display_items_by_node.is_empty() {
+            target_nodes
+                .iter()
+                .filter_map(|node| snapshot.display_items_by_node.get(node))
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            frame
+                .display_list
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| target_nodes.contains(&item.node.0).then_some(index))
+                .collect::<Vec<_>>()
+        }
     } else {
         (0..frame.display_list.len()).collect::<Vec<_>>()
     };
     if item_indexes.is_empty() && target_nodes.is_some() {
-        item_indexes = (0..frame.display_list.len()).collect::<Vec<_>>();
+        stats.reason = Some("no-target-display-items".to_owned());
     }
     stats.item_index_count = item_indexes.len();
     for index in item_indexes {
@@ -40538,7 +40894,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             for (path, target) in bindings {
                 if target.attr == "text"
                     || matches!(target.attr.as_str(), "label" | "value" | "display_value")
-                    || target.attr.starts_with("__source_intent:")
+                    || document_attr_is_source_intent_binding(&target.attr)
                 {
                     continue;
                 }
@@ -40555,7 +40911,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                         patch_target.attr.as_str(),
                         "label" | "value" | "display_value"
                     )
-                    || patch_target.attr.starts_with("__source_intent:")
+                    || document_attr_is_source_intent_binding(&patch_target.attr)
                     || preview_style_attr_affects_layout(&patch_target.attr)
                 {
                     continue;
@@ -40571,27 +40927,24 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             let Some(paths) = text_binding_paths_for_node else {
                 continue;
             };
-            if !paths.iter().any(|path| !path.starts_with('@')) {
-                continue;
-            }
             let text_from_binding = document_text_binding_value_for_paths(paths, state_summary);
             let Some(next_text) = text_from_binding else {
                 continue;
             };
             if item.text.as_deref() != Some(next_text.as_str()) {
-                text_updates.push((index, next_text));
+                text_updates.push((index, next_text, node.to_owned(), paths.clone()));
             }
             continue;
         }
+        let binding_paths = text_binding_paths_for_node.cloned().unwrap_or_default();
         let text_from_binding = text_binding_paths_for_node
             .and_then(|paths| document_text_binding_value_for_paths(paths, state_summary));
-        let current_address = source_intent_updates
-            .get(&(node.to_owned(), "address".to_owned()))
-            .cloned()
-            .or_else(|| focused_address(&shared.layout_proof, node))
-            .map(|address| {
-                resolve_source_intent_payload_value_from_summary(state_summary, address)
-            });
+        let current_address =
+            source_intent_binding_update_for_intent(&source_intent_updates, node, "address")
+                .or_else(|| focused_address(&shared.layout_proof, node))
+                .map(|address| {
+                    resolve_source_intent_payload_value_from_summary(state_summary, address)
+                });
         let next_text = text_from_binding.or_else(|| {
             current_address
                 .as_deref()
@@ -40601,11 +40954,19 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             continue;
         };
         if item.text.as_deref() != Some(next_text.as_str()) {
-            text_updates.push((index, next_text));
+            text_updates.push((index, next_text, node.to_owned(), binding_paths));
         }
     }
     stats.style_update_count = style_updates.len();
     stats.text_update_count = text_updates.len();
+    stats.text_update_nodes = text_updates
+        .iter()
+        .map(|(_, _, node, _)| node.clone())
+        .collect();
+    stats.text_update_binding_paths = text_updates
+        .iter()
+        .map(|(_, _, node, paths)| (node.clone(), paths.clone()))
+        .collect();
     if style_updates.is_empty() && text_updates.is_empty() {
         stats.status = "pass";
         stats.changed = changed;
@@ -40627,7 +40988,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             changed = true;
         }
     }
-    for (index, next_text) in text_updates {
+    for (index, next_text, _, _) in text_updates {
         let Some(item) = frame.display_list.get_mut(index) else {
             continue;
         };
@@ -40996,6 +41357,7 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
         {
             binding_projection_prefixes =
                 document_binding_projection_prefixes_for_nodes(&snapshot, &target_nodes);
+            extend_target_nodes_for_binding_dependencies(&snapshot, &mut target_nodes);
             extend_target_nodes_for_binding_projections(
                 &snapshot,
                 &mut target_nodes,
@@ -41034,6 +41396,56 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn preview_sync_bound_text_inputs_for_nodes_from_state_summary(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    state_summary: &serde_json::Value,
+    target_nodes: &BTreeSet<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    let mut target_nodes = target_nodes.clone();
+    if let Some(layout_hash) = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
+    {
+        extend_target_nodes_for_available_summary_bindings(
+            &snapshot,
+            state_summary,
+            &mut target_nodes,
+        );
+    }
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    let changed = preview_sync_bound_text_inputs_in_shared_state_for_nodes(
+        &mut shared,
+        state_summary,
+        Some(&target_nodes),
+    );
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_error = None;
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
+fn extend_target_nodes_for_available_summary_bindings(
+    snapshot: &DocumentRenderSnapshot,
+    state_summary: &serde_json::Value,
+    target_nodes: &mut BTreeSet<String>,
+) {
+    for (path, node, _) in &snapshot.data_binding_targets.source_intent_binding_targets {
+        if state_summary_value_for_data_path(state_summary, path).is_some() {
+            target_nodes.insert(node.clone());
+        }
+    }
 }
 
 fn preview_bound_text_input_targeted_state_summary(
@@ -41254,6 +41666,75 @@ fn extend_target_nodes_for_binding_projections(
     }
 }
 
+fn extend_target_nodes_for_binding_dependencies(
+    snapshot: &DocumentRenderSnapshot,
+    target_nodes: &mut BTreeSet<String>,
+) {
+    let mut dependency_paths = BTreeSet::new();
+    for node in target_nodes.iter() {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                dependency_paths.insert(path.clone());
+            }
+        }
+        if let Some(paths) = snapshot
+            .data_binding_targets
+            .text_binding_paths_by_node
+            .get(node)
+        {
+            for path in paths {
+                dependency_paths.insert(path.clone());
+            }
+        }
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                dependency_paths.insert(path.clone());
+            }
+        }
+    }
+    if dependency_paths.is_empty() {
+        return;
+    }
+    for (node, bindings) in &snapshot.data_binding_targets.state_binding_targets_by_node {
+        if bindings.iter().any(|(path, _)| {
+            dependency_paths
+                .iter()
+                .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        }) {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, paths) in &snapshot.data_binding_targets.text_binding_paths_by_node {
+        if paths.iter().any(|path| {
+            dependency_paths
+                .iter()
+                .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        }) {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, bindings) in &snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+    {
+        if bindings.iter().any(|(path, _)| {
+            dependency_paths
+                .iter()
+                .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        }) {
+            target_nodes.insert(node.clone());
+        }
+    }
+}
+
 fn targeted_binding_path_allowed(
     path: &str,
     projection_prefixes: Option<&BTreeSet<String>>,
@@ -41339,23 +41820,32 @@ fn preview_bound_input_sync_full_state_summary_reason(
         &source_intent_update_nodes,
     );
     for item in &frame.display_list {
-        if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
-            continue;
-        }
         let node = item.node.0.as_str();
         if let Some(paths) = text_binding_paths.get(node) {
             if document_text_binding_value_for_paths(paths, state_summary).is_some() {
                 continue;
             }
+            if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+                && paths.iter().any(|path| path.starts_with('@'))
+            {
+                return Some(format!(
+                    "missing_projected_visible_text_binding_path:{node}:{paths:?}"
+                ));
+            }
+            if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
+                continue;
+            }
             return Some(format!("missing_text_input_binding_path:{node}:{paths:?}"));
         }
-        let current_address = source_intent_updates
-            .get(&(node.to_owned(), "address".to_owned()))
-            .cloned()
-            .or_else(|| focused_address(layout_proof, node))
-            .map(|address| {
-                resolve_source_intent_payload_value_from_summary(state_summary, address)
-            });
+        if !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput) {
+            continue;
+        }
+        let current_address =
+            source_intent_binding_update_for_intent(&source_intent_updates, node, "address")
+                .or_else(|| focused_address(layout_proof, node))
+                .map(|address| {
+                    resolve_source_intent_payload_value_from_summary(state_summary, address)
+                });
         if let Some(address) = current_address
             && focused_editing_text_for_address(state_summary, &address).is_none()
         {
@@ -41369,7 +41859,7 @@ fn source_intent_binding_updates_for_nodes(
     snapshot: &DocumentRenderSnapshot,
     state_summary: &Value,
     nodes: &BTreeSet<String>,
-) -> BTreeMap<(String, String), String> {
+) -> BTreeMap<(String, DocumentSourceIntentBindingSelector), String> {
     let mut updates = BTreeMap::new();
     for node in nodes {
         let Some(bindings) = snapshot
@@ -41379,7 +41869,7 @@ fn source_intent_binding_updates_for_nodes(
         else {
             continue;
         };
-        for (path, intent) in bindings {
+        for (path, selector) in bindings {
             let Some(value) = state_summary_value_for_data_path(state_summary, path) else {
                 continue;
             };
@@ -41387,10 +41877,52 @@ fn source_intent_binding_updates_for_nodes(
             if source_path.trim().is_empty() {
                 continue;
             }
-            updates.insert((node.clone(), intent.clone()), source_path);
+            updates.insert((node.clone(), selector.clone()), source_path);
         }
     }
     updates
+}
+
+fn source_intent_binding_update_for_intent(
+    updates: &BTreeMap<(String, DocumentSourceIntentBindingSelector), String>,
+    node: &str,
+    intent: &str,
+) -> Option<String> {
+    updates
+        .iter()
+        .filter(|((update_node, selector), _)| update_node == node && selector.intent == intent)
+        .min_by(|((_, left), _), ((_, right), _)| {
+            let left_specificity =
+                u8::from(left.binding_id.is_some()) + u8::from(left.ordinal.is_some());
+            let right_specificity =
+                u8::from(right.binding_id.is_some()) + u8::from(right.ordinal.is_some());
+            right_specificity
+                .cmp(&left_specificity)
+                .then_with(|| left.cmp(right))
+        })
+        .map(|(_, source_path)| source_path.clone())
+}
+
+fn source_intent_assertion_matches_selector(
+    object: &serde_json::Map<String, Value>,
+    selector: &DocumentSourceIntentBindingSelector,
+) -> bool {
+    object
+        .get("intent")
+        .and_then(Value::as_str)
+        .is_some_and(|intent| intent == selector.intent)
+        && selector.binding_id.as_deref().is_none_or(|expected| {
+            object
+                .get("binding_id")
+                .and_then(Value::as_str)
+                .is_some_and(|actual| actual == expected)
+        })
+        && selector.ordinal.is_none_or(|expected| {
+            object
+                .get("binding_ordinal")
+                .and_then(Value::as_u64)
+                .is_some_and(|actual| actual == u64::from(expected))
+        })
 }
 
 fn source_intent_binding_value_for_node(
@@ -41409,7 +41941,7 @@ fn source_intent_binding_value_for_node(
         .get(node)?;
     let mut bindings = bindings
         .iter()
-        .filter(|(_, binding_intent)| binding_intent == intent)
+        .filter(|(_, selector)| selector.intent == intent)
         .collect::<Vec<_>>();
     bindings.sort_by(|(left, _), (right, _)| {
         document_text_binding_path_rank(left)
@@ -41443,7 +41975,7 @@ fn source_intent_binding_paths_for_node(
         .get(node)
         .into_iter()
         .flatten()
-        .filter_map(|(path, binding_intent)| (binding_intent == intent).then_some(path.clone()))
+        .filter_map(|(path, selector)| (selector.intent == intent).then_some(path.clone()))
         .collect()
 }
 
@@ -42008,16 +42540,37 @@ fn focused_node_for_source_identity(
     identity_value: &str,
     required_extra: Option<(&str, &str)>,
 ) -> Option<String> {
-    let hit_nodes = layout_proof
+    let mut hit_nodes = layout_proof
         .get("hit_target_assertions")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|hit| hit.get("node").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    let intents = layout_proof
+    let snapshot_source_intents;
+    let intents = if let Some(intents) = layout_proof
         .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?;
+        .and_then(serde_json::Value::as_array)
+    {
+        intents
+    } else {
+        let layout_hash = layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)?;
+        let snapshot = cached_document_render_snapshot(layout_hash)?;
+        if hit_nodes.is_empty() {
+            hit_nodes.extend(
+                snapshot
+                    .layout_frame
+                    .hit_regions
+                    .iter()
+                    .map(|hit| hit.node.0.clone()),
+            );
+        }
+        snapshot_source_intents = snapshot.source_intents.clone();
+        &snapshot_source_intents
+    };
     intents.iter().find_map(|intent| {
         let node = intent.get("node").and_then(serde_json::Value::as_str)?;
         if intent.get("intent").and_then(serde_json::Value::as_str) == Some(identity_intent)
@@ -42535,6 +43088,24 @@ fn rect_intersection(left: boon_document::Rect, right: boon_document::Rect) -> b
         width: (x2 - x1).max(0.0),
         height: (y2 - y1).max(0.0),
     }
+}
+
+fn cached_snapshot_covers_layout_proof(
+    layout_proof: &Value,
+    snapshot: &DocumentRenderSnapshot,
+) -> bool {
+    let expected_display_count = layout_proof
+        .get("display_item_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let expected_hit_count = layout_proof
+        .get("hit_target_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    (expected_display_count == 0
+        || snapshot.layout_frame.display_list.len() >= expected_display_count)
+        && (expected_hit_count == 0
+            || snapshot.layout_frame.hit_regions.len() >= expected_hit_count)
 }
 
 fn preview_apply_live_event(
@@ -43495,14 +44066,37 @@ fn preview_apply_live_events_internal(
         return Ok(return_value);
     }
     preview_set_interaction_diagnostic_subphase("live_events.full_document_layout_lower");
+    let full_lower_state_summary = if matches!(
+        summary_source,
+        "patched_previous_window"
+            | "targeted_render_patch_paths"
+            | "patched_previous_window_with_targeted_currentness"
+    ) {
+        let (row_start, row_count, column_start, column_count) =
+            preview_scroll_window(scroll_x_px, scroll_y_px);
+        Some(
+            live_runtime
+                .lock()
+                .map_err(|_| "preview live runtime mutex poisoned while refreshing layout summary")?
+                .document_state_summary_for_window(
+                    row_start,
+                    row_count,
+                    column_start,
+                    column_count,
+                ),
+        )
+    } else {
+        None
+    };
+    let layout_state_summary = full_lower_state_summary.as_ref().unwrap_or(state_summary);
     let (mut post_input_layout, mut post_input_frame) =
         native_document_layout_proof_with_project_state_embedded_for_viewport(
             source_path,
             runtime_units,
-            Some(state_summary),
+            Some(layout_state_summary),
             viewport,
         )?;
-    cache_layout_runtime_state_snapshot_for_proof(&post_input_layout, state_summary);
+    cache_layout_runtime_state_snapshot_for_proof(&post_input_layout, layout_state_summary);
     let layout_rebuild_ms = elapsed_ms(layout_started);
     let layout_profile = post_input_layout
         .get("layout_profile")
@@ -43525,7 +44119,7 @@ fn preview_apply_live_events_internal(
         post_input_layout = scrolled_layout;
         post_input_frame = scrolled_frame;
     }
-    cache_layout_runtime_state_snapshot_for_proof(&post_input_layout, state_summary);
+    cache_layout_runtime_state_snapshot_for_proof(&post_input_layout, layout_state_summary);
     let scroll_adjust_ms = elapsed_ms(scroll_adjust_started);
     let shared_update_started = Instant::now();
     let mut return_value = Value::Null;
@@ -43553,7 +44147,7 @@ fn preview_apply_live_events_internal(
         if !return_layout {
             cache_layout_runtime_state_snapshot_for_hot_layout_proof(
                 &mut post_input_layout,
-                state_summary,
+                layout_state_summary,
             );
         }
         shared_render_state.layout_proof = post_input_layout;
@@ -44426,16 +45020,17 @@ fn source_intent_indexes(assertions: &[Value]) -> (Value, Value) {
 
 fn patched_source_intent_indexes(
     previous_layout_proof: &Value,
-    updates: &[(String, String, String)],
+    updates: &[DocumentSourceIntentUpdate],
 ) -> Option<(Value, Value)> {
     let mut by_node = previous_layout_proof.get("source_intent_index")?.clone();
     let mut by_value = previous_layout_proof
         .get("source_intent_value_index")?
         .clone();
-    for (node, intent, source_path) in updates {
+    for update in updates {
+        let (node, intent, source_path) = update.legacy_index_tuple();
         let old_source_path = by_node
-            .get(node)
-            .and_then(|node_index| node_index.get(intent))
+            .get(&node)
+            .and_then(|node_index| node_index.get(&intent))
             .and_then(Value::as_str)
             .map(str::to_owned);
         let node_index = by_node
@@ -44450,7 +45045,7 @@ fn patched_source_intent_indexes(
             .entry(intent.clone())
             .or_insert_with(|| json!({}));
         if let Some(old_source_path) = old_source_path
-            && old_source_path != *source_path
+            && old_source_path != source_path
             && let Some(old_nodes) = intent_index
                 .as_object_mut()?
                 .get_mut(&old_source_path)
@@ -45461,6 +46056,7 @@ struct PreviewVisibleRenderState {
     layout_artifact: String,
     layout_artifact_sha256: Value,
     layout_frame_hash: Option<String>,
+    content_revision: u64,
     scroll_transform: Value,
     layout_frame_override: Option<Arc<boon_document::LayoutFrame>>,
     render_scene_patch_layout_reuse: bool,
@@ -45584,6 +46180,7 @@ impl PreviewVisibleRenderState {
                 .cloned()
                 .unwrap_or_else(|| json!("missing")),
             layout_frame_hash,
+            content_revision: preview_content_revision(shared.update_count),
             scroll_transform: shared
                 .layout_proof
                 .get("scroll_transform")
@@ -45598,10 +46195,16 @@ impl PreviewVisibleRenderState {
         }
     }
 
-    fn layout_cache_key(&self) -> &str {
-        self.layout_frame_hash
+    fn layout_cache_key(&self) -> String {
+        let base = self
+            .layout_frame_hash
             .as_deref()
-            .unwrap_or(self.layout_artifact.as_str())
+            .unwrap_or(self.layout_artifact.as_str());
+        if self.layout_frame_override.is_some() {
+            format!("{base}:retained-content-revision:{}", self.content_revision)
+        } else {
+            base.to_owned()
+        }
     }
 }
 
@@ -46146,15 +46749,19 @@ fn source_intents_from_document_source_bindings(
     frame
         .nodes
         .values()
-        .filter_map(|node| {
-            let binding = node.source_binding.as_ref()?;
-            Some(json!({
-                "node": node.id.0,
-                "intent": binding.intent,
-                "source_path": binding.source_path,
-                "binding_id": binding.id.0,
-                "implicit": false
-            }))
+        .flat_map(|node| {
+            node.source_bindings()
+                .enumerate()
+                .map(|(ordinal, binding)| {
+                    json!({
+                    "node": node.id.0,
+                    "intent": binding.intent,
+                    "source_path": binding.source_path,
+                    "binding_id": binding.id.0,
+                    "binding_ordinal": ordinal,
+                    "implicit": false
+                    })
+                })
         })
         .collect()
 }
@@ -46788,7 +47395,8 @@ struct PreviewHitRouteStaticTable {
     display_items_by_node: BTreeMap<String, Vec<usize>>,
     hit_index_by_node: BTreeMap<String, usize>,
     text_binding_paths_by_node: BTreeMap<String, Vec<String>>,
-    source_intent_binding_paths_by_node: BTreeMap<String, Vec<(String, String)>>,
+    source_intent_binding_paths_by_node:
+        BTreeMap<String, Vec<(String, DocumentSourceIntentBindingSelector)>>,
 }
 
 impl std::ops::Deref for PreviewHitRouteTable {
@@ -46955,6 +47563,31 @@ impl PreviewHitRouteTable {
     fn source_for_node_intent(&self, node: &str, expected: &str) -> Option<String> {
         self.source_intent_for_node_intent(node, expected)
             .map(|intent| intent.source_path.clone())
+            .or_else(|| {
+                self.typed_source_route_for_node_intent(node, expected)
+                    .map(|route| route.source_path.clone())
+            })
+            .or_else(|| {
+                self.hit_for_node(node).and_then(|hit| {
+                    hit.source_intent
+                        .as_deref()
+                        .is_some_and(|intent| intent == expected)
+                        .then(|| hit.source_path.clone())
+                        .flatten()
+                })
+            })
+    }
+
+    fn typed_source_route_for_node_intent(
+        &self,
+        node: &str,
+        expected: &str,
+    ) -> Option<&boon_document::DocumentTypedBindingRoute> {
+        self.hit_for_node(node).and_then(|hit| {
+            hit.source_routes
+                .iter()
+                .find(|route| route.intent == expected)
+        })
     }
 
     fn source_intent_for_node_intent(
@@ -46994,6 +47627,15 @@ impl PreviewHitRouteTable {
         self.source_intents_by_node
             .get(node)
             .is_some_and(|by_intent| by_intent.contains_key(expected))
+            || self
+                .typed_source_route_for_node_intent(node, expected)
+                .is_some()
+            || self.hit_for_node(node).is_some_and(|hit| {
+                hit.source_intent
+                    .as_deref()
+                    .is_some_and(|intent| intent == expected)
+                    && hit.source_path.is_some()
+            })
     }
 
     fn source_node_for_hit(
@@ -47247,7 +47889,7 @@ impl PreviewHitRouteTable {
             .source_intent_binding_paths_by_node
             .get(node)?
             .iter()
-            .filter_map(|(path, binding_intent)| (binding_intent == intent).then_some(path))
+            .filter_map(|(path, selector)| (selector.intent == intent).then_some(path))
             .collect::<Vec<_>>();
         paths.sort_by(|left, right| {
             document_text_binding_path_rank(left)
@@ -49608,34 +50250,107 @@ fn document_style_value_as_json(value: &boon_document_model::StyleValue) -> Opti
     }
 }
 
-fn document_patch_for_data_binding_target(
+fn ui_semantic_style_change_for_patch(
+    id: boon_document_model::DocumentNodeId,
+    patch: boon_document_model::StylePatch,
+) -> boon_document_model::UiSemanticChange {
+    if patch
+        .keys()
+        .any(|attr| preview_style_attr_affects_layout(attr))
+    {
+        return boon_document_model::UiSemanticChange::SetLayoutStyle {
+            id,
+            patch: boon_document_model::LayoutStylePatch { patch },
+        };
+    }
+    if patch
+        .keys()
+        .any(|attr| document_style_attr_affects_text(attr))
+    {
+        return boon_document_model::UiSemanticChange::SetTextStyle {
+            id,
+            patch: boon_document_model::TextStylePatch { patch },
+        };
+    }
+    if patch
+        .keys()
+        .any(|attr| document_style_attr_affects_material(attr))
+    {
+        return boon_document_model::UiSemanticChange::SetMaterialStyle {
+            id,
+            patch: boon_document_model::MaterialStylePatch { patch },
+        };
+    }
+    if patch
+        .keys()
+        .any(|attr| document_style_attr_affects_paint(attr))
+    {
+        return boon_document_model::UiSemanticChange::SetPaintStyle {
+            id,
+            patch: boon_document_model::PaintStylePatch { patch },
+        };
+    }
+    boon_document_model::UiSemanticChange::SetStyle { id, patch }
+}
+
+fn document_style_attr_affects_text(attr: &str) -> bool {
+    matches!(
+        attr,
+        "font"
+            | "font_family"
+            | "font_weight"
+            | "font_style"
+            | "line_height"
+            | "letter_spacing"
+            | "text_align"
+    )
+}
+
+fn document_style_attr_affects_material(attr: &str) -> bool {
+    matches!(
+        attr,
+        "material" | "texture" | "image" | "shader" | "border_radius" | "clip"
+    )
+}
+
+fn document_style_attr_affects_paint(attr: &str) -> bool {
+    matches!(
+        attr,
+        "color"
+            | "background"
+            | "background_color"
+            | "border"
+            | "border_color"
+            | "opacity"
+            | "relief"
+            | "depth"
+            | "shadow"
+            | "outline"
+    ) || attr.starts_with("__selected_")
+        || attr.starts_with("__hover_")
+        || attr.starts_with("__focus_")
+}
+
+fn ui_semantic_change_for_data_binding_target(
     frame: &boon_document_model::DocumentFrame,
     target: &DocumentDataBindingTarget,
     value: &Value,
-) -> Result<Option<boon_document_model::DocumentPatch>, String> {
+) -> Result<Option<boon_document_model::UiSemanticChange>, String> {
     let node = frame
         .nodes
         .get(&target.node)
         .ok_or_else(|| format!("stale_target_node:{}", target.node.0))?;
-    if let Some(intent) = target.attr.strip_prefix("__source_intent:") {
-        let Some(binding) = node.source_binding.as_ref() else {
-            return Ok(None);
-        };
-        if binding.intent != intent {
-            return Ok(None);
-        }
-        return Ok(Some(boon_document_model::DocumentPatch::SetBinding {
-            id: target.node.clone(),
-            binding: boon_document_model::SourceBinding {
-                id: binding.id.clone(),
-                source_path: json_value_to_document_source_path(value),
-                intent: binding.intent.clone(),
-            },
-        }));
+    if let Some(selector) = document_source_intent_selector_from_attr(&target.attr) {
+        return Ok(ui_semantic_set_binding_for_selector(
+            &target.node,
+            node,
+            &selector,
+            json_value_to_document_source_path(value),
+        ));
     }
     if target.attr == "text" || matches!(target.attr.as_str(), "label" | "value" | "display_value")
     {
-        return Ok(Some(boon_document_model::DocumentPatch::SetText {
+        return Ok(Some(boon_document_model::UiSemanticChange::SetText {
             id: target.node.clone(),
             text: boon_document_model::TextValue {
                 text: json_value_to_document_text(value),
@@ -49656,10 +50371,114 @@ fn document_patch_for_data_binding_target(
         patch.insert("box_size".to_owned(), Some(style_value.clone()));
     }
     patch.insert(target.attr.clone(), Some(style_value));
-    Ok(Some(boon_document_model::DocumentPatch::SetStyle {
-        id: target.node.clone(),
+    Ok(Some(ui_semantic_style_change_for_patch(
+        target.node.clone(),
         patch,
-    }))
+    )))
+}
+
+fn runtime_render_patch_target_to_ui_semantic_lowering(
+    frame: &boon_document_model::DocumentFrame,
+    target: &DocumentDataBindingTarget,
+    value: &Value,
+) -> Result<RuntimeUiSemanticPatchLowering, String> {
+    let (patch_target, patch_value) = document_data_binding_patch_target_value(target, value)?;
+    let Some(node) = frame.nodes.get(&patch_target.node) else {
+        return Err(format!("stale_target_node:{}", patch_target.node.0));
+    };
+    let direct_target = DocumentDirectLayoutPatchTarget {
+        target: patch_target.clone(),
+        value: patch_value.clone(),
+    };
+    if let Some(selector) = document_source_intent_selector_from_attr(&patch_target.attr) {
+        let source_path = json_value_to_document_source_path(&patch_value);
+        let semantic_change = ui_semantic_set_binding_for_selector(
+            &patch_target.node,
+            node,
+            &selector,
+            source_path.clone(),
+        );
+        let source_intent_update =
+            (!source_path.trim().is_empty()).then(|| DocumentSourceIntentUpdate {
+                node: patch_target.node.0.clone(),
+                selector: selector.clone(),
+                source_path: source_path.clone(),
+            });
+        return Ok(RuntimeUiSemanticPatchLowering {
+            direct_target,
+            semantic_change,
+            source_intent_update,
+            source_intent_route_changed: !selector.preserves_hit_route(),
+        });
+    }
+    let semantic_change =
+        ui_semantic_change_for_data_binding_target(frame, &patch_target, &patch_value)?;
+    Ok(RuntimeUiSemanticPatchLowering {
+        direct_target,
+        semantic_change,
+        source_intent_update: None,
+        source_intent_route_changed: false,
+    })
+}
+
+fn ui_semantic_set_binding_for_selector(
+    node_id: &boon_document_model::DocumentNodeId,
+    node: &boon_document_model::DocumentNode,
+    selector: &DocumentSourceIntentBindingSelector,
+    source_path: String,
+) -> Option<boon_document_model::UiSemanticChange> {
+    let (ordinal, binding) = node
+        .source_bindings()
+        .enumerate()
+        .find(|(ordinal, binding)| {
+            u32::try_from(*ordinal)
+                .ok()
+                .is_some_and(|ordinal| selector.matches_binding(ordinal, binding))
+        })?;
+    let ordinal = u32::try_from(ordinal).ok()?;
+    let binding = boon_document_model::SourceBinding {
+        id: binding.id.clone(),
+        source_path,
+        intent: binding.intent.clone(),
+    };
+    if ordinal == 0 {
+        Some(boon_document_model::UiSemanticChange::SetBinding {
+            id: node_id.clone(),
+            binding,
+        })
+    } else {
+        Some(boon_document_model::UiSemanticChange::SetBindingAt {
+            id: node_id.clone(),
+            ordinal,
+            binding,
+        })
+    }
+}
+
+fn runtime_render_patch_lowerings_to_ui_semantic_change_batch(
+    epoch: u64,
+    lowerings: &[RuntimeUiSemanticPatchLowering],
+) -> RuntimeUiSemanticChangeBatchLowering {
+    RuntimeUiSemanticChangeBatchLowering {
+        direct_targets: lowerings
+            .iter()
+            .map(|lowering| lowering.direct_target.clone())
+            .collect(),
+        semantic_batch: boon_document_model::ChangeBatch {
+            epoch,
+            changes: lowerings
+                .iter()
+                .filter_map(|lowering| lowering.semantic_change.clone())
+                .collect(),
+        },
+        source_intent_updates: lowerings
+            .iter()
+            .filter_map(|lowering| lowering.source_intent_update.clone())
+            .collect(),
+        source_intent_route_changed: lowerings
+            .iter()
+            .any(|lowering| lowering.source_intent_route_changed),
+    }
 }
 
 #[cfg(test)]
@@ -49941,14 +50760,14 @@ fn preview_direct_patch_targets_are_source_bindings_only(
     !targets.is_empty()
         && targets
             .iter()
-            .all(|target| target.target.attr.starts_with("__source_intent:"))
+            .all(|target| document_attr_is_source_intent_binding(&target.target.attr))
 }
 
 fn preview_direct_layout_patch_touched_nodes(
     document_frame: &boon_document_model::DocumentFrame,
     target: &DocumentDirectLayoutPatchTarget,
 ) -> BTreeSet<boon_document_model::DocumentNodeId> {
-    if target.target.attr.starts_with("__source_intent:") {
+    if document_attr_is_source_intent_binding(&target.target.attr) {
         return BTreeSet::new();
     }
     let mut nodes = BTreeSet::new();
@@ -49987,7 +50806,7 @@ enum DirectBatchedPaintPatch {
 fn preview_direct_target_can_use_batched_paint_patch(
     target: &DocumentDirectLayoutPatchTarget,
 ) -> bool {
-    target.target.attr.starts_with("__source_intent:")
+    document_attr_is_source_intent_binding(&target.target.attr)
         || target.target.attr == "text"
         || matches!(
             target.target.attr.as_str(),
@@ -50010,7 +50829,7 @@ fn preview_apply_batched_direct_paint_targets(
     let mut applied_target_count = 0usize;
     let mut required_display_nodes = BTreeSet::new();
     for target in targets {
-        if target.target.attr.starts_with("__source_intent:") {
+        if document_attr_is_source_intent_binding(&target.target.attr) {
             applied_target_count = applied_target_count.saturating_add(1);
             continue;
         }
@@ -50163,7 +50982,7 @@ fn preview_apply_direct_layout_patch_target(
     target: &DocumentDirectLayoutPatchTarget,
     layout_node_index: Option<&DocumentLayoutNodeIndex>,
 ) -> Result<(), &'static str> {
-    if target.target.attr.starts_with("__source_intent:") {
+    if document_attr_is_source_intent_binding(&target.target.attr) {
         return Ok(());
     }
     if target.target.attr == "text"
@@ -51116,7 +51935,7 @@ fn preview_text_render_scene_patch_operation_for_target(
     target: &DocumentDirectLayoutPatchTarget,
     layout_frame_hash: &str,
 ) -> Result<Option<boon_document::RenderScenePatchOperation>, &'static str> {
-    if target.target.attr.starts_with("__source_intent:") {
+    if document_attr_is_source_intent_binding(&target.target.attr) {
         return Ok(None);
     }
     let Some(node) = document_frame.nodes.get(&target.target.node) else {
@@ -51312,7 +52131,7 @@ fn preview_partial_text_render_scene_patch_for_targets(
 fn preview_target_can_use_grouped_style_render_scene_patch(
     target: &DocumentDirectLayoutPatchTarget,
 ) -> bool {
-    !target.target.attr.starts_with("__source_intent:")
+    !document_attr_is_source_intent_binding(&target.target.attr)
         && target.target.attr != "text"
         && !matches!(
             target.target.attr.as_str(),
@@ -51329,7 +52148,7 @@ fn preview_layout_frame_with_patched_render_scene_targets(
 ) -> Result<Option<DirectLayoutFramePatchResult>, &'static str> {
     let paint_targets = targets
         .iter()
-        .filter(|target| !target.target.attr.starts_with("__source_intent:"))
+        .filter(|target| !document_attr_is_source_intent_binding(&target.target.attr))
         .cloned()
         .collect::<Vec<_>>();
     if paint_targets.is_empty() {
@@ -51511,21 +52330,20 @@ fn preview_direct_patch_targets_preserve_hit_route(
     !targets.is_empty()
         && targets.iter().all(|target| {
             let attr = target.target.attr.as_str();
-            attr.strip_prefix("__source_intent:")
-                .is_none_or(preview_source_intent_payload_attr_preserves_hit_route)
-                && !matches!(
-                    attr,
-                    "source_intent"
-                        | "source_binding"
-                        | "__source_binding"
-                        | "disabled"
-                        | "focus"
-                        | "link_url"
-                        | "__focused"
-                        | "caret_column"
-                        | "caret_visible"
-                )
-                && !preview_style_attr_affects_layout(attr)
+            document_source_intent_selector_from_attr(attr).is_none_or(|selector| {
+                preview_source_intent_payload_attr_preserves_hit_route(&selector.intent)
+            }) && !matches!(
+                attr,
+                "source_intent"
+                    | "source_binding"
+                    | "__source_binding"
+                    | "disabled"
+                    | "focus"
+                    | "link_url"
+                    | "__focused"
+                    | "caret_column"
+                    | "caret_visible"
+            ) && !preview_style_attr_affects_layout(attr)
         })
 }
 
@@ -51623,6 +52441,10 @@ fn preview_try_patch_paint_space_for_root_deltas(
         record_preview_paint_space_patch_reject("missing_document_snapshot");
         return Ok(None);
     };
+    if !cached_snapshot_covers_layout_proof(previous_layout_proof, &snapshot) {
+        record_preview_paint_space_patch_reject("stale_partial_document_snapshot");
+        return Ok(None);
+    }
     let layout_node_index = cached_document_layout_node_index(layout_hash);
     let viewport = viewport
         .or_else(|| layout_proof_viewport(previous_layout_proof))
@@ -51638,8 +52460,8 @@ fn preview_try_patch_paint_space_for_root_deltas(
     let mut targetless_layout_patch_count = 0usize;
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
-    let mut document_patches = Vec::new();
-    let mut source_intent_updates = Vec::<(String, String, String)>::new();
+    let mut ui_semantic_patch_lowerings = Vec::new();
+    let mut source_intent_updates = Vec::<DocumentSourceIntentUpdate>::new();
     let document_frame_patch_started = Instant::now();
     for patch in patches {
         let Some((path, value)) = document_data_patch_value(patch) else {
@@ -51682,19 +52504,21 @@ fn preview_try_patch_paint_space_for_root_deltas(
                     continue;
                 }
             }
-            let (patch_target, patch_value) =
-                match document_data_binding_patch_target_value(target, &value) {
-                    Ok(result) => result,
+            let lowering =
+                match runtime_render_patch_target_to_ui_semantic_lowering(&frame, target, &value) {
+                    Ok(lowering) => lowering,
                     Err(reason) => {
                         record_preview_paint_space_patch_reject(reason);
                         return Ok(None);
                     }
                 };
+            let patch_target = &lowering.direct_target.target;
+            let patch_value = &lowering.direct_target.value;
             if !preview_paint_space_patch_target_allowed(
                 snapshot.layout_frame.as_ref(),
                 &snapshot.document_frame,
-                &patch_target,
-                &patch_value,
+                patch_target,
+                patch_value,
             ) {
                 record_preview_paint_space_patch_reject(format!(
                     "target_disallowed:{}",
@@ -51702,38 +52526,19 @@ fn preview_try_patch_paint_space_for_root_deltas(
                 ));
                 return Ok(None);
             }
-            let Some(node) = frame.nodes.get(&patch_target.node) else {
-                record_preview_paint_space_patch_reject("stale_target_node");
-                return Ok(None);
-            };
-            if let Some(intent) = patch_target.attr.strip_prefix("__source_intent:") {
+            if document_attr_is_source_intent_binding(&patch_target.attr)
+                && lowering.source_intent_update.is_none()
+            {
+                continue;
+            }
+            if let Some(update) = lowering.source_intent_update.as_ref() {
                 let clone_started = Instant::now();
                 let source_intents = source_intents.get_or_insert_with(|| {
                     let cloned = snapshot.source_intents.clone();
                     layout_patch_profile.source_intents_clone_ms += elapsed_ms(clone_started);
                     cloned
                 });
-                let source_path = json_value_to_document_source_path(&patch_value);
-                if source_path.trim().is_empty() {
-                    continue;
-                }
-                source_intent_updates.push((
-                    patch_target.node.0.clone(),
-                    intent.to_owned(),
-                    source_path.clone(),
-                ));
-                if let Some(binding) = node.source_binding.as_ref()
-                    && binding.intent == intent
-                {
-                    document_patches.push(boon_document_model::DocumentPatch::SetBinding {
-                        id: patch_target.node.clone(),
-                        binding: boon_document_model::SourceBinding {
-                            id: binding.id.clone(),
-                            source_path: source_path.clone(),
-                            intent: binding.intent.clone(),
-                        },
-                    });
-                }
+                source_intent_updates.push(update.clone());
                 for source_intent in source_intents {
                     let Some(object) = source_intent.as_object_mut() else {
                         continue;
@@ -51741,40 +52546,35 @@ fn preview_try_patch_paint_space_for_root_deltas(
                     let node_matches = object
                         .get("node")
                         .and_then(Value::as_str)
-                        .is_some_and(|node| node == patch_target.node.0);
-                    let intent_matches = object
-                        .get("intent")
-                        .and_then(Value::as_str)
-                        .is_some_and(|actual| actual == intent);
-                    if node_matches && intent_matches {
-                        object.insert("source_path".to_owned(), json!(source_path.clone()));
-                    }
-                }
-            } else {
-                match document_patch_for_data_binding_target(&frame, &patch_target, &patch_value) {
-                    Ok(Some(patch)) => document_patches.push(patch),
-                    Ok(None) => {}
-                    Err(reason) => {
-                        record_preview_paint_space_patch_reject(reason);
-                        return Ok(None);
+                        .is_some_and(|actual| actual == update.node);
+                    if node_matches
+                        && source_intent_assertion_matches_selector(object, &update.selector)
+                    {
+                        object.insert("source_path".to_owned(), json!(update.source_path.clone()));
                     }
                 }
             }
-            direct_patch_targets.push(DocumentDirectLayoutPatchTarget {
-                target: patch_target,
-                value: patch_value,
-            });
+            ui_semantic_patch_lowerings.push(lowering.clone());
+            direct_patch_targets.push(lowering.direct_target);
             patched_targets = patched_targets.saturating_add(1);
         }
     }
     let mut document_change_set = None;
-    if !document_patches.is_empty() {
+    let ui_semantic_batch_lowering =
+        runtime_render_patch_lowerings_to_ui_semantic_change_batch(0, &ui_semantic_patch_lowerings);
+    debug_assert_eq!(
+        ui_semantic_batch_lowering.direct_targets.len(),
+        direct_patch_targets.len()
+    );
+    debug_assert_eq!(
+        ui_semantic_batch_lowering.source_intent_updates.len(),
+        source_intent_updates.len()
+    );
+    if !ui_semantic_batch_lowering.semantic_batch.changes.is_empty() {
         let (patched_frame, change_set) =
-            boon_document::DocumentState::apply_nonstructural_batch_to_valid_owned_frame(
+            boon_document::DocumentState::apply_ui_semantic_batch_to_valid_owned_frame(
                 frame,
-                boon_document::DocumentChangeBatch {
-                    patches: document_patches,
-                },
+                ui_semantic_batch_lowering.semantic_batch,
             )?;
         frame = patched_frame;
         document_change_set = Some(change_set);
@@ -52273,7 +53073,7 @@ fn preview_visible_state_sync_target_allowed(
     target: &DocumentDataBindingTarget,
     value: &Value,
 ) -> bool {
-    if target.attr.starts_with("__source_intent:") {
+    if document_attr_is_source_intent_binding(&target.attr) {
         return true;
     }
     if target.attr == "text" || matches!(target.attr.as_str(), "label" | "value" | "display_value")
@@ -52294,7 +53094,7 @@ fn preview_paint_space_patch_target_allowed(
     target: &DocumentDataBindingTarget,
     value: &Value,
 ) -> bool {
-    if target.attr.starts_with("__source_intent:") {
+    if document_attr_is_source_intent_binding(&target.attr) {
         return true;
     }
     if target.attr == "text" || matches!(target.attr.as_str(), "label" | "value" | "display_value")
@@ -52338,6 +53138,9 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
         return Err("document patch fast path invariant failed: missing cached document snapshot after precheck".into());
     };
+    if !cached_snapshot_covers_layout_proof(previous_layout_proof, &snapshot) {
+        return Ok(None);
+    }
     let layout_node_index = cached_document_layout_node_index(layout_hash);
     let mut layout_patch_profile = DocumentPatchLayoutProfile::default();
     let document_frame_clone_started = Instant::now();
@@ -52353,7 +53156,7 @@ fn preview_try_patch_document_layout_for_root_deltas(
     let mut patched_target_samples = Vec::new();
     let mut layout_hash_patches = Vec::new();
     let mut direct_patch_targets = Vec::new();
-    let mut document_patches = Vec::new();
+    let mut ui_semantic_patch_lowerings = Vec::new();
     let mut source_intent_route_changed = false;
     let collect_patch_samples = full_proof || !preview_compact_timing_enabled();
     let document_frame_patch_started = Instant::now();
@@ -52401,39 +53204,25 @@ fn preview_try_patch_document_layout_for_root_deltas(
                     continue;
                 }
             }
-            let (patch_target, patch_value) =
-                document_data_binding_patch_target_value(target, &value)?;
-            let Some(node) = frame.nodes.get(&patch_target.node) else {
-                return Err(format!(
-                    "document patch fast path stale target node `{}` for data path `{path}`",
-                    patch_target.node.0
-                )
-                .into());
-            };
-            direct_patch_targets.push(DocumentDirectLayoutPatchTarget {
-                target: patch_target.clone(),
-                value: patch_value.clone(),
-            });
-            if let Some(intent) = patch_target.attr.strip_prefix("__source_intent:") {
-                if !preview_source_intent_payload_attr_preserves_hit_route(intent) {
-                    source_intent_route_changed = true;
-                }
-                let source_path = json_value_to_document_source_path(&patch_value);
-                if source_path.trim().is_empty() {
-                    continue;
-                }
-                if let Some(binding) = node.source_binding.as_ref()
-                    && binding.intent == intent
-                {
-                    document_patches.push(boon_document_model::DocumentPatch::SetBinding {
-                        id: patch_target.node.clone(),
-                        binding: boon_document_model::SourceBinding {
-                            id: binding.id.clone(),
-                            source_path: source_path.clone(),
-                            intent: binding.intent.clone(),
-                        },
-                    });
-                }
+            let lowering =
+                runtime_render_patch_target_to_ui_semantic_lowering(&frame, target, &value)
+                    .map_err(|reason| {
+                        format!(
+                            "document patch fast path target lowering failed for `{path}`: {reason}"
+                        )
+                    })?;
+            let patch_target = lowering.direct_target.target.clone();
+            let patch_value = lowering.direct_target.value.clone();
+            if lowering.source_intent_route_changed {
+                source_intent_route_changed = true;
+            }
+            if document_attr_is_source_intent_binding(&patch_target.attr)
+                && lowering.source_intent_update.is_none()
+            {
+                continue;
+            }
+            direct_patch_targets.push(lowering.direct_target.clone());
+            if let Some(update) = lowering.source_intent_update.as_ref() {
                 for source_intent in &mut source_intents {
                     let Some(object) = source_intent.as_object_mut() else {
                         continue;
@@ -52441,28 +53230,15 @@ fn preview_try_patch_document_layout_for_root_deltas(
                     let node_matches = object
                         .get("node")
                         .and_then(Value::as_str)
-                        .is_some_and(|node| node == patch_target.node.0);
-                    let intent_matches = object
-                        .get("intent")
-                        .and_then(Value::as_str)
-                        .is_some_and(|actual| actual == intent);
-                    if node_matches && intent_matches {
-                        object.insert("source_path".to_owned(), json!(source_path.clone()));
-                    }
-                }
-            } else {
-                match document_patch_for_data_binding_target(&frame, &patch_target, &patch_value) {
-                    Ok(Some(patch)) => document_patches.push(patch),
-                    Ok(None) => {}
-                    Err(reason) => {
-                        return Err(format!(
-                            "document patch fast path target lowering failed for `{}`: {reason}",
-                            patch_target.node.0
-                        )
-                        .into());
+                        .is_some_and(|actual| actual == update.node);
+                    if node_matches
+                        && source_intent_assertion_matches_selector(object, &update.selector)
+                    {
+                        object.insert("source_path".to_owned(), json!(update.source_path.clone()));
                     }
                 }
             }
+            ui_semantic_patch_lowerings.push(lowering.clone());
             patched_this_path = true;
             patched_targets = patched_targets.saturating_add(1);
             if collect_patch_samples && patched_target_samples.len() < 32 {
@@ -52482,13 +53258,21 @@ fn preview_try_patch_document_layout_for_root_deltas(
         }
     }
     let mut document_change_set = None;
-    if !document_patches.is_empty() {
+    let ui_semantic_batch_lowering =
+        runtime_render_patch_lowerings_to_ui_semantic_change_batch(0, &ui_semantic_patch_lowerings);
+    debug_assert_eq!(
+        ui_semantic_batch_lowering.direct_targets.len(),
+        direct_patch_targets.len()
+    );
+    debug_assert_eq!(
+        ui_semantic_batch_lowering.source_intent_route_changed,
+        source_intent_route_changed
+    );
+    if !ui_semantic_batch_lowering.semantic_batch.changes.is_empty() {
         let (patched_frame, change_set) =
-            boon_document::DocumentState::apply_nonstructural_batch_to_valid_owned_frame(
+            boon_document::DocumentState::apply_ui_semantic_batch_to_valid_owned_frame(
                 frame,
-                boon_document::DocumentChangeBatch {
-                    patches: document_patches,
-                },
+                ui_semantic_batch_lowering.semantic_batch,
             )?;
         frame = patched_frame;
         document_change_set = Some(change_set);
@@ -52563,8 +53347,8 @@ fn preview_try_patch_document_layout_for_root_deltas(
         render_scene_patch_rejection.map(str::to_owned);
     let source_binding_only_layout_reuse = cached_patched_snapshot.is_none()
         && preview_direct_patch_targets_are_source_bindings_only(&direct_patch_targets);
-    let direct_layout_frame_patch_rejection: Option<String>;
-    let (layout, cached_patched_layout, direct_patched_layout, touched_node_ids) =
+    let mut direct_layout_frame_patch_rejection: Option<String>;
+    let (mut layout, mut cached_patched_layout, mut direct_patched_layout, mut touched_node_ids) =
         if render_scene_patch_layout_reuse {
             direct_layout_frame_patch_rejection = None;
             let render_scene_layout_patch = preview_layout_frame_with_patched_render_scene_targets(
@@ -52653,6 +53437,23 @@ fn preview_try_patch_document_layout_for_root_deltas(
                 }
             }
         };
+    if layout.display_list.len() < snapshot.layout_frame.display_list.len()
+        || layout.hit_regions.len() < snapshot.layout_frame.hit_regions.len()
+    {
+        if direct_layout_frame_patch_rejection.is_none() {
+            direct_layout_frame_patch_rejection = Some("partial_layout_frame_patch".to_owned());
+        }
+        let fallback_started = Instant::now();
+        layout = Arc::new(layout_frame_for_document_frame_with_indexes(
+            &frame,
+            &derived_indexes,
+            viewport,
+        )?);
+        layout_patch_profile.fallback_full_layout_ms += elapsed_ms(fallback_started);
+        cached_patched_layout = false;
+        direct_patched_layout = false;
+        touched_node_ids = None;
+    }
     layout_patch_profile.direct_layout_frame_patch = direct_patched_layout;
     layout_patch_profile.render_scene_patch_applied = render_scene_patch.is_some();
     layout_patch_profile.render_scene_patch_operation_count = render_scene_patch
@@ -53696,6 +54497,9 @@ fn handle_preview_ipc_client(
             });
         let should_wake =
             response.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        if should_wake {
+            wake_handle.wake();
+        }
         write_preview_ipc_response(
             &mut stream,
             &state,
@@ -53703,9 +54507,6 @@ fn handle_preview_ipc_client(
             request_started,
             &response,
         )?;
-        if should_wake {
-            wake_handle.wake();
-        }
         return Ok(());
     }
     let message_count = request
@@ -58215,6 +59016,16 @@ mod tests {
             }),
             "Cells headed scenario should assert that the selected editor text is current"
         );
+        assert!(
+            definition.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    PreviewHeadedScenarioStep::AssertFormulaBarText { expected }
+                        if expected == "=add(A0,A1)"
+                )
+            }),
+            "Cells headed scenario should assert that the retained formula-bar text is visible"
+        );
     }
 
     #[test]
@@ -60077,7 +60888,7 @@ mod tests {
     }
 
     #[test]
-    fn data_binding_targets_lower_to_atomic_document_change_batch() {
+    fn data_binding_targets_lower_to_atomic_ui_semantic_change_batch() {
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let root = boon_document_model::DocumentNodeId("root".to_owned());
         let mut button = dev_node(
@@ -60116,20 +60927,65 @@ mod tests {
                 json!("new.press"),
             ),
         ];
-        let patches = targets
+        let lowerings = targets
             .iter()
-            .filter_map(|(target, value)| {
-                document_patch_for_data_binding_target(&frame, target, value)
-                    .expect("test target should lower")
+            .map(|(target, value)| {
+                runtime_render_patch_target_to_ui_semantic_lowering(&frame, target, value)
+                    .expect("test runtime render target should lower")
             })
             .collect::<Vec<_>>();
-        assert_eq!(patches.len(), 3);
+        assert_eq!(lowerings.len(), 3);
+        assert_eq!(
+            lowerings
+                .iter()
+                .map(|lowering| lowering.direct_target.target.attr.as_str())
+                .collect::<Vec<_>>(),
+            vec!["text", "size", "__source_intent:press"]
+        );
+        assert_eq!(
+            lowerings
+                .iter()
+                .find_map(|lowering| lowering.source_intent_update.as_ref())
+                .map(|update| { (update.selector.intent.as_str(), update.source_path.as_str(),) }),
+            Some(("press", "new.press"))
+        );
+        let batch_lowering =
+            runtime_render_patch_lowerings_to_ui_semantic_change_batch(9, &lowerings);
+        assert_eq!(batch_lowering.direct_targets.len(), 3);
+        assert_eq!(batch_lowering.semantic_batch.epoch, 9);
+        assert_eq!(batch_lowering.semantic_batch.changes.len(), 3);
+        assert!(
+            batch_lowering
+                .semantic_batch
+                .changes
+                .iter()
+                .any(|change| matches!(
+                    change,
+                    boon_document_model::UiSemanticChange::SetLayoutStyle { id, patch }
+                        if id.0 == "button"
+                            && patch.patch.contains_key("size")
+                            && patch.patch.contains_key("box_size")
+                )),
+            "size updates for layout-bearing controls should use the typed layout style semantic change"
+        );
+        assert_eq!(
+            batch_lowering
+                .source_intent_updates
+                .iter()
+                .map(|update| { (update.selector.intent.as_str(), update.source_path.as_str(),) })
+                .collect::<Vec<_>>(),
+            vec![("press", "new.press")]
+        );
+        assert!(
+            batch_lowering.source_intent_route_changed,
+            "press source-intent changes should mark route cache invalidation"
+        );
 
         let mut state = boon_document::DocumentState::from_frame(frame)
             .expect("test document frame should validate");
         let change_set = state
-            .apply_batch(boon_document::DocumentChangeBatch { patches })
-            .expect("typed document batch should apply");
+            .apply_ui_semantic_batch(batch_lowering.semantic_batch)
+            .expect("typed semantic document batch should apply");
         let frame = state.frame();
         let button = &frame.nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
         assert_eq!(change_set.patch_count, 3);
@@ -60153,6 +61009,171 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.source_path.as_str()),
             Some("new.press")
+        );
+    }
+
+    #[test]
+    fn source_intent_data_binding_lowers_to_secondary_binding_ordinal() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        let mut button = dev_node(
+            "button",
+            boon_document_model::DocumentNodeKind::Button,
+            Some("Run".to_owned()),
+            &[("width", "80"), ("size", "14")],
+        );
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
+            source_path: "old.press".to_owned(),
+            intent: "press".to_owned(),
+        });
+        button
+            .source_bindings
+            .push(boon_document_model::SourceBinding {
+                id: boon_document_model::SourceBindingId("source:button:change".to_owned()),
+                source_path: "old.change".to_owned(),
+                intent: "change".to_owned(),
+            });
+        append_child(&mut frame, root, button);
+
+        let lowering = runtime_render_patch_target_to_ui_semantic_lowering(
+            &frame,
+            &DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("button".to_owned()),
+                attr: "__source_intent:change".to_owned(),
+            },
+            &json!("new.change"),
+        )
+        .expect("secondary source-intent target should lower");
+
+        assert!(matches!(
+            lowering.semantic_change,
+            Some(boon_document_model::UiSemanticChange::SetBindingAt {
+                ref id,
+                ordinal: 1,
+                ref binding,
+            }) if id.0 == "button"
+                && binding.id.0 == "source:button:change"
+                && binding.source_path == "new.change"
+                && binding.intent == "change"
+        ));
+
+        let batch_lowering =
+            runtime_render_patch_lowerings_to_ui_semantic_change_batch(13, &[lowering]);
+        let mut state = boon_document::DocumentState::from_frame(frame)
+            .expect("test document frame should validate");
+        state
+            .apply_ui_semantic_batch(batch_lowering.semantic_batch)
+            .expect("secondary source binding semantic batch should apply");
+        let button =
+            &state.frame().nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
+        assert_eq!(
+            button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("old.press")
+        );
+        assert_eq!(
+            button
+                .source_bindings
+                .first()
+                .map(|binding| binding.source_path.as_str()),
+            Some("new.change")
+        );
+    }
+
+    #[test]
+    fn source_intent_selector_lowers_duplicate_intent_to_matching_binding_id() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        let mut button = dev_node(
+            "button",
+            boon_document_model::DocumentNodeKind::Button,
+            Some("Run".to_owned()),
+            &[("width", "80"), ("size", "14")],
+        );
+        button.source_binding = Some(boon_document_model::SourceBinding {
+            id: boon_document_model::SourceBindingId("source:button:press-primary".to_owned()),
+            source_path: "old.primary".to_owned(),
+            intent: "press".to_owned(),
+        });
+        button
+            .source_bindings
+            .push(boon_document_model::SourceBinding {
+                id: boon_document_model::SourceBindingId(
+                    "source:button:press-secondary".to_owned(),
+                ),
+                source_path: "old.secondary".to_owned(),
+                intent: "press".to_owned(),
+            });
+        append_child(&mut frame, root, button);
+
+        let attr = document_source_intent_binding_attr_for_binding_id(
+            "press",
+            "source:button:press-secondary",
+        );
+        let lowering = runtime_render_patch_target_to_ui_semantic_lowering(
+            &frame,
+            &DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("button".to_owned()),
+                attr,
+            },
+            &json!("new.secondary"),
+        )
+        .expect("duplicate-intent source target should lower by binding id");
+
+        assert!(matches!(
+            lowering.semantic_change,
+            Some(boon_document_model::UiSemanticChange::SetBindingAt {
+                ref id,
+                ordinal: 1,
+                ref binding,
+            }) if id.0 == "button"
+                && binding.id.0 == "source:button:press-secondary"
+                && binding.source_path == "new.secondary"
+                && binding.intent == "press"
+        ));
+        let update = lowering
+            .source_intent_update
+            .as_ref()
+            .expect("selector lowering should carry a source-intent update");
+        assert_eq!(update.node, "button");
+        assert_eq!(update.selector.intent, "press");
+        assert_eq!(
+            update.selector.binding_id.as_deref(),
+            Some("source:button:press-secondary")
+        );
+        assert_eq!(update.source_path, "new.secondary");
+        let ordinal_attr = document_source_intent_binding_attr_for_ordinal("press", 1);
+        let ordinal_selector = document_source_intent_selector_from_attr(&ordinal_attr)
+            .expect("ordinal selector attr should parse");
+        assert_eq!(ordinal_selector.intent, "press");
+        assert_eq!(ordinal_selector.ordinal, Some(1));
+
+        let mut state = boon_document::DocumentState::from_frame(frame)
+            .expect("test document frame should validate");
+        state
+            .apply_ui_semantic_batch(
+                runtime_render_patch_lowerings_to_ui_semantic_change_batch(17, &[lowering])
+                    .semantic_batch,
+            )
+            .expect("selector semantic batch should apply");
+        let button =
+            &state.frame().nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
+        assert_eq!(
+            button
+                .source_binding
+                .as_ref()
+                .map(|binding| binding.source_path.as_str()),
+            Some("old.primary")
+        );
+        assert_eq!(
+            button
+                .source_bindings
+                .first()
+                .map(|binding| binding.source_path.as_str()),
+            Some("new.secondary")
         );
     }
 
@@ -60281,6 +61302,107 @@ mod tests {
         assert_eq!(
             result.proof["source_intent_assertions"][0]["source_path"],
             json!("patched")
+        );
+    }
+
+    #[test]
+    fn retained_patch_rejects_cached_snapshot_smaller_than_active_proof() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut frame,
+            root.clone(),
+            dev_node(
+                "title",
+                boon_document_model::DocumentNodeKind::Text,
+                Some("Old".to_owned()),
+                &[("width", "160"), ("height", "24"), ("size", "14")],
+            ),
+        );
+        append_child(
+            &mut frame,
+            root,
+            dev_node(
+                "subtitle",
+                boon_document_model::DocumentNodeKind::Text,
+                Some("Stable".to_owned()),
+                &[("width", "160"), ("height", "24"), ("size", "14")],
+            ),
+        );
+
+        let derived_indexes = document_derived_indexes_for_frame(&frame).unwrap();
+        let full_layout =
+            layout_frame_for_document_frame_with_indexes(&frame, &derived_indexes, (320.0, 160.0))
+                .unwrap();
+        assert!(
+            full_layout.display_list.len() > 1,
+            "test fixture should have a full retained frame with multiple items"
+        );
+        let mut partial_layout = full_layout.clone();
+        partial_layout.display_list.truncate(1);
+        partial_layout.hit_regions.clear();
+        let retained_layout_cache =
+            retained_layout_cache_for_document_layout(&frame, &derived_indexes, &partial_layout)
+                .unwrap();
+        let mut data_binding_targets = BTreeMap::new();
+        data_binding_targets.insert(
+            "store.title".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("title".to_owned()),
+                attr: "text".to_owned(),
+            }],
+        );
+        let layout_hash = "test-retained-patch-partial-snapshot-rejected";
+        cache_document_render_snapshot(
+            layout_hash.to_owned(),
+            DocumentRenderSnapshot {
+                document_frame: frame,
+                runtime_document_state_values: BTreeMap::new(),
+                derived_indexes,
+                layout_frame: Arc::new(partial_layout),
+                display_items_by_node: BTreeMap::new(),
+                retained_layout_cache,
+                data_binding_targets: Arc::new(data_binding_targets.into()),
+                structural_data_reads: BTreeSet::new(),
+                structural_data_read_aliases: Vec::new(),
+                source_intents: Vec::new(),
+                hit_route_static_cache_key: None,
+            },
+        );
+        let proof = json!({
+            "layout_frame_hash": layout_hash,
+            "viewport": {"width": 320.0, "height": 160.0, "scale": 1.0},
+            "display_item_count": full_layout.display_list.len(),
+            "hit_target_count": full_layout.hit_regions.len()
+        });
+        let patch = test_root_field_patch("store.title");
+
+        assert!(
+            preview_try_patch_paint_space_for_root_deltas(
+                &proof,
+                &json!({}),
+                std::slice::from_ref(&patch),
+                Some((320.0, 160.0)),
+                0.0,
+                0.0,
+            )
+            .unwrap()
+            .is_none(),
+            "paint-space patches must reject a cached partial frame when the active proof expects a larger frame"
+        );
+        assert!(
+            preview_try_patch_document_layout_for_root_deltas(
+                &proof,
+                &json!({}),
+                &[patch],
+                Some((320.0, 160.0)),
+                0.0,
+                0.0,
+                true,
+            )
+            .unwrap()
+            .is_none(),
+            "document layout patches must reject a cached partial frame when the active proof expects a larger frame"
         );
     }
 
@@ -71556,7 +72678,7 @@ label:
         let file_bindings = frame
             .nodes
             .values()
-            .filter_map(|node| node.source_binding.as_ref())
+            .flat_map(|node| node.source_bindings())
             .filter(|binding| binding.source_path.starts_with("dev.project_files.select."))
             .collect::<Vec<_>>();
         assert_eq!(file_bindings.len(), 8);
@@ -77964,6 +79086,69 @@ document:
     }
 
     #[test]
+    fn targeted_bound_sync_expands_to_selection_dependent_formula_bar() {
+        let mut data_binding_targets = BTreeMap::new();
+        data_binding_targets.insert(
+            "store.selected_address".to_owned(),
+            vec![
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("cell-b0".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("B0")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("formula-input".to_owned()),
+                    attr: "__source_intent:address".to_owned(),
+                },
+            ],
+        );
+        data_binding_targets.insert(
+            "store.selected_input.editing_text".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("formula-input".to_owned()),
+                attr: "text".to_owned(),
+            }],
+        );
+        let document_frame = boon_document_model::DocumentFrame::empty("root");
+        let derived_indexes = document_derived_indexes_for_frame(&document_frame).unwrap();
+        let layout_frame = boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree { node_count: 0 },
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let retained_layout_cache = retained_layout_cache_for_document_layout(
+            &document_frame,
+            &derived_indexes,
+            &layout_frame,
+        )
+        .unwrap();
+        let snapshot = DocumentRenderSnapshot {
+            document_frame,
+            runtime_document_state_values: BTreeMap::new(),
+            derived_indexes,
+            layout_frame: Arc::new(layout_frame),
+            display_items_by_node: BTreeMap::new(),
+            retained_layout_cache,
+            structural_data_reads: BTreeSet::new(),
+            structural_data_read_aliases: Vec::new(),
+            source_intents: Vec::new(),
+            data_binding_targets: Arc::new(data_binding_targets.into()),
+            hit_route_static_cache_key: None,
+        };
+
+        let mut nodes = BTreeSet::from(["cell-b0".to_owned()]);
+        extend_target_nodes_for_binding_dependencies(&snapshot, &mut nodes);
+
+        assert!(
+            nodes.contains("formula-input"),
+            "targeted retained sync must include controls whose source identity follows the selected cell"
+        );
+    }
+
+    #[test]
     fn static_equality_binding_prunes_from_retained_frame_without_state_snapshot() {
         let mut frame = boon_document_model::DocumentFrame::empty("root");
         let insert_node =
@@ -80511,6 +81696,17 @@ document:
             .and_then(|item| item.text.clone())
     }
 
+    fn render_scene_text_for_node(
+        scene: &boon_document::RenderScene,
+        node: &str,
+    ) -> Option<String> {
+        scene
+            .text_runs
+            .iter()
+            .find(|run| run.node.0 == node)
+            .map(|run| run.text.clone())
+    }
+
     fn frame_visible_text_for_node(
         frame: &boon_document::LayoutFrame,
         node: &str,
@@ -81649,6 +82845,70 @@ document:
     }
 
     #[test]
+    fn typed_hit_source_intent_json_reports_requested_secondary_route() {
+        let entry = boon_document::HitSideTableEntry {
+            hit_id: "hit-secondary".to_owned(),
+            node: boon_document_model::DocumentNodeId("node-secondary".to_owned()),
+            source_binding_id: Some(boon_document_model::SourceBindingId(
+                "binding-primary".to_owned(),
+            )),
+            source_path: Some("primary.source".to_owned()),
+            source_intent: Some("click".to_owned()),
+            source_binding_refs: vec![
+                boon_document::DocumentTypedBindingRef {
+                    node: boon_document::DocumentHotNodeId(7),
+                    ordinal: 0,
+                },
+                boon_document::DocumentTypedBindingRef {
+                    node: boon_document::DocumentHotNodeId(7),
+                    ordinal: 1,
+                },
+            ],
+            source_routes: vec![
+                boon_document::DocumentTypedBindingRoute {
+                    source_path: "primary.source".to_owned(),
+                    intent: "click".to_owned(),
+                },
+                boon_document::DocumentTypedBindingRoute {
+                    source_path: "secondary.source".to_owned(),
+                    intent: "change".to_owned(),
+                },
+            ],
+            bounds: boon_document::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            z_depth: 0,
+            scroll_root: None,
+            row_key: None,
+            row_generation: None,
+            spatial_bucket: boon_document::HitSpatialBucket { x: 0, y: 0 },
+        };
+
+        let intent =
+            typed_hit_entry_to_source_intent_json_for_source_path(&entry, Some("secondary.source"));
+
+        assert_eq!(intent["source_path"], "secondary.source");
+        assert_eq!(intent["intent"], "change");
+        assert_eq!(
+            intent["matched_source_route"],
+            json!({"source_path": "secondary.source", "intent": "change"})
+        );
+        assert_eq!(
+            intent["source_routes"].as_array().map(Vec::len),
+            Some(2),
+            "route proof JSON should preserve all typed source routes"
+        );
+        assert_eq!(
+            intent["source_binding_refs"].as_array().map(Vec::len),
+            Some(2),
+            "route proof JSON should preserve binding refs so secondary-route matches are auditable"
+        );
+    }
+
+    #[test]
     fn preview_hover_and_click_use_typed_route_table_without_proof_hit_json() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
@@ -81739,6 +82999,7 @@ document:
         let (b0_x, b0_y, b0_node) =
             source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
                 .unwrap();
+        let (_, _, formula_node) = formula_bar_input_center(&initial_layout);
         let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
             layout_proof: initial_layout,
             layout_frame_override: Some(Arc::new(initial_frame)),
@@ -81788,6 +83049,12 @@ document:
                 .any(|sample| sample.fast_path == "simple_source_click"),
             "real-window-shaped click should stay on the simple source-click path: {timings:?}"
         );
+        assert!(
+            timings.iter().any(|sample| {
+                sample.fast_path == "simple_source_click" && sample.bound_input_sync_ms < 2.0
+            }),
+            "simple cell clicks should use a bounded retained bound-input sync after the retained state patch: {timings:?}"
+        );
 
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["store"]["selected_address"], "B0");
@@ -81797,6 +83064,26 @@ document:
         );
         assert_eq!(input_state.focused_node.as_deref(), Some(b0_node.as_str()));
         let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &formula_node).as_deref(),
+            Some("=add(A0,A1)"),
+            "clicking B0 should patch the retained formula-bar text input, not only runtime state or a fresh relower"
+        );
+        let shared = shared_render_state.lock().unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let (render_scene, lowering_mode) =
+            preview_render_scene_for_frame(&shared.layout_proof, &frame, 920, 720, &mut columns)
+                .unwrap();
+        assert_eq!(
+            lowering_mode, "cached-derived-retained-keys",
+            "Cells retained click rendering should keep the derived retained-key lowering path"
+        );
+        assert_eq!(
+            render_scene_text_for_node(&render_scene, &formula_node).as_deref(),
+            Some("=add(A0,A1)"),
+            "clicking B0 should feed the updated formula-bar text to the render scene, not only the retained layout frame"
+        );
+        drop(shared);
         let cell_item_for_address = |address: &str| {
             frame
                 .display_list
@@ -82494,7 +83781,7 @@ document:
         let (initial_layout, initial_frame) =
             preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
                 .unwrap();
-        let (a3_x, a3_y, _) =
+        let (a3_x, a3_y, _initial_a3_node) =
             source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("A3"))
                 .unwrap();
         let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
@@ -82519,15 +83806,58 @@ document:
             &mut input_state,
         )
         .unwrap();
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert!(
+                layout_has_visible_address(&shared.layout_proof, "A3"),
+                "A3 click should keep visible grid address metadata; hit_count={}",
+                shared
+                    .layout_proof
+                    .get("hit_target_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+            assert!(
+                shared
+                    .layout_frame_override
+                    .as_ref()
+                    .is_some_and(|frame| frame.hit_regions.len() > 20),
+                "A3 click should not collapse the retained frame to a partial focus frame"
+            );
+        }
         preview_apply_real_window_input(
             &test_keyboard_input(
-                vec![
-                    test_key_press(1, "Num2"),
-                    test_key_press(2, "Num0"),
-                    test_key_press(3, "Return"),
-                ],
+                vec![test_key_press(1, "Num2"), test_key_press(2, "Num0")],
                 Vec::new(),
             ),
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert!(
+                layout_has_visible_address(&shared.layout_proof, "A3"),
+                "typing an A3 draft should keep visible grid address metadata; hit_count={}",
+                shared
+                    .layout_proof
+                    .get("hit_target_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+            assert!(
+                shared
+                    .layout_frame_override
+                    .as_ref()
+                    .is_some_and(|frame| frame.hit_regions.len() > 20),
+                "typing an A3 draft should not collapse the retained frame to a partial focus frame"
+            );
+        }
+        preview_apply_real_window_input(
+            &test_keyboard_input(vec![test_key_press(3, "Return")], Vec::new()),
             &cells_path,
             &cells_source,
             Some(&live_runtime),
@@ -82541,15 +83871,14 @@ document:
         assert_eq!(summary["store"]["selected_input"]["formula_text"], "20");
         assert_eq!(summary["store"]["selected_input"]["value"], "20");
         let current_layout = shared_render_state.lock().unwrap().layout_proof.clone();
-        let (_, _, a3_node) =
-            source_hit_center_for_target(&current_layout, "cell.sources.editor.select", Some("A3"))
-                .unwrap();
+        let current_a3_node = focused_node_for_address(&current_layout, "A3")
+            .expect("A3 should remain visible after committing its value");
         let (_, _, formula_node) = formula_bar_input_center(&current_layout);
         let frame = latest_preview_frame(&shared_render_state);
         assert_eq!(
-            frame_visible_text_for_node(&frame, &a3_node).as_deref(),
+            frame_visible_text_for_node(&frame, &current_a3_node).as_deref(),
             Some("20"),
-            "A3 visible text should be updated in the retained preview frame"
+            "A3 visible text should be updated in the current retained preview frame; node={current_a3_node}"
         );
         assert_eq!(
             frame_text_for_node(&frame, &formula_node).as_deref(),
@@ -82669,6 +83998,104 @@ document:
     fn native_gpu_render_cache_reuses_stable_layout_override_hashes() {
         assert!(!native_gpu_render_cache_stale(Some("layout-a"), "layout-a"));
         assert!(native_gpu_render_cache_stale(Some("layout-a"), "layout-b"));
+    }
+
+    #[test]
+    fn retained_visible_cache_key_advances_with_content_revision() {
+        let empty_frame = Arc::new(boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        });
+        let mut shared = PreviewSharedRenderState {
+            layout_proof: json!({
+                "status": "pass",
+                "layout_frame_hash": "cells-retained-frame"
+            }),
+            layout_frame_override: Some(Arc::clone(&empty_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        };
+
+        let initial = PreviewVisibleRenderState::from_shared(&shared).layout_cache_key();
+        shared.update_count = 4;
+        let updated = PreviewVisibleRenderState::from_shared(&shared).layout_cache_key();
+        shared.layout_frame_override = None;
+        let artifact_key = PreviewVisibleRenderState::from_shared(&shared).layout_cache_key();
+
+        assert_eq!(initial, "cells-retained-frame:retained-content-revision:1");
+        assert_eq!(updated, "cells-retained-frame:retained-content-revision:5");
+        assert_ne!(
+            initial, updated,
+            "retained-frame text/style mutations can keep the same layout hash but must invalidate visible render caches"
+        );
+        assert_eq!(
+            artifact_key, "cells-retained-frame",
+            "artifact-backed layouts without a retained override keep the stable layout hash key"
+        );
+    }
+
+    #[test]
+    fn direct_layout_sidecar_base_scene_lookup_uses_cached_base_layout_hash() {
+        let mut cache = PreviewRenderSceneCache::new();
+        let cached_key = (
+            "render-frame-hash-for-previous-visible-state".to_owned(),
+            320,
+            200,
+            "cached-derived-retained-keys".to_owned(),
+            "none".to_owned(),
+        );
+        cache.insert(
+            cached_key.clone(),
+            (
+                "base-layout-hash-for-sidecar:retained-content-revision:7".to_owned(),
+                "base-scene-hash".to_owned(),
+                boon_document::RenderScene {
+                    viewport: boon_document::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 320.0,
+                        height: 200.0,
+                    },
+                    items: Vec::new(),
+                    visual_primitives: Vec::new(),
+                    quad_batches: Vec::new(),
+                    text_runs: Vec::new(),
+                    metrics: boon_document::RenderSceneMetrics::default(),
+                },
+            ),
+        );
+
+        assert_eq!(
+            preview_cached_render_scene_key_for_layout_hash(
+                &cache,
+                "base-layout-hash-for-sidecar",
+                320,
+                200,
+                "cached-derived-retained-keys",
+            ),
+            Some(cached_key)
+        );
+        assert_eq!(
+            preview_cached_render_scene_key_for_layout_hash(
+                &cache,
+                "current-patched-layout-hash",
+                320,
+                200,
+                "cached-derived-retained-keys",
+            ),
+            None,
+            "sidecar base lookup must not pretend the current patched layout hash is the cached base"
+        );
     }
 
     #[test]

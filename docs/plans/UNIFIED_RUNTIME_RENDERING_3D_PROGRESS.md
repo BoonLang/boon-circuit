@@ -20856,3 +20856,1157 @@ Next architecture options:
    slice on generic runtime rewrites unless the fresh counters regress. The
    native reports currently show zero full-layout fallback for selection/formula
    interactions and pass the runtime work contract.
+
+## 2026-06-28 Cells formula-bar node evidence
+
+Changes made:
+
+- Targeted retained text-input sync now expands from a touched node to other
+  visible nodes that depend on the same data/source-intent binding path. This
+  fixes the class where a selected cell could update while a separate
+  selection-dependent control, such as the Cells formula input, was not included
+  in the same retained sync target set.
+- Retained bound-sync reports now include `text_update_nodes` and
+  `text_update_binding_paths`.
+- The Cells visible-click visual formula probe now requires retained visual
+  evidence to include `store.selected_input.editing_text`, so the verifier no
+  longer accepts an arbitrary text-input update as proof that the top formula
+  input changed.
+- Added
+  `targeted_bound_sync_expands_to_selection_dependent_formula_bar` as a
+  regression for the formula-bar target expansion.
+
+Fresh local evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_native_playground -p xtask`: pass, with existing
+  dead-code warnings.
+- `cargo test -q -p boon_native_playground
+  targeted_bound_sync_expands_to_selection_dependent_formula_bar`: pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release
+  --report target/reports/native-gpu/cells-visible-click-e2e-release-formula-node.json`:
+  fail, but not because the top formula input is stale:
+  - formula transition contract: pass
+    (`change_required_sample_count=64`,
+    `changed_formula_sample_count=64`,
+    `visual_pass_required_sample_count=64`).
+  - every inspected sample reports
+    `formula_bar_text_input_changed=true`.
+  - sample evidence updates node `doc-node-274` with binding paths
+    `store.selected_input.editing_text` and `@row:1:1:editing_text`.
+  - remaining blockers are timing/readback:
+    `steady_click_to_formula_visible_ms.p95=31.580ms`,
+    `steady_click_to_formula_visible_ms.max=34.469ms`,
+    `steady_input_wake_to_formula_visible_ms.p95=18.849ms`.
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells
+  --report target/reports/native-gpu/headed-scenario-cells.json`: pass.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release
+  --report target/reports/native-gpu/cells-interaction-speed-release-formula-node.json`:
+  pass after refreshing headed evidence.
+
+Interpretation:
+
+- The live/manual symptom "cell focus changes but the main input above the grid
+  does not visibly change" is now a first-class verifier condition, not an
+  inferred state-only check.
+- Current isolated evidence says the top formula input node does change, so if
+  a manual COSMIC playground still shows it stale, the next suspicion is a
+  stale launched binary/window, a manual-launch path different from the
+  isolated verifier, or a present/readback/scheduling delay rather than the
+  Boon `store.selected_input.editing_text` binding itself.
+- TASK-0804A is still not complete: the visible-click e2e gate remains red on
+  60 FPS timing/readback budgets.
+
+## 2026-06-28 U2 Generic ChangeBatch and UiSemanticChange Boundary
+
+Status: implemented a compatibility slice toward the Phase 2 transactional
+runtime-to-document boundary. This does not replace the existing document patch
+API yet; it gives runtime/UI code a semantic batch type that lowers into the
+already verified atomic `DocumentChangeBatch` path.
+
+What changed:
+
+- Added portable `ChangeBatch<T> { epoch, changes }` to
+  `boon_document_model`.
+- Added `UiSemanticChange` with structural/property-specific variants for
+  insert, remove, move, text, style, binding, visibility, scroll, and list
+  window updates.
+- Added lowering from `ChangeBatch<UiSemanticChange>` to the existing
+  `DocumentChangeBatch`, preserving existing rollback and dirty-fact reporting.
+- Added `DocumentState::apply_ui_semantic_batch` and
+  `DocumentState::apply_ui_semantic_batch_to_owned_frame` as explicit
+  compatibility entrypoints.
+- Extended `verify-document-batch-patches` so the gate now checks for
+  `ChangeBatch`, `UiSemanticChange`, and semantic-batch lowering test coverage.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_document document_batch`: pass (`3` focused tests,
+  including `document_batch_accepts_ui_semantic_change_batch`).
+- `cargo check -q -p boon_document -p xtask`: pass, with existing native GPU
+  dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+
+Remaining blockers:
+
+- Runtime render patches are not yet emitted as `ChangeBatch<UiSemanticChange>`
+  at the runtime boundary; the native playground bridge now uses
+  `UiSemanticChange`, but the originating runtime stream is still
+  `RenderPatch`.
+- `UiSemanticChange::SetStyle` remains a compatibility bridge over
+  `StylePatch`; the full layout/paint/text/material style ID split is still
+  future U2/U3 work.
+- This does not resolve TASK-0804A visible-click timing/readback budgets, Phase
+  10 default execution, browser/native WGPU unification, accessibility scene
+  extraction, 3D SolidGraph, or manufacturing output.
+
+## 2026-06-28 U2 Native Preview Semantic Batch Bridge
+
+Status: implemented the next compatibility step after introducing
+`ChangeBatch<UiSemanticChange>`. Native preview data-binding patches now lower
+to semantic UI changes before entering the document transaction boundary.
+
+What changed:
+
+- Replaced the native preview `document_patch_for_data_binding_target` bridge
+  with `ui_semantic_change_for_data_binding_target`.
+- Switched both retained layout/document fast paths from collecting
+  `DocumentPatch` values to collecting `UiSemanticChange` values.
+- The fast paths apply those changes through
+  `DocumentChangeBatch::from(ChangeBatch<UiSemanticChange>)`, preserving the
+  existing trusted nonstructural batch validation and retained layout cache
+  behavior.
+- Updated the native preview lowering regression to
+  `data_binding_targets_lower_to_atomic_ui_semantic_change_batch`.
+- Extended `verify-document-batch-patches` with a bin-target focused cargo-test
+  helper and a required native preview semantic bridge check.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  data_binding_targets_lower_to_atomic_ui_semantic_change_batch`: pass.
+- `cargo check -q -p boon_native_playground -p xtask`: pass, with existing
+  native GPU/playground dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+- `git diff --check`: pass.
+
+Remaining blockers:
+
+- This still is not an end-to-end runtime-owned UI semantic change stream; the
+  runtime/native bridge starts from `boon_runtime::RenderPatch` and maps it to
+  `UiSemanticChange` at the preview boundary.
+- The style split remains partial because `UiSemanticChange::SetStyle` still
+  carries `StylePatch`.
+- The broader goal remains open for default PlanExecutor switching,
+  TASK-0804A/60 FPS click-readback timing, retained layout execution, shared
+  native/browser WGPU, accessibility, SolidGraph, and manufacturing.
+
+## 2026-06-28 U2 Runtime Patch to UI Semantic Bridge Boundary
+
+Status: implemented a narrower runtime/render-patch bridge boundary inside the
+native preview compatibility layer. This does not yet make `boon_runtime` emit
+`ChangeBatch<UiSemanticChange>`, but it removes another direct document-patch
+shape from the retained fast paths and gives the verifier a named boundary to
+guard.
+
+What changed:
+
+- Added `RuntimeUiSemanticPatchLowering` and
+  `runtime_render_patch_target_to_ui_semantic_lowering`.
+- Routed both retained patch paths through that helper:
+  - `preview_try_patch_paint_space_for_root_deltas`;
+  - `preview_try_patch_document_layout_for_root_deltas`.
+- The helper returns the direct layout target, optional semantic UI change,
+  source-intent update metadata, and route-cache invalidation flag.
+- Preserved the previous source-intent behavior for empty source payloads.
+- Extended `data_binding_targets_lower_to_atomic_ui_semantic_change_batch` to
+  assert the runtime/render target boundary, direct layout target attrs, and
+  source-intent update metadata.
+- Extended `verify-document-batch-patches` to require the
+  `runtime_render_patch_target_to_ui_semantic_lowering` boundary.
+
+Cells retained input note:
+
+- Cell clicks no longer skip dependent bound-text sync for selection-proxy
+  clicks. This fixes the retained-path class where a clicked grid cell could
+  reveal its formula while the separate top formula-bar text input stayed stale.
+- The focused native-shaped B0 click regression now asserts that the retained
+  formula-bar text input itself changes to `=add(A0,A1)`.
+- A broader keyboard-navigation Cells test still exposes a separate retained
+  source-intent lookup fragility after an edit commit; that remains a real
+  blocker and is not counted as fixed by this slice.
+
+Fresh evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  data_binding_targets_lower_to_atomic_ui_semantic_change_batch`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`: pass.
+- `cargo test -q -p boon_native_playground
+  targeted_bound_sync_expands_to_selection_dependent_formula_bar`: pass.
+- `cargo check -q -p boon_native_playground -p xtask`: pass, with existing
+  native GPU/playground dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `runtime_render_patch_semantic_bridge_source_hits=4`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+- `git diff --check`: pass.
+
+Remaining blockers:
+
+- `boon_runtime` still emits `RenderPatch`; the runtime-owned
+  `ChangeBatch<UiSemanticChange>` stream remains future work.
+- `UiSemanticChange::SetStyle` still uses `StylePatch`, so typed layout/paint/
+  text/material style records are not complete.
+- TASK-0804A is still open on visible-click 60 FPS/readback timing, and the
+  broad Cells keyboard navigation retained-layout test still has a source-intent
+  lookup issue after edit commit.
+- Release playground launch could not be verified in the last manual attempt
+  because `cosmic-background-launch` failed with DBus `ServiceUnknown`; this is
+  an external launcher problem, not native verifier evidence.
+
+## 2026-06-28 U1/U2 Typed Runtime ChangeBatch Contract
+
+Status: implemented a typed runtime batch wrapper for semantic deltas and render
+patches in the generic runtime report path. This is still JSON serialized at
+the report boundary, but the runtime now has a shared typed carrier with
+runtime identity, epochs, server ticks, step IDs, and per-step change payloads.
+
+What changed:
+
+- Added `RuntimeChangeBatch<T>` in `boon_runtime`.
+- Reworked semantic delta protocol batch construction to use typed
+  `RuntimeChangeBatch<JsonValue>` values before serializing.
+- Added matching `render_patch_protocol_batches` so render patches carry the
+  same runtime identity/epoch/tick envelope as semantic deltas.
+- Extended `semantic_delta_batches_require_runtime_identity_and_server_tick` to
+  cover the typed helper path and render patch batch stream.
+- Extended `verify-runtime-change-sets` so the gate requires the typed runtime
+  batch carrier and render patch protocol batches.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime
+  semantic_delta_batches_require_runtime_identity_and_server_tick`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`: pass.
+- `cargo test -q -p boon_native_playground
+  targeted_bound_sync_expands_to_selection_dependent_formula_bar`: pass.
+- `cargo check -q -p boon_runtime -p boon_native_playground -p xtask`: pass,
+  with existing native GPU/playground dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-runtime-change-sets --report
+  target/reports/unified/runtime-change-sets.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/runtime-change-sets.json`: pass.
+
+Remaining blockers:
+
+- Runtime batches still carry `JsonValue` changes at the public report layer;
+  the next step is a typed runtime-to-render semantic stream instead of
+  boundary-only serialization.
+- The native retained bridge still lowers from runtime `RenderPatch` to
+  `UiSemanticChange`; runtime-owned `ChangeBatch<UiSemanticChange>` is not
+  complete yet.
+- This does not close TASK-0804A. Cells still needs app-owned visible
+  interaction/readback timing, input wake scheduling audit, and the broader
+  demand-current/list dependency architecture work.
+
+## 2026-06-28 U1/U2 Typed Runtime Batch Payloads
+
+Status: implemented the next runtime-change-set slice. Runtime protocol
+batches now keep semantic deltas and render patches typed until the JSON report
+boundary, instead of converting every change payload to `JsonValue` while
+constructing the batch.
+
+What changed:
+
+- `semantic_delta_change_batches` now returns
+  `Vec<RuntimeChangeBatch<SemanticDelta<'static>>>`.
+- `render_patch_change_batches` now returns
+  `Vec<RuntimeChangeBatch<RenderPatch<'static>>>`.
+- The shared helper now clones typed changes into each per-step batch and lets
+  the existing `Serialize` implementations handle JSON only when the report is
+  emitted.
+- `verify-runtime-change-sets` now requires typed semantic and render-patch
+  runtime batch source hits, not only the generic `RuntimeChangeBatch` carrier.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime
+  semantic_delta_batches_require_runtime_identity_and_server_tick`: pass.
+- `cargo check -q -p boon_runtime -p xtask`: pass, with existing native GPU
+  dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-runtime-change-sets --report
+  target/reports/unified/runtime-change-sets.json`: pass; report records
+  `typed_semantic_runtime_change_batch_source_hits=1` and
+  `typed_render_patch_runtime_change_batch_source_hits=1`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/runtime-change-sets.json`: pass.
+
+Remaining blockers:
+
+- The batch payloads are typed inside `boon_runtime`, but they still serialize
+  to JSON for reports and are not yet the direct native/document application
+  protocol.
+- The native retained bridge still lowers from runtime `RenderPatch` to
+  `UiSemanticChange`; runtime-owned `ChangeBatch<UiSemanticChange>` remains the
+  next architectural step.
+- TASK-0804A remains open on visible interaction/readback budgets and the
+  larger demand-current/list dependency architecture.
+
+## 2026-06-28 U2 Native Runtime Patch Batch to UI Semantic Batch Boundary
+
+Status: implemented a batch-level native bridge between runtime render patches
+and document UI semantic changes. This keeps the crate dependency direction
+unchanged: `boon_runtime` still does not depend on `boon_document_model`, but
+the native retained application path now constructs one
+`ChangeBatch<UiSemanticChange>` from runtime patch lowerings before applying
+document changes.
+
+What changed:
+
+- Added `RuntimeUiSemanticChangeBatchLowering` in the native playground bridge.
+- Added `runtime_render_patch_lowerings_to_ui_semantic_change_batch`.
+- Routed both retained fast paths through the batch helper before calling
+  `DocumentChangeBatch::from(ChangeBatch<UiSemanticChange>)`:
+  - `preview_try_patch_paint_space_for_root_deltas`;
+  - `preview_try_patch_document_layout_for_root_deltas`.
+- Preserved direct layout patch targets, source-intent updates, and route-cache
+  invalidation metadata alongside the semantic batch.
+- Extended `data_binding_targets_lower_to_atomic_ui_semantic_change_batch` to
+  assert the batch helper carries direct targets, semantic changes,
+  source-intent updates, and route invalidation.
+- Extended `verify-document-batch-patches` so it requires both the single-target
+  runtime-patch lowering boundary and the batch-level semantic bridge.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  data_binding_targets_lower_to_atomic_ui_semantic_change_batch`: pass.
+- `cargo check -q -p boon_native_playground -p xtask`: pass, with existing
+  native GPU/playground dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`: pass.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `runtime_render_patch_semantic_batch_bridge_source_hits=4`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+
+Remaining blockers:
+
+- This is still a native boundary bridge, not runtime-owned
+  `ChangeBatch<UiSemanticChange>` emission from `boon_runtime`.
+- `UiSemanticChange::SetStyle` still carries compatibility `StylePatch`
+  payloads; typed layout/paint/text/material style records are not complete.
+- TASK-0804A remains open on app-owned visible-click/readback timing and the
+  deeper sparse spreadsheet runtime/list dependency work.
+
+## 2026-06-28 U2 Typed Style Semantic Change Variants
+
+Status: implemented the next compatibility slice for typed style semantics.
+`UiSemanticChange` now has layout/paint/text/material style variants while
+still lowering to the existing `DocumentPatch::SetStyle` path for compatibility
+with current document application, layout, and render code.
+
+What changed:
+
+- Added typed style patch wrappers in `boon_document_model`:
+  - `LayoutStylePatch`;
+  - `PaintStylePatch`;
+  - `TextStylePatch`;
+  - `MaterialStylePatch`.
+- Added `UiSemanticChange` variants:
+  - `SetLayoutStyle`;
+  - `SetPaintStyle`;
+  - `SetTextStyle`;
+  - `SetMaterialStyle`.
+- Kept `DocumentPatch` unchanged; typed semantic style changes lower to
+  compatible `DocumentPatch::SetStyle` patches.
+- Added model regression coverage proving the typed style semantic variants
+  preserve compatible lowering.
+- Updated the native runtime-patch bridge so known style attrs emit typed
+  semantic variants:
+  - layout attrs use `SetLayoutStyle`;
+  - text attrs use `SetTextStyle`;
+  - material attrs use `SetMaterialStyle`;
+  - paint attrs use `SetPaintStyle`;
+  - unknown/pseudo attrs keep the compatibility `SetStyle` path.
+- Extended the native bridge test to prove a control `size` update uses the
+  typed layout style semantic variant while preserving existing `size` to
+  `box_size` normalization.
+- Extended `verify-document-batch-patches` so typed style semantic variants are
+  required source evidence.
+
+Evidence:
+
+- `cargo test -q -p boon_document_model
+  typed_ui_style_changes_lower_to_compatible_style_patches`: pass.
+- `cargo test -q -p boon_document
+  document_batch_accepts_ui_semantic_change_batch`: pass.
+- `cargo test -q -p boon_native_playground
+  data_binding_targets_lower_to_atomic_ui_semantic_change_batch`: pass.
+- `cargo check -q -p boon_document_model -p boon_document -p
+  boon_native_playground -p xtask`: pass, with existing native GPU/playground
+  dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `typed_style_semantic_change_source_hits=3`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+
+Remaining blockers:
+
+- Typed style semantic changes still lower to `DocumentPatch::SetStyle`; the
+  document application and retained invalidation layers do not yet consume
+  typed style records directly.
+- The native bridge owns the attr classifier for now. A shared protocol-level
+  classifier or compiler-produced style category would be cleaner before
+  removing compatibility paths.
+- Runtime-owned `ChangeBatch<UiSemanticChange>` emission, TASK-0804A, shared
+  native/browser WGPU completion, accessibility breadth, SolidGraph, and
+  manufacturing readiness all remain open.
+
+## 2026-06-28 U2 Direct UI Semantic Batch Application
+
+Status: implemented a direct document application path for
+`ChangeBatch<UiSemanticChange>`. Typed style semantic changes no longer have to
+be erased into generic `DocumentPatch::SetStyle` before document application;
+they now produce typed patch-kind evidence while preserving the existing style
+map mutation and invalidation behavior.
+
+What changed:
+
+- Reworked `DocumentState::apply_ui_semantic_batch` to apply semantic changes
+  transactionally through `apply_ui_semantic_changes_unchecked` instead of
+  immediately converting the full batch into `DocumentChangeBatch`.
+- Added `DocumentState::apply_ui_semantic_batch_to_valid_owned_frame` for
+  retained native paths that already hold a validated owned frame.
+- Added typed style report kinds for semantic style variants:
+  - `set_layout_style`;
+  - `set_paint_style`;
+  - `set_text_style`;
+  - `set_material_style`.
+- Updated the native retained runtime-patch bridge to call the semantic batch
+  owned-frame application API directly, preserving typed style report kinds
+  across the bridge.
+- Added `document_batch_ui_semantic_typed_style_preserves_typed_patch_kinds`,
+  which proves typed style semantic batches mutate the same style map while
+  preserving typed patch-kind reports and invalidation.
+- Extended `verify-document-batch-patches` to require the direct UI semantic
+  apply helper as source evidence.
+
+Evidence:
+
+- `cargo test -q -p boon_document
+  document_batch_ui_semantic_typed_style_preserves_typed_patch_kinds`: pass.
+- `cargo test -q -p boon_document document_batch`: pass (`4` focused tests,
+  including the typed semantic style patch-kind regression).
+- `cargo test -q -p boon_native_playground
+  data_binding_targets_lower_to_atomic_ui_semantic_change_batch`: pass.
+- `cargo check -q -p boon_document_model -p boon_document -p
+  boon_native_playground -p xtask`: pass, with existing native GPU/playground
+  dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `direct_ui_semantic_apply_source_hits=3`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+
+Remaining blockers:
+
+- The direct semantic path still mutates the legacy `StyleMap`; typed style
+  records/indexes are not yet the primary storage for retained layout/render.
+- The compatibility `DocumentPatch` path remains necessary for existing callers
+  and report replay.
+- Runtime-owned `ChangeBatch<UiSemanticChange>` emission, TASK-0804A, shared
+  native/browser WGPU completion, accessibility breadth, SolidGraph, and
+  manufacturing readiness remain open.
+
+## 2026-06-28 U2 Retained Content Revision Render Cache Key
+
+Status: implemented a retained visible-render cache correctness slice after a
+manual Cells observation. Runtime selection and the retained frame could be
+current while the visible WGPU path reused a stale cached render frame because
+the cache key was based on `layout_frame_hash` only.
+
+What changed:
+
+- Added `PreviewVisibleRenderState::content_revision`, derived from
+  `PreviewSharedRenderState::update_count`.
+- Changed retained override layout cache keys to include
+  `retained-content-revision:<n>` when a `layout_frame_override` is present.
+- Preserved stable artifact/layout-hash keys when there is no retained override.
+- Added `retained_visible_cache_key_advances_with_content_revision`, proving
+  retained text/style mutations can invalidate visible render caches without a
+  new layout hash.
+
+Evidence:
+
+- `cargo test -q -p boon_native_playground
+  retained_visible_cache_key_advances_with_content_revision`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`:
+  pass; this test also asserts that clicking B0 patches the retained
+  formula-bar text input to `=add(A0,A1)`.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo build --release -p boon_native_playground`: pass, with existing
+  native GPU/playground dead-code warnings.
+
+Launch note:
+
+- `cosmic-background-launch --workspace boon-circuit --
+  ./target/release/boon_native_playground --role desktop --example cells`:
+  failed with DBus `ServiceUnknown` (`The name is not activatable`). No
+  `boon_native_playground` process was left running.
+
+Remaining blockers:
+
+- This fixes stale visible cache reuse for retained overrides, but does not
+  prove the full TASK-0804A 60 FPS target.
+- Native input scheduling and true retained render-scene patch ownership still
+  need broader work.
+
+## 2026-06-28 U2 Multiple Typed Interaction Bindings
+
+Status: implemented an additive document-model and derived-index slice for
+multiple typed interaction bindings per node. This preserves the existing
+single `source_binding` compatibility field while adding a multi-binding field
+that can be indexed and routed with stable ordinals.
+
+What changed:
+
+- Added `DocumentNode::source_bindings: Vec<SourceBinding>` with serde default
+  and skip-empty serialization.
+- Added `DocumentNode::source_bindings()` as a compatibility iterator over the
+  primary binding plus additional bindings.
+- Extended `DocumentInternedNode` with all interned source binding IDs while
+  preserving the existing primary `source_binding` slot.
+- Reworked `DocumentTypedBindingIndex` to index every node binding with stable
+  `DocumentTypedBindingRef { node, ordinal }` values.
+- Added `HitSideTableEntry::source_routes` so a hit entry can be discovered by
+  non-primary source paths while preserving the existing primary
+  `source_path`/`source_intent` fields.
+- Updated native document source-intent extraction to emit all document source
+  bindings.
+- Extended `verify-document-batch-patches` to require source and test evidence
+  for multi-binding typed routes.
+
+Evidence:
+
+- `cargo test -q -p boon_document
+  typed_binding_index_preserves_multiple_bindings_per_node`: pass.
+- `cargo test -q -p boon_document
+  typed_binding_index_exposes_current_single_binding_as_multi_binding_shape`:
+  pass.
+- `cargo test -q -p boon_document typed_binding`: pass (`2` tests).
+- `cargo test -q -p boon_document_model
+  typed_ui_style_changes_lower_to_compatible_style_patches`: pass.
+- `cargo check -q -p boon_document_model -p boon_document -p
+  boon_native_playground -p xtask`: pass, with existing native GPU/playground
+  dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `multi_binding_model_source_hits=4`,
+  `typed_hit_source_routes_source_hits=5`, and
+  `multi_binding_test_source_hits=1`.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+
+Remaining blockers:
+
+- Most native hot paths still read only the primary `source_binding` field.
+  Moving all routing/action dispatch to the typed binding index remains open.
+- `DocumentNode` still stores string IDs and compatibility `StyleMap`; typed
+  hot storage is not yet the primary application model.
+- Runtime-owned `ChangeBatch<UiSemanticChange>` emission, TASK-0804A, shared
+  native/browser WGPU completion, accessibility breadth, SolidGraph, and
+  manufacturing readiness remain open.
+
+## 2026-06-28 U2 Native Multi-Binding Route Proofs
+
+Status: implemented a native routing/proof slice that moves source-intent
+reporting off primary-binding-only assumptions where the route proof needs the
+actual matched source path.
+
+What changed:
+
+- Extended typed hit-side-table JSON with `source_binding_refs` and
+  `source_routes`, so reports preserve all typed routes attached to a hit
+  region.
+- Added route-specific source-intent JSON selection so a hit table lookup by a
+  secondary source path reports that secondary route, not the primary
+  compatibility binding.
+- Updated dev-window host activation fallback, dev route proof source-intent
+  inventory, document source-path inventory, and structural inventory to iterate
+  `DocumentNode::source_bindings()`.
+- Changed the native element fallback-source guard to avoid adding a fallback
+  binding when a node already has any primary or additional source binding.
+- Strengthened the Cells retained click regression so clicking B0 must patch
+  the visible formula-bar `LayoutFrame` text and feed `=add(A0,A1)` into the
+  derived retained-key `RenderScene` text run.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  typed_hit_source_intent_json_reports_requested_secondary_route`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`:
+  pass; now asserts runtime state, retained frame text, selected cell style,
+  and render-scene text run.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `cargo build --release -p boon_native_playground`: pass, with existing
+  native GPU/playground dead-code warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+- `cosmic-background-launch --workspace boon-circuit --
+  ./target/release/boon_native_playground --role desktop --example cells`:
+  failed with DBus `ServiceUnknown` (`The name is not activatable`).
+- `pgrep -af 'boon_native_playground'`: no matching process after the failed
+  launch.
+- Report summary from `target/reports/unified/document-batch-patches.json`:
+  `status=pass`, `multi_binding_model_source_hits=4`,
+  `typed_hit_source_routes_source_hits=5`,
+  `multi_binding_test_source_hits=1`, and
+  `direct_ui_semantic_apply_source_hits=3`.
+
+Remaining blockers:
+
+- This does not prove the user's live-window Cells click observation is fixed.
+  The focused regression proves the runtime summary, retained frame, and render
+  scene update for the tested route; the remaining gap is likely live-window
+  process/binary state, WGPU surface presentation/readback coverage, or a
+  click-routing case not yet represented by the verifier.
+- TASK-0804A 60 FPS, full retained layout patches, shared native/browser WGPU,
+  accessibility breadth, SolidGraph, and manufacturing readiness remain open.
+
+## 2026-06-28 U2 Ordinal Source Binding Mutation
+
+Status: implemented an additive ordinal-aware source binding mutation path for
+transactional document batches and native runtime render-patch semantic
+lowering. The compatibility primary `SetBinding` shape remains available, while
+secondary bindings can now be mutated without rewriting the primary
+`source_binding` slot.
+
+What changed:
+
+- Added `DocumentPatch::SetBindingAt { id, ordinal, binding }`.
+- Added `UiSemanticChange::SetBindingAt { id, ordinal, binding }` and lowering
+  to the document patch batch boundary.
+- Added document application for ordinal source binding mutation:
+  `ordinal=0` targets the primary compatibility binding and `ordinal=N` targets
+  `source_bindings[N-1]`.
+- Reused the existing binding/source-binding/hit-region invalidation class for
+  both primary and ordinal binding changes.
+- Updated source-intent data-binding lowering to scan
+  `DocumentNode::source_bindings()` and emit `SetBindingAt` for non-primary
+  source-intent matches.
+- Extended `verify-document-batch-patches` to require ordinal binding mutation
+  source and focused document/native tests.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_document
+  document_batch_set_binding_at_updates_secondary_binding_only`: pass.
+- `cargo test -q -p boon_native_playground
+  source_intent_data_binding_lowers_to_secondary_binding_ordinal`: pass.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/unified/document-batch-patches.json`: pass.
+- `cargo check -q -p boon_document_model -p boon_document -p
+  boon_native_playground -p xtask`: pass, with existing native GPU/playground
+  dead-code warnings.
+- `git diff --check`: pass.
+- `cargo build --release -p boon_native_playground`: pass, with existing
+  native GPU/playground dead-code warnings.
+- `cosmic-background-launch --workspace boon-circuit --
+  ./target/release/boon_native_playground --role desktop --example cells`:
+  failed with DBus `ServiceUnknown` (`The name is not activatable`).
+- `pgrep -af 'boon_native_playground'`: no matching process after the failed
+  launch.
+- Report summary from `target/reports/unified/document-batch-patches.json`:
+  `status=pass`, `document_batch_patches_status=document-batch-patches-pass`,
+  `binding_at_model_source_hits=4`,
+  `binding_at_document_test_source_hits=1`,
+  `binding_at_native_test_source_hits=1`,
+  `multi_binding_model_source_hits=4`, and
+  `typed_hit_source_routes_source_hits=5`.
+
+Remaining blockers:
+
+- This is an additive compatibility protocol. The larger typed binding-set
+  protocol is still not the primary serialized document representation.
+- Source-intent patch targets still select by intent string. Controls with
+  multiple bindings sharing the same intent need an explicit binding ordinal or
+  binding ID in the data-binding target to avoid ambiguity.
+- TASK-0804A 60 FPS, full retained layout patches, shared native/browser WGPU,
+  accessibility breadth, SolidGraph, and manufacturing readiness remain open.
+
+## 2026-06-28 U3 Source Intent Binding Selectors
+
+Status: implemented selector-aware source-intent data-binding targets so native
+runtime render patches can target a source binding by legacy intent, explicit
+binding id, or ordinal. This closes the ambiguity left by U2 for controls with
+multiple bindings that share the same intent while preserving the legacy
+`__source_intent:<intent>` target encoding.
+
+What changed:
+
+- Added `DocumentSourceIntentBindingSelector` and encoded selector attrs under
+  `__source_intent_selector:<json>`.
+- Kept legacy `__source_intent:<intent>` parsing as a selector with only an
+  intent.
+- Changed document data-binding snapshot indexes to store selectors instead of
+  raw intent strings for source-intent binding targets.
+- Changed runtime UI semantic lowering to emit `SetBindingAt` for selector
+  matches by binding id or ordinal, including duplicate-intent bindings on the
+  same node.
+- Changed retained source-intent update maps from `(node, intent)` to
+  `(node, selector)` and matched source-intent assertion updates by binding id
+  or ordinal when present.
+- Added `binding_id` and `binding_ordinal` metadata to generated source-intent
+  records when the originating document source binding is known.
+- Added a typed hit-route fallback for native route lookup when proof
+  source-intent JSON is incomplete.
+- Narrowed the Cells editing scenario so it no longer rediscovers an already
+  edited/focused A3 cell through a post-edit `select` route before checking the
+  retained visible text.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo test -q -p boon_native_playground source_intent`: pass, 7 tests.
+- `cargo test -q -p boon_native_playground
+  cells_click_selection_updates_formula_bar_and_selected_style`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`:
+  pass.
+- `cargo check -q -p boon_native_playground`: pass, with existing native
+  GPU/playground dead-code warnings.
+
+Known failing evidence:
+
+- `cargo test -q -p boon_native_playground
+  cells_native_editing_scenario_updates_cell_and_formula_with_keyboard_navigation`:
+  fail. After committing `A3 = 20`, runtime summary has
+  `store.selected_input.formula_text == "20"` and value `"20"`, but the retained
+  preview frame does not expose visible text `"20"` for the original A3 cell
+  node. This is a real retained visible-cell update gap, not only source-intent
+  selector ambiguity.
+
+Remaining blockers:
+
+- Cells live/manual click behavior is not proven fixed. The smoke tests prove
+  initial selection and formula-bar patching for covered routes, but the broader
+  editing scenario still shows retained visible cell text staleness after
+  commit.
+- Source-intent JSON and typed hit routes are still partially parallel sources
+  of truth. Dispatch now falls back to typed routes, but proof/report metadata
+  still needs consolidation around the typed binding table.
+- TASK-0804A 60 FPS, full retained layout patches, shared native/browser WGPU,
+  accessibility breadth, SolidGraph, and manufacturing readiness remain open.
+
+## 2026-06-28 U4 Cells Retained Commit Frame Recovery
+
+Status: fixed the retained-frame collapse found in the broader Cells native
+editing scenario. The runtime state was current after committing `A3 = 20`, but
+the fallback layout path could lower from a targeted partial state summary after
+a fast patch rejection. That produced a retained frame/proof containing only the
+formula-bar text input, so visible cell metadata, selection, and later focus
+updates could not find the grid.
+
+What changed:
+
+- Added a cached-snapshot coverage guard for retained paint/document patch fast
+  paths. If the cached snapshot has fewer display or hit entries than the active
+  proof says it should have, the fast path is rejected instead of reusing a
+  stale partial snapshot.
+- Added a retained layout patch guard so a non-structural document patch cannot
+  replace the current full frame with a smaller partial frame. It falls back to
+  a full layout for the patched document frame.
+- Changed the full-document/window lower fallback to refresh a current
+  visible-window runtime summary when the previous summary was targeted or
+  patched. This keeps Cells visible rows/cells present after a fast-path miss.
+- Made focus/address lookup tolerate compact proofs by falling back to the
+  cached render snapshot for source intents and hit nodes.
+- Strengthened the Cells native editing scenario to prove the grid frame stays
+  intact after selecting A3, after typing the draft `20`, after pressing Enter,
+  and that both A3 visible text and the formula bar show `20`.
+- Added a generic retained patch regression that rejects cached snapshots whose
+  retained frame is smaller than the active proof's expected display/hit
+  coverage, so the guard is not only Cells-specific evidence.
+- Extended `verify-document-batch-patches` to require that retained
+  partial-snapshot rejection regression and report its source-hit count.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_native_playground`: pass, with existing native
+  GPU/playground dead-code warnings.
+- `cargo test -q -p boon_native_playground
+  retained_patch_rejects_cached_snapshot_smaller_than_active_proof`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_native_editing_scenario_updates_cell_and_formula_with_keyboard_navigation`:
+  pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`:
+  pass.
+- `cargo test -q -p boon_native_playground
+  cells_formula_bar_click_accepts_text_edit`: pass.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass; report records
+  `retained_partial_snapshot_test_source_hits=1` and includes
+  `document-batch-patches:retained-partial-snapshot-rejection-test`.
+
+Remaining blockers:
+
+- This proves the covered retained native-input edit/commit path, not the full
+  TASK-0804A 60 FPS target.
+- Manual visible playground testing is still needed because the user reported
+  stale top formula-bar behavior in the release playground.
+- The retained patch cache now has correctness guards, but the better
+  architecture is still to avoid producing or caching partial layout snapshots
+  under full-layout hashes in the first place.
+
+## 2026-06-28 U5 Unified Aggregate Freshness Enforcement
+
+Status: implemented an honesty/provenance guard in the unified architecture
+aggregate. `verify-unified-architecture-all` no longer accepts child reports
+only because they exist, schema-check, and have `status=pass`; it now also
+requires each child report to match the current git commit and dirty-worktree
+fingerprint.
+
+What changed:
+
+- Added per-child `git_fresh` and `worktree_fresh` checks to
+  `verify-unified-architecture-all`, matching the stricter native GPU aggregate
+  style already used elsewhere in `xtask`.
+- Added `git_fresh_report_count` and `worktree_fresh_report_count` to the
+  unified aggregate report.
+- Added `git_fresh` and `worktree_fresh` flags to each
+  `child_reports[]` / `required_reports[]` row so stale proof can be diagnosed
+  without reading every child report manually.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `target/debug/xtask verify-unified-architecture-all --check-existing --report
+  target/reports/unified/unified-architecture-all.json`: expected fail after
+  the new freshness checks.
+- Refreshed aggregate report:
+  `status=fail`,
+  `unified_architecture_all_status=unified-architecture-all-incomplete`,
+  `required_report_count=18`, `checked_report_count=18`,
+  `missing_report_count=0`, `passed_report_count=18`,
+  `failed_report_count=0`, `command_match_report_count=18`,
+  `git_fresh_report_count=2`, and `worktree_fresh_report_count=0`.
+
+Remaining blockers:
+
+- The unified aggregate is now stricter and correctly fails on stale evidence.
+  It does not indicate that the 18 child gates semantically regressed; it says
+  their reports are not proof for the current dirty worktree.
+- `verify-report-schema target/reports/unified/unified-architecture-all.json`
+  exits nonzero because the report status is `fail`; the report was still
+  written through `write_static_gate_report`, which validates schema shape
+  before returning the gate failure.
+- The next checkpoint that wants a green aggregate must refresh child reports
+  after the current code/doc edits settle, or intentionally continue another
+  architecture slice while recording aggregate freshness as incomplete.
+
+## 2026-06-28 U6 Unified Child Report Refresh
+
+Status: refreshed the unified aggregate's child evidence after U5 made
+`verify-unified-architecture-all` enforce child report git/worktree freshness.
+The aggregate is no longer failing because of stale passing children. It now
+fails for one current, real native demand-driven blocker.
+
+What changed:
+
+- Refreshed static/runtime/document/layout/text/render child reports for the
+  current dirty worktree:
+  `runtime-change-sets`, `document-batch-patches`,
+  `retained-layout-deltas`, `text-cache-layers`, and
+  `render-patch-contract`.
+- Refreshed semantic, accessibility, SolidGraph, and manufacturing child
+  reports:
+  `semantic-scene`, `accessibility-adapters`, `3d-hello-cube`,
+  `solid-graph`, `3d-printable-bracket`, `manufacturing-slices`,
+  `3mf-export`, and `3d-parametric-car`.
+- Refreshed native/browser WGPU prerequisite and child reports:
+  `world-scene`, `browser-world-scene`, `wgpu-retained-arenas`,
+  `native-web-render-comparison`, `wgpu-readback`,
+  `native-web-render-parity`, and `browser-artifact-budget`.
+- Refreshed idle-wake children for the demand-driven loop aggregate:
+  `idle-wake-counter`, `idle-wake-todomvc`, `idle-wake-cells`, and
+  `idle-wake-custom-projects`.
+
+Evidence:
+
+- `target/debug/xtask verify-runtime-change-sets --report
+  target/reports/unified/runtime-change-sets.json`: pass.
+- `target/debug/xtask verify-document-batch-patches --report
+  target/reports/unified/document-batch-patches.json`: pass.
+- `target/debug/xtask verify-retained-layout-deltas --report
+  target/reports/unified/retained-layout-deltas.json`: pass.
+- `target/debug/xtask verify-text-cache-layers --report
+  target/reports/unified/text-cache-layers.json`: pass.
+- `target/debug/xtask verify-render-patch-contract --report
+  target/reports/unified/render-patch-contract.json`: pass.
+- `target/debug/xtask verify-semantic-scene --report
+  target/reports/unified/semantic-scene.json`: pass.
+- `target/debug/xtask verify-accessibility-adapters --report
+  target/reports/unified/accessibility-adapters.json`: pass.
+- `target/debug/xtask verify-3d-hello-cube --report
+  target/reports/unified/3d-hello-cube.json`: pass.
+- `target/debug/xtask verify-solid-graph --report
+  target/reports/unified/solid-graph.json`: pass.
+- `target/debug/xtask verify-3d-printable-bracket --report
+  target/reports/unified/3d-printable-bracket.json`: pass.
+- `target/debug/xtask verify-manufacturing-slices --report
+  target/reports/unified/manufacturing-slices.json`: pass.
+- `target/debug/xtask verify-3mf-export --report
+  target/reports/unified/3mf-export.json`: pass.
+- `target/debug/xtask verify-3d-parametric-car --report
+  target/reports/unified/3d-parametric-car.json`: pass.
+- `target/debug/xtask verify-native-gpu-world-scene --report
+  target/reports/native-gpu/world-scene.json`: pass.
+- `target/debug/xtask verify-browser-webgpu-world-scene --report
+  target/reports/native-gpu/browser-world-scene.json`: pass.
+- `target/debug/xtask verify-wgpu-retained-arenas --report
+  target/reports/native-gpu/wgpu-retained-arenas.json`: pass after refreshing
+  `world-scene` and `browser-world-scene`.
+- `target/debug/xtask verify-native-web-render-comparison --report
+  target/reports/native-gpu/native-web-render-comparison.json`: pass.
+- `target/debug/xtask verify-wgpu-readback --report
+  target/reports/native-gpu/wgpu-readback.json`: pass after refreshing
+  `native-web-render-comparison`.
+- `target/debug/xtask verify-native-web-render-parity --report
+  target/reports/native-gpu/native-web-render-parity.json`: pass.
+- `target/debug/xtask verify-browser-artifact-budget --report
+  target/reports/native-gpu/browser-artifact-budget.json`: pass.
+- `target/debug/xtask verify-native-gpu-idle-wake --example counter
+  --idle-ms 1500 --report target/reports/native-gpu/idle-wake-counter.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-idle-wake --example todomvc
+  --idle-ms 1500 --report target/reports/native-gpu/idle-wake-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-idle-wake --example cells
+  --idle-ms 1500 --report target/reports/native-gpu/idle-wake-cells.json`:
+  fail, fresh evidence. The only failing step is
+  `native-gpu-idle-wake:post-idle-input-wakes` with
+  `post_idle_input_to_present_ms=166.640`, budget `120.000`, and
+  `changed=true`.
+- `target/debug/xtask verify-native-gpu-idle-wake --custom-project-fixture
+  target/fixtures/native-gpu/custom-projects.json --idle-ms 1500 --report
+  target/reports/native-gpu/idle-wake-custom-projects.json`: pass.
+- `target/debug/xtask verify-demand-driven-render-loop --check-existing
+  --report target/reports/native-gpu/demand-driven-render-loop.json`: expected
+  fail. It found all four idle-wake children fresh for git/worktree, with three
+  passing and `idle-wake-cells` failing.
+- `target/debug/xtask verify-unified-architecture-all --check-existing
+  --report target/reports/unified/unified-architecture-all.json`: expected
+  fail. Current aggregate summary:
+  `required_report_count=18`, `checked_report_count=18`,
+  `missing_report_count=0`, `passed_report_count=17`,
+  `failed_report_count=1`, `schema_valid_report_count=17`,
+  `command_match_report_count=18`, `git_fresh_report_count=18`,
+  `worktree_fresh_report_count=18`, and the sole failing child is
+  `demand-driven-render-loop`.
+- `git diff --check`: pass.
+
+Remaining blockers:
+
+- `idle-wake-cells` is a fresh real blocker, not stale evidence. It misses the
+  post-idle input wake smoke budget with `166.640ms` against `120ms`.
+- The stricter unified aggregate is now doing its job: it is green on freshness
+  for all children, but still fails because the demand-driven render-loop child
+  honestly fails.
+- This does not prove TASK-0804A 60 FPS interaction/scroll. Idle-wake remains
+  only a smoke gate, and the broader Cells interaction performance work remains
+  open.
+
+## 2026-06-28 Cells retained formula bar and chunk dependency update
+
+Implemented:
+
+- `List/chunk` root materialization no longer records a dependency on every
+  field of every source row when the projection stores `RowRef`s. This keeps
+  `store.sheet_rows` dependent on the source list/row identity instead of
+  dirtying it for visible `cells.value` / `cells.display_text` changes.
+- The native headed scenario runner now has a retained formula-bar text
+  assertion. The Cells headed visual scenario checks both runtime currentness
+  and the visible retained top input text after B0 and C0 clicks.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime
+  cells_visible_value_edit_does_not_rematerialize_chunked_sheet_rows --
+  --nocapture`: pass.
+- `cargo test -q -p boon_native_playground
+  headed_cells_scenario_targets_visible_cell_clicks -- --nocapture`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path --
+  --nocapture`: pass.
+- `cargo build -q -p xtask`: pass.
+- `cargo xtask verify-native-gpu-headed-scenario --example cells --report
+  target/reports/native-gpu/headed-scenario-cells.json`: pass. Nested scenario
+  report `target/reports/native-gpu/headed-scenario-cells-basic-headed.json`
+  has retained formula-bar assertions passing for `=add(A0,A1)` and
+  `=sum(A0:A2)` on node `doc-node-274`.
+- `cargo xtask verify-native-cells-interaction-speed --profile release
+  --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  still fail before the headed assertion change. Current role report shows
+  `interaction_latency_ms_p95=17.868` against `16.700`, max `19.655`, formula
+  bar runtime text current, zero root materialization in slow click samples, and
+  no `store.sheet_rows` materialization during clicks.
+
+Remaining blockers:
+
+- Manual top-input staleness is now covered by an app-owned headed retained-text
+  assertion, but the manual production window may still need a fresh release
+  launch for human confirmation.
+- The 60 FPS Cells interaction gate remains open. After removing chunk root
+  rematerialization, the next likely targets are native input scheduling/frame
+  boundary cost, occasional hit-resolution spikes, and the still-present
+  targeted state-summary/read cost.
+
+## 2026-06-28 Cells duplicate bound-input sync removal
+
+Implemented:
+
+- Removed the second post-click bound text-input sync on the simple source-click
+  path when `preview_apply_live_events_state_summary` already produced and
+  applied a retained visible state patch. This keeps runtime currentness in the
+  live-event/update path, but avoids re-reading targeted runtime paths and
+  repainting bound inputs twice for the same click.
+- Strengthened the existing Cells real-window-shaped click regression test so a
+  simple cell click must keep `bound_input_sync_ms < 1.0` on the native input
+  sample.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path --
+  --nocapture`: pass.
+- `cargo test -q -p boon_native_playground
+  headed_cells_scenario_targets_visible_cell_clicks -- --nocapture`: pass.
+- `cargo xtask verify-native-cells-interaction-speed --profile release
+  --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  role report passes with `interaction_latency_ms_p95=8.429`,
+  `interaction_latency_ms_max=14.857`, `native_input_apply.p95=3.911`, and
+  simple-click `bound_input_sync_ms` effectively zero. Top-level wrapper still
+  failed only because `target/reports/native-gpu/headed-scenario-cells.json`
+  was stale for the new worktree (`worktree_fresh=false`) while its internal
+  status/readback/cursor checks were otherwise passing.
+
+Next verification step:
+
+- Refresh `verify-native-gpu-headed-scenario --example cells`, then rerun
+  `verify-native-cells-interaction-speed --profile release` without further
+  source edits so the wrapper can validate the headed visual child against the
+  current worktree.
+
+## 2026-06-28 Cells top input retained sync and idle-wake split
+
+Implemented:
+
+- Fixed the remaining retained top-input staleness after a cell click by
+  reusing the returned state summary from `preview_apply_live_events_state_summary`
+  to patch bound text-input nodes whose source bindings are current in that
+  summary. This keeps the formula-bar/top input update in the retained patch
+  path instead of requiring a full runtime summary or relower.
+- Added a narrow IPC wake-order improvement for successful
+  `operator-host-input` requests: the preview loop is now woken before the IPC
+  ACK is written. This removes an avoidable response-read boundary, but it did
+  not by itself fix the debug idle-wake budget.
+- Fixed the idle-wake retained render-scene miss by resolving direct
+  input-overlay and layout-sidecar patches against the cached base layout hash,
+  including retained-content-revision cache keys. The post-idle click now
+  patches the cached scene directly instead of rebuilding the full render scene
+  during the visible frame.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path --
+  --nocapture`: pass. The test now asserts the retained frame and render scene
+  top input text become `=add(A0,A1)` after the Cells click.
+- `cargo test -q -p boon_native_playground
+  targeted_bound_sync_expands_to_selection_dependent_formula_bar -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_native_playground
+  direct_layout_sidecar_base_scene_lookup_uses_cached_base_layout_hash --
+  --nocapture`: pass.
+- `cargo xtask verify-native-gpu-headed-scenario --example cells --report
+  target/reports/native-gpu/headed-scenario-cells.json`: pass.
+- `cargo xtask verify-native-cells-interaction-speed --profile release
+  --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass with `interaction_latency_ms_p95=10.735` and
+  `interaction_latency_ms_max=13.787`.
+- `cargo xtask verify-native-gpu-idle-wake --example cells --idle-ms 1500
+  --report target/reports/native-gpu/idle-wake-cells.json`: pass with
+  `post_idle_input_to_present_ms=35.586`,
+  `input_wake_to_poll_started_ms=0.047`, `input_wake_to_present_ms=24.576`,
+  and `surface_acquired_to_render_hook_completed_ms=6.575`.
+
+Current diagnosis:
+
+- The corrected Cells interaction path is no longer the slow part: the relevant
+  native input sample reports `fast_path=simple_source_click`,
+  `total_ms` around 8 ms, zero `List/find`/list scans, and a bounded retained
+  bound-input sync.
+- The earlier 130-155 ms idle-wake failures were caused by a retained
+  render-scene cache miss on the native input-overlay path. The passing report
+  shows `last_scheduler_reason=host_input`, `render_frame_cache_hit=true`,
+  `render_scene_cache_hit=true`, `render_scene_cache_ms=0.464`, and
+  `input_overlay_render_scene_patch_direct_encode=true`, so the idle-wake smoke
+  gate is no longer pointing at formula evaluation, `store.sheet_rows`
+  materialization, or runtime currentness.
+
+Next architectural work:
+
+- Keep the top-input/formula-bar retained sync covered in the headed scenario
+  and interaction-speed gates; if human testing still sees stale text, the next
+  suspected gap is a visible manual launch path that is not using the same
+  retained state-summary patch as the verified host-event path.
+- Continue the larger TASK-0804A work on runtime/list/formula architecture:
+  sparse materialization, generic `List/find` indexing, demand-current indexed
+  fields, and dependency-tracked formula recomputation remain the real 60 FPS
+  acceptance path beyond the idle-wake smoke gate.

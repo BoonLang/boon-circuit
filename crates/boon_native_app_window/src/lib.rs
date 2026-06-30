@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use app_window::coordinates::{Position, Size};
 use app_window::input::keyboard::{Keyboard, key::KeyboardKey};
@@ -22,6 +22,11 @@ const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
 const LOW_LATENCY_SURFACE_FRAME_LATENCY: u32 = 1;
+const NATIVE_TARGET_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0;
+pub const REQUESTED_ANIMATION_BURST_MIN_FRAMES: u32 = 2;
+pub const REQUESTED_ANIMATION_QUIET_MS: u64 = 100;
+pub const REQUESTED_ANIMATION_HARD_CAP_MS: u64 = 1_000;
+pub const REQUESTED_ANIMATION_MAX_PENDING_SNAPSHOTS: u32 = 1;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -612,6 +617,31 @@ pub enum NativeRenderLoopMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum NativeFramePacingState {
+    Idle,
+    RequestedAnimationBurst,
+    Probe,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeFramePacing {
+    pub state: NativeFramePacingState,
+    pub target_frame_interval_ms: f64,
+    pub last_frame_interval_ms: Option<f64>,
+    pub last_frame_lateness_ms: Option<f64>,
+    pub timer_due: bool,
+    pub requested_animation_burst_frames_remaining: u32,
+    pub requested_animation_burst_started_elapsed_ms: Option<f64>,
+    pub requested_animation_burst_quiet_until_elapsed_ms: Option<f64>,
+    pub requested_animation_burst_hard_stop_elapsed_ms: Option<f64>,
+    pub requested_animation_burst_min_frames: u32,
+    pub requested_animation_quiet_ms: u64,
+    pub requested_animation_hard_cap_ms: u64,
+    pub requested_animation_max_pending_snapshots: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeSchedulerReason {
     FirstFrame,
     SurfaceChanged,
@@ -783,9 +813,19 @@ pub struct NativeRenderLoopState {
     pub last_render_hook_completed_elapsed_ms: Option<f64>,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
+    pub last_present_interval_ms: Option<f64>,
+    pub last_frame_lateness_ms: Option<f64>,
     pub last_encoder_finish_ms: Option<f64>,
     pub last_queue_submit_call_ms: Option<f64>,
     pub last_present_call_ms: Option<f64>,
+    pub missed_frame_count: u64,
+    pub telemetry_drop_count: u64,
+    pub last_missed_frame_cause: Option<String>,
+    pub requested_animation_burst_count: u64,
+    pub requested_animation_burst_frames_remaining: u32,
+    pub requested_animation_burst_started_elapsed_ms: Option<f64>,
+    pub requested_animation_burst_quiet_until_elapsed_ms: Option<f64>,
+    pub requested_animation_burst_hard_stop_elapsed_ms: Option<f64>,
     pub last_poll_diagnostics: Option<serde_json::Value>,
     #[serde(skip)]
     pub next_wake_at: Option<Instant>,
@@ -839,9 +879,19 @@ impl NativeRenderLoopState {
             last_render_hook_completed_elapsed_ms: None,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
+            last_present_interval_ms: None,
+            last_frame_lateness_ms: None,
             last_encoder_finish_ms: None,
             last_queue_submit_call_ms: None,
             last_present_call_ms: None,
+            missed_frame_count: 0,
+            telemetry_drop_count: 0,
+            last_missed_frame_cause: None,
+            requested_animation_burst_count: 0,
+            requested_animation_burst_frames_remaining: 0,
+            requested_animation_burst_started_elapsed_ms: None,
+            requested_animation_burst_quiet_until_elapsed_ms: None,
+            requested_animation_burst_hard_stop_elapsed_ms: None,
             last_poll_diagnostics: None,
             next_wake_at: None,
         }
@@ -997,6 +1047,24 @@ impl NativeRenderLoopState {
     }
 
     pub fn note_present_completed(&mut self, elapsed_ms: f64) {
+        if let Some(previous_ms) = self.last_present_completed_elapsed_ms
+            && elapsed_ms >= previous_ms
+        {
+            let interval_ms = elapsed_ms - previous_ms;
+            self.last_present_interval_ms = Some(interval_ms);
+            let lateness_ms = (interval_ms - NATIVE_TARGET_FRAME_INTERVAL_MS).max(0.0);
+            self.last_frame_lateness_ms = Some(lateness_ms);
+            if lateness_ms > NATIVE_TARGET_FRAME_INTERVAL_MS {
+                self.missed_frame_count = self.missed_frame_count.saturating_add(1);
+                self.last_missed_frame_cause =
+                    Some("present_interval_exceeded_two_frames".to_owned());
+            }
+        }
+        if self.requested_animation_burst_frames_remaining > 0 {
+            self.requested_animation_burst_frames_remaining = self
+                .requested_animation_burst_frames_remaining
+                .saturating_sub(1);
+        }
         self.last_present_completed_elapsed_ms = Some(elapsed_ms);
     }
 
@@ -1051,11 +1119,88 @@ impl NativeRenderLoopState {
         self.next_wake_at.unwrap_or(candidate)
     }
 
+    pub fn request_animation_burst(
+        &mut self,
+        now: Instant,
+        elapsed_ms: f64,
+        reason: NativeSchedulerReason,
+    ) {
+        if self.mode != NativeRenderLoopMode::DemandDriven {
+            return;
+        }
+        let active = self
+            .requested_animation_burst_hard_stop_elapsed_ms
+            .is_some_and(|hard_stop| elapsed_ms <= hard_stop);
+        if !active {
+            self.requested_animation_burst_count =
+                self.requested_animation_burst_count.saturating_add(1);
+            self.requested_animation_burst_started_elapsed_ms = Some(elapsed_ms);
+            self.requested_animation_burst_hard_stop_elapsed_ms =
+                Some(elapsed_ms + REQUESTED_ANIMATION_HARD_CAP_MS as f64);
+        }
+        let hard_stop = self
+            .requested_animation_burst_hard_stop_elapsed_ms
+            .unwrap_or(elapsed_ms + REQUESTED_ANIMATION_HARD_CAP_MS as f64);
+        self.requested_animation_burst_quiet_until_elapsed_ms =
+            Some((elapsed_ms + REQUESTED_ANIMATION_QUIET_MS as f64).min(hard_stop));
+        self.requested_animation_burst_frames_remaining = self
+            .requested_animation_burst_frames_remaining
+            .max(REQUESTED_ANIMATION_BURST_MIN_FRAMES);
+        self.last_scheduler_reason = Some(reason);
+        self.current_scheduler_reason = Some(reason);
+        self.schedule_wake_after(
+            now,
+            Duration::from_micros((NATIVE_TARGET_FRAME_INTERVAL_MS * 1000.0).round() as u64),
+        );
+    }
+
+    pub fn schedule_requested_animation_followup(&mut self, now: Instant, elapsed_ms: f64) {
+        if self.mode != NativeRenderLoopMode::DemandDriven {
+            return;
+        }
+        if self
+            .requested_animation_burst_hard_stop_elapsed_ms
+            .is_some_and(|hard_stop| elapsed_ms > hard_stop)
+        {
+            self.clear_requested_animation_burst();
+            return;
+        }
+        if self.requested_animation_burst_frames_remaining > 0 {
+            self.schedule_wake_after(
+                now,
+                Duration::from_micros((NATIVE_TARGET_FRAME_INTERVAL_MS * 1000.0).round() as u64),
+            );
+        }
+    }
+
+    pub fn clear_requested_animation_burst_if_quiet(&mut self, elapsed_ms: f64) {
+        if self.requested_animation_burst_frames_remaining == 0
+            && self
+                .requested_animation_burst_quiet_until_elapsed_ms
+                .is_some_and(|quiet_until| elapsed_ms >= quiet_until)
+        {
+            self.clear_requested_animation_burst();
+        }
+    }
+
+    fn clear_requested_animation_burst(&mut self) {
+        self.requested_animation_burst_frames_remaining = 0;
+        self.requested_animation_burst_started_elapsed_ms = None;
+        self.requested_animation_burst_quiet_until_elapsed_ms = None;
+        self.requested_animation_burst_hard_stop_elapsed_ms = None;
+    }
+
     pub fn consume_due_wake(&mut self, now: Instant) -> bool {
         if self.next_wake_at.is_some_and(|wake_at| now >= wake_at) {
             self.next_wake_at = None;
-            self.last_scheduler_reason = Some(NativeSchedulerReason::Timer);
-            self.current_scheduler_reason = Some(NativeSchedulerReason::Timer);
+            let reason = if self.requested_animation_burst_frames_remaining > 0 {
+                self.dirty_revision = self.dirty_revision.saturating_add(1);
+                NativeSchedulerReason::RequestedAnimation
+            } else {
+                NativeSchedulerReason::Timer
+            };
+            self.last_scheduler_reason = Some(reason);
+            self.current_scheduler_reason = Some(reason);
             self.current_role_dirty_reason = None;
             self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
             true
@@ -1463,6 +1608,41 @@ pub struct NativeMouseWindowPosition {
     pub window_height: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrameEvidenceKey {
+    pub frame_seq: u64,
+    pub content_revision: u64,
+    pub layout_revision: u64,
+    pub render_scene_revision: u64,
+    pub surface_id: SurfaceId,
+    pub surface_epoch: u64,
+    pub input_event_seq: Option<u64>,
+    pub present_id: u64,
+    pub proof_request_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativePreviewPerfStats {
+    pub kind: String,
+    pub status: String,
+    pub role: NativeWindowRole,
+    pub frame_seq: u64,
+    pub sample_elapsed_ms: f64,
+    pub render_loop_mode: NativeRenderLoopMode,
+    pub frame_pacing: NativeFramePacing,
+    pub renders_per_second: f64,
+    pub render_hook_ms: Option<f64>,
+    pub present_call_ms: Option<f64>,
+    pub input_to_present_ms: Option<f64>,
+    pub missed_frame_count: u64,
+    pub proof_mode: String,
+    pub proof_overhead_ms: Option<f64>,
+    pub telemetry_drop_count: u64,
+    pub last_missed_frame_cause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_evidence_key: Option<FrameEvidenceKey>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppWindowReadbackArtifact {
     pub path: String,
@@ -1475,6 +1655,8 @@ pub struct AppWindowReadbackArtifact {
     pub content_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_frame_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_evidence_key: Option<FrameEvidenceKey>,
     pub capture_method: String,
     pub texture_format: String,
     pub nonblank_samples: usize,
@@ -1577,11 +1759,13 @@ pub type NativeRenderHook = Box<
 pub type NativePollHook =
     Box<dyn FnMut(NativePollContext) -> Result<NativePollResult, String> + Send>;
 pub type NativeExitHook = Box<dyn FnMut() -> Option<String> + Send>;
+pub type NativePerfStatsHook = Box<dyn FnMut(NativePreviewPerfStats) + Send>;
 
 pub struct NativeWindowHooks {
     pub poll: Option<NativePollHook>,
     pub should_exit: Option<NativeExitHook>,
     pub render: NativeRenderHook,
+    pub perf_stats: Option<NativePerfStatsHook>,
 }
 
 impl NativeWindowHooks {
@@ -1590,6 +1774,7 @@ impl NativeWindowHooks {
             poll: None,
             should_exit: None,
             render,
+            perf_stats: None,
         }
     }
 }
@@ -1599,6 +1784,12 @@ fn native_window_exit_reason(hooks: &mut Option<NativeWindowHooks>) -> Option<St
         .as_mut()
         .and_then(|hooks| hooks.should_exit.as_mut())
         .and_then(|should_exit| should_exit())
+}
+
+fn notify_native_perf_stats(hooks: &mut Option<NativeWindowHooks>, stats: NativePreviewPerfStats) {
+    if let Some(callback) = hooks.as_mut().and_then(|hooks| hooks.perf_stats.as_mut()) {
+        callback(stats);
+    }
 }
 
 fn poll_native_window_hooks(
@@ -2399,6 +2590,7 @@ async fn run_surface_probe_inner(
     let mut last_interactive_surface_readback_skipped_for_stale_input = false;
     let mut last_interactive_surface_readback_pending = false;
     let mut last_render_loop_report_write_ms: Option<f64> = None;
+    let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
@@ -2461,6 +2653,9 @@ async fn run_surface_probe_inner(
         let poll_started_at = Instant::now();
         render_loop_state.note_poll_started(hold_started.elapsed().as_secs_f64() * 1000.0);
         render_loop_state.consume_due_wake(poll_started_at);
+        render_loop_state.clear_requested_animation_burst_if_quiet(
+            hold_started.elapsed().as_secs_f64() * 1000.0,
+        );
         let input_sample_started = Instant::now();
         let mut sampled_input_event_wake_count_before =
             input_event_wake_count.load(Ordering::Relaxed);
@@ -2516,6 +2711,19 @@ async fn run_surface_probe_inner(
                 );
             }
             render_loop_state.apply_poll_result(&poll_result, input.real_os_events_observed);
+            if poll_result.wants_animation_frame {
+                render_loop_state.request_animation_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                    NativeSchedulerReason::RequestedAnimation,
+                );
+            } else if input.real_os_events_observed && poll_result.dirty {
+                render_loop_state.request_animation_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                    NativeSchedulerReason::HostInput,
+                );
+            }
             if poll_result.dirty {
                 render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
@@ -2523,6 +2731,11 @@ async fn run_surface_probe_inner(
         } else if input.real_os_events_observed && !native_input_delta_is_button_press_only(&input)
         {
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
+            render_loop_state.request_animation_burst(
+                poll_started_at,
+                hold_started.elapsed().as_secs_f64() * 1000.0,
+                NativeSchedulerReason::HostInput,
+            );
             render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
         }
         let wake_generation = wake_handle.generation();
@@ -2913,6 +3126,10 @@ async fn run_surface_probe_inner(
             queue_submit_call_ms,
             present_call_ms,
         );
+        render_loop_state.schedule_requested_animation_followup(
+            Instant::now(),
+            hold_started.elapsed().as_secs_f64() * 1000.0,
+        );
         let post_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let skip_interactive_surface_readback_for_stale_input = interactive_readback.is_some()
             && post_present_input_event_wake_count > sampled_input_event_wake_count;
@@ -2928,6 +3145,52 @@ async fn run_surface_probe_inner(
             skip_interactive_surface_readback_for_stale_input;
         last_interactive_surface_readback_pending =
             interactive_readback.is_some() && !skip_interactive_surface_readback_for_stale_input;
+        let current_frame_evidence_key = frame_evidence_key_for_presented_frame(
+            &render_loop_state,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            (last_presented_input_event_wake_count > 0)
+                .then_some(last_presented_input_event_wake_count),
+            None,
+        );
+        last_frame_evidence_key = Some(current_frame_evidence_key.clone());
+        let stats_elapsed = hold_started.elapsed();
+        let stats_elapsed_seconds = stats_elapsed.as_secs_f64().max(0.001);
+        let stats_presented_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
+            &input_event_wake_timeline,
+            last_presented_input_event_wake_count,
+            hold_started,
+        );
+        let stats_input_to_present_ms = elapsed_delta_ms(
+            stats_presented_input_wake_elapsed_ms,
+            render_loop_state.last_present_completed_elapsed_ms,
+        );
+        let stats_proof_mode = if last_interactive_surface_readback_queued {
+            if last_interactive_surface_readback_pending {
+                "readback_pending"
+            } else {
+                "readback"
+            }
+        } else if last_interactive_surface_readback_skipped_for_external_proof {
+            "external_app_owned_readback"
+        } else if last_interactive_surface_readback_skipped_for_stale_input {
+            "skipped_stale_input"
+        } else {
+            "off"
+        };
+        notify_native_perf_stats(
+            &mut hooks,
+            native_preview_perf_stats_snapshot(
+                options.role,
+                &render_loop_state,
+                stats_elapsed,
+                render_loop_state.rendered_frame_count as f64 / stats_elapsed_seconds,
+                stats_input_to_present_ms,
+                stats_proof_mode,
+                None,
+                Some(current_frame_evidence_key),
+            ),
+        );
         if let Some(report) = options.render_loop_state_report.as_deref() {
             let report_write_started = Instant::now();
             write_render_loop_state_report(
@@ -2974,7 +3237,8 @@ async fn run_surface_probe_inner(
                     last_interactive_surface_readback_skipped_for_stale_input,
                     last_interactive_surface_readback_pending,
                 )
-                .with_external_render_proof(external_render_proof.as_ref()),
+                .with_external_render_proof(external_render_proof.as_ref())
+                .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
                 None,
             )?;
             last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
@@ -2992,6 +3256,7 @@ async fn run_surface_probe_inner(
             artifact.presented_revision = Some(render_loop_state.presented_revision);
             artifact.content_revision = Some(render_loop_state.last_render_content_revision);
             artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
+            artifact.frame_evidence_key = last_frame_evidence_key.clone();
             last_interactive_readback_artifact = Some(artifact);
             if let Some(report) = options.render_loop_state_report.as_deref() {
                 let report_write_started = Instant::now();
@@ -3039,7 +3304,8 @@ async fn run_surface_probe_inner(
                         last_interactive_surface_readback_skipped_for_stale_input,
                         last_interactive_surface_readback_pending,
                     )
-                    .with_external_render_proof(external_render_proof.as_ref()),
+                    .with_external_render_proof(external_render_proof.as_ref())
+                    .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
                     None,
                 )?;
                 last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
@@ -3094,7 +3360,8 @@ async fn run_surface_probe_inner(
                 last_interactive_surface_readback_skipped_for_stale_input,
                 last_interactive_surface_readback_pending,
             )
-            .with_external_render_proof(external_render_proof.as_ref()),
+            .with_external_render_proof(external_render_proof.as_ref())
+            .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
             None,
         )?;
     }
@@ -3230,6 +3497,7 @@ struct NativeRenderLoopReportExtras {
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
     external_render_proof: Option<serde_json::Value>,
+    frame_evidence_key: Option<FrameEvidenceKey>,
 }
 
 impl NativeRenderLoopReportExtras {
@@ -3273,6 +3541,11 @@ impl NativeRenderLoopReportExtras {
         self.external_render_proof = proof.cloned();
         self
     }
+
+    fn with_frame_evidence_key(mut self, key: Option<&FrameEvidenceKey>) -> Self {
+        self.frame_evidence_key = key.cloned();
+        self
+    }
 }
 
 fn render_loop_report_extras(
@@ -3306,6 +3579,7 @@ fn render_loop_report_extras(
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
         external_render_proof: None,
+        frame_evidence_key: None,
     }
 }
 
@@ -3391,6 +3665,93 @@ fn elapsed_delta_ms(start_ms: Option<f64>, end_ms: Option<f64>) -> Option<f64> {
     match (start_ms, end_ms) {
         (Some(start), Some(end)) if end >= start => Some(end - start),
         _ => None,
+    }
+}
+
+fn native_frame_pacing_snapshot(state: &NativeRenderLoopState) -> NativeFramePacing {
+    let state_name = if state.mode == NativeRenderLoopMode::ContinuousProbe {
+        NativeFramePacingState::Probe
+    } else if state.requested_animation_burst_frames_remaining > 0
+        || state
+            .requested_animation_burst_quiet_until_elapsed_ms
+            .is_some()
+    {
+        NativeFramePacingState::RequestedAnimationBurst
+    } else {
+        NativeFramePacingState::Idle
+    };
+    NativeFramePacing {
+        state: state_name,
+        target_frame_interval_ms: NATIVE_TARGET_FRAME_INTERVAL_MS,
+        last_frame_interval_ms: state.last_present_interval_ms,
+        last_frame_lateness_ms: state.last_frame_lateness_ms,
+        timer_due: state.next_wake_at.is_some(),
+        requested_animation_burst_frames_remaining: state
+            .requested_animation_burst_frames_remaining,
+        requested_animation_burst_started_elapsed_ms: state
+            .requested_animation_burst_started_elapsed_ms,
+        requested_animation_burst_quiet_until_elapsed_ms: state
+            .requested_animation_burst_quiet_until_elapsed_ms,
+        requested_animation_burst_hard_stop_elapsed_ms: state
+            .requested_animation_burst_hard_stop_elapsed_ms,
+        requested_animation_burst_min_frames: REQUESTED_ANIMATION_BURST_MIN_FRAMES,
+        requested_animation_quiet_ms: REQUESTED_ANIMATION_QUIET_MS,
+        requested_animation_hard_cap_ms: REQUESTED_ANIMATION_HARD_CAP_MS,
+        requested_animation_max_pending_snapshots: REQUESTED_ANIMATION_MAX_PENDING_SNAPSHOTS,
+    }
+}
+
+fn frame_evidence_key_for_presented_frame(
+    state: &NativeRenderLoopState,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    input_event_seq: Option<u64>,
+    proof_request_id: Option<u64>,
+) -> FrameEvidenceKey {
+    FrameEvidenceKey {
+        frame_seq: state.rendered_frame_count,
+        content_revision: state.last_render_content_revision,
+        layout_revision: state.last_render_content_revision,
+        render_scene_revision: state.last_render_content_revision,
+        surface_id: surface_id.clone(),
+        surface_epoch,
+        input_event_seq,
+        present_id: state.rendered_frame_count,
+        proof_request_id,
+    }
+}
+
+fn native_preview_perf_stats_snapshot(
+    role: NativeWindowRole,
+    state: &NativeRenderLoopState,
+    elapsed: Duration,
+    renders_per_second: f64,
+    input_to_present_ms: Option<f64>,
+    proof_mode: impl Into<String>,
+    proof_overhead_ms: Option<f64>,
+    frame_evidence_key: Option<FrameEvidenceKey>,
+) -> NativePreviewPerfStats {
+    NativePreviewPerfStats {
+        kind: "preview-perf-stats".to_owned(),
+        status: "pass".to_owned(),
+        role,
+        frame_seq: state.rendered_frame_count,
+        sample_elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        render_loop_mode: state.mode,
+        frame_pacing: native_frame_pacing_snapshot(state),
+        renders_per_second,
+        render_hook_ms: elapsed_delta_ms(
+            state.last_surface_acquired_elapsed_ms,
+            state.last_render_hook_completed_elapsed_ms,
+        ),
+        present_call_ms: state.last_present_call_ms,
+        input_to_present_ms,
+        missed_frame_count: state.missed_frame_count,
+        proof_mode: proof_mode.into(),
+        proof_overhead_ms,
+        telemetry_drop_count: state.telemetry_drop_count,
+        last_missed_frame_cause: state.last_missed_frame_cause.clone(),
+        frame_evidence_key,
     }
 }
 
@@ -3526,6 +3887,29 @@ fn write_render_loop_state_report(
         }
         _ => None,
     };
+    let proof_mode = if extras.last_interactive_surface_readback_queued {
+        if extras.last_interactive_surface_readback_pending {
+            "readback_pending"
+        } else {
+            "readback"
+        }
+    } else if extras.last_interactive_surface_readback_skipped_for_external_proof {
+        "external_app_owned_readback"
+    } else if extras.last_interactive_surface_readback_skipped_for_stale_input {
+        "skipped_stale_input"
+    } else {
+        "off"
+    };
+    let preview_perf_stats = native_preview_perf_stats_snapshot(
+        role,
+        state,
+        elapsed,
+        renders_per_second,
+        input_wake_to_present_ms,
+        proof_mode,
+        present_to_readback_report_ms,
+        extras.frame_evidence_key.clone(),
+    );
     let stale_for_latest_input = extras
         .presented_input_event_wake_count
         .is_some_and(|presented| presented < extras.input_event_wake_count);
@@ -3592,6 +3976,8 @@ fn write_render_loop_state_report(
         "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
         "last_render_target_kind": state.last_render_target_kind,
         "last_poll_diagnostics": state.last_poll_diagnostics,
+        "frame_pacing": preview_perf_stats.frame_pacing.clone(),
+        "preview_perf_stats": preview_perf_stats.clone(),
         "loop_exit_reason": state.loop_exit_reason,
         "forced_frame_count": state.forced_frame_count,
         "renders_per_second": renders_per_second,
@@ -3637,6 +4023,7 @@ fn write_render_loop_state_report(
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
         "last_external_render_proof": extras.external_render_proof,
+        "frame_evidence_key": extras.frame_evidence_key,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
         "current_scheduler_reason": state.current_scheduler_reason,
@@ -3817,6 +4204,7 @@ fn finish_visible_surface_readback(
         presented_revision: None,
         content_revision: None,
         rendered_frame_count: None,
+        frame_evidence_key: None,
         capture_method: "wgpu-visible-surface-copy-src-readback".to_owned(),
         texture_format: format!("{:?}", pending.format),
         nonblank_samples,
@@ -4485,6 +4873,60 @@ mod tests {
     }
 
     #[test]
+    fn frame_evidence_key_tracks_presented_frame_identity() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented_with_content(7, 42);
+        let surface_id = SurfaceId("surface-test".to_owned());
+
+        let key = frame_evidence_key_for_presented_frame(&state, &surface_id, 9, Some(3), Some(11));
+
+        assert_eq!(key.frame_seq, 1);
+        assert_eq!(key.present_id, 1);
+        assert_eq!(key.content_revision, 42);
+        assert_eq!(key.layout_revision, 42);
+        assert_eq!(key.render_scene_revision, 42);
+        assert_eq!(key.surface_id, surface_id);
+        assert_eq!(key.surface_epoch, 9);
+        assert_eq!(key.input_event_seq, Some(3));
+        assert_eq!(key.proof_request_id, Some(11));
+    }
+
+    #[test]
+    fn preview_perf_stats_keep_proof_overhead_separate_from_ux_latency() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_surface_acquired(4.0);
+        state.note_render_hook_completed(6.5);
+        state.note_present_completed(12.0);
+        state.note_submit_phase_durations(0.2, 0.1, 1.4);
+        state.mark_presented_with_content(2, 5);
+        let key = frame_evidence_key_for_presented_frame(
+            &state,
+            &SurfaceId("surface-test".to_owned()),
+            1,
+            Some(8),
+            None,
+        );
+
+        let stats = native_preview_perf_stats_snapshot(
+            NativeWindowRole::Preview,
+            &state,
+            Duration::from_millis(120),
+            60.0,
+            Some(8.0),
+            "readback",
+            Some(24.0),
+            Some(key.clone()),
+        );
+
+        assert_eq!(stats.render_loop_mode, NativeRenderLoopMode::DemandDriven);
+        assert_eq!(stats.input_to_present_ms, Some(8.0));
+        assert_eq!(stats.proof_overhead_ms, Some(24.0));
+        assert_eq!(stats.render_hook_ms, Some(2.5));
+        assert_eq!(stats.present_call_ms, Some(1.4));
+        assert_eq!(stats.frame_evidence_key, Some(key));
+    }
+
+    #[test]
     fn demand_driven_scheduler_wakes_for_surface_change() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented(state.dirty_revision);
@@ -4498,6 +4940,50 @@ mod tests {
         assert_eq!(
             state.last_scheduler_reason,
             Some(NativeSchedulerReason::SurfaceChanged)
+        );
+    }
+
+    #[test]
+    fn requested_animation_burst_is_bounded_inside_demand_driven_mode() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+
+        assert_eq!(
+            native_frame_pacing_snapshot(&state).state,
+            NativeFramePacingState::RequestedAnimationBurst
+        );
+        assert_eq!(
+            state.requested_animation_burst_frames_remaining,
+            REQUESTED_ANIMATION_BURST_MIN_FRAMES
+        );
+        assert!(!state.should_render(now, false));
+
+        let due = now + Duration::from_millis(17);
+        assert!(state.consume_due_wake(due));
+        assert_eq!(
+            state.last_scheduler_reason,
+            Some(NativeSchedulerReason::RequestedAnimation)
+        );
+        assert!(state.should_render(due, false));
+
+        let dirty = state.dirty_revision;
+        state.mark_presented(dirty);
+        state.note_present_completed(27.0);
+        state.schedule_requested_animation_followup(due, 27.0);
+        assert_eq!(state.requested_animation_burst_frames_remaining, 1);
+        assert!(state.next_wake_at.is_some());
+
+        let second_due = due + Duration::from_millis(17);
+        assert!(state.consume_due_wake(second_due));
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(44.0);
+        state.clear_requested_animation_burst_if_quiet(200.0);
+        assert_eq!(
+            native_frame_pacing_snapshot(&state).state,
+            NativeFramePacingState::Idle
         );
     }
 

@@ -102,6 +102,7 @@ const DEV_TYPE_INSPECTOR_LIST_LOAD_STEP: usize = 4;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
+const DEV_PREVIEW_PERF_REFRESH_MS: u64 = 250;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
 const DEFAULT_PREVIEW_HEIGHT: f32 = 720.0;
@@ -5988,6 +5989,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         source_bytes: source.len() as u64,
         source_sha256: code_hash.clone(),
         runtime_summary: runtime_summary.clone(),
+        preview_perf_stats: None,
         shared_render_state: Arc::clone(&shared_render_state),
         live_runtime: live_runtime.clone(),
         world_scene: world_scene.clone(),
@@ -6083,6 +6085,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let poll_shared_render_state = Arc::clone(&shared_render_state);
         let poll_preview_ipc_state = Arc::clone(&preview_ipc_state);
         let render_preview_ipc_state = Arc::clone(&preview_ipc_state);
+        let perf_preview_ipc_state = Arc::clone(&preview_ipc_state);
         let input_state = Arc::new(Mutex::new(PreviewNativeInputState::default()));
         let poll_input_state = Arc::clone(&input_state);
         let render_input_state = Arc::clone(&input_state);
@@ -6520,6 +6523,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             poll: Some(poll),
             should_exit: Some(should_exit),
             render,
+            perf_stats: Some(Box::new(move |stats| {
+                if let Ok(mut state) = perf_preview_ipc_state.lock() {
+                    state.preview_perf_stats = Some(stats);
+                }
+            })),
         })
     };
     boon_native_app_window::run_visible_surface_probe_with_hooks_and_wake(
@@ -6758,6 +6766,22 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
             }
+            if !input_hot_path && shell.refresh_preview_perf_snapshot_if_due(context.now) {
+                dirty = true;
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
+                if !needs_layout_refresh
+                    && !cache_needs_dev_render_layout(&render_state, context.width, context.height)
+                    && patch_dev_render_footer_content(&shell, &mut render_state)
+                {
+                    render_state.revision = render_state.revision.saturating_add(1);
+                    render_state.fast_frame_patch_count =
+                        render_state.fast_frame_patch_count.saturating_add(1);
+                    layout_refreshed = true;
+                } else {
+                    needs_layout_refresh = true;
+                }
+            }
             if context.forced_frame && render_state.layout_frame.is_some() {
                 dirty = true;
                 role_dirty_reason = role_dirty_reason.or(Some(
@@ -6778,8 +6802,11 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let caret_wake = input_state
                 .editor_focused
                 .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS);
-            let telemetry_wake =
-                (!input_hot_path).then(|| shell.preview_summary_wake_after_ms(context.now));
+            let telemetry_wake = (!input_hot_path).then(|| {
+                shell
+                    .preview_summary_wake_after_ms(context.now)
+                    .min(shell.preview_perf_wake_after_ms(context.now))
+            });
             let next_wake_after_ms = [caret_wake, telemetry_wake].into_iter().flatten().min();
             let scheduler_reason = if context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
@@ -6849,6 +6876,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             poll: Some(poll),
             should_exit: None,
             render,
+            perf_stats: None,
         })
     };
     let report_shell = Arc::clone(&dev_shell);
@@ -10623,6 +10651,27 @@ fn preview_runtime_summary_response(
     })
 }
 
+fn preview_perf_snapshot_response(state: &PreviewIpcState) -> serde_json::Value {
+    let ipc_counters = state.ipc_counters.snapshot();
+    let mut response = json!({
+        "kind": "preview-perf-snapshot",
+        "status": if state.preview_perf_stats.is_some() { "pass" } else { "not-run" },
+        "transport_bound": true,
+        "bounded_query": true,
+        "fixed_scalar_fields_only": true,
+        "runtime_state_locked": false,
+        "full_state_mirroring_allowed": false,
+        "full_state_mirroring_observed": false,
+        "preview_pid": std::process::id(),
+        "preview_perf": state.preview_perf_stats.clone(),
+    });
+    attach_preview_ipc_counter_snapshot(&mut response, &ipc_counters);
+    attach_latest_wins_metrics(&mut response, state.replace_worker.metrics());
+    let payload_bytes = serde_json::to_vec(&response).unwrap_or_default().len() as u64;
+    response["preview_perf_payload_bytes"] = json!(payload_bytes);
+    response
+}
+
 fn preview_fresh_runtime_summary_for_state(
     state: &Arc<Mutex<PreviewIpcState>>,
 ) -> Result<(serde_json::Value, Arc<Mutex<PreviewSharedRenderState>>), Box<dyn std::error::Error>> {
@@ -12641,8 +12690,11 @@ fn native_gpu_dev_visible_render_hook(
         "dev_hot_path_counters": {
             "preview_replace_result_poll_count": shell.preview_replace_result_poll_count,
             "preview_summary_query_count": shell.preview_summary_query_count,
+            "preview_perf_query_count": shell.preview_perf_query_count,
             "hot_path_preview_replace_result_poll_count": shell.hot_path_preview_replace_result_poll_count,
             "hot_path_preview_summary_query_count": shell.hot_path_preview_summary_query_count,
+            "hot_path_preview_perf_query_count": shell.hot_path_preview_perf_query_count,
+            "preview_perf_hot_path_query_count": shell.hot_path_preview_perf_query_count,
             "command_probe_count": 0
         },
         "dev_render_cache": {
@@ -19540,6 +19592,33 @@ impl PreviewTransport {
         }
     }
 
+    fn preview_perf_snapshot(&self) -> serde_json::Value {
+        let Some(connect) = &self.connect else {
+            return json!({
+                "status": "not-bound",
+                "kind": "preview-perf-snapshot",
+                "transport_bound": false,
+                "bounded_query": true
+            });
+        };
+        match send_preview_ipc_request_with_timeouts(
+            connect,
+            json!({"kind": "preview-perf-snapshot"}),
+            Duration::ZERO,
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
+        ) {
+            Ok(value) => value,
+            Err(error) => json!({
+                "status": "unavailable",
+                "kind": "preview-perf-snapshot",
+                "transport_bound": true,
+                "bounded_query": true,
+                "diagnostic": error.to_string()
+            }),
+        }
+    }
+
     fn runtime_value(
         &self,
         paths: &[String],
@@ -19638,10 +19717,14 @@ struct DevWindowShell {
     last_preview_summary: serde_json::Value,
     last_good_runtime_summary: Option<serde_json::Value>,
     last_preview_summary_refresh: Option<Instant>,
+    last_preview_perf_snapshot: serde_json::Value,
+    last_preview_perf_refresh: Option<Instant>,
     preview_replace_result_poll_count: u64,
     preview_summary_query_count: u64,
+    preview_perf_query_count: u64,
     hot_path_preview_replace_result_poll_count: u64,
     hot_path_preview_summary_query_count: u64,
+    hot_path_preview_perf_query_count: u64,
     last_dev_command: String,
     last_dev_command_status: String,
     last_dev_command_detail: Option<String>,
@@ -19787,11 +19870,15 @@ impl Clone for DevWindowShell {
             last_preview_summary: self.last_preview_summary.clone(),
             last_good_runtime_summary: self.last_good_runtime_summary.clone(),
             last_preview_summary_refresh: self.last_preview_summary_refresh,
+            last_preview_perf_snapshot: self.last_preview_perf_snapshot.clone(),
+            last_preview_perf_refresh: self.last_preview_perf_refresh,
             preview_replace_result_poll_count: self.preview_replace_result_poll_count,
             preview_summary_query_count: self.preview_summary_query_count,
+            preview_perf_query_count: self.preview_perf_query_count,
             hot_path_preview_replace_result_poll_count: self
                 .hot_path_preview_replace_result_poll_count,
             hot_path_preview_summary_query_count: self.hot_path_preview_summary_query_count,
+            hot_path_preview_perf_query_count: self.hot_path_preview_perf_query_count,
             last_dev_command: self.last_dev_command.clone(),
             last_dev_command_status: self.last_dev_command_status.clone(),
             last_dev_command_detail: self.last_dev_command_detail.clone(),
@@ -19851,10 +19938,19 @@ impl DevWindowShell {
             }),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            last_preview_perf_snapshot: json!({
+                "status": "not-run",
+                "kind": "preview-perf-snapshot",
+                "reason": "preview performance snapshot has not been queried yet",
+                "bounded_query": true
+            }),
+            last_preview_perf_refresh: None,
             preview_replace_result_poll_count: 0,
             preview_summary_query_count: 0,
+            preview_perf_query_count: 0,
             hot_path_preview_replace_result_poll_count: 0,
             hot_path_preview_summary_query_count: 0,
+            hot_path_preview_perf_query_count: 0,
             last_dev_command: "startup".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -20271,6 +20367,13 @@ impl DevWindowShell {
                 ),
             ));
         }
+        lines.push((
+            "Preview perf".to_owned(),
+            preview_perf_footer_summary(
+                &self.last_preview_perf_snapshot,
+                self.last_preview_perf_refresh,
+            ),
+        ));
         if preview_error_count > 0 || preview_error != "-" {
             let preview_error_summary = if preview_error_count > 0 {
                 format!(
@@ -21281,9 +21384,40 @@ impl DevWindowShell {
         previous_hash != next_hash
     }
 
+    fn refresh_preview_perf_snapshot_if_due(&mut self, now: Instant) -> bool {
+        let refresh_interval = Duration::from_millis(DEV_PREVIEW_PERF_REFRESH_MS);
+        let due = self
+            .last_preview_perf_refresh
+            .is_none_or(|last| now.duration_since(last) >= refresh_interval);
+        if !due {
+            return false;
+        }
+        self.preview_perf_query_count = self.preview_perf_query_count.saturating_add(1);
+        let previous_hash = boon_runtime::sha256_bytes(
+            &serde_json::to_vec(&self.last_preview_perf_snapshot).unwrap_or_default(),
+        );
+        self.last_preview_perf_snapshot = self.preview_transport.preview_perf_snapshot();
+        self.last_preview_perf_refresh = Some(now);
+        let next_hash = boon_runtime::sha256_bytes(
+            &serde_json::to_vec(&self.last_preview_perf_snapshot).unwrap_or_default(),
+        );
+        previous_hash != next_hash
+    }
+
     fn preview_summary_wake_after_ms(&self, now: Instant) -> u64 {
         let refresh_interval = self.preview_summary_refresh_interval();
         self.last_preview_summary_refresh
+            .and_then(|last| {
+                let due_at = last + refresh_interval;
+                due_at.checked_duration_since(now)
+            })
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
+    fn preview_perf_wake_after_ms(&self, now: Instant) -> u64 {
+        let refresh_interval = Duration::from_millis(DEV_PREVIEW_PERF_REFRESH_MS);
+        self.last_preview_perf_refresh
             .and_then(|last| {
                 let due_at = last + refresh_interval;
                 due_at.checked_duration_since(now)
@@ -22936,6 +23070,85 @@ fn runtime_footer_summary(
     };
     parts.push(keys_text);
     parts.join(", ")
+}
+
+fn preview_perf_footer_summary(
+    snapshot: &serde_json::Value,
+    refreshed_at: Option<Instant>,
+) -> String {
+    let age = refreshed_at
+        .map(|instant| format!("{:.1}s", instant.elapsed().as_secs_f64()))
+        .unwrap_or_else(|| "-".to_owned());
+    let Some(stats) = snapshot.get("preview_perf") else {
+        let status = snapshot
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run");
+        return format!(
+            "mode idle, last -, render -, age {age}, proof off, drops 0, {}",
+            ui_status_label(status).to_ascii_lowercase()
+        );
+    };
+    let render_loop_mode = stats
+        .get("render_loop_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("demand_driven");
+    let pacing_state = stats
+        .pointer("/frame_pacing/state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("idle");
+    let mode = if render_loop_mode == "continuous_probe" {
+        "probe"
+    } else if pacing_state == "requested_animation_burst" {
+        "burst"
+    } else {
+        "idle"
+    };
+    let last = stats
+        .get("input_to_present_ms")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| {
+            stats
+                .get("present_call_ms")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .map(format_ms_compact)
+        .unwrap_or_else(|| "-".to_owned());
+    let render = stats
+        .get("render_hook_ms")
+        .and_then(serde_json::Value::as_f64)
+        .map(format_ms_compact)
+        .unwrap_or_else(|| "-".to_owned());
+    let fps = stats
+        .get("renders_per_second")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".to_owned());
+    let proof = stats
+        .get("proof_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("off");
+    let drops = stats
+        .get("telemetry_drop_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if mode == "idle" {
+        format!("mode idle, last {last}, render {render}, age {age}, proof {proof}, drops {drops}")
+    } else {
+        format!(
+            "mode {mode}, fps {fps}, last {last}, render {render}, age {age}, proof {proof}, drops {drops}"
+        )
+    }
+}
+
+fn format_ms_compact(value: f64) -> String {
+    if value >= 100.0 {
+        format!("{value:.0}ms")
+    } else if value >= 10.0 {
+        format!("{value:.1}ms")
+    } else {
+        format!("{value:.2}ms")
+    }
 }
 
 fn format_runtime_bytes(bytes: u64) -> String {
@@ -49602,6 +49815,7 @@ struct PreviewIpcState {
     source_bytes: u64,
     source_sha256: String,
     runtime_summary: serde_json::Value,
+    preview_perf_stats: Option<boon_native_app_window::NativePreviewPerfStats>,
     shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
     world_scene: Option<PreviewWorldSceneStore>,
@@ -55415,6 +55629,22 @@ fn handle_preview_ipc_client(
             let mut response = state.replace_status_cache.clone();
             attach_latest_wins_metrics(&mut response, state.replace_worker.metrics());
             response
+        };
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("preview-perf-snapshot") {
+        let response = {
+            let state = state
+                .lock()
+                .map_err(|_| "preview IPC state mutex poisoned")?;
+            preview_perf_snapshot_response(&state)
         };
         write_preview_ipc_response(
             &mut stream,
@@ -70047,10 +70277,14 @@ label:
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            last_preview_perf_snapshot: json!({"status": "not-run", "kind": "preview-perf-snapshot"}),
+            last_preview_perf_refresh: None,
             preview_replace_result_poll_count: 0,
             preview_summary_query_count: 0,
+            preview_perf_query_count: 0,
             hot_path_preview_replace_result_poll_count: 0,
             hot_path_preview_summary_query_count: 0,
+            hot_path_preview_perf_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -70919,6 +71153,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256: source_sha256.clone(),
             runtime_summary: initial_summary,
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: Some(Arc::clone(&live_runtime)),
             world_scene: None,
@@ -70993,6 +71228,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256,
             runtime_summary: initial_summary,
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: Some(Arc::clone(&live_runtime)),
             world_scene: None,
@@ -71149,6 +71385,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256: runtime_source_hash,
             runtime_summary: initial_summary,
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: Some(Arc::clone(&live_runtime)),
             world_scene: None,
@@ -71266,6 +71503,147 @@ label:
                 .iter()
                 .skip(1)
                 .all(|(label, value)| { label.is_empty() && value.chars().count() <= 48 })
+        );
+    }
+
+    #[test]
+    fn dev_footer_includes_cached_preview_perf_row() {
+        let (mut shell, _, _, _) = test_dev_editor_context("store: []\n");
+        shell.last_preview_perf_snapshot = json!({
+            "status": "pass",
+            "kind": "preview-perf-snapshot",
+            "preview_perf": {
+                "kind": "preview-perf-stats",
+                "status": "pass",
+                "role": "preview",
+                "frame_seq": 12,
+                "sample_elapsed_ms": 250.0,
+                "render_loop_mode": "demand_driven",
+                "frame_pacing": {
+                    "state": "requested_animation_burst",
+                    "target_frame_interval_ms": 16.666,
+                    "last_frame_interval_ms": 15.5,
+                    "last_frame_lateness_ms": 0.0,
+                    "timer_due": false,
+                    "requested_animation_burst_min_frames": 2,
+                    "requested_animation_quiet_ms": 100,
+                    "requested_animation_hard_cap_ms": 1000,
+                    "requested_animation_max_pending_snapshots": 1
+                },
+                "renders_per_second": 59.8,
+                "render_hook_ms": 1.3,
+                "present_call_ms": 2.1,
+                "input_to_present_ms": 8.4,
+                "missed_frame_count": 0,
+                "proof_mode": "off",
+                "proof_overhead_ms": null,
+                "telemetry_drop_count": 0,
+                "last_missed_frame_cause": null
+            }
+        });
+        shell.last_preview_perf_refresh = Some(Instant::now());
+
+        let footer_text = shell.footer_display_lines().join("\n");
+
+        assert!(footer_text.contains("Preview perf: mode burst"));
+        assert!(footer_text.contains("fps 59.8"));
+        assert!(footer_text.contains("last 8.40ms"));
+        assert_eq!(shell.hot_path_preview_perf_query_count, 0);
+    }
+
+    #[test]
+    fn preview_perf_snapshot_response_is_bounded_and_avoids_runtime_summary() {
+        let source_path = PathBuf::from("examples/counter.bn");
+        let source = "store: []\n".to_owned();
+        let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = PreviewIpcState {
+            source_path: source_path.clone(),
+            source_text: source.clone(),
+            runtime_units: project_units_for_source_text(&source_path, &source),
+            source_bytes: source.len() as u64,
+            source_sha256: source_hash,
+            runtime_summary: json!({"large_runtime_summary": "must not be copied"}),
+            preview_perf_stats: Some(boon_native_app_window::NativePreviewPerfStats {
+                kind: "preview-perf-stats".to_owned(),
+                status: "pass".to_owned(),
+                role: boon_native_app_window::NativeWindowRole::Preview,
+                frame_seq: 3,
+                sample_elapsed_ms: 20.0,
+                render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
+                frame_pacing: boon_native_app_window::NativeFramePacing {
+                    state: boon_native_app_window::NativeFramePacingState::Idle,
+                    target_frame_interval_ms: 1000.0 / 60.0,
+                    last_frame_interval_ms: Some(16.0),
+                    last_frame_lateness_ms: Some(0.0),
+                    timer_due: false,
+                    requested_animation_burst_frames_remaining: 0,
+                    requested_animation_burst_started_elapsed_ms: None,
+                    requested_animation_burst_quiet_until_elapsed_ms: None,
+                    requested_animation_burst_hard_stop_elapsed_ms: None,
+                    requested_animation_burst_min_frames: 2,
+                    requested_animation_quiet_ms: 100,
+                    requested_animation_hard_cap_ms: 1000,
+                    requested_animation_max_pending_snapshots: 1,
+                },
+                renders_per_second: 0.0,
+                render_hook_ms: Some(1.0),
+                present_call_ms: Some(1.2),
+                input_to_present_ms: Some(4.0),
+                missed_frame_count: 0,
+                proof_mode: "off".to_owned(),
+                proof_overhead_ms: None,
+                telemetry_drop_count: 0,
+                last_missed_frame_cause: None,
+                frame_evidence_key: Some(boon_native_app_window::FrameEvidenceKey {
+                    frame_seq: 3,
+                    content_revision: 9,
+                    layout_revision: 9,
+                    render_scene_revision: 9,
+                    surface_id: boon_host::SurfaceId("surface-test".to_owned()),
+                    surface_epoch: 1,
+                    input_event_seq: Some(2),
+                    present_id: 3,
+                    proof_request_id: None,
+                }),
+            }),
+            shared_render_state,
+            live_runtime: None,
+            world_scene: None,
+            world_editor_session: None,
+            latest_accepted_command_id: 0,
+            latest_accepted_source_revision: 0,
+            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
+            prewarmed_project_hashes: BTreeSet::new(),
+            prewarmed_project_results: BTreeMap::new(),
+            prewarm_worker: PreviewPrewarmWorkerQueue::default(),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+            ipc_counters: PreviewIpcCounterState::default(),
+            shutdown: PreviewShutdownState::default(),
+        };
+
+        let response = preview_perf_snapshot_response(&state);
+
+        assert_eq!(response["status"], "pass");
+        assert_eq!(response["runtime_state_locked"], false);
+        assert!(response.get("runtime_summary").is_none());
+        assert_eq!(response["preview_perf"]["frame_seq"], 3);
+        assert!(
+            response["preview_perf_payload_bytes"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                < 4096,
+            "{response}"
         );
     }
 
@@ -71443,10 +71821,14 @@ label:
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            last_preview_perf_snapshot: json!({"status": "not-run", "kind": "preview-perf-snapshot"}),
+            last_preview_perf_refresh: None,
             preview_replace_result_poll_count: 0,
             preview_summary_query_count: 0,
+            preview_perf_query_count: 0,
             hot_path_preview_replace_result_poll_count: 0,
             hot_path_preview_summary_query_count: 0,
+            hot_path_preview_perf_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -73769,10 +74151,14 @@ label:
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            last_preview_perf_snapshot: json!({"status": "not-run", "kind": "preview-perf-snapshot"}),
+            last_preview_perf_refresh: None,
             preview_replace_result_poll_count: 0,
             preview_summary_query_count: 0,
+            preview_perf_query_count: 0,
             hot_path_preview_replace_result_poll_count: 0,
             hot_path_preview_summary_query_count: 0,
+            hot_path_preview_perf_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -73888,10 +74274,14 @@ label:
             last_preview_summary: json!({"status": "not-run"}),
             last_good_runtime_summary: None,
             last_preview_summary_refresh: None,
+            last_preview_perf_snapshot: json!({"status": "not-run", "kind": "preview-perf-snapshot"}),
+            last_preview_perf_refresh: None,
             preview_replace_result_poll_count: 0,
             preview_summary_query_count: 0,
+            preview_perf_query_count: 0,
             hot_path_preview_replace_result_poll_count: 0,
             hot_path_preview_summary_query_count: 0,
+            hot_path_preview_perf_query_count: 0,
             last_dev_command: "test".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
@@ -74355,6 +74745,7 @@ label:
             source_bytes: counter_source.len() as u64,
             source_sha256: counter_hash.clone(),
             runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: Some(Arc::new(Mutex::new(
                 boon_runtime::LiveRuntime::new(
@@ -75036,6 +75427,7 @@ label:
             source_bytes: counter_source.len() as u64,
             source_sha256: counter_hash.clone(),
             runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &counter_source)
                 .ok()
@@ -75289,6 +75681,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256: runtime_units_hash,
             runtime_summary: json!({"status": "pass"}),
+            preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: None,
             world_scene: None,
@@ -75358,6 +75751,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256: project_hash,
             runtime_summary: json!({"status": "pass", "source": "current-preview-runtime"}),
+            preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: None,
             world_scene: None,
@@ -75411,6 +75805,7 @@ label:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: json!({"status": "pass"}),
+            preview_perf_stats: None,
             shared_render_state: Arc::new(Mutex::new(PreviewSharedRenderState {
                 layout_proof: json!({"status": "pass"}),
                 layout_frame_override: None,
@@ -80301,6 +80696,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &source)
                 .ok()
@@ -80361,6 +80757,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &source)
                 .ok()
@@ -80984,6 +81381,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: Some(Arc::new(Mutex::new(runtime))),
             world_scene: None,
@@ -81147,6 +81545,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: boon_runtime::LiveRuntime::from_project(
                 "test-physical-preview",
@@ -81238,6 +81637,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: boon_runtime::LiveRuntime::from_project(
                 "test-todomvc-preview",
@@ -81340,6 +81740,7 @@ document:
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
+            preview_perf_stats: None,
             shared_render_state,
             live_runtime: boon_runtime::LiveRuntime::from_project("test-novywave-preview", &units)
                 .ok()

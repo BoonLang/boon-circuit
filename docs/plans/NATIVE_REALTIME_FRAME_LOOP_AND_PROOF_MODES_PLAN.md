@@ -1,6 +1,6 @@
 # Native Realtime Frame Loop, Proof Modes, And Performance HUD Plan
 
-Status: planned
+Status: in progress
 
 Created: 2026-06-30
 
@@ -271,6 +271,41 @@ case, not a compiler/runtime/document/renderer/verifier special case.
 - Formula/list fanout must be generic read-index/currentness behavior.
 - Batch reset and startup fast paths must be generic pattern recognizers with
   fallback equivalence tests.
+
+## Current Implementation Progress
+
+2026-06-30 first implementation slice:
+
+- Added generic `NativeFramePacing`, `NativePreviewPerfStats`, and
+  `FrameEvidenceKey` data models in `boon_native_app_window`.
+- Render-loop reports now include `frame_pacing`, `preview_perf_stats`, and
+  `frame_evidence_key`, with proof overhead kept separate from
+  `input_to_present_ms`.
+- Visible-surface readback artifacts can carry the same `FrameEvidenceKey` as
+  the presented frame they prove.
+- Preview app-window hooks publish bounded perf stats into preview IPC state
+  without reading runtime summaries.
+- Added a cheap `preview-perf-snapshot` IPC endpoint that copies fixed scalar
+  fields only and avoids `LiveRuntime::state_summary()`.
+- The dev window footer now includes one cached `Preview perf` row and refreshes
+  the snapshot outside input hot paths at a 250 ms cadence. If only the footer
+  row changes and a retained footer layout exists, the dev window patches footer
+  text instead of forcing a full layout refresh.
+- Implemented `RequestedAnimation` as a bounded pacing substate inside
+  `DemandDriven`, not as a third render-loop mode. Host input and explicit
+  animation requests now schedule short 60 FPS follow-up bursts using the plan's
+  initial min-frame, quiet, and hard-cap defaults.
+- Focused verification passed:
+  - `cargo check -q -p boon_native_app_window`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo test -q -p boon_native_app_window frame_evidence_key`
+  - `cargo test -q -p boon_native_app_window preview_perf_stats`
+  - `cargo test -q -p boon_native_app_window requested_animation_burst`
+  - `cargo test -q -p boon_native_playground preview_perf`
+
+This slice does not complete the plan. Deeper frame-pacing verification,
+active/pending snapshots, retained extraction/upload, full proof identity gates,
+native UX latency gates, and generic runtime/list/currentness work remain.
 
 ## Implementation Slices
 

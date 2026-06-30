@@ -307,6 +307,62 @@ This slice does not complete the plan. Deeper frame-pacing verification,
 active/pending snapshots, retained extraction/upload, full proof identity gates,
 native UX latency gates, and generic runtime/list/currentness work remain.
 
+2026-06-30 proof-contract slice:
+
+- Render-loop reports now include `proof_lag_frames` when a readback artifact
+  proves an earlier presented frame than the current report frame.
+- `verify_report_schema` now applies a native GPU contract check to passing
+  native reports:
+  - native UX reports are rejected when they claim
+    `render_loop_mode=continuous_probe`;
+  - `frame_pacing` and `preview_perf_stats` shapes are validated when present;
+  - every `wgpu-visible-surface-copy-src-readback` artifact must carry a
+    structured `frame_evidence_key`;
+  - readback artifact `content_revision`, `rendered_frame_count`, and
+    `surface_epoch` are checked against the embedded frame evidence key when
+    those artifact fields are present;
+  - `preview_perf_stats.frame_evidence_key` must match the top-level
+    `frame_evidence_key`;
+  - `proof_lag_frames` must match the top-level frame and
+    `last_interactive_readback_artifact.frame_evidence_key`.
+- `verify-native-gpu-negative` now includes adversarial cases for:
+  - hash-only visible readback proof;
+  - mismatched readback frame evidence;
+  - preview perf frame-evidence mismatch;
+  - missing proof-lag reporting.
+- Focused verification passed:
+  - `cargo test -q -p boon_report_schema native_gpu_schema`
+  - `cargo check -q -p boon_native_app_window`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+  - `git diff --check`
+  - production diff no-hacks scan for `cells`, `address`, `A0`, source path,
+    fixture-specific, and example-specific strings
+
+2026-06-30 retained scroll slice:
+
+- Preview runtime-backed scroll now has a generic same-materialized-window fast
+  path:
+  - reads `document_scroll_window` from the current layout proof;
+  - when the new scroll offset stays in the same row/column materialization
+    window, reuses the retained base layout frame and applies only the residual
+    transform;
+  - avoids the live-runtime `document_state_summary_for_window` relower path for
+    same-window wheel movement;
+  - stores `scroll_materialization_mode` and
+    `retained_same_materialized_window_scroll` in `layout_profile` for verifier
+    evidence.
+- Scroll transform metadata now carries `base_layout_frame_hash`, so repeated
+  retained scroll updates reapply the total residual to the base frame instead
+  of compounding transforms.
+- Focused verification passed:
+  - `cargo check -q -p boon_native_playground`
+  - `cargo test -q -p boon_native_playground cells_preview_same_window_scroll_uses_retained_materialized_frame`
+  - `cargo test -q -p boon_native_playground cells_preview_scroll_input_moves_window_forward_and_back`
+  - `cargo test -q -p boon_native_playground cells_shift_wheel_scrolls_horizontally`
+  - `cargo test -q -p boon_native_playground cells_horizontal_scroll_keeps_row_gutter_fixed_and_headers_synced`
+
 ## Implementation Slices
 
 1. Terminology and schema:

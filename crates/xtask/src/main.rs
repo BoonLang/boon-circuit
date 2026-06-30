@@ -58329,6 +58329,124 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "hash-only-visible-readback-proof",
+            merge_json(
+                base(),
+                json!({
+                    "readback_artifact": {
+                        "path": "target/reports/native-gpu/hash-only-visible-readback-proof.png",
+                        "sha256": "hash-only-fixture",
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "content_revision": 7,
+                        "rendered_frame_count": 3
+                    }
+                }),
+            ),
+        ),
+        (
+            "mismatched-readback-frame-evidence",
+            merge_json(
+                base(),
+                json!({
+                    "readback_artifact": {
+                        "path": "target/reports/native-gpu/mismatched-readback-frame-evidence.png",
+                        "sha256": "mismatched-fixture",
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "content_revision": 7,
+                        "rendered_frame_count": 3,
+                        "frame_evidence_key": {
+                            "frame_seq": 3,
+                            "content_revision": 6,
+                            "layout_revision": 7,
+                            "render_scene_revision": 7,
+                            "surface_id": "surface:negative",
+                            "surface_epoch": 1,
+                            "input_event_seq": null,
+                            "present_id": 3,
+                            "proof_request_id": 3
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
+            "preview-perf-frame-evidence-mismatch",
+            merge_json(
+                base(),
+                json!({
+                    "surface_id": "surface:negative",
+                    "surface_epoch": 1,
+                    "rendered_frame_count": 3,
+                    "last_render_content_revision": 7,
+                    "frame_evidence_key": {
+                        "frame_seq": 3,
+                        "content_revision": 7,
+                        "layout_revision": 7,
+                        "render_scene_revision": 7,
+                        "surface_id": "surface:negative",
+                        "surface_epoch": 1,
+                        "input_event_seq": null,
+                        "present_id": 3,
+                        "proof_request_id": 3
+                    },
+                    "preview_perf_stats": {
+                        "frame_evidence_key": {
+                            "frame_seq": 2,
+                            "content_revision": 7,
+                            "layout_revision": 7,
+                            "render_scene_revision": 7,
+                            "surface_id": "surface:negative",
+                            "surface_epoch": 1,
+                            "input_event_seq": null,
+                            "present_id": 2,
+                            "proof_request_id": 2
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
+            "missing-proof-lag-frames",
+            merge_json(
+                base(),
+                json!({
+                    "surface_id": "surface:negative",
+                    "surface_epoch": 1,
+                    "rendered_frame_count": 4,
+                    "last_render_content_revision": 9,
+                    "frame_evidence_key": {
+                        "frame_seq": 4,
+                        "content_revision": 9,
+                        "layout_revision": 9,
+                        "render_scene_revision": 9,
+                        "surface_id": "surface:negative",
+                        "surface_epoch": 1,
+                        "input_event_seq": null,
+                        "present_id": 4,
+                        "proof_request_id": 4
+                    },
+                    "last_interactive_readback_artifact": {
+                        "path": "target/reports/native-gpu/missing-proof-lag-frames.png",
+                        "sha256": "missing-proof-lag-fixture",
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "content_revision": 8,
+                        "rendered_frame_count": 3,
+                        "frame_evidence_key": {
+                            "frame_seq": 3,
+                            "content_revision": 8,
+                            "layout_revision": 8,
+                            "render_scene_revision": 8,
+                            "surface_id": "surface:negative",
+                            "surface_epoch": 1,
+                            "input_event_seq": null,
+                            "present_id": 3,
+                            "proof_request_id": 3
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
             "mutated-source-event-field",
             merge_json(
                 base(),
@@ -62526,6 +62644,8 @@ fn native_gpu_report_integrity_reasons(
         reasons.push("copied or reused pixel hash proof is forbidden".to_owned());
     }
     collect_scaffold_render_proof_reasons(report, "$", &mut reasons);
+    collect_native_gpu_frame_evidence_reasons(report, "$", &mut reasons);
+    collect_native_gpu_top_level_frame_evidence_linkage_reasons(report, &mut reasons);
     if report
         .get("measurement_source")
         .and_then(serde_json::Value::as_str)
@@ -62863,6 +62983,209 @@ fn is_opaque_source_identity(value: &str) -> bool {
         return false;
     };
     suffix.len() >= 16 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn collect_native_gpu_frame_evidence_reasons(
+    value: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let visible_surface_readback = object
+                .get("capture_method")
+                .and_then(serde_json::Value::as_str)
+                == Some("wgpu-visible-surface-copy-src-readback");
+            if let Some(key) = object.get("frame_evidence_key") {
+                validate_native_gpu_frame_evidence_key(
+                    key,
+                    &format!("{path}.frame_evidence_key"),
+                    reasons,
+                );
+                if visible_surface_readback {
+                    validate_native_gpu_readback_frame_evidence(value, key, path, reasons);
+                }
+            } else if visible_surface_readback {
+                reasons.push(format!(
+                    "{path} visible-surface WGPU readback is missing frame_evidence_key"
+                ));
+            }
+            for (key, child) in object {
+                collect_native_gpu_frame_evidence_reasons(child, &format!("{path}.{key}"), reasons);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_native_gpu_frame_evidence_reasons(
+                    child,
+                    &format!("{path}[{index}]"),
+                    reasons,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_native_gpu_frame_evidence_key(
+    key: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<String>,
+) -> bool {
+    let Some(object) = key.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return false;
+    };
+    let mut valid = true;
+    for field in ["frame_seq", "surface_epoch", "present_id"] {
+        if !object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value > 0)
+        {
+            reasons.push(format!("{path}.{field} must be a positive integer"));
+            valid = false;
+        }
+    }
+    for field in [
+        "content_revision",
+        "layout_revision",
+        "render_scene_revision",
+    ] {
+        if object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            reasons.push(format!("{path}.{field} must be an integer"));
+            valid = false;
+        }
+    }
+    if !object
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|surface_id| !surface_id.is_empty())
+    {
+        reasons.push(format!("{path}.surface_id must be a nonempty string"));
+        valid = false;
+    }
+    for field in ["input_event_seq", "proof_request_id"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        {
+            reasons.push(format!("{path}.{field} must be null or an integer"));
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_native_gpu_readback_frame_evidence(
+    artifact: &serde_json::Value,
+    key: &serde_json::Value,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    for (artifact_field, key_field) in [
+        ("content_revision", "content_revision"),
+        ("rendered_frame_count", "frame_seq"),
+        ("surface_epoch", "surface_epoch"),
+    ] {
+        let Some(artifact_value) = artifact
+            .get(artifact_field)
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        let key_value = key.get(key_field).and_then(serde_json::Value::as_u64);
+        if key_value != Some(artifact_value) {
+            reasons.push(format!(
+                "{path}.frame_evidence_key.{key_field} does not match {artifact_field}"
+            ));
+        }
+    }
+}
+
+fn collect_native_gpu_top_level_frame_evidence_linkage_reasons(
+    report: &serde_json::Value,
+    reasons: &mut Vec<String>,
+) {
+    let root_key = report.get("frame_evidence_key");
+    let stats_key = report.pointer("/preview_perf_stats/frame_evidence_key");
+    if stats_key.is_some() && root_key.is_none() {
+        reasons.push(
+            "preview_perf_stats.frame_evidence_key requires top-level frame_evidence_key"
+                .to_owned(),
+        );
+    }
+    if let (Some(root_key), Some(stats_key)) = (root_key, stats_key)
+        && root_key != stats_key
+    {
+        reasons.push(
+            "preview_perf_stats.frame_evidence_key does not match top-level frame_evidence_key"
+                .to_owned(),
+        );
+    }
+    if let Some(root_key) = root_key {
+        for (report_field, key_field) in [
+            ("surface_epoch", "surface_epoch"),
+            ("rendered_frame_count", "frame_seq"),
+            ("last_render_content_revision", "content_revision"),
+        ] {
+            let Some(report_value) = report.get(report_field).and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            if root_key.get(key_field).and_then(serde_json::Value::as_u64) != Some(report_value) {
+                reasons.push(format!(
+                    "frame_evidence_key.{key_field} does not match top-level {report_field}"
+                ));
+            }
+        }
+        if let (Some(surface_id), Some(key_surface_id)) = (
+            report.get("surface_id").and_then(serde_json::Value::as_str),
+            root_key
+                .get("surface_id")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            if surface_id != key_surface_id {
+                reasons.push("frame_evidence_key.surface_id does not match surface_id".to_owned());
+            }
+        }
+    }
+    let readback_key = report.pointer("/last_interactive_readback_artifact/frame_evidence_key");
+    if let Some(readback_key) = readback_key {
+        let Some(root_key) = root_key else {
+            reasons.push(
+                "last_interactive_readback_artifact.frame_evidence_key requires top-level frame_evidence_key"
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(current_frame) = root_key
+            .get("frame_seq")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return;
+        };
+        let Some(proof_frame) = readback_key
+            .get("frame_seq")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return;
+        };
+        let expected_lag = current_frame.saturating_sub(proof_frame);
+        if report
+            .get("proof_lag_frames")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_lag)
+        {
+            reasons.push(format!(
+                "proof_lag_frames must report {expected_lag} for last_interactive_readback_artifact"
+            ));
+        }
+    }
 }
 
 fn command_argv_contains_pair(argv: &[serde_json::Value], flag: &str, value: &str) -> bool {

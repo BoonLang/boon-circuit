@@ -3887,6 +3887,17 @@ fn write_render_loop_state_report(
         }
         _ => None,
     };
+    let proof_lag_frames = last_interactive_readback_artifact.and_then(|artifact| {
+        artifact
+            .frame_evidence_key
+            .as_ref()
+            .and_then(|artifact_key| {
+                extras
+                    .frame_evidence_key
+                    .as_ref()
+                    .map(|current_key| current_key.frame_seq.saturating_sub(artifact_key.frame_seq))
+            })
+    });
     let proof_mode = if extras.last_interactive_surface_readback_queued {
         if extras.last_interactive_surface_readback_pending {
             "readback_pending"
@@ -4013,6 +4024,7 @@ fn write_render_loop_state_report(
         "wake_to_queue_ms": wake_to_queue_ms,
         "queue_to_present_ms": queue_to_present_ms,
         "present_to_readback_report_ms": present_to_readback_report_ms,
+        "proof_lag_frames": proof_lag_frames,
         "last_render_loop_report_write_ms": extras.last_render_loop_report_write_ms,
         "last_interactive_readback_finish_ms": extras.last_interactive_readback_finish_ms,
         "last_interactive_readback_completed_elapsed_ms": extras.last_interactive_readback_completed_elapsed_ms,

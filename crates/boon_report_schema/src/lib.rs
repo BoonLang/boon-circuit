@@ -531,6 +531,9 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report_is_runtime_execution_layer(&report) {
         verify_runtime_execution_metadata(&report, path)?;
     }
+    if report_is_native_gpu_command(&report) {
+        verify_native_gpu_report_contract(&report, path)?;
+    }
     if report.get("playground_surface").is_some()
         || report_layer_is(&report, "headed-smoke")
         || report_layer_is(&report, "headed-ply")
@@ -26060,6 +26063,336 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn report_is_native_gpu_command(report: &JsonValue) -> bool {
+    let Some(command) = report.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    command.starts_with("verify-native-gpu-")
+        || matches!(
+            command,
+            "boon-native-playground-role"
+                | "verify-demand-driven-render-loop"
+                | "verify-native-dev-editor-scroll-speed"
+                | "verify-native-example-switch-speed"
+                | "verify-native-real-window-input-environment"
+                | "verify-native-visible-launch"
+                | "verify-native-examples"
+                | "verify-native-dev-window-editor"
+                | "verify-native-example-tabs"
+                | "verify-native-editor-format"
+                | "verify-native-example-speed"
+                | "verify-native-counter-interaction-speed"
+        )
+}
+
+fn report_is_native_ux_command(report: &JsonValue) -> bool {
+    matches!(
+        report.get("command").and_then(JsonValue::as_str),
+        Some(
+            "verify-native-gpu-preview-e2e"
+                | "verify-native-gpu-scroll-speed"
+                | "verify-native-gpu-idle-wake"
+                | "verify-native-dev-editor-scroll-speed"
+                | "verify-native-example-switch-speed"
+                | "verify-native-counter-interaction-speed"
+        )
+    )
+}
+
+fn verify_native_gpu_report_contract(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let mut reasons = Vec::new();
+    if report_is_native_ux_command(report)
+        && report.get("render_loop_mode").and_then(JsonValue::as_str) == Some("continuous_probe")
+    {
+        reasons.push("native UX reports must not use render_loop_mode=continuous_probe".to_owned());
+    }
+    if let Some(frame_pacing) = report.get("frame_pacing") {
+        verify_native_frame_pacing(frame_pacing, "$.frame_pacing", &mut reasons);
+    }
+    if let Some(preview_perf) = report.get("preview_perf_stats") {
+        verify_native_preview_perf_stats(preview_perf, "$.preview_perf_stats", &mut reasons);
+    }
+    collect_native_frame_evidence_reasons(report, "$", &mut reasons);
+    collect_native_top_level_frame_evidence_linkage_reasons(report, &mut reasons);
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} native GPU report contract failed: {}",
+            report_path.display(),
+            reasons.join("; ")
+        )
+        .into())
+    }
+}
+
+fn verify_native_frame_pacing(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return;
+    };
+    if !matches!(
+        object.get("state").and_then(JsonValue::as_str),
+        Some("idle" | "requested_animation_burst" | "probe")
+    ) {
+        reasons.push(format!("{path}.state has an unknown pacing state"));
+    }
+    if !object
+        .get("target_frame_interval_ms")
+        .and_then(JsonValue::as_f64)
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+    {
+        reasons.push(format!(
+            "{path}.target_frame_interval_ms must be a positive number"
+        ));
+    }
+    for field in [
+        "requested_animation_burst_frames_remaining",
+        "requested_animation_burst_min_frames",
+        "requested_animation_quiet_ms",
+        "requested_animation_hard_cap_ms",
+        "requested_animation_max_pending_snapshots",
+    ] {
+        if object.get(field).and_then(JsonValue::as_u64).is_none() {
+            reasons.push(format!("{path}.{field} must be an integer"));
+        }
+    }
+}
+
+fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return;
+    };
+    if object.get("kind").and_then(JsonValue::as_str) != Some("preview-perf-stats") {
+        reasons.push(format!("{path}.kind must be preview-perf-stats"));
+    }
+    if object.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        reasons.push(format!("{path}.status must be pass"));
+    }
+    if object
+        .get("frame_seq")
+        .and_then(JsonValue::as_u64)
+        .is_none()
+    {
+        reasons.push(format!("{path}.frame_seq must be an integer"));
+    }
+    if !object
+        .get("sample_elapsed_ms")
+        .and_then(JsonValue::as_f64)
+        .is_some_and(|value| value.is_finite() && value >= 0.0)
+    {
+        reasons.push(format!("{path}.sample_elapsed_ms must be a finite number"));
+    }
+    if !matches!(
+        object.get("render_loop_mode").and_then(JsonValue::as_str),
+        Some("demand_driven" | "continuous_probe")
+    ) {
+        reasons.push(format!("{path}.render_loop_mode has an unknown mode"));
+    }
+    if let Some(frame_pacing) = object.get("frame_pacing") {
+        verify_native_frame_pacing(frame_pacing, &format!("{path}.frame_pacing"), reasons);
+    } else {
+        reasons.push(format!("{path}.frame_pacing is missing"));
+    }
+    for field in [
+        "renders_per_second",
+        "missed_frame_count",
+        "telemetry_drop_count",
+    ] {
+        if object.get(field).is_none() {
+            reasons.push(format!("{path}.{field} is missing"));
+        }
+    }
+    if object
+        .get("proof_mode")
+        .and_then(JsonValue::as_str)
+        .is_none_or(str::is_empty)
+    {
+        reasons.push(format!("{path}.proof_mode must be a nonempty string"));
+    }
+}
+
+fn collect_native_frame_evidence_reasons(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
+    match value {
+        JsonValue::Object(object) => {
+            let visible_surface_readback = object.get("capture_method").and_then(JsonValue::as_str)
+                == Some("wgpu-visible-surface-copy-src-readback");
+            if let Some(key) = object.get("frame_evidence_key") {
+                validate_native_frame_evidence_key(
+                    key,
+                    &format!("{path}.frame_evidence_key"),
+                    reasons,
+                );
+                if visible_surface_readback {
+                    validate_native_readback_frame_evidence(value, key, path, reasons);
+                }
+            } else if visible_surface_readback {
+                reasons.push(format!(
+                    "{path} visible-surface WGPU readback is missing frame_evidence_key"
+                ));
+            }
+            for (key, child) in object {
+                collect_native_frame_evidence_reasons(child, &format!("{path}.{key}"), reasons);
+            }
+        }
+        JsonValue::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_native_frame_evidence_reasons(child, &format!("{path}[{index}]"), reasons);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_native_frame_evidence_key(
+    key: &JsonValue,
+    path: &str,
+    reasons: &mut Vec<String>,
+) -> bool {
+    let Some(object) = key.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return false;
+    };
+    let mut valid = true;
+    for field in ["frame_seq", "surface_epoch", "present_id"] {
+        if !object
+            .get(field)
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|value| value > 0)
+        {
+            reasons.push(format!("{path}.{field} must be a positive integer"));
+            valid = false;
+        }
+    }
+    for field in [
+        "content_revision",
+        "layout_revision",
+        "render_scene_revision",
+    ] {
+        if object.get(field).and_then(JsonValue::as_u64).is_none() {
+            reasons.push(format!("{path}.{field} must be an integer"));
+            valid = false;
+        }
+    }
+    if !object
+        .get("surface_id")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|surface_id| !surface_id.is_empty())
+    {
+        reasons.push(format!("{path}.surface_id must be a nonempty string"));
+        valid = false;
+    }
+    for field in ["input_event_seq", "proof_request_id"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        {
+            reasons.push(format!("{path}.{field} must be null or an integer"));
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn validate_native_readback_frame_evidence(
+    artifact: &JsonValue,
+    key: &JsonValue,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    for (artifact_field, key_field) in [
+        ("content_revision", "content_revision"),
+        ("rendered_frame_count", "frame_seq"),
+        ("surface_epoch", "surface_epoch"),
+    ] {
+        let Some(artifact_value) = artifact.get(artifact_field).and_then(JsonValue::as_u64) else {
+            continue;
+        };
+        let key_value = key.get(key_field).and_then(JsonValue::as_u64);
+        if key_value != Some(artifact_value) {
+            reasons.push(format!(
+                "{path}.frame_evidence_key.{key_field} does not match {artifact_field}"
+            ));
+        }
+    }
+}
+
+fn collect_native_top_level_frame_evidence_linkage_reasons(
+    report: &JsonValue,
+    reasons: &mut Vec<String>,
+) {
+    let root_key = report.get("frame_evidence_key");
+    let stats_key = report.pointer("/preview_perf_stats/frame_evidence_key");
+    if let Some(stats_key) = stats_key
+        && root_key.is_none()
+    {
+        reasons.push(
+            "preview_perf_stats.frame_evidence_key requires top-level frame_evidence_key"
+                .to_owned(),
+        );
+        validate_native_frame_evidence_key(
+            stats_key,
+            "$.preview_perf_stats.frame_evidence_key",
+            reasons,
+        );
+    }
+    if let (Some(root_key), Some(stats_key)) = (root_key, stats_key)
+        && root_key != stats_key
+    {
+        reasons.push(
+            "preview_perf_stats.frame_evidence_key does not match top-level frame_evidence_key"
+                .to_owned(),
+        );
+    }
+    if let Some(root_key) = root_key {
+        for (report_field, key_field) in [
+            ("surface_epoch", "surface_epoch"),
+            ("rendered_frame_count", "frame_seq"),
+            ("last_render_content_revision", "content_revision"),
+        ] {
+            let Some(report_value) = report.get(report_field).and_then(JsonValue::as_u64) else {
+                continue;
+            };
+            if root_key.get(key_field).and_then(JsonValue::as_u64) != Some(report_value) {
+                reasons.push(format!(
+                    "frame_evidence_key.{key_field} does not match top-level {report_field}"
+                ));
+            }
+        }
+        if let (Some(surface_id), Some(key_surface_id)) = (
+            report.get("surface_id").and_then(JsonValue::as_str),
+            root_key.get("surface_id").and_then(JsonValue::as_str),
+        ) {
+            if surface_id != key_surface_id {
+                reasons.push("frame_evidence_key.surface_id does not match surface_id".to_owned());
+            }
+        }
+    }
+    let readback_key = report.pointer("/last_interactive_readback_artifact/frame_evidence_key");
+    if let Some(readback_key) = readback_key {
+        let Some(root_key) = root_key else {
+            reasons.push(
+                "last_interactive_readback_artifact.frame_evidence_key requires top-level frame_evidence_key"
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(current_frame) = root_key.get("frame_seq").and_then(JsonValue::as_u64) else {
+            return;
+        };
+        let Some(proof_frame) = readback_key.get("frame_seq").and_then(JsonValue::as_u64) else {
+            return;
+        };
+        let expected_lag = current_frame.saturating_sub(proof_frame);
+        if report.get("proof_lag_frames").and_then(JsonValue::as_u64) != Some(expected_lag) {
+            reasons.push(format!(
+                "proof_lag_frames must report {expected_lag} for last_interactive_readback_artifact"
+            ));
+        }
+    }
+}
+
 fn verify_common_report_shape(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let version = report
         .get("report_version")
@@ -30684,12 +31017,144 @@ mod tests {
         report
     }
 
+    fn native_frame_evidence_key() -> JsonValue {
+        json!({
+            "frame_seq": 3,
+            "content_revision": 7,
+            "layout_revision": 7,
+            "render_scene_revision": 7,
+            "surface_id": "surface:test",
+            "surface_epoch": 2,
+            "input_event_seq": 11,
+            "present_id": 3,
+            "proof_request_id": 3
+        })
+    }
+
+    fn native_frame_pacing() -> JsonValue {
+        json!({
+            "state": "idle",
+            "target_frame_interval_ms": 16.7,
+            "last_frame_interval_ms": 16.4,
+            "last_frame_lateness_ms": 0.0,
+            "timer_due": false,
+            "requested_animation_burst_frames_remaining": 0,
+            "requested_animation_burst_started_elapsed_ms": null,
+            "requested_animation_burst_quiet_until_elapsed_ms": null,
+            "requested_animation_burst_hard_stop_elapsed_ms": null,
+            "requested_animation_burst_min_frames": 2,
+            "requested_animation_quiet_ms": 100,
+            "requested_animation_hard_cap_ms": 1000,
+            "requested_animation_max_pending_snapshots": 1
+        })
+    }
+
+    fn native_gpu_report_with_frame_evidence() -> JsonValue {
+        let key = native_frame_evidence_key();
+        let pacing = native_frame_pacing();
+        let mut report = base_report();
+        report["command"] = json!("verify-native-gpu-idle-wake");
+        report["command_argv"] = json!(["verify-native-gpu-idle-wake"]);
+        report["native_gpu_contract"] = json!(true);
+        report["render_loop_mode"] = json!("demand_driven");
+        report["surface_id"] = json!("surface:test");
+        report["surface_epoch"] = json!(2);
+        report["rendered_frame_count"] = json!(3);
+        report["last_render_content_revision"] = json!(7);
+        report["proof_lag_frames"] = json!(0);
+        report["frame_pacing"] = pacing.clone();
+        report["frame_evidence_key"] = key.clone();
+        report["preview_perf_stats"] = json!({
+            "kind": "preview-perf-stats",
+            "status": "pass",
+            "role": "preview",
+            "frame_seq": 3,
+            "sample_elapsed_ms": 42.0,
+            "render_loop_mode": "demand_driven",
+            "frame_pacing": pacing,
+            "renders_per_second": 60.0,
+            "render_hook_ms": 1.2,
+            "present_call_ms": 2.4,
+            "input_to_present_ms": 8.0,
+            "missed_frame_count": 0,
+            "proof_mode": "readback",
+            "proof_overhead_ms": 4.0,
+            "telemetry_drop_count": 0,
+            "last_missed_frame_cause": null,
+            "frame_evidence_key": key.clone()
+        });
+        report["last_interactive_readback_artifact"] = json!({
+            "path": "target/reports/native-gpu/test-readback.png",
+            "sha256": "test-readback-sha",
+            "width": 640,
+            "height": 480,
+            "presented_revision": 7,
+            "content_revision": 7,
+            "rendered_frame_count": 3,
+            "frame_evidence_key": key,
+            "capture_method": "wgpu-visible-surface-copy-src-readback",
+            "texture_format": "Bgra8UnormSrgb",
+            "nonblank_samples": 100,
+            "unique_rgba_values": 4,
+            "readback_deadline_ms": 250,
+            "readback_poll_status": "completed_before_deadline"
+        });
+        report
+    }
+
     fn schema_accepts(report: JsonValue, name: &str) -> bool {
         let path = temp_report_path(name);
         write_json(&path, &report).unwrap();
         let accepted = verify_report_schema(&path).is_ok();
         let _ = fs::remove_file(path);
         accepted
+    }
+
+    #[test]
+    fn native_gpu_schema_accepts_structured_frame_evidence() {
+        assert!(schema_accepts(
+            native_gpu_report_with_frame_evidence(),
+            "native-frame-evidence-valid"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_missing_frame_evidence_key() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_readback_artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frame_evidence_key");
+        assert!(!schema_accepts(report, "native-frame-evidence-missing-key"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_mismatched_frame_evidence_key() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_readback_artifact"]["frame_evidence_key"]["content_revision"] =
+            json!(6);
+        assert!(!schema_accepts(
+            report,
+            "native-frame-evidence-mismatched-key"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_hash_only_readback_proof() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_readback_artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frame_evidence_key");
+        report["last_interactive_readback_artifact"]["sha256"] = json!("hash-only-proof");
+        assert!(!schema_accepts(report, "native-frame-evidence-hash-only"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_continuous_probe_ux_report() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["render_loop_mode"] = json!("continuous_probe");
+        assert!(!schema_accepts(report, "native-frame-evidence-probe-ux"));
     }
 
     #[test]

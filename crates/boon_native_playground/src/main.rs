@@ -43751,8 +43751,36 @@ fn preview_apply_scroll_input_with_units(
     let scroll_x_px = (current_scroll_x + scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
     let scroll_y_px = (current_scroll_y + scroll_delta_y * 5.0).clamp(0.0, 2_600.0);
     let current_viewport = layout_proof_viewport(&layout_proof);
-    let (transformed, transformed_frame) =
-        if let (Some(source_path), Some(runtime_units), Some(live_runtime)) =
+    let new_scroll_window = preview_scroll_window(scroll_x_px, scroll_y_px);
+    let retained_same_window_scroll = runtime_units.is_some()
+        && live_runtime.is_some()
+        && layout_proof_scroll_window(&layout_proof).is_some_and(|current| {
+            current.0 == new_scroll_window.0 && current.2 == new_scroll_window.2
+        });
+    let (transformed, transformed_frame) = if retained_same_window_scroll {
+        if let Some((base_layout_proof, base_layout_frame)) =
+            retained_scroll_base_layout(&layout_proof, layout_frame_override.as_deref())
+        {
+            let residual_x = scroll_x_px % PREVIEW_TABLE_COLUMN_WIDTH_PX;
+            let residual_y = scroll_y_px % PREVIEW_TABLE_ROW_HEIGHT_PX;
+            let (mut transformed, transformed_frame) = scrolled_layout_proof_with_header_scroll(
+                &base_layout_proof,
+                Some(&base_layout_frame),
+                residual_x,
+                residual_y,
+                residual_x,
+            )?;
+            annotate_scroll_window_layout_proof(
+                &mut transformed,
+                new_scroll_window,
+                scroll_x_px,
+                scroll_y_px,
+                residual_x,
+                residual_y,
+                "retained_same_materialized_window",
+            );
+            (transformed, transformed_frame)
+        } else if let (Some(source_path), Some(runtime_units), Some(live_runtime)) =
             (source_path, runtime_units, live_runtime)
         {
             preview_layout_for_scroll_window_with_units_for_viewport(
@@ -43770,7 +43798,26 @@ fn preview_apply_scroll_input_with_units(
                 scroll_x_px,
                 scroll_y_px,
             )?
-        };
+        }
+    } else if let (Some(source_path), Some(runtime_units), Some(live_runtime)) =
+        (source_path, runtime_units, live_runtime)
+    {
+        preview_layout_for_scroll_window_with_units_for_viewport(
+            source_path,
+            runtime_units,
+            live_runtime,
+            scroll_x_px,
+            scroll_y_px,
+            current_viewport,
+        )?
+    } else {
+        scrolled_layout_proof(
+            &layout_proof,
+            layout_frame_override.as_deref(),
+            scroll_x_px,
+            scroll_y_px,
+        )?
+    };
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
@@ -43808,6 +43855,78 @@ fn preview_scroll_window(scroll_x_px: f64, scroll_y_px: f64) -> (usize, usize, u
         column_start,
         PREVIEW_TABLE_WINDOW_COLUMNS,
     )
+}
+
+fn layout_proof_scroll_window(layout_proof: &Value) -> Option<(usize, usize, usize, usize)> {
+    let window = layout_proof.get("document_scroll_window")?;
+    Some((
+        window.get("row_start")?.as_u64()? as usize,
+        window.get("row_count")?.as_u64()? as usize,
+        window.get("column_start")?.as_u64()? as usize,
+        window.get("column_count")?.as_u64()? as usize,
+    ))
+}
+
+fn retained_scroll_base_layout(
+    layout_proof: &Value,
+    layout_frame_override: Option<&boon_document::LayoutFrame>,
+) -> Option<(Value, boon_document::LayoutFrame)> {
+    if let Some(base_hash) = layout_proof
+        .pointer("/scroll_transform/base_layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+    {
+        let snapshot = cached_document_render_snapshot(base_hash)?;
+        let mut base_proof = layout_proof.clone();
+        base_proof["layout_frame_hash"] = json!(base_hash);
+        base_proof["scroll_transform"] = json!({
+            "status": "base_materialized_window",
+            "base_layout_frame_hash": base_hash
+        });
+        return Some((base_proof, snapshot.layout_frame.as_ref().clone()));
+    }
+    if layout_proof
+        .pointer("/scroll_transform/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("applied")
+    {
+        return None;
+    }
+    let frame = layout_frame_override
+        .cloned()
+        .or_else(|| layout_frame_from_layout_proof(layout_proof).ok())?;
+    Some((layout_proof.clone(), frame))
+}
+
+fn annotate_scroll_window_layout_proof(
+    layout_proof: &mut Value,
+    scroll_window: (usize, usize, usize, usize),
+    scroll_x_px: f64,
+    scroll_y_px: f64,
+    residual_x: f64,
+    residual_y: f64,
+    materialization_mode: &str,
+) {
+    let (row_start, row_count, column_start, column_count) = scroll_window;
+    layout_proof["document_scroll_window"] = json!({
+        "row_start": row_start,
+        "row_count": row_count,
+        "column_start": column_start,
+        "column_count": column_count,
+        "scroll_x_px": scroll_x_px,
+        "scroll_y_px": scroll_y_px,
+        "residual_x_px": residual_x,
+        "residual_y_px": residual_y,
+        "materialization_mode": materialization_mode
+    });
+    if !layout_proof
+        .get("layout_profile")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        layout_proof["layout_profile"] = json!({});
+    }
+    layout_proof["layout_profile"]["scroll_materialization_mode"] = json!(materialization_mode);
+    layout_proof["layout_profile"]["retained_same_materialized_window_scroll"] =
+        json!(materialization_mode == "retained_same_materialized_window");
 }
 
 #[cfg(test)]
@@ -43885,16 +44004,15 @@ fn preview_layout_for_scroll_window_with_units_for_viewport(
         layout_proof = scrolled_layout;
         layout_frame = scrolled_frame;
     }
-    layout_proof["document_scroll_window"] = json!({
-        "row_start": row_start,
-        "row_count": row_count,
-        "column_start": column_start,
-        "column_count": column_count,
-        "scroll_x_px": scroll_x_px,
-        "scroll_y_px": scroll_y_px,
-        "residual_x_px": residual_x,
-        "residual_y_px": residual_y
-    });
+    annotate_scroll_window_layout_proof(
+        &mut layout_proof,
+        (row_start, row_count, column_start, column_count),
+        scroll_x_px,
+        scroll_y_px,
+        residual_x,
+        residual_y,
+        "runtime_window",
+    );
     cache_layout_runtime_state_snapshot_for_hot_layout_proof(&mut layout_proof, &state_summary);
     Ok((layout_proof, layout_frame))
 }
@@ -43990,6 +44108,7 @@ fn scrolled_layout_proof_with_header_scroll(
         "scroll_x_px": scroll_x_px,
         "scroll_y_px": scroll_y_px,
         "header_scroll_x_px": header_scroll_x_px,
+        "base_layout_frame_hash": base_layout_hash,
         "layout_source": "embedded_transformed_layout_frame",
         "layout_frame_hash_basis": "base-layout-frame-hash-plus-scroll-offset",
         "visual_scroll_applied_before_render": true
@@ -84359,6 +84478,93 @@ document:
         assert!(!layout_has_visible_address(&shared.layout_proof, "Z40"));
         assert_eq!(shared.scroll_x_px, 0.0);
         assert_eq!(shared.scroll_y_px, 0.0);
+    }
+
+    #[test]
+    fn cells_preview_same_window_scroll_uses_retained_materialized_frame() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-same-window-scroll",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let initial_a0 = display_item_rect_by_text(&initial_frame, "10", |item| {
+            item.bounds.x > 45.0 && item.bounds.y > 70.0
+        });
+        let (mouse_x, mouse_y) = first_scroll_region_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+
+        let mut first_scroll = test_keyboard_input(Vec::new(), Vec::new());
+        first_scroll.mouse_scroll_event_count = 1;
+        first_scroll.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: mouse_x,
+            y: mouse_y,
+            window_width: 920.0,
+            window_height: 720.0,
+        });
+        first_scroll.scroll_delta_y = 10.0 / 5.0;
+        preview_apply_scroll_input(
+            &first_scroll,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+
+        let mut second_scroll = first_scroll.clone();
+        second_scroll.mouse_scroll_event_count = 2;
+        second_scroll.scroll_delta_y = 5.0 / 5.0;
+        preview_apply_scroll_input(
+            &second_scroll,
+            Some(&cells_path),
+            Some(&cells_source),
+            Some(&live_runtime),
+            &shared_render_state,
+        )
+        .unwrap();
+
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(
+            shared
+                .layout_proof
+                .pointer("/layout_profile/scroll_materialization_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("retained_same_materialized_window")
+        );
+        assert_eq!(
+            shared
+                .layout_proof
+                .pointer("/document_scroll_window/row_start")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(shared.scroll_y_px, 15.0);
+        let scrolled_a0 = display_item_rect_by_text(
+            shared.layout_frame_override.as_ref().unwrap().as_ref(),
+            "10",
+            |item| item.bounds.x > 45.0 && item.bounds.y > 50.0,
+        );
+        assert!(
+            (f64::from(scrolled_a0.y) - (f64::from(initial_a0.y) - 15.0)).abs() <= 1.0,
+            "same-window scroll should apply total retained residual without compounding; initial_y={}, scrolled_y={}",
+            f64::from(initial_a0.y),
+            f64::from(scrolled_a0.y)
+        );
     }
 
     #[test]

@@ -2812,6 +2812,10 @@ async fn run_surface_probe_inner(
         artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
         artifact.frame_evidence_key = proof_frame_evidence_key.clone();
     }
+    let surface_external_render_proof = external_render_proof_with_frame_evidence_key(
+        external_render_proof.clone(),
+        proof_frame_evidence_key.as_ref(),
+    );
 
     let mut observed_input_adapter = input_adapter.clone();
     let proof = AppWindowSurfaceProof {
@@ -2864,7 +2868,7 @@ async fn run_surface_probe_inner(
         frame_timing,
         post_input_frame_timing,
         input_adapter,
-        external_render_proof: external_render_proof.clone(),
+        external_render_proof: surface_external_render_proof,
         readback_artifact,
     };
     let _ = ready_sender.send(Ok(proof));
@@ -3978,6 +3982,47 @@ fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json
     external_render_proof_has_app_owned_readback(proof)
 }
 
+fn external_render_proof_with_frame_evidence_key(
+    proof: Option<serde_json::Value>,
+    key: Option<&FrameEvidenceKey>,
+) -> Option<serde_json::Value> {
+    let mut proof = proof?;
+    let Some(key) = key else {
+        return Some(proof);
+    };
+    let Ok(key_value) = serde_json::to_value(key) else {
+        return Some(proof);
+    };
+    attach_frame_evidence_key_to_visible_readback_values(&mut proof, &key_value);
+    Some(proof)
+}
+
+fn attach_frame_evidence_key_to_visible_readback_values(
+    value: &mut serde_json::Value,
+    key_value: &serde_json::Value,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let visible_surface_readback = object
+                .get("capture_method")
+                .and_then(serde_json::Value::as_str)
+                == Some("wgpu-visible-surface-copy-src-readback");
+            if visible_surface_readback && !object.contains_key("frame_evidence_key") {
+                object.insert("frame_evidence_key".to_owned(), key_value.clone());
+            }
+            for child in object.values_mut() {
+                attach_frame_evidence_key_to_visible_readback_values(child, key_value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                attach_frame_evidence_key_to_visible_readback_values(child, key_value);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_sha256_hex_string(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -4264,6 +4309,10 @@ fn write_render_loop_state_report(
             "scheduled_wake"
         }
     });
+    let external_render_proof = external_render_proof_with_frame_evidence_key(
+        extras.external_render_proof.clone(),
+        extras.frame_evidence_key.as_ref(),
+    );
     let mut report = serde_json::json!({
         "status": status,
         "role": role.as_str(),
@@ -4380,7 +4429,7 @@ fn write_render_loop_state_report(
         "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
-        "last_external_render_proof": extras.external_render_proof,
+        "last_external_render_proof": external_render_proof,
         "frame_evidence_key": extras.frame_evidence_key,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
@@ -5247,6 +5296,45 @@ mod tests {
         assert_eq!(key.surface_epoch, 9);
         assert_eq!(key.input_event_seq, Some(3));
         assert_eq!(key.proof_request_id, Some(11));
+    }
+
+    #[test]
+    fn external_visible_readback_proof_gets_frame_evidence_key() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented_with_revisions(7, 42, 43, 44);
+        let surface_id = SurfaceId("surface-test".to_owned());
+        let key = frame_evidence_key_for_presented_frame(&state, &surface_id, 9, Some(3), None);
+        let proof = serde_json::json!({
+            "status": "pass",
+            "proof": {
+                "capture_method": "wgpu-visible-surface-copy-src-readback",
+                "artifact": {
+                    "capture_method": "metadata-only"
+                }
+            },
+            "nested": [
+                {
+                    "capture_method": "wgpu-visible-surface-copy-src-readback"
+                }
+            ]
+        });
+
+        let enriched =
+            external_render_proof_with_frame_evidence_key(Some(proof), Some(&key)).unwrap();
+
+        assert_eq!(
+            enriched.pointer("/proof/frame_evidence_key/frame_seq"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            enriched.pointer("/nested/0/frame_evidence_key/surface_id"),
+            Some(&serde_json::json!("surface-test"))
+        );
+        assert!(
+            enriched
+                .pointer("/proof/artifact/frame_evidence_key")
+                .is_none()
+        );
     }
 
     #[test]

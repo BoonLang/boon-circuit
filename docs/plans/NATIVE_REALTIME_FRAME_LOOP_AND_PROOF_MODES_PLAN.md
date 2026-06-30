@@ -595,6 +595,32 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo check -q -p xtask`
   - `git diff --check`
 
+2026-06-30 axis scroll fallback and proof identity slice:
+
+- Axis-specific real-window scroll observation now resolves app-owned evidence
+  generically from the strongest current report source:
+  - loop report `observed_input_adapter` for delivered wheel input;
+  - loop report `last_interactive_readback_artifact` and
+    `last_external_render_proof` for same-frame proof currentness;
+  - supervisor/role surface proof for post-input timing windows.
+- Deterministic role/loop fallback is guarded by role status, isolated Weston
+  display connection, matching `surface_id`, matching `surface_epoch`,
+  same-frame WGPU readback, and non-empty post-input timing. It does not branch
+  on Cells or fixture labels.
+- `boon_native_app_window` now recursively attaches the presented
+  `FrameEvidenceKey` to nested visible-surface WGPU readback proof objects, so
+  proof identity is emitted at the source instead of patched only by verifiers.
+- Fresh verification passed:
+  - `target/debug/xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`
+  - `target/debug/xtask verify-report-schema target/reports/native-gpu/scroll-speed-cells.json`
+- Fresh Cells scroll-speed report highlights:
+  - `status=pass`
+  - `required_real_window_speed_proven=true`
+  - `speed_timing_window=axis-specific-post-real-window-input`
+  - `preview_frame_ms_p95=11.789346`
+  - `post_input_frame_timing.measured_frame_count=118`
+  - `post_input_frame_timing.presented_frame_ms_over_16_7_count=0`
+
 ## Implementation Slices
 
 1. Terminology and schema:

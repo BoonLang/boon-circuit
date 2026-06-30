@@ -49641,6 +49641,178 @@ fn same_frame_scroll_readback_proven(measured_loop: &serde_json::Value) -> bool 
             == Some(true)
 }
 
+fn native_surface_role_prefix(measured_surface_key: &str) -> &'static str {
+    if measured_surface_key == "dev_surface_proof" {
+        "dev"
+    } else {
+        "preview"
+    }
+}
+
+fn native_surface_input_adapter_from_reports(
+    supervisor: &serde_json::Value,
+    measured_role_report: &serde_json::Value,
+    measured_loop_report: &serde_json::Value,
+    measured_surface_key: &str,
+) -> (serde_json::Value, String) {
+    let candidates = vec![
+        (
+            "measured-loop-report.observed_input_adapter".to_owned(),
+            measured_loop_report.get("observed_input_adapter").cloned(),
+        ),
+        (
+            format!("desktop-supervisor.{measured_surface_key}.input_adapter"),
+            supervisor
+                .pointer(&format!("/{measured_surface_key}/input_adapter"))
+                .cloned(),
+        ),
+        (
+            "measured-role-report.details.app_window_surface_proof.input_adapter".to_owned(),
+            measured_role_report
+                .pointer("/details/app_window_surface_proof/input_adapter")
+                .cloned(),
+        ),
+    ];
+
+    for (source, value) in &candidates {
+        if value
+            .as_ref()
+            .is_some_and(native_input_adapter_has_delivered_events)
+        {
+            return (value.clone().unwrap_or_else(|| json!({})), source.clone());
+        }
+    }
+    choose_non_empty_json_value(candidates)
+}
+
+fn native_surface_evidence_from_reports(
+    supervisor: &serde_json::Value,
+    measured_role_report: &serde_json::Value,
+    measured_loop_report: &serde_json::Value,
+    measured_surface_key: &str,
+    field: &str,
+) -> (serde_json::Value, String) {
+    let supervisor_source = format!("desktop-supervisor.{measured_surface_key}.{field}");
+    let supervisor_value = supervisor
+        .pointer(&format!("/{measured_surface_key}/{field}"))
+        .cloned();
+    let role_source = format!("measured-role-report.details.app_window_surface_proof.{field}");
+    let role_value = measured_role_report
+        .pointer(&format!("/details/app_window_surface_proof/{field}"))
+        .cloned();
+
+    let candidates = match field {
+        "readback_artifact" => vec![
+            (
+                "measured-loop-report.last_interactive_readback_artifact".to_owned(),
+                measured_loop_report
+                    .get("last_interactive_readback_artifact")
+                    .cloned(),
+            ),
+            (supervisor_source, supervisor_value),
+            (role_source, role_value),
+        ],
+        "external_render_proof" => vec![
+            (
+                "measured-loop-report.last_external_render_proof".to_owned(),
+                measured_loop_report
+                    .get("last_external_render_proof")
+                    .cloned(),
+            ),
+            (supervisor_source, supervisor_value),
+            (role_source, role_value),
+        ],
+        "post_input_frame_timing" => vec![
+            (supervisor_source, supervisor_value),
+            (role_source, role_value),
+            (
+                "measured-loop-report.post_input_frame_timing".to_owned(),
+                measured_loop_report.get("post_input_frame_timing").cloned(),
+            ),
+        ],
+        "frame_timing" => vec![
+            (supervisor_source, supervisor_value),
+            (role_source, role_value),
+            (
+                "measured-loop-report.frame_timing".to_owned(),
+                measured_loop_report.get("frame_timing").cloned(),
+            ),
+        ],
+        _ => vec![
+            (supervisor_source, supervisor_value),
+            (role_source, role_value),
+        ],
+    };
+
+    choose_non_empty_json_value(candidates)
+}
+
+fn choose_non_empty_json_value(
+    candidates: Vec<(String, Option<serde_json::Value>)>,
+) -> (serde_json::Value, String) {
+    for (source, value) in candidates {
+        if value.as_ref().is_some_and(json_value_has_content) {
+            return (value.unwrap_or_else(|| json!({})), source);
+        }
+    }
+    (json!({}), "missing".to_owned())
+}
+
+fn json_value_has_content(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(object) => !object.is_empty(),
+        serde_json::Value::Array(array) => !array.is_empty(),
+        _ => true,
+    }
+}
+
+fn native_surface_role_loop_reports_match(
+    socket: &str,
+    measured_role_report: &serde_json::Value,
+    measured_loop_report: &serde_json::Value,
+) -> bool {
+    if measured_role_report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return false;
+    }
+    let role_proof = measured_role_report
+        .pointer("/details/app_window_surface_proof")
+        .unwrap_or(&serde_json::Value::Null);
+    if role_proof
+        .get("display_connection")
+        .and_then(serde_json::Value::as_str)
+        != Some(socket)
+    {
+        return false;
+    }
+    let Some(role_surface_id) = role_proof
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(loop_surface_id) = measured_loop_report
+        .get("surface_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    if role_surface_id != loop_surface_id {
+        return false;
+    }
+    let role_surface_epoch = role_proof
+        .get("surface_epoch")
+        .and_then(serde_json::Value::as_u64);
+    let loop_surface_epoch = measured_loop_report
+        .get("surface_epoch")
+        .and_then(serde_json::Value::as_u64);
+    role_surface_epoch.is_some() && role_surface_epoch == loop_surface_epoch
+}
+
 fn run_native_scroll_axis_observation_with_retries(
     label: &str,
     axis: &str,
@@ -49711,6 +49883,10 @@ fn native_scroll_axis_attempt_summary(
         "driver_pass": observation.get("driver_pass").cloned().unwrap_or_else(|| json!(false)),
         "desktop_pass": observation.get("desktop_pass").cloned().unwrap_or_else(|| json!(false)),
         "measured_loop_pass": observation.get("measured_loop_pass").cloned().unwrap_or_else(|| json!(false)),
+        "measured_loop_same_frame_readback_proven": observation.get("measured_loop_same_frame_readback_proven").cloned().unwrap_or_else(|| json!(false)),
+        "post_input_timing_proven": observation.get("post_input_timing_proven").cloned().unwrap_or_else(|| json!(false)),
+        "measured_role_loop_reports_match": observation.get("measured_role_loop_reports_match").cloned().unwrap_or_else(|| json!(false)),
+        "desktop_lifecycle_or_app_owned_reports_ok": observation.get("desktop_lifecycle_or_app_owned_reports_ok").cloned().unwrap_or_else(|| json!(false)),
         "real_os_events_observed": observation.get("real_os_events_observed").cloned().unwrap_or_else(|| json!(false)),
         "wheel_input_observed": observation.get("wheel_input_observed").cloned().unwrap_or_else(|| json!(false)),
         "mouse_scroll_event_count": input_adapter
@@ -49995,6 +50171,14 @@ fn native_scroll_axis_observation_pass(observation: &serde_json::Value, axis: &s
             == Some(true)
         && observation
             .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && observation
+            .get("measured_loop_same_frame_readback_proven")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && observation
+            .get("post_input_timing_proven")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         && input_adapter
@@ -67386,11 +67570,13 @@ fn run_linux_human_like_desktop_surface_smoke(
 
     let loop_report_path = PathBuf::from("target/reports/native-gpu/roles").join(format!(
         "{}-loop-{}-{}.json",
-        if measured_surface_key == "dev_surface_proof" {
-            "dev"
-        } else {
-            "preview"
-        },
+        native_surface_role_prefix(measured_surface_key),
+        example,
+        desktop.id()
+    ));
+    let role_report_path = PathBuf::from("target/reports/native-gpu/roles").join(format!(
+        "{}-{}-{}.json",
+        native_surface_role_prefix(measured_surface_key),
         example,
         desktop.id()
     ));
@@ -67450,14 +67636,127 @@ fn run_linux_human_like_desktop_surface_smoke(
     } else {
         json!({"status": "missing"})
     };
-    let input_adapter = supervisor
-        .pointer(&format!("/{measured_surface_key}/input_adapter"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let readback_artifact = supervisor
-        .pointer(&format!("/{measured_surface_key}/readback_artifact"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let driver_pass = last_driver_success
+        && last_driver_json
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let desktop_pass = desktop_status
+        .as_ref()
+        .is_some_and(|status| status.success());
+    let measured_role_status_key = if measured_surface_key == "dev_surface_proof" {
+        "dev_role_status"
+    } else {
+        "preview_role_status"
+    };
+    let measured_loop_report_key = if measured_surface_key == "dev_surface_proof" {
+        "dev_loop_report"
+    } else {
+        "preview_loop_report"
+    };
+    let measured_role_report_file_key = if measured_surface_key == "dev_surface_proof" {
+        "dev_role_report"
+    } else {
+        "preview_role_report"
+    };
+    let supervisor_loop_report_path = supervisor
+        .get(measured_loop_report_key)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let measured_loop_report_path = supervisor_loop_report_path
+        .clone()
+        .or_else(|| loop_report_path.exists().then(|| loop_report_path.clone()));
+    let measured_loop_report_path_source = if supervisor_loop_report_path.is_some() {
+        format!("desktop-supervisor.{measured_loop_report_key}")
+    } else if measured_loop_report_path.is_some() {
+        "deterministic-role-loop-report-path".to_owned()
+    } else {
+        "missing".to_owned()
+    };
+    let measured_loop_report = measured_loop_report_path
+        .as_ref()
+        .map(|path| {
+            read_json(path).unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "reason": format!("failed to read measured loop report: {error}"),
+                    "path": path
+                })
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "missing",
+                "reason": format!("missing measured loop report `{measured_loop_report_key}`")
+            })
+        });
+    let supervisor_role_report_path = supervisor
+        .get(measured_role_report_file_key)
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let measured_role_report_path = supervisor_role_report_path
+        .clone()
+        .or_else(|| role_report_path.exists().then(|| role_report_path.clone()));
+    let measured_role_report_path_source = if supervisor_role_report_path.is_some() {
+        format!("desktop-supervisor.{measured_role_report_file_key}")
+    } else if measured_role_report_path.is_some() {
+        "deterministic-role-report-path".to_owned()
+    } else {
+        "missing".to_owned()
+    };
+    let measured_role_report = measured_role_report_path
+        .as_ref()
+        .map(|path| {
+            read_json(path).unwrap_or_else(|error| {
+                json!({
+                    "status": "fail",
+                    "reason": format!("failed to read measured role report: {error}"),
+                    "path": path
+                })
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "missing",
+                "reason": format!("missing measured role report `{measured_role_report_file_key}`")
+            })
+        });
+    let (input_adapter, input_adapter_source) = native_surface_input_adapter_from_reports(
+        &supervisor,
+        &measured_role_report,
+        &measured_loop_report,
+        measured_surface_key,
+    );
+    let (readback_artifact, readback_artifact_source) = native_surface_evidence_from_reports(
+        &supervisor,
+        &measured_role_report,
+        &measured_loop_report,
+        measured_surface_key,
+        "readback_artifact",
+    );
+    let (external_render_proof, external_render_proof_source) =
+        native_surface_evidence_from_reports(
+            &supervisor,
+            &measured_role_report,
+            &measured_loop_report,
+            measured_surface_key,
+            "external_render_proof",
+        );
+    let (post_input_frame_timing, post_input_frame_timing_source) =
+        native_surface_evidence_from_reports(
+            &supervisor,
+            &measured_role_report,
+            &measured_loop_report,
+            measured_surface_key,
+            "post_input_frame_timing",
+        );
+    let (frame_timing, frame_timing_source) = native_surface_evidence_from_reports(
+        &supervisor,
+        &measured_role_report,
+        &measured_loop_report,
+        measured_surface_key,
+        "frame_timing",
+    );
     let real_os_events_observed = input_adapter
         .get("real_os_events_observed")
         .and_then(serde_json::Value::as_bool)
@@ -67496,45 +67795,6 @@ fn run_linux_human_like_desktop_surface_smoke(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
             > 0;
-    let driver_pass = last_driver_success
-        && last_driver_json
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-    let desktop_pass = desktop_status
-        .as_ref()
-        .is_some_and(|status| status.success());
-    let measured_role_status_key = if measured_surface_key == "dev_surface_proof" {
-        "dev_role_status"
-    } else {
-        "preview_role_status"
-    };
-    let measured_loop_report_key = if measured_surface_key == "dev_surface_proof" {
-        "dev_loop_report"
-    } else {
-        "preview_loop_report"
-    };
-    let measured_loop_report_path = supervisor
-        .get(measured_loop_report_key)
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
-    let measured_loop_report = measured_loop_report_path
-        .as_ref()
-        .map(|path| {
-            read_json(path).unwrap_or_else(|error| {
-                json!({
-                    "status": "fail",
-                    "reason": format!("failed to read measured loop report: {error}"),
-                    "path": path
-                })
-            })
-        })
-        .unwrap_or_else(|| {
-            json!({
-                "status": "missing",
-                "reason": format!("supervisor missing `{measured_loop_report_key}`")
-            })
-        });
     let measured_loop_status_pass = measured_loop_report
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -67571,25 +67831,50 @@ fn run_linux_human_like_desktop_surface_smoke(
         >= measured_loop_dirty_revision;
     let measured_loop_pass =
         measured_loop_status_pass && measured_loop_presented_fresh && measured_loop_content_fresh;
+    let measured_role_report_status_pass = measured_role_report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     let measured_role_pass = supervisor
         .get(measured_role_status_key)
         .and_then(serde_json::Value::as_str)
-        == Some("pass");
+        == Some("pass")
+        || measured_role_report_status_pass;
     let supervisor_pass = supervisor.get("status").and_then(serde_json::Value::as_str)
         == Some("pass")
         || measured_role_pass;
+    let measured_loop_same_frame_readback_proven =
+        same_frame_scroll_readback_proven(&measured_loop_report);
+    let post_input_timing_proven = post_input_frame_timing
+        .get("measured_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0;
+    let measured_role_loop_reports_match = native_surface_role_loop_reports_match(
+        &socket,
+        &measured_role_report,
+        &measured_loop_report,
+    );
+    let desktop_lifecycle_or_app_owned_reports_ok = desktop_pass
+        || (measured_role_pass
+            && measured_loop_pass
+            && measured_loop_same_frame_readback_proven
+            && measured_role_loop_reports_match);
     let readback_pass = readback_artifact
         .get("nonblank_samples")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
         > 0;
     let pass = driver_pass
-        && desktop_pass
+        && desktop_lifecycle_or_app_owned_reports_ok
         && supervisor_pass
         && readback_pass
         && real_os_events_observed
         && wheel_input_observed
-        && measured_loop_pass;
+        && measured_loop_pass
+        && measured_loop_same_frame_readback_proven
+        && post_input_timing_proven
+        && measured_role_loop_reports_match;
 
     Ok(json!({
         "status": if pass { "pass" } else { "fail" },
@@ -67623,19 +67908,15 @@ fn run_linux_human_like_desktop_surface_smoke(
         "weston_test_driver_stdout_path": driver_stdout_path,
         "weston_test_driver_stderr_path": driver_stderr_path,
         "surface_input_adapter": input_adapter,
+        "surface_input_adapter_source": input_adapter_source,
         "surface_readback_artifact": readback_artifact,
-        "surface_external_render_proof": supervisor
-            .pointer(&format!("/{measured_surface_key}/external_render_proof"))
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-        "surface_post_input_frame_timing": supervisor
-            .pointer(&format!("/{measured_surface_key}/post_input_frame_timing"))
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-        "surface_frame_timing": supervisor
-            .pointer(&format!("/{measured_surface_key}/frame_timing"))
-            .cloned()
-            .unwrap_or_else(|| json!({})),
+        "surface_readback_artifact_source": readback_artifact_source,
+        "surface_external_render_proof": external_render_proof,
+        "surface_external_render_proof_source": external_render_proof_source,
+        "surface_post_input_frame_timing": post_input_frame_timing,
+        "surface_post_input_frame_timing_source": post_input_frame_timing_source,
+        "surface_frame_timing": frame_timing,
+        "surface_frame_timing_source": frame_timing_source,
         "desktop_pid": desktop.id(),
         "preview_child_pid": supervisor
             .get("preview_child_pid")
@@ -67650,13 +67931,22 @@ fn run_linux_human_like_desktop_surface_smoke(
         "supervisor_pass": supervisor_pass,
         "measured_role_status_key": measured_role_status_key,
         "measured_role_pass": measured_role_pass,
+        "measured_role_report_file_key": measured_role_report_file_key,
+        "measured_role_report_path": measured_role_report_path,
+        "measured_role_report_path_source": measured_role_report_path_source,
+        "measured_role_report_status_pass": measured_role_report_status_pass,
         "measured_loop_report_key": measured_loop_report_key,
         "measured_loop_report_path": measured_loop_report_path,
+        "measured_loop_report_path_source": measured_loop_report_path_source,
         "measured_loop_report": measured_loop_report,
         "measured_loop_pass": measured_loop_pass,
         "measured_loop_status_pass": measured_loop_status_pass,
         "measured_loop_presented_fresh": measured_loop_presented_fresh,
         "measured_loop_content_fresh": measured_loop_content_fresh,
+        "measured_loop_same_frame_readback_proven": measured_loop_same_frame_readback_proven,
+        "post_input_timing_proven": post_input_timing_proven,
+        "measured_role_loop_reports_match": measured_role_loop_reports_match,
+        "desktop_lifecycle_or_app_owned_reports_ok": desktop_lifecycle_or_app_owned_reports_ok,
         "readback_pass": readback_pass,
         "wheel_input_observed": wheel_input_observed,
         "real_os_events_observed": real_os_events_observed,
@@ -81999,6 +82289,181 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn axis_surface_report_fallback_keeps_loop_readback_and_role_timing_strict() {
+        let frame_key = json!({
+            "frame_seq": 91,
+            "content_revision": 31,
+            "layout_revision": 7,
+            "render_scene_revision": 29,
+            "surface_id": "preview:test-surface",
+            "surface_epoch": 1,
+            "input_event_seq": 14,
+            "present_id": 91,
+            "proof_request_id": null
+        });
+        let role_report = json!({
+            "status": "pass",
+            "details": {
+                "app_window_surface_proof": {
+                    "display_connection": "boon-test-socket",
+                    "surface_id": "preview:test-surface",
+                    "surface_epoch": 1,
+                    "input_adapter": {
+                        "installed": true,
+                        "real_os_events_observed": true,
+                        "synthetic_input_probe": false,
+                        "mouse_scroll_event_count": 1,
+                        "scroll_delta_y": 120.0,
+                        "mouse_last_window_protocol_id": 7
+                    },
+                    "post_input_frame_timing": {
+                        "measured_frame_count": 59,
+                        "presented_frame_ms_p95": 10.0
+                    },
+                    "readback_artifact": {
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "readback_poll_status": "completed_before_deadline",
+                        "nonblank_samples": 16,
+                        "frame_evidence_key": {
+                            "frame_seq": 2,
+                            "content_revision": 1,
+                            "layout_revision": 1,
+                            "render_scene_revision": 1,
+                            "surface_id": "preview:test-surface",
+                            "surface_epoch": 1,
+                            "input_event_seq": null,
+                            "present_id": 2,
+                            "proof_request_id": null
+                        }
+                    }
+                }
+            }
+        });
+        let loop_report = json!({
+            "status": "pass",
+            "surface_id": "preview:test-surface",
+            "surface_epoch": 1,
+            "frame_evidence_key": frame_key.clone(),
+            "observed_input_adapter": {
+                "installed": true,
+                "real_os_events_observed": true,
+                "synthetic_input_probe": false,
+                "mouse_scroll_event_count": 3,
+                "scroll_delta_y": 360.0,
+                "mouse_last_window_protocol_id": 7
+            },
+            "last_external_render_proof": {
+                "status": "pass",
+                "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
+                "offscreen_app_owned_scene_readback_skipped": true
+            },
+            "last_interactive_readback_artifact": {
+                "capture_method": "wgpu-visible-surface-copy-src-readback",
+                "readback_poll_status": "completed_before_deadline",
+                "nonblank_samples": 32,
+                "frame_evidence_key": frame_key
+            }
+        });
+
+        let (adapter, adapter_source) = native_surface_input_adapter_from_reports(
+            &json!({"status": "missing"}),
+            &role_report,
+            &loop_report,
+            "preview_surface_proof",
+        );
+        assert_eq!(
+            adapter_source,
+            "measured-loop-report.observed_input_adapter"
+        );
+        assert_eq!(
+            adapter
+                .get("mouse_scroll_event_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        let (readback, readback_source) = native_surface_evidence_from_reports(
+            &json!({"status": "missing"}),
+            &role_report,
+            &loop_report,
+            "preview_surface_proof",
+            "readback_artifact",
+        );
+        assert_eq!(
+            readback_source,
+            "measured-loop-report.last_interactive_readback_artifact"
+        );
+        assert_eq!(
+            readback
+                .get("nonblank_samples")
+                .and_then(serde_json::Value::as_u64),
+            Some(32)
+        );
+        let (timing, timing_source) = native_surface_evidence_from_reports(
+            &json!({"status": "missing"}),
+            &role_report,
+            &loop_report,
+            "preview_surface_proof",
+            "post_input_frame_timing",
+        );
+        assert_eq!(
+            timing_source,
+            "measured-role-report.details.app_window_surface_proof.post_input_frame_timing"
+        );
+        assert_eq!(
+            timing
+                .get("measured_frame_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(59)
+        );
+        assert!(same_frame_scroll_readback_proven(&loop_report));
+        assert!(native_surface_role_loop_reports_match(
+            "boon-test-socket",
+            &role_report,
+            &loop_report
+        ));
+
+        let mut stale_role = role_report;
+        stale_role["details"]["app_window_surface_proof"]["display_connection"] =
+            json!("different-socket");
+        assert!(!native_surface_role_loop_reports_match(
+            "boon-test-socket",
+            &stale_role,
+            &loop_report
+        ));
+    }
+
+    #[test]
+    fn native_scroll_axis_observation_requires_timing_and_same_frame_readback() {
+        let mut observation = json!({
+            "status": "pass",
+            "wheel_input_observed": true,
+            "real_os_events_observed": true,
+            "measured_loop_same_frame_readback_proven": true,
+            "post_input_timing_proven": true,
+            "surface_input_adapter": {
+                "mouse_scroll_event_count": 1,
+                "scroll_delta_y": 120.0
+            }
+        });
+
+        assert!(native_scroll_axis_observation_pass(
+            &observation,
+            "vertical"
+        ));
+        observation["post_input_timing_proven"] = json!(false);
+        assert!(!native_scroll_axis_observation_pass(
+            &observation,
+            "vertical"
+        ));
+        observation["post_input_timing_proven"] = json!(true);
+        observation["measured_loop_same_frame_readback_proven"] = json!(false);
+        assert!(!native_scroll_axis_observation_pass(
+            &observation,
+            "vertical"
+        ));
     }
 
     #[test]

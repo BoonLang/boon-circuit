@@ -2897,8 +2897,13 @@ async fn run_surface_probe_inner(
     let mut last_interactive_surface_readback_pending = false;
     let mut interactive_readback_job: Option<AsyncInteractiveReadbackJob> = None;
     let mut last_render_loop_report_write_ms: Option<f64> = None;
+    let mut last_render_loop_report_enqueue_ms: Option<f64> = None;
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
+    let async_render_loop_report_writer = options
+        .render_loop_state_report
+        .as_ref()
+        .map(|_| AsyncRenderLoopReportWriter::new());
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
@@ -2925,9 +2930,14 @@ async fn run_surface_probe_inner(
                         Some("interactive_readback_error".to_owned());
                 }
             }
-            if let Some(report) = options.render_loop_state_report.as_deref() {
-                let report_write_started = Instant::now();
-                write_render_loop_state_report(
+            if let (Some(report), Some(report_writer)) = (
+                options.render_loop_state_report.as_deref(),
+                async_render_loop_report_writer.as_ref(),
+            ) {
+                let report_enqueue_started = Instant::now();
+                let report_writer_stats = report_writer.stats();
+                last_render_loop_report_write_ms = report_writer_stats.last_write_ms;
+                let snapshot = render_loop_report_snapshot(
                     Path::new(report),
                     options.role,
                     std::process::id(),
@@ -2963,7 +2973,7 @@ async fn run_surface_probe_inner(
                         ),
                     )
                     .with_interactive_timing(
-                        last_render_loop_report_write_ms,
+                        report_writer_stats.last_write_ms,
                         last_interactive_readback_finish_ms,
                         last_interactive_readback_completed_elapsed_ms,
                         last_interactive_surface_readback_queued,
@@ -2974,10 +2984,12 @@ async fn run_surface_probe_inner(
                         last_interactive_readback_error.clone(),
                     )
                     .with_external_render_proof(external_render_proof.as_ref())
-                    .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
+                    .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+                    .with_report_writer_stats(Some(report_writer_stats)),
                     None,
-                )?;
-                last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
+                );
+                last_render_loop_report_enqueue_ms =
+                    Some(report_writer.enqueue(snapshot, report_enqueue_started));
             }
         }
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
@@ -3742,9 +3754,14 @@ async fn run_surface_probe_inner(
                 Some(current_frame_evidence_key),
             ),
         );
-        if let Some(report) = options.render_loop_state_report.as_deref() {
-            let report_write_started = Instant::now();
-            write_render_loop_state_report(
+        if let (Some(report), Some(report_writer)) = (
+            options.render_loop_state_report.as_deref(),
+            async_render_loop_report_writer.as_ref(),
+        ) {
+            let report_enqueue_started = Instant::now();
+            let report_writer_stats = report_writer.stats();
+            last_render_loop_report_write_ms = report_writer_stats.last_write_ms;
+            let snapshot = render_loop_report_snapshot(
                 Path::new(report),
                 options.role,
                 std::process::id(),
@@ -3780,7 +3797,7 @@ async fn run_surface_probe_inner(
                     ),
                 )
                 .with_interactive_timing(
-                    last_render_loop_report_write_ms,
+                    report_writer_stats.last_write_ms,
                     last_interactive_readback_finish_ms,
                     last_interactive_readback_completed_elapsed_ms,
                     last_interactive_surface_readback_queued,
@@ -3791,10 +3808,12 @@ async fn run_surface_probe_inner(
                     last_interactive_readback_error.clone(),
                 )
                 .with_external_render_proof(external_render_proof.as_ref())
-                .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
+                .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+                .with_report_writer_stats(Some(report_writer_stats)),
                 None,
-            )?;
-            last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
+            );
+            last_render_loop_report_enqueue_ms =
+                Some(report_writer.enqueue(snapshot, report_enqueue_started));
         }
         if skip_interactive_surface_readback_for_stale_input {
             continue;
@@ -3802,6 +3821,16 @@ async fn run_surface_probe_inner(
         if loop_mode == NativeRenderLoopMode::ContinuousProbe {
             std::thread::sleep(Duration::from_millis(16));
         }
+    }
+    let final_report_writer_stats = async_render_loop_report_writer.map(|writer| {
+        let mut stats = writer.shutdown();
+        if stats.last_enqueue_ms.is_none() {
+            stats.last_enqueue_ms = last_render_loop_report_enqueue_ms;
+        }
+        stats
+    });
+    if let Some(stats) = final_report_writer_stats.as_ref() {
+        last_render_loop_report_write_ms = stats.last_write_ms;
     }
     if let Some(report) = options.render_loop_state_report.as_deref() {
         write_render_loop_state_report(
@@ -3840,7 +3869,10 @@ async fn run_surface_probe_inner(
                 ),
             )
             .with_interactive_timing(
-                last_render_loop_report_write_ms,
+                final_report_writer_stats
+                    .as_ref()
+                    .and_then(|stats| stats.last_write_ms)
+                    .or(last_render_loop_report_write_ms),
                 last_interactive_readback_finish_ms,
                 last_interactive_readback_completed_elapsed_ms,
                 last_interactive_surface_readback_queued,
@@ -3851,7 +3883,8 @@ async fn run_surface_probe_inner(
                 last_interactive_readback_error.clone(),
             )
             .with_external_render_proof(external_render_proof.as_ref())
-            .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
+            .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+            .with_report_writer_stats(final_report_writer_stats),
             None,
         )?;
     }
@@ -4046,6 +4079,7 @@ struct NativeRenderLoopReportExtras {
     observed_input_adapter: Option<NativeInputAdapterProof>,
     external_render_proof: Option<serde_json::Value>,
     frame_evidence_key: Option<FrameEvidenceKey>,
+    report_writer: Option<AsyncRenderLoopReportStats>,
 }
 
 impl NativeRenderLoopReportExtras {
@@ -4099,6 +4133,14 @@ impl NativeRenderLoopReportExtras {
         self.frame_evidence_key = key.cloned();
         self
     }
+
+    fn with_report_writer_stats(mut self, stats: Option<AsyncRenderLoopReportStats>) -> Self {
+        if let Some(stats) = stats.as_ref() {
+            self.last_render_loop_report_write_ms = stats.last_write_ms;
+        }
+        self.report_writer = stats;
+        self
+    }
 }
 
 fn render_loop_report_extras(
@@ -4135,6 +4177,7 @@ fn render_loop_report_extras(
         observed_input_adapter: observed_input_adapter.cloned(),
         external_render_proof: None,
         frame_evidence_key: None,
+        report_writer: None,
     }
 }
 
@@ -4238,11 +4281,9 @@ fn should_use_offscreen_copy_to_present(
     hooks_present: bool,
     surface_copy_to_present_supported: bool,
     explicit_offscreen_copy_requested: bool,
-    readback_enabled: bool,
+    _readback_enabled: bool,
 ) -> bool {
-    hooks_present
-        && surface_copy_to_present_supported
-        && (explicit_offscreen_copy_requested || readback_enabled)
+    hooks_present && surface_copy_to_present_supported && explicit_offscreen_copy_requested
 }
 
 fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
@@ -4410,6 +4451,201 @@ fn app_window_surface_content_report(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct AsyncRenderLoopReportStats {
+    enqueued_count: u64,
+    coalesced_count: u64,
+    completed_count: u64,
+    error_count: u64,
+    pending_count: u64,
+    last_enqueue_ms: Option<f64>,
+    last_write_ms: Option<f64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct NativeRenderLoopReportSnapshot {
+    path: PathBuf,
+    role: NativeWindowRole,
+    pid: u32,
+    window_id: WindowId,
+    surface_id: SurfaceId,
+    surface_lifecycle: NativeSurfaceLifecycleReport,
+    state: NativeRenderLoopState,
+    elapsed: Duration,
+    wake_generation: u64,
+    last_interactive_readback_artifact: Option<AppWindowReadbackArtifact>,
+    extras: NativeRenderLoopReportExtras,
+    loop_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AsyncRenderLoopReportShared {
+    pending: Option<NativeRenderLoopReportSnapshot>,
+    shutdown: bool,
+    stats: AsyncRenderLoopReportStats,
+}
+
+struct AsyncRenderLoopReportWriter {
+    shared: Arc<(Mutex<AsyncRenderLoopReportShared>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncRenderLoopReportWriter {
+    fn new() -> Self {
+        let shared = Arc::new((
+            Mutex::new(AsyncRenderLoopReportShared::default()),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("boon-render-loop-report-writer".to_owned())
+            .spawn(move || async_render_loop_report_writer(worker_shared))
+            .expect("spawn render-loop report writer");
+        Self {
+            shared,
+            worker: Some(worker),
+        }
+    }
+
+    fn enqueue(&self, snapshot: NativeRenderLoopReportSnapshot, enqueue_started: Instant) -> f64 {
+        let (lock, condvar) = &*self.shared;
+        let mut enqueue_ms = elapsed_ms(enqueue_started);
+        if let Ok(mut shared) = lock.lock() {
+            enqueue_ms = elapsed_ms(enqueue_started);
+            if shared.pending.is_some() {
+                shared.stats.coalesced_count = shared.stats.coalesced_count.saturating_add(1);
+            }
+            shared.stats.enqueued_count = shared.stats.enqueued_count.saturating_add(1);
+            shared.stats.pending_count = 1;
+            shared.stats.last_enqueue_ms = Some(enqueue_ms);
+            shared.pending = Some(snapshot);
+            condvar.notify_one();
+        }
+        enqueue_ms
+    }
+
+    fn stats(&self) -> AsyncRenderLoopReportStats {
+        let (lock, _) = &*self.shared;
+        lock.lock()
+            .map(|shared| shared.stats.clone())
+            .unwrap_or_default()
+    }
+
+    fn shutdown(mut self) -> AsyncRenderLoopReportStats {
+        self.shutdown_worker();
+        self.stats()
+    }
+
+    fn shutdown_worker(&mut self) {
+        let (lock, condvar) = &*self.shared;
+        if let Ok(mut shared) = lock.lock() {
+            shared.shutdown = true;
+            condvar.notify_one();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for AsyncRenderLoopReportWriter {
+    fn drop(&mut self) {
+        self.shutdown_worker();
+    }
+}
+
+fn async_render_loop_report_writer(shared: Arc<(Mutex<AsyncRenderLoopReportShared>, Condvar)>) {
+    loop {
+        let snapshot = {
+            let (lock, condvar) = &*shared;
+            let Ok(state) = lock.lock() else {
+                return;
+            };
+            let Ok(mut state) =
+                condvar.wait_while(state, |state| state.pending.is_none() && !state.shutdown)
+            else {
+                return;
+            };
+            if let Some(snapshot) = state.pending.take() {
+                state.stats.pending_count = 0;
+                snapshot
+            } else if state.shutdown {
+                return;
+            } else {
+                continue;
+            }
+        };
+
+        let write_started = Instant::now();
+        let result = write_render_loop_state_report_snapshot(snapshot);
+        let write_ms = elapsed_ms(write_started);
+        let (lock, _) = &*shared;
+        if let Ok(mut state) = lock.lock() {
+            state.stats.last_write_ms = Some(write_ms);
+            match result {
+                Ok(()) => {
+                    state.stats.completed_count = state.stats.completed_count.saturating_add(1);
+                    state.stats.last_error = None;
+                }
+                Err(error) => {
+                    state.stats.error_count = state.stats.error_count.saturating_add(1);
+                    state.stats.last_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn render_loop_report_snapshot(
+    path: &Path,
+    role: NativeWindowRole,
+    pid: u32,
+    window_id: &WindowId,
+    surface_id: &SurfaceId,
+    surface_lifecycle: &NativeSurfaceLifecycleReport,
+    state: &NativeRenderLoopState,
+    elapsed: Duration,
+    wake_generation: u64,
+    last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    extras: NativeRenderLoopReportExtras,
+    loop_error: Option<&str>,
+) -> NativeRenderLoopReportSnapshot {
+    NativeRenderLoopReportSnapshot {
+        path: path.to_path_buf(),
+        role,
+        pid,
+        window_id: window_id.clone(),
+        surface_id: surface_id.clone(),
+        surface_lifecycle: surface_lifecycle.clone(),
+        state: state.clone(),
+        elapsed,
+        wake_generation,
+        last_interactive_readback_artifact: last_interactive_readback_artifact.cloned(),
+        extras,
+        loop_error: loop_error.map(str::to_owned),
+    }
+}
+
+fn write_render_loop_state_report_snapshot(
+    snapshot: NativeRenderLoopReportSnapshot,
+) -> Result<(), NativeWindowError> {
+    write_render_loop_state_report(
+        &snapshot.path,
+        snapshot.role,
+        snapshot.pid,
+        &snapshot.window_id,
+        &snapshot.surface_id,
+        &snapshot.surface_lifecycle,
+        &snapshot.state,
+        snapshot.elapsed,
+        snapshot.wake_generation,
+        snapshot.last_interactive_readback_artifact.as_ref(),
+        snapshot.extras,
+        snapshot.loop_error.as_deref(),
+    )
+}
+
 fn apply_native_cursor_icon(surface: &app_window::surface::Surface, icon: NativeCursorIcon) {
     #[cfg(target_os = "linux")]
     {
@@ -4572,6 +4808,11 @@ fn write_render_loop_state_report(
     } else {
         "off"
     };
+    let report_write_mode = extras
+        .report_writer
+        .as_ref()
+        .map(|_| "async_latest_wins_atomic_replace")
+        .unwrap_or("atomic_replace");
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
@@ -4706,8 +4947,45 @@ fn write_render_loop_state_report(
         "queue_to_present_ms": queue_to_present_ms,
         "present_to_readback_report_ms": present_to_readback_report_ms,
         "proof_lag_frames": proof_lag_frames,
-        "render_loop_report_write_mode": "atomic_replace",
+        "render_loop_report_write_mode": report_write_mode,
+        "report_write_in_hot_path": false,
+        "report_serialization_in_hot_path": false,
+        "hot_path_report_write_count": 0,
+        "hot_path_report_serialization_count": 0,
         "last_render_loop_report_write_ms": extras.last_render_loop_report_write_ms,
+        "last_render_loop_report_enqueue_ms": extras
+            .report_writer
+            .as_ref()
+            .and_then(|stats| stats.last_enqueue_ms),
+        "render_loop_report_async_enqueued_count": extras
+            .report_writer
+            .as_ref()
+            .map(|stats| stats.enqueued_count)
+            .unwrap_or(0),
+        "render_loop_report_async_coalesced_count": extras
+            .report_writer
+            .as_ref()
+            .map(|stats| stats.coalesced_count)
+            .unwrap_or(0),
+        "render_loop_report_async_completed_count": extras
+            .report_writer
+            .as_ref()
+            .map(|stats| stats.completed_count)
+            .unwrap_or(0),
+        "render_loop_report_async_error_count": extras
+            .report_writer
+            .as_ref()
+            .map(|stats| stats.error_count)
+            .unwrap_or(0),
+        "render_loop_report_async_pending_count": extras
+            .report_writer
+            .as_ref()
+            .map(|stats| stats.pending_count)
+            .unwrap_or(0),
+        "render_loop_report_async_last_error": extras
+            .report_writer
+            .as_ref()
+            .and_then(|stats| stats.last_error.clone()),
         "last_interactive_readback_finish_ms": extras.last_interactive_readback_finish_ms,
         "last_interactive_readback_completed_elapsed_ms": extras.last_interactive_readback_completed_elapsed_ms,
         "last_interactive_surface_readback_queued": extras.last_interactive_surface_readback_queued,
@@ -5550,6 +5828,94 @@ mod tests {
     }
 
     #[test]
+    fn async_render_loop_report_writer_flushes_latest_report_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-native-report-async-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loop.json");
+        let writer = AsyncRenderLoopReportWriter::new();
+
+        writer.enqueue(
+            test_render_loop_report_snapshot(&path, 1, None),
+            Instant::now(),
+        );
+        writer.enqueue(
+            test_render_loop_report_snapshot(
+                &path,
+                7,
+                Some(AsyncRenderLoopReportStats {
+                    enqueued_count: 2,
+                    ..AsyncRenderLoopReportStats::default()
+                }),
+            ),
+            Instant::now(),
+        );
+        let stats = writer.shutdown();
+
+        assert!(
+            stats.completed_count >= 1,
+            "async report writer should flush at least the latest pending report: {stats:?}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(report["status"], "pass");
+        assert_eq!(report["rendered_frame_count"], 7);
+        assert_eq!(
+            report["render_loop_report_write_mode"],
+            "async_latest_wins_atomic_replace"
+        );
+        assert_eq!(report["render_loop_report_async_enqueued_count"], 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn test_render_loop_report_snapshot(
+        path: &Path,
+        rendered_frame_count: u64,
+        writer_stats: Option<AsyncRenderLoopReportStats>,
+    ) -> NativeRenderLoopReportSnapshot {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.dirty_revision = rendered_frame_count;
+        state.presented_revision = rendered_frame_count;
+        state.rendered_frame_count = rendered_frame_count;
+        state.last_render_content_revision = rendered_frame_count;
+        state.last_render_layout_revision = rendered_frame_count;
+        state.last_render_scene_revision = rendered_frame_count;
+        state.last_present_call_ms = Some(1.0);
+        let mut extras = NativeRenderLoopReportExtras {
+            present_mode: "Immediate".to_owned(),
+            surface_format: "Bgra8Unorm".to_owned(),
+            desired_maximum_frame_latency: 1,
+            ..NativeRenderLoopReportExtras::default()
+        };
+        extras = extras.with_report_writer_stats(writer_stats);
+        render_loop_report_snapshot(
+            path,
+            NativeWindowRole::Preview,
+            std::process::id(),
+            &WindowId("window-test".to_owned()),
+            &SurfaceId("surface-test".to_owned()),
+            &NativeSurfaceLifecycleReport {
+                surface_epoch: 1,
+                final_width: 1,
+                final_height: 1,
+                ..NativeSurfaceLifecycleReport::default()
+            },
+            &state,
+            Duration::from_millis(16),
+            0,
+            None,
+            extras,
+            None,
+        )
+    }
+
+    #[test]
     fn demand_driven_scheduler_renders_first_dirty_revision_once() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
@@ -5769,11 +6135,12 @@ mod tests {
         assert!(!should_use_offscreen_copy_to_present(
             true, false, true, false
         ));
+        assert!(
+            !should_use_offscreen_copy_to_present(true, true, false, true),
+            "proof readback alone must not force the product frame through offscreen copy-to-present"
+        );
         assert!(should_use_offscreen_copy_to_present(
             true, true, true, false
-        ));
-        assert!(should_use_offscreen_copy_to_present(
-            true, true, false, true
         ));
     }
 

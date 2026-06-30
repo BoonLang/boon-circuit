@@ -48813,6 +48813,16 @@ impl PreviewHitRouteTable {
             .map(Vec::as_slice)
             .unwrap_or(snapshot.source_intents.as_slice());
         let state_summary = layout_proof_runtime_state_snapshot_arc(&shared.layout_proof);
+        let active_cache_key =
+            preview_active_hit_route_cache_key(shared, &snapshot, layout_frame, source_intents);
+        if let Some(cache_key) = active_cache_key.as_ref()
+            && let Some(cached) = preview_active_hit_route_cache()
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(cache_key).cloned())
+        {
+            return Some(cached);
+        }
         let route_key_source = if snapshot.hit_route_static_cache_key.is_some() {
             "snapshot"
         } else {
@@ -48852,11 +48862,27 @@ impl PreviewHitRouteTable {
                 source_intents,
             )?)
         };
-        Some(Arc::new(Self {
+        let route_table = Arc::new(Self {
             static_table,
             state_summary,
             route_key_source,
-        }))
+        });
+        if let Some(cache_key) = active_cache_key {
+            let cached_route_table = Arc::new(Self {
+                static_table: Arc::clone(&route_table.static_table),
+                state_summary: route_table.state_summary.clone(),
+                route_key_source: "active_route_snapshot",
+            });
+            if let Ok(mut cache) = preview_active_hit_route_cache().lock() {
+                if cache.len() >= 32
+                    && let Some(first_key) = cache.keys().next().cloned()
+                {
+                    cache.remove(&first_key);
+                }
+                cache.insert(cache_key, cached_route_table);
+            }
+        }
+        Some(route_table)
     }
 
     fn from_layout_proof(layout_proof: &Value) -> Option<Self> {
@@ -49705,6 +49731,56 @@ fn preview_hit_route_cache() -> &'static Mutex<BTreeMap<String, Arc<PreviewHitRo
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn preview_active_hit_route_cache() -> &'static Mutex<BTreeMap<String, Arc<PreviewHitRouteTable>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<PreviewHitRouteTable>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn preview_active_hit_route_cache_key(
+    shared: &PreviewSharedRenderState,
+    snapshot: &DocumentRenderSnapshot,
+    layout_frame: &boon_document::LayoutFrame,
+    source_intents: &[Value],
+) -> Option<String> {
+    let layout_frame_hash = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)?;
+    let static_key =
+        preview_hit_route_cache_key_for_snapshot(snapshot, layout_frame, source_intents);
+    let state_key = layout_proof_runtime_state_snapshot_identity(&shared.layout_proof);
+    Some(format!(
+        "layout:{layout_frame_hash}:static:{static_key}:state:{state_key}:update:{:016x}:scroll:{:016x}:{:016x}",
+        shared.update_count,
+        shared.scroll_x_px.to_bits(),
+        shared.scroll_y_px.to_bits()
+    ))
+}
+
+fn layout_proof_runtime_state_snapshot_identity(layout_proof: &Value) -> String {
+    if let Some(key) = layout_proof
+        .get("runtime_document_state_snapshot_cache_key")
+        .and_then(Value::as_str)
+    {
+        return format!("cache:{key}");
+    }
+    if let Some(snapshot) = layout_proof.get("runtime_document_state_snapshot") {
+        let bytes = serde_json::to_vec(snapshot).unwrap_or_default();
+        return format!("inline:{}", boon_runtime::sha256_bytes(&bytes));
+    }
+    if layout_proof
+        .get("runtime_document_state_snapshot_omitted")
+        .is_some()
+    {
+        return "omitted".to_owned();
+    }
+    layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .map(|hash| format!("layout:{hash}"))
+        .unwrap_or_else(|| "none".to_owned())
+}
+
 fn preview_hit_route_cache_key(
     shared: &PreviewSharedRenderState,
     snapshot: &DocumentRenderSnapshot,
@@ -49726,7 +49802,9 @@ fn preview_hit_route_cache_key(
     {
         return None;
     }
-    if let Some(key) = snapshot.hit_route_static_cache_key.as_ref() {
+    if std::ptr::eq(layout_frame, snapshot.layout_frame.as_ref())
+        && let Some(key) = snapshot.hit_route_static_cache_key.as_ref()
+    {
         return Some(key.clone());
     }
     Some(preview_hit_route_cache_key_for_snapshot(
@@ -49792,6 +49870,9 @@ fn preview_display_route_fingerprint(layout_frame: &boon_document::LayoutFrame) 
         item.text.hash(&mut hasher);
         item.focused.hash(&mut hasher);
         display_style_bool(&item.style, "disabled").hash(&mut hasher);
+        display_style_bool(&item.style, "input_live_change").hash(&mut hasher);
+        display_style_number_bits(&item.style, "size").hash(&mut hasher);
+        display_style_number_bits(&item.style, "text_inset").hash(&mut hasher);
         display_item_has_focus_overlay_state(item).hash(&mut hasher);
         display_style_text(&item.style, "link_url").hash(&mut hasher);
     }
@@ -49847,6 +49928,16 @@ fn display_style_bool(
         style.get(key),
         Some(boon_document_model::StyleValue::Bool(true))
     )
+}
+
+fn display_style_number_bits(
+    style: &BTreeMap<String, boon_document_model::StyleValue>,
+    key: &str,
+) -> Option<u64> {
+    style
+        .get(key)
+        .and_then(style_number_from_value)
+        .map(f64::to_bits)
 }
 
 fn rect_contains_typed(rect: boon_document::Rect, x: f32, y: f32) -> bool {
@@ -50016,6 +50107,8 @@ struct PreviewReplaceWorkerQueue {
 struct PreviewReplaceWorkerShared {
     started: bool,
     pending: Option<SourceProjectPayload>,
+    in_flight: Option<(u64, u64)>,
+    in_flight_superseded: bool,
     dropped_stale: u64,
     metrics: PreviewLatestWinsMetrics,
 }
@@ -50030,10 +50123,17 @@ struct PreviewReplaceQueueStats {
 #[derive(Clone, Copy, Debug, Default)]
 struct PreviewLatestWinsMetrics {
     input_count: u64,
+    started_count: u64,
     coalesced_count: u64,
     dropped_count: u64,
+    in_flight_count: u64,
+    in_flight_command_id: u64,
+    in_flight_revision: u64,
+    superseded_in_flight_count: u64,
+    stale_in_flight_snapshot_count_observed: u64,
     completed_command_id: u64,
     completed_revision: u64,
+    completed_count: u64,
     stale_revision_discard_count: u64,
 }
 
@@ -50178,6 +50278,12 @@ impl PreviewReplaceWorkerQueue {
             .lock()
             .map_err(|_| "preview replace worker mutex poisoned")?;
         shared.metrics.input_count = shared.metrics.input_count.saturating_add(1);
+        if shared.in_flight.is_some() && !shared.in_flight_superseded {
+            shared.in_flight_superseded = true;
+            shared.metrics.superseded_in_flight_count =
+                shared.metrics.superseded_in_flight_count.saturating_add(1);
+            shared.metrics.stale_in_flight_snapshot_count_observed = 1;
+        }
         if shared.pending.replace(payload).is_some() {
             shared.dropped_stale = shared.dropped_stale.saturating_add(1);
             shared.metrics.coalesced_count = shared.metrics.coalesced_count.saturating_add(1);
@@ -50197,6 +50303,13 @@ impl PreviewReplaceWorkerQueue {
         let mut shared = lock.lock().expect("preview replace worker mutex poisoned");
         loop {
             if let Some(payload) = shared.pending.take() {
+                shared.in_flight = Some((payload.command_id, payload.source_revision));
+                shared.in_flight_superseded = false;
+                shared.metrics.started_count = shared.metrics.started_count.saturating_add(1);
+                shared.metrics.in_flight_count = 1;
+                shared.metrics.in_flight_command_id = payload.command_id;
+                shared.metrics.in_flight_revision = payload.source_revision;
+                shared.metrics.stale_in_flight_snapshot_count_observed = 0;
                 return payload;
             }
             shared = condvar
@@ -50208,6 +50321,17 @@ impl PreviewReplaceWorkerQueue {
     fn record_completed(&self, command_id: u64, source_revision: u64) {
         let (lock, _) = &*self.inner;
         if let Ok(mut shared) = lock.lock() {
+            if shared.in_flight == Some((command_id, source_revision)) {
+                shared.in_flight = None;
+                shared.in_flight_superseded = false;
+            }
+            shared.metrics.in_flight_count = u64::from(shared.in_flight.is_some());
+            if shared.in_flight.is_none() {
+                shared.metrics.in_flight_command_id = 0;
+                shared.metrics.in_flight_revision = 0;
+                shared.metrics.stale_in_flight_snapshot_count_observed = 0;
+            }
+            shared.metrics.completed_count = shared.metrics.completed_count.saturating_add(1);
             shared.metrics.completed_command_id = command_id;
             shared.metrics.completed_revision = source_revision;
         }
@@ -50216,6 +50340,12 @@ impl PreviewReplaceWorkerQueue {
     fn record_stale_discard(&self) {
         let (lock, _) = &*self.inner;
         if let Ok(mut shared) = lock.lock() {
+            shared.in_flight = None;
+            shared.in_flight_superseded = false;
+            shared.metrics.in_flight_count = 0;
+            shared.metrics.in_flight_command_id = 0;
+            shared.metrics.in_flight_revision = 0;
+            shared.metrics.stale_in_flight_snapshot_count_observed = 0;
             shared.metrics.stale_revision_discard_count = shared
                 .metrics
                 .stale_revision_discard_count
@@ -50294,10 +50424,17 @@ impl PreviewIpcCounterState {
 fn latest_wins_metrics_json(metrics: PreviewLatestWinsMetrics) -> serde_json::Value {
     json!({
         "input_count": metrics.input_count,
+        "started_count": metrics.started_count,
         "coalesced_count": metrics.coalesced_count,
         "dropped_count": metrics.dropped_count,
+        "in_flight_count": metrics.in_flight_count,
+        "in_flight_command_id": metrics.in_flight_command_id,
+        "in_flight_revision": metrics.in_flight_revision,
+        "superseded_in_flight_count": metrics.superseded_in_flight_count,
+        "stale_in_flight_snapshot_count_observed": metrics.stale_in_flight_snapshot_count_observed,
         "completed_command_id": metrics.completed_command_id,
         "completed_revision": metrics.completed_revision,
+        "completed_count": metrics.completed_count,
         "stale_revision_discard_count": metrics.stale_revision_discard_count,
         "semantic_coalescing_reason": if metrics.coalesced_count > 0 {
             "single-slot latest-wins source replacement queue overwrote older pending work"
@@ -50309,10 +50446,18 @@ fn latest_wins_metrics_json(metrics: PreviewLatestWinsMetrics) -> serde_json::Va
 
 fn attach_latest_wins_metrics(value: &mut serde_json::Value, metrics: PreviewLatestWinsMetrics) {
     value["latest_wins_input_count"] = json!(metrics.input_count);
+    value["latest_wins_started_count"] = json!(metrics.started_count);
     value["latest_wins_coalesced_count"] = json!(metrics.coalesced_count);
     value["latest_wins_dropped_count"] = json!(metrics.dropped_count);
+    value["latest_wins_in_flight_count"] = json!(metrics.in_flight_count);
+    value["latest_wins_in_flight_command_id"] = json!(metrics.in_flight_command_id);
+    value["latest_wins_in_flight_revision"] = json!(metrics.in_flight_revision);
+    value["latest_wins_superseded_in_flight_count"] = json!(metrics.superseded_in_flight_count);
+    value["latest_wins_stale_in_flight_snapshot_count_observed"] =
+        json!(metrics.stale_in_flight_snapshot_count_observed);
     value["latest_wins_completed_command_id"] = json!(metrics.completed_command_id);
     value["latest_wins_completed_revision"] = json!(metrics.completed_revision);
+    value["latest_wins_completed_count"] = json!(metrics.completed_count);
     value["stale_revision_discard_count"] = json!(metrics.stale_revision_discard_count);
     value["semantic_coalescing_reason"] = if metrics.coalesced_count > 0 {
         json!("single-slot latest-wins source replacement queue overwrote older pending work")
@@ -50331,6 +50476,17 @@ fn attach_active_pending_snapshot_backpressure(
     stale_result_rejected: bool,
 ) {
     let max_pending_snapshots = 1_u64;
+    let queued_pending_snapshot_count = pending_snapshot_count.min(max_pending_snapshots);
+    let in_flight_current = metrics
+        .in_flight_count
+        .saturating_sub(metrics.stale_in_flight_snapshot_count_observed)
+        .min(max_pending_snapshots);
+    let current_pending_snapshot_count = if queued_pending_snapshot_count > 0 {
+        queued_pending_snapshot_count
+    } else {
+        in_flight_current
+    };
+    let current_pending_snapshot_count_observed = current_pending_snapshot_count;
     let active_frame_kept_while_pending = value
         .get("last_good_frame_kept_while_pending")
         .and_then(serde_json::Value::as_bool)
@@ -50346,9 +50502,17 @@ fn attach_active_pending_snapshot_backpressure(
     value["active_pending_snapshot_backpressure"] = json!({
         "status": "pass",
         "max_pending_snapshots": max_pending_snapshots,
-        "pending_snapshot_count": pending_snapshot_count.min(max_pending_snapshots),
-        "pending_snapshot_count_observed": pending_snapshot_count,
-        "pending_snapshot_kind": if pending_snapshot_count > 0 {
+        "pending_snapshot_count": current_pending_snapshot_count,
+        "pending_snapshot_count_observed": current_pending_snapshot_count_observed,
+        "queued_pending_snapshot_count": queued_pending_snapshot_count,
+        "queued_pending_snapshot_count_observed": pending_snapshot_count,
+        "in_flight_pending_snapshot_count": in_flight_current,
+        "in_flight_pending_snapshot_count_observed": metrics.in_flight_count,
+        "stale_in_flight_snapshot_count_observed": metrics.stale_in_flight_snapshot_count_observed,
+        "superseded_in_flight_snapshot_count": metrics.superseded_in_flight_count,
+        "in_flight_command_id": metrics.in_flight_command_id,
+        "in_flight_revision": metrics.in_flight_revision,
+        "pending_snapshot_kind": if current_pending_snapshot_count > 0 {
             "runtime-layout-render"
         } else {
             "none"
@@ -75898,8 +76062,18 @@ label:
         let latest = queue.wait_for_latest_payload();
         assert_eq!(latest.command_id, 2);
         assert_eq!(latest.source_revision, 2);
+        let metrics = queue.metrics();
+        assert_eq!(metrics.started_count, 1);
+        assert_eq!(metrics.in_flight_count, 1);
+        assert_eq!(metrics.in_flight_command_id, 2);
+        assert_eq!(metrics.in_flight_revision, 2);
+
         queue.record_completed(latest.command_id, latest.source_revision);
         let metrics = queue.metrics();
+        assert_eq!(metrics.in_flight_count, 0);
+        assert_eq!(metrics.in_flight_command_id, 0);
+        assert_eq!(metrics.in_flight_revision, 0);
+        assert_eq!(metrics.completed_count, 1);
         assert_eq!(metrics.completed_command_id, 2);
         assert_eq!(metrics.completed_revision, 2);
 
@@ -75907,6 +76081,154 @@ label:
         let metrics = queue.metrics();
         assert_eq!(metrics.stale_revision_discard_count, 1);
         assert_eq!(metrics.dropped_count, 2);
+    }
+
+    #[test]
+    fn preview_replace_worker_backpressure_separates_current_pending_from_stale_in_flight() {
+        let queue = PreviewReplaceWorkerQueue::default();
+        let first =
+            SourceProjectPayload::single_unit(10, 10, "source-10", "memory://first.bn", "root: 1");
+        let second =
+            SourceProjectPayload::single_unit(11, 11, "source-11", "memory://second.bn", "root: 2");
+
+        queue.enqueue_latest(first).unwrap();
+        let in_flight = queue.wait_for_latest_payload();
+        assert_eq!(in_flight.command_id, 10);
+        assert_eq!(queue.metrics().in_flight_count, 1);
+
+        let second_stats = queue.enqueue_latest(second).unwrap();
+        assert_eq!(second_stats.queue_depth, 1);
+        let metrics = queue.metrics();
+        assert_eq!(metrics.input_count, 2);
+        assert_eq!(metrics.started_count, 1);
+        assert_eq!(metrics.in_flight_count, 1);
+        assert_eq!(metrics.in_flight_command_id, 10);
+        assert_eq!(metrics.in_flight_revision, 10);
+        assert_eq!(metrics.superseded_in_flight_count, 1);
+        assert_eq!(metrics.stale_in_flight_snapshot_count_observed, 1);
+
+        let mut report = json!({
+            "last_good_frame_kept_while_pending": true,
+            "render_thread_blocked_on_replace_count": 0,
+            "preview_blocked_on_ipc_count": 0
+        });
+        attach_active_pending_snapshot_backpressure(
+            &mut report,
+            second_stats.queue_depth,
+            3,
+            None,
+            metrics,
+            false,
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["pending_snapshot_count"],
+            1
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["queued_pending_snapshot_count"],
+            1
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["in_flight_pending_snapshot_count"],
+            0
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["in_flight_pending_snapshot_count_observed"],
+            1
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["stale_in_flight_snapshot_count_observed"],
+            1
+        );
+        assert_eq!(
+            report["active_pending_snapshot_backpressure"]["pending_snapshot_kind"],
+            "runtime-layout-render"
+        );
+
+        queue.record_stale_discard();
+        let metrics = queue.metrics();
+        assert_eq!(metrics.in_flight_count, 0);
+        assert_eq!(metrics.stale_revision_discard_count, 1);
+        assert_eq!(metrics.dropped_count, 1);
+    }
+
+    #[test]
+    fn stale_replace_source_commit_does_not_mutate_active_preview_state() {
+        let counter_path = repo_path("examples/counter.bn");
+        let counter_source = std::fs::read_to_string(&counter_path).unwrap();
+        let counter_hash = boon_runtime::sha256_bytes(counter_source.as_bytes());
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&counter_path, &counter_source).unwrap(),
+            layout_frame_override: None,
+            update_count: 0,
+            scroll_x_px: 12.0,
+            scroll_y_px: 34.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: counter_path.clone(),
+            source_text: counter_source.clone(),
+            runtime_units: project_units_for_source_text(&counter_path, &counter_source),
+            source_bytes: counter_source.len() as u64,
+            source_sha256: counter_hash.clone(),
+            runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            preview_perf_stats: None,
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &counter_source)
+                .ok()
+                .map(|runtime| Arc::new(Mutex::new(runtime))),
+            world_scene: None,
+            world_editor_session: None,
+            latest_accepted_command_id: 8,
+            latest_accepted_source_revision: 4,
+            replace_status_cache: json!({
+                "kind": "replace-source-status",
+                "status": "pending",
+                "command_id": 8,
+                "source_revision": 4
+            }),
+            prewarmed_project_hashes: BTreeSet::new(),
+            prewarmed_project_results: BTreeMap::new(),
+            prewarm_worker: PreviewPrewarmWorkerQueue::default(),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+            ipc_counters: PreviewIpcCounterState::default(),
+            shutdown: PreviewShutdownState::default(),
+        }));
+        let stale_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
+        let stale_payload = SourceProjectPayload::single_unit(
+            7,
+            3,
+            "opaque-stale-source-id",
+            "memory://stale-todomvc.bn",
+            &stale_source,
+        );
+        let stale_result = preview_build_source_project(stale_payload.clone(), || true);
+        assert_eq!(stale_result.status, "pass");
+
+        preview_commit_source_project_result(&state, &stale_payload, stale_result).unwrap();
+
+        let state_guard = state.lock().unwrap();
+        assert_eq!(state_guard.source_path, counter_path);
+        assert_eq!(state_guard.source_text, counter_source);
+        assert_eq!(state_guard.source_sha256, counter_hash);
+        assert_eq!(state_guard.latest_accepted_command_id, 8);
+        assert_eq!(state_guard.latest_accepted_source_revision, 4);
+        assert_eq!(state_guard.replace_status_cache["command_id"], 8);
+        assert_eq!(state_guard.replace_status_cache["source_revision"], 4);
+        let metrics = state_guard.replace_worker.metrics();
+        assert_eq!(metrics.stale_revision_discard_count, 1);
+        assert_eq!(metrics.dropped_count, 1);
+        drop(state_guard);
+
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(shared.update_count, 0);
+        assert_eq!(shared.scroll_x_px, 12.0);
+        assert_eq!(shared.scroll_y_px, 34.0);
+        assert_eq!(shared.last_dirty_reason, None);
+        assert!(shared.last_error.is_none());
     }
 
     #[test]
@@ -85141,6 +85463,139 @@ document:
     }
 
     #[test]
+    fn preview_hit_route_table_reuses_active_snapshot_and_rejects_stale_state() {
+        let source_path = repo_path("examples/counter.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let mut layout_proof = native_document_layout_proof(&source_path, &source).unwrap();
+        let layout_hash = layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .expect("counter layout proof should have a cached layout hash");
+        let snapshot = cached_document_render_snapshot(layout_hash)
+            .expect("counter layout proof should cache the document render snapshot");
+        layout_proof["source_intent_assertions"] = json!(snapshot.source_intents.clone());
+        layout_proof["runtime_document_state_snapshot"] =
+            json!({"route_cache_test_state": "initial"});
+        let mut shared = PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(Arc::clone(&snapshot.layout_frame)),
+            update_count: 81_040_001,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        };
+
+        let first = PreviewHitRouteTable::from_shared(&shared)
+            .expect("first route table build should use the active frame");
+        assert_ne!(
+            first.route_key_source, "active_route_snapshot",
+            "first build should populate the active cache, not claim a hit"
+        );
+        let second = PreviewHitRouteTable::from_shared(&shared)
+            .expect("second route table build should hit the active cache");
+        assert_eq!(
+            second.route_key_source, "active_route_snapshot",
+            "unchanged active frame should reuse the typed route table"
+        );
+        assert!(Arc::ptr_eq(&first.static_table, &second.static_table));
+        assert_eq!(
+            second
+                .state_summary
+                .as_deref()
+                .and_then(|summary| summary.get("route_cache_test_state"))
+                .and_then(Value::as_str),
+            Some("initial")
+        );
+
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.layout_proof["runtime_document_state_snapshot"] =
+            json!({"route_cache_test_state": "changed"});
+        let changed = PreviewHitRouteTable::from_shared(&shared)
+            .expect("changed runtime state should still build a route table");
+        assert_ne!(
+            changed.route_key_source, "active_route_snapshot",
+            "runtime-state changes must reject the previous active route snapshot"
+        );
+        assert_eq!(
+            changed
+                .state_summary
+                .as_deref()
+                .and_then(|summary| summary.get("route_cache_test_state"))
+                .and_then(Value::as_str),
+            Some("changed")
+        );
+        let changed_again = PreviewHitRouteTable::from_shared(&shared)
+            .expect("unchanged replacement state should be cached");
+        assert_eq!(
+            changed_again.route_key_source, "active_route_snapshot",
+            "the replacement active frame should be cached after the first rebuild"
+        );
+        assert!(
+            Arc::ptr_eq(&changed.static_table, &changed_again.static_table),
+            "runtime-state-only changes should reuse static route data while refreshing the typed route table state"
+        );
+    }
+
+    #[test]
+    fn preview_route_cache_key_recomputes_for_retained_layout_override() {
+        let source_path = repo_path("examples/counter.bn");
+        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
+        let mut layout_proof = native_document_layout_proof(&source_path, &source).unwrap();
+        let layout_hash = layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+            .expect("counter layout proof should have a cached layout hash");
+        let snapshot = cached_document_render_snapshot(layout_hash)
+            .expect("counter layout proof should cache the document render snapshot");
+        let snapshot_key = snapshot
+            .hit_route_static_cache_key
+            .clone()
+            .expect("render snapshot should have a static route key");
+        layout_proof["source_intent_assertions"] = json!(snapshot.source_intents.clone());
+        let mut modified_frame = snapshot.layout_frame.as_ref().clone();
+        let modified_item = modified_frame
+            .display_list
+            .iter_mut()
+            .find(|item| !display_style_bool(&item.style, "input_live_change"))
+            .expect("fixture should have at least one display item that can receive route style");
+        modified_item.style.insert(
+            "input_live_change".to_owned(),
+            boon_document_model::StyleValue::Bool(true),
+        );
+        let shared = PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(Arc::new(modified_frame)),
+            update_count: 81_040_002,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        };
+        let source_intents = shared
+            .layout_proof
+            .get("source_intent_assertions")
+            .and_then(serde_json::Value::as_array)
+            .expect("synthetic embedded proof should expose source intents");
+
+        assert_ne!(
+            preview_hit_route_cache_key(
+                &shared,
+                snapshot.as_ref(),
+                shared.layout_frame_override.as_deref().unwrap(),
+                source_intents,
+            )
+            .as_deref(),
+            Some(snapshot_key.as_str()),
+            "retained layout overrides must recompute the static route key from the active frame"
+        );
+    }
+
+    #[test]
     fn typed_hit_source_intent_json_reports_requested_secondary_route() {
         let entry = boon_document::HitSideTableEntry {
             hit_id: "hit-secondary".to_owned(),
@@ -85234,6 +85689,8 @@ document:
             );
         }
         let mut input_state = PreviewNativeInputState::default();
+        let _ = take_preview_native_input_timings();
+        preview_set_hot_path_profile_enabled(true);
         let mut hover = test_keyboard_input(Vec::new(), Vec::new());
         hover.mouse_motion_event_count = 1;
         hover.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
@@ -85255,6 +85712,14 @@ document:
             input_state.hovered_node.as_deref(),
             Some(formula_node.as_str())
         );
+        let _ = take_preview_native_input_timings();
+        {
+            let shared = shared_render_state.lock().unwrap();
+            assert!(
+                PreviewHitRouteTable::from_shared(&shared).is_some(),
+                "route table should warm against the current hovered frame before click"
+            );
+        }
 
         let click = deterministic_click_input_from_index(0, x, y);
         preview_apply_real_window_input(
@@ -85270,6 +85735,13 @@ document:
             input_state.focused_node.as_deref(),
             Some(formula_node.as_str())
         );
+        let click_timings = take_preview_native_input_timings();
+        assert!(
+            click_timings
+                .iter()
+                .any(|sample| sample.route_table_key_source == Some("active_route_snapshot")),
+            "click after an explicit route-table warmup should report an active route snapshot hit: {click_timings:?}"
+        );
         let frame = latest_preview_frame(&shared_render_state);
         assert!(
             frame
@@ -85278,6 +85750,7 @@ document:
                 .any(|item| item.node.0 == formula_node && item.focused),
             "typed click route should focus the formula bar without proof hit/source JSON"
         );
+        preview_set_hot_path_profile_enabled(false);
     }
 
     #[test]

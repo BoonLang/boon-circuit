@@ -61931,6 +61931,46 @@ fn require_active_pending_snapshot_backpressure(
             "{label}.pending_snapshot_count_observed must not exceed max_pending_snapshots"
         ));
     }
+    let queued_pending = field("queued_pending_snapshot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    if queued_pending > max_pending {
+        blockers.push(format!(
+            "{label}.queued_pending_snapshot_count must not exceed max_pending_snapshots"
+        ));
+    }
+    let queued_observed = field("queued_pending_snapshot_count_observed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(queued_pending);
+    if queued_observed > max_pending {
+        blockers.push(format!(
+            "{label}.queued_pending_snapshot_count_observed must not exceed max_pending_snapshots"
+        ));
+    }
+    let in_flight_current = field("in_flight_pending_snapshot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    if in_flight_current > max_pending {
+        blockers.push(format!(
+            "{label}.in_flight_pending_snapshot_count must not exceed max_pending_snapshots"
+        ));
+    }
+    let in_flight_observed = field("in_flight_pending_snapshot_count_observed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(in_flight_current);
+    let stale_in_flight = field("stale_in_flight_snapshot_count_observed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if stale_in_flight > in_flight_observed {
+        blockers.push(format!(
+            "{label}.stale_in_flight_snapshot_count_observed must not exceed in_flight_pending_snapshot_count_observed"
+        ));
+    }
+    if queued_pending > 0 && in_flight_current > 0 {
+        blockers.push(format!(
+            "{label} must report either queued or current in-flight pending snapshot, not both"
+        ));
+    }
     match (
         pending,
         field("pending_snapshot_kind").and_then(serde_json::Value::as_str),
@@ -61976,6 +62016,12 @@ fn require_active_pending_snapshot_backpressure(
         "coalesced_pending_snapshot_count",
         "dropped_pending_snapshot_count",
         "stale_pending_snapshot_rejected_count",
+        "queued_pending_snapshot_count",
+        "queued_pending_snapshot_count_observed",
+        "in_flight_pending_snapshot_count",
+        "in_flight_pending_snapshot_count_observed",
+        "stale_in_flight_snapshot_count_observed",
+        "superseded_in_flight_snapshot_count",
         "render_thread_blocked_on_replace_count",
         "preview_blocked_on_ipc_count",
     ] {

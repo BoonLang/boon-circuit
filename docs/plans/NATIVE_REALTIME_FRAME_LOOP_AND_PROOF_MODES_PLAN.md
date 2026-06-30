@@ -395,6 +395,69 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
   - `git diff --check`
 
+2026-06-30 active route snapshot slice:
+
+- Hit routing now has a generic active route snapshot cache:
+  - caches the fully typed `PreviewHitRouteTable`, not only the static hit
+    side table;
+  - keys reuse by active layout hash, static route fingerprint,
+    runtime-state snapshot identity, shared-state update count, and scroll
+    offsets;
+  - keeps the existing static route table cache for reusable layout/source
+    identity while preventing stale state-summary reuse.
+- Static route fingerprints now include route-affecting text-input style
+  inputs used by the hit route path: `input_live_change`, `size`, and
+  `text_inset`.
+- Static snapshot route keys are reused only when the active layout frame is
+  the exact cached snapshot frame. Retained layout overrides recompute the
+  static key from the active frame instead of trusting a precomputed snapshot
+  key.
+- Native input timing samples already expose `route_table_key_source`; focused
+  tests now require the click path to report `active_route_snapshot` after a
+  warmed active-frame route table.
+- This is a bounded active-frame cache step, not the full active/pending
+  runtime-layout-render snapshot architecture. Pending snapshot ownership,
+  stale-worker cancellation, and render-scene upload deltas remain.
+- Focused verification passed:
+  - `cargo check -q -p boon_native_playground`
+  - `cargo test -q -p boon_native_playground preview_hit_route_table_reuses_active_snapshot_and_rejects_stale_state`
+  - `cargo test -q -p boon_native_playground preview_route_cache_key_recomputes_for_retained_layout_override`
+  - `cargo test -q -p boon_native_playground preview_route_cache_key_uses_snapshot_key_with_embedded_source_intents`
+  - `cargo test -q -p boon_native_playground preview_hover_and_click_use_typed_route_table_without_proof_hit_json`
+  - `cargo test -q -p boon_native_playground cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path`
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`
+  - `cargo test -q -p boon_native_playground host_route_does_not_use_direct_node_source_for_stale_row_identity`
+  - `cargo test -q -p boon_native_playground cells_preview_same_window_scroll_uses_retained_materialized_frame`
+
+2026-06-30 replace-source pending lifecycle slice:
+
+- The source replacement worker now reports a real single-slot lifecycle:
+  - queued pending snapshot count;
+  - in-flight build count and identity;
+  - superseded in-flight build count;
+  - stale in-flight snapshot observation;
+  - started, completed, coalesced, dropped, and stale-rejected counters.
+- `active_pending_snapshot_backpressure` now distinguishes current
+  commit-eligible pending snapshots from superseded in-flight background work.
+  A queued newer replacement can coexist with a stale in-flight older build, but
+  only the queued replacement counts as the current pending snapshot.
+- `xtask` now requires these lifecycle fields in active/pending backpressure
+  proof and rejects reports that claim both a queued and current in-flight
+  pending snapshot at the same time.
+- Added a stale commit negative test proving an older built source result cannot
+  mutate active preview source/runtime/layout/shared render state after a newer
+  source revision has been accepted.
+- This still does not satisfy the full plan requirement for pending snapshots to
+  validate surface epoch, frame sequence, layout revision, and render-scene
+  revision before commit. That evidence must be threaded through future
+  runtime-layout-render snapshot objects.
+- Focused verification passed:
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p boon_native_playground preview_replace_worker_queue_reports_live_latest_wins_metrics`
+  - `cargo test -q -p boon_native_playground preview_replace_worker_backpressure_separates_current_pending_from_stale_in_flight`
+  - `cargo test -q -p boon_native_playground stale_replace_source_commit_does_not_mutate_active_preview_state`
+  - `cargo test -q -p boon_native_playground replace_source_ack_is_small_and_worker_commits_latest_revision`
+
 ## Implementation Slices
 
 1. Terminology and schema:

@@ -6685,6 +6685,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut last_render_scene_identity = None::<String>;
         let mut render_scene_revision = 0_u64;
         let mut poll_text_measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let mut render_text_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let mut dev_render_scene_cache = None::<DevRenderSceneCache>;
         let mut input_state = DevNativeInputState::default();
         let shell = Arc::clone(&dev_shell);
         let poll_shell = Arc::clone(&dev_shell);
@@ -6885,9 +6887,13 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .derived_indexes
                 .as_ref()
                 .ok_or_else(|| "dev derived index cache was not initialized".to_owned())?;
+            let content_revision = render_state.revision.max(1);
             let proof = native_gpu_dev_visible_render_hook(
                 context,
                 &mut visible_renderer,
+                &mut render_text_columns,
+                &mut dev_render_scene_cache,
+                content_revision,
                 &shell,
                 derived_indexes,
                 layout_frame,
@@ -6895,7 +6901,6 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_state.full_layout_refresh_count,
                 render_state.fast_frame_patch_count,
             )?;
-            let content_revision = render_state.revision.max(1);
             let layout_identity_fallback = format!("dev-content:{content_revision}");
             let layout_identity = preview_proof_identity_value(
                 &proof,
@@ -12690,6 +12695,9 @@ fn native_gpu_world_scene_visible_render_hook(
 fn native_gpu_dev_visible_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
+    render_text_columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
+    render_scene_cache: &mut Option<DevRenderSceneCache>,
+    content_revision: u64,
     shell: &DevWindowShell,
     derived_indexes: &boon_document::DocumentDerivedIndexBundle,
     layout_frame: &boon_document::LayoutFrame,
@@ -12704,38 +12712,82 @@ fn native_gpu_dev_visible_render_hook(
             context.surface_texture_format,
         )
     });
-    let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
-    let render_scene = derived_indexes
-        .try_render_scene(layout_frame, context.width, context.height, &mut columns)
-        .map_err(|error| error.to_string())?;
+    let render_hook_started = Instant::now();
+    let render_scene_cache_started = Instant::now();
+    let render_scene_cache_hit = render_scene_cache.as_ref().is_some_and(|cache| {
+        cache.content_revision == content_revision
+            && cache.width == context.width
+            && cache.height == context.height
+    });
+    let mut render_scene_ms = 0.0;
+    let mut identity_ms = 0.0;
+    if !render_scene_cache_hit {
+        let render_scene_started = Instant::now();
+        let render_scene = derived_indexes
+            .try_render_scene(
+                layout_frame,
+                context.width,
+                context.height,
+                render_text_columns,
+            )
+            .map_err(|error| error.to_string())?;
+        render_scene_ms = elapsed_ms(render_scene_started);
+        let identity_started = Instant::now();
+        let layout_frame_hash = render_frame_hash(layout_frame);
+        let render_scene_hash_value = render_scene_hash(&render_scene);
+        let render_scene_identity = format!("dev-render-scene:{render_scene_hash_value}");
+        identity_ms = elapsed_ms(identity_started);
+        *render_scene_cache = Some(DevRenderSceneCache {
+            content_revision,
+            width: context.width,
+            height: context.height,
+            layout_frame_hash,
+            render_scene_hash_value,
+            render_scene_identity,
+            render_scene,
+        });
+    }
+    let render_scene_cache_ms = elapsed_ms(render_scene_cache_started);
+    let cache = render_scene_cache
+        .as_ref()
+        .ok_or_else(|| "dev render scene cache was not initialized".to_owned())?;
+    let encode_scene_started = Instant::now();
     let visible_metrics = renderer
         .encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
             device: context.device,
             queue: context.queue,
             encoder: context.encoder,
             view: context.surface_view,
-            scene: &render_scene,
+            scene: &cache.render_scene,
             format: context.surface_texture_format,
             width: context.width,
             height: context.height,
         })
         .map_err(|error| error.to_string())?;
-    let layout_frame_hash = render_frame_hash(layout_frame);
-    let render_scene_hash_value = render_scene_hash(&render_scene);
-    let render_scene_identity = format!("dev-render-scene:{render_scene_hash_value}");
-    Ok(json!({
+    let encode_scene_ms = elapsed_ms(encode_scene_started);
+    let mut render_hook_phase_timings_ms = json!({
+        "render_scene_cache_hit": render_scene_cache_hit,
+        "render_scene_cache_ms": render_scene_cache_ms,
+        "render_scene_ms": render_scene_ms,
+        "encode_scene_ms": encode_scene_ms,
+        "identity_ms": identity_ms,
+        "total_before_report_json_ms": elapsed_ms(render_hook_started),
+    });
+    let report_json_started = Instant::now();
+    let mut report = json!({
         "status": "pass",
         "renderer": "boon_native_gpu",
         "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
-        "layout_frame_hash": layout_frame_hash,
-        "render_scene_hash": render_scene_hash_value,
-        "render_scene_identity": render_scene_identity,
+        "layout_frame_hash": cache.layout_frame_hash,
+        "render_scene_hash": cache.render_scene_hash_value,
+        "render_scene_identity": cache.render_scene_identity,
         "surface_id": context.surface_id,
         "surface_epoch": context.surface_epoch,
         "surface_format": context.surface_format,
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics,
+        "render_hook_phase_timings_ms": render_hook_phase_timings_ms,
         "viewport_fill_ratio": 1.0,
         "content_bounds_fill_ratio": viewport_fill_ratio(layout_frame, context.width, context.height),
         "dev_ui_source": "boon-dev-editor-debug-shell",
@@ -12765,7 +12817,17 @@ fn native_gpu_dev_visible_render_hook(
             "fast_frame_patch_supported": true
         },
         "layout_metrics": layout_frame.metrics
-    }))
+    });
+    let report_json_ms = elapsed_ms(report_json_started);
+    if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+        timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+        timings.insert(
+            "total_with_report_json_ms".to_owned(),
+            json!(elapsed_ms(render_hook_started)),
+        );
+    }
+    report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+    Ok(report)
 }
 
 fn dev_code_editor_visible_style_report(
@@ -12898,17 +12960,15 @@ fn dev_code_editor_model_report(shell: &DevWindowShell) -> serde_json::Value {
         "syntax_render_segment_count": model.syntax_render_segments_for_visible_lines(40).len(),
         "type_hint_backend": model.type_hint_backend(),
         "type_hint_count": model.type_hint_count(),
-        "type_hint_samples": model.type_hint_samples(),
-        "caret_type_hint": model
+        "type_hint_samples_omitted": true,
+        "caret_type_hint_available": model
             .type_hint_at_position(model.caret())
-            .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
-            .unwrap_or_else(|| json!(null)),
-        "hover_type_hint": shell
+            .is_some(),
+        "hover_type_hint_available": shell
             .hovered_editor_position
             .as_ref()
             .and_then(|position| model.type_hint_at_position(position))
-            .map(|hint| serde_json::to_value(hint).unwrap_or_else(|_| json!(null)))
-            .unwrap_or_else(|| json!(null)),
+            .is_some(),
         "syntax_theme": model.syntax_theme_report(),
         "diagnostic_count": model.diagnostics.len(),
         "font_family": shell.editor_view.font_family,
@@ -12950,6 +13010,16 @@ struct DevRenderState {
     code_editor_model_report: serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+}
+
+struct DevRenderSceneCache {
+    content_revision: u64,
+    width: u32,
+    height: u32,
+    layout_frame_hash: String,
+    render_scene_hash_value: String,
+    render_scene_identity: String,
+    render_scene: boon_document::RenderScene,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72443,6 +72513,24 @@ label:
         assert!(footer_text.contains("fps 59.8"));
         assert!(footer_text.contains("last 8.40ms"));
         assert_eq!(shell.hot_path_preview_perf_query_count, 0);
+    }
+
+    #[test]
+    fn dev_code_editor_model_report_is_bounded_for_hot_render_path() {
+        let source = "store: [\n    value: 1\n]\nview: []\n";
+        let (shell, _, _, _) = test_dev_editor_context(source);
+
+        let report = dev_code_editor_model_report(&shell);
+
+        assert_eq!(report["type_hint_samples_omitted"], true);
+        assert!(report.get("type_hint_samples").is_none());
+        assert!(report.get("caret_type_hint").is_none());
+        assert!(report.get("hover_type_hint").is_none());
+        assert!(report["syntax_token_count"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            serde_json::to_vec(&report).unwrap().len() < 8192,
+            "{report}"
+        );
     }
 
     #[test]

@@ -47149,16 +47149,41 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
     let layout_probe_report = artifacts_dir.join(format!("scroll-{label}-layout-proof.json"));
     let mut cosmic_launch_proof = json!({"status": "not-run"});
-    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
+    let force_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
         .ok()
         .as_deref()
-        == Some("1");
+        == Some("1")
+        || std::env::var("BOON_NATIVE_GPU_SCROLL_SPEED_ISOLATED")
+            .ok()
+            .as_deref()
+            == Some("1");
+    let prefer_cosmic_workspace_launch = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_COSMIC")
+        .ok()
+        .as_deref()
+        == Some("1")
+        || std::env::var("BOON_NATIVE_GPU_SCROLL_SPEED_COSMIC")
+            .ok()
+            .as_deref()
+            == Some("1");
+    let isolated_real_window_available = command_available("weston")
+        && command_available("wayland-info")
+        && weston_test_plugin_path().is_some()
+        && weston_test_driver_path().is_some();
+    let prefer_isolated_real_window =
+        !prefer_cosmic_workspace_launch && isolated_real_window_available;
+    let isolated_required_but_unavailable =
+        force_isolated_real_window && !isolated_real_window_available;
+    let default_isolated_unavailable =
+        !prefer_cosmic_workspace_launch && !isolated_real_window_available;
+    let prefer_isolated_real_window = prefer_isolated_real_window || force_isolated_real_window;
     let mut isolated_real_window_launch_proof = json!({
         "status": "not-run",
         "reason": if prefer_isolated_real_window {
-            "isolated Weston launch unavailable or not applicable"
+            "isolated Weston launch selected but has not run yet"
+        } else if prefer_cosmic_workspace_launch {
+            "workspace-qualified COSMIC launch was explicitly requested"
         } else {
-            "workspace-qualified COSMIC launch is the default scroll-speed path"
+            "isolated Weston launch unavailable; workspace launcher fallback selected"
         }
     });
     let title_token = native_gpu_title_token(&format!("scroll-{label}"));
@@ -47166,20 +47191,28 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
 
-    let isolated_real_window_available = command_available("weston")
-        && command_available("wayland-info")
-        && weston_test_plugin_path().is_some()
-        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-scroll-{label}:isolated-real-window-environment"),
-        !prefer_isolated_real_window || isolated_real_window_available,
+        !isolated_required_but_unavailable,
         format!(
-            "prefer_isolated_real_window={prefer_isolated_real_window}, isolated_real_window_available={isolated_real_window_available}"
+            "force_isolated_real_window={force_isolated_real_window}, prefer_cosmic_workspace_launch={prefer_cosmic_workspace_launch}, isolated_real_window_available={isolated_real_window_available}"
         ),
-        (prefer_isolated_real_window && !isolated_real_window_available).then(|| {
+        isolated_required_but_unavailable.then(|| {
             "native scroll-speed proof requires the isolated Weston real-window harness".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-scroll-{label}:isolated-default-or-explicit-fallback"),
+        !default_isolated_unavailable || prefer_cosmic_workspace_launch,
+        format!(
+            "default_isolated_unavailable={default_isolated_unavailable}, prefer_cosmic_workspace_launch={prefer_cosmic_workspace_launch}"
+        ),
+        (default_isolated_unavailable && !prefer_cosmic_workspace_launch).then(|| {
+            "native scroll-speed default isolated Weston harness is unavailable; set BOON_NATIVE_GPU_SCROLL_SPEED_COSMIC=1 to use the workspace launcher fallback".to_owned()
         }),
     );
 
@@ -47351,7 +47384,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = if dev_editor {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&source_example_id),
@@ -47365,7 +47398,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 )
             } else {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --probe --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&label),
@@ -47500,7 +47533,11 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "driver_target_region": driver_target,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
-        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
+        "launcher_command": if prefer_isolated_real_window {
+            "isolated-weston-real-window"
+        } else {
+            "cosmic-background-launch --workspace boon-circuit"
+        },
         "cosmic_background_launch_proof": cosmic_launch_proof,
         "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_desktop_input_allowed": false,
@@ -65689,56 +65726,17 @@ fn run_isolated_weston_desktop_preview_e2e(
         }));
     }
 
-    let input_sample_delay_text = input_sample_delay_ms.to_string();
-    let role_report_timeout_text = role_report_timeout_ms.to_string();
-    let dev_start_delay_text = if target_dev_surface { "0" } else { "2500" };
-    let mut desktop_args = vec!["--role", "desktop", "--example", example];
-    let code_file_string = code_file
-        .map(|path| path.to_str().ok_or("isolated code file path is not UTF-8"))
-        .transpose()?
-        .map(str::to_owned);
-    if let Some(code_file) = code_file_string.as_deref() {
-        desktop_args.extend([
-            "--code-file",
-            code_file,
-            "--dev-editor-code-file",
-            code_file,
-        ]);
-        if target_dev_surface {
-            desktop_args.push("--dev-editor-only");
-        }
-    }
-    desktop_args.extend([
-        "--probe",
-        "--real-window-input-probe",
-        "--child-hold-ms",
-        "30000",
-        "--dev-hold-ms",
-        "10000",
-        "--title-token",
+    let desktop_args = isolated_weston_desktop_preview_e2e_args(
+        example,
         title_token,
-        "--input-sample-delay-ms",
-        &input_sample_delay_text,
-        "--warmup-frame-count",
-        "3",
-        "--sample-frame-count",
-        "30",
-        "--role-report-timeout-ms",
-        &role_report_timeout_text,
-        "--dev-start-delay-ms",
-        dev_start_delay_text,
-        "--live-state-report",
-        live_state_report
-            .to_str()
-            .ok_or("live state report path is not UTF-8")?,
-        "--report",
-        supervisor_report
-            .to_str()
-            .ok_or("supervisor report path is not UTF-8")?,
-    ]);
-    if skip_operator_host_input_probe {
-        desktop_args.push("--skip-operator-host-input-probe");
-    }
+        input_sample_delay_ms,
+        role_report_timeout_ms,
+        supervisor_report,
+        live_state_report,
+        code_file,
+        skip_operator_host_input_probe,
+        target_dev_surface,
+    )?;
     let mut desktop = Command::new(binary)
         .args(&desktop_args)
         .env("WAYLAND_DISPLAY", &socket)
@@ -65991,6 +65989,76 @@ fn run_isolated_weston_desktop_preview_e2e(
         "driver_effect_observed": driver_effect_observed,
         "input_route": "weston_test compositor control API -> isolated Weston test seat -> two native app_window child processes -> preview app_window Wayland pointer/keyboard dispatch -> app_window coalesced input proof"
     }))
+}
+
+fn isolated_weston_desktop_preview_e2e_args(
+    example: &str,
+    title_token: &str,
+    input_sample_delay_ms: u64,
+    role_report_timeout_ms: u64,
+    supervisor_report: &Path,
+    live_state_report: &Path,
+    code_file: Option<&Path>,
+    skip_operator_host_input_probe: bool,
+    target_dev_surface: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let dev_start_delay_text = if target_dev_surface { "0" } else { "2500" };
+    let mut args = vec![
+        "--role".to_owned(),
+        "desktop".to_owned(),
+        "--example".to_owned(),
+        example.to_owned(),
+    ];
+    if let Some(code_file) = code_file {
+        let code_file = code_file
+            .to_str()
+            .ok_or("isolated code file path is not UTF-8")?
+            .to_owned();
+        args.extend([
+            "--code-file".to_owned(),
+            code_file.clone(),
+            "--dev-editor-code-file".to_owned(),
+            code_file,
+        ]);
+        if target_dev_surface {
+            args.push("--dev-editor-only".to_owned());
+        }
+    }
+    args.extend([
+        "--probe".to_owned(),
+        "--real-window-input-probe".to_owned(),
+        "--demand-driven-loop".to_owned(),
+        "--child-hold-ms".to_owned(),
+        "30000".to_owned(),
+        "--dev-hold-ms".to_owned(),
+        "10000".to_owned(),
+        "--title-token".to_owned(),
+        title_token.to_owned(),
+        "--input-sample-delay-ms".to_owned(),
+        input_sample_delay_ms.to_string(),
+        "--warmup-frame-count".to_owned(),
+        "3".to_owned(),
+        "--sample-frame-count".to_owned(),
+        "30".to_owned(),
+        "--role-report-timeout-ms".to_owned(),
+        role_report_timeout_ms.to_string(),
+        "--dev-start-delay-ms".to_owned(),
+        dev_start_delay_text.to_owned(),
+        "--live-state-report".to_owned(),
+        live_state_report
+            .to_str()
+            .ok_or("live state report path is not UTF-8")?
+            .to_owned(),
+        "--report".to_owned(),
+        supervisor_report
+            .to_str()
+            .ok_or("supervisor report path is not UTF-8")?
+            .to_owned(),
+    ]);
+    if skip_operator_host_input_probe {
+        args.push("--skip-operator-host-input-probe".to_owned());
+    }
+    Ok(args)
 }
 
 fn run_linux_human_like_preview_smoke(
@@ -66345,6 +66413,7 @@ fn run_linux_human_like_desktop_surface_smoke(
             .to_owned(),
         "--probe".to_owned(),
         "--real-window-input-probe".to_owned(),
+        "--demand-driven-loop".to_owned(),
         "--child-hold-ms".to_owned(),
         "8000".to_owned(),
         "--dev-hold-ms".to_owned(),
@@ -80724,6 +80793,30 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .pointer("/native_gpu_render_proof/artifact/kind")
                 .and_then(serde_json::Value::as_str),
             Some("app_owned_pixels")
+        );
+    }
+
+    #[test]
+    fn isolated_weston_desktop_preview_e2e_uses_demand_driven_product_mode() {
+        let args = isolated_weston_desktop_preview_e2e_args(
+            "generic",
+            "test-title-token",
+            1500,
+            180_000,
+            Path::new("target/reports/native-gpu/test-supervisor.json"),
+            Path::new("target/reports/native-gpu/test-live-state.json"),
+            Some(Path::new("examples/counter.bn")),
+            true,
+            true,
+        )
+        .expect("test paths are UTF-8");
+
+        assert!(args.iter().any(|arg| arg == "--demand-driven-loop"));
+        assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
+        assert!(args.iter().any(|arg| arg == "--dev-editor-only"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--skip-operator-host-input-probe")
         );
     }
 

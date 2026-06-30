@@ -26151,6 +26151,7 @@ fn native_gpu_product_path_negative_case_ids() -> &'static [&'static str] {
         "lagged-ux-proof",
         "pending-ux-readback",
         "same-frame-proof-identity-mismatch",
+        "render-hook-offscreen-proof-hot-path",
     ]
 }
 
@@ -26270,6 +26271,20 @@ fn collect_native_ux_product_path_reasons(
                 if native_ux_hot_path_bool_key(key) && child.as_bool() == Some(true) {
                     reasons.push(format!(
                         "{child_path}=true is forbidden in native UX hot paths"
+                    ));
+                }
+                if key == "offscreen_app_owned_scene_readback_skipped"
+                    && child.as_bool() == Some(false)
+                {
+                    reasons.push(format!(
+                        "{child_path}=false means render-hook offscreen app-owned proof ran in a native UX hot path"
+                    ));
+                }
+                if key == "render_backend_trait"
+                    && child.as_str() == Some("boon_native_gpu::render_app_owned_scene_pixels")
+                {
+                    reasons.push(format!(
+                        "{child_path}=boon_native_gpu::render_app_owned_scene_pixels runs render-hook offscreen app-owned proof in a native UX hot path"
                     ));
                 }
                 if passive_scroll
@@ -31628,6 +31643,23 @@ mod tests {
         report["preview_perf_hot_path_query_count"] = json!(1);
         report["dev_perf_row_queries_ipc_from_render_hook"] = json!(true);
         assert!(!schema_accepts(report, "native-dev-perf-hot-path-query"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_render_hook_offscreen_proof_hot_path() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["command"] = json!("verify-native-gpu-scroll-speed");
+        report["preview_surface_proof"] = json!({
+            "external_render_proof": {
+                "status": "pass",
+                "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
+                "offscreen_app_owned_scene_readback_skipped": false
+            }
+        });
+        assert!(!schema_accepts(
+            report,
+            "native-render-hook-offscreen-proof-hot-path"
+        ));
     }
 
     #[test]

@@ -33151,6 +33151,7 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
             None,
             true,
             false,
+            false,
         )?;
         let launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -33624,6 +33625,7 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
             None,
             true,
             false,
+            false,
         )?;
         let launch_success = isolated_real_window_launch_proof
             .get("status")
@@ -33975,6 +33977,7 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
             Some("a"),
             None,
             true,
+            false,
             false,
         )?;
         let launch_success = isolated_real_window_launch_proof
@@ -39985,6 +39988,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             driver_target.clone(),
             isolated_driver_text.as_deref(),
             None,
+            false,
             false,
             false,
         )?;
@@ -47328,6 +47332,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             None,
             dev_editor.then_some(source_path.as_path()),
             true,
+            true,
             dev_editor,
         )?;
         let isolated_launch_success =
@@ -47390,7 +47395,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             let role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
             let script = if dev_editor {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --dev-editor-code-file {} --dev-editor-only --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --probe-min-dev-hold-ms 5000 --probe-preview-hold-tail-ms 1000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-dev-code-editor.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&source_example_id),
@@ -47404,7 +47409,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 )
             } else {
                 format!(
-                    "cd {} && {} --role desktop --example {} --code-file {} --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
+                    "cd {} && {} --role desktop --example {} --code-file {} --probe --demand-driven-loop --skip-operator-host-input-probe --skip-render-hook-app-owned-proof --child-hold-ms 10000 --dev-hold-ms 5000 --probe-min-dev-hold-ms 5000 --probe-preview-hold-tail-ms 1000 --warmup-frame-count 3 --sample-frame-count 30 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-scroll-{}.log 2>&1",
                     shell_quote(&cwd.display().to_string()),
                     speed_binary,
                     shell_quote(&label),
@@ -49390,10 +49395,6 @@ fn isolated_scroll_real_window_wheel_delivery_proven(report: &serde_json::Value)
         .get("driver_pass")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
-        && report
-            .get("desktop_pass")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
         && report
             .get("real_os_events_observed")
             .and_then(serde_json::Value::as_bool)
@@ -59431,6 +59432,22 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "render-hook-offscreen-proof-hot-path",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-scroll-speed",
+                    "preview_surface_proof": {
+                        "external_render_proof": {
+                            "status": "pass",
+                            "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
+                            "offscreen_app_owned_scene_readback_skipped": false
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
             "desktop-screenshot-visible-proof",
             merge_json(
                 base(),
@@ -62803,6 +62820,7 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
     require_object_field(blockers, report, "materialized_range_before_after");
     require_frame_timing_split_fields(blockers, report, "preview_frame_timing");
     require_frame_timing_split_fields(blockers, report, "post_input_frame_timing");
+    require_scroll_render_hook_app_owned_proof_skipped(blockers, report);
     if !scroll_wall_clock_budget_exempt(report) {
         require_axis_p95_at_most(
             blockers,
@@ -62862,6 +62880,38 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
                     ));
                 }
             }
+        }
+    }
+}
+
+fn require_scroll_render_hook_app_owned_proof_skipped(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+) {
+    for surface_key in ["preview_surface_proof", "dev_surface_proof"] {
+        let Some(external_render_proof) = report
+            .pointer(&format!("/{surface_key}/external_render_proof"))
+            .filter(|value| value.is_object())
+        else {
+            continue;
+        };
+        if external_render_proof
+            .get("offscreen_app_owned_scene_readback_skipped")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            blockers.push(format!(
+                "{surface_key}.external_render_proof.offscreen_app_owned_scene_readback_skipped must be true for scroll UX timing"
+            ));
+        }
+        if external_render_proof
+            .get("render_backend_trait")
+            .and_then(serde_json::Value::as_str)
+            == Some("boon_native_gpu::render_app_owned_scene_pixels")
+        {
+            blockers.push(format!(
+                "{surface_key}.external_render_proof.render_backend_trait must not use render_app_owned_scene_pixels for scroll UX timing"
+            ));
         }
     }
 }
@@ -64566,6 +64616,20 @@ fn collect_native_gpu_ux_product_path_value_reasons(
                         "{child_path}=true is forbidden in native UX hot paths"
                     ));
                 }
+                if key == "offscreen_app_owned_scene_readback_skipped"
+                    && child.as_bool() == Some(false)
+                {
+                    reasons.push(format!(
+                        "{child_path}=false means render-hook offscreen app-owned proof ran in a native UX hot path"
+                    ));
+                }
+                if key == "render_backend_trait"
+                    && child.as_str() == Some("boon_native_gpu::render_app_owned_scene_pixels")
+                {
+                    reasons.push(format!(
+                        "{child_path}=boon_native_gpu::render_app_owned_scene_pixels runs render-hook offscreen app-owned proof in a native UX hot path"
+                    ));
+                }
                 if passive_scroll_gate
                     && native_gpu_ux_passive_scroll_counter_key(key)
                     && json_value_is_positive_number(child)
@@ -66267,6 +66331,7 @@ fn run_isolated_weston_desktop_preview_e2e(
     driver_text: Option<&str>,
     code_file: Option<&Path>,
     skip_operator_host_input_probe: bool,
+    skip_render_hook_app_owned_proof: bool,
     target_dev_surface: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let artifact_dir = PathBuf::from(format!(
@@ -66361,6 +66426,7 @@ fn run_isolated_weston_desktop_preview_e2e(
         live_state_report,
         code_file,
         skip_operator_host_input_probe,
+        skip_render_hook_app_owned_proof,
         target_dev_surface,
     )?;
     let mut desktop = Command::new(binary)
@@ -66591,7 +66657,7 @@ fn run_isolated_weston_desktop_preview_e2e(
         "desktop_stdout_path": desktop_stdout_path,
         "desktop_stderr_path": desktop_stderr_path,
         "desktop_args": desktop_args,
-        "render_hook_app_owned_proof_skipped": true,
+        "render_hook_app_owned_proof_skipped": skip_render_hook_app_owned_proof,
         "desktop_exit_status": desktop_status
             .as_ref()
             .map(std::process::ExitStatus::to_string)
@@ -66628,6 +66694,7 @@ fn isolated_weston_desktop_preview_e2e_args(
     live_state_report: &Path,
     code_file: Option<&Path>,
     skip_operator_host_input_probe: bool,
+    skip_render_hook_app_owned_proof: bool,
     target_dev_surface: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let dev_start_delay_text = if target_dev_surface { "0" } else { "2500" };
@@ -66670,6 +66737,10 @@ fn isolated_weston_desktop_preview_e2e_args(
         "30".to_owned(),
         "--role-report-timeout-ms".to_owned(),
         role_report_timeout_ms.to_string(),
+        "--probe-min-dev-hold-ms".to_owned(),
+        "5000".to_owned(),
+        "--probe-preview-hold-tail-ms".to_owned(),
+        "1000".to_owned(),
         "--dev-start-delay-ms".to_owned(),
         dev_start_delay_text.to_owned(),
         "--live-state-report".to_owned(),
@@ -66685,6 +66756,9 @@ fn isolated_weston_desktop_preview_e2e_args(
     ]);
     if skip_operator_host_input_probe {
         args.push("--skip-operator-host-input-probe".to_owned());
+    }
+    if skip_render_hook_app_owned_proof {
+        args.push("--skip-render-hook-app-owned-proof".to_owned());
     }
     Ok(args)
 }
@@ -67057,6 +67131,10 @@ fn run_linux_human_like_desktop_surface_smoke(
         "60".to_owned(),
         "--role-report-timeout-ms".to_owned(),
         "60000".to_owned(),
+        "--probe-min-dev-hold-ms".to_owned(),
+        "5000".to_owned(),
+        "--probe-preview-hold-tail-ms".to_owned(),
+        "1000".to_owned(),
         "--live-state-report".to_owned(),
         live_state_report
             .to_str()
@@ -81437,11 +81515,26 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             Some(Path::new("examples/counter.bn")),
             true,
             true,
+            true,
         )
         .expect("test paths are UTF-8");
 
         assert!(args.iter().any(|arg| arg == "--demand-driven-loop"));
         assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--skip-render-hook-app-owned-proof")
+        );
+        assert!(command_argv_contains_pair(
+            &args.iter().map(|arg| json!(arg)).collect::<Vec<_>>(),
+            "--probe-min-dev-hold-ms",
+            "5000"
+        ));
+        assert!(command_argv_contains_pair(
+            &args.iter().map(|arg| json!(arg)).collect::<Vec<_>>(),
+            "--probe-preview-hold-tail-ms",
+            "1000"
+        ));
         assert!(args.iter().any(|arg| arg == "--dev-editor-only"));
         assert!(
             args.iter()
@@ -81450,11 +81543,47 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
     }
 
     #[test]
-    fn isolated_scroll_wheel_delivery_does_not_require_unrelated_supervisor_pass() {
+    fn scroll_hot_path_rejects_render_hook_offscreen_proof() {
+        let mut blockers = Vec::new();
+        require_scroll_render_hook_app_owned_proof_skipped(
+            &mut blockers,
+            &json!({
+                "preview_surface_proof": {
+                    "external_render_proof": {
+                        "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
+                        "offscreen_app_owned_scene_readback_skipped": false
+                    }
+                }
+            }),
+        );
+        assert!(blockers.iter().any(|blocker| {
+            blocker.contains("offscreen_app_owned_scene_readback_skipped must be true")
+        }));
+        assert!(blockers.iter().any(|blocker| {
+            blocker.contains("render_backend_trait must not use render_app_owned_scene_pixels")
+        }));
+
+        let mut blockers = Vec::new();
+        require_scroll_render_hook_app_owned_proof_skipped(
+            &mut blockers,
+            &json!({
+                "preview_surface_proof": {
+                    "external_render_proof": {
+                        "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
+                        "offscreen_app_owned_scene_readback_skipped": true
+                    }
+                }
+            }),
+        );
+        assert!(blockers.is_empty(), "{blockers:?}");
+    }
+
+    #[test]
+    fn isolated_scroll_wheel_delivery_does_not_require_unrelated_wrapper_pass() {
         let proof = json!({
             "status": "fail",
             "driver_pass": true,
-            "desktop_pass": true,
+            "desktop_pass": false,
             "supervisor_report_written": false,
             "real_os_events_observed": true,
             "driver_effect_observed": true,

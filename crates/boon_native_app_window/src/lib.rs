@@ -3121,10 +3121,11 @@ async fn run_surface_probe_inner(
         let mut rendered_content_revision = rendered_revision;
         let mut rendered_layout_revision = rendered_revision;
         let mut rendered_render_scene_revision = rendered_revision;
-        let use_offscreen_copy_to_present = hooks.is_some()
-            && surface_copy_to_present_supported
-            && (std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some()
-                || (options.role == NativeWindowRole::Preview && options.demand_driven_loop));
+        let use_offscreen_copy_to_present = should_use_offscreen_copy_to_present(
+            hooks.is_some(),
+            surface_copy_to_present_supported,
+            std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some(),
+        );
         let render_target_kind = if use_offscreen_copy_to_present {
             "app-owned-offscreen-copy-to-present"
         } else {
@@ -3976,6 +3977,14 @@ fn external_render_proof_has_app_owned_readback(proof: Option<&serde_json::Value
         .and_then(serde_json::Value::as_str)
         .is_some_and(is_sha256_hex_string);
     app_owned_reused && artifact_hash
+}
+
+fn should_use_offscreen_copy_to_present(
+    hooks_present: bool,
+    surface_copy_to_present_supported: bool,
+    explicit_offscreen_copy_requested: bool,
+) -> bool {
+    hooks_present && surface_copy_to_present_supported && explicit_offscreen_copy_requested
 }
 
 fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
@@ -5335,6 +5344,17 @@ mod tests {
                 .pointer("/proof/artifact/frame_evidence_key")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn offscreen_copy_to_present_is_explicit_diagnostic_path() {
+        assert!(
+            !should_use_offscreen_copy_to_present(true, true, false),
+            "normal demand-driven preview frames should render directly to the visible surface"
+        );
+        assert!(!should_use_offscreen_copy_to_present(false, true, true));
+        assert!(!should_use_offscreen_copy_to_present(true, false, true));
+        assert!(should_use_offscreen_copy_to_present(true, true, true));
     }
 
     #[test]

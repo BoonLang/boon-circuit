@@ -4496,9 +4496,21 @@ fn write_render_loop_state_report(
         state.last_render_started_elapsed_ms,
         state.last_surface_acquired_elapsed_ms,
     );
+    let render_started_to_render_hook_completed_ms = elapsed_delta_ms(
+        state.last_render_started_elapsed_ms,
+        state.last_render_hook_completed_elapsed_ms,
+    );
     let surface_acquired_to_render_hook_completed_ms = elapsed_delta_ms(
         state.last_surface_acquired_elapsed_ms,
         state.last_render_hook_completed_elapsed_ms,
+    );
+    let render_hook_completed_to_surface_acquired_ms = elapsed_delta_ms(
+        state.last_render_hook_completed_elapsed_ms,
+        state.last_surface_acquired_elapsed_ms,
+    );
+    let render_hook_completed_to_present_ms = elapsed_delta_ms(
+        state.last_render_hook_completed_elapsed_ms,
+        state.last_present_completed_elapsed_ms,
     );
     let render_hook_to_queue_ms = elapsed_delta_ms(
         state.last_render_hook_completed_elapsed_ms,
@@ -4682,7 +4694,10 @@ fn write_render_loop_state_report(
         "poll_started_to_dirty_poll_ms": poll_started_to_dirty_poll_ms,
         "dirty_poll_to_render_started_ms": dirty_poll_to_render_started_ms,
         "render_started_to_surface_acquired_ms": render_started_to_surface_acquired_ms,
+        "render_started_to_render_hook_completed_ms": render_started_to_render_hook_completed_ms,
         "surface_acquired_to_render_hook_completed_ms": surface_acquired_to_render_hook_completed_ms,
+        "render_hook_completed_to_surface_acquired_ms": render_hook_completed_to_surface_acquired_ms,
+        "render_hook_completed_to_present_ms": render_hook_completed_to_present_ms,
         "render_hook_to_queue_ms": render_hook_to_queue_ms,
         "poll_started_to_queue_ms": poll_started_to_queue_ms,
         "render_started_to_queue_ms": render_started_to_queue_ms,

@@ -10955,7 +10955,9 @@ fn native_gpu_app_owned_render_hook(
             .ok_or("layout frame cache was not initialized")?
     };
     let input_overlay_prepare_started = Instant::now();
-    let retained_bound_text_nodes = preview_retained_bound_sync_text_update_nodes();
+    let retained_bound_text_nodes = preview_retained_bound_sync_text_update_nodes_for(
+        visible_state.retained_bound_sync_stats.as_ref(),
+    );
     let input_overlay_render_scene_patch_enabled = layout_render_scene_patch.is_none()
         && last_error.is_none()
         && status_overlay.is_none()
@@ -11553,7 +11555,9 @@ fn native_gpu_app_owned_render_hook(
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics_report,
-        "retained_bound_sync": preview_retained_bound_sync_stats_json(),
+        "retained_bound_sync": preview_retained_bound_sync_stats_json_for(
+            visible_state.retained_bound_sync_stats.as_ref()
+        ),
         "render_hook_phase_timings_ms": render_hook_phase_timings_ms,
         "render_scene_lowering_mode": render_scene_lowering_mode,
         "render_scene_patch_hash": render_scene_patch_hash,
@@ -35940,12 +35944,17 @@ fn merge_preview_retained_bound_sync_stats(
     existing.changed |= next.changed;
 }
 
-fn preview_retained_bound_sync_stats_json() -> Value {
-    let stats = preview_retained_bound_sync_stats()
+fn preview_retained_bound_sync_stats_snapshot() -> Option<PreviewRetainedBoundSyncStats> {
+    preview_retained_bound_sync_stats()
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
-    match stats {
+        .and_then(|slot| slot.clone())
+}
+
+fn preview_retained_bound_sync_stats_json_for(
+    stats: Option<&PreviewRetainedBoundSyncStats>,
+) -> Value {
+    match stats.cloned() {
         Some(stats) => json!({
             "status": stats.status,
             "reason": stats.reason,
@@ -35980,12 +35989,18 @@ fn preview_retained_bound_sync_stats_json() -> Value {
     }
 }
 
+#[cfg(test)]
 fn preview_retained_bound_sync_text_update_nodes() -> BTreeSet<boon_document_model::DocumentNodeId>
 {
-    preview_retained_bound_sync_stats()
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
+    preview_retained_bound_sync_text_update_nodes_for(
+        preview_retained_bound_sync_stats_snapshot().as_ref(),
+    )
+}
+
+fn preview_retained_bound_sync_text_update_nodes_for(
+    stats: Option<&PreviewRetainedBoundSyncStats>,
+) -> BTreeSet<boon_document_model::DocumentNodeId> {
+    stats
         .filter(|stats| {
             stats.status == "pass"
                 && stats.changed
@@ -35994,8 +36009,9 @@ fn preview_retained_bound_sync_text_update_nodes() -> BTreeSet<boon_document_mod
         .map(|stats| {
             stats
                 .text_update_nodes
-                .into_iter()
-                .chain(stats.style_update_nodes)
+                .iter()
+                .chain(stats.style_update_nodes.iter())
+                .cloned()
                 .map(boon_document_model::DocumentNodeId)
                 .collect()
         })
@@ -47530,6 +47546,7 @@ struct PreviewVisibleRenderState {
     scroll_transform: Value,
     layout_frame_override: Option<Arc<boon_document::LayoutFrame>>,
     render_scene_patch_layout_reuse: bool,
+    retained_bound_sync_stats: Option<PreviewRetainedBoundSyncStats>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47720,6 +47737,7 @@ impl PreviewVisibleRenderState {
                 .pointer("/layout_profile/render_scene_patch_layout_reuse")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true),
+            retained_bound_sync_stats: preview_retained_bound_sync_stats_snapshot(),
         }
     }
 
@@ -86665,6 +86683,14 @@ document:
             "formula-bar text input must be part of retained text update nodes so direct WGPU render-scene patches replace its old glyphs"
         );
         let shared = shared_render_state.lock().unwrap();
+        let visible_state = PreviewVisibleRenderState::from_shared(&shared);
+        assert!(
+            preview_retained_bound_sync_text_update_nodes_for(
+                visible_state.retained_bound_sync_stats.as_ref()
+            )
+            .contains(&boon_document_model::DocumentNodeId(formula_node.clone())),
+            "visible render state must carry retained text update nodes so the WGPU render hook does not rediscover them from global mutable state"
+        );
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let (render_scene, lowering_mode) =
             preview_render_scene_for_frame(&shared.layout_proof, &frame, 920, 720, &mut columns)

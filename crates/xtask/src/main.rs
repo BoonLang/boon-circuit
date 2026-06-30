@@ -34475,11 +34475,21 @@ fn native_renderer_counter_inventory() -> serde_json::Value {
                 "frame_timing.presented_frame_ms_p95",
                 "frame_timing.presented_frame_ms_p99",
                 "frame_timing.presented_frame_ms_max",
+                "frame_timing.command_record_ms_p95",
+                "frame_timing.encoder_finish_ms_p95",
+                "frame_timing.queue_submit_ms_p95",
+                "frame_timing.frame_present_ms_p95",
+                "frame_timing.post_present_bookkeeping_ms_p95",
                 "post_input_frame_timing"
             ],
             "field_semantics": {
                 "surface_acquire_ms": "time to acquire the visible surface texture",
-                "present_submit_ms": "combined submit/present timing currently not split into encode versus submit versus present",
+                "present_submit_ms": "legacy combined visible-frame timing from command recording through queue submit, frame.present, and post-present bookkeeping",
+                "command_record_ms": "CPU wall time from surface-view creation through command recording, render hook execution, and readback command enqueue",
+                "encoder_finish_ms": "CPU wall time spent finishing the WGPU command encoder into a command buffer",
+                "queue_submit_ms": "CPU wall time spent in queue.submit for the visible-surface command buffer",
+                "frame_present_ms": "CPU wall time spent in surface texture frame.present; this may include platform/present-mode blocking and does not prove GPU completion",
+                "post_present_bookkeeping_ms": "CPU wall time after frame.present for render-loop state updates and optional app-owned JSON report writes",
                 "presented_frame_ms": "single-frame visible presentation timing",
                 "readback_ms": "proof-mode readback timing, not interaction hot-path timing"
             }
@@ -49557,6 +49567,21 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
     let present_submit_p50 = max_axis_f64("present_submit_ms_p50", 0.0);
     let present_submit_p95 = max_axis_f64("present_submit_ms_p95", 0.0);
     let present_submit_max = max_axis_f64("present_submit_ms_max", 0.0);
+    let command_record_p50 = max_axis_f64("command_record_ms_p50", 0.0);
+    let command_record_p95 = max_axis_f64("command_record_ms_p95", 0.0);
+    let command_record_max = max_axis_f64("command_record_ms_max", 0.0);
+    let encoder_finish_p50 = max_axis_f64("encoder_finish_ms_p50", 0.0);
+    let encoder_finish_p95 = max_axis_f64("encoder_finish_ms_p95", 0.0);
+    let encoder_finish_max = max_axis_f64("encoder_finish_ms_max", 0.0);
+    let queue_submit_p50 = max_axis_f64("queue_submit_ms_p50", 0.0);
+    let queue_submit_p95 = max_axis_f64("queue_submit_ms_p95", 0.0);
+    let queue_submit_max = max_axis_f64("queue_submit_ms_max", 0.0);
+    let frame_present_p50 = max_axis_f64("frame_present_ms_p50", 0.0);
+    let frame_present_p95 = max_axis_f64("frame_present_ms_p95", 0.0);
+    let frame_present_max = max_axis_f64("frame_present_ms_max", 0.0);
+    let post_present_bookkeeping_p50 = max_axis_f64("post_present_bookkeeping_ms_p50", 0.0);
+    let post_present_bookkeeping_p95 = max_axis_f64("post_present_bookkeeping_ms_p95", 0.0);
+    let post_present_bookkeeping_max = max_axis_f64("post_present_bookkeeping_ms_max", 0.0);
     let p50 = max_axis_f64("presented_frame_ms_p50", p95);
     let p99 = max_axis_f64("presented_frame_ms_p99", p95);
     let frame_max = max_axis_f64("presented_frame_ms_max", p95);
@@ -49596,6 +49621,21 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
         "present_submit_ms_max": present_submit_max,
         "present_submit_ms_p50": present_submit_p50,
         "present_submit_ms_p95": present_submit_p95,
+        "command_record_ms_max": command_record_max,
+        "command_record_ms_p50": command_record_p50,
+        "command_record_ms_p95": command_record_p95,
+        "encoder_finish_ms_max": encoder_finish_max,
+        "encoder_finish_ms_p50": encoder_finish_p50,
+        "encoder_finish_ms_p95": encoder_finish_p95,
+        "queue_submit_ms_max": queue_submit_max,
+        "queue_submit_ms_p50": queue_submit_p50,
+        "queue_submit_ms_p95": queue_submit_p95,
+        "frame_present_ms_max": frame_present_max,
+        "frame_present_ms_p50": frame_present_p50,
+        "frame_present_ms_p95": frame_present_p95,
+        "post_present_bookkeeping_ms_max": post_present_bookkeeping_max,
+        "post_present_bookkeeping_ms_p50": post_present_bookkeeping_p50,
+        "post_present_bookkeeping_ms_p95": post_present_bookkeeping_p95,
         "presented_frame_ms_max": frame_max,
         "presented_frame_ms_p50": p50,
         "presented_frame_ms_p95": p95,
@@ -62761,6 +62801,8 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
     require_positive_u64(blockers, report, "sustained_scroll_duration_ms");
     require_object_field(blockers, report, "scroll_distance_px_rows_cols");
     require_object_field(blockers, report, "materialized_range_before_after");
+    require_frame_timing_split_fields(blockers, report, "preview_frame_timing");
+    require_frame_timing_split_fields(blockers, report, "post_input_frame_timing");
     if !scroll_wall_clock_budget_exempt(report) {
         require_axis_p95_at_most(
             blockers,
@@ -65583,6 +65625,40 @@ fn numeric_value_as_f64(value: &serde_json::Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_u64().map(|value| value as f64))
         .or_else(|| value.as_i64().map(|value| value as f64))
+}
+
+fn require_frame_timing_split_fields(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    key: &str,
+) {
+    let Some(timing) = report.get(key).and_then(serde_json::Value::as_object) else {
+        blockers.push(format!(
+            "{key} must be an object with split frame timing fields"
+        ));
+        return;
+    };
+    for field in [
+        "command_record_ms_p50",
+        "command_record_ms_p95",
+        "command_record_ms_max",
+        "encoder_finish_ms_p50",
+        "encoder_finish_ms_p95",
+        "encoder_finish_ms_max",
+        "queue_submit_ms_p50",
+        "queue_submit_ms_p95",
+        "queue_submit_ms_max",
+        "frame_present_ms_p50",
+        "frame_present_ms_p95",
+        "frame_present_ms_max",
+        "post_present_bookkeeping_ms_p50",
+        "post_present_bookkeeping_ms_p95",
+        "post_present_bookkeeping_ms_max",
+    ] {
+        if timing.get(field).and_then(numeric_value_as_f64).is_none() {
+            blockers.push(format!("{key}.{field} is missing or not numeric"));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -81419,6 +81495,21 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                     "surface_post_input_frame_timing": {
                         "first_presented_frame_ms": 300.0,
                         "measured_frame_count": 59,
+                        "command_record_ms_max": 5.5,
+                        "command_record_ms_p50": 1.1,
+                        "command_record_ms_p95": 4.5,
+                        "encoder_finish_ms_max": 0.7,
+                        "encoder_finish_ms_p50": 0.2,
+                        "encoder_finish_ms_p95": 0.6,
+                        "queue_submit_ms_max": 0.9,
+                        "queue_submit_ms_p50": 0.3,
+                        "queue_submit_ms_p95": 0.8,
+                        "frame_present_ms_max": 9.7,
+                        "frame_present_ms_p50": 6.1,
+                        "frame_present_ms_p95": 8.6,
+                        "post_present_bookkeeping_ms_max": 0.5,
+                        "post_present_bookkeeping_ms_p50": 0.1,
+                        "post_present_bookkeeping_ms_p95": 0.4,
                         "presented_frame_ms_max": 17.6,
                         "presented_frame_ms_p50": 10.1,
                         "presented_frame_ms_p95": 12.3,
@@ -81435,6 +81526,21 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                     "surface_post_input_frame_timing": {
                         "first_presented_frame_ms": 310.0,
                         "measured_frame_count": 59,
+                        "command_record_ms_max": 6.5,
+                        "command_record_ms_p50": 1.2,
+                        "command_record_ms_p95": 5.5,
+                        "encoder_finish_ms_max": 0.8,
+                        "encoder_finish_ms_p50": 0.3,
+                        "encoder_finish_ms_p95": 0.7,
+                        "queue_submit_ms_max": 1.0,
+                        "queue_submit_ms_p50": 0.4,
+                        "queue_submit_ms_p95": 0.9,
+                        "frame_present_ms_max": 10.7,
+                        "frame_present_ms_p50": 6.2,
+                        "frame_present_ms_p95": 9.6,
+                        "post_present_bookkeeping_ms_max": 0.6,
+                        "post_present_bookkeeping_ms_p50": 0.2,
+                        "post_present_bookkeeping_ms_p95": 0.5,
                         "presented_frame_ms_max": 16.8,
                         "presented_frame_ms_p50": 10.2,
                         "presented_frame_ms_p95": 14.9,
@@ -81510,6 +81616,24 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .and_then(serde_json::Value::as_array)
                 .cloned(),
             Some(vec![json!(12), json!(79)])
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/command_record_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(5.5)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/frame_present_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(9.6)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/post_present_bookkeeping_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.5)
         );
     }
 

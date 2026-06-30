@@ -1589,6 +1589,21 @@ pub struct NativeFrameTimingProof {
     pub present_submit_ms_p50: f64,
     pub present_submit_ms_p95: f64,
     pub present_submit_ms_max: f64,
+    pub command_record_ms_p50: f64,
+    pub command_record_ms_p95: f64,
+    pub command_record_ms_max: f64,
+    pub encoder_finish_ms_p50: f64,
+    pub encoder_finish_ms_p95: f64,
+    pub encoder_finish_ms_max: f64,
+    pub queue_submit_ms_p50: f64,
+    pub queue_submit_ms_p95: f64,
+    pub queue_submit_ms_max: f64,
+    pub frame_present_ms_p50: f64,
+    pub frame_present_ms_p95: f64,
+    pub frame_present_ms_max: f64,
+    pub post_present_bookkeeping_ms_p50: f64,
+    pub post_present_bookkeeping_ms_p95: f64,
+    pub post_present_bookkeeping_ms_max: f64,
     pub presented_frame_ms_p50: f64,
     pub presented_frame_ms_p95: f64,
     pub presented_frame_ms_p99: f64,
@@ -2167,6 +2182,11 @@ async fn run_surface_probe_inner(
     let mut first_presented_frame_ms = 0.0;
     let mut surface_acquire_samples = Vec::new();
     let mut present_submit_samples = Vec::new();
+    let mut command_record_samples = Vec::new();
+    let mut encoder_finish_samples = Vec::new();
+    let mut queue_submit_samples = Vec::new();
+    let mut frame_present_samples = Vec::new();
+    let mut post_present_bookkeeping_samples = Vec::new();
     let mut presented_frame_samples = Vec::new();
     let mut presented_frame_over_16_7_indices = Vec::new();
     let mut presented_frame_over_16_7_max = 0.0_f64;
@@ -2336,8 +2356,17 @@ async fn run_surface_probe_inner(
                 surface_lifecycle.epoch(),
             )?);
         }
-        queue.submit(Some(encoder.finish()));
+        let current_command_record_ms = elapsed_ms(present_start);
+        let encoder_finish_start = Instant::now();
+        let command_buffer = encoder.finish();
+        let current_encoder_finish_ms = elapsed_ms(encoder_finish_start);
+        let queue_submit_start = Instant::now();
+        queue.submit(Some(command_buffer));
+        let current_queue_submit_ms = elapsed_ms(queue_submit_start);
+        let frame_present_start = Instant::now();
         frame.present();
+        let current_frame_present_ms = elapsed_ms(frame_present_start);
+        let post_present_bookkeeping_start = Instant::now();
         render_loop_state.mark_presented_with_revisions(
             rendered_revision,
             rendered_content_revision,
@@ -2369,6 +2398,7 @@ async fn run_surface_probe_inner(
                 None,
             )?;
         }
+        let current_post_present_bookkeeping_ms = elapsed_ms(post_present_bookkeeping_start);
         let current_present_submit_ms = elapsed_ms(present_start);
         let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
         if frame_index == 0 {
@@ -2381,6 +2411,11 @@ async fn run_surface_probe_inner(
         if include_timing_sample {
             surface_acquire_samples.push(current_surface_acquire_ms);
             present_submit_samples.push(current_present_submit_ms);
+            command_record_samples.push(current_command_record_ms);
+            encoder_finish_samples.push(current_encoder_finish_ms);
+            queue_submit_samples.push(current_queue_submit_ms);
+            frame_present_samples.push(current_frame_present_ms);
+            post_present_bookkeeping_samples.push(current_post_present_bookkeeping_ms);
             let sample_index = presented_frame_samples.len() as u32;
             presented_frame_samples.push(frame_ms);
             if frame_ms > 16.7 {
@@ -2406,6 +2441,33 @@ async fn run_surface_probe_inner(
         present_submit_ms_p50: percentile(&present_submit_samples, 0.50),
         present_submit_ms_p95: percentile(&present_submit_samples, 0.95),
         present_submit_ms_max: present_submit_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        command_record_ms_p50: percentile(&command_record_samples, 0.50),
+        command_record_ms_p95: percentile(&command_record_samples, 0.95),
+        command_record_ms_max: command_record_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        encoder_finish_ms_p50: percentile(&encoder_finish_samples, 0.50),
+        encoder_finish_ms_p95: percentile(&encoder_finish_samples, 0.95),
+        encoder_finish_ms_max: encoder_finish_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        queue_submit_ms_p50: percentile(&queue_submit_samples, 0.50),
+        queue_submit_ms_p95: percentile(&queue_submit_samples, 0.95),
+        queue_submit_ms_max: queue_submit_samples.iter().copied().fold(0.0_f64, f64::max),
+        frame_present_ms_p50: percentile(&frame_present_samples, 0.50),
+        frame_present_ms_p95: percentile(&frame_present_samples, 0.95),
+        frame_present_ms_max: frame_present_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        post_present_bookkeeping_ms_p50: percentile(&post_present_bookkeeping_samples, 0.50),
+        post_present_bookkeeping_ms_p95: percentile(&post_present_bookkeeping_samples, 0.95),
+        post_present_bookkeeping_ms_max: post_present_bookkeeping_samples
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
@@ -2454,6 +2516,11 @@ async fn run_surface_probe_inner(
             .max(1);
         let mut post_input_surface_acquire_samples = Vec::new();
         let mut post_input_present_submit_samples = Vec::new();
+        let mut post_input_command_record_samples = Vec::new();
+        let mut post_input_encoder_finish_samples = Vec::new();
+        let mut post_input_queue_submit_samples = Vec::new();
+        let mut post_input_frame_present_samples = Vec::new();
+        let mut post_input_post_present_bookkeeping_samples = Vec::new();
         let mut post_input_presented_frame_samples = Vec::new();
         let mut post_input_presented_frame_over_16_7_indices = Vec::new();
         let mut post_input_presented_frame_over_16_7_max = 0.0_f64;
@@ -2604,14 +2671,24 @@ async fn run_surface_probe_inner(
                     surface_lifecycle.epoch(),
                 )?);
             }
-            queue.submit(Some(encoder.finish()));
+            let current_command_record_ms = elapsed_ms(present_start);
+            let encoder_finish_start = Instant::now();
+            let command_buffer = encoder.finish();
+            let current_encoder_finish_ms = elapsed_ms(encoder_finish_start);
+            let queue_submit_start = Instant::now();
+            queue.submit(Some(command_buffer));
+            let current_queue_submit_ms = elapsed_ms(queue_submit_start);
+            let frame_present_start = Instant::now();
             frame.present();
+            let current_frame_present_ms = elapsed_ms(frame_present_start);
+            let post_present_bookkeeping_start = Instant::now();
             render_loop_state.mark_presented_with_revisions(
                 rendered_revision,
                 rendered_content_revision,
                 rendered_layout_revision,
                 rendered_render_scene_revision,
             );
+            let current_post_present_bookkeeping_ms = elapsed_ms(post_present_bookkeeping_start);
             let current_present_submit_ms = elapsed_ms(present_start);
             let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
             if frame_index == 0 {
@@ -2622,6 +2699,12 @@ async fn run_surface_probe_inner(
             if include_timing_sample {
                 post_input_surface_acquire_samples.push(current_surface_acquire_ms);
                 post_input_present_submit_samples.push(current_present_submit_ms);
+                post_input_command_record_samples.push(current_command_record_ms);
+                post_input_encoder_finish_samples.push(current_encoder_finish_ms);
+                post_input_queue_submit_samples.push(current_queue_submit_ms);
+                post_input_frame_present_samples.push(current_frame_present_ms);
+                post_input_post_present_bookkeeping_samples
+                    .push(current_post_present_bookkeeping_ms);
                 let sample_index = post_input_presented_frame_samples.len() as u32;
                 post_input_presented_frame_samples.push(frame_ms);
                 if frame_ms > 16.7 {
@@ -2648,6 +2731,42 @@ async fn run_surface_probe_inner(
             present_submit_ms_p50: percentile(&post_input_present_submit_samples, 0.50),
             present_submit_ms_p95: percentile(&post_input_present_submit_samples, 0.95),
             present_submit_ms_max: post_input_present_submit_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            command_record_ms_p50: percentile(&post_input_command_record_samples, 0.50),
+            command_record_ms_p95: percentile(&post_input_command_record_samples, 0.95),
+            command_record_ms_max: post_input_command_record_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            encoder_finish_ms_p50: percentile(&post_input_encoder_finish_samples, 0.50),
+            encoder_finish_ms_p95: percentile(&post_input_encoder_finish_samples, 0.95),
+            encoder_finish_ms_max: post_input_encoder_finish_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            queue_submit_ms_p50: percentile(&post_input_queue_submit_samples, 0.50),
+            queue_submit_ms_p95: percentile(&post_input_queue_submit_samples, 0.95),
+            queue_submit_ms_max: post_input_queue_submit_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            frame_present_ms_p50: percentile(&post_input_frame_present_samples, 0.50),
+            frame_present_ms_p95: percentile(&post_input_frame_present_samples, 0.95),
+            frame_present_ms_max: post_input_frame_present_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            post_present_bookkeeping_ms_p50: percentile(
+                &post_input_post_present_bookkeeping_samples,
+                0.50,
+            ),
+            post_present_bookkeeping_ms_p95: percentile(
+                &post_input_post_present_bookkeeping_samples,
+                0.95,
+            ),
+            post_present_bookkeeping_ms_max: post_input_post_present_bookkeeping_samples
                 .iter()
                 .copied()
                 .fold(0.0_f64, f64::max),

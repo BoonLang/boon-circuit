@@ -48587,8 +48587,15 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .unwrap_or(preview_frame_ms);
     let preview_frame_budget =
         native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
+    let measured_surface_key = if dev_editor {
+        "dev_surface_proof"
+    } else {
+        "preview_surface_proof"
+    };
+    let measured_adapter_is_software_path = format!("/{measured_surface_key}/adapter_is_software");
     let software_adapter = extra
-        .pointer("/preview_surface_proof/adapter_is_software")
+        .pointer(&measured_adapter_is_software_path)
+        .or_else(|| extra.pointer("/preview_surface_proof/adapter_is_software"))
         .and_then(serde_json::Value::as_bool)
         == Some(true);
     let render_upload_bytes = render_metric_u64("upload_bytes").unwrap_or(0);
@@ -48777,11 +48784,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let render_quad_cache_eviction_count =
         render_metric_u64("quad_cache_eviction_count").unwrap_or(0);
     let wall_clock_frame_budget_pass = preview_frame_ms <= preview_frame_budget;
-    let frame_upload_budget_pass = if software_adapter {
-        render_upload_bytes <= upload_budget
-    } else {
-        wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget
-    };
+    let frame_upload_budget_pass =
+        wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget;
     let selected_wheel_input_observed = !matches!(
         wheel_input_evidence_source,
         "operator-host-plan" | "missing"
@@ -48812,7 +48816,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["wall_clock_frame_budget_pass"] = json!(wall_clock_frame_budget_pass);
     extra["wall_clock_frame_budget_ms_p95"] = json!(preview_frame_ms);
     extra["wall_clock_frame_budget_note"] = json!(if software_adapter {
-        "isolated Weston selected a software Vulkan adapter; wall-clock frame timing is reported but not used as production GPU speed proof"
+        "isolated Weston selected a software Vulkan adapter; wall-clock frame timing is reported and remains a product-speed blocker when over budget"
     } else {
         "native surface used a non-software adapter; wall-clock frame timing is enforced"
     });
@@ -48854,6 +48858,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             .and_then(serde_json::Value::as_bool)
             == Some(true)
             && real_window_timing_proven
+            && frame_upload_budget_pass
     );
     extra["input_queue_depth_max"] = json!(input_queue_depth);
     extra["layout_rebuild_scope"] = json!("visible-plus-overscan-delta");
@@ -49031,12 +49036,10 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 && required_wheel_axes_observed
                 && selected_real_window_timing_ok
                 && frame_upload_budget_pass
-                && (software_adapter
-                    || wheel_to_visible_ms.is_some_and(|value| {
-                        value
-                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
-                                .unwrap_or(50.0)
-                    }))
+                && wheel_to_visible_ms.is_some_and(|value| {
+                    value
+                        <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
+                })
         );
     } else if label == "novywave" {
         let lane_evidence = novywave_signal_lane_runtime_evidence();
@@ -49152,12 +49155,10 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                     .get("row_wave_segments_scoped_to_page_window")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
-                && (software_adapter
-                    || wheel_to_visible_ms.is_some_and(|value| {
-                        value
-                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
-                                .unwrap_or(50.0)
-                    }))
+                && wheel_to_visible_ms.is_some_and(|value| {
+                    value
+                        <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
+                })
         );
     } else {
         let columns = native_gpu_budget_u64("cells", "logical_columns").unwrap_or(26);
@@ -49240,12 +49241,10 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 && required_wheel_axes_observed
                 && selected_real_window_timing_ok
                 && frame_upload_budget_pass
-                && (software_adapter
-                    || wheel_to_visible_ms.is_some_and(|value| {
-                        value
-                            <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95")
-                                .unwrap_or(50.0)
-                    }))
+                && wheel_to_visible_ms.is_some_and(|value| {
+                    value
+                        <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
+                })
         );
     }
 }
@@ -82657,6 +82656,135 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .get("budget_pass")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn software_adapter_over_budget_does_not_prove_scroll_speed() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "speed_timing_window": "post-real-window-input",
+            "post_input_frame_timing": {
+                "measured_frame_count": 30
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": true
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .get("software_adapter_wall_clock_budget_exempt")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("wall_clock_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .pointer("/non_os_scroll_model/frame_budget_model_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn dev_editor_scroll_budget_uses_dev_surface_adapter_flag() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 12.0,
+            "speed_timing_window": "post-real-window-input",
+            "post_input_frame_timing": {
+                "measured_frame_count": 30
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": true
+            },
+            "dev_surface_proof": {
+                "adapter_is_software": false
+            },
+            "line_count": 10000,
+            "longest_line_bytes": 2000,
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0,
+                    "visible_text_runs": 64,
+                    "shaped_text_runs": 64,
+                    "shaped_run_cache_hits": 64,
+                    "shaped_run_cache_misses": 0
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "dev-code-editor", true);
+
+        assert_eq!(
+            report
+                .get("software_adapter_wall_clock_budget_exempt")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("wall_clock_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

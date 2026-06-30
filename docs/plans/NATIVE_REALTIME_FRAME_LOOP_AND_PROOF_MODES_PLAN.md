@@ -621,6 +621,42 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `post_input_frame_timing.measured_frame_count=118`
   - `post_input_frame_timing.presented_frame_ms_over_16_7_count=0`
 
+2026-06-30 Cells visible-click structured proof slice:
+
+- `boon_native_app_window` recognizes structured nested
+  `wgpu-visible-surface-copy-src-readback` proof as replacing the duplicate
+  interaction readback only when the nested proof status is pass.
+- `verify-native-cells-visible-click-e2e` now consumes that structured
+  same-frame proof instead of waiting for an obsolete duplicate
+  `last_interactive_readback_artifact`:
+  - the proof `FrameEvidenceKey` must match the measured presented frame;
+  - the visible-surface render path must be direct and app-owned;
+  - `preview_blocked_on_ipc_count` must remain zero;
+  - retained bound text updates must prove the formula text and selected address;
+  - focused-node render-state evidence must prove the clicked cell is selected
+    and focused.
+- Metadata-only retained text sync still fails, and a mismatched
+  `FrameEvidenceKey` structured proof fails.
+- Fresh verification passed:
+  - `cargo test -q -p boon_native_app_window external_visible_readback_proof`
+  - `cargo test -q -p xtask cells_visual_formula_probe_requires_expected_formula_bar_text_value`
+  - `cargo check -q -p xtask`
+  - `timeout 900s cargo run -q -p xtask -- verify-native-cells-visible-click-e2e --profile release --repeat-count 2 --report target/reports/native-gpu/cells-visible-click-e2e-release-current.json`
+  - `cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release-current.json`
+- Fresh Cells visible-click report highlights:
+  - `status=pass`
+  - `target_count=8`
+  - `input_wake_to_formula_visible_ms_p95=15.929690`
+  - `click_to_formula_visible_ms_p95=27.529414`
+  - `present_call_ms.p95=8.888936`
+  - `render_started_to_render_hook_completed_ms.p95=3.067628`
+  - `retained_update_contract.total=8`, `retained=8`, `full_lower=0`
+  - `runtime_work_contract.total=8`, `zero_scans=8`,
+    `zero_root_materialization=8`, `zero_recompute=8`
+- This does not complete the full plan. Remaining work still includes full
+  aggregate native GPU gates, dev-code-editor crash/scroll coverage,
+  broader no-hacks audit, and generic runtime/list/currentness verification.
+
 ## Implementation Slices
 
 1. Terminology and schema:

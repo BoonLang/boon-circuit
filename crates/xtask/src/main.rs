@@ -53787,7 +53787,13 @@ fn verify_native_cells_visible_click_e2e(
         || live_probe
             .pointer("/readback_probe/accepted_by_external_render_proof_hash_change")
             .and_then(serde_json::Value::as_bool)
-            == Some(true)
+            == Some(true);
+    let structured_external_proof_changed = live_probe
+        .pointer("/readback_probe/accepted_by_structured_external_render_proof")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let proof_current_changed = readback_hash_changed
+        || structured_external_proof_changed
         || live_probe
             .pointer("/visual_formula_probe/visual_formula_changed")
             .and_then(serde_json::Value::as_bool)
@@ -53900,8 +53906,9 @@ fn verify_native_cells_visible_click_e2e(
                 .get("input_wake_to_present_ms")
                 .and_then(numeric_value_as_f64)
                 .unwrap_or(f64::INFINITY);
-            let readback_hash_changed = sample
-                .get("readback_hash_changed")
+            let proof_current_changed = sample
+                .get("proof_current_changed")
+                .or_else(|| sample.get("readback_hash_changed"))
                 .and_then(serde_json::Value::as_bool)
                 == Some(true);
             let exceeds_driver_to_visible_budget = click_to_formula > max_click_to_present_ms
@@ -53915,10 +53922,10 @@ fn verify_native_cells_visible_click_e2e(
                 && click_to_present <= bounded_click_to_present_outlier_cap_ms
                 && input_wake_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && input_wake_to_present <= bounded_click_to_present_outlier_cap_ms
-                && readback_hash_changed;
+                && proof_current_changed;
             let bounded = input_wake_to_formula <= max_click_to_formula_ms
                 && input_wake_to_present <= max_click_to_formula_ms
-                && readback_hash_changed;
+                && proof_current_changed;
             if bounded_cold_start {
                 bounded_cold_start_outliers.push(json!({
                     "index": sample_index.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
@@ -53932,7 +53939,7 @@ fn verify_native_cells_visible_click_e2e(
                     "input_wake_to_present_ms": input_wake_to_present,
                     "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
                     "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
-                    "readback_hash_changed": readback_hash_changed,
+                    "proof_current_changed": proof_current_changed,
                     "cold_sample_count": cold_sample_count,
                     "classification": "bounded-cold-start-driver-to-app-wake-outlier"
                 }));
@@ -53949,7 +53956,7 @@ fn verify_native_cells_visible_click_e2e(
                     "input_wake_to_present_ms": input_wake_to_present,
                     "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
                     "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
-                    "readback_hash_changed": readback_hash_changed,
+                    "proof_current_changed": proof_current_changed,
                     "classification": "external-driver-to-app-wake-outlier-with-bounded-app-owned-input-latency"
                 }));
             } else {
@@ -54058,11 +54065,11 @@ fn verify_native_cells_visible_click_e2e(
         &mut checks,
         &mut blockers,
         "cells-visible-click-e2e:proof-identity-current-changed-readback",
-        readback_ok && readback_hash_changed,
+        readback_ok && proof_current_changed,
         format!(
-            "readback_ok={readback_ok}, hash_changed={readback_hash_changed}, click_to_present_ms_p95={click_to_present_ms:.3}, proof_latency_after_present_ms_max={click_to_readback_after_present_ms_max:.3}"
+            "readback_ok={readback_ok}, hash_changed={readback_hash_changed}, structured_external_proof={structured_external_proof_changed}, proof_current_changed={proof_current_changed}, click_to_present_ms_p95={click_to_present_ms:.3}, proof_latency_after_present_ms_max={click_to_readback_after_present_ms_max:.3}"
         ),
-        (!(readback_ok && readback_hash_changed)).then(|| {
+        (!(readback_ok && proof_current_changed)).then(|| {
             "Cells click did not produce current changed app-owned WGPU proof for the presented frame"
                 .to_owned()
         }),
@@ -54394,7 +54401,18 @@ fn cells_visual_formula_probe_from_readback(
             .get("accepted_by_external_render_proof_hash_change")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
-    let readback_pass = readback_probe
+    let structured_visible_probe = cells_structured_external_visible_surface_formula_probe(
+        readback_probe,
+        previous_address,
+        expected_address,
+        previous_formula,
+        expected_formula,
+    );
+    let structured_visible_pass = structured_visible_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let readback_status_pass = readback_probe
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
@@ -54453,12 +54471,22 @@ fn cells_visual_formula_probe_from_readback(
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
-    let formula_bar_visual_changed = readback_pass
+    let structured_formula_bar_visual_changed = structured_visible_probe
+        .get("formula_bar_visual_changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let structured_selected_cell_visual_changed = structured_visible_probe
+        .get("selected_cell_visual_changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let formula_bar_visual_changed = (readback_status_pass
         && readback_hash_changed
         && retained_text_sync_matches
-        && formula_bar_crop_pass;
+        && formula_bar_crop_pass)
+        || structured_formula_bar_visual_changed;
     let selected_cell_visual_changed =
-        readback_pass && readback_hash_changed && selected_cell_crop_pass;
+        (readback_status_pass && readback_hash_changed && selected_cell_crop_pass)
+            || structured_selected_cell_visual_changed;
     let full_frame_visual_changed = formula_bar_visual_changed && selected_cell_visual_changed;
     let visual_formula_changed = full_frame_visual_changed;
     json!({
@@ -54476,6 +54504,8 @@ fn cells_visual_formula_probe_from_readback(
         "readback_hash_changed": readback_hash_changed,
         "accepted_by_retained_bound_text_sync": accepted_by_retained_bound_text_sync,
         "retained_render_proof_pass": retained_render_proof_pass,
+        "structured_external_visible_surface_probe": structured_visible_probe,
+        "structured_external_visible_surface_pass": structured_visible_pass,
         "retained_bound_sync": retained_sync,
         "retained_sync_unavailable": retained_sync_unavailable,
         "retained_text_changed": retained_text_changed,
@@ -54495,6 +54525,167 @@ fn cells_visual_formula_probe_from_readback(
         "full_frame_visual_changed": full_frame_visual_changed,
         "retained_text_update_count": text_update_count,
         "visual_formula_changed": visual_formula_changed
+    })
+}
+
+fn cells_structured_external_visible_surface_formula_probe(
+    readback_probe: &serde_json::Value,
+    previous_address: &str,
+    expected_address: &str,
+    previous_formula: &str,
+    expected_formula: &str,
+) -> serde_json::Value {
+    let accepted_by_structured_external_render_proof = readback_probe
+        .get("accepted_by_structured_external_render_proof")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let Some(external_proof) = readback_probe.get("last_external_render_proof") else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing structured external render proof",
+            "accepted_by_structured_external_render_proof": accepted_by_structured_external_render_proof
+        });
+    };
+    let proof = external_proof
+        .get("proof")
+        .unwrap_or(&serde_json::Value::Null);
+    let root_frame_key = readback_probe.get("frame_evidence_key");
+    let proof_frame_key = proof.get("frame_evidence_key");
+    let frame_evidence_matches = root_frame_key.is_some() && root_frame_key == proof_frame_key;
+    let proof_capture_method = proof
+        .get("capture_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let app_owned_visible_surface_proof =
+        native_gpu_app_owned_wgpu_readback_capture_method(proof_capture_method);
+    let proof_status_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    let external_status_pass = external_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let visible_surface_rendered = external_proof
+        .get("visible_surface_rendered")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let visible_present_path = external_proof
+        .get("visible_present_path")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let render_target_kind = external_proof
+        .get("render_target_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let direct_visible_surface = render_target_kind == "visible-surface-direct";
+    let preview_blocked_on_ipc_count = proof
+        .pointer("/metrics/preview_blocked_on_ipc_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let no_preview_ipc_block = preview_blocked_on_ipc_count == 0;
+    let retained_sync = external_proof
+        .get("retained_bound_sync")
+        .unwrap_or(&serde_json::Value::Null);
+    let retained_sync_pass = retained_sync
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let address_change_required = previous_address != expected_address;
+    let formula_change_required = previous_formula != expected_formula;
+    let formula_text_visible = !formula_change_required
+        || retained_bound_sync_changed_text_path_to_value(
+            retained_sync,
+            "store.selected_input.editing_text",
+            expected_formula,
+        );
+    let address_text_visible = !address_change_required
+        || retained_bound_sync_changed_text_path_to_value(
+            retained_sync,
+            "store.selected_address",
+            expected_address,
+        );
+    let focus_state_selected_address = external_proof
+        .pointer("/input_overlay_focus_state/selected_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let focus_state_previous_address = external_proof
+        .pointer("/input_overlay_focus_state/previous_selected_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let focused_node_probe = external_proof
+        .get("input_overlay_focused_node_probe")
+        .unwrap_or(&serde_json::Value::Null);
+    let focused_node_probe_pass = focused_node_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let focused_node_selected = focused_node_probe
+        .get("style_selected")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let focused_node_focused = focused_node_probe
+        .get("style_focused")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || focused_node_probe
+            .get("focused")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let focus_state_matches = focus_state_selected_address == expected_address
+        && (!address_change_required || focus_state_previous_address == previous_address);
+    let selected_cell_visible = !address_change_required
+        || (focused_node_probe_pass
+            && focused_node_selected
+            && focused_node_focused
+            && focus_state_matches);
+    let pass = accepted_by_structured_external_render_proof
+        && external_status_pass
+        && proof_status_pass
+        && app_owned_visible_surface_proof
+        && frame_evidence_matches
+        && visible_surface_rendered
+        && visible_present_path
+        && direct_visible_surface
+        && no_preview_ipc_block
+        && retained_sync_pass
+        && formula_text_visible
+        && address_text_visible
+        && selected_cell_visible;
+    let formula_bar_visual_changed = pass && formula_text_visible && address_text_visible;
+    let selected_cell_visual_changed = pass && selected_cell_visible;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "evidence": if pass {
+            "same-frame structured visible-surface WGPU proof carried retained formula/address text and selected-cell render-state changes"
+        } else {
+            "structured visible-surface proof did not prove current formula/address and selected-cell render state"
+        },
+        "accepted_by_structured_external_render_proof": accepted_by_structured_external_render_proof,
+        "external_status_pass": external_status_pass,
+        "proof_status_pass": proof_status_pass,
+        "proof_capture_method": proof_capture_method,
+        "app_owned_visible_surface_proof": app_owned_visible_surface_proof,
+        "frame_evidence_matches": frame_evidence_matches,
+        "root_frame_evidence_key": root_frame_key.cloned().unwrap_or(serde_json::Value::Null),
+        "proof_frame_evidence_key": proof_frame_key.cloned().unwrap_or(serde_json::Value::Null),
+        "visible_surface_rendered": visible_surface_rendered,
+        "visible_present_path": visible_present_path,
+        "render_target_kind": render_target_kind,
+        "direct_visible_surface": direct_visible_surface,
+        "preview_blocked_on_ipc_count": preview_blocked_on_ipc_count,
+        "no_preview_ipc_block": no_preview_ipc_block,
+        "retained_sync_pass": retained_sync_pass,
+        "formula_change_required": formula_change_required,
+        "address_change_required": address_change_required,
+        "formula_text_visible": formula_text_visible,
+        "address_text_visible": address_text_visible,
+        "focus_state_selected_address": focus_state_selected_address,
+        "focus_state_previous_address": focus_state_previous_address,
+        "focus_state_matches": focus_state_matches,
+        "focused_node_probe_pass": focused_node_probe_pass,
+        "focused_node_selected": focused_node_selected,
+        "focused_node_focused": focused_node_focused,
+        "selected_cell_visible": selected_cell_visible,
+        "formula_bar_visual_changed": formula_bar_visual_changed,
+        "selected_cell_visual_changed": selected_cell_visual_changed
     })
 }
 
@@ -56088,11 +56279,16 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 .get("accepted_by_external_render_proof_hash_change")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true);
+        let structured_external_proof_changed = readback_probe
+            .get("accepted_by_structured_external_render_proof")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let proof_current_changed = readback_hash_changed || structured_external_proof_changed;
         let readback_pass = readback_probe
             .get("status")
             .and_then(serde_json::Value::as_str)
             == Some("pass")
-            && readback_hash_changed;
+            && proof_current_changed;
         let visual_formula_pass = visual_formula_probe
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -56138,6 +56334,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             == present_probe
                 .get("input_event_wake_count")
                 .and_then(serde_json::Value::as_u64);
+        let structured_external_proof_is_current = readback_probe
+            .get("structured_external_render_proof_is_current")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         let readback_proves_presented_frame = formula_bar_visual_pass
             && readback_probe
                 .get("surface_readback_is_current")
@@ -56149,7 +56349,11 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 .is_some_and(|(readback_revision, present_revision)| {
                     readback_revision >= present_revision
                 });
-        let harness_click_to_formula_visible_ms = if readback_proves_presented_frame {
+        let visual_proof_proves_presented_frame = readback_proves_presented_frame
+            || (formula_bar_visual_pass
+                && structured_external_proof_is_current
+                && same_input_generation);
+        let harness_click_to_formula_visible_ms = if visual_proof_proves_presented_frame {
             harness_click_to_present_ms
         } else {
             harness_click_to_readback_visible_ms
@@ -56353,7 +56557,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "native_input_reject_counts": sample_native_input_reject_counts,
             "present_probe": present_probe,
             "readback_probe": readback_probe,
-            "readback_hash_changed": readback_hash_changed
+            "readback_hash_changed": readback_hash_changed,
+            "structured_external_proof_changed": structured_external_proof_changed,
+            "proof_current_changed": proof_current_changed,
+            "visual_proof_proves_presented_frame": visual_proof_proves_presented_frame
         });
         let accepted_external_hash = readback_probe
             .get("accepted_by_external_render_proof_hash_change")
@@ -56645,6 +56852,14 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .unwrap_or(serde_json::Value::Null),
         "readback_hash_changed": last_sample
             .get("readback_hash_changed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "structured_external_proof_changed": last_sample
+            .get("structured_external_proof_changed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "proof_current_changed": last_sample
+            .get("proof_current_changed")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "initial_readback_probe": initial_readback,
@@ -56952,6 +57167,45 @@ fn native_input_adapter_mouse_window_xy(input_adapter: &serde_json::Value) -> Op
     Some((x, y))
 }
 
+fn structured_external_visible_surface_proof_matches_report(report: &serde_json::Value) -> bool {
+    let Some(frame_key) = report.get("frame_evidence_key") else {
+        return false;
+    };
+    let Some(external_proof) = report.get("last_external_render_proof") else {
+        return false;
+    };
+    let Some(proof) = external_proof.get("proof") else {
+        return false;
+    };
+    external_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && proof.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && proof
+            .get("capture_method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(native_gpu_app_owned_wgpu_readback_capture_method)
+        && proof.get("frame_evidence_key") == Some(frame_key)
+        && external_proof
+            .get("visible_surface_rendered")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && external_proof
+            .get("visible_present_path")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && external_proof
+            .get("render_target_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("visible-surface-direct")
+        && proof
+            .pointer("/metrics/preview_blocked_on_ipc_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            == 0
+}
+
 fn wait_for_cells_formula_visible_match(
     connect: &str,
     loop_report: &Path,
@@ -57030,6 +57284,8 @@ fn wait_for_cells_formula_visible_match(
                         && current_presented_input_generation
                         && generation_timed_frame;
                     if present_probe.is_none() && current_input_frame_presented {
+                        let structured_external_render_proof_current =
+                            structured_external_visible_surface_proof_matches_report(&report);
                         present_probe = Some(json!({
                             "status": "pass",
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -57133,7 +57389,11 @@ fn wait_for_cells_formula_visible_match(
                                 "accepted_by_revision": true,
                                 "accepted_by_hash_change": false,
                                 "accepted_by_external_render_proof_hash_change": false,
+                                "accepted_by_structured_external_render_proof": structured_external_render_proof_current,
+                                "structured_external_render_proof_is_current": structured_external_render_proof_current,
                                 "accepted_by_retained_bound_text_sync": true,
+                                "surface_readback_is_current": false,
+                                "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                                 "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
                                 "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null)
                             });
@@ -81799,6 +82059,114 @@ mod tests {
                 .get("retained_text_sync_matches")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+
+        let frame_key = json!({
+            "frame_seq": 9,
+            "content_revision": 7,
+            "layout_revision": 3,
+            "render_scene_revision": 5,
+            "surface_id": "preview:test-surface",
+            "surface_epoch": 1,
+            "input_event_seq": 4,
+            "present_id": 9,
+            "proof_request_id": null
+        });
+        let structured_probe = json!({
+            "status": "pass",
+            "accepted_by_hash_change": false,
+            "accepted_by_retained_bound_text_sync": true,
+            "accepted_by_structured_external_render_proof": true,
+            "structured_external_render_proof_is_current": true,
+            "frame_evidence_key": frame_key.clone(),
+            "last_external_render_proof": {
+                "status": "pass",
+                "visible_surface_rendered": true,
+                "visible_present_path": true,
+                "render_target_kind": "visible-surface-direct",
+                "input_overlay_focus_state": {
+                    "previous_selected_address": "A0",
+                    "selected_address": "B0"
+                },
+                "input_overlay_focused_node_probe": {
+                    "status": "pass",
+                    "focused": true,
+                    "style_selected": true,
+                    "style_focused": true
+                },
+                "proof": {
+                    "status": "pass",
+                    "capture_method": "wgpu-visible-surface-copy-src-readback",
+                    "replacement_proof": "render-loop visible surface readback artifact",
+                    "frame_evidence_key": frame_key.clone(),
+                    "metrics": {
+                        "preview_blocked_on_ipc_count": 0
+                    }
+                },
+                "retained_bound_sync": {
+                    "status": "pass",
+                    "changed": true,
+                    "text_update_count": 2,
+                    "text_update_values": [
+                        {
+                            "node": "formula-input",
+                            "text": "=add(A0,A1)",
+                            "paths": ["store.selected_input.editing_text"]
+                        },
+                        {
+                            "node": "formula-address",
+                            "text": "B0",
+                            "paths": ["store.selected_address"]
+                        }
+                    ]
+                }
+            }
+        });
+        let structured_result = cells_visual_formula_probe_from_readback(
+            &structured_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            structured_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "same-frame structured visible-surface WGPU proof should replace duplicate interaction readback"
+        );
+        assert_eq!(
+            structured_result
+                .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let mut stale_structured_probe = structured_probe.clone();
+        stale_structured_probe["last_external_render_proof"]["proof"]["frame_evidence_key"]["present_id"] =
+            json!(8);
+        let stale_structured_result = cells_visual_formula_probe_from_readback(
+            &stale_structured_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            stale_structured_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail"),
+            "structured visible-surface proof must not pass with stale frame identity"
+        );
+        assert_eq!(
+            stale_structured_result
+                .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
         let _ = std::fs::remove_dir_all(&artifact_dir);
     }

@@ -36991,6 +36991,15 @@ fn run_native_example_switch_live_probe(
                     .and_then(serde_json::Value::as_bool)
             })
             .unwrap_or(false);
+        let active_pending_snapshot_backpressure = ack
+            .get("active_pending_snapshot_backpressure")
+            .cloned()
+            .or_else(|| {
+                ready
+                    .pointer("/response/active_pending_snapshot_backpressure")
+                    .cloned()
+            })
+            .unwrap_or_else(|| json!({"status": "missing"}));
         let preview_ms = if visual_change_required {
             if final_readback
                 .get("status")
@@ -37044,6 +37053,7 @@ fn run_native_example_switch_live_probe(
                 .unwrap_or(0.0),
             "ack": ack,
             "ready": ready,
+            "active_pending_snapshot_backpressure": active_pending_snapshot_backpressure,
             "pending_overlay_readback_probe": pending_overlay_readback,
             "readback_probe": final_readback,
             "pending_overlay_frame_revision": pending_overlay_frame_revision,
@@ -58447,6 +58457,123 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "continuous-probe-ux-report",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-scroll-speed",
+                    "render_loop_mode": "continuous_probe"
+                }),
+            ),
+        ),
+        (
+            "proof-required-visible-update",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "proof_required_for_visible_update": true
+                }),
+            ),
+        ),
+        (
+            "below-host-input-injection",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-counter-interaction-speed",
+                    "input_injection_method": "direct-runtime-route-below-host-event"
+                }),
+            ),
+        ),
+        (
+            "preview-blocked-on-ipc-product-path",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "preview_blocked_on_ipc_count": 1
+                }),
+            ),
+        ),
+        (
+            "passive-scroll-runtime-dispatch",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-scroll-speed",
+                    "runtime_dispatch_on_passive_scroll": true,
+                    "runtime_dispatch_count_for_passive_scroll": 1
+                }),
+            ),
+        ),
+        (
+            "passive-scroll-graph-rebuild",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-dev-editor-scroll-speed",
+                    "graph_rebuild_count": 1
+                }),
+            ),
+        ),
+        (
+            "dev-perf-row-hot-path-query",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "preview_perf_hot_path_query_count": 1,
+                    "dev_perf_row_queries_ipc_from_render_hook": true
+                }),
+            ),
+        ),
+        (
+            "desktop-screenshot-visible-proof",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "visual_capture_method": "desktop-screenshot"
+                }),
+            ),
+        ),
+        (
+            "nested-private-runtime-dispatch",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "native_host_input_route_evidence": {
+                        "private_runtime_dispatch_used": true
+                    }
+                }),
+            ),
+        ),
+        (
+            "browser-proof-substituted-for-native",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "browser_render_executed": true,
+                    "browser_capture_method": "headless-chromium-webgpu-app-owned-copyTextureToBuffer"
+                }),
+            ),
+        ),
+        (
+            "cosmic-toplevel-proof",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "cosmic_toplevel_probe": {
+                        "status": "pass"
+                    }
+                }),
+            ),
+        ),
+        (
             "mutated-source-event-field",
             merge_json(
                 base(),
@@ -61036,6 +61163,11 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                         "per_switch[{index}] must prove bounded latest-wins worker scheduling"
                     ));
                 }
+                require_active_pending_snapshot_backpressure(
+                    &mut blockers,
+                    step,
+                    &format!("per_switch[{index}].active_pending_snapshot_backpressure"),
+                );
                 if step
                     .get("expected_result_status")
                     .and_then(serde_json::Value::as_str)
@@ -61759,6 +61891,106 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
         );
     }
     require_u64_array_field(blockers, report, "frames_over_16_7_ms");
+}
+
+fn require_active_pending_snapshot_backpressure(
+    blockers: &mut Vec<String>,
+    report: &serde_json::Value,
+    label: &str,
+) {
+    let Some(proof) = report
+        .get("active_pending_snapshot_backpressure")
+        .and_then(serde_json::Value::as_object)
+    else {
+        blockers.push(format!("{label} is missing"));
+        return;
+    };
+    let field = |key: &str| proof.get(key);
+    if field("status").and_then(serde_json::Value::as_str) != Some("pass") {
+        blockers.push(format!("{label}.status must be pass"));
+    }
+    let max_pending = field("max_pending_snapshots")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    if max_pending != 1 {
+        blockers.push(format!("{label}.max_pending_snapshots must be 1"));
+    }
+    let pending = field("pending_snapshot_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    if pending > max_pending {
+        blockers.push(format!(
+            "{label}.pending_snapshot_count must not exceed max_pending_snapshots"
+        ));
+    }
+    let observed_pending = field("pending_snapshot_count_observed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(pending);
+    if observed_pending > max_pending {
+        blockers.push(format!(
+            "{label}.pending_snapshot_count_observed must not exceed max_pending_snapshots"
+        ));
+    }
+    match (
+        pending,
+        field("pending_snapshot_kind").and_then(serde_json::Value::as_str),
+    ) {
+        (0, Some("none")) => {}
+        (1, Some("runtime-layout-render")) => {}
+        _ => blockers.push(format!(
+            "{label}.pending_snapshot_kind must match the pending snapshot count"
+        )),
+    }
+    for key in [
+        "single_slot_pending_snapshot",
+        "latest_wins_pending_queue",
+        "active_frame_kept_while_pending",
+    ] {
+        if field(key).and_then(serde_json::Value::as_bool) != Some(true) {
+            blockers.push(format!("{label}.{key} must be true"));
+        }
+    }
+    if field("active_frame_update_policy").and_then(serde_json::Value::as_str)
+        != Some("retain-active-frame-with-pending-overlay")
+    {
+        blockers.push(format!(
+            "{label}.active_frame_update_policy must retain the active frame with a pending overlay"
+        ));
+    }
+    let commit_policy = field("pending_snapshot_commit_policy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(commit_policy, "commit-current-only" | "reject-stale") {
+        blockers.push(format!(
+            "{label}.pending_snapshot_commit_policy must be commit-current-only or reject-stale"
+        ));
+    }
+    if field("stale_result_rejected").and_then(serde_json::Value::as_bool) == Some(true)
+        && commit_policy != "reject-stale"
+    {
+        blockers.push(format!(
+            "{label}.pending_snapshot_commit_policy must be reject-stale when stale_result_rejected is true"
+        ));
+    }
+    for key in [
+        "coalesced_pending_snapshot_count",
+        "dropped_pending_snapshot_count",
+        "stale_pending_snapshot_rejected_count",
+        "render_thread_blocked_on_replace_count",
+        "preview_blocked_on_ipc_count",
+    ] {
+        if field(key).and_then(serde_json::Value::as_u64).is_none() {
+            blockers.push(format!("{label}.{key} must be present"));
+        }
+    }
+    for key in [
+        "render_thread_blocked_on_replace_count",
+        "preview_blocked_on_ipc_count",
+    ] {
+        if field(key).and_then(serde_json::Value::as_u64).unwrap_or(1) != 0 {
+            blockers.push(format!("{label}.{key} must be 0"));
+        }
+    }
 }
 
 fn scroll_wall_clock_budget_exempt(report: &serde_json::Value) -> bool {
@@ -62646,6 +62878,7 @@ fn native_gpu_report_integrity_reasons(
     collect_scaffold_render_proof_reasons(report, "$", &mut reasons);
     collect_native_gpu_frame_evidence_reasons(report, "$", &mut reasons);
     collect_native_gpu_top_level_frame_evidence_linkage_reasons(report, &mut reasons);
+    collect_native_gpu_ux_product_path_reasons(report, &mut reasons);
     if report
         .get("measurement_source")
         .and_then(serde_json::Value::as_str)
@@ -63186,6 +63419,280 @@ fn collect_native_gpu_top_level_frame_evidence_linkage_reasons(
             ));
         }
     }
+}
+
+fn collect_native_gpu_ux_product_path_reasons(
+    report: &serde_json::Value,
+    reasons: &mut Vec<String>,
+) {
+    if !native_gpu_report_is_ux_gate(report) {
+        return;
+    }
+    let passive_scroll_gate = native_gpu_report_is_passive_scroll_gate(report);
+    collect_native_gpu_ux_product_path_value_reasons(report, "$", passive_scroll_gate, reasons);
+}
+
+fn native_gpu_report_is_ux_gate(report: &serde_json::Value) -> bool {
+    let Some(command) = report.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    command.ends_with("-speed")
+        || command.contains("interaction-speed")
+        || command == "verify-native-gpu-preview-e2e"
+        || command == "verify-native-gpu-scroll-speed"
+        || command == "verify-native-gpu-idle-wake"
+        || command == "verify-native-dev-editor-scroll-speed"
+        || command == "verify-native-example-switch-speed"
+        || command == "verify-native-counter-interaction-speed"
+        || command == "verify-native-visible-launch"
+        || command == "verify-demand-driven-render-loop"
+}
+
+fn native_gpu_report_is_passive_scroll_gate(report: &serde_json::Value) -> bool {
+    report
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| command.contains("scroll"))
+        || report.get("passive_scroll_path_kind").is_some()
+        || report
+            .get("runtime_dispatch_count_for_passive_scroll")
+            .is_some()
+        || report.get("runtime_dispatch_on_passive_scroll").is_some()
+}
+
+fn collect_native_gpu_ux_product_path_value_reasons(
+    value: &serde_json::Value,
+    path: &str,
+    passive_scroll_gate: bool,
+    reasons: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if key == "render_loop_mode" && child.as_str() == Some("continuous_probe") {
+                    reasons.push(format!(
+                        "{child_path}=continuous_probe is forbidden for native UX gates"
+                    ));
+                }
+                if native_gpu_ux_proof_required_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true makes proof part of the visible update path"
+                    ));
+                }
+                if native_gpu_ux_below_host_input_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true injects input below HostEvent/HostInputEvent"
+                    ));
+                }
+                if native_gpu_ux_forbidden_proof_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true substitutes non-native proof for native UX evidence"
+                    ));
+                }
+                if key == "cosmic_toplevel_probe"
+                    && child.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                {
+                    reasons.push(format!(
+                        "{child_path}.status=pass uses COSMIC toplevel scraping as native UX proof"
+                    ));
+                }
+                if native_gpu_ux_hot_path_counter_key(key) && json_value_is_positive_number(child) {
+                    reasons.push(format!("{child_path} must be zero for native UX gates"));
+                }
+                if native_gpu_ux_hot_path_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true is forbidden in native UX hot paths"
+                    ));
+                }
+                if passive_scroll_gate
+                    && native_gpu_ux_passive_scroll_counter_key(key)
+                    && json_value_is_positive_number(child)
+                {
+                    reasons.push(format!(
+                        "{child_path} must be zero for passive scroll native UX gates"
+                    ));
+                }
+                if passive_scroll_gate
+                    && native_gpu_ux_passive_scroll_bool_key(key)
+                    && child.as_bool() == Some(true)
+                {
+                    reasons.push(format!(
+                        "{child_path}=true is forbidden for passive scroll native UX gates"
+                    ));
+                }
+                if key == "input_injection_method"
+                    && child
+                        .as_str()
+                        .is_some_and(native_gpu_ux_below_host_input_method)
+                {
+                    reasons.push(format!(
+                        "{child_path} injects input below HostEvent/HostInputEvent"
+                    ));
+                }
+                if native_gpu_ux_capture_method_key(key)
+                    && child
+                        .as_str()
+                        .is_some_and(native_gpu_ux_forbidden_capture_method)
+                {
+                    reasons.push(format!(
+                        "{child_path} uses non-native proof capture `{}`",
+                        child.as_str().unwrap_or_default()
+                    ));
+                }
+                collect_native_gpu_ux_product_path_value_reasons(
+                    child,
+                    &child_path,
+                    passive_scroll_gate,
+                    reasons,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_native_gpu_ux_product_path_value_reasons(
+                    child,
+                    &format!("{path}[{index}]"),
+                    passive_scroll_gate,
+                    reasons,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_value_is_positive_number(value: &serde_json::Value) -> bool {
+    value.as_u64().is_some_and(|number| number > 0)
+        || value.as_i64().is_some_and(|number| number > 0)
+        || value.as_f64().is_some_and(|number| number > 0.0)
+}
+
+fn native_gpu_ux_proof_required_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "proof_required_for_visible_update"
+            | "visible_update_requires_proof"
+            | "proof_mode_required_for_visible_update"
+    )
+}
+
+fn native_gpu_ux_below_host_input_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "below_host_input_injection"
+            | "direct_runtime_input_injection"
+            | "input_injected_below_host_event"
+            | "input_injected_below_host_input_event"
+            | "private_runtime_dispatch_used"
+    )
+}
+
+fn native_gpu_ux_forbidden_proof_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "browser_render_executed"
+            | "browser_capture_executed"
+            | "xvfb"
+            | "cosmic_toplevel_scraping_used"
+            | "whole_desktop_screenshot_used"
+    )
+}
+
+fn native_gpu_ux_hot_path_counter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "preview_blocked_on_ipc_count"
+            | "hot_path_preview_perf_query_count"
+            | "preview_perf_hot_path_query_count"
+            | "dev_footer_preview_perf_hot_path_ipc_count"
+            | "footer_lines_preview_perf_ipc_count"
+            | "render_hook_preview_perf_ipc_count"
+            | "preview_perf_runtime_summary_query_count"
+            | "preview_perf_hot_path_runtime_query_count"
+            | "hot_path_png_write_count"
+            | "hot_path_report_write_count"
+            | "hot_path_report_serialization_count"
+            | "hot_path_heavy_json_summary_count"
+            | "hot_path_proof_readback_count"
+            | "hot_path_verbose_trace_event_count"
+            | "hot_path_dev_blocking_ipc_count"
+            | "dev_blocking_ipc_count"
+    )
+}
+
+fn native_gpu_ux_hot_path_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "dev_perf_row_queries_ipc_from_render_hook"
+            | "dev_perf_row_queries_runtime_from_render_hook"
+            | "preview_perf_snapshot_queried_in_render_hook"
+            | "preview_perf_snapshot_queried_in_footer_lines"
+            | "proof_readback_in_hot_path"
+            | "readback_in_hot_path"
+            | "verbose_tracing_in_hot_path"
+            | "dev_blocking_ipc_in_hot_path"
+            | "report_write_in_hot_path"
+            | "report_serialization_in_hot_path"
+            | "heavy_json_summary_in_hot_path"
+    )
+}
+
+fn native_gpu_ux_passive_scroll_counter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "runtime_dispatch_count_for_passive_scroll"
+            | "source_replace_count_for_passive_scroll"
+            | "replace_code_count_during_scroll"
+            | "preview_runtime_summary_query_count_for_passive_scroll"
+            | "telemetry_poll_count_in_scroll_hot_path"
+            | "graph_rebuild_count"
+    )
+}
+
+fn native_gpu_ux_passive_scroll_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "runtime_dispatch_on_passive_scroll"
+            | "passive_scroll_did_source_replacement"
+            | "passive_scroll_queried_runtime_summary"
+    )
+}
+
+fn native_gpu_ux_capture_method_key(key: &str) -> bool {
+    matches!(
+        key,
+        "capture_method"
+            | "visual_capture_method"
+            | "manual_artifact_capture_method"
+            | "headed_capture_method"
+            | "proof_capture_method"
+    ) || key.ends_with("_capture_method")
+}
+
+fn native_gpu_ux_below_host_input_method(method: &str) -> bool {
+    let lower = method.to_ascii_lowercase();
+    lower.contains("below-host")
+        || lower.contains("direct-runtime")
+        || lower.contains("runtime-dispatch")
+        || lower.contains("private-runtime")
+        || lower.contains("private_dispatch")
+        || lower.contains("source-event-only")
+}
+
+fn native_gpu_ux_forbidden_capture_method(method: &str) -> bool {
+    let lower = method.to_ascii_lowercase();
+    lower.contains("desktop-screenshot")
+        || lower.contains("browser-screenshot")
+        || lower.contains("headless-chromium")
+        || lower.contains("whole-desktop")
+        || lower.contains("xvfb")
+        || lower.contains("cosmic")
+        || lower.contains("human")
+        || lower.contains("legacy-ply")
+        || lower.contains("ply-")
+        || lower.contains("xdotool")
+        || lower.contains("ydotool")
 }
 
 fn command_argv_contains_pair(argv: &[serde_json::Value], flag: &str, value: &str) -> bool {

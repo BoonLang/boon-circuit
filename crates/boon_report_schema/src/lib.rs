@@ -531,6 +531,9 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report_is_runtime_execution_layer(&report) {
         verify_runtime_execution_metadata(&report, path)?;
     }
+    if report_command_is(&report, "verify-native-gpu-negative") {
+        verify_native_gpu_negative_report(&report, path)?;
+    }
     if report_is_native_gpu_command(&report) {
         verify_native_gpu_report_contract(&report, path)?;
     }
@@ -26086,17 +26089,18 @@ fn report_is_native_gpu_command(report: &JsonValue) -> bool {
 }
 
 fn report_is_native_ux_command(report: &JsonValue) -> bool {
-    matches!(
-        report.get("command").and_then(JsonValue::as_str),
-        Some(
+    let Some(command) = report.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    command.ends_with("-speed")
+        || command.contains("interaction-speed")
+        || matches!(
+            command,
             "verify-native-gpu-preview-e2e"
-                | "verify-native-gpu-scroll-speed"
                 | "verify-native-gpu-idle-wake"
-                | "verify-native-dev-editor-scroll-speed"
-                | "verify-native-example-switch-speed"
-                | "verify-native-counter-interaction-speed"
+                | "verify-native-visible-launch"
+                | "verify-demand-driven-render-loop"
         )
-    )
 }
 
 fn verify_native_gpu_report_contract(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -26105,6 +26109,10 @@ fn verify_native_gpu_report_contract(report: &JsonValue, report_path: &Path) -> 
         && report.get("render_loop_mode").and_then(JsonValue::as_str) == Some("continuous_probe")
     {
         reasons.push("native UX reports must not use render_loop_mode=continuous_probe".to_owned());
+    }
+    if report_is_native_ux_command(report) {
+        let passive_scroll = report_is_native_passive_scroll_command(report);
+        collect_native_ux_product_path_reasons(report, "$", passive_scroll, &mut reasons);
     }
     if let Some(frame_pacing) = report.get("frame_pacing") {
         verify_native_frame_pacing(frame_pacing, "$.frame_pacing", &mut reasons);
@@ -26124,6 +26132,319 @@ fn verify_native_gpu_report_contract(report: &JsonValue, report_path: &Path) -> 
         )
         .into())
     }
+}
+
+fn native_gpu_product_path_negative_case_ids() -> &'static [&'static str] {
+    &[
+        "continuous-probe-ux-report",
+        "proof-required-visible-update",
+        "below-host-input-injection",
+        "preview-blocked-on-ipc-product-path",
+        "passive-scroll-runtime-dispatch",
+        "passive-scroll-graph-rebuild",
+        "dev-perf-row-hot-path-query",
+        "desktop-screenshot-visible-proof",
+        "nested-private-runtime-dispatch",
+        "browser-proof-substituted-for-native",
+        "cosmic-toplevel-proof",
+    ]
+}
+
+fn verify_native_gpu_negative_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let required_ids = report
+        .get("required_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-native-gpu-negative required_negative_cases is missing",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                format!(
+                    "{} verify-native-gpu-negative required_negative_cases contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(negative_case_count) = report
+        .get("negative_case_count")
+        .and_then(JsonValue::as_u64)
+    else {
+        return Err(format!(
+            "{} verify-native-gpu-negative negative_case_count is missing",
+            report_path.display()
+        )
+        .into());
+    };
+    if negative_case_count < required_ids.len() as u64 {
+        return Err(format!(
+            "{} verify-native-gpu-negative negative_case_count is smaller than required_negative_cases",
+            report_path.display()
+        )
+        .into());
+    }
+    if required_ids.len() != required_ids.iter().copied().collect::<BTreeSet<_>>().len() {
+        return Err(format!(
+            "{} verify-native-gpu-negative required_negative_cases contains duplicates",
+            report_path.display()
+        )
+        .into());
+    }
+    let present = required_ids.iter().copied().collect::<BTreeSet<_>>();
+    let missing = native_gpu_product_path_negative_case_ids()
+        .iter()
+        .copied()
+        .filter(|id| !present.contains(id))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} verify-native-gpu-negative required_negative_cases missing product-path cases: {}",
+            report_path.display(),
+            missing.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn report_is_native_passive_scroll_command(report: &JsonValue) -> bool {
+    report
+        .get("command")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|command| command.contains("scroll"))
+        || report.get("passive_scroll_path_kind").is_some()
+        || report
+            .get("runtime_dispatch_count_for_passive_scroll")
+            .is_some()
+        || report.get("runtime_dispatch_on_passive_scroll").is_some()
+}
+
+fn collect_native_ux_product_path_reasons(
+    value: &JsonValue,
+    path: &str,
+    passive_scroll: bool,
+    reasons: &mut Vec<String>,
+) {
+    match value {
+        JsonValue::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if key == "render_loop_mode" && child.as_str() == Some("continuous_probe") {
+                    reasons.push(format!(
+                        "{child_path}=continuous_probe is forbidden for native UX reports"
+                    ));
+                }
+                if native_ux_proof_required_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true makes proof part of the visible update path"
+                    ));
+                }
+                if native_ux_below_host_input_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true injects input below HostEvent/HostInputEvent"
+                    ));
+                }
+                if native_ux_forbidden_proof_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true substitutes non-native proof for native UX evidence"
+                    ));
+                }
+                if key == "cosmic_toplevel_probe"
+                    && child.get("status").and_then(JsonValue::as_str) == Some("pass")
+                {
+                    reasons.push(format!(
+                        "{child_path}.status=pass uses COSMIC toplevel scraping as native UX proof"
+                    ));
+                }
+                if native_ux_hot_path_counter_key(key) && json_number_is_positive(child) {
+                    reasons.push(format!("{child_path} must be zero for native UX reports"));
+                }
+                if native_ux_hot_path_bool_key(key) && child.as_bool() == Some(true) {
+                    reasons.push(format!(
+                        "{child_path}=true is forbidden in native UX hot paths"
+                    ));
+                }
+                if passive_scroll
+                    && native_ux_passive_scroll_counter_key(key)
+                    && json_number_is_positive(child)
+                {
+                    reasons.push(format!(
+                        "{child_path} must be zero for passive scroll native UX reports"
+                    ));
+                }
+                if passive_scroll
+                    && native_ux_passive_scroll_bool_key(key)
+                    && child.as_bool() == Some(true)
+                {
+                    reasons.push(format!(
+                        "{child_path}=true is forbidden for passive scroll native UX reports"
+                    ));
+                }
+                if key == "input_injection_method"
+                    && child
+                        .as_str()
+                        .is_some_and(native_ux_below_host_input_method)
+                {
+                    reasons.push(format!(
+                        "{child_path} injects input below HostEvent/HostInputEvent"
+                    ));
+                }
+                if native_ux_capture_method_key(key)
+                    && child
+                        .as_str()
+                        .is_some_and(native_ux_forbidden_capture_method)
+                {
+                    reasons.push(format!(
+                        "{child_path} uses non-native proof capture `{}`",
+                        child.as_str().unwrap_or_default()
+                    ));
+                }
+                collect_native_ux_product_path_reasons(child, &child_path, passive_scroll, reasons);
+            }
+        }
+        JsonValue::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_native_ux_product_path_reasons(
+                    child,
+                    &format!("{path}[{index}]"),
+                    passive_scroll,
+                    reasons,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn native_ux_proof_required_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "proof_required_for_visible_update"
+            | "visible_update_requires_proof"
+            | "proof_mode_required_for_visible_update"
+    )
+}
+
+fn native_ux_below_host_input_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "below_host_input_injection"
+            | "direct_runtime_input_injection"
+            | "input_injected_below_host_event"
+            | "input_injected_below_host_input_event"
+            | "private_runtime_dispatch_used"
+    )
+}
+
+fn native_ux_forbidden_proof_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "browser_render_executed"
+            | "browser_capture_executed"
+            | "xvfb"
+            | "cosmic_toplevel_scraping_used"
+            | "whole_desktop_screenshot_used"
+    )
+}
+
+fn native_ux_hot_path_counter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "preview_blocked_on_ipc_count"
+            | "hot_path_preview_perf_query_count"
+            | "preview_perf_hot_path_query_count"
+            | "dev_footer_preview_perf_hot_path_ipc_count"
+            | "footer_lines_preview_perf_ipc_count"
+            | "render_hook_preview_perf_ipc_count"
+            | "preview_perf_runtime_summary_query_count"
+            | "preview_perf_hot_path_runtime_query_count"
+            | "hot_path_png_write_count"
+            | "hot_path_report_write_count"
+            | "hot_path_report_serialization_count"
+            | "hot_path_heavy_json_summary_count"
+            | "hot_path_proof_readback_count"
+            | "hot_path_verbose_trace_event_count"
+            | "hot_path_dev_blocking_ipc_count"
+            | "dev_blocking_ipc_count"
+    )
+}
+
+fn native_ux_hot_path_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "dev_perf_row_queries_ipc_from_render_hook"
+            | "dev_perf_row_queries_runtime_from_render_hook"
+            | "preview_perf_snapshot_queried_in_render_hook"
+            | "preview_perf_snapshot_queried_in_footer_lines"
+            | "proof_readback_in_hot_path"
+            | "readback_in_hot_path"
+            | "verbose_tracing_in_hot_path"
+            | "dev_blocking_ipc_in_hot_path"
+            | "report_write_in_hot_path"
+            | "report_serialization_in_hot_path"
+            | "heavy_json_summary_in_hot_path"
+    )
+}
+
+fn native_ux_passive_scroll_counter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "runtime_dispatch_count_for_passive_scroll"
+            | "source_replace_count_for_passive_scroll"
+            | "replace_code_count_during_scroll"
+            | "preview_runtime_summary_query_count_for_passive_scroll"
+            | "telemetry_poll_count_in_scroll_hot_path"
+            | "graph_rebuild_count"
+    )
+}
+
+fn native_ux_passive_scroll_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "runtime_dispatch_on_passive_scroll"
+            | "passive_scroll_did_source_replacement"
+            | "passive_scroll_queried_runtime_summary"
+    )
+}
+
+fn native_ux_capture_method_key(key: &str) -> bool {
+    matches!(
+        key,
+        "capture_method"
+            | "visual_capture_method"
+            | "manual_artifact_capture_method"
+            | "headed_capture_method"
+            | "proof_capture_method"
+    ) || key.ends_with("_capture_method")
+}
+
+fn native_ux_below_host_input_method(method: &str) -> bool {
+    let lower = method.to_ascii_lowercase();
+    lower.contains("below-host")
+        || lower.contains("direct-runtime")
+        || lower.contains("runtime-dispatch")
+        || lower.contains("private-runtime")
+        || lower.contains("private_dispatch")
+        || lower.contains("source-event-only")
+}
+
+fn native_ux_forbidden_capture_method(method: &str) -> bool {
+    let lower = method.to_ascii_lowercase();
+    lower.contains("desktop-screenshot")
+        || lower.contains("browser-screenshot")
+        || lower.contains("headless-chromium")
+        || lower.contains("whole-desktop")
+        || lower.contains("xvfb")
+        || lower.contains("cosmic")
+        || lower.contains("human")
+        || lower.contains("legacy-ply")
+        || lower.contains("ply-")
+        || lower.contains("xdotool")
+        || lower.contains("ydotool")
 }
 
 fn verify_native_frame_pacing(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
@@ -31155,6 +31476,137 @@ mod tests {
         let mut report = native_gpu_report_with_frame_evidence();
         report["render_loop_mode"] = json!("continuous_probe");
         assert!(!schema_accepts(report, "native-frame-evidence-probe-ux"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_proof_required_visible_update() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["proof_required_for_visible_update"] = json!(true);
+        assert!(!schema_accepts(
+            report,
+            "native-proof-required-visible-update"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_below_host_input_injection() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["input_injection_method"] = json!("direct-runtime-route-below-host-event");
+        assert!(!schema_accepts(report, "native-below-host-input"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_preview_ipc_blocking() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["preview_blocked_on_ipc_count"] = json!(1);
+        assert!(!schema_accepts(report, "native-preview-ipc-blocking"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_passive_scroll_runtime_dispatch() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["command"] = json!("verify-native-gpu-scroll-speed");
+        report["runtime_dispatch_on_passive_scroll"] = json!(true);
+        report["runtime_dispatch_count_for_passive_scroll"] = json!(1);
+        assert!(!schema_accepts(
+            report,
+            "native-passive-scroll-runtime-dispatch"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_dev_perf_hot_path_query() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["preview_perf_hot_path_query_count"] = json!(1);
+        report["dev_perf_row_queries_ipc_from_render_hook"] = json!(true);
+        assert!(!schema_accepts(report, "native-dev-perf-hot-path-query"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_desktop_screenshot_proof() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["visual_capture_method"] = json!("desktop-screenshot");
+        assert!(!schema_accepts(report, "native-desktop-screenshot-proof"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_nested_private_runtime_dispatch() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["native_host_input_route_evidence"] = json!({
+            "private_runtime_dispatch_used": true
+        });
+        assert!(!schema_accepts(report, "native-nested-private-dispatch"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_browser_proof_substitution() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["browser_render_executed"] = json!(true);
+        report["browser_capture_method"] =
+            json!("headless-chromium-webgpu-app-owned-copyTextureToBuffer");
+        assert!(!schema_accepts(report, "native-browser-proof-substitution"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_cosmic_toplevel_proof() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["cosmic_toplevel_probe"] = json!({
+            "status": "pass"
+        });
+        assert!(!schema_accepts(report, "native-cosmic-toplevel-proof"));
+    }
+
+    fn native_gpu_negative_report() -> JsonValue {
+        let ids = native_gpu_product_path_negative_case_ids();
+        let mut report = base_report();
+        report["command"] = json!("verify-native-gpu-negative");
+        report["command_argv"] = json!(["verify-native-gpu-negative"]);
+        report["native_gpu_contract"] = json!(true);
+        report["negative_case_count"] = json!(ids.len());
+        report["required_negative_cases"] = json!(ids);
+        report
+    }
+
+    #[test]
+    fn native_gpu_negative_schema_requires_product_path_cases() {
+        assert!(schema_accepts(
+            native_gpu_negative_report(),
+            "native-negative-product-path-valid"
+        ));
+
+        let mut missing = native_gpu_negative_report();
+        missing["required_negative_cases"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(!schema_accepts(
+            missing,
+            "native-negative-product-path-missing"
+        ));
+
+        let mut duplicate = native_gpu_negative_report();
+        let first = duplicate["required_negative_cases"][0].clone();
+        duplicate["required_negative_cases"]
+            .as_array_mut()
+            .unwrap()
+            .push(first);
+        duplicate["negative_case_count"] = json!(
+            duplicate["required_negative_cases"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        assert!(!schema_accepts(
+            duplicate,
+            "native-negative-product-path-duplicate"
+        ));
+
+        let mut wrong_count = native_gpu_negative_report();
+        wrong_count["negative_case_count"] = json!(1);
+        assert!(!schema_accepts(
+            wrong_count,
+            "native-negative-product-path-count"
+        ));
     }
 
     #[test]

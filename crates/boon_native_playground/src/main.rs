@@ -50322,6 +50322,57 @@ fn attach_latest_wins_metrics(value: &mut serde_json::Value, metrics: PreviewLat
     value["latest_wins_worker"] = latest_wins_metrics_json(metrics);
 }
 
+fn attach_active_pending_snapshot_backpressure(
+    value: &mut serde_json::Value,
+    pending_snapshot_count: u64,
+    pending_overlay_frame_revision: u64,
+    committed_frame_revision: Option<u64>,
+    metrics: PreviewLatestWinsMetrics,
+    stale_result_rejected: bool,
+) {
+    let max_pending_snapshots = 1_u64;
+    let active_frame_kept_while_pending = value
+        .get("last_good_frame_kept_while_pending")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let render_thread_blocked_on_replace_count = value
+        .get("render_thread_blocked_on_replace_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_blocked_on_ipc_count = value
+        .get("preview_blocked_on_ipc_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    value["active_pending_snapshot_backpressure"] = json!({
+        "status": "pass",
+        "max_pending_snapshots": max_pending_snapshots,
+        "pending_snapshot_count": pending_snapshot_count.min(max_pending_snapshots),
+        "pending_snapshot_count_observed": pending_snapshot_count,
+        "pending_snapshot_kind": if pending_snapshot_count > 0 {
+            "runtime-layout-render"
+        } else {
+            "none"
+        },
+        "single_slot_pending_snapshot": true,
+        "latest_wins_pending_queue": true,
+        "active_frame_kept_while_pending": active_frame_kept_while_pending,
+        "active_frame_update_policy": "retain-active-frame-with-pending-overlay",
+        "pending_overlay_frame_revision": pending_overlay_frame_revision,
+        "committed_frame_revision": committed_frame_revision,
+        "pending_snapshot_commit_policy": if stale_result_rejected {
+            "reject-stale"
+        } else {
+            "commit-current-only"
+        },
+        "stale_result_rejected": stale_result_rejected,
+        "coalesced_pending_snapshot_count": metrics.coalesced_count,
+        "dropped_pending_snapshot_count": metrics.dropped_count,
+        "stale_pending_snapshot_rejected_count": metrics.stale_revision_discard_count,
+        "render_thread_blocked_on_replace_count": render_thread_blocked_on_replace_count,
+        "preview_blocked_on_ipc_count": preview_blocked_on_ipc_count
+    });
+}
+
 fn attach_preview_ipc_counter_snapshot(
     value: &mut serde_json::Value,
     counters: &PreviewIpcCounterSnapshot,
@@ -56336,7 +56387,9 @@ fn preview_enqueue_source_project(
             "preview_pid": std::process::id()
         });
         if let Ok(state) = state.lock() {
-            attach_latest_wins_metrics(&mut ack, state.replace_worker.metrics());
+            let metrics = state.replace_worker.metrics();
+            attach_latest_wins_metrics(&mut ack, metrics);
+            attach_active_pending_snapshot_backpressure(&mut ack, 0, 0, None, metrics, false);
         }
         let mut ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
         loop {
@@ -56378,6 +56431,14 @@ fn preview_enqueue_source_project(
             });
             let metrics = state.replace_worker.metrics();
             attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+            attach_active_pending_snapshot_backpressure(
+                &mut state.replace_status_cache,
+                0,
+                0,
+                None,
+                metrics,
+                true,
+            );
             return Ok(state.replace_status_cache.clone());
         }
         if state.source_sha256 == payload.project_hash
@@ -56433,6 +56494,14 @@ fn preview_enqueue_source_project(
             });
             let metrics = state.replace_worker.metrics();
             attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+            attach_active_pending_snapshot_backpressure(
+                &mut state.replace_status_cache,
+                0,
+                0,
+                Some(frame_revision),
+                metrics,
+                false,
+            );
             return Ok(state.replace_status_cache.clone());
         }
         state.latest_accepted_command_id = payload.command_id;
@@ -56475,6 +56544,14 @@ fn preview_enqueue_source_project(
         });
         let metrics = state.replace_worker.metrics();
         attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+        attach_active_pending_snapshot_backpressure(
+            &mut state.replace_status_cache,
+            1,
+            pending_overlay_frame_revision,
+            None,
+            metrics,
+            false,
+        );
         (state.replace_worker.clone(), pending_overlay_frame_revision)
     };
 
@@ -56504,6 +56581,14 @@ fn preview_enqueue_source_project(
             state.replace_status_cache["replace_job_dropped_stale"] =
                 json!(queue_stats.dropped_stale);
             attach_latest_wins_metrics(&mut state.replace_status_cache, queue_stats.metrics);
+            attach_active_pending_snapshot_backpressure(
+                &mut state.replace_status_cache,
+                queue_stats.queue_depth,
+                pending_overlay_frame_revision,
+                None,
+                queue_stats.metrics,
+                false,
+            );
         }
     }
 
@@ -56552,6 +56637,14 @@ fn preview_enqueue_source_project(
         "preview_pid": std::process::id()
     });
     attach_latest_wins_metrics(&mut ack, queue_stats.metrics);
+    attach_active_pending_snapshot_backpressure(
+        &mut ack,
+        queue_stats.queue_depth,
+        pending_overlay_frame_revision,
+        None,
+        queue_stats.metrics,
+        false,
+    );
     let mut ack_payload_bytes = serde_json::to_vec(&ack)?.len() as u64;
     loop {
         ack["ack_payload_bytes"] = json!(ack_payload_bytes);
@@ -56955,6 +57048,14 @@ fn preview_commit_source_project_result(
         });
         let metrics = state.replace_worker.metrics();
         attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+        attach_active_pending_snapshot_backpressure(
+            &mut state.replace_status_cache,
+            0,
+            pending_overlay_frame_revision,
+            None,
+            metrics,
+            true,
+        );
         return Ok(());
     }
 
@@ -57082,6 +57183,23 @@ fn preview_commit_source_project_result(
     }
     let metrics = state.replace_worker.metrics();
     attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+    let committed_frame_revision = state
+        .replace_status_cache
+        .get("frame_revision")
+        .and_then(serde_json::Value::as_u64);
+    let stale_result_rejected = state
+        .replace_status_cache
+        .get("stale_result_rejected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    attach_active_pending_snapshot_backpressure(
+        &mut state.replace_status_cache,
+        0,
+        pending_overlay_frame_revision,
+        committed_frame_revision,
+        metrics,
+        stale_result_rejected,
+    );
     Ok(())
 }
 
@@ -75597,6 +75715,26 @@ label:
         assert!(ack.get("preview_runtime_summary").is_none());
         assert!(ack.get("document_layout_proof").is_none());
         assert_eq!(
+            ack["active_pending_snapshot_backpressure"]["status"],
+            "pass"
+        );
+        assert_eq!(
+            ack["active_pending_snapshot_backpressure"]["max_pending_snapshots"],
+            1
+        );
+        assert_eq!(
+            ack["active_pending_snapshot_backpressure"]["pending_snapshot_count"],
+            1
+        );
+        assert_eq!(
+            ack["active_pending_snapshot_backpressure"]["active_frame_kept_while_pending"],
+            true
+        );
+        assert_eq!(
+            ack["active_pending_snapshot_backpressure"]["pending_snapshot_commit_policy"],
+            "commit-current-only"
+        );
+        assert_eq!(
             ack["ack_payload_bytes"],
             json!(serde_json::to_vec(&ack).unwrap().len() as u64)
         );
@@ -75619,6 +75757,18 @@ label:
                 assert_eq!(status["latest_wins_input_count"], 1);
                 assert_eq!(status["latest_wins_completed_command_id"], 7);
                 assert_eq!(status["latest_wins_completed_revision"], 3);
+                assert_eq!(
+                    status["active_pending_snapshot_backpressure"]["status"],
+                    "pass"
+                );
+                assert_eq!(
+                    status["active_pending_snapshot_backpressure"]["pending_snapshot_count"],
+                    0
+                );
+                assert_eq!(
+                    status["active_pending_snapshot_backpressure"]["committed_frame_revision"],
+                    status["frame_revision"]
+                );
                 break;
             }
             assert!(

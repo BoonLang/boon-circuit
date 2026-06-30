@@ -363,6 +363,38 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo test -q -p boon_native_playground cells_shift_wheel_scrolls_horizontally`
   - `cargo test -q -p boon_native_playground cells_horizontal_scroll_keeps_row_gutter_fixed_and_headers_synced`
 
+2026-06-30 native UX product-path gate slice:
+
+- `verify_report_schema` and `verify-native-gpu-negative` now reject passing
+  native UX reports that cheat the product path:
+  - `render_loop_mode=continuous_probe`;
+  - proof required to make visible updates happen;
+  - input injected below `HostEvent` / `HostInputEvent`;
+  - preview IPC blocking or dev perf-row hot-path IPC/runtime queries;
+  - passive scroll runtime dispatch, source replacement, summary queries, or
+    graph rebuild;
+  - browser/headless/Xvfb/COSMIC/human/desktop screenshot proof substituted for
+    app-owned native WGPU proof.
+- UX classification is command-pattern based, not example-name based. The
+  verifier does not branch on Cells, address fields, formula fields, source
+  paths, or fixture strings for this gate.
+- Added adversarial negative fixtures for continuous-probe UX, proof-gated
+  visible updates, below-host input, preview IPC blocking, passive-scroll
+  runtime dispatch and graph rebuild, dev perf-row hot-path queries, nested
+  private runtime dispatch, desktop screenshot proof, browser proof
+  substitution, and COSMIC toplevel proof.
+- Native negative report schema now requires the product-path adversarial case
+  subset to remain listed in `required_negative_cases` and rejects duplicate or
+  under-counted native negative manifests. The subset is intentionally generic
+  and does not duplicate older example-named negative fixture IDs into the
+  schema crate.
+- Focused verification passed:
+  - `cargo test -q -p boon_report_schema native_gpu`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+  - `git diff --check`
+
 ## Implementation Slices
 
 1. Terminology and schema:

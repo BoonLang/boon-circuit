@@ -1771,6 +1771,16 @@ struct PendingSurfaceReadback {
     format: wgpu::TextureFormat,
 }
 
+struct AsyncInteractiveReadbackResult {
+    artifact: AppWindowReadbackArtifact,
+    finish_ms: f64,
+    completed_elapsed_ms: f64,
+}
+
+struct AsyncInteractiveReadbackJob {
+    receiver: mpsc::Receiver<Result<AsyncInteractiveReadbackResult, String>>,
+}
+
 struct NativeOffscreenPresentTarget {
     width: u32,
     height: u32,
@@ -2878,10 +2888,12 @@ async fn run_surface_probe_inner(
     let mut last_interactive_readback_artifact: Option<AppWindowReadbackArtifact> = None;
     let mut last_interactive_readback_finish_ms: Option<f64> = None;
     let mut last_interactive_readback_completed_elapsed_ms: Option<f64> = None;
+    let mut last_interactive_readback_error: Option<String> = None;
     let mut last_interactive_surface_readback_queued = false;
     let mut last_interactive_surface_readback_skipped_for_external_proof = false;
     let mut last_interactive_surface_readback_skipped_for_stale_input = false;
     let mut last_interactive_surface_readback_pending = false;
+    let mut interactive_readback_job: Option<AsyncInteractiveReadbackJob> = None;
     let mut last_render_loop_report_write_ms: Option<f64> = None;
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
@@ -2889,6 +2901,82 @@ async fn run_surface_probe_inner(
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
     loop {
+        if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
+            match result {
+                Ok(result) => {
+                    last_interactive_readback_finish_ms = Some(result.finish_ms);
+                    last_interactive_readback_completed_elapsed_ms =
+                        Some(result.completed_elapsed_ms);
+                    last_interactive_readback_artifact = Some(result.artifact);
+                    last_interactive_surface_readback_pending = false;
+                    last_interactive_readback_error = None;
+                }
+                Err(error) => {
+                    last_interactive_readback_finish_ms = None;
+                    last_interactive_readback_completed_elapsed_ms =
+                        Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+                    last_interactive_surface_readback_pending = false;
+                    last_interactive_readback_error = Some(error);
+                    render_loop_state.telemetry_drop_count =
+                        render_loop_state.telemetry_drop_count.saturating_add(1);
+                    render_loop_state.last_missed_frame_cause =
+                        Some("interactive_readback_error".to_owned());
+                }
+            }
+            if let Some(report) = options.render_loop_state_report.as_deref() {
+                let report_write_started = Instant::now();
+                write_render_loop_state_report(
+                    Path::new(report),
+                    options.role,
+                    std::process::id(),
+                    &window_id,
+                    &surface_id,
+                    surface_lifecycle.report(),
+                    &render_loop_state,
+                    hold_started.elapsed(),
+                    wake_handle.generation(),
+                    last_interactive_readback_artifact.as_ref(),
+                    render_loop_report_extras(
+                        resize_wake_count.load(Ordering::Relaxed),
+                        input_event_wake_count.load(Ordering::Relaxed),
+                        present_mode.as_str(),
+                        surface_format.as_str(),
+                        desired_maximum_frame_latency,
+                        input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
+                        &app_surface,
+                        Some(&observed_input_adapter),
+                    )
+                    .with_input_generation(
+                        last_sampled_input_event_wake_count,
+                        last_presented_input_event_wake_count,
+                        input_event_wake_elapsed_ms_for_generation(
+                            &input_event_wake_timeline,
+                            last_sampled_input_event_wake_count,
+                            hold_started,
+                        ),
+                        input_event_wake_elapsed_ms_for_generation(
+                            &input_event_wake_timeline,
+                            last_presented_input_event_wake_count,
+                            hold_started,
+                        ),
+                    )
+                    .with_interactive_timing(
+                        last_render_loop_report_write_ms,
+                        last_interactive_readback_finish_ms,
+                        last_interactive_readback_completed_elapsed_ms,
+                        last_interactive_surface_readback_queued,
+                        last_interactive_surface_readback_skipped_for_external_proof,
+                        last_interactive_surface_readback_skipped_for_stale_input,
+                        last_interactive_surface_readback_pending,
+                        last_interactive_readback_error.clone(),
+                    )
+                    .with_external_render_proof(external_render_proof.as_ref())
+                    .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
+                    None,
+                )?;
+                last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
+            }
+        }
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
             break;
@@ -3474,6 +3562,55 @@ async fn run_surface_probe_inner(
             None,
         );
         last_frame_evidence_key = Some(current_frame_evidence_key.clone());
+        if !skip_interactive_surface_readback_for_stale_input
+            && let Some((artifact_dir, pending)) = interactive_readback
+        {
+            if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
+                match result {
+                    Ok(result) => {
+                        last_interactive_readback_finish_ms = Some(result.finish_ms);
+                        last_interactive_readback_completed_elapsed_ms =
+                            Some(result.completed_elapsed_ms);
+                        last_interactive_readback_artifact = Some(result.artifact);
+                        last_interactive_readback_error = None;
+                    }
+                    Err(error) => {
+                        last_interactive_readback_finish_ms = None;
+                        last_interactive_readback_completed_elapsed_ms =
+                            Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+                        last_interactive_readback_error = Some(error);
+                        render_loop_state.telemetry_drop_count =
+                            render_loop_state.telemetry_drop_count.saturating_add(1);
+                        render_loop_state.last_missed_frame_cause =
+                            Some("interactive_readback_error".to_owned());
+                    }
+                }
+            }
+            if interactive_readback_job.is_some() {
+                render_loop_state.telemetry_drop_count =
+                    render_loop_state.telemetry_drop_count.saturating_add(1);
+                render_loop_state.last_missed_frame_cause =
+                    Some("interactive_readback_backpressure".to_owned());
+                last_interactive_surface_readback_pending = true;
+                last_interactive_surface_readback_queued = true;
+            } else {
+                last_interactive_readback_finish_ms = None;
+                last_interactive_readback_completed_elapsed_ms = None;
+                last_interactive_readback_error = None;
+                last_interactive_surface_readback_pending = true;
+                interactive_readback_job = Some(spawn_interactive_visible_surface_readback(
+                    device.clone(),
+                    pending,
+                    artifact_dir,
+                    current_frame_evidence_key.clone(),
+                    render_loop_state.presented_revision,
+                    render_loop_state.last_render_content_revision,
+                    render_loop_state.rendered_frame_count,
+                    wake_handle.clone(),
+                    hold_started,
+                )?);
+            }
+        }
         let stats_elapsed = hold_started.elapsed();
         let stats_elapsed_seconds = stats_elapsed.as_secs_f64().max(0.001);
         let stats_presented_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
@@ -3491,7 +3628,9 @@ async fn run_surface_probe_inner(
                 render_loop_state.last_present_completed_elapsed_ms,
             )
         });
-        let stats_proof_mode = if last_interactive_surface_readback_queued {
+        let stats_proof_mode = if last_interactive_readback_error.is_some() {
+            "readback_error"
+        } else if last_interactive_surface_readback_queued {
             if last_interactive_surface_readback_pending {
                 "readback_pending"
             } else {
@@ -3562,6 +3701,7 @@ async fn run_surface_probe_inner(
                     last_interactive_surface_readback_skipped_for_external_proof,
                     last_interactive_surface_readback_skipped_for_stale_input,
                     last_interactive_surface_readback_pending,
+                    last_interactive_readback_error.clone(),
                 )
                 .with_external_render_proof(external_render_proof.as_ref())
                 .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
@@ -3571,71 +3711,6 @@ async fn run_surface_probe_inner(
         }
         if skip_interactive_surface_readback_for_stale_input {
             continue;
-        }
-        if let Some((artifact_dir, pending)) = interactive_readback {
-            let readback_finish_started = Instant::now();
-            let mut artifact = finish_visible_surface_readback(&device, pending, &artifact_dir)?;
-            last_interactive_readback_finish_ms = Some(elapsed_ms(readback_finish_started));
-            last_interactive_readback_completed_elapsed_ms =
-                Some(hold_started.elapsed().as_secs_f64() * 1000.0);
-            last_interactive_surface_readback_pending = false;
-            artifact.presented_revision = Some(render_loop_state.presented_revision);
-            artifact.content_revision = Some(render_loop_state.last_render_content_revision);
-            artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
-            artifact.frame_evidence_key = last_frame_evidence_key.clone();
-            last_interactive_readback_artifact = Some(artifact);
-            if let Some(report) = options.render_loop_state_report.as_deref() {
-                let report_write_started = Instant::now();
-                write_render_loop_state_report(
-                    Path::new(report),
-                    options.role,
-                    std::process::id(),
-                    &window_id,
-                    &surface_id,
-                    surface_lifecycle.report(),
-                    &render_loop_state,
-                    hold_started.elapsed(),
-                    wake_handle.generation(),
-                    last_interactive_readback_artifact.as_ref(),
-                    render_loop_report_extras(
-                        resize_wake_count.load(Ordering::Relaxed),
-                        input_event_wake_count.load(Ordering::Relaxed),
-                        present_mode.as_str(),
-                        surface_format.as_str(),
-                        desired_maximum_frame_latency,
-                        input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
-                        &app_surface,
-                        Some(&observed_input_adapter),
-                    )
-                    .with_input_generation(
-                        last_sampled_input_event_wake_count,
-                        last_presented_input_event_wake_count,
-                        input_event_wake_elapsed_ms_for_generation(
-                            &input_event_wake_timeline,
-                            last_sampled_input_event_wake_count,
-                            hold_started,
-                        ),
-                        input_event_wake_elapsed_ms_for_generation(
-                            &input_event_wake_timeline,
-                            last_presented_input_event_wake_count,
-                            hold_started,
-                        ),
-                    )
-                    .with_interactive_timing(
-                        last_render_loop_report_write_ms,
-                        last_interactive_readback_finish_ms,
-                        last_interactive_readback_completed_elapsed_ms,
-                        last_interactive_surface_readback_queued,
-                        last_interactive_surface_readback_skipped_for_external_proof,
-                        last_interactive_surface_readback_skipped_for_stale_input,
-                        last_interactive_surface_readback_pending,
-                    )
-                    .with_external_render_proof(external_render_proof.as_ref())
-                    .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
-                    None,
-                )?;
-                last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
-            }
         }
         if loop_mode == NativeRenderLoopMode::ContinuousProbe {
             std::thread::sleep(Duration::from_millis(16));
@@ -3685,6 +3760,7 @@ async fn run_surface_probe_inner(
                 last_interactive_surface_readback_skipped_for_external_proof,
                 last_interactive_surface_readback_skipped_for_stale_input,
                 last_interactive_surface_readback_pending,
+                last_interactive_readback_error.clone(),
             )
             .with_external_render_proof(external_render_proof.as_ref())
             .with_frame_evidence_key(last_frame_evidence_key.as_ref()),
@@ -3820,6 +3896,7 @@ struct NativeRenderLoopReportExtras {
     last_interactive_surface_readback_skipped_for_external_proof: bool,
     last_interactive_surface_readback_skipped_for_stale_input: bool,
     last_interactive_surface_readback_pending: bool,
+    last_interactive_readback_error: Option<String>,
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
     external_render_proof: Option<serde_json::Value>,
@@ -3850,6 +3927,7 @@ impl NativeRenderLoopReportExtras {
         surface_readback_skipped_for_external_proof: bool,
         surface_readback_skipped_for_stale_input: bool,
         surface_readback_pending: bool,
+        readback_error: Option<String>,
     ) -> Self {
         self.last_render_loop_report_write_ms = report_write_ms;
         self.last_interactive_readback_finish_ms = readback_finish_ms;
@@ -3860,6 +3938,7 @@ impl NativeRenderLoopReportExtras {
         self.last_interactive_surface_readback_skipped_for_stale_input =
             surface_readback_skipped_for_stale_input;
         self.last_interactive_surface_readback_pending = surface_readback_pending;
+        self.last_interactive_readback_error = readback_error;
         self
     }
 
@@ -3902,6 +3981,7 @@ fn render_loop_report_extras(
         last_interactive_surface_readback_skipped_for_external_proof: false,
         last_interactive_surface_readback_skipped_for_stale_input: false,
         last_interactive_surface_readback_pending: false,
+        last_interactive_readback_error: None,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
         external_render_proof: None,
@@ -4285,7 +4365,9 @@ fn write_render_loop_state_report(
                     .map(|current_key| current_key.frame_seq.saturating_sub(artifact_key.frame_seq))
             })
     });
-    let proof_mode = if extras.last_interactive_surface_readback_queued {
+    let proof_mode = if extras.last_interactive_readback_error.is_some() {
+        "readback_error"
+    } else if extras.last_interactive_surface_readback_queued {
         if extras.last_interactive_surface_readback_pending {
             "readback_pending"
         } else {
@@ -4436,6 +4518,7 @@ fn write_render_loop_state_report(
         "last_interactive_surface_readback_skipped_for_external_proof": extras.last_interactive_surface_readback_skipped_for_external_proof,
         "last_interactive_surface_readback_skipped_for_stale_input": extras.last_interactive_surface_readback_skipped_for_stale_input,
         "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
+        "last_interactive_readback_error": extras.last_interactive_readback_error,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
         "last_external_render_proof": external_render_proof,
@@ -4628,6 +4711,60 @@ fn finish_visible_surface_readback(
         readback_deadline_ms: VISIBLE_SURFACE_READBACK_TIMEOUT.as_millis() as u64,
         readback_poll_status: "completed_before_deadline".to_owned(),
     })
+}
+
+fn spawn_interactive_visible_surface_readback(
+    device: wgpu::Device,
+    pending: PendingSurfaceReadback,
+    artifact_dir: String,
+    frame_evidence_key: FrameEvidenceKey,
+    presented_revision: u64,
+    content_revision: u64,
+    rendered_frame_count: u64,
+    wake_handle: NativeWakeHandle,
+    hold_started: Instant,
+) -> Result<AsyncInteractiveReadbackJob, NativeWindowError> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("boon-interactive-readback".to_owned())
+        .spawn(move || {
+            let finish_started = Instant::now();
+            let result = finish_visible_surface_readback(&device, pending, &artifact_dir)
+                .map(|mut artifact| {
+                    artifact.presented_revision = Some(presented_revision);
+                    artifact.content_revision = Some(content_revision);
+                    artifact.rendered_frame_count = Some(rendered_frame_count);
+                    artifact.frame_evidence_key = Some(frame_evidence_key);
+                    AsyncInteractiveReadbackResult {
+                        artifact,
+                        finish_ms: elapsed_ms(finish_started),
+                        completed_elapsed_ms: hold_started.elapsed().as_secs_f64() * 1000.0,
+                    }
+                })
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            wake_handle.wake();
+        })
+        .map_err(|error| {
+            NativeWindowError::Failed(format!("spawn interactive readback worker: {error}"))
+        })?;
+    Ok(AsyncInteractiveReadbackJob { receiver })
+}
+
+fn poll_interactive_readback_job(
+    job: &mut Option<AsyncInteractiveReadbackJob>,
+) -> Option<Result<AsyncInteractiveReadbackResult, String>> {
+    let pending = job.take()?;
+    match pending.receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) => {
+            *job = Some(pending);
+            None
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            Some(Err("interactive readback worker disconnected".to_owned()))
+        }
+    }
 }
 
 fn visible_readback_failure_message(

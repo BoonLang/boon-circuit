@@ -6775,6 +6775,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         render_state.revision = render_state.revision.saturating_add(1);
                         render_state.fast_frame_patch_count =
                             render_state.fast_frame_patch_count.saturating_add(1);
+                        render_state.fast_render_scene_patch = None;
                         layout_refreshed = true;
                         role_dirty_reason = Some(
                             boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
@@ -6810,6 +6811,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     render_state.revision = render_state.revision.saturating_add(1);
                     render_state.fast_frame_patch_count =
                         render_state.fast_frame_patch_count.saturating_add(1);
+                    render_state.fast_render_scene_patch = None;
                     layout_refreshed = true;
                 } else {
                     needs_layout_refresh = true;
@@ -6900,6 +6902,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &render_state.code_editor_model_report,
                 render_state.full_layout_refresh_count,
                 render_state.fast_frame_patch_count,
+                render_state.fast_render_scene_patch.as_ref(),
             )?;
             let layout_identity_fallback = format!("dev-content:{content_revision}");
             let layout_identity = preview_proof_identity_value(
@@ -12716,6 +12719,7 @@ fn native_gpu_dev_visible_render_hook(
     code_editor_model_report: &serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+    fast_render_scene_patch: Option<&DevFastRenderScenePatch>,
 ) -> Result<serde_json::Value, String> {
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
@@ -12731,8 +12735,152 @@ fn native_gpu_dev_visible_render_hook(
             && cache.width == context.width
             && cache.height == context.height
     });
+    let direct_patch_base_cache_hit = fast_render_scene_patch.is_some_and(|patch| {
+        render_scene_cache.as_ref().is_some_and(|cache| {
+            cache.content_revision == patch.base_revision
+                && cache.width == context.width
+                && cache.height == context.height
+                && patch.target_revision == content_revision
+        })
+    });
+    let mut direct_patch_build_ms = 0.0;
+    let mut direct_patch_apply_ms = 0.0;
+    let mut direct_patch_report = None::<boon_document::RenderScenePatchReport>;
+    let mut direct_patch_hash = "none".to_owned();
+    let mut direct_patch_rejection = None::<&'static str>;
     let mut render_scene_ms = 0.0;
     let mut identity_ms = 0.0;
+    if !render_scene_cache_hit && direct_patch_base_cache_hit {
+        let Some(patch_request) = fast_render_scene_patch else {
+            return Err("dev fast render-scene patch base hit without patch request".to_owned());
+        };
+        let patch_started = Instant::now();
+        let patch = match dev_render_scene_patch_for_touched_nodes(
+            layout_frame,
+            context.width,
+            context.height,
+            render_text_columns,
+            &patch_request.touched_nodes,
+        ) {
+            Some(patch) => patch,
+            None => {
+                direct_patch_rejection = Some("empty_patch");
+                boon_document::RenderScenePatch {
+                    operations: Vec::new(),
+                }
+            }
+        };
+        direct_patch_build_ms = elapsed_ms(patch_started);
+        if patch.operations.is_empty() {
+            direct_patch_rejection.get_or_insert("empty_patch");
+        } else {
+            direct_patch_hash = render_scene_patch_hash(Some(&patch));
+            let apply_started = Instant::now();
+            let mut patched_scene = render_scene_cache
+                .as_ref()
+                .ok_or_else(|| "dev render scene cache missing for direct patch".to_owned())?
+                .render_scene
+                .clone();
+            let patch_report = patched_scene
+                .apply_patch(&patch)
+                .map_err(|error| error.to_string())?;
+            direct_patch_apply_ms = elapsed_ms(apply_started);
+            let cache = render_scene_cache
+                .as_mut()
+                .ok_or_else(|| "dev render scene cache missing for direct patch".to_owned())?;
+            let encode_scene_started = Instant::now();
+            let visible_metrics = renderer
+                .encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
+                    device: context.device,
+                    queue: context.queue,
+                    encoder: context.encoder,
+                    view: context.surface_view,
+                    scene: &cache.render_scene,
+                    patch: &patch,
+                    format: context.surface_texture_format,
+                    width: context.width,
+                    height: context.height,
+                })
+                .map_err(|error| error.to_string())?;
+            let encode_scene_ms = elapsed_ms(encode_scene_started);
+            let identity_started = Instant::now();
+            let layout_frame_hash = boon_runtime::sha256_bytes(
+                format!(
+                    "dev-layout-render-scene-patch:{}:{}:{}",
+                    cache.layout_frame_hash, direct_patch_hash, content_revision
+                )
+                .as_bytes(),
+            );
+            let render_scene_hash_value = boon_runtime::sha256_bytes(
+                format!(
+                    "dev-render-scene-patch:{}:{}:{}",
+                    cache.render_scene_hash_value, direct_patch_hash, content_revision
+                )
+                .as_bytes(),
+            );
+            let render_scene_identity = format!("dev-render-scene:{render_scene_hash_value}");
+            identity_ms = elapsed_ms(identity_started);
+            direct_patch_report = Some(patch_report);
+            *cache = DevRenderSceneCache {
+                content_revision,
+                width: context.width,
+                height: context.height,
+                layout_frame_hash,
+                render_scene_hash_value,
+                render_scene_identity,
+                render_scene: patched_scene,
+            };
+            let render_scene_cache_ms = elapsed_ms(render_scene_cache_started);
+            let cache = render_scene_cache
+                .as_ref()
+                .ok_or_else(|| "dev render scene cache was not updated".to_owned())?;
+            let mut render_hook_phase_timings_ms = json!({
+                "render_scene_cache_hit": false,
+                "render_scene_patch_base_cache_hit": true,
+                "render_scene_direct_patch": true,
+                "render_scene_cache_ms": render_scene_cache_ms,
+                "render_scene_ms": render_scene_ms,
+                "render_scene_patch_build_ms": direct_patch_build_ms,
+                "render_scene_patch_apply_ms": direct_patch_apply_ms,
+                "encode_scene_ms": encode_scene_ms,
+                "identity_ms": identity_ms,
+                "total_before_report_json_ms": elapsed_ms(render_hook_started),
+            });
+            let report_json_started = Instant::now();
+            let mut report = dev_visible_render_report(
+                context,
+                shell,
+                layout_frame,
+                code_editor_model_report,
+                full_layout_refresh_count,
+                fast_frame_patch_count,
+                cache,
+                visible_metrics,
+                render_hook_phase_timings_ms.clone(),
+            );
+            report["dev_render_cache"]["fast_render_scene_patch"] = json!({
+                "status": "pass",
+                "kind": patch_request.kind,
+                "base_revision": patch_request.base_revision,
+                "target_revision": patch_request.target_revision,
+                "touched_node_count": patch_request.touched_nodes.len(),
+                "patch_hash": direct_patch_hash,
+                "patch_report": direct_patch_report,
+                "base_cache_hit": true,
+                "rejection": direct_patch_rejection
+            });
+            let report_json_ms = elapsed_ms(report_json_started);
+            if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+                timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+                timings.insert(
+                    "total_with_report_json_ms".to_owned(),
+                    json!(elapsed_ms(render_hook_started)),
+                );
+            }
+            report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+            return Ok(report);
+        }
+    }
     if !render_scene_cache_hit {
         let render_scene_started = Instant::now();
         let render_scene = derived_indexes
@@ -12779,6 +12927,10 @@ fn native_gpu_dev_visible_render_hook(
     let encode_scene_ms = elapsed_ms(encode_scene_started);
     let mut render_hook_phase_timings_ms = json!({
         "render_scene_cache_hit": render_scene_cache_hit,
+        "render_scene_patch_base_cache_hit": direct_patch_base_cache_hit,
+        "render_scene_direct_patch": false,
+        "render_scene_patch_build_ms": direct_patch_build_ms,
+        "render_scene_patch_apply_ms": direct_patch_apply_ms,
         "render_scene_cache_ms": render_scene_cache_ms,
         "render_scene_ms": render_scene_ms,
         "encode_scene_ms": encode_scene_ms,
@@ -12786,7 +12938,54 @@ fn native_gpu_dev_visible_render_hook(
         "total_before_report_json_ms": elapsed_ms(render_hook_started),
     });
     let report_json_started = Instant::now();
-    let mut report = json!({
+    let mut report = dev_visible_render_report(
+        context,
+        shell,
+        layout_frame,
+        code_editor_model_report,
+        full_layout_refresh_count,
+        fast_frame_patch_count,
+        cache,
+        visible_metrics,
+        render_hook_phase_timings_ms.clone(),
+    );
+    report["dev_render_cache"]["fast_render_scene_patch"] = json!({
+        "status": if direct_patch_rejection.is_some() { "fallback" } else { "not-used" },
+        "kind": fast_render_scene_patch.map(|patch| patch.kind).unwrap_or("none"),
+        "base_revision": fast_render_scene_patch.map(|patch| patch.base_revision),
+        "target_revision": fast_render_scene_patch.map(|patch| patch.target_revision),
+        "touched_node_count": fast_render_scene_patch
+            .map(|patch| patch.touched_nodes.len())
+            .unwrap_or(0),
+        "patch_hash": direct_patch_hash,
+        "patch_report": direct_patch_report,
+        "base_cache_hit": direct_patch_base_cache_hit,
+        "rejection": direct_patch_rejection
+    });
+    let report_json_ms = elapsed_ms(report_json_started);
+    if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+        timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+        timings.insert(
+            "total_with_report_json_ms".to_owned(),
+            json!(elapsed_ms(render_hook_started)),
+        );
+    }
+    report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+    Ok(report)
+}
+
+fn dev_visible_render_report(
+    context: boon_native_app_window::NativeRenderFrameContext<'_>,
+    shell: &DevWindowShell,
+    layout_frame: &boon_document::LayoutFrame,
+    code_editor_model_report: &serde_json::Value,
+    full_layout_refresh_count: u64,
+    fast_frame_patch_count: u64,
+    cache: &DevRenderSceneCache,
+    visible_metrics: boon_native_gpu::FrameMetrics,
+    render_hook_phase_timings_ms: serde_json::Value,
+) -> serde_json::Value {
+    json!({
         "status": "pass",
         "renderer": "boon_native_gpu",
         "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
@@ -12829,17 +13028,52 @@ fn native_gpu_dev_visible_render_hook(
             "fast_frame_patch_supported": true
         },
         "layout_metrics": layout_frame.metrics
-    });
-    let report_json_ms = elapsed_ms(report_json_started);
-    if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
-        timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
-        timings.insert(
-            "total_with_report_json_ms".to_owned(),
-            json!(elapsed_ms(render_hook_started)),
-        );
+    })
+}
+
+fn dev_render_scene_patch_for_touched_nodes(
+    layout_frame: &boon_document::LayoutFrame,
+    width: u32,
+    height: u32,
+    columns: &mut impl boon_document::render_scene::RenderTextColumnMeasurer,
+    touched_nodes: &BTreeSet<boon_document::DocumentNodeId>,
+) -> Option<boon_document::RenderScenePatch> {
+    if touched_nodes.is_empty() {
+        return None;
     }
-    report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
-    Ok(report)
+    let items = boon_document::render_scene::render_scene_items_for_touched_nodes(
+        layout_frame,
+        width,
+        height,
+        touched_nodes,
+    );
+    let visual_primitives = boon_document::render_scene::render_visual_primitives_for_touched_nodes(
+        layout_frame,
+        width,
+        height,
+        &mut *columns,
+        touched_nodes,
+    );
+    let text_runs = boon_document::render_scene::render_text_runs_for_touched_nodes(
+        layout_frame,
+        width,
+        height,
+        &mut *columns,
+        touched_nodes,
+    );
+    if items.is_empty() && visual_primitives.is_empty() && text_runs.is_empty() {
+        return None;
+    }
+    Some(boon_document::RenderScenePatch {
+        operations: vec![
+            boon_document::RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes: touched_nodes.iter().cloned().collect(),
+                items,
+                visual_primitives,
+                text_runs,
+            },
+        ],
+    })
 }
 
 fn dev_code_editor_visible_style_report(
@@ -13022,6 +13256,15 @@ struct DevRenderState {
     code_editor_model_report: serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+    fast_render_scene_patch: Option<DevFastRenderScenePatch>,
+}
+
+#[derive(Clone, Debug)]
+struct DevFastRenderScenePatch {
+    kind: &'static str,
+    base_revision: u64,
+    target_revision: u64,
+    touched_nodes: BTreeSet<boon_document::DocumentNodeId>,
 }
 
 struct DevRenderSceneCache {
@@ -13180,6 +13423,7 @@ fn refresh_dev_render_layout(
     render_state.revision = render_state.revision.saturating_add(1);
     render_state.full_layout_refresh_count =
         render_state.full_layout_refresh_count.saturating_add(1);
+    render_state.fast_render_scene_patch = None;
 }
 
 fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut DevRenderState) {
@@ -13197,6 +13441,7 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
     }
     render_state.revision = render_state.revision.saturating_add(1);
     render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+    render_state.fast_render_scene_patch = None;
 }
 
 fn editor_line_number_from_node_id(node_id: &str, prefix: &str) -> Option<usize> {
@@ -13327,6 +13572,7 @@ fn patch_dev_render_editor_visual_state(
     if patched {
         render_state.revision = render_state.revision.saturating_add(1);
         render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+        render_state.fast_render_scene_patch = None;
         if render_state.code_editor_model_report.is_object() {
             render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
             render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
@@ -13339,10 +13585,12 @@ fn patch_dev_render_editor_scroll(
     shell: &DevWindowShell,
     render_state: &mut DevRenderState,
 ) -> bool {
+    let base_revision = render_state.revision.max(1);
     let Some(frame) = render_state.layout_frame.as_mut() else {
         return false;
     };
     let model = &shell.workspace.selected_buffer;
+    let mut touched_nodes = BTreeSet::new();
     let mut text_indices = frame
         .display_list
         .iter()
@@ -13367,6 +13615,7 @@ fn patch_dev_render_editor_scroll(
     let bracket_columns_by_line = model.bracket_columns_by_line();
     for (slot, item_index) in text_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
+        touched_nodes.insert(item.node.clone());
         if let Some((line_number, line)) = visible_lines.get(slot) {
             item.text = Some(line.clone());
             item.style.insert(
@@ -13454,6 +13703,7 @@ fn patch_dev_render_editor_scroll(
     });
     for (slot, item_index) in gutter_indices.into_iter().enumerate() {
         let item = &mut frame.display_list[item_index];
+        touched_nodes.insert(item.node.clone());
         if let Some((line_number, _)) = visible_lines.get(slot) {
             item.text = Some(format!("{line_number:>4}"));
             item.style.insert(
@@ -13493,6 +13743,7 @@ fn patch_dev_render_editor_scroll(
         });
         for (slot, item_index) in row_indices.into_iter().enumerate() {
             let item = &mut frame.display_list[item_index];
+            touched_nodes.insert(item.node.clone());
             if let Some((line_number, _)) = visible_lines.get(slot) {
                 item.style.insert(
                     "editor_source_line".to_owned(),
@@ -13511,8 +13762,15 @@ fn patch_dev_render_editor_scroll(
         }
     }
 
-    render_state.revision = render_state.revision.saturating_add(1);
+    let target_revision = render_state.revision.saturating_add(1);
+    render_state.revision = target_revision;
     render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+    render_state.fast_render_scene_patch = Some(DevFastRenderScenePatch {
+        kind: "dev_editor_scroll",
+        base_revision,
+        target_revision,
+        touched_nodes,
+    });
     if render_state.code_editor_model_report.is_object() {
         render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
         render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
@@ -71817,6 +72075,98 @@ label:
                 &mut columns,
             )
             .expect("fast-scrolled dev frame must render with cached derived indexes");
+        let patch = render_state
+            .fast_render_scene_patch
+            .as_ref()
+            .expect("scroll fast path should record a render-scene patch request");
+        assert_eq!(patch.kind, "dev_editor_scroll");
+        assert!(patch.target_revision > patch.base_revision);
+        assert!(
+            patch
+                .touched_nodes
+                .contains(&boon_document_model::DocumentNodeId(
+                    "dev-code-editor-line-text-1".to_owned()
+                )),
+            "patched visible editor rows should be available for direct render-scene patching"
+        );
+    }
+
+    #[test]
+    fn dev_render_scroll_patch_builds_direct_render_scene_patch_for_touched_rows() {
+        let source = (1..=120)
+            .map(|line| format!("line_{line:04}: value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut shell, _, _, _) = test_dev_editor_context(&source);
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        let base_revision = render_state.revision;
+        let base_layout = render_state
+            .layout_frame
+            .as_ref()
+            .expect("base layout should exist")
+            .clone();
+        let mut base_scene = render_state
+            .derived_indexes
+            .as_ref()
+            .expect("derived indexes should exist")
+            .try_render_scene(&base_layout, 1180, 820, &mut columns)
+            .expect("base render scene should lower");
+        let first_text_before = base_scene
+            .text_runs
+            .iter()
+            .find(|run| run.node.0 == "dev-code-editor-line-text-1")
+            .map(|run| run.text.clone())
+            .expect("base first editor text run should exist");
+
+        shell.workspace.selected_buffer.scroll_line = 12;
+        assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
+        let request = render_state
+            .fast_render_scene_patch
+            .as_ref()
+            .expect("scroll fast path should expose render-scene patch metadata");
+        assert_eq!(request.base_revision, base_revision);
+        assert_eq!(request.target_revision, render_state.revision);
+        assert!(
+            request.touched_nodes.len() >= 3,
+            "scroll patch should include text, gutter, and row nodes"
+        );
+        let patched_layout = render_state
+            .layout_frame
+            .as_ref()
+            .expect("patched layout should exist");
+        let expected_first_text = patched_layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-code-editor-line-text-1")
+            .and_then(|item| item.text.clone())
+            .expect("patched first editor text should exist");
+        assert_ne!(first_text_before, expected_first_text);
+
+        let patch = dev_render_scene_patch_for_touched_nodes(
+            patched_layout,
+            1180,
+            820,
+            &mut columns,
+            &request.touched_nodes,
+        )
+        .expect("touched row patch should lower to render-scene entries");
+        assert_eq!(patch.operations.len(), 1);
+        let report = base_scene
+            .apply_patch(&patch)
+            .expect("direct dev editor scroll render-scene patch should apply");
+        assert!(report.patched_items >= request.touched_nodes.len());
+        assert!(report.patched_text_runs > 0);
+        let first_text_after = base_scene
+            .text_runs
+            .iter()
+            .find(|run| run.node.0 == "dev-code-editor-line-text-1")
+            .map(|run| run.text.clone())
+            .expect("patched first editor text run should exist");
+        assert_eq!(first_text_after, expected_first_text);
     }
 
     #[test]

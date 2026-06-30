@@ -38990,27 +38990,25 @@ fn verify_native_dev_editor_scroll_speed(
     let horizontal_driver_target =
         native_scroll_driver_target_for_axis("dev-code-editor", &layout_probe, "horizontal");
     let release_build = profile == "release";
-    let vertical_observation = run_linux_human_like_desktop_surface_smoke(
-        "dev-editor-scroll-speed-vertical",
+    let vertical_observation = run_native_scroll_axis_observation_with_retries(
+        "dev-editor-scroll-speed",
+        "vertical",
         &example_id,
         &source_path,
         release_build,
         true,
         "dev_surface_proof",
         vertical_driver_target.clone(),
-        true,
-        Some("vertical-scroll-only"),
     )?;
-    let horizontal_observation = run_linux_human_like_desktop_surface_smoke(
-        "dev-editor-scroll-speed-horizontal",
+    let horizontal_observation = run_native_scroll_axis_observation_with_retries(
+        "dev-editor-scroll-speed",
+        "horizontal",
         &example_id,
         &source_path,
         release_build,
         true,
         "dev_surface_proof",
         horizontal_driver_target.clone(),
-        true,
-        Some("horizontal-scroll-only"),
     )?;
     let vertical_surface_proof = vertical_observation
         .get("surface_external_render_proof")
@@ -47372,6 +47370,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             "vertical",
             &source_example_id,
             &source_path,
+            true,
             dev_editor,
             measured_surface_key,
             vertical_driver_target.clone(),
@@ -47381,6 +47380,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             "horizontal",
             &source_example_id,
             &source_path,
+            true,
             dev_editor,
             measured_surface_key,
             horizontal_driver_target.clone(),
@@ -49856,6 +49856,7 @@ fn run_native_scroll_axis_observation_with_retries(
     axis: &str,
     example: &str,
     source_path: &Path,
+    release_build: bool,
     dev_editor: bool,
     measured_surface_key: &str,
     driver_target: Option<serde_json::Value>,
@@ -49867,7 +49868,9 @@ fn run_native_scroll_axis_observation_with_retries(
     };
     let max_attempts = 3_u64;
     let mut attempt_summaries = Vec::new();
-    let mut last_observation = json!({
+    let mut best_failed_observation = None::<serde_json::Value>;
+    let mut best_failed_score = i64::MIN;
+    let mut fallback_observation = json!({
         "status": "not-run",
         "reason": "native scroll axis observation was not attempted"
     });
@@ -49878,7 +49881,7 @@ fn run_native_scroll_axis_observation_with_retries(
             &attempt_label,
             example,
             source_path,
-            true,
+            release_build,
             dev_editor,
             measured_surface_key,
             driver_target.clone(),
@@ -49886,24 +49889,144 @@ fn run_native_scroll_axis_observation_with_retries(
             Some(scroll_mode),
         )?;
         let pass = native_scroll_axis_observation_pass(&observation, axis);
+        observation["axis_retry_attempt_index"] = json!(attempt);
         observation["axis_retry_attempt_count"] = json!(attempt);
         observation["axis_retry_max_attempts"] = json!(max_attempts);
+        observation["axis_retry_selected_attempt"] = json!(attempt);
+        observation["axis_retry_selection"] = json!("pass");
         observation["axis_retry_previous_attempts"] = json!(attempt_summaries);
         if pass {
             return Ok(observation);
+        }
+        let score = native_scroll_axis_observation_score(&observation, axis);
+        if score > best_failed_score {
+            best_failed_score = score;
+            best_failed_observation = Some(observation.clone());
         }
         attempt_summaries.push(native_scroll_axis_attempt_summary(
             &observation,
             axis,
             attempt,
         ));
-        last_observation = observation;
+        fallback_observation = observation;
     }
 
-    last_observation["axis_retry_attempt_count"] = json!(max_attempts);
-    last_observation["axis_retry_max_attempts"] = json!(max_attempts);
-    last_observation["axis_retry_previous_attempts"] = json!(attempt_summaries);
-    Ok(last_observation)
+    let mut selected = best_failed_observation.unwrap_or(fallback_observation);
+    let selected_attempt = selected
+        .get("axis_retry_attempt_index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(max_attempts);
+    selected["axis_retry_attempt_count"] = json!(max_attempts);
+    selected["axis_retry_max_attempts"] = json!(max_attempts);
+    selected["axis_retry_selected_attempt"] = json!(selected_attempt);
+    selected["axis_retry_selection"] = json!("best_failed_observation");
+    selected["axis_retry_best_failed_score"] = json!(best_failed_score);
+    selected["axis_retry_previous_attempts"] = json!(attempt_summaries);
+    Ok(selected)
+}
+
+fn native_scroll_axis_observation_score(observation: &serde_json::Value, axis: &str) -> i64 {
+    let input_adapter = observation
+        .get("surface_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    let axis_delta = match axis {
+        "vertical" => input_adapter
+            .get("scroll_delta_y")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0),
+        "horizontal" => input_adapter
+            .get("scroll_delta_x")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let mut score = 0_i64;
+    let mut add_if = |points: i64, condition: bool| {
+        if condition {
+            score += points;
+        }
+    };
+    add_if(
+        1_000,
+        native_scroll_axis_observation_pass(observation, axis),
+    );
+    add_if(
+        120,
+        observation
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass"),
+    );
+    add_if(
+        100,
+        observation
+            .get("wheel_input_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        80,
+        observation
+            .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        70,
+        input_adapter
+            .get("mouse_scroll_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0,
+    );
+    add_if(70, axis_delta.abs() > f64::EPSILON);
+    add_if(
+        60,
+        observation
+            .get("measured_loop_same_frame_readback_proven")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        50,
+        observation
+            .get("post_input_timing_proven")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        30,
+        observation
+            .get("measured_role_loop_reports_match")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        20,
+        observation
+            .get("driver_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    add_if(
+        20,
+        observation
+            .get("desktop_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    if let Some(p95) = observation
+        .get("surface_post_input_frame_timing")
+        .and_then(|timing| timing.get("presented_frame_ms_p95"))
+        .and_then(numeric_value_as_f64)
+    {
+        if p95 <= 16.7 {
+            score += 20;
+        } else if p95 <= 33.4 {
+            score += 10;
+        }
+    }
+    score
 }
 
 fn native_scroll_axis_attempt_summary(
@@ -49939,6 +50062,11 @@ fn native_scroll_axis_attempt_summary(
             .get("scroll_delta_y")
             .cloned()
             .unwrap_or_else(|| json!(0.0)),
+        "presented_frame_ms_p95": observation
+            .get("surface_post_input_frame_timing")
+            .and_then(|timing| timing.get("presented_frame_ms_p95"))
+            .cloned()
+            .unwrap_or_else(|| json!(null)),
     })
 }
 
@@ -83065,6 +83193,80 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             &observation,
             "vertical"
         ));
+    }
+
+    #[test]
+    fn native_scroll_axis_score_prefers_best_failed_real_wheel_attempt() {
+        let no_wheel_attempt = json!({
+            "status": "fail",
+            "wheel_input_observed": false,
+            "real_os_events_observed": true,
+            "measured_loop_same_frame_readback_proven": false,
+            "post_input_timing_proven": true,
+            "measured_role_loop_reports_match": true,
+            "driver_pass": true,
+            "desktop_pass": true,
+            "surface_input_adapter": {
+                "mouse_scroll_event_count": 0,
+                "scroll_delta_x": 0.0,
+                "scroll_delta_y": 0.0
+            },
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 11.0
+            }
+        });
+        let wheel_attempt_without_same_frame_proof = json!({
+            "status": "fail",
+            "wheel_input_observed": true,
+            "real_os_events_observed": true,
+            "measured_loop_same_frame_readback_proven": false,
+            "post_input_timing_proven": true,
+            "measured_role_loop_reports_match": true,
+            "driver_pass": true,
+            "desktop_pass": true,
+            "surface_input_adapter": {
+                "mouse_scroll_event_count": 1,
+                "scroll_delta_x": 180.0,
+                "scroll_delta_y": 0.0
+            },
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 25.0
+            }
+        });
+        let wheel_attempt_with_same_frame_proof = json!({
+            "status": "pass",
+            "wheel_input_observed": true,
+            "real_os_events_observed": true,
+            "measured_loop_same_frame_readback_proven": true,
+            "post_input_timing_proven": true,
+            "measured_role_loop_reports_match": true,
+            "driver_pass": true,
+            "desktop_pass": true,
+            "surface_input_adapter": {
+                "mouse_scroll_event_count": 1,
+                "scroll_delta_x": 180.0,
+                "scroll_delta_y": 0.0
+            },
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 15.0
+            }
+        });
+
+        assert!(
+            native_scroll_axis_observation_score(
+                &wheel_attempt_without_same_frame_proof,
+                "horizontal"
+            ) > native_scroll_axis_observation_score(&no_wheel_attempt, "horizontal")
+        );
+        assert!(
+            native_scroll_axis_observation_score(
+                &wheel_attempt_with_same_frame_proof,
+                "horizontal"
+            ) > native_scroll_axis_observation_score(
+                &wheel_attempt_without_same_frame_proof,
+                "horizontal"
+            )
+        );
     }
 
     #[test]

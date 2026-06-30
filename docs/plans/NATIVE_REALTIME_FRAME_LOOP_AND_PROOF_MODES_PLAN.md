@@ -657,6 +657,50 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   aggregate native GPU gates, dev-code-editor crash/scroll coverage,
   broader no-hacks audit, and generic runtime/list/currentness verification.
 
+2026-07-01 dev-editor scroll retry evidence slice:
+
+- `verify-native-dev-editor-scroll-speed` now uses the shared axis-specific
+  native scroll retry helper instead of running vertical and horizontal probes
+  once. The helper is profile-aware, so the standalone dev-editor gate can run
+  debug or release while the existing release-only scroll-speed gate keeps its
+  behavior.
+- When all retry attempts fail, the helper now returns the strongest failed
+  observation instead of blindly returning the last attempt. The selection score
+  prefers real wheel delivery, nonzero axis delta, post-input timing, role/loop
+  report agreement, same-frame proof, and lower p95 frame timing. Reports now
+  include `axis_retry_selected_attempt` and `axis_retry_selection` so verifier
+  evidence explains which attempt was used.
+- Focused verification passed:
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask native_scroll_axis`
+  - `git diff --check`
+- Fresh release verifier attempt:
+  - `timeout 900s cargo xtask verify-native-dev-editor-scroll-speed --profile
+    release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json`
+  - status remains `fail`;
+  - both axes now show real wheel movement:
+    `scroll_line_delta=15`, `scroll_column_delta=12`;
+  - horizontal timing is within budget:
+    `horizontal.presented_frame_ms_p95=11.248325`;
+  - remaining blockers are:
+    - vertical p95/max still above release budget:
+      `wheel_to_visible_p95=25.122470`, max `29.140229`;
+    - the report still counts cumulative full layout refreshes during the
+      passive-scroll run:
+      `full_layout_refresh_count_for_passive_scroll=27`,
+      `fast_frame_patch_count_for_passive_scroll=4`;
+    - same-frame dev-surface readback proof is not yet produced for the
+      measured frame. The measured loop frame evidence was
+      `frame_seq=162`, `content_revision=31`, while the available WGPU readback
+      artifact was from an older frame (`frame_seq=126`, `content_revision=13`).
+- This slice improves verifier determinism and diagnostic honesty. It does not
+  complete dev-editor scroll performance. The next architecture work is to make
+  dev-surface interaction frames keep retained render-scene patch/cache state
+  hot through the measured frame window, avoid cumulative startup/layout counts
+  in passive-scroll hot-path checks, and schedule same-frame visible-surface
+  WGPU proof for the measured dev frame without putting readback on the UX hot
+  path.
+
 ## Implementation Slices
 
 1. Terminology and schema:

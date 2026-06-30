@@ -26113,6 +26113,7 @@ fn verify_native_gpu_report_contract(report: &JsonValue, report_path: &Path) -> 
     if report_is_native_ux_command(report) {
         let passive_scroll = report_is_native_passive_scroll_command(report);
         collect_native_ux_product_path_reasons(report, "$", passive_scroll, &mut reasons);
+        collect_native_ux_proof_currentness_reasons(report, &mut reasons);
     }
     if let Some(frame_pacing) = report.get("frame_pacing") {
         verify_native_frame_pacing(frame_pacing, "$.frame_pacing", &mut reasons);
@@ -26147,6 +26148,9 @@ fn native_gpu_product_path_negative_case_ids() -> &'static [&'static str] {
         "nested-private-runtime-dispatch",
         "browser-proof-substituted-for-native",
         "cosmic-toplevel-proof",
+        "lagged-ux-proof",
+        "pending-ux-readback",
+        "same-frame-proof-identity-mismatch",
     ]
 }
 
@@ -26317,6 +26321,57 @@ fn collect_native_ux_product_path_reasons(
             }
         }
         _ => {}
+    }
+}
+
+fn collect_native_ux_proof_currentness_reasons(report: &JsonValue, reasons: &mut Vec<String>) {
+    if report
+        .get("proof_lag_frames")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|frames| frames > 0)
+    {
+        reasons.push("native UX proof must not lag the measured presented frame".to_owned());
+    }
+    for key in [
+        "stale_for_latest_input",
+        "readback_stale_for_latest_input",
+        "last_interactive_surface_readback_pending",
+        "last_interactive_readback_pending",
+        "readback_pending_for_latest_input",
+    ] {
+        if report.get(key).and_then(JsonValue::as_bool) == Some(true) {
+            reasons.push(format!(
+                "{key}=true is forbidden for native UX proof currentness"
+            ));
+        }
+    }
+    let Some(artifact) = report.get("last_interactive_readback_artifact") else {
+        return;
+    };
+    let visible_surface_readback = artifact.get("capture_method").and_then(JsonValue::as_str)
+        == Some("wgpu-visible-surface-copy-src-readback");
+    if !visible_surface_readback {
+        return;
+    }
+    if artifact
+        .get("readback_poll_status")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|status| status != "completed_before_deadline")
+    {
+        reasons.push(
+            "last_interactive_readback_artifact must be completed before deadline for native UX"
+                .to_owned(),
+        );
+    }
+    if let (Some(root_key), Some(readback_key)) = (
+        report.get("frame_evidence_key"),
+        artifact.get("frame_evidence_key"),
+    ) && root_key != readback_key
+    {
+        reasons.push(
+            "last_interactive_readback_artifact.frame_evidence_key must match top-level frame_evidence_key for native UX"
+                .to_owned(),
+        );
     }
 }
 
@@ -31469,6 +31524,38 @@ mod tests {
             .remove("frame_evidence_key");
         report["last_interactive_readback_artifact"]["sha256"] = json!("hash-only-proof");
         assert!(!schema_accepts(report, "native-frame-evidence-hash-only"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_lagged_ux_proof() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["rendered_frame_count"] = json!(4);
+        report["proof_lag_frames"] = json!(1);
+        report["frame_evidence_key"]["frame_seq"] = json!(4);
+        report["frame_evidence_key"]["present_id"] = json!(4);
+        report["preview_perf_stats"]["frame_seq"] = json!(4);
+        report["preview_perf_stats"]["frame_evidence_key"]["frame_seq"] = json!(4);
+        report["preview_perf_stats"]["frame_evidence_key"]["present_id"] = json!(4);
+        assert!(!schema_accepts(report, "native-lagged-ux-proof"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_pending_ux_readback() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_surface_readback_pending"] = json!(true);
+        report["last_interactive_readback_artifact"]["readback_poll_status"] = json!("pending");
+        assert!(!schema_accepts(report, "native-pending-ux-readback"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_same_frame_proof_identity_mismatch() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_readback_artifact"]["frame_evidence_key"]["proof_request_id"] =
+            json!(99);
+        assert!(!schema_accepts(
+            report,
+            "native-same-frame-proof-identity-mismatch"
+        ));
     }
 
     #[test]

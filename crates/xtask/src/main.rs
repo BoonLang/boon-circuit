@@ -58457,6 +58457,106 @@ fn verify_native_gpu_negative(args: &[String]) -> Result<(), Box<dyn std::error:
             ),
         ),
         (
+            "lagged-ux-proof",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "surface_id": "surface:negative",
+                    "surface_epoch": 1,
+                    "rendered_frame_count": 4,
+                    "last_render_content_revision": 9,
+                    "proof_lag_frames": 1,
+                    "frame_evidence_key": {
+                        "frame_seq": 4,
+                        "content_revision": 9,
+                        "layout_revision": 9,
+                        "render_scene_revision": 9,
+                        "surface_id": "surface:negative",
+                        "surface_epoch": 1,
+                        "input_event_seq": 42,
+                        "present_id": 4,
+                        "proof_request_id": 4
+                    },
+                    "last_interactive_readback_artifact": {
+                        "path": "target/reports/native-gpu/lagged-ux-proof.png",
+                        "sha256": "lagged-proof-fixture",
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "content_revision": 9,
+                        "rendered_frame_count": 3,
+                        "readback_poll_status": "completed_before_deadline",
+                        "frame_evidence_key": {
+                            "frame_seq": 3,
+                            "content_revision": 9,
+                            "layout_revision": 9,
+                            "render_scene_revision": 9,
+                            "surface_id": "surface:negative",
+                            "surface_epoch": 1,
+                            "input_event_seq": 42,
+                            "present_id": 3,
+                            "proof_request_id": 3
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
+            "pending-ux-readback",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "last_interactive_surface_readback_pending": true,
+                    "last_interactive_readback_pending": true,
+                    "readback_pending_for_latest_input": true
+                }),
+            ),
+        ),
+        (
+            "same-frame-proof-identity-mismatch",
+            merge_json(
+                base(),
+                json!({
+                    "command": "verify-native-gpu-preview-e2e",
+                    "surface_id": "surface:negative",
+                    "surface_epoch": 1,
+                    "rendered_frame_count": 4,
+                    "last_render_content_revision": 9,
+                    "proof_lag_frames": 0,
+                    "frame_evidence_key": {
+                        "frame_seq": 4,
+                        "content_revision": 9,
+                        "layout_revision": 9,
+                        "render_scene_revision": 9,
+                        "surface_id": "surface:negative",
+                        "surface_epoch": 1,
+                        "input_event_seq": 42,
+                        "present_id": 4,
+                        "proof_request_id": 4
+                    },
+                    "last_interactive_readback_artifact": {
+                        "path": "target/reports/native-gpu/same-frame-proof-identity-mismatch.png",
+                        "sha256": "same-frame-mismatch-fixture",
+                        "capture_method": "wgpu-visible-surface-copy-src-readback",
+                        "content_revision": 9,
+                        "rendered_frame_count": 4,
+                        "readback_poll_status": "completed_before_deadline",
+                        "frame_evidence_key": {
+                            "frame_seq": 4,
+                            "content_revision": 9,
+                            "layout_revision": 9,
+                            "render_scene_revision": 9,
+                            "surface_id": "surface:negative",
+                            "surface_epoch": 1,
+                            "input_event_seq": 43,
+                            "present_id": 4,
+                            "proof_request_id": 99
+                        }
+                    }
+                }),
+            ),
+        ),
+        (
             "continuous-probe-ux-report",
             merge_json(
                 base(),
@@ -62012,6 +62112,34 @@ fn require_active_pending_snapshot_backpressure(
             "{label}.pending_snapshot_commit_policy must be reject-stale when stale_result_rejected is true"
         ));
     }
+    let frame_evidence_status = field("pending_frame_evidence_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        frame_evidence_status,
+        "missing" | "accepted-current-missing" | "current" | "stale-rejected"
+    ) {
+        blockers.push(format!(
+            "{label}.pending_frame_evidence_status must be missing, accepted-current-missing, current, or stale-rejected"
+        ));
+    }
+    let currentness_policy = field("pending_snapshot_commit_currentness_policy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if currentness_policy != "source-revision-plus-frame-evidence-no-regression" {
+        blockers.push(format!(
+            "{label}.pending_snapshot_commit_currentness_policy must be source-revision-plus-frame-evidence-no-regression"
+        ));
+    }
+    if frame_evidence_status == "stale-rejected"
+        && field("pending_frame_evidence_rejection")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        blockers.push(format!(
+            "{label}.pending_frame_evidence_rejection must explain stale-rejected frame evidence"
+        ));
+    }
     for key in [
         "coalesced_pending_snapshot_count",
         "dropped_pending_snapshot_count",
@@ -62026,6 +62154,17 @@ fn require_active_pending_snapshot_backpressure(
         "preview_blocked_on_ipc_count",
     ] {
         if field(key).and_then(serde_json::Value::as_u64).is_none() {
+            blockers.push(format!("{label}.{key} must be present"));
+        }
+    }
+    for key in [
+        "pending_frame_evidence_key_at_accept",
+        "pending_frame_evidence_current_key",
+        "pending_frame_evidence_status",
+        "pending_frame_evidence_rejection",
+        "pending_snapshot_commit_currentness_policy",
+    ] {
+        if field(key).is_none() {
             blockers.push(format!("{label}.{key} must be present"));
         }
     }
@@ -63476,6 +63615,7 @@ fn collect_native_gpu_ux_product_path_reasons(
     }
     let passive_scroll_gate = native_gpu_report_is_passive_scroll_gate(report);
     collect_native_gpu_ux_product_path_value_reasons(report, "$", passive_scroll_gate, reasons);
+    collect_native_gpu_ux_proof_currentness_reasons(report, reasons);
 }
 
 fn native_gpu_report_is_ux_gate(report: &serde_json::Value) -> bool {
@@ -63605,6 +63745,62 @@ fn collect_native_gpu_ux_product_path_value_reasons(
             }
         }
         _ => {}
+    }
+}
+
+fn collect_native_gpu_ux_proof_currentness_reasons(
+    report: &serde_json::Value,
+    reasons: &mut Vec<String>,
+) {
+    if report
+        .get("proof_lag_frames")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|frames| frames > 0)
+    {
+        reasons.push("native UX proof must not lag the measured presented frame".to_owned());
+    }
+    for key in [
+        "stale_for_latest_input",
+        "readback_stale_for_latest_input",
+        "last_interactive_surface_readback_pending",
+        "last_interactive_readback_pending",
+        "readback_pending_for_latest_input",
+    ] {
+        if report.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
+            reasons.push(format!(
+                "{key}=true is forbidden for native UX proof currentness"
+            ));
+        }
+    }
+    let Some(artifact) = report.get("last_interactive_readback_artifact") else {
+        return;
+    };
+    let visible_surface_readback = artifact
+        .get("capture_method")
+        .and_then(serde_json::Value::as_str)
+        == Some("wgpu-visible-surface-copy-src-readback");
+    if !visible_surface_readback {
+        return;
+    }
+    if artifact
+        .get("readback_poll_status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status != "completed_before_deadline")
+    {
+        reasons.push(
+            "last_interactive_readback_artifact must be completed before deadline for native UX"
+                .to_owned(),
+        );
+    }
+    if let (Some(root_key), Some(readback_key)) = (
+        report.get("frame_evidence_key"),
+        artifact.get("frame_evidence_key"),
+    ) && root_key != readback_key
+    {
+        reasons.push(
+            "last_interactive_readback_artifact.frame_evidence_key must match top-level frame_evidence_key for native UX"
+                .to_owned(),
+        );
     }
 }
 

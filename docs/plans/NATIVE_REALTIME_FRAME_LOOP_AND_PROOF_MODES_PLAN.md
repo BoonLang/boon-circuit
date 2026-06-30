@@ -458,6 +458,65 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo test -q -p boon_native_playground stale_replace_source_commit_does_not_mutate_active_preview_state`
   - `cargo test -q -p boon_native_playground replace_source_ack_is_small_and_worker_commits_latest_revision`
 
+2026-06-30 pending frame-evidence commit guard slice:
+
+- Source replacement now captures the current preview `FrameEvidenceKey` when a
+  pending source/runtime/layout/render snapshot is accepted.
+- Final source replacement commit validates that the accepted frame evidence and
+  current preview frame evidence still share the same surface id and surface
+  epoch, and that frame sequence, content revision, layout revision,
+  render-scene revision, and present id have not regressed.
+- A stale frame-evidence result is rejected before mutating active preview
+  source, runtime units, runtime summary, live runtime, world scene/session, or
+  retained shared render state.
+- Replace-source status and `active_pending_snapshot_backpressure` now expose:
+  - accepted pending frame evidence;
+  - current frame evidence at commit/report time;
+  - pending frame-evidence status;
+  - stale rejection reason;
+  - currentness policy.
+- `xtask` now requires active/pending backpressure proof to carry the
+  frame-evidence/currentness fields and validates their allowed status and
+  policy values.
+- This is still a conservative commit-currentness guard. The app-window
+  `layout_revision` and `render_scene_revision` values are currently aliases of
+  the content revision; a future renderer/layout identity slice must make those
+  independent identities before the full active/pending snapshot contract can be
+  called complete.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground replace_source_commit_rejects_stale_surface_epoch_before_state_mutation`
+  - `cargo test -q -p boon_native_playground stale_replace_source_commit_does_not_mutate_active_preview_state`
+  - `cargo test -q -p boon_native_playground preview_replace_worker_backpressure_separates_current_pending_from_stale_in_flight`
+  - `cargo test -q -p boon_native_playground replace_source_ack_is_small_and_worker_commits_latest_revision`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+
+2026-06-30 native UX proof-currentness gate slice:
+
+- Native UX report validation now rejects visible proof that is stale for the
+  measured interaction:
+  - `proof_lag_frames > 0`;
+  - stale-for-latest-input flags;
+  - pending interactive readback flags;
+  - visible-surface readback artifacts that did not complete before deadline;
+  - `last_interactive_readback_artifact.frame_evidence_key` differing from the
+    top-level `frame_evidence_key`.
+- The gate is command-classified and generic. It does not branch on examples,
+  source paths, Cells fields, formula fields, or fixture labels.
+- `verify-native-gpu-negative` now includes required adversarial cases for
+  lagged UX proof, pending UX readback, and same-frame proof identity mismatch.
+- Focused verification passed:
+  - `cargo test -q -p boon_report_schema native_gpu_schema_rejects_lagged_ux_proof`
+  - `cargo test -q -p boon_report_schema native_gpu_schema_rejects_pending_ux_readback`
+  - `cargo test -q -p boon_report_schema native_gpu_schema_rejects_same_frame_proof_identity_mismatch`
+  - `cargo test -q -p boon_report_schema native_gpu_negative_schema_requires_product_path_cases`
+  - `cargo check -q -p boon_report_schema`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+
 ## Implementation Slices
 
 1. Terminology and schema:

@@ -50535,6 +50535,51 @@ fn attach_active_pending_snapshot_backpressure(
         "render_thread_blocked_on_replace_count": render_thread_blocked_on_replace_count,
         "preview_blocked_on_ipc_count": preview_blocked_on_ipc_count
     });
+    let pending_frame_evidence_fields = [
+        (
+            "pending_frame_evidence_key_at_accept",
+            value
+                .get("pending_frame_evidence_key_at_accept")
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+        ),
+        (
+            "pending_frame_evidence_current_key",
+            value
+                .get("pending_frame_evidence_current_key")
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+        ),
+        (
+            "pending_frame_evidence_status",
+            value
+                .get("pending_frame_evidence_status")
+                .cloned()
+                .unwrap_or_else(|| json!("missing")),
+        ),
+        (
+            "pending_frame_evidence_rejection",
+            value
+                .get("pending_frame_evidence_rejection")
+                .cloned()
+                .unwrap_or_else(|| json!(null)),
+        ),
+        (
+            "pending_snapshot_commit_currentness_policy",
+            value
+                .get("pending_snapshot_commit_currentness_policy")
+                .cloned()
+                .unwrap_or_else(|| json!("source-revision-plus-frame-evidence-no-regression")),
+        ),
+    ];
+    if let Some(backpressure) = value
+        .get_mut("active_pending_snapshot_backpressure")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (field, field_value) in pending_frame_evidence_fields {
+            backpressure.insert(field.to_owned(), field_value);
+        }
+    }
 }
 
 fn attach_preview_ipc_counter_snapshot(
@@ -56388,6 +56433,100 @@ struct PreviewReplaceBuildResult {
     diagnostic: Option<String>,
 }
 
+fn preview_current_frame_evidence_key(
+    state: &PreviewIpcState,
+) -> Option<boon_native_app_window::FrameEvidenceKey> {
+    state
+        .preview_perf_stats
+        .as_ref()
+        .and_then(|stats| stats.frame_evidence_key.clone())
+}
+
+fn preview_frame_evidence_key_value(
+    key: Option<&boon_native_app_window::FrameEvidenceKey>,
+) -> serde_json::Value {
+    key.map(|key| serde_json::to_value(key).unwrap_or_else(|_| json!(null)))
+        .unwrap_or_else(|| json!(null))
+}
+
+fn preview_pending_frame_evidence_key_from_status(
+    status: &serde_json::Value,
+) -> Option<boon_native_app_window::FrameEvidenceKey> {
+    status
+        .get("pending_frame_evidence_key_at_accept")
+        .and_then(|value| {
+            if value.is_null() {
+                None
+            } else {
+                serde_json::from_value(value.clone()).ok()
+            }
+        })
+}
+
+fn preview_frame_evidence_commit_rejection(
+    accepted: Option<&boon_native_app_window::FrameEvidenceKey>,
+    current: Option<&boon_native_app_window::FrameEvidenceKey>,
+) -> Option<&'static str> {
+    let (Some(accepted), Some(current)) = (accepted, current) else {
+        return None;
+    };
+    if accepted.surface_id != current.surface_id {
+        return Some("surface_id_changed");
+    }
+    if accepted.surface_epoch != current.surface_epoch {
+        return Some("surface_epoch_changed");
+    }
+    if current.frame_seq < accepted.frame_seq {
+        return Some("frame_seq_regressed");
+    }
+    if current.content_revision < accepted.content_revision {
+        return Some("content_revision_regressed");
+    }
+    if current.layout_revision < accepted.layout_revision {
+        return Some("layout_revision_regressed");
+    }
+    if current.render_scene_revision < accepted.render_scene_revision {
+        return Some("render_scene_revision_regressed");
+    }
+    if current.present_id < accepted.present_id {
+        return Some("present_id_regressed");
+    }
+    None
+}
+
+fn preview_frame_evidence_status_name(
+    accepted: Option<&boon_native_app_window::FrameEvidenceKey>,
+    current: Option<&boon_native_app_window::FrameEvidenceKey>,
+    rejection: Option<&'static str>,
+) -> &'static str {
+    if rejection.is_some() {
+        "stale-rejected"
+    } else if accepted.is_some() && current.is_some() {
+        "current"
+    } else if accepted.is_some() {
+        "accepted-current-missing"
+    } else {
+        "missing"
+    }
+}
+
+fn attach_pending_frame_evidence_fields(
+    value: &mut serde_json::Value,
+    accepted: Option<&boon_native_app_window::FrameEvidenceKey>,
+    current: Option<&boon_native_app_window::FrameEvidenceKey>,
+    rejection: Option<&'static str>,
+) {
+    value["pending_frame_evidence_key_at_accept"] = preview_frame_evidence_key_value(accepted);
+    value["pending_frame_evidence_current_key"] = preview_frame_evidence_key_value(current);
+    value["pending_frame_evidence_status"] = json!(preview_frame_evidence_status_name(
+        accepted, current, rejection
+    ));
+    value["pending_frame_evidence_rejection"] =
+        rejection.map_or_else(|| json!(null), |reason| json!(reason));
+    value["pending_snapshot_commit_currentness_policy"] =
+        json!("source-revision-plus-frame-evidence-no-regression");
+}
+
 fn preview_layout_frame_text_evidence(
     frame: Option<&boon_document::LayoutFrame>,
 ) -> serde_json::Value {
@@ -56481,6 +56620,7 @@ fn preview_enqueue_source_project(
             let mut state = state
                 .lock()
                 .map_err(|_| "preview IPC state mutex poisoned")?;
+            let pending_frame_evidence_key = preview_current_frame_evidence_key(&state);
             state.latest_accepted_command_id = payload.command_id;
             state.latest_accepted_source_revision = payload.source_revision;
             state.replace_status_cache = json!({
@@ -56502,6 +56642,12 @@ fn preview_enqueue_source_project(
                 "source_project_binary_frame": source_project_binary_frame,
                 "preview_receives_example_name": false
             });
+            attach_pending_frame_evidence_fields(
+                &mut state.replace_status_cache,
+                pending_frame_evidence_key.as_ref(),
+                pending_frame_evidence_key.as_ref(),
+                None,
+            );
         }
         preview_commit_source_project_result(state, &payload, result)?;
         wake_handle.wake();
@@ -56567,10 +56713,11 @@ fn preview_enqueue_source_project(
         return Ok(ack);
     }
 
-    let (worker_queue, pending_overlay_frame_revision) = {
+    let (worker_queue, pending_overlay_frame_revision, pending_frame_evidence_key) = {
         let mut state = state
             .lock()
             .map_err(|_| "preview IPC state mutex poisoned")?;
+        let pending_frame_evidence_key = preview_current_frame_evidence_key(&state);
         let source_project_prewarmed = state
             .prewarmed_project_hashes
             .contains(&payload.project_hash)
@@ -56706,6 +56853,12 @@ fn preview_enqueue_source_project(
             "source_project_binary_frame": source_project_binary_frame,
             "preview_receives_example_name": false
         });
+        attach_pending_frame_evidence_fields(
+            &mut state.replace_status_cache,
+            pending_frame_evidence_key.as_ref(),
+            pending_frame_evidence_key.as_ref(),
+            None,
+        );
         let metrics = state.replace_worker.metrics();
         attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
         attach_active_pending_snapshot_backpressure(
@@ -56716,7 +56869,11 @@ fn preview_enqueue_source_project(
             metrics,
             false,
         );
-        (state.replace_worker.clone(), pending_overlay_frame_revision)
+        (
+            state.replace_worker.clone(),
+            pending_overlay_frame_revision,
+            pending_frame_evidence_key,
+        )
     };
 
     worker_queue.start_once(Arc::clone(state), wake_handle.clone())?;
@@ -56798,7 +56955,20 @@ fn preview_enqueue_source_project(
         "source_project_ipc_transport": source_project_ipc_transport.as_str(),
         "source_project_binary_frame": source_project_binary_frame,
         "preview_receives_example_name": false,
-        "preview_pid": std::process::id()
+        "preview_pid": std::process::id(),
+        "pending_frame_evidence_key_at_accept": preview_frame_evidence_key_value(
+            pending_frame_evidence_key.as_ref()
+        ),
+        "pending_frame_evidence_current_key": preview_frame_evidence_key_value(
+            pending_frame_evidence_key.as_ref()
+        ),
+        "pending_frame_evidence_status": preview_frame_evidence_status_name(
+            pending_frame_evidence_key.as_ref(),
+            pending_frame_evidence_key.as_ref(),
+            None
+        ),
+        "pending_frame_evidence_rejection": null,
+        "pending_snapshot_commit_currentness_policy": "source-revision-plus-frame-evidence-no-regression"
     });
     attach_latest_wins_metrics(&mut ack, queue_stats.metrics);
     attach_active_pending_snapshot_backpressure(
@@ -57194,6 +57364,46 @@ fn preview_commit_source_project_result(
         state.replace_worker.record_stale_discard();
         return Ok(());
     }
+    let pending_frame_evidence_key =
+        preview_pending_frame_evidence_key_from_status(&state.replace_status_cache);
+    let current_frame_evidence_key = preview_current_frame_evidence_key(&state);
+    if let Some(rejection) = preview_frame_evidence_commit_rejection(
+        pending_frame_evidence_key.as_ref(),
+        current_frame_evidence_key.as_ref(),
+    ) {
+        state.replace_worker.record_stale_discard();
+        state.replace_status_cache = json!({
+            "kind": "replace-source-result",
+            "status": "stale",
+            "command_id": payload.command_id,
+            "source_revision": payload.source_revision,
+            "project_hash": payload.project_hash,
+            "entrypoint_unit": payload.entrypoint_unit,
+            "active_file": payload.active_file(),
+            "diagnostic": format!("replace-source payload became stale before commit: {rejection}"),
+            "parse_lower_runtime_layout_timings": result.timings,
+            "bounded_latest_wins_worker": true,
+            "stale_result_rejected": true,
+            "preview_receives_example_name": false
+        });
+        attach_pending_frame_evidence_fields(
+            &mut state.replace_status_cache,
+            pending_frame_evidence_key.as_ref(),
+            current_frame_evidence_key.as_ref(),
+            Some(rejection),
+        );
+        let metrics = state.replace_worker.metrics();
+        attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
+        attach_active_pending_snapshot_backpressure(
+            &mut state.replace_status_cache,
+            0,
+            pending_overlay_frame_revision,
+            None,
+            metrics,
+            true,
+        );
+        return Ok(());
+    }
     if result.status == "stale" {
         state.replace_worker.record_stale_discard();
         state.replace_status_cache = json!({
@@ -57210,6 +57420,12 @@ fn preview_commit_source_project_result(
             "stale_result_rejected": true,
             "preview_receives_example_name": false
         });
+        attach_pending_frame_evidence_fields(
+            &mut state.replace_status_cache,
+            pending_frame_evidence_key.as_ref(),
+            current_frame_evidence_key.as_ref(),
+            None,
+        );
         let metrics = state.replace_worker.metrics();
         attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
         attach_active_pending_snapshot_backpressure(
@@ -57309,6 +57525,12 @@ fn preview_commit_source_project_result(
             "stale_result_rejected": false,
             "preview_receives_example_name": false
         });
+        attach_pending_frame_evidence_fields(
+            &mut state.replace_status_cache,
+            pending_frame_evidence_key.as_ref(),
+            current_frame_evidence_key.as_ref(),
+            None,
+        );
     } else {
         let diagnostic = result
             .diagnostic
@@ -57344,6 +57566,12 @@ fn preview_commit_source_project_result(
             "last_good_frame_kept_while_pending": true,
             "preview_receives_example_name": false
         });
+        attach_pending_frame_evidence_fields(
+            &mut state.replace_status_cache,
+            pending_frame_evidence_key.as_ref(),
+            current_frame_evidence_key.as_ref(),
+            None,
+        );
     }
     let metrics = state.replace_worker.metrics();
     attach_latest_wins_metrics(&mut state.replace_status_cache, metrics);
@@ -60940,6 +61168,61 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    fn test_frame_evidence_key(
+        frame_seq: u64,
+        surface_epoch: u64,
+    ) -> boon_native_app_window::FrameEvidenceKey {
+        boon_native_app_window::FrameEvidenceKey {
+            frame_seq,
+            content_revision: frame_seq.saturating_add(10),
+            layout_revision: frame_seq.saturating_add(10),
+            render_scene_revision: frame_seq.saturating_add(10),
+            surface_id: boon_host::SurfaceId("surface-test".to_owned()),
+            surface_epoch,
+            input_event_seq: Some(frame_seq),
+            present_id: frame_seq,
+            proof_request_id: None,
+        }
+    }
+
+    fn test_preview_perf_stats(
+        frame_evidence_key: boon_native_app_window::FrameEvidenceKey,
+    ) -> boon_native_app_window::NativePreviewPerfStats {
+        boon_native_app_window::NativePreviewPerfStats {
+            kind: "preview-perf-stats".to_owned(),
+            status: "pass".to_owned(),
+            role: boon_native_app_window::NativeWindowRole::Preview,
+            frame_seq: frame_evidence_key.frame_seq,
+            sample_elapsed_ms: 20.0,
+            render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
+            frame_pacing: boon_native_app_window::NativeFramePacing {
+                state: boon_native_app_window::NativeFramePacingState::Idle,
+                target_frame_interval_ms: 1000.0 / 60.0,
+                last_frame_interval_ms: Some(16.0),
+                last_frame_lateness_ms: Some(0.0),
+                timer_due: false,
+                requested_animation_burst_frames_remaining: 0,
+                requested_animation_burst_started_elapsed_ms: None,
+                requested_animation_burst_quiet_until_elapsed_ms: None,
+                requested_animation_burst_hard_stop_elapsed_ms: None,
+                requested_animation_burst_min_frames: 2,
+                requested_animation_quiet_ms: 100,
+                requested_animation_hard_cap_ms: 1000,
+                requested_animation_max_pending_snapshots: 1,
+            },
+            renders_per_second: 0.0,
+            render_hook_ms: Some(1.0),
+            present_call_ms: Some(1.2),
+            input_to_present_ms: Some(4.0),
+            missed_frame_count: 0,
+            proof_mode: "off".to_owned(),
+            proof_overhead_ms: None,
+            telemetry_drop_count: 0,
+            last_missed_frame_cause: None,
+            frame_evidence_key: Some(frame_evidence_key),
+        }
     }
 
     fn find_document_field<'a>(
@@ -76228,6 +76511,124 @@ label:
         assert_eq!(shared.scroll_x_px, 12.0);
         assert_eq!(shared.scroll_y_px, 34.0);
         assert_eq!(shared.last_dirty_reason, None);
+        assert!(shared.last_error.is_none());
+    }
+
+    #[test]
+    fn replace_source_commit_rejects_stale_surface_epoch_before_state_mutation() {
+        let counter_path = repo_path("examples/counter.bn");
+        let counter_source = std::fs::read_to_string(&counter_path).unwrap();
+        let counter_hash = boon_runtime::sha256_bytes(counter_source.as_bytes());
+        let accepted_frame_evidence = test_frame_evidence_key(7, 1);
+        let current_frame_evidence = test_frame_evidence_key(9, 2);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: native_document_layout_proof(&counter_path, &counter_source).unwrap(),
+            layout_frame_override: None,
+            update_count: 11,
+            scroll_x_px: 12.0,
+            scroll_y_px: 34.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: Some(PreviewStatusOverlay {
+                kind: PreviewStatusOverlayKind::Pending,
+                message: "Preview source update pending".to_owned(),
+            }),
+            last_dirty_reason: Some(
+                boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted,
+            ),
+        }));
+        let payload = SourceProjectPayload::single_unit(
+            8,
+            4,
+            "opaque-current-source-id",
+            "memory://new-source.bn",
+            "store: []\n",
+        );
+        let state = Arc::new(Mutex::new(PreviewIpcState {
+            source_path: counter_path.clone(),
+            source_text: counter_source.clone(),
+            runtime_units: project_units_for_source_text(&counter_path, &counter_source),
+            source_bytes: counter_source.len() as u64,
+            source_sha256: counter_hash.clone(),
+            runtime_summary: preview_runtime_summary(&counter_path, &counter_source, &counter_hash),
+            preview_perf_stats: Some(test_preview_perf_stats(current_frame_evidence.clone())),
+            shared_render_state: Arc::clone(&shared_render_state),
+            live_runtime: boon_runtime::LiveRuntime::from_source("test-counter", &counter_source)
+                .ok()
+                .map(|runtime| Arc::new(Mutex::new(runtime))),
+            world_scene: None,
+            world_editor_session: None,
+            latest_accepted_command_id: payload.command_id,
+            latest_accepted_source_revision: payload.source_revision,
+            replace_status_cache: json!({
+                "kind": "replace-source-status",
+                "status": "pending",
+                "command_id": payload.command_id,
+                "source_revision": payload.source_revision,
+                "pending_overlay_frame_revision": 11,
+                "pending_frame_evidence_key_at_accept": preview_frame_evidence_key_value(
+                    Some(&accepted_frame_evidence)
+                )
+            }),
+            prewarmed_project_hashes: BTreeSet::new(),
+            prewarmed_project_results: BTreeMap::new(),
+            prewarm_worker: PreviewPrewarmWorkerQueue::default(),
+            replace_worker: PreviewReplaceWorkerQueue::default(),
+            ipc_counters: PreviewIpcCounterState::default(),
+            shutdown: PreviewShutdownState::default(),
+        }));
+        let result = PreviewReplaceBuildResult {
+            layout_proof: json!({"status": "pass"}),
+            layout_frame: None,
+            runtime_summary: json!({"status": "pass"}),
+            live_runtime: None,
+            runtime_units: Vec::new(),
+            timings: json!({"total_ms": 1.0}),
+            source_text: "SHOULD-NOT-COMMIT".to_owned(),
+            source_sha256: payload.project_hash.clone(),
+            source_bytes: "SHOULD-NOT-COMMIT".len() as u64,
+            virtual_uri: "memory://new-source.bn".to_owned(),
+            status: "pass",
+            diagnostic: None,
+        };
+
+        preview_commit_source_project_result(&state, &payload, result).unwrap();
+
+        let state_guard = state.lock().unwrap();
+        assert_eq!(state_guard.source_path, counter_path);
+        assert_eq!(state_guard.source_text, counter_source);
+        assert_eq!(state_guard.source_sha256, counter_hash);
+        assert_eq!(state_guard.replace_status_cache["status"], "stale");
+        assert_eq!(
+            state_guard.replace_status_cache["pending_frame_evidence_status"],
+            "stale-rejected"
+        );
+        assert_eq!(
+            state_guard.replace_status_cache["pending_frame_evidence_rejection"],
+            "surface_epoch_changed"
+        );
+        assert_eq!(
+            state_guard.replace_status_cache["pending_frame_evidence_key_at_accept"]["surface_epoch"],
+            1
+        );
+        assert_eq!(
+            state_guard.replace_status_cache["pending_frame_evidence_current_key"]["surface_epoch"],
+            2
+        );
+        let metrics = state_guard.replace_worker.metrics();
+        assert_eq!(metrics.stale_revision_discard_count, 1);
+        assert_eq!(metrics.dropped_count, 1);
+        drop(state_guard);
+
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(shared.update_count, 11);
+        assert_eq!(shared.scroll_x_px, 12.0);
+        assert_eq!(shared.scroll_y_px, 34.0);
+        assert_eq!(
+            shared.last_dirty_reason,
+            Some(boon_native_app_window::NativeRoleDirtyReason::SourcePayloadAccepted)
+        );
+        assert!(shared.status_overlay.is_some());
         assert!(shared.last_error.is_none());
     }
 

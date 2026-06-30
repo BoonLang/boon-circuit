@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wgpu::SurfaceTargetUnsafe;
 
 const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -4706,6 +4706,7 @@ fn write_render_loop_state_report(
         "queue_to_present_ms": queue_to_present_ms,
         "present_to_readback_report_ms": present_to_readback_report_ms,
         "proof_lag_frames": proof_lag_frames,
+        "render_loop_report_write_mode": "atomic_replace",
         "last_render_loop_report_write_ms": extras.last_render_loop_report_write_ms,
         "last_interactive_readback_finish_ms": extras.last_interactive_readback_finish_ms,
         "last_interactive_readback_completed_elapsed_ms": extras.last_interactive_readback_completed_elapsed_ms,
@@ -4790,12 +4791,35 @@ fn write_render_loop_state_report(
     }
     let bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| NativeWindowError::Failed(format!("serialize loop state: {error}")))?;
-    std::fs::write(path, bytes).map_err(|error| {
+    write_atomic_report_bytes(path, &bytes).map_err(|error| {
         NativeWindowError::Failed(format!(
             "write render-loop report {}: {error}",
             path.display()
         ))
     })?;
+    Ok(())
+}
+
+fn write_atomic_report_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("render-loop-report.json");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ));
+    std::fs::write(&temp_path, bytes)?;
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -5494,6 +5518,36 @@ fn stable_debug_hash<T: std::fmt::Debug>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_loop_report_bytes_replace_existing_file_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-native-report-atomic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loop.json");
+
+        write_atomic_report_bytes(&path, br#"{"old":true}"#).unwrap();
+        write_atomic_report_bytes(&path, br#"{"new":true}"#).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"new":true}"#);
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "atomic report writes must not leave temp files on success: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn demand_driven_scheduler_renders_first_dirty_revision_once() {

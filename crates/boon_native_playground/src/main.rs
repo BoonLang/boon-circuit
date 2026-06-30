@@ -36026,6 +36026,24 @@ fn preview_retained_bound_sync_already_changed_text() -> bool {
         .is_some_and(|stats| stats.status == "pass" && stats.changed && stats.text_update_count > 0)
 }
 
+fn preview_retained_bound_sync_already_changed_style_for_nodes(nodes: &BTreeSet<String>) -> bool {
+    if nodes.is_empty() {
+        return false;
+    }
+    preview_retained_bound_sync_stats()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .is_some_and(|stats| {
+            stats.status == "pass"
+                && stats.changed
+                && stats.style_update_count > 0
+                && nodes
+                    .iter()
+                    .all(|node| stats.style_update_nodes.iter().any(|seen| seen == node))
+        })
+}
+
 fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefinition {
     PreviewHeadedScenarioDefinition {
         id: "counter-basic-headed".to_owned(),
@@ -39238,6 +39256,7 @@ fn preview_try_apply_simple_source_click_input(
     let previous_selected_nodes =
         preview_current_selected_nodes_from_shared_layout(shared_render_state)
             .unwrap_or_else(|| input_state.selected_overlay_nodes.clone());
+    let mut selected_overlay_sync_nodes = previous_selected_nodes.clone();
     preview_set_interaction_diagnostic_subphase("simple_source_click.apply_live_events");
     let apply_started = Instant::now();
     let live_events_started = Instant::now();
@@ -39262,11 +39281,13 @@ fn preview_try_apply_simple_source_click_input(
     if let Some(previous_selected_address) = previous_selected_address.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
-        bound_sync_nodes.extend(source_intent_nodes_for_value(
+        let nodes = source_intent_nodes_for_value(
             &shared.layout_proof,
             &["address"],
             previous_selected_address,
-        ));
+        );
+        selected_overlay_sync_nodes.extend(nodes.iter().cloned());
+        bound_sync_nodes.extend(nodes);
     }
     let selected_address_for_style_patch = post_turn_state_summary
         .as_ref()
@@ -39280,11 +39301,10 @@ fn preview_try_apply_simple_source_click_input(
     if let Some(selected_address) = selected_address_for_style_patch.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
-        bound_sync_nodes.extend(source_intent_nodes_for_value(
-            &shared.layout_proof,
-            &["address"],
-            selected_address,
-        ));
+        let nodes =
+            source_intent_nodes_for_value(&shared.layout_proof, &["address"], selected_address);
+        selected_overlay_sync_nodes.extend(nodes.iter().cloned());
+        bound_sync_nodes.extend(nodes);
     }
     let bound_input_sync_started = Instant::now();
     // `preview_apply_live_events_state_summary` already computed the current
@@ -39326,12 +39346,16 @@ fn preview_try_apply_simple_source_click_input(
     let selection_proxy_text_refresh_ms = elapsed_ms(selection_proxy_text_refresh_started);
     let selected_overlay_patch_started = Instant::now();
     if let Some(selected_address) = selected_address_for_style_patch.as_deref() {
-        preview_patch_retained_selected_address_overlay(
-            shared_render_state,
-            selected_address,
-            previous_selected_address.as_deref(),
-            &previous_selected_nodes,
-        )?;
+        if !preview_retained_bound_sync_already_changed_style_for_nodes(
+            &selected_overlay_sync_nodes,
+        ) {
+            preview_patch_retained_selected_address_overlay(
+                shared_render_state,
+                selected_address,
+                previous_selected_address.as_deref(),
+                &previous_selected_nodes,
+            )?;
+        }
         input_state.focused_address = Some(selected_address.to_owned());
         input_state.selected_overlay_address = Some(selected_address.to_owned());
     }

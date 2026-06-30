@@ -35740,7 +35740,10 @@ fn wait_for_loop_readback_change(
                             "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_render_hook_completed_ms": report_numeric_or_elapsed_delta_ms(&report, "render_started_to_render_hook_completed_ms", "last_render_started_elapsed_ms", "last_render_hook_completed_elapsed_ms"),
                             "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_surface_acquired_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_surface_acquired_ms", "last_render_hook_completed_elapsed_ms", "last_surface_acquired_elapsed_ms"),
+                            "render_hook_completed_to_present_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_present_ms", "last_render_hook_completed_elapsed_ms", "last_present_completed_elapsed_ms"),
                             "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -35851,7 +35854,10 @@ fn wait_for_loop_readback_at_revision_or_change(
                             "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_render_hook_completed_ms": report.get("render_started_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_surface_acquired_ms": report.get("render_hook_completed_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_present_ms": report.get("render_hook_completed_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -35948,7 +35954,10 @@ fn wait_for_loop_presented_change_since(
                             "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_render_hook_completed_ms": report_numeric_or_elapsed_delta_ms(&report, "render_started_to_render_hook_completed_ms", "last_render_started_elapsed_ms", "last_render_hook_completed_elapsed_ms"),
                             "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_surface_acquired_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_surface_acquired_ms", "last_render_hook_completed_elapsed_ms", "last_surface_acquired_elapsed_ms"),
+                            "render_hook_completed_to_present_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_present_ms", "last_render_hook_completed_elapsed_ms", "last_present_completed_elapsed_ms"),
                             "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -48473,6 +48482,36 @@ fn numeric_sample_values_after(
         .collect()
 }
 
+fn numeric_sample_pointer_values(samples: &[serde_json::Value], pointer: &str) -> Vec<f64> {
+    samples
+        .iter()
+        .filter_map(|sample| sample.pointer(pointer).and_then(numeric_value_as_f64))
+        .filter(|value| value.is_finite())
+        .collect()
+}
+
+fn report_numeric_or_elapsed_delta_ms(
+    report: &serde_json::Value,
+    field: &str,
+    start_field: &str,
+    end_field: &str,
+) -> serde_json::Value {
+    if let Some(value) = report
+        .get(field)
+        .filter(|value| numeric_value_as_f64(value).is_some())
+        .cloned()
+    {
+        return value;
+    }
+    match (
+        report.get(start_field).and_then(numeric_value_as_f64),
+        report.get(end_field).and_then(numeric_value_as_f64),
+    ) {
+        (Some(start), Some(end)) if end >= start => json!(end - start),
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn percentile_sorted_f64(sorted: &[f64], percentile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -54224,6 +54263,14 @@ fn verify_native_cells_visible_click_e2e(
                 .get("steady_input_wake_to_present_ms")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            "present_probe_phase_ms": live_probe
+                .get("present_probe_phase_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_present_probe_phase_ms": live_probe
+                .get("steady_present_probe_phase_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             "native_input_reject_counts": live_probe
                 .get("native_input_reject_counts")
                 .cloned()
@@ -54290,6 +54337,18 @@ fn verify_native_cells_visible_click_e2e(
             "measurement_source": "isolated-weston-real-app-window-mouse-click-plus-app-owned-render-proof-or-wgpu-readback-then-sparse-runtime-value",
             "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
             "visual_capture_method": "app-owned-wgpu-readback",
+            "preview_loop_report": live_probe
+                .get("preview_loop_report")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "preview_report": live_probe
+                .get("preview_report")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "layout_probe_report": live_probe
+                .get("layout_probe_report")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "live_probe": live_probe,
             "artifact_sha256s": role_artifacts
         }),
@@ -56274,6 +56333,15 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "input_accept_timing_source": present_probe.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_to_input_accept_ms": present_probe.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_dirty_poll_ms": present_probe.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "dirty_poll_to_render_started_ms": present_probe.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_started_to_render_hook_completed_ms": present_probe.get("render_started_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_surface_acquired_ms": present_probe.get("render_hook_completed_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_present_ms": present_probe.get("render_hook_completed_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_to_queue_ms": present_probe.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "queue_to_present_ms": present_probe.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "present_call_ms": present_probe.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_render_loop_report_write_ms": present_probe.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "proof_lag_frames": present_probe.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_budget_source": input_wake_budget_source,
             "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
             "surface_hash_baseline_before_click": baseline_surface_hash.clone(),
@@ -56413,6 +56481,30 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "input_wake_to_present_ms",
         cold_sample_count,
     );
+    let present_probe_phase_ms = json!({
+        "input_wake_to_input_accept": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/input_wake_to_input_accept_ms")),
+        "input_accept_to_dirty_poll": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/input_accept_to_dirty_poll_ms")),
+        "dirty_poll_to_render_started": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/dirty_poll_to_render_started_ms")),
+        "render_started_to_render_hook_completed": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/render_started_to_render_hook_completed_ms")),
+        "render_hook_completed_to_surface_acquired": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/render_hook_completed_to_surface_acquired_ms")),
+        "render_hook_completed_to_present": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/render_hook_completed_to_present_ms")),
+        "render_hook_to_queue": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/render_hook_to_queue_ms")),
+        "queue_to_present": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/queue_to_present_ms")),
+        "present_call": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/present_call_ms")),
+        "report_write": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/last_render_loop_report_write_ms"))
+    });
+    let steady_present_probe_phase_ms = json!({
+        "input_wake_to_input_accept": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "input_wake_to_input_accept_ms", cold_sample_count)),
+        "input_accept_to_dirty_poll": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "input_accept_to_dirty_poll_ms", cold_sample_count)),
+        "dirty_poll_to_render_started": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "dirty_poll_to_render_started_ms", cold_sample_count)),
+        "render_started_to_render_hook_completed": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_started_to_render_hook_completed_ms", cold_sample_count)),
+        "render_hook_completed_to_surface_acquired": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_hook_completed_to_surface_acquired_ms", cold_sample_count)),
+        "render_hook_completed_to_present": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_hook_completed_to_present_ms", cold_sample_count)),
+        "render_hook_to_queue": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_hook_to_queue_ms", cold_sample_count)),
+        "queue_to_present": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "queue_to_present_ms", cold_sample_count)),
+        "present_call": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "present_call_ms", cold_sample_count)),
+        "report_write": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "last_render_loop_report_write_ms", cold_sample_count))
+    });
     let status = if all_clicks_pass && real_os_input && timing_sample_count_complete {
         "pass"
     } else {
@@ -56479,6 +56571,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "steady_click_to_present_ms": f64_p50_p95_max_summary(&steady_click_to_present_samples),
         "steady_input_wake_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_input_wake_to_formula_samples),
         "steady_input_wake_to_present_ms": f64_p50_p95_max_summary(&steady_input_wake_to_present_samples),
+        "present_probe_phase_ms": present_probe_phase_ms,
+        "steady_present_probe_phase_ms": steady_present_probe_phase_ms,
         "native_input_reject_counts": native_input_reject_counts,
         "simple_source_click_count": simple_source_click_count,
         "generic_fallback_count": generic_fallback_count,
@@ -56972,7 +57066,10 @@ fn wait_for_cells_formula_visible_match(
                             "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_render_hook_completed_ms": report_numeric_or_elapsed_delta_ms(&report, "render_started_to_render_hook_completed_ms", "last_render_started_elapsed_ms", "last_render_hook_completed_elapsed_ms"),
                             "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_surface_acquired_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_surface_acquired_ms", "last_render_hook_completed_elapsed_ms", "last_surface_acquired_elapsed_ms"),
+                            "render_hook_completed_to_present_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_present_ms", "last_render_hook_completed_elapsed_ms", "last_present_completed_elapsed_ms"),
                             "render_hook_to_queue_ms": report.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "poll_started_to_queue_ms": report.get("poll_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "render_started_to_queue_ms": report.get("render_started_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57000,6 +57097,7 @@ fn wait_for_cells_formula_visible_match(
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "proof_lag_frames": report.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_loop_report_write_mode": report.get("render_loop_report_write_mode").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
@@ -57116,6 +57214,13 @@ fn wait_for_cells_formula_visible_match(
                             "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "dirty_poll_to_render_started_ms": report.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_surface_acquired_ms": report.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_started_to_render_hook_completed_ms": report_numeric_or_elapsed_delta_ms(&report, "render_started_to_render_hook_completed_ms", "last_render_started_elapsed_ms", "last_render_hook_completed_elapsed_ms"),
+                            "surface_acquired_to_render_hook_completed_ms": report.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_hook_completed_to_surface_acquired_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_surface_acquired_ms", "last_render_hook_completed_elapsed_ms", "last_surface_acquired_elapsed_ms"),
+                            "render_hook_completed_to_present_ms": report_numeric_or_elapsed_delta_ms(&report, "render_hook_completed_to_present_ms", "last_render_hook_completed_elapsed_ms", "last_present_completed_elapsed_ms"),
                             "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_surface_acquired_elapsed_ms": report.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57139,6 +57244,7 @@ fn wait_for_cells_formula_visible_match(
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "proof_lag_frames": report.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+                            "render_loop_report_write_mode": report.get("render_loop_report_write_mode").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),

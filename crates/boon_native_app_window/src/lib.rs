@@ -772,6 +772,8 @@ pub struct NativeRenderLoopState {
     pub dirty_revision: u64,
     pub presented_revision: u64,
     pub last_render_content_revision: u64,
+    pub last_render_layout_revision: u64,
+    pub last_render_scene_revision: u64,
     pub rendered_frame_count: u64,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
@@ -841,6 +843,8 @@ impl NativeRenderLoopState {
             dirty_revision: 1,
             presented_revision: 0,
             last_render_content_revision: 0,
+            last_render_layout_revision: 0,
+            last_render_scene_revision: 0,
             rendered_frame_count: 0,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
@@ -921,6 +925,8 @@ impl NativeRenderLoopState {
     pub fn mark_presented(&mut self, revision: u64) {
         self.presented_revision = self.presented_revision.max(revision);
         self.last_render_content_revision = self.last_render_content_revision.max(revision);
+        self.last_render_layout_revision = self.last_render_layout_revision.max(revision);
+        self.last_render_scene_revision = self.last_render_scene_revision.max(revision);
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
         if self.presented_revision >= self.dirty_revision {
             self.current_scheduler_reason = None;
@@ -929,8 +935,25 @@ impl NativeRenderLoopState {
     }
 
     pub fn mark_presented_with_content(&mut self, revision: u64, content_revision: u64) {
+        self.mark_presented_with_revisions(
+            revision,
+            content_revision,
+            content_revision,
+            content_revision,
+        );
+    }
+
+    pub fn mark_presented_with_revisions(
+        &mut self,
+        revision: u64,
+        content_revision: u64,
+        layout_revision: u64,
+        render_scene_revision: u64,
+    ) {
         self.presented_revision = self.presented_revision.max(revision);
         self.last_render_content_revision = content_revision;
+        self.last_render_layout_revision = layout_revision;
+        self.last_render_scene_revision = render_scene_revision;
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
         if self.presented_revision >= self.dirty_revision {
             self.current_scheduler_reason = None;
@@ -1311,6 +1334,8 @@ pub enum NativeCursorIcon {
 pub struct NativeRenderHookResult {
     pub proof: serde_json::Value,
     pub content_revision: u64,
+    pub layout_revision: Option<u64>,
+    pub render_scene_revision: Option<u64>,
     pub rendered: bool,
     pub content_changed: bool,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
@@ -1321,6 +1346,8 @@ impl NativeRenderHookResult {
         Self {
             proof,
             content_revision: 0,
+            layout_revision: None,
+            render_scene_revision: None,
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -1342,6 +1369,16 @@ impl NativeRenderHookResult {
         }
         if self.content_revision == 0 {
             return Err("render hook result content_revision must be nonzero".to_owned());
+        }
+        if self.layout_revision == Some(0) {
+            return Err(
+                "render hook result layout_revision must be nonzero when provided".to_owned(),
+            );
+        }
+        if self.render_scene_revision == Some(0) {
+            return Err(
+                "render hook result render_scene_revision must be nonzero when provided".to_owned(),
+            );
         }
         let same_content_surface_render = matches!(
             scheduler_reason,
@@ -1400,6 +1437,19 @@ impl NativeRenderHookResult {
         } else {
             self.content_revision
         }
+    }
+
+    pub fn presented_revisions(
+        &self,
+        dirty_revision: u64,
+        scheduler_reason: Option<NativeSchedulerReason>,
+        role_dirty_reason: Option<NativeRoleDirtyReason>,
+    ) -> (u64, u64, u64) {
+        let content_revision =
+            self.presented_content_revision(dirty_revision, scheduler_reason, role_dirty_reason);
+        let layout_revision = self.layout_revision.unwrap_or(content_revision);
+        let render_scene_revision = self.render_scene_revision.unwrap_or(layout_revision);
+        (content_revision, layout_revision, render_scene_revision)
     }
 }
 
@@ -2167,6 +2217,8 @@ async fn run_surface_probe_inner(
             label: Some("boon-native-app-window-probe-encoder"),
         });
         let mut rendered_content_revision = rendered_revision;
+        let mut rendered_layout_revision = rendered_revision;
+        let mut rendered_render_scene_revision = rendered_revision;
         let render_hook_ms = match hooks.as_mut() {
             Some(hooks) => {
                 let render_start = Instant::now();
@@ -2222,11 +2274,14 @@ async fn run_surface_probe_inner(
                         "external render hook: {error}"
                     )));
                 }
-                rendered_content_revision = render_result.presented_content_revision(
+                let presented_revisions = render_result.presented_revisions(
                     rendered_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 );
+                rendered_content_revision = presented_revisions.0;
+                rendered_layout_revision = presented_revisions.1;
+                rendered_render_scene_revision = presented_revisions.2;
                 external_render_proof = Some(render_result.proof);
                 Some(elapsed_ms(render_start))
             }
@@ -2268,7 +2323,12 @@ async fn run_surface_probe_inner(
         }
         queue.submit(Some(encoder.finish()));
         frame.present();
-        render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
+        render_loop_state.mark_presented_with_revisions(
+            rendered_revision,
+            rendered_content_revision,
+            rendered_layout_revision,
+            rendered_render_scene_revision,
+        );
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
                 Path::new(report),
@@ -2418,6 +2478,8 @@ async fn run_surface_probe_inner(
                 label: Some("boon-native-app-window-input-sample-encoder"),
             });
             let mut rendered_content_revision = rendered_revision;
+            let mut rendered_layout_revision = rendered_revision;
+            let mut rendered_render_scene_revision = rendered_revision;
             let mut post_input_render_hook_ms = None;
             if let Some(hooks) = hooks.as_mut() {
                 let render_start = Instant::now();
@@ -2473,11 +2535,14 @@ async fn run_surface_probe_inner(
                         "external render hook after input: {error}"
                     )));
                 }
-                rendered_content_revision = render_result.presented_content_revision(
+                let presented_revisions = render_result.presented_revisions(
                     rendered_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 );
+                rendered_content_revision = presented_revisions.0;
+                rendered_layout_revision = presented_revisions.1;
+                rendered_render_scene_revision = presented_revisions.2;
                 external_render_proof = Some(render_result.proof);
                 post_input_render_hook_ms = Some(elapsed_ms(render_start));
             }
@@ -2499,8 +2564,12 @@ async fn run_surface_probe_inner(
             }
             queue.submit(Some(encoder.finish()));
             frame.present();
-            render_loop_state
-                .mark_presented_with_content(rendered_revision, rendered_content_revision);
+            render_loop_state.mark_presented_with_revisions(
+                rendered_revision,
+                rendered_content_revision,
+                rendered_layout_revision,
+                rendered_render_scene_revision,
+            );
             let current_present_submit_ms = elapsed_ms(present_start);
             let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
             if frame_index == 0 {
@@ -2843,6 +2912,8 @@ async fn run_surface_probe_inner(
             label: Some("boon-native-app-window-interactive-encoder"),
         });
         let mut rendered_content_revision = rendered_revision;
+        let mut rendered_layout_revision = rendered_revision;
+        let mut rendered_render_scene_revision = rendered_revision;
         let use_offscreen_copy_to_present = hooks.is_some()
             && surface_copy_to_present_supported
             && (std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some()
@@ -2920,11 +2991,14 @@ async fn run_surface_probe_inner(
                         "external render hook: {error}"
                     )));
                 }
-                rendered_content_revision = render_result.presented_content_revision(
+                let presented_revisions = render_result.presented_revisions(
                     rendered_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 );
+                rendered_content_revision = presented_revisions.0;
+                rendered_layout_revision = presented_revisions.1;
+                rendered_render_scene_revision = presented_revisions.2;
                 external_render_proof = Some(render_result.proof);
                 render_loop_state
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -3054,11 +3128,14 @@ async fn run_surface_probe_inner(
                             "external render hook: {error}"
                         )));
                     }
-                    rendered_content_revision = render_result.presented_content_revision(
+                    let presented_revisions = render_result.presented_revisions(
                         rendered_revision,
                         render_loop_state.current_scheduler_reason,
                         render_loop_state.current_role_dirty_reason,
                     );
+                    rendered_content_revision = presented_revisions.0;
+                    rendered_layout_revision = presented_revisions.1;
+                    rendered_render_scene_revision = presented_revisions.2;
                     external_render_proof = Some(render_result.proof);
                     render_loop_state
                         .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -3149,7 +3226,12 @@ async fn run_surface_probe_inner(
         frame.present();
         let present_call_ms = elapsed_ms(present_call_started);
         last_presented_input_event_wake_count = sampled_input_event_wake_count;
-        render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
+        render_loop_state.mark_presented_with_revisions(
+            rendered_revision,
+            rendered_content_revision,
+            rendered_layout_revision,
+            rendered_render_scene_revision,
+        );
         render_loop_state.note_present_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
         render_loop_state.note_submit_phase_durations(
             encoder_finish_ms,
@@ -3747,8 +3829,8 @@ fn frame_evidence_key_for_presented_frame(
     FrameEvidenceKey {
         frame_seq: state.rendered_frame_count,
         content_revision: state.last_render_content_revision,
-        layout_revision: state.last_render_content_revision,
-        render_scene_revision: state.last_render_content_revision,
+        layout_revision: state.last_render_layout_revision,
+        render_scene_revision: state.last_render_scene_revision,
         surface_id: surface_id.clone(),
         surface_epoch,
         input_event_seq,
@@ -3994,6 +4076,8 @@ fn write_render_loop_state_report(
         "dirty_revision": state.dirty_revision,
         "presented_revision": state.presented_revision,
         "last_render_content_revision": state.last_render_content_revision,
+        "last_render_layout_revision": state.last_render_layout_revision,
+        "last_render_scene_revision": state.last_render_scene_revision,
         "rendered_frame_count": state.rendered_frame_count,
         "skipped_idle_poll_count": state.skipped_idle_poll_count,
         "input_poll_count": state.input_poll_count,
@@ -4946,7 +5030,7 @@ mod tests {
     #[test]
     fn frame_evidence_key_tracks_presented_frame_identity() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
-        state.mark_presented_with_content(7, 42);
+        state.mark_presented_with_revisions(7, 42, 43, 44);
         let surface_id = SurfaceId("surface-test".to_owned());
 
         let key = frame_evidence_key_for_presented_frame(&state, &surface_id, 9, Some(3), Some(11));
@@ -4954,8 +5038,8 @@ mod tests {
         assert_eq!(key.frame_seq, 1);
         assert_eq!(key.present_id, 1);
         assert_eq!(key.content_revision, 42);
-        assert_eq!(key.layout_revision, 42);
-        assert_eq!(key.render_scene_revision, 42);
+        assert_eq!(key.layout_revision, 43);
+        assert_eq!(key.render_scene_revision, 44);
         assert_eq!(key.surface_id, surface_id);
         assert_eq!(key.surface_epoch, 9);
         assert_eq!(key.input_event_seq, Some(3));
@@ -5611,6 +5695,8 @@ mod tests {
             NativeRenderHookResult {
                 proof: serde_json::json!({}),
                 content_revision: 1,
+                layout_revision: None,
+                render_scene_revision: None,
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -5642,6 +5728,8 @@ mod tests {
             (NativeRenderHookResult {
                 proof: serde_json::json!({}),
                 content_revision: 2,
+                layout_revision: None,
+                render_scene_revision: None,
                 rendered: true,
                 content_changed: true,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -5661,6 +5749,8 @@ mod tests {
         let render = NativeRenderHookResult {
             proof: serde_json::json!({}),
             content_revision: 2,
+            layout_revision: None,
+            render_scene_revision: None,
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -5700,6 +5790,35 @@ mod tests {
 
         zero.rendered = true;
         assert!(zero.validate_for_presented_revision(2).is_ok());
+
+        zero.layout_revision = Some(0);
+        assert!(zero.validate_for_presented_revision(2).is_err());
+
+        zero.layout_revision = Some(3);
+        zero.render_scene_revision = Some(0);
+        assert!(zero.validate_for_presented_revision(2).is_err());
+    }
+
+    #[test]
+    fn render_hook_result_can_carry_independent_layer_revisions() {
+        let render = NativeRenderHookResult {
+            proof: serde_json::json!({}),
+            content_revision: 10,
+            layout_revision: Some(4),
+            render_scene_revision: Some(7),
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: None,
+        };
+
+        assert_eq!(
+            render.presented_revisions(
+                10,
+                Some(NativeSchedulerReason::ExternalWake),
+                Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+            ),
+            (10, 4, 7)
+        );
     }
 
     #[test]
@@ -5707,6 +5826,8 @@ mod tests {
         let render = NativeRenderHookResult {
             proof: serde_json::json!({}),
             content_revision: 1,
+            layout_revision: None,
+            render_scene_revision: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -5743,6 +5864,8 @@ mod tests {
         let render = NativeRenderHookResult {
             proof: serde_json::json!({}),
             content_revision: 2,
+            layout_revision: None,
+            render_scene_revision: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -5779,6 +5902,8 @@ mod tests {
         let render = NativeRenderHookResult {
             proof: serde_json::json!({}),
             content_revision: 4,
+            layout_revision: None,
+            render_scene_revision: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -5854,6 +5979,8 @@ mod tests {
             (NativeRenderHookResult {
                 proof: serde_json::json!({}),
                 content_revision: semantic_revision,
+                layout_revision: None,
+                render_scene_revision: None,
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: None,
@@ -5869,13 +5996,15 @@ mod tests {
     }
 
     #[test]
-    fn presented_state_records_render_content_revision() {
+    fn presented_state_records_render_layer_revisions() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
 
-        state.mark_presented_with_content(1, 3);
+        state.mark_presented_with_revisions(1, 3, 4, 5);
 
         assert_eq!(state.presented_revision, 1);
         assert_eq!(state.last_render_content_revision, 3);
+        assert_eq!(state.last_render_layout_revision, 4);
+        assert_eq!(state.last_render_scene_revision, 5);
         assert_eq!(state.rendered_frame_count, 1);
     }
 

@@ -26726,6 +26726,8 @@ fn collect_native_top_level_frame_evidence_linkage_reasons(
             ("surface_epoch", "surface_epoch"),
             ("rendered_frame_count", "frame_seq"),
             ("last_render_content_revision", "content_revision"),
+            ("last_render_layout_revision", "layout_revision"),
+            ("last_render_scene_revision", "render_scene_revision"),
         ] {
             let Some(report_value) = report.get(report_field).and_then(JsonValue::as_u64) else {
                 continue;
@@ -31437,6 +31439,8 @@ mod tests {
         report["surface_epoch"] = json!(2);
         report["rendered_frame_count"] = json!(3);
         report["last_render_content_revision"] = json!(7);
+        report["last_render_layout_revision"] = json!(7);
+        report["last_render_scene_revision"] = json!(7);
         report["proof_lag_frames"] = json!(0);
         report["frame_pacing"] = pacing.clone();
         report["frame_evidence_key"] = key.clone();
@@ -31512,6 +31516,23 @@ mod tests {
         assert!(!schema_accepts(
             report,
             "native-frame-evidence-mismatched-key"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_mismatched_top_level_layer_revisions() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_render_layout_revision"] = json!(8);
+        assert!(!schema_accepts(
+            report,
+            "native-frame-evidence-layout-mismatch"
+        ));
+
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_render_scene_revision"] = json!(9);
+        assert!(!schema_accepts(
+            report,
+            "native-frame-evidence-render-scene-mismatch"
         ));
     }
 

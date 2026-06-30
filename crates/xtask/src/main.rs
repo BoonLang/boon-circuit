@@ -63550,6 +63550,8 @@ fn collect_native_gpu_top_level_frame_evidence_linkage_reasons(
             ("surface_epoch", "surface_epoch"),
             ("rendered_frame_count", "frame_seq"),
             ("last_render_content_revision", "content_revision"),
+            ("last_render_layout_revision", "layout_revision"),
+            ("last_render_scene_revision", "render_scene_revision"),
         ] {
             let Some(report_value) = report.get(report_field).and_then(serde_json::Value::as_u64)
             else {

@@ -77,6 +77,8 @@ pub enum RenderProofArtifact {
         surface_epoch: u64,
         frame_seq: u64,
         layout_frame_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_scene_identity_hash: Option<String>,
         width: u32,
         height: u32,
         nonblank_samples: usize,
@@ -3655,6 +3657,7 @@ pub fn render_app_owned_pixels(
             surface_epoch: request.surface_epoch,
             frame_seq: 1,
             layout_frame_hash,
+            render_scene_identity_hash: None,
             width,
             height,
             nonblank_samples,
@@ -3840,7 +3843,8 @@ pub fn render_app_owned_scene_pixels(
             surface_id: request.surface_id,
             surface_epoch: request.surface_epoch,
             frame_seq: 1,
-            layout_frame_hash: render_identity_hash,
+            layout_frame_hash: render_identity_hash.clone(),
+            render_scene_identity_hash: Some(render_identity_hash),
             width,
             height,
             nonblank_samples,
@@ -10699,6 +10703,7 @@ mod tests {
 
             let RenderProofArtifact::AppOwnedPixels {
                 layout_frame_hash,
+                render_scene_identity_hash,
                 nonblank_samples,
                 ..
             } = proof.artifact
@@ -10706,6 +10711,10 @@ mod tests {
                 panic!("expected app-owned pixel artifact");
             };
             assert_eq!(layout_frame_hash, render_identity_hash);
+            assert_eq!(
+                render_scene_identity_hash.as_deref(),
+                Some(render_identity_hash)
+            );
             assert!(nonblank_samples > 0);
             assert_eq!(
                 proof.metrics.render_scene_source,

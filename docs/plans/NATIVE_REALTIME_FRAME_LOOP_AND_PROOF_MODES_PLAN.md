@@ -517,6 +517,54 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
   - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
 
+2026-06-30 independent frame-evidence layer revision slice:
+
+- `NativeRenderLoopState` now tracks last presented content, layout, and
+  render-scene revisions independently instead of deriving all three
+  `FrameEvidenceKey` fields from content revision.
+- `NativeRenderHookResult` can carry optional layout and render-scene revisions.
+  Hooks that do not provide them retain the older fallback behavior; hooks that
+  do provide them let reports distinguish document content, layout identity, and
+  render-scene identity.
+- Preview and dev render hooks now derive monotonic layer revisions from generic
+  proof identities:
+  - layout identity comes from `layout_frame_hash`;
+  - render-scene identity comes from `render_scene_identity` or
+    `render_scene_hash`;
+  - no production path branches on example names, source paths, Cells fields, or
+    fixture labels.
+- Dev-window proof JSON now emits `layout_frame_hash`, `render_scene_hash`, and
+  `render_scene_identity`, matching the preview proof identity shape.
+- App-owned prelowered render-scene readback artifacts now carry
+  `render_scene_identity_hash` in addition to the older compatibility
+  `layout_frame_hash` field.
+- Report schema and xtask native frame-evidence linkage now validate
+  `last_render_layout_revision == frame_evidence_key.layout_revision` and
+  `last_render_scene_revision == frame_evidence_key.render_scene_revision` when
+  those top-level fields are present.
+- This slice resolves the aliasing caveat recorded in the pending
+  frame-evidence commit guard slice. It still does not complete the whole plan:
+  retained extraction/upload deltas, full active/pending runtime-layout-render
+  snapshot ownership, release-mode UX latency gates, and generic runtime/list
+  currentness work remain.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_app_window frame_evidence`
+  - `cargo test -q -p boon_native_app_window render_hook_result_can_carry_independent_layer_revisions`
+  - `cargo test -q -p boon_native_app_window presented_state_records_render_layer_revisions`
+  - `cargo test -q -p boon_report_schema native_gpu_schema_accepts_structured_frame_evidence`
+  - `cargo test -q -p boon_report_schema native_gpu_schema_rejects_mismatched_top_level_layer_revisions`
+  - `cargo test -q -p boon_native_gpu app_owned_scene_readback_uses_prelowered_render_scene_identity`
+  - `cargo check -q -p boon_native_app_window`
+  - `cargo check -q -p boon_native_gpu`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo check -q -p boon_report_schema`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+  - `git diff --check`
+  - production diff no-hacks scan for `cells`, `address`, `A0`, source path,
+    fixture-specific, example-specific, and hardcode strings
+
 ## Implementation Slices
 
 1. Terminology and schema:

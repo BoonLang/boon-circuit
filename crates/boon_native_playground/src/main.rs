@@ -6095,6 +6095,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .map(|state| preview_content_revision(state.update_count))
             .unwrap_or_default();
         let mut last_rendered_content_revision = 0;
+        let mut last_layout_identity = None::<String>;
+        let mut layout_revision = 0_u64;
+        let mut last_render_scene_identity = None::<String>;
+        let mut render_scene_revision = 0_u64;
         let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
             let poll_total_started = Instant::now();
             let mut poll_phase_timings_ms = serde_json::Map::new();
@@ -6506,11 +6510,34 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 skip_render_hook_app_owned_proof,
             )
             .map_err(|error| error.to_string())?;
+            let layout_identity_fallback = format!("preview-content:{content_revision}");
+            let layout_identity = preview_proof_identity_value(
+                &proof,
+                &["layout_frame_hash"],
+                &layout_identity_fallback,
+            );
+            let render_scene_identity = preview_proof_identity_value(
+                &proof,
+                &["render_scene_identity", "render_scene_hash"],
+                &layout_identity,
+            );
+            let presented_layout_revision = preview_monotonic_identity_revision(
+                &mut last_layout_identity,
+                &mut layout_revision,
+                layout_identity,
+            );
+            let presented_render_scene_revision = preview_monotonic_identity_revision(
+                &mut last_render_scene_identity,
+                &mut render_scene_revision,
+                render_scene_identity,
+            );
             let content_changed = content_revision != last_rendered_content_revision;
             last_rendered_content_revision = content_revision;
             Ok(boon_native_app_window::NativeRenderHookResult {
                 proof,
                 content_revision,
+                layout_revision: Some(presented_layout_revision),
+                render_scene_revision: Some(presented_render_scene_revision),
                 rendered: true,
                 content_changed,
                 role_dirty_reason: None,
@@ -6653,6 +6680,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_render_state = Arc::new(Mutex::new(DevRenderState::default()));
     let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
+        let mut last_layout_identity = None::<String>;
+        let mut layout_revision = 0_u64;
+        let mut last_render_scene_identity = None::<String>;
+        let mut render_scene_revision = 0_u64;
         let mut poll_text_measurer = boon_native_gpu::GlyphonTextMeasurer::new();
         let mut input_state = DevNativeInputState::default();
         let shell = Arc::clone(&dev_shell);
@@ -6864,9 +6895,33 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_state.full_layout_refresh_count,
                 render_state.fast_frame_patch_count,
             )?;
+            let content_revision = render_state.revision.max(1);
+            let layout_identity_fallback = format!("dev-content:{content_revision}");
+            let layout_identity = preview_proof_identity_value(
+                &proof,
+                &["layout_frame_hash"],
+                &layout_identity_fallback,
+            );
+            let render_scene_identity = preview_proof_identity_value(
+                &proof,
+                &["render_scene_identity", "render_scene_hash"],
+                &layout_identity,
+            );
+            let presented_layout_revision = preview_monotonic_identity_revision(
+                &mut last_layout_identity,
+                &mut layout_revision,
+                layout_identity,
+            );
+            let presented_render_scene_revision = preview_monotonic_identity_revision(
+                &mut last_render_scene_identity,
+                &mut render_scene_revision,
+                render_scene_identity,
+            );
             Ok(boon_native_app_window::NativeRenderHookResult {
                 proof,
-                content_revision: render_state.revision.max(1),
+                content_revision,
+                layout_revision: Some(presented_layout_revision),
+                render_scene_revision: Some(presented_render_scene_revision),
                 rendered: true,
                 content_changed: true,
                 role_dirty_reason: None,
@@ -12664,10 +12719,16 @@ fn native_gpu_dev_visible_render_hook(
             height: context.height,
         })
         .map_err(|error| error.to_string())?;
+    let layout_frame_hash = render_frame_hash(layout_frame);
+    let render_scene_hash_value = render_scene_hash(&render_scene);
+    let render_scene_identity = format!("dev-render-scene:{render_scene_hash_value}");
     Ok(json!({
         "status": "pass",
         "renderer": "boon_native_gpu",
         "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
+        "layout_frame_hash": layout_frame_hash,
+        "render_scene_hash": render_scene_hash_value,
+        "render_scene_identity": render_scene_identity,
         "surface_id": context.surface_id,
         "surface_epoch": context.surface_epoch,
         "surface_format": context.surface_format,
@@ -50015,6 +50076,30 @@ enum PreviewStatusOverlayKind {
 
 fn preview_content_revision(update_count: u64) -> u64 {
     update_count.saturating_add(1)
+}
+
+fn preview_proof_identity_value(proof: &Value, keys: &[&str], fallback: &str) -> String {
+    for key in keys {
+        if let Some(value) = proof.get(*key).and_then(Value::as_str)
+            && !value.is_empty()
+            && value != "missing"
+        {
+            return value.to_owned();
+        }
+    }
+    fallback.to_owned()
+}
+
+fn preview_monotonic_identity_revision(
+    last_identity: &mut Option<String>,
+    revision: &mut u64,
+    identity: String,
+) -> u64 {
+    if last_identity.as_deref() != Some(identity.as_str()) {
+        *revision = revision.saturating_add(1).max(1);
+        *last_identity = Some(identity);
+    }
+    *revision
 }
 
 #[derive(Clone)]
@@ -87591,6 +87676,7 @@ document:
                     surface_epoch: 0,
                     frame_seq: 1,
                     layout_frame_hash: render_frame_hash(frame),
+                    render_scene_identity_hash: None,
                     width: 320,
                     height: 200,
                     nonblank_samples: 1,

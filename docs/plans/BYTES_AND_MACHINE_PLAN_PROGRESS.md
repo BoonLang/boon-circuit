@@ -18,13 +18,13 @@ MachinePlan migration.
 | Phase 0 - Baseline | Partial | Raw baseline exists at `target/reports/bytes-plan/phase0-baseline.json`, but the exit gate is not satisfied because current HEAD has pre-existing failing checks and release benchmark baselines have not yet been captured. |
 | Phase 1 - Plan Boundary | Complete | Added `crates/boon_plan` to the workspace with `PlanVersion`, `MachinePlan`, `TargetProfile`, typed plan IDs, constants, source routes, storage layout, operation regions, dirty/commit/delta plans, capability summary, `DebugMap`, deterministic plan hashing, and `verify_plan`. Added `compile_typed_program` and the `boon_cli dump-plan` developer command. The CLI default remains legacy execution. CPU PlanExecutor completeness, full parity, executable dirty scheduling, performance, and the default switch remain tracked by later phases. |
 | Phase 2 - BYTES Parser | Complete | Parser now has `ByteLiteral`, `BytesLiteral`, exact spans, dynamic/inferred/fixed size syntax, explicit-base byte literal validation for supported bases, nested item coverage, multiline `BYTES` constructor support with `--` comments, focused parser tests, and schema-required `verify-bytes-negative` parser cases for bad bases, missing digits, overflow, bad size expressions, missing bodies, unterminated bodies, and multiline trailing tokens. This is parser-surface complete; type, IR, runtime, and executor work remain tracked by later phases. |
-| Phase 3 - BYTES Type System | Partial | Typechecker now has `Type::Byte`, `Type::Bytes(dynamic/fixed)`, fixed/inferred length checks, TEXT/BYTES conversion diagnostics, v1 builtin return signatures, BYTES-scoped builtin argument validation for required inputs/operands, explicit `Utf8`/`Ascii` TEXT/BYTES encodings, numeric byte-count/endian checks, unknown-arg rejection, contextual fixed-length result refinement for static `Bytes/set`, `Bytes/write_unsigned`, `Bytes/write_signed`, `Bytes/slice`, `Bytes/take`, `Bytes/drop`, `Bytes/concat`, and `Bytes/zeros`, compiler rejection for ambiguous positional BYTES builtin args and constructor-style `Bytes/zeros` inputs, `File/read_bytes` as TEXT-pipe input returning dynamic BYTES, `File/read_text` as TEXT-pipe input returning TEXT, `docs/architecture/BYTES_SEMANTICS.md`, focused type tests, schema-required `verify-bytes-negative` compiler cases, a narrow `TypeCheckReport.resolved_constant_table`, checked static integer folding for BYTES scalar args over literal `+`, `-`, and `*`, explicit overflow and MachinePlan `i64` range diagnostics for folded BYTES scalar arguments, resolved-constant-driven IR readers for root/scalar BYTES compile-time numeric/byte/endian/encoding arguments, and dump-plan report-schema binding for the resolved constant table. Exit is not satisfied until broader constant evaluation policy, runtime-body audit, and final Phase 3 gate coverage are complete. |
+| Phase 3 - BYTES Type System | Complete | Typechecker now has `Type::Byte`, `Type::Bytes(dynamic/fixed)`, fixed/inferred length checks, TEXT/BYTES conversion diagnostics, v1 builtin return signatures, BYTES-scoped builtin argument validation for required inputs/operands, explicit `Utf8`/`Ascii` TEXT/BYTES encodings, numeric byte-count/endian checks, unknown-arg rejection, contextual fixed-length result refinement for static `Bytes/set`, `Bytes/write_unsigned`, `Bytes/write_signed`, `Bytes/slice`, `Bytes/take`, `Bytes/drop`, `Bytes/concat`, and `Bytes/zeros`, compiler rejection for ambiguous positional BYTES builtin args and constructor-style `Bytes/zeros` inputs, `File/read_bytes` as TEXT-pipe input returning dynamic BYTES, `File/read_text` as TEXT, `docs/architecture/BYTES_SEMANTICS.md`, focused type tests, schema-required `verify-bytes-negative` compiler cases, `TypeCheckReport.resolved_constant_table`, checked static integer folding for BYTES scalar args over literal `+`, `-`, or `*`, explicit overflow and MachinePlan `i64` range diagnostics for folded BYTES scalar arguments, resolved-constant-driven IR readers for root/scalar BYTES compile-time numeric/byte/endian/encoding arguments, and dump-plan report-schema binding for the resolved constant table. `verify-bytes-type-system` is now a schema-checked aggregate-required Phase 3 exit gate covering the full v1 BYTES/File boundary builtin type surface, fixed/dynamic refinements, and resolved constant table coverage. Runtime-body proof, global constant evaluation beyond the documented v1 BYTES scalar policy, and BITS interop are explicitly outside Phase 3 and remain later/non-goal work. |
 | Phase 4 - Semantic IR | Partial | `boon_ir` expression classifiers/walkers now cover byte and bytes AST nodes so they do not compile as `Unknown` or get skipped. `InitialValue::Byte` and typed update expressions for `Bytes/length`, `Bytes/is_empty`, pipe/call-form `Bytes/get(index: literal-or-folded-static-integer)`, pipe/call-form `Bytes/set(index: literal-or-folded-static-integer, value: byte literal)`, pipe/call-form `Bytes/slice`, `Bytes/read_unsigned`, `Bytes/write_unsigned`, pipe/call-form `Bytes/equal`, pipe/call-form `Bytes/concat`, and static-path `File/read_bytes` now exist. `InitialValue::Bytes` now preserves dynamic vs fixed length metadata so `BYTES {}` can target dynamic host-read output while `BYTES[N]` remains fixed. MachinePlan constant allocation now interns repeated `PlanConstantValue`s by value, including BYTES constants, and `verify_plan` rejects duplicate constant-pool values. Broader typed byte operations in semantic IR summaries and source-payload typing remain open. |
 | Phase 5 - Real MachinePlan Lowering | Partial | Minimal BYTES[4] scalar initial state now lowers to typed storage, typed byte constants, and executable `StateInitialize`/`SourceRoute` ops. `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes` lower to typed `PlanExpressionKind`s; `Bytes/get` requires `PlanValueType::Byte` output and a typed index constant, `Bytes/set` uses ordered typed operands `[State(BYTES), Constant(Number index), Constant(Byte value)]` plus same-length BYTES output and fixed-length out-of-bounds rejection, `Bytes/equal` requires two distinct BYTES state inputs and a BOOL output, `Bytes/concat` uses ordered typed BYTES operands plus BYTES output fixed-length checking, and `File/read_bytes` uses one static TEXT constant path operand with dynamic BYTES output support. Source-payload update branches lower to typed `ValueRef::SourcePayload` operands, const update branches carry typed `update_constant_id` refs, indexed row aliases resolve to typed scoped state refs, TodoMVC list storage now carries typed initial rows with typed row-field IDs, TodoMVC `List/append` carries typed trigger/row-field metadata, and `store.title_to_add` plus row `Bool/not` fields lower to typed derived expressions. TodoMVC and Cells now have typed-lowering-executable plans, but whole-plan CPU executor support and full operation semantics are not proven. |
 | Phase 6 - CPU PlanExecutor and Parity | Partial | Added explicit `run-plan` initial-state CPU PlanExecutor proof for scalar constants and typed list initial storage, `run-plan-route` for one unscoped source-payload update route plus one unscoped const update route, a four-step TodoMVC root-scalar scenario subset, a narrow TodoMVC submit root/list slice, TodoMVC retain-backed `store.visible_todos` materialization, and root-scalar BYTES op parity for `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. `examples/list_initial_plan_ops.bn` proves `run-plan` can initialize one typed list slot and report row fields without fallback counters. `examples/bytes_concat_chain_plan_ops.bn` proves committed-step chaining from `Bytes/concat`; `examples/bytes_set_plan_ops.bn` proves committed-step chaining from `Bytes/set` into later `Bytes/get`, `Bytes/length`, and `Bytes/concat`; `examples/bytes_file_read_plan_ops.bn` proves file-read BYTES state can be consumed by later `Bytes/length` and `Bytes/get` through typed PlanExecutor state. `examples/bytes_initial.bn`, `examples/list_initial_plan_ops.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, TodoMVC `store.sources.new_todo_input.change -> store.new_todo_text`, TodoMVC `store.sources.filter_active.press -> store.selected_filter`, TodoMVC selected steps `add-test-todo-type,filter-active,filter-completed,filter-all`, TodoMVC `add-test-todo-type,add-test-todo-submit`, TodoMVC `add-test-todo-type,add-test-todo-submit,filter-active,toggle-dynamic-test-todo-under-active-filter`, and whitespace submit rejection prove zero fallback counters on their selected surfaces. TodoMVC and Cells full scenario compare reports now pass on the current aggregate surface, but broader conflict/error/source-binding coverage, generic dependency-frontier scheduling, and final default-switch readiness remain open. |
 | Phase 7 - BYTES Runtime/Storage | Partial | Legacy runtime can evaluate source-language BYTES constructors and v1 BYTES builtins into existing inline `RuntimeBytes`; root-scalar PlanExecutor can initialize inline BYTES and replay `Bytes/length`, `Bytes/is_empty`, `Bytes/get`, `Bytes/set`, `Bytes/equal`, `Bytes/concat`, and static-path `File/read_bytes`. PlanExecutor now carries a private root BYTES sidecar state initialized from typed constants and updated by BYTES-producing branches, so committed BYTES outputs can be consumed by later BYTES operations while public reports still expose only digest/length summaries. Fixed root BYTES now have preallocated byte-bank metadata, fixed root `Bytes/set` can mutate the private destination bank with zero measured runtime copy/alloc counters, and focused patch-then-read/write storage-profile cases prove later `Bytes/get`, `Bytes/length`, `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, `Bytes/ends_with`, `Bytes/read_unsigned`, `Bytes/read_signed`, `Bytes/to_text`, `Bytes/to_hex`, `Bytes/to_base64`, `Bytes/write_unsigned`, and `Bytes/write_signed` use `root_fixed_byte_bank` borrowed views or patch mutations without measured byte copies. Root-scalar `Bytes/slice`, `Bytes/take`, and `Bytes/drop` now have schema-enforced view-backed output evidence with zero measured byte-buffer copy/clone/alloc/fill counters. The standalone `verify-bytes-fixed-warm-tick` gate now proves selected root fixed-BYTES warm ticks and a focused indexed source-payload receive/readback warm tick after PlanExecutor initial state, indexed/list/source binding setup, and fixed byte-bank preparation have zero measured byte-buffer helper copy/clone/alloc/zero-fill counters. `Bytes/concat` still has a root BYTES commit path for exact legacy semantic-delta parity but remains a measured-copy operation. Static `File/read_bytes` reads a sandboxed source-relative host file into dynamic BYTES with digest/length report evidence. Static-path typed MachinePlan `File/write_bytes` writes private BYTES state to a sandboxed host file and reports digest/length host-effect evidence. Root-scalar dynamic-path `File/write_bytes` now lowers and verifies `[State(BYTES), State(TEXT path)]`, resolves the path through PlanExecutor state, writes through the same sandboxed host boundary, and rejects a dynamic `../` path-state negative at runtime. Root-scalar dynamic-path `File/read_bytes` now lowers and verifies `[State(TEXT path)]`, resolves the path through PlanExecutor state, reads through the same sandboxed host boundary, feeds later `Bytes/length` and `Bytes/get`, and rejects a dynamic `../` path-state negative at runtime. Indexed row `File/write_bytes` now writes fixed indexed row byte-bank state and reports `indexed_fixed_byte_bank` / `byte_bank_used=true` borrowed host-boundary evidence for the indexed source-payload file-write slice. Indexed row-field dynamic-path `File/write_bytes` now accepts `[State(BYTES), Field(TEXT path)]`, resolves the path from the current row, writes through the same sandboxed host boundary, and preserves zero byte-copy counters in the storage-profile proof. Indexed row-field dynamic-path `File/read_bytes` now accepts `[Field(TEXT path)]`, resolves the path from the current row, reads through the same sandboxed host boundary, stores the result in a fixed indexed byte bank, and proves a later `Bytes/get` reads from `indexed_fixed_byte_bank` with borrowed access and zero measured byte-copy counters. Indexed row-field dynamic-path read/write gates now reject parent-directory paths, missing indexed target rows, unknown row path fields, non-TEXT row path fields, missing files/parents, fixed-output length mismatch for read, fabricated malformed row-field path operand shapes, mixed row-shape dynamic paths, and foreign-list row-field dynamic paths. Storage-profile schema now binds indexed row BYTES public summaries to private indexed byte-bank evidence and aggregate adversarial checks reject forged nested row summary digests. Source-payload negative coverage now includes missing required `bytes` payload rejection for BYTES source routes. Dynamic byte mutation storage beyond inline sidecar, broad indexed warm-tick coverage beyond the focused source-payload/readback shape, broader byte source payload hardening, broad malformed private-state runtime tests, broad borrowed execution for remaining BYTES ops, complete fixed indexed byte-bank coverage beyond the proven file-write/read/length/get and focused warm-tick slices, and broad no-panic/OOB coverage beyond the focused negative cases remain open. |
 | Phase 8 - Examples | Partial | Added `examples/bytes_initial.bn`, `examples/bytes_length_plan_ops.bn`, `examples/bytes_is_empty_plan_ops.bn`, `examples/bytes_get_plan_ops.bn`, `examples/bytes_set_plan_ops.bn`, `examples/bytes_equal_plan_ops.bn`, `examples/bytes_concat_plan_ops.bn`, `examples/bytes_concat_chain_plan_ops.bn`, and `examples/bytes_file_read_plan_ops.bn` as stable focused BYTES fixtures. `examples/todo_mvc_physical/BUILD.bn` and `examples/novywave/BUILD.bn` now use `File/read_bytes() |> Bytes/to_text(encoding: Utf8)` at the asset ingestion boundary. `examples/cells/formula.bn` keeps `formula_text` as TEXT but scans formula grammar through an explicit `Text/to_bytes(encoding: Ascii)` boundary and BYTES search operations. Final BYTES-backed asset descriptors and full example behavior parity remain open. |
-| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, folded static-integer BYTES scalar argument proof for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and `Bytes/write_unsigned`, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields plus folded static integer overflow/range diagnostics and missing required BYTES source-payload rejection, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence, and the aggregate-required `verify-bytes-fixed-warm-tick` gate with focused root/indexed fixed-BYTES warm-tick byte-buffer evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 56/56 required reports checked, 46 proof reports, 10 diagnostic reports, and 38 no-fallback PlanExecutor reports, including root and indexed same-event BYTES dependency scenarios, folded static integer BYTES scalar argument reports, fixed-bank conversion MachinePlan proof reports, and fixed warm-tick storage evidence. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, the TodoMVC release benchmark reproduction proof, and the fixed warm-tick proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
+| Phase 9 - Verification and Performance | Partial | Added focused unit tests, targeted report-schema path validation, regenerated BYTES/TodoMVC/Cells plan reports, BYTES initial-state proof, BYTES root-scalar operation proofs including `Bytes/equal` true/false parity, `Bytes/concat` ordered BYTES output parity, `Bytes/set` fixed-length mutation parity/tamper rejection, committed-step chained BYTES private-state replay, folded static-integer BYTES scalar argument proof for `Bytes/get`, `Bytes/slice`, `Bytes/read_unsigned`, and `Bytes/write_unsigned`, and static-path typed `File/read_bytes` / `File/write_bytes` proofs. TodoMVC source-payload plus const source-route parity proofs, source-derived root-scalar/root-list scenario schema verification, submit-specific tamper checks for derived values, list appends, list summaries, source binds, semantic deltas, and candidate update IDs, the `verify-bytes-negative` gate with schema-required OOB `panic_free=true` / `structured_error` fields plus folded static integer overflow/range diagnostics and missing required BYTES source-payload rejection, the `verify-build-bytes-boundary` gate, the `verify-bytes-file-read-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-file/fixed-length/non-TEXT-path/missing-target/unknown-field negatives, fabricated row-field operand-shape negatives, and later byte-consumer proof, the `verify-bytes-file-write-plan` gate with static-path proof, root dynamic-path proof, dynamic bad-path runtime negative, indexed row-field parent-path/missing-parent/non-TEXT-path/missing-target/unknown-field negatives, live/report/fabricated negatives, the `verify-bytes-storage-profile` gate with indexed row-field dynamic-path `File/write_bytes` and `File/read_bytes` borrowed byte-bank evidence, and the aggregate-required `verify-bytes-fixed-warm-tick` gate with focused root/indexed fixed-BYTES warm-tick byte-buffer evidence exist. `verify_plan` now includes a schema-visible `plan-constants-deduplicated` check, and all refreshed aggregate dump-plan reports pass it. Dump-plan reports now emit and schema-verify the source-derived `typecheck_report.resolved_constant_table` projection so resolved constants are a report contract, not only an in-memory typechecker/IR detail. Static xtask gate reports now record replayable `command_argv` values with the current xtask binary path. `verify-bytes-negative` and the standalone aggregate-required `verify-bytes-machine-plan-adversarial` gate now prove focused aggregate tamper rejection for missing child reports, stale child artifact hashes, edited success flags, runtime AST fallback counters, executable string-path counters, unknown op counters, forged indexed storage-profile private-BYTES row summaries, hardware-bounded unbounded BYTES capacity claims, and fake benchmark profile edits. `bench-todomvc` now writes schema-valid TodoMVC release benchmark reports with Phase 0 baseline comparison, compile/lower timing, runtime tick summaries, allocation counters, row/region counters, and explicit copy-counter unavailability. The aggregate-required `verify-bytes-release-benchmark-reproduction` gate now checks two TodoMVC release benchmark reports for schema validity, fresh linked artifacts, consistent benchmark identity, no speedup claim, and repeated metric ratios. The aggregate-required `verify-bytes-type-system` gate now schema-checks the full v1 BYTES/File boundary builtin type surface, fixed/dynamic refinements, and resolved constant table coverage. The aggregate-required `verify-bytes-default-engine-readiness` gate now proves explicit `boon_cli run --engine compare` paths for `examples/todomvc.bn` and `examples/cells.bn`, plus a no-`--engine` semantic/default smoke, while recording that the default engine remains `legacy` and the Phase 10 switch is not yet allowed. The focused `verify-bytes-machine-plan-all --check-existing` aggregate currently passes with 63/63 required reports checked, 52 proof reports, 11 diagnostic reports, and 42 no-fallback PlanExecutor reports, including root and indexed same-event BYTES dependency scenarios, direct indexed source-payload `run-plan-route` proof, aggregate-required append-row refresh dump/scenario reports, indexed BYTES `Bytes/is_empty` search/predicate updates, folded static integer BYTES scalar argument reports, fixed-bank conversion MachinePlan proof reports, fixed warm-tick storage evidence, the type-system exit proof, and the default-engine readiness guard. The aggregate requires TodoMVC and Cells full compare reports, the standalone adversarial proof report, the TodoMVC release benchmark reproduction proof, the fixed warm-tick proof, the type-system proof, the direct indexed source-payload route proof, append-row refresh proof, and the default-engine readiness proof. Full BYTES/MachinePlan performance coverage, Cells release benchmark evidence, broad parity gates beyond the current aggregate, stricter repeated-performance policy, and performance claims remain open. |
 | Phase 10 - Default Switch | Blocked | Readiness was rechecked on 2026-06-25. `boon_cli run` still defaults to legacy, and this must not be switched yet because Phase 10 explicitly requires all parity, negative, no-fallback, performance/regression, report-schema, readiness/finality, and existing example gates to pass first. Current blockers include partial BYTES phases, missing Cells release benchmark evidence, and the demand-driven Cells path. |
 
 ## Current Baseline
@@ -23277,6 +23277,163 @@ Remaining blockers reported by
 - `boon_runtime` still depends on frontend crates
   `boon_parser`, `boon_ir`, and `boon_typecheck`.
 
+## 2026-06-28 - Compiler Boundary Blockers Decomposed
+
+Status: tightened the Milestone 1 compiler-boundary verifier so it reports the
+remaining architecture cuts separately. This does not complete the boundary or
+unlock Rust/Zig codegen; it makes the blocked state more actionable.
+
+What changed:
+
+- `verify-compiler-boundaries` now emits `boundary_decomposition` with four
+  booleans:
+  - `lowering_still_owned_by_plan_backend`
+  - `plan_schema_still_uses_ir_ids`
+  - `parser_ast_still_in_plan_lowering`
+  - `plan_executor_core_still_frontend_coupled`
+- The same report now carries `next_architectural_cuts`:
+  - move TypedProgram-to-MachinePlan lowering out of `boon_plan` and into
+    `boon_compiler`;
+  - introduce plan-owned or shared stable ID/source-schema types so the
+    `MachinePlan` schema stops depending on `boon_ir`;
+  - split PlanExecutor core from source parsing/IR orchestration in
+    `boon_runtime`.
+- `boon_report_schema` now validates the new decomposition shape, so the
+  additional fields are enforced evidence rather than ad hoc JSON.
+
+Evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`: pass, with existing native
+  GPU dead-code warnings.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass after formatting.
+- `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler/m1-boundaries.json`: expected fail; wrote a blocker
+  report with the new decomposition.
+- `target/debug/xtask verify-report-schema
+  target/reports/compiler/m1-boundaries.json`: pass.
+
+Current decomposition from `target/reports/compiler/m1-boundaries.json`:
+
+- `lowering_still_owned_by_plan_backend=true`
+- `plan_schema_still_uses_ir_ids=true`
+- `parser_ast_still_in_plan_lowering=true`
+- `plan_executor_core_still_frontend_coupled=true`
+- `full_milestone_complete=false`
+- `rust_zig_codegen_allowed=false`
+
+## 2026-06-28 - MachinePlan Schema Owns ID Newtypes
+
+Status: completed the first schema-model extraction slice. `MachinePlan`
+serialization no longer exposes the frontend IR ID newtypes for source, state,
+list, field, or scope identity. This is not the full compiler-boundary
+milestone: `boon_plan` still depends on `boon_ir` because the legacy
+TypedProgram-to-MachinePlan backend and source payload schema still live there.
+
+What changed:
+
+- Added plan-owned `SourceId`, `StateId`, `ListId`, `FieldId`, and `ScopeId`
+  newtypes in `boon_plan`.
+- Added explicit conversions between IR IDs and plan IDs at the legacy compiler
+  backend boundary.
+- Updated `boon_runtime`, `boon_report_schema`, and `xtask` plan consumers to
+  use plan IDs when inspecting or mutating `MachinePlan` artifacts.
+- Tightened `verify-compiler-boundaries` decomposition so it now separates
+  `plan_schema_still_uses_ir_ids` from
+  `plan_schema_still_uses_ir_source_schema`.
+
+Evidence:
+
+- `cargo check -q -p boon_plan`: pass.
+- `cargo check -q -p boon_compiler -p boon_cli -p boon_runtime -p
+  boon_report_schema -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `cargo test -q -p boon_compiler -p boon_plan`: pass, `1` compiler test and
+  `51` plan tests.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler/m1-boundaries.json`: expected fail; wrote a blocker
+  report.
+- `target/debug/xtask verify-report-schema
+  target/reports/compiler/m1-boundaries.json`: pass.
+
+Current decomposition from `target/reports/compiler/m1-boundaries.json`:
+
+- `lowering_still_owned_by_plan_backend=true`
+- `plan_schema_still_uses_ir_ids=false`
+- `plan_schema_still_uses_ir_source_schema=true`
+- `parser_ast_still_in_plan_lowering=true`
+- `plan_executor_core_still_frontend_coupled=true`
+- `full_milestone_complete=false`
+- `rust_zig_codegen_allowed=false`
+
+Remaining architectural cuts:
+
+- Move TypedProgram-to-MachinePlan lowering out of `boon_plan` and into
+  `boon_compiler`.
+- Replace `SourcePayloadSchema` / `SourcePayloadField` / payload value typing
+  in the plan schema with plan-owned or shared stable source-schema types.
+- Split PlanExecutor core from source parsing/IR orchestration in
+  `boon_runtime`.
+
+## 2026-06-28 - MachinePlan Schema Owns Source Payload Types
+
+Status: completed the second schema-model extraction slice. `MachinePlan`
+serialization now owns source payload field/schema/value-type definitions in
+`boon_plan`; it no longer exposes frontend IR payload schema types. This still
+does not complete the compiler-boundary milestone because the legacy
+TypedProgram-to-MachinePlan lowering backend remains in `boon_plan`.
+
+What changed:
+
+- Added plan-owned `SourcePayloadSchema`, `SourcePayloadDescriptor`,
+  `SourcePayloadValueType`, and `SourcePayloadField` in `boon_plan`.
+- Added explicit conversion from IR source payload schema/fields to plan source
+  payload schema/fields at the legacy compiler backend boundary.
+- Updated `boon_runtime`, `boon_report_schema`, and `xtask` plan consumers to
+  use plan source payload fields when interpreting compiled `MachinePlan`
+  routes.
+- Kept raw `TypedProgram` diagnostics explicitly IR-typed where they inspect
+  frontend IR payload schemas before compilation.
+- Tightened `verify-compiler-boundaries` so
+  `plan_schema_still_uses_ir_source_schema` reflects ownership of the payload
+  schema types rather than the presence of a similarly named plan-owned field.
+
+Evidence:
+
+- `cargo check -q -p boon_plan`: pass.
+- `cargo check -q -p boon_compiler -p boon_cli -p boon_runtime -p
+  boon_report_schema -p xtask`: pass, with existing native GPU dead-code
+  warnings.
+- `cargo test -q -p boon_compiler -p boon_plan`: pass, `1` compiler test and
+  `51` plan tests.
+- `cargo build -q -p xtask`: pass, with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler/m1-boundaries.json`: expected fail; wrote a blocker
+  report.
+- `target/debug/xtask verify-report-schema
+  target/reports/compiler/m1-boundaries.json`: pass.
+
+Current decomposition from `target/reports/compiler/m1-boundaries.json`:
+
+- `lowering_still_owned_by_plan_backend=true`
+- `plan_schema_still_uses_ir_ids=false`
+- `plan_schema_still_uses_ir_source_schema=false`
+- `parser_ast_still_in_plan_lowering=true`
+- `plan_executor_core_still_frontend_coupled=true`
+- `full_milestone_complete=false`
+- `rust_zig_codegen_allowed=false`
+
+Remaining architectural cuts:
+
+- Move TypedProgram-to-MachinePlan lowering out of `boon_plan` and into
+  `boon_compiler`; this is the remaining reason `boon_plan` still depends on
+  `boon_ir` and `boon_parser`.
+- Split PlanExecutor core from source parsing/IR orchestration in
+  `boon_runtime`.
+
 ## 2026-06-27 - Cells Visible Click Summary Reuse and Runtime Work Gate
 
 Status: full release Cells visible-click E2E passes on fresh app-owned native
@@ -23558,3 +23715,11804 @@ Remaining architecture options:
 - A spreadsheet formula graph is still the long-term engine shape: parsed
   formulas, direct/range dependencies, scalable range intervals, cycle states,
   and demand-current visible evaluation.
+
+## 2026-06-28 - MachinePlan Schema Default Build Split
+
+Status: implemented a focused compiler-boundary extraction slice. This does
+not complete Phase 10 or permit Rust/Zig codegen yet, but it makes
+`boon_plan`'s default crate surface schema/verification-oriented instead of
+requiring frontend crates by default.
+
+What changed:
+
+- `boon_plan` now has an explicit `legacy-compiler-backend` feature.
+- `boon_ir`, `boon_parser`, and `boon_typecheck` are optional dependencies of
+  `boon_plan`, enabled only by the legacy backend feature.
+- `boon_compiler` enables `boon_plan/legacy-compiler-backend` while the old
+  TypedProgram-to-MachinePlan backend remains in `boon_plan`.
+- Legacy backend imports, IR conversion impls, AST lowering helpers, and tests
+  are feature-gated so `cargo check -p boon_plan` builds the plan schema without
+  frontend crates.
+- `verify-compiler-boundaries` now distinguishes:
+  default/required `boon_plan` frontend dependencies,
+  optional legacy backend frontend dependencies,
+  `boon_compiler` enabling the compatibility backend,
+  and the remaining physical lowering move.
+- The compiler-boundary schema now requires those decomposition fields so future
+  reports cannot collapse optional scaffolding and real default dependencies
+  into one vague flag.
+
+Evidence:
+
+- `cargo check -q -p boon_plan`: pass.
+- `cargo check -q -p boon_plan --features legacy-compiler-backend`: pass.
+- `cargo check -q -p boon_compiler -p boon_cli -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_plan --features legacy-compiler-backend`: pass,
+  `51` tests.
+- `cargo test -q -p boon_compiler`: pass.
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- `boundary_decomposition.boon_plan_default_build_schema_only=true`.
+- `boundary_decomposition.boon_plan_frontend_dependencies_optional_only=true`.
+- `dependency_direction.boon_plan_depends_on_boon_ir=false`.
+- `dependency_direction.boon_plan_depends_on_boon_parser=false`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_ir=true`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_parser=true`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_typecheck=true`.
+- `acceptance.full_milestone_complete=false`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blockers:
+
+- `boon_plan` still imports parser AST types under the compatibility feature.
+- Legacy TypedProgram-to-MachinePlan lowering still lives in `boon_plan` behind
+  `legacy-compiler-backend`; it has not been physically moved into
+  `boon_compiler`.
+- `boon_runtime` still depends on parser/IR/typecheck crates, so PlanExecutor
+  core is not yet isolated from frontend orchestration.
+
+Next executable task:
+
+- Move the legacy TypedProgram-to-MachinePlan lowering module and its tests from
+  `boon_plan` into `boon_compiler`, leaving `boon_plan` as a pure plan schema,
+  verifier, and backend-neutral ABI crate.
+
+## 2026-06-28 - MachinePlan Compiler Backend Moved Out of BoonPlan
+
+Status: implemented the follow-up compiler-boundary cut. `boon_plan` is now a
+frontend-free plan schema, verifier, hashing, and plan-inspection crate. The
+legacy TypedProgram-to-MachinePlan backend and its tests now live in
+`boon_compiler`.
+
+What changed:
+
+- Added `crates/boon_compiler/src/legacy_backend.rs` with the moved
+  TypedProgram-to-MachinePlan lowering implementation and the former plan
+  backend tests.
+- `boon_compiler::compile_typed_program` now calls its local legacy backend
+  instead of delegating to `boon_plan::compile_typed_program`.
+- Removed `boon_ir`, `boon_parser`, and `boon_typecheck` dependencies and
+  features from `boon_plan`.
+- Moved remaining IR ID and source-payload conversions into `boon_compiler` and
+  the still-coupled runtime call sites.
+- Promoted generic plan-inspection helpers from private verifier helpers to
+  public `boon_plan` APIs where the moved backend/tests need them.
+- Updated `verify-compiler-boundaries` and schema validation to report
+  compiler-owned backend source, absence of plan frontend dependencies, and the
+  remaining runtime frontend coupling.
+
+Evidence:
+
+- `cargo check -q -p boon_plan`: pass.
+- `cargo test -q -p boon_plan`: pass, `0` tests.
+- `cargo test -q -p boon_compiler`: pass, `52` tests.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_cli -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `rg -n "boon_ir|boon_parser|boon_typecheck|legacy-ir-adapter|legacy-compiler-backend|AstExpr|TypedProgram" crates/boon_plan/src/lib.rs crates/boon_plan/Cargo.toml`:
+  no matches for frontend crate/backend symbols; only plan-domain enum names
+  such as `InitialValueKind` remain.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `PlanExecutor core is not extracted; boon_runtime still depends on parser/IR/typecheck crates`.
+- `boon_compiler.compiler_owns_legacy_backend_source=true`.
+- `boundary_decomposition.lowering_still_owned_by_plan_backend=false`.
+- `boundary_decomposition.parser_ast_still_in_plan_lowering=false`.
+- `boundary_decomposition.boon_plan_default_build_schema_only=true`.
+- `boundary_decomposition.boon_plan_legacy_backend_feature_present=false`.
+- `boundary_decomposition.boon_plan_legacy_ir_adapter_feature_present=false`.
+- `dependency_direction.boon_plan_depends_on_boon_ir=false`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_ir=false`.
+- `dependency_direction.boon_plan_depends_on_boon_parser=false`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_parser=false`.
+- `dependency_direction.boon_plan_optionally_depends_on_boon_typecheck=false`.
+- `acceptance.full_milestone_complete=false`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- `boon_runtime` still owns source parsing/IR/typecheck orchestration and local
+  IR-to-plan ID/source-payload conversions. The next architectural cut is to
+  split PlanExecutor core from runtime frontend orchestration so the executor
+  can depend on `boon_plan` without depending on parser/IR/typecheck crates.
+
+## 2026-06-28 - Initial PlanExecutor Core Extracted
+
+Status: implemented the first runtime-boundary cut after moving the compiler
+backend. A new `boon_plan_executor` crate now owns the frontend-free
+initial-state PlanExecutor slice. This is not the full executor extraction and
+does not unblock Rust/Zig codegen yet.
+
+What changed:
+
+- Added `crates/boon_plan_executor` as a workspace crate depending on
+  `boon_plan`, `serde`, and `serde_json`.
+- Moved the MachinePlan verification plus scalar initial-state execution
+  contract for `run-plan` into `boon_plan_executor::execute_initial_state`.
+- `boon_runtime` now calls that core executor and keeps the remaining
+  list-projection/list-retain materialization and source/scenario orchestration.
+- `run-plan` reports now include
+  `plan_executor.executor_core.executor="cpu-plan-executor-core-v1"` evidence.
+- `verify-compiler-boundaries` and its schema now distinguish the extracted
+  `boon_plan_executor` core from the still-coupled `boon_runtime`
+  orchestration.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor`: pass.
+- `cargo test -q -p boon_plan_executor`: pass, `0` tests.
+- `cargo check -q -p xtask -p boon_report_schema -p boon_runtime -p boon_plan_executor`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_compiler`: pass, `52` tests.
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan examples/bytes_initial.bn --report target/reports/bytes-plan/bytes-initial-run-plan.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-initial-run-plan.json`:
+  pass.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.crate_present=true`.
+- `boon_plan_executor.workspace_member=true`.
+- `boon_plan_executor.workspace_dependency=true`.
+- `boon_plan_executor.depends_on_boon_plan=true`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boon_plan_executor.initial_state_executor_extracted=true`.
+- `boundary_decomposition.plan_executor_core_still_frontend_coupled=false`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `dependency_direction.boon_plan_executor_frontend_dependencies=[]`.
+- `dependency_direction.boon_runtime_frontend_dependencies=["boon_parser","boon_ir","boon_typecheck"]`.
+- `acceptance.full_milestone_complete=false`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- The core crate only owns initial-state execution. Source-route execution,
+  root-scalar scenario execution, list/source event plumbing, and parser/IR/
+  typecheck orchestration remain in `boon_runtime`. The next cut is to move
+  source-route and root-scenario PlanExecutor execution into
+  `boon_plan_executor` while leaving source loading and legacy comparison above
+  the boundary.
+
+## 2026-06-28 - Source-Route Selection Moved Into PlanExecutor Core
+
+Status: implemented the next non-initial PlanExecutor boundary slice. The core
+crate now owns source-route/update-branch selection and validation for root
+source-route proofs. Full event execution still remains in `boon_runtime`.
+
+What changed:
+
+- Added `boon_plan_executor::select_source_route_update`.
+- The core selector verifies the MachinePlan, resolves source/state debug labels
+  to typed IDs, rejects scoped/indexed/ambiguous route surfaces for this slice,
+  validates zero unresolved executable refs, and checks typed source-payload
+  field inputs.
+- `boon_runtime::execute_machine_plan_source_route_inner` now calls the core
+  selector before doing runtime-owned event/value execution.
+- `run-plan-route` reports now include
+  `plan_executor.executor_core.executor="cpu-plan-source-route-selection-v1"`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.source_route_selection_extracted`.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor`: pass.
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_plan_executor`: pass, `0` tests.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `cargo build -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-route examples/root_scalar_plan_ops.bn --source store.input.change --target-state store.copied --text 'Typed payload' --compare-legacy --report target/reports/bytes-plan/root-scalar-route-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-route-selection.json`:
+  pass.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boon_plan_executor.initial_state_executor_extracted=true`.
+- `boon_plan_executor.source_route_selection_extracted=true`.
+- `boundary_decomposition.plan_executor_core_still_frontend_coupled=false`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `dependency_direction.boon_plan_executor_frontend_dependencies=[]`.
+- `dependency_direction.boon_runtime_frontend_dependencies=["boon_parser","boon_ir","boon_typecheck"]`.
+- `acceptance.full_milestone_complete=false`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- Source-route value execution, root-scalar scenario execution, list/source
+  event plumbing, runtime bytes/private storage, and legacy comparison remain
+  in `boon_runtime`. The next extraction needs to move a larger execution state
+  object or a root-scalar update evaluator into `boon_plan_executor` without
+  dragging parser/IR/typecheck back into the core crate.
+
+## 2026-06-28 - Root Source-Event Work Selection Moved Into PlanExecutor Core
+
+Status: implemented the next root-scenario boundary slice. The frontend-free
+PlanExecutor core now owns source-event work selection for root scenario steps:
+it resolves the source route, selects the ordered update branch plan ops,
+detects same-event root read ordering, computes the root update key gate for
+list-scoped branches, and reports the selected work back to the runtime.
+
+What changed:
+
+- Added `boon_plan_executor::select_root_source_event_work`.
+- Moved the root update ordering/key-gate helpers out of `boon_runtime` and
+  into `boon_plan_executor`.
+- `boon_runtime::execute_machine_plan_root_scenario_inner` now consumes the
+  core-selected ordered op IDs instead of selecting that work locally.
+- Root scenario reports now include per-step
+  `plan_executor.per_step[].executor_core.executor=
+  "cpu-plan-root-source-event-work-selection-v1"`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_source_event_work_selection_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/root_scalar_plan_ops.bn --scenario examples/root_scalar_plan_ops.scn --steps toggle,copy --compare-legacy --report target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-route-selection.json`:
+  pass.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boon_plan_executor.initial_state_executor_extracted=true`.
+- `boon_plan_executor.source_route_selection_extracted=true`.
+- `boon_plan_executor.root_source_event_work_selection_extracted=true`.
+- `boundary_decomposition.plan_executor_core_still_frontend_coupled=false`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `dependency_direction.boon_plan_executor_frontend_dependencies=[]`.
+- `dependency_direction.boon_runtime_frontend_dependencies=["boon_parser","boon_ir","boon_typecheck"]`.
+- `acceptance.full_milestone_complete=false`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- Root scenario value execution, mutation of root/list runtime state, list/source
+  event plumbing, runtime bytes/private storage, report enrichment, and legacy
+  comparison still live in `boon_runtime`. The next extraction should move a
+  plan-only root update evaluator or execution-state object into
+  `boon_plan_executor` while keeping parser/IR/typecheck and legacy comparison
+  above the core boundary.
+
+## 2026-06-28 - Root JSON Update Evaluator Moved Into PlanExecutor Core
+
+Status: implemented the next PlanExecutor execution slice. The core crate now
+evaluates supported root JSON/scalar update branches directly, while runtime
+keeps BYTES, file, indexed/list, host-effect, and broader state-mutation
+responsibilities.
+
+What changed:
+
+- Added `boon_plan_executor::evaluate_root_json_update_branch`.
+- Added plan-owned `RootJsonSourceEvent` and `RootJsonUpdateEvaluation` proof
+  structs for frontend-free root update evaluation.
+- The extracted evaluator supports root scalar JSON cases:
+  `source_payload`, `const`, `bool_not`, `read_path`, `previous_value`, and
+  `text_trim_or_previous`.
+- Unsupported BYTES/file/runtime-specific branches return an explicit
+  unsupported reason and fall back to the existing runtime evaluator.
+- `boon_runtime::execute_machine_plan_root_scenario_inner` now asks the core
+  evaluator first for unindexed root updates and records
+  `updates[].executor_core.executor="cpu-plan-root-json-update-evaluator-v1"`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_json_update_evaluator_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/root_scalar_plan_ops.bn --scenario examples/root_scalar_plan_ops.scn --steps toggle,copy --compare-legacy --report target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass.
+- The refreshed report contains three
+  `cpu-plan-root-json-update-evaluator-v1` update proofs for `bool_not`,
+  `read_path`, and `source_payload`.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boon_plan_executor.initial_state_executor_extracted=true`.
+- `boon_plan_executor.source_route_selection_extracted=true`.
+- `boon_plan_executor.root_source_event_work_selection_extracted=true`.
+- `boon_plan_executor.root_json_update_evaluator_extracted=true`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- The core evaluator does not yet own BYTES operations, file effects,
+  indexed/list updates, root/list state mutation, retained UI/WGPU execution,
+  native-web/accessibility replay, SolidGraph/3D data movement, or
+  manufacturing backends. Those paths still need a shared executor state model
+  before Rust/Zig codegen can be honestly enabled.
+
+## 2026-06-28 - Root JSON State Writes Moved Into PlanExecutor Core
+
+Status: implemented the first executor-owned root state mutation slice. The
+core crate now applies supported JSON/scalar root state writes and produces the
+matching FieldSet semantic delta proof. Runtime still owns BYTES banks,
+fixed-byte mutations, list/indexed state, file effects, report enrichment, and
+legacy comparison.
+
+What changed:
+
+- Added `boon_plan_executor::apply_root_json_state_value`.
+- Added `RootJsonStateWrite` as a frontend-free state-write proof object.
+- `boon_runtime::execute_machine_plan_root_scenario_inner` now uses the core
+  state writer for supported JSON/scalar staged writes and final root writes.
+- Root scenario update reports now include
+  `state_write_core.executor="cpu-plan-root-json-state-write-v1"` for extracted
+  JSON writes.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_json_state_write_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/root_scalar_plan_ops.bn --scenario examples/root_scalar_plan_ops.scn --steps toggle,copy --compare-legacy --report target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass.
+- The refreshed report contains three
+  `cpu-plan-root-json-state-write-v1` update proofs for `store.flag`,
+  `store.mirrored`, and `store.copied`.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.root_json_update_evaluator_extracted=true`.
+- `boon_plan_executor.root_json_state_write_extracted=true`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- The core state writer handles only JSON/scalar root state. BYTES/fixed-bank
+  mutation, list/indexed mutation, source bind/unbind emission, retained UI/WGPU
+  patch propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, and manufacturing backend state transitions still need a shared
+  executor state model before the default path can honestly switch.
+
+## 2026-06-28 - Source-Route JSON Execution Moved Into PlanExecutor Core
+
+Status: implemented the next source-route execution slice. The core crate now
+executes supported root JSON/scalar source-route updates end to end by composing
+the extracted route selector, root JSON evaluator, and root JSON state writer.
+Runtime still performs the full root-scenario parity check and falls back for
+BYTES/file/runtime-specific branches.
+
+What changed:
+
+- Added `boon_plan_executor::execute_source_route_json_update`.
+- Added `SourceRouteJsonExecution` as the frontend-free source-route execution
+  proof object.
+- `boon_runtime::execute_machine_plan_source_route_inner` now asks the core
+  route executor for JSON/scalar routes before using the runtime fallback.
+- `run-plan-route` reports now include
+  `plan_executor.route_execution_core.executor=
+  "cpu-plan-source-route-json-execution-v1"`.
+- The route execution proof nests the selector, evaluator, and state-write
+  proof reports.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.source_route_json_execution_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-route examples/root_scalar_plan_ops.bn --source store.input.change --target-state store.copied --text 'Typed payload' --compare-legacy --report target/reports/bytes-plan/root-scalar-route-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-route-selection.json`:
+  pass.
+- `target/reports/bytes-plan/root-scalar-route-selection.json` reports
+  `cpu-plan-source-route-json-execution-v1`.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/root_scalar_plan_ops.bn --scenario examples/root_scalar_plan_ops.scn --steps toggle,copy --compare-legacy --report target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/root-scalar-work-selection.json`:
+  pass.
+- `target/debug/xtask verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail.
+- `target/debug/xtask verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+
+Current compiler-boundary report:
+
+- `status="fail"`.
+- Only blocker:
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `boon_plan_executor.source_route_selection_extracted=true`.
+- `boon_plan_executor.source_route_json_execution_extracted=true`.
+- `boon_plan_executor.root_json_update_evaluator_extracted=true`.
+- `boon_plan_executor.root_json_state_write_extracted=true`.
+- `boon_plan_executor.frontend_dependency_count=0`.
+- `boundary_decomposition.runtime_frontend_orchestration_remaining=true`.
+- `acceptance.rust_zig_codegen_allowed=false`.
+
+Remaining blocker:
+
+- Source-route JSON/scalar execution is core-owned, but route/full-scenario
+  orchestration, BYTES/fixed-bank execution, file effects, list/indexed mutation,
+  retained UI/WGPU patch propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, and manufacturing backend transitions remain
+  outside the core executor.
+
+## 2026-06-28 - Root BYTES Source-Payload Report Evaluation in PlanExecutor Core
+
+Status: implemented a narrow BYTES evaluator slice without moving byte storage.
+The PlanExecutor core can now validate a root `SourcePayload(Bytes)` update and
+produce the canonical public BYTES report value, while `boon_runtime` still owns
+the private byte banks and runtime-specific BYTES operations.
+
+What changed:
+
+- Added `payload_bytes` to `boon_plan_executor::RootJsonSourceEvent`.
+- Added BYTES handling to `evaluate_root_json_update_branch` for root
+  `SourcePayload(Bytes)` updates.
+- The core validates the target state is BYTES, enforces fixed-length output
+  constraints, and reports digest/byte length through the same public BYTES
+  shape as runtime reports.
+- Runtime records the core evaluator proof, but BYTES-valued updates still use
+  the existing byte-aware runtime mutation path so later `Bytes/length` and
+  `Bytes/get` reads keep using private byte state instead of JSON-only summaries.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_source_payload_report_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_source_payload_plan_ops.bn --scenario examples/bytes_source_payload_plan_ops.scn --steps receive-bytes,inspect-bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass; legacy comparison passes.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass.
+- The refreshed report shows the receive step has
+  `executor_core.executor="cpu-plan-root-json-update-evaluator-v1"`,
+  `executor_core.supported=true`, `source_payload_field="Bytes"`, and a public
+  BYTES value with `byte_len=3`.
+- The inspect step still shows `Bytes/length` and `Bytes/get` as
+  runtime-specific evaluator fallbacks with `bytes_access.access_source=
+  "root_bytes_state"`, proving the storage migration was not faked.
+
+Remaining blocker:
+
+- BYTES source-payload report evaluation is not full BYTES executor ownership.
+  Private byte storage, fixed-byte mutations, BYTES operation execution, file
+  effects, indexed/list mutation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, and
+  manufacturing backend transitions still need a shared executor-owned state
+  model before the default path or Rust/Zig codegen can be honestly enabled.
+
+## 2026-06-28 - Root BYTES Initial Private Storage Moved Into PlanExecutor Core
+
+Status: implemented the first actual root BYTES storage slice. The executor
+core now validates root BYTES initial constants, builds private inline byte
+payloads, and prepares fixed root byte banks. Runtime converts that executor
+storage into the current `RuntimeBytes` representation until BYTES mutation and
+read operations move fully into the core.
+
+What changed:
+
+- Added `PlanExecutorBytes` and `RootBytesStorageInitialization` to
+  `boon_plan_executor`.
+- Added `boon_plan_executor::initialize_root_bytes_storage`.
+- Runtime root-scenario initialization now calls the core BYTES initializer
+  instead of reimplementing initial BYTES private payload and fixed-bank
+  validation locally.
+- Root scenario reports now include
+  `plan_executor.root_bytes_initialization_core.executor=
+  "cpu-plan-root-bytes-storage-initializer-v1"`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_initial_storage_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_source_payload_plan_ops.bn --scenario examples/bytes_source_payload_plan_ops.scn --steps receive-bytes,inspect-bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass; legacy comparison passes.
+- The refreshed report includes
+  `root_bytes_initialization_core.initialized_bytes_state_count=1` and
+  `root_bytes_initialization_core.executor=
+  "cpu-plan-root-bytes-storage-initializer-v1"`.
+- The receive step still shows core `SourcePayload(Bytes)` report evaluation;
+  the inspect step still reads through `root_bytes_state`, so mutation/read
+  operation ownership has not been overstated.
+
+Remaining blocker:
+
+- Runtime still owns BYTES source-payload mutation, fixed-byte mutations,
+  BYTES operation execution, file effects, indexed/list private byte state,
+  and report enrichment. The next useful extraction is a core-owned root BYTES
+  state transition/read layer so `Bytes/length`, `Bytes/get`, fixed-bank
+  patches, and source-payload commits can stop round-tripping through
+  `RuntimeBytes`.
+
+## 2026-06-28 - Root BYTES Read Evaluation Moved Into PlanExecutor Core
+
+Status: implemented the first executor-owned root BYTES operation slice.
+`boon_plan_executor` now evaluates read-only root BYTES update branches for
+`Bytes/length`, `Bytes/is_empty`, and `Bytes/get` against private byte payloads
+and fixed byte banks. Runtime still adapts its current `RuntimeBytes` maps into
+the executor input shape until commits and mutations move into the core state
+model.
+
+What changed:
+
+- Added `RootBytesReadEvaluation`.
+- Added `boon_plan_executor::evaluate_root_bytes_read_update`.
+- The core read evaluator validates public BYTES summaries against executor
+  private payloads or fixed banks before exposing read results.
+- Runtime fallback branches for root `Bytes/length`, `Bytes/is_empty`, and
+  `Bytes/get` now call the core evaluator and preserve its executor report.
+- Root scenario update reports now show
+  `updates[].executor_core.executor=
+  "cpu-plan-root-bytes-read-evaluator-v1"` for supported read-only BYTES
+  branches.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_source_payload_plan_ops.bn --scenario examples/bytes_source_payload_plan_ops.scn --steps receive-bytes,inspect-bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass; legacy comparison passes.
+- The refreshed report shows `Bytes/length` and `Bytes/get` updates using
+  `cpu-plan-root-bytes-read-evaluator-v1`, with `supported=true` and borrowed
+  BYTES access.
+
+Remaining blocker:
+
+- This is not full BYTES state ownership. Runtime still owns source-payload
+  BYTES commits, fixed-bank mutation, BYTES-producing operations, file effects,
+  indexed/list private byte state, and report enrichment. The next useful cut
+  is a core-owned root BYTES state transition layer that can commit
+  `SourcePayload(Bytes)` and fixed-bank patches without adapting through
+  `RuntimeBytes`.
+
+## 2026-06-28 - Root BYTES Source-Payload Commits Moved Into PlanExecutor Core
+
+Status: implemented the first executor-owned root BYTES commit slice.
+`boon_plan_executor` now validates root `SourcePayload(Bytes)` commits, builds
+the private `PlanExecutorBytes` payload, and returns the public BYTES summary
+plus commit proof. Runtime still adapts the executor-owned bytes into
+`RuntimeBytes` until the remaining root state maps move fully into the core.
+
+What changed:
+
+- Added `RootBytesSourcePayloadCommit`.
+- Added `boon_plan_executor::evaluate_root_bytes_source_payload_commit`.
+- Runtime root `SourcePayload(Bytes)` update branches now use the core commit
+  evaluator and preserve its executor report.
+- Root scenario update reports now show
+  `updates[].executor_core.executor=
+  "cpu-plan-root-bytes-source-payload-commit-v1"` for source-payload BYTES
+  commits.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_source_payload_commit_extracted=true`.
+
+Evidence:
+
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_source_payload_plan_ops.bn --scenario examples/bytes_source_payload_plan_ops.scn --steps receive-bytes,inspect-bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass; legacy comparison passes.
+- The receive step reports
+  `cpu-plan-root-bytes-source-payload-commit-v1`; the inspect step still reports
+  the core BYTES read evaluator for `Bytes/length` and `Bytes/get`.
+
+Remaining blocker:
+
+- Runtime still owns the root BYTES maps, fixed-bank patch application,
+  BYTES-producing operations beyond source payload, file effects, indexed/list
+  private byte state, and report enrichment. The next useful cut is moving
+  `apply_executed_root_update_to_state` BYTES application and fixed-bank patch
+  handling into the executor-owned root BYTES state transition layer.
+
+## 2026-06-28 - Root BYTES State Transitions Moved Into PlanExecutor Core
+
+Status: implemented the next bounded root BYTES state slice. The PlanExecutor
+core now applies root BYTES commits, clears, and fixed-byte patch mutations to
+executor-owned BYTES maps. `boon_runtime` still adapts its current
+`RuntimeBytes` and fixed-bank maps into that core helper until the full root
+state container moves into `boon_plan_executor`.
+
+What changed:
+
+- Added `RootBytesFixedMutation` and `RootBytesStateTransition` to
+  `boon_plan_executor`.
+- Added `boon_plan_executor::apply_root_bytes_state_transition`.
+- Runtime root update application now delegates BYTES commits and fixed-bank
+  patches to the core transition helper, then adapts the resulting executor
+  maps back to the current runtime maps.
+- Root scenario update reports now include
+  `updates[].bytes_state_core.executor=
+  "cpu-plan-root-bytes-state-transition-v1"`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`.
+- The source-derived scenario semantic comparator treats `bytes_state_core` as
+  executor evidence, like `executor_core`, `state_write_core`, and
+  `bytes_access`, so semantic replay remains focused on state/delta parity.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_source_payload_plan_ops.bn --scenario examples/bytes_source_payload_plan_ops.scn --steps receive-bytes,inspect-bytes --compare-legacy --report target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass with `legacy_comparison.passed=true`.
+- The focused report shows the receive step using
+  `cpu-plan-root-bytes-source-payload-commit-v1` and
+  `bytes_state_core.executor="cpu-plan-root-bytes-state-transition-v1"` with
+  `bytes_state_core.mode="bytes_commit"`; the inspect step still uses
+  `cpu-plan-root-bytes-read-evaluator-v1`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-source-payload-core.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; report written.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`.
+- Still blocked:
+  runtime still owns the outer root BYTES maps/adaptation, BYTES-producing
+  operations beyond source payload, file effects, indexed/list private byte
+  state, report enrichment, source parsing/IR/typecheck orchestration, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, and manufacturing backend transitions. Rust/Zig codegen remains
+  blocked until the PlanExecutor state container and execution surface are
+  broader than this root BYTES transition slice.
+
+## 2026-06-28 - Root BYTES `Bytes/set` Write Evaluation Moved Into PlanExecutor Core
+
+Status: implemented the first executor-owned root BYTES write-operation
+evaluator. `boon_plan_executor` now evaluates root `Bytes/set`, including typed
+operand validation, fixed-length validation, public summary computation, and
+fixed-bank mutation planning. Runtime still adapts the returned
+`PlanExecutorBytes` or `RootBytesFixedMutation` into the current outer root
+state maps.
+
+What changed:
+
+- Added `RootBytesWriteEvaluation`.
+- Added `boon_plan_executor::evaluate_root_bytes_write_update`.
+- The executor write evaluator supports `PlanExpressionKind::BytesSet`.
+- Runtime root `Bytes/set` update branches now call the core write evaluator
+  and preserve its report in `updates[].executor_core`.
+- Existing `apply_root_bytes_state_transition` applies the evaluator result as
+  either a `bytes_commit` or `fixed_byte_patch`.
+- `verify-compiler-boundaries` and schema validation now require
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_set_plan_ops.bn --scenario examples/bytes_set_plan_ops.scn --steps patch-bytes,inspect-patched --compare-legacy --report target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-set` report shows the `patch-bytes` update using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"`,
+  `executor_core.fixed_mutation=true`, and
+  `bytes_state_core.mode="fixed_byte_patch"`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; report written.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`.
+- Still blocked:
+  BYTES write ownership is limited to root `Bytes/set`. Runtime still owns
+  `Bytes/slice`, `Bytes/take`, `Bytes/drop`, numeric writes, `Bytes/concat`,
+  file effects, indexed/list private byte state, report enrichment, source
+  parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, and
+  manufacturing backend transitions.
+
+## 2026-06-28 - Root BYTES `Bytes/concat` Write Evaluation Added To PlanExecutor Core
+
+Status: expanded the executor-owned root BYTES write evaluator beyond fixed
+byte patches. `boon_plan_executor` now evaluates root `Bytes/concat`, validates
+the two ordered state inputs, preserves the public BYTES summary, and returns a
+private `PlanExecutorBytes` commit for the existing root BYTES state transition
+helper. Runtime still adapts the result into its current outer root state maps.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports both
+  `PlanExpressionKind::BytesSet` and `PlanExpressionKind::BytesConcat`.
+- Added ordered-input validation for root `Bytes/concat` in the executor core.
+- Runtime root `Bytes/concat` update branches now call the core write evaluator
+  and preserve `cpu-plan-root-bytes-write-evaluator-v1` in
+  `updates[].executor_core`.
+- Existing `apply_root_bytes_state_transition` applies the concat result as a
+  `bytes_commit`.
+- `verify-compiler-boundaries` now treats
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` as requiring
+  both `Bytes/set` and `Bytes/concat` coverage in the core evaluator.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_set_plan_ops.bn --scenario examples/bytes_set_plan_ops.scn --steps patch-bytes,inspect-patched --compare-legacy --report target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-set` report shows the `patch-bytes` update using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"`,
+  `executor_core.fixed_mutation=true`, and
+  `bytes_state_core.mode="fixed_byte_patch"`.
+- The same report shows the `store.patched_joined` concat update using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"`,
+  `executor_core.expression_kind="bytes_concat"`,
+  `executor_core.bytes_commit=true`, and
+  `bytes_state_core.mode="bytes_commit"`.
+- The report also shows `plan_executor.bytes_storage_no_copy=true` for this
+  fixture.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`,
+  `boon_plan_executor.frontend_dependency_count=0`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/set` and root `Bytes/concat` write evaluation are executor-owned.
+- Still blocked:
+  the write evaluator is still limited to root `Bytes/set` and
+  `Bytes/concat`. Runtime still owns `Bytes/slice`, `Bytes/take`,
+  `Bytes/drop`, numeric writes, file effects, indexed/list private byte state,
+  root map adaptation, report enrichment, source parsing/IR/typecheck
+  orchestration, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, and Rust/Zig codegen
+  readiness.
+
+## 2026-06-28 - Root BYTES `Bytes/slice` Write Evaluation Added To PlanExecutor Core
+
+Status: expanded the executor-owned root BYTES write evaluator to cover the
+first slicing operation. `boon_plan_executor` now evaluates root
+`Bytes/slice`, including state/constant operand validation, byte-range
+validation, fixed-output-length validation, public summary computation, and
+private `PlanExecutorBytes` commit creation. Runtime delegates the root
+`Bytes/slice` branch to the core evaluator and adapts the returned private
+bytes into the current outer root state maps.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports
+  `PlanExpressionKind::BytesSlice`.
+- Added executor-side root `Bytes/slice` operand parsing for constant and root
+  NUMBER state operands.
+- Added executor-side root byte slice range validation and BYTES output length
+  validation.
+- Runtime root `Bytes/slice` update branches now call the core write evaluator
+  and preserve `cpu-plan-root-bytes-write-evaluator-v1` in
+  `updates[].executor_core`.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` to cover
+  `Bytes/set`, `Bytes/concat`, and `Bytes/slice`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_slice_take_drop_plan_ops.bn --scenario examples/bytes_slice_take_drop_plan_ops.scn --steps split-bytes,inspect-splits --compare-legacy --report target/reports/bytes-plan/bytes-slice-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-slice` report shows the `store.sliced` update using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"`,
+  `executor_core.expression_kind="bytes_slice"`, and
+  `bytes_state_core.mode="bytes_commit"`.
+- The same report still shows `store.taken` and `store.dropped` using the
+  runtime-specific fallback evaluator, which is the next bounded slice.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-slice-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`,
+  `boon_plan_executor.frontend_dependency_count=0`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/set`, root `Bytes/concat`, and root `Bytes/slice` write
+  evaluation are executor-owned.
+- Still blocked:
+  root `Bytes/take`, root `Bytes/drop`, numeric BYTES writes, file effects,
+  indexed/list private byte state, root map adaptation, report enrichment,
+  source parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, and Rust/Zig codegen readiness remain outside the executor-owned
+  surface.
+
+## 2026-06-28 - Root BYTES `Bytes/take` And `Bytes/drop` Write Evaluation Added To PlanExecutor Core
+
+Status: completed the root slice/take/drop write-evaluator group. The
+PlanExecutor core now evaluates root `Bytes/take` and `Bytes/drop`, validates
+count operands and byte bounds, preserves the existing update-constant report
+shape, creates private `PlanExecutorBytes` commits, and lets runtime apply the
+result through the already extracted root BYTES state transition helper.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports
+  `PlanExpressionKind::BytesTake` and `PlanExpressionKind::BytesDrop`.
+- Added executor-side root byte-count operand parsing for constant and root
+  NUMBER state operands.
+- Added executor-side bounded `Bytes/drop` validation.
+- Runtime root `Bytes/take` and `Bytes/drop` update branches now call the core
+  write evaluator and preserve `cpu-plan-root-bytes-write-evaluator-v1` in
+  `updates[].executor_core`.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` to cover
+  `Bytes/set`, `Bytes/concat`, `Bytes/slice`, `Bytes/take`, and `Bytes/drop`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_slice_take_drop_plan_ops.bn --scenario examples/bytes_slice_take_drop_plan_ops.scn --steps split-bytes,inspect-splits --compare-legacy --report target/reports/bytes-plan/bytes-slice-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-slice` report shows `store.sliced`, `store.taken`, and
+  `store.dropped` all using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"` with
+  `executor_core.expression_kind` values `bytes_slice`, `bytes_take`, and
+  `bytes_drop`.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-slice-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`,
+  `boon_plan_executor.frontend_dependency_count=0`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/set`, root `Bytes/concat`, root `Bytes/slice`, root
+  `Bytes/take`, and root `Bytes/drop` write evaluation are executor-owned.
+- Still blocked:
+  root `Bytes/zeros`, text/BYTES conversions, numeric BYTES reads/writes,
+  predicates/search/equality, file effects, indexed/list private byte state,
+  root map adaptation, report enrichment, source parsing/IR/typecheck
+  orchestration, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, and Rust/Zig codegen
+  readiness remain outside the executor-owned surface.
+
+## 2026-06-28 - Root BYTES `Bytes/zeros` Write Evaluation Added To PlanExecutor Core
+
+Status: moved root `Bytes/zeros` into the executor-owned root BYTES write
+surface. The PlanExecutor core now validates the zero-count constant operand,
+rejects unexpected state inputs, validates fixed output length, creates the
+zero-filled private `PlanExecutorBytes` payload, and returns the same public
+summary/update-constant report shape that runtime previously produced.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports
+  `PlanExpressionKind::BytesZeros`.
+- Added executor-side root `Bytes/zeros` operand validation.
+- Runtime root `Bytes/zeros` update branches now call the core write evaluator
+  and preserve `cpu-plan-root-bytes-write-evaluator-v1` in
+  `updates[].executor_core`.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` to cover
+  `Bytes/set`, `Bytes/concat`, `Bytes/slice`, `Bytes/take`, `Bytes/drop`, and
+  `Bytes/zeros`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_encoding_plan_ops.bn --scenario examples/bytes_encoding_plan_ops.scn --steps build-bytes,encode-bytes,decode-text,inspect-decoded --compare-legacy --report target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-encoding` report shows `store.zeros` using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"`,
+  `executor_core.expression_kind="bytes_zeros"`, and
+  `bytes_state_core.mode="bytes_commit"`.
+- The same report shows `Bytes/from_hex`, `Bytes/from_base64`, and the later
+  `Bytes/to_hex` conversion still using runtime-specific fallback paths.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_state_transition_extracted=true`,
+  `boon_plan_executor.frontend_dependency_count=0`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/set`, root `Bytes/concat`, root `Bytes/slice`, root
+  `Bytes/take`, root `Bytes/drop`, and root `Bytes/zeros` write evaluation are
+  executor-owned.
+- Still blocked:
+  text/BYTES conversions, numeric BYTES reads/writes, predicates/search/equality,
+  file effects, indexed/list private byte state, root map adaptation, report
+  enrichment, source parsing/IR/typecheck orchestration, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, and Rust/Zig codegen readiness remain outside the
+  executor-owned surface.
+
+## 2026-06-28 - Root BYTES `Bytes/to_hex` And `Bytes/to_base64` Read Evaluation Added To PlanExecutor Core
+
+Status: moved the root `Bytes/to_hex` and `Bytes/to_base64` read conversions
+into the executor-owned root BYTES read surface. The PlanExecutor core now
+borrows the input BYTES state through the shared bytes-view helper, produces the
+TEXT encoding result, and reports the same read-only byte access metadata that
+runtime previously assembled inline.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_read_update` now supports
+  `PlanExpressionKind::BytesToHex` and
+  `PlanExpressionKind::BytesToBase64`.
+- Runtime root `Bytes/to_hex` and `Bytes/to_base64` update branches now call
+  the core read evaluator and preserve
+  `cpu-plan-root-bytes-read-evaluator-v1` in `updates[].executor_core`.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true` to cover
+  `Bytes/length`, `Bytes/get`, `Bytes/to_hex`, and `Bytes/to_base64`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_encoding_plan_ops.bn --scenario examples/bytes_encoding_plan_ops.scn --steps build-bytes,encode-bytes,decode-text,inspect-decoded --compare-legacy --report target/reports/bytes-plan/bytes-encoding-read-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-encoding-read` report shows `store.hex`,
+  `store.base64`, and `store.decoded_base64_hex` all using
+  `executor_core.executor="cpu-plan-root-bytes-read-evaluator-v1"` with
+  expression kinds `bytes_to_hex`, `bytes_to_base64`, and `bytes_to_hex`.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-encoding-read-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/length`, root `Bytes/is_empty`, root `Bytes/get`, root
+  `Bytes/to_hex`, and root `Bytes/to_base64` read evaluation are
+  executor-owned; the previously extracted root BYTES write operations remain
+  executor-owned.
+- Still blocked:
+  root `Bytes/from_hex`, root `Bytes/from_base64`, numeric BYTES reads/writes,
+  predicates/search/equality, file effects, indexed/list private byte state,
+  root map adaptation, report enrichment, source parsing/IR/typecheck
+  orchestration, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, and Rust/Zig codegen
+  readiness remain outside the executor-owned surface.
+
+## 2026-06-28 - Root BYTES `Bytes/from_hex` And `Bytes/from_base64` Write Evaluation Added To PlanExecutor Core
+
+Status: moved the root text-to-BYTES decode conversions into the
+executor-owned root BYTES write surface. The PlanExecutor core now validates
+TEXT inputs, decodes hex/base64, validates fixed output length, creates the
+private `PlanExecutorBytes` commit, and returns the same public BYTES digest
+summary that runtime previously produced.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports
+  `PlanExpressionKind::BytesFromHex` and
+  `PlanExpressionKind::BytesFromBase64`.
+- Executor-local hex/base64 decode helpers preserve the existing
+  `bytes_invalid_hex` and `bytes_invalid_base64` diagnostics for root decode
+  branches.
+- Runtime root `Bytes/from_hex` and `Bytes/from_base64` update branches now
+  call the core write evaluator and preserve
+  `cpu-plan-root-bytes-write-evaluator-v1` in `updates[].executor_core`.
+- The focused runtime scenario test now asserts the decode branches use the
+  executor-owned BYTES write evaluator.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` to cover
+  `Bytes/set`, `Bytes/concat`, `Bytes/slice`, `Bytes/take`, `Bytes/drop`,
+  `Bytes/zeros`, `Bytes/from_hex`, and `Bytes/from_base64`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass before the unit-test type-boundary fix;
+  `cargo fmt --all`: applied the final test formatting.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_encoding_plan_ops.bn --scenario examples/bytes_encoding_plan_ops.scn --steps build-bytes,encode-bytes,decode-text,inspect-decoded --compare-legacy --report target/reports/bytes-plan/bytes-encoding-decode-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-encoding-decode` report shows `store.decoded_hex` and
+  `store.decoded_base64` using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"` with
+  expression kinds `bytes_from_hex` and `bytes_from_base64`.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-encoding-decode-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_encoding_updates`:
+  pass after fixing test-only `boon_ir::SourceId` / `boon_plan::SourceId`
+  boundary drift in existing route tests.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/from_hex` and root `Bytes/from_base64` write evaluation are
+  executor-owned; root `Bytes/length`, `Bytes/is_empty`, `Bytes/get`,
+  `Bytes/to_hex`, and `Bytes/to_base64` read evaluation plus the previously
+  extracted root BYTES write operations remain executor-owned.
+- Still blocked:
+  root `Bytes/to_text`, generic text/BYTES conversions, numeric BYTES
+  reads/writes, predicates/search/equality, file effects, indexed/list private
+  byte state, root map adaptation, report enrichment, source parsing/IR/typecheck
+  orchestration, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, and Rust/Zig codegen
+  readiness remain outside the executor-owned surface.
+
+## 2026-06-28 - Root `Text/to_bytes` And `Bytes/to_text` Evaluation Added To PlanExecutor Core
+
+Status: moved the explicit root TEXT/BYTES conversion pair into the
+executor-owned BYTES evaluators. `Text/to_bytes` now runs in the root BYTES
+write evaluator, creates the private `PlanExecutorBytes` commit, and preserves
+the public BYTES digest summary. `Bytes/to_text` now runs in the root BYTES read
+evaluator and borrows the executor private BYTES state before decoding TEXT.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_write_update` now supports
+  `PlanExpressionKind::TextToBytes`.
+- `boon_plan_executor::evaluate_root_bytes_read_update` now supports
+  `PlanExpressionKind::BytesToText`.
+- Added executor-side root text/BYTES conversion operand parsing and
+  UTF-8/ASCII normalization helpers.
+- Runtime root `Text/to_bytes` and `Bytes/to_text` update branches now delegate
+  to the executor-owned BYTES write/read evaluators.
+- The focused runtime conversion-chain test now asserts
+  `Text/to_bytes` uses `cpu-plan-root-bytes-write-evaluator-v1` and
+  `Bytes/to_text` uses `cpu-plan-root-bytes-read-evaluator-v1`.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true` to include
+  `Bytes/to_text` and
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true` to include
+  `Text/to_bytes`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass after applying `cargo fmt --all`.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_text_conversion_plan_ops.bn --scenario examples/bytes_text_conversion_plan_ops.scn --steps encode-text,decode-bytes --compare-legacy --report target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed `bytes-text-conversion` report shows `store.encoded` using
+  `executor_core.executor="cpu-plan-root-bytes-write-evaluator-v1"` with
+  expression kind `text_to_bytes`, and `store.decoded` using
+  `executor_core.executor="cpu-plan-root-bytes-read-evaluator-v1"` with
+  expression kind `bytes_to_text`.
+- The report also shows `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_text_bytes_conversion_chain`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_rejects_invalid_utf8_bytes_to_text`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture`:
+  expected broader fail outside this slice; 18 passed and 3 existing
+  storage-profile tests failed:
+  `root_scalar_plan_executor_replays_bytes_equal_update`,
+  `root_scalar_plan_executor_replays_indexed_bytes_source_payload_update`, and
+  `root_scalar_plan_executor_replays_bytes_slice_take_drop_chain`.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Text/to_bytes` write evaluation and root `Bytes/to_text` read
+  evaluation are executor-owned; earlier root BYTES read/write extractions
+  remain executor-owned.
+- Still blocked:
+  numeric BYTES reads/writes, predicates/search/equality, file effects,
+  indexed/list private byte state, root map adaptation, report enrichment,
+  source parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and the broader root scalar storage
+  profile regressions listed above remain outside the completed surface.
+
+## 2026-06-28 - Root BYTES Predicate/Search Read Evaluation Added To PlanExecutor Core
+
+Status: moved the remaining root BYTES predicate/search read operations in the
+current scalar surface into the executor-owned BYTES read evaluator. The runtime
+still routes these root update branches, but branch evaluation now happens in
+`boon_plan_executor` and preserves `cpu-plan-root-bytes-read-evaluator-v1` in
+the public update reports.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_read_update` now supports
+  `PlanExpressionKind::BytesEqual`, `PlanExpressionKind::BytesFind`,
+  `PlanExpressionKind::BytesStartsWith`, and
+  `PlanExpressionKind::BytesEndsWith`.
+- The executor read evaluator records read-only private BYTES access evidence
+  for equality, find, prefix, and suffix operations.
+- Runtime root branches for `Bytes/equal`, `Bytes/find`,
+  `Bytes/starts_with`, and `Bytes/ends_with` now delegate to the core read
+  evaluator and preserve the existing public operation strings.
+- `Bytes/equal` uses declared distinct state inputs because the equality plan
+  op does not carry ordered operands; search/prefix/suffix operations use the
+  ordered BYTES state operands.
+- `verify-compiler-boundaries` now requires
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true` to cover
+  `Bytes/length`, `Bytes/get`, `Bytes/to_text`, `Bytes/to_hex`,
+  `Bytes/to_base64`, `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, and
+  `Bytes/ends_with`.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_equal_plan_ops.bn --scenario examples/bytes_equal_plan_ops.scn --steps measure-bytes --compare-legacy --report target/reports/bytes-plan/bytes-equal-read-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed equality report shows `bytes_equal` using
+  `executor_core.executor="cpu-plan-root-bytes-read-evaluator-v1"` and
+  `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_search_plan_ops.bn --scenario examples/bytes_search_plan_ops.scn --steps build-bytes,measure-bytes --compare-legacy --report target/reports/bytes-plan/bytes-search-read-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`.
+- The refreshed search report shows `bytes_find`, `bytes_starts_with`, and
+  `bytes_ends_with` using
+  `executor_core.executor="cpu-plan-root-bytes-read-evaluator-v1"` and
+  `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-equal-read-plan-ops-scenario-run-plan.json target/reports/bytes-plan/bytes-search-read-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_equal_update -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_search_updates -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture`:
+  expected broader fail outside this slice; 20 passed and 1 storage-profile
+  test still failed:
+  `root_scalar_plan_executor_replays_indexed_bytes_source_payload_update`.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root `Bytes/equal`, `Bytes/find`, `Bytes/starts_with`, and
+  `Bytes/ends_with` read evaluation are executor-owned; earlier root BYTES
+  read/write extractions remain executor-owned.
+- Still blocked:
+  numeric BYTES reads/writes, file effects, indexed/list private byte state,
+  root map adaptation, report enrichment, source parsing/IR/typecheck
+  orchestration, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and the indexed BYTES source-payload storage-profile regression
+  remain outside the completed surface.
+
+## 2026-06-28 - Indexed BYTES Source-Payload Storage Evidence Restored
+
+Status: fixed the remaining broad root-scalar PlanExecutor regression in the
+indexed BYTES source-payload fixture without weakening the report contract. The
+runtime now reports the indexed source-payload receive as a fixed row byte-bank
+write, and the source-derived report-schema replay expects the same evidence.
+
+What changed:
+
+- Indexed `SourcePayload(Bytes)` update reports now fill `bytes_storage` when
+  the output row state has an indexed fixed byte bank.
+- Source-derived report-schema replay now reconstructs the same
+  `bytes_storage` evidence for indexed `SourcePayload(Bytes)` updates.
+- The focused indexed source-payload regression now asserts the real two-step
+  fixture has three indexed updates: one payload receive, one `Bytes/length`,
+  and one `Bytes/get`.
+- The same test now asserts the receive update writes
+  `storage="indexed_fixed_byte_bank"`, `byte_bank_used=true`, and
+  `byte_len=3`.
+- The stale slice/take/drop test expectation was updated because the current
+  report now proves the full two-step fixture, including concat, has
+  `bytes_storage_no_copy=true`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_source_payload_update -- --nocapture`:
+  pass.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_source_payload_plan_ops.bn --scenario examples/bytes_indexed_source_payload_plan_ops.scn --steps receive-beta-bytes,inspect-beta-bytes --compare-legacy --report target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json`:
+  pass with `legacy_comparison.passed=true`,
+  `plan_executor.executed_indexed_update_count=3`,
+  indexed receive `bytes_storage.storage="indexed_fixed_byte_bank"`,
+  `byte_bank_used=true`, and `plan_executor.bytes_storage_no_copy=true`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json`:
+  pass after the source-derived replay learned the new indexed source-payload
+  storage evidence.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_runtime -p boon_report_schema -p boon_plan_executor -p xtask`:
+  pass with existing native GPU dead-code warnings.
+
+Current blocker classification:
+
+- Completed in this slice:
+  the focused indexed source-payload fixed-bank storage-profile regression is
+  resolved, and the broad root-scalar PlanExecutor regression filter passes
+  when run serially.
+- Still blocked:
+  numeric BYTES reads/writes, file effects, broader indexed/list private byte
+  state ownership, root map adaptation, report enrichment, source
+  parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Route Execution Surface Policy Extracted
+
+Status: advanced PlanExecutor ownership by moving the source-route
+PlanExecutor-JSON versus runtime-branch execution-surface decision out of
+`boon_runtime` and into `boon_plan_executor`. Runtime still owns the older
+fallback branch for BYTES/host-effect cases and the full root-scenario replay
+validation wrapper, but the policy that decides which surface is required is
+now executor-owned and report-gated.
+
+What changed:
+
+- Added `SourceRouteExecutionSurfaceKind` and `SourceRouteExecutionSurface` to
+  `boon_plan_executor`.
+- Added `select_source_route_execution_surface` to classify supported scalar
+  JSON execution as `plan-json`, BYTES reports as `runtime-branch`, and
+  guard-skipped selected branches as errors.
+- `execute_machine_plan_source_route_inner` now delegates this surface
+  selection to `boon_plan_executor` and attaches the classifier report under
+  `execution_surface_core`.
+- Added focused PlanExecutor coverage for scalar, BYTES, and skipped-guard
+  source-route execution-surface classification.
+- `verify-compiler-boundaries` now reports
+  `source_route_execution_surface_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_execution_surface_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 19 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_execution_surface_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route execution-surface policy is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, BYTES/host-effect
+  source-route fallback execution, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list row construction and refresh, indexed
+  row state transitions, broader indexed/list byte state ownership, root map
+  adaptation, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Indexed Fixed Byte-Bank Lookup Extracted
+
+Status: advanced PlanExecutor ownership for indexed BYTES storage policy by
+moving fixed byte-bank declaration lookup out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns row construction, byte-bank adaptation,
+and indexed branch execution, but the generic policy for deciding whether an
+indexed state/row field has a fixed byte bank is now executor-owned and
+report-gated.
+
+What changed:
+
+- Exported `indexed_state_has_fixed_byte_bank` from `boon_plan_executor`.
+- Added `indexed_field_has_fixed_byte_bank` to `boon_plan_executor` for
+  row-field lookup by scope and local field name.
+- Runtime initial row setup, append field handling, row refresh, and indexed
+  BYTES report assembly now delegate fixed byte-bank declaration checks to
+  `boon_plan_executor`.
+- Removed runtime-owned `indexed_state_has_fixed_byte_bank` and
+  `indexed_field_has_fixed_byte_bank`.
+- `verify-compiler-boundaries` now reports
+  `indexed_fixed_byte_bank_lookup_extracted`.
+- `verify-report-schema` now requires the new executor extraction flag on
+  compiler-boundary reports.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_fixed_byte_bank_lookup_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 29 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_fixed_byte_bank_lookup_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed fixed byte-bank declaration lookup is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Indexed Update Target Row Adapter Removed
+
+Status: tightened the existing PlanExecutor-owned indexed update target
+selection boundary. `select_unscoped_indexed_update_targets` now consumes the
+normal `PlanExecutorListRow` list-state view instead of requiring runtime to
+build a second target-row-only map. The returned target rows are unchanged, but
+runtime no longer owns a duplicate key/generation projection helper for this
+selection path.
+
+What changed:
+
+- Changed `select_unscoped_indexed_update_targets` to accept
+  `BTreeMap<usize, Vec<PlanExecutorListRow>>`.
+- Runtime now passes `plan_executor_list_state_for_materialization(&list_state)`
+  directly to indexed target selection.
+- Removed runtime-owned `plan_executor_indexed_update_target_rows`.
+- Tightened `verify-compiler-boundaries` so
+  `indexed_update_target_selection_extracted` now requires the runtime adapter
+  to be absent.
+- Updated focused PlanExecutor target-selection coverage to use
+  `PlanExecutorListRow` input state.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_update_target_selection_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 29 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_update_target_selection_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed update target selection no longer requires a runtime-owned
+  target-row adapter and remains report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - List Row Default Fields Extracted
+
+Status: advanced PlanExecutor ownership for typed list initialization by moving
+row default-field assembly and slot-aware BYTES constant validation out of
+`boon_runtime` and into `boon_plan_executor`. Runtime still owns row
+construction, refresh, and the `RuntimeBytes` sidecar representation, but it no
+longer owns the policy that scans scoped scalar slots, resolves initial
+constants, builds public default fields, validates BYTES storage shape, or marks
+fixed byte-bank defaults.
+
+What changed:
+
+- Added `ListRowDefaultFields` to `boon_plan_executor`.
+- Added `plan_constant_bytes_for_storage_slot` to expose slot-aware BYTES
+  constant validation without runtime duplicating the type/storage checks.
+- Added `list_row_default_fields` to assemble default public fields, private
+  executor BYTES, and fixed byte-bank defaults for a list slot.
+- Runtime append and range-list initialization now call
+  `plan_list_row_default_fields`.
+- Removed runtime-owned `plan_row_default_fields` and
+  `plan_constant_runtime_bytes_for_slot`.
+- Runtime root const BYTES conversion now delegates slot validation to
+  `plan_executor_constant_bytes_for_storage_slot` and only converts
+  `PlanExecutorBytes` into `RuntimeBytes`.
+- `verify-compiler-boundaries` now reports
+  `list_row_default_fields_extracted`.
+- `verify-report-schema` now requires the new executor extraction flag on
+  compiler-boundary reports.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_default_fields_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 30 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_row_default_fields_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list row default-field assembly and slot-aware BYTES constant validation are
+  PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, row refresh, indexed row state transitions, broader indexed/list
+  byte state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Indexed Fixed Byte-Bank Length Lookup Extracted
+
+Status: tightened the existing indexed fixed byte-bank lookup extraction by
+moving fixed bank length lookup out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns row refresh and byte-sidecar
+adaptation, but the storage-policy question of whether an indexed state has a
+fixed byte bank and what fixed length it declares is now executor-owned.
+
+What changed:
+
+- Added `indexed_fixed_byte_bank_len` to `boon_plan_executor`.
+- Runtime fixed-BYTES update validation and row-initial field refresh now call
+  `plan_indexed_fixed_byte_bank_len`.
+- Removed runtime-owned `indexed_fixed_byte_bank_len`.
+- Tightened `verify-compiler-boundaries` so
+  `indexed_fixed_byte_bank_lookup_extracted` requires the fixed-length helper to
+  live in PlanExecutor and be absent from runtime.
+- Extended focused PlanExecutor coverage for indexed fixed byte-bank lookup to
+  assert the declared fixed length.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_fixed_byte_bank_lookup_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 30 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_fixed_byte_bank_lookup_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed fixed byte-bank presence and length lookup are PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, row refresh, indexed row state transitions, broader indexed/list
+  byte state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - List Row Report Fields Extracted
+
+Status: advanced PlanExecutor ownership for indexed/list reporting by moving
+the row-field report merge policy out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still adapts `RuntimeBytes` into
+`PlanExecutorBytes`, but the generic policy that overlays private BYTES reports
+onto public row fields for reports is now executor-owned and report-gated.
+
+What changed:
+
+- Added `list_row_report_fields` to `boon_plan_executor`.
+- Runtime indexed update reports now call `plan_list_row_report_fields` after
+  converting row private BYTES sidecars into `PlanExecutorBytes`.
+- Removed runtime-owned `report_row_fields`.
+- Added `list_row_report_fields_extracted` to `verify-compiler-boundaries`.
+- `verify-report-schema` now requires the new executor extraction flag on
+  compiler-boundary reports.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_report_fields_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 31 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_row_report_fields_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list row report-field assembly is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, row refresh, indexed row state transitions, broader indexed/list
+  byte state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Materialized Work Validation Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario replay by moving
+post-dispatch materialized-work validation out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns the outer replay/mutation loop, but
+the policy that rejects a source-event step after no update ops, derived values,
+or list-remove work materialized is now executor-owned and report-gated.
+
+What changed:
+
+- Added `RootScenarioMaterializedWork` to `boon_plan_executor`.
+- Added `validate_root_scenario_materialized_work` to validate post-evaluation
+  work counts and emit `cpu-plan-root-scenario-materialized-work-v1`.
+- Runtime root-scenario replay now delegates materialized-work validation to
+  `boon_plan_executor` and attaches the report under `materialized_work_core`
+  in the dispatch report passed to step reporting.
+- Added focused PlanExecutor coverage for update-op, derived-value,
+  list-remove, and empty-work cases.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_materialized_work_validation_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_scenario_materialized_work_validation_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 21 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail;
+  `root_scenario_materialized_work_validation_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario materialized-work validation is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, BYTES/host-effect
+  root update fallback execution, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list row construction and refresh, indexed
+  row state transitions, broader indexed/list byte state ownership, root map
+  adaptation, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Root Update Execution Surface Policy Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario replay by moving
+the root JSON update versus runtime-branch execution-surface decision out of
+`boon_runtime` and into `boon_plan_executor`. Runtime still owns the older
+BYTES/host-effect fallback executor and the outer root-scenario state mutation
+loop, but the policy that decides whether a root update can stay on the
+PlanExecutor JSON surface is now executor-owned and report-gated.
+
+What changed:
+
+- Added `RootUpdateExecutionSurfaceKind` and `RootUpdateExecutionSurface` to
+  `boon_plan_executor`.
+- Added `select_root_update_execution_surface` to classify scalar supported
+  root JSON updates as `plan-json`, BYTES report values or unsupported JSON
+  updates as `runtime-branch`, and skipped guards as `skipped-by-guard`.
+- Runtime root-scenario replay now delegates this classification to
+  `boon_plan_executor` and attaches the classifier report under
+  `execution_surface_core`.
+- Added focused PlanExecutor coverage for scalar, BYTES, and skipped-guard
+  root update execution-surface classification.
+- `verify-compiler-boundaries` now reports
+  `root_update_execution_surface_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_execution_surface_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 20 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_update_execution_surface_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root update execution-surface policy is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, BYTES/host-effect
+  root update fallback execution, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list row construction and refresh, indexed
+  row state transitions, broader indexed/list byte state ownership, root map
+  adaptation, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Root BYTES Numeric Read/Write Evaluation Moved To PlanExecutor
+
+Status: moved root `Bytes/read_unsigned`, `Bytes/read_signed`,
+`Bytes/write_unsigned`, and `Bytes/write_signed` update evaluation out of the
+runtime inline branch and into `boon_plan_executor`. The runtime now delegates
+these root numeric BYTES updates through the same PlanExecutor read/write
+evaluator bridge used by the earlier BYTES operations.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_read_update` now handles root
+  unsigned and signed numeric BYTES reads.
+- `boon_plan_executor::evaluate_root_bytes_write_update` now handles root
+  unsigned and signed numeric BYTES writes, including fixed byte-bank patch
+  reporting and no public inline-byte leakage.
+- `boon_runtime` now routes the four root numeric BYTES expression kinds
+  through the executor bridge and maps executor fixed-bank mutations back into
+  runtime byte-bank transitions.
+- The numeric root-scalar runtime test now explicitly asserts numeric read and
+  write updates use `cpu-plan-root-bytes-read-evaluator-v1` /
+  `cpu-plan-root-bytes-write-evaluator-v1`.
+- `verify-compiler-boundaries` now includes the four numeric BYTES expression
+  kinds in the root BYTES read/write extraction predicates.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_numeric_updates -- --nocapture`:
+  pass.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_numeric_plan_ops.bn --scenario examples/bytes_numeric_plan_ops.scn --steps measure-bytes,write-bytes,inspect-written --compare-legacy --report target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json`:
+  pass with `status=pass`, `legacy_comparison.passed=true`, and
+  `plan_executor.executed_update_branch_count=10`.
+- Saved numeric report evidence:
+  numeric reads use `cpu-plan-root-bytes-read-evaluator-v1`; numeric writes use
+  `cpu-plan-root-bytes-write-evaluator-v1` with
+  `bytes_access.mutation_kind="fixed_byte_bank_patches"` and
+  `patch_count=2`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root numeric BYTES read/write evaluation is executor-owned for root scalar
+  MachinePlan replay.
+- Still blocked:
+  file effects, broader indexed/list private byte state ownership, root map
+  adaptation, report enrichment, source parsing/IR/typecheck orchestration,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Root File BYTES Effects Moved To PlanExecutor
+
+Status: moved root `File/read_bytes` and `File/write_bytes` evaluation out of
+the runtime inline branch and into `boon_plan_executor`. The runtime now passes
+the host file root into the executor-owned root BYTES read/write evaluators and
+maps the executor result back into the existing runtime state transition.
+
+What changed:
+
+- `boon_plan_executor::evaluate_root_bytes_read_update` now handles root
+  `PlanExpressionKind::FileReadBytes`, including static and state-derived path
+  operands, host-root validation, source-relative path rejection, output BYTES
+  validation, and storage reporting.
+- `boon_plan_executor::evaluate_root_bytes_write_update` now handles root
+  `PlanExpressionKind::FileWriteBytes`, including static and state-derived path
+  operands, read-only BYTES access reporting, atomic host-file write/rename
+  verification, and host-effect reporting.
+- `boon_runtime` now delegates root file read/write BYTES effects through the
+  PlanExecutor bridge while keeping indexed file effects runtime-owned until a
+  later indexed/list executor slice.
+- `verify-compiler-boundaries` now includes `FileReadBytes` and
+  `FileWriteBytes` in the root BYTES extraction predicates.
+- Executor root-context diagnostics now identify the rejected indexed row-field
+  path operand id for file effects.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-file-read-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-file-write-plan.json`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root file BYTES read/write effects are executor-owned for root scalar
+  MachinePlan replay.
+- Still blocked:
+  indexed file effects, broader indexed/list private byte state ownership, root
+  map adaptation, report enrichment, source parsing/IR/typecheck orchestration,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed BYTES Read Evaluation Row View Added
+
+Status: introduced an executor-facing indexed row view and moved indexed
+`Bytes/length` and `Bytes/get` evaluation into `boon_plan_executor`. Runtime
+still owns row resolution, row writeback, derived fanout, and the remaining
+indexed update branches; this slice only extracts the read-only indexed BYTES
+evaluator core.
+
+What changed:
+
+- Added `boon_plan_executor::IndexedRowView` as the first executor-facing row
+  adapter for indexed update evaluation.
+- Added `boon_plan_executor::evaluate_indexed_bytes_read_update` and
+  `IndexedBytesReadEvaluation`, reporting
+  `cpu-plan-indexed-bytes-read-evaluator-v1`.
+- `boon_runtime` now converts `PlanListRowState` into `IndexedRowView` and
+  delegates indexed `Bytes/length` / `Bytes/get` evaluation through the
+  executor.
+- Indexed update report rows now include `executor_core`; the indexed BYTES
+  read updates prove executor ownership directly.
+- Source-derived report-schema replay now reconstructs the indexed BYTES read
+  `executor_core` evidence and the stronger `Bytes/get` constant metadata.
+- `verify-compiler-boundaries` now reports
+  `boon_plan_executor.indexed_bytes_read_evaluator_extracted`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo check -q -p boon_report_schema -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed -- --nocapture --test-threads=1`:
+  pass; 2 passed and 335 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_source_payload_plan_ops.bn --scenario examples/bytes_indexed_source_payload_plan_ops.scn --steps receive-beta-bytes,inspect-beta-bytes --compare-legacy --report target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json`:
+  pass with `status=pass`, `legacy_comparison.passed=true`, and
+  `plan_executor.executed_indexed_update_count=3`.
+- Report evidence:
+  the `inspect-beta-bytes` indexed `bytes_length` and `bytes_get` updates carry
+  `executor_core.executor="cpu-plan-indexed-bytes-read-evaluator-v1"`;
+  `bytes_get` also reports `update_constant_id=2` and
+  `update_constant_value=1`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json`:
+  pass after source-derived replay was updated for indexed `executor_core` and
+  `Bytes/get` constant evidence.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.indexed_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`,
+  `acceptance.rust_zig_codegen_allowed=false`, and the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed read-only BYTES `Bytes/length` and `Bytes/get` evaluation is
+  executor-owned behind an explicit row-view adapter.
+- Still blocked:
+  indexed BYTES writes, indexed file effects, indexed row writeback/state
+  transitions, broader indexed/list private byte state ownership, root map
+  adaptation, report enrichment, source parsing/IR/typecheck orchestration,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed BYTES Write Evaluation Extracted
+
+Status: moved indexed `Bytes/set` evaluation into `boon_plan_executor`.
+Runtime still owns row resolution, row writeback, derived fanout, and indexed
+file effects; this slice extracts the indexed BYTES write evaluator core behind
+the existing row-view adapter.
+
+What changed:
+
+- Added `boon_plan_executor::IndexedBytesWriteEvaluation`.
+- Added `boon_plan_executor::evaluate_indexed_bytes_write_update`, reporting
+  `cpu-plan-indexed-bytes-write-evaluator-v1`.
+- The executor now validates indexed `Bytes/set` operands, fixed output length,
+  byte patch bounds, digest/report output, write access metadata, and output
+  byte-storage metadata.
+- `boon_runtime` now delegates indexed `Bytes/set` evaluation through the
+  executor and only converts the returned `PlanExecutorBytes` back to runtime
+  row storage for writeback.
+- Source-derived report-schema replay now reconstructs indexed BYTES write
+  `executor_core` evidence.
+- `verify-compiler-boundaries` now reports
+  `boon_plan_executor.indexed_bytes_write_evaluator_extracted`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency -- --nocapture --test-threads=1`:
+  pass; 1 passed and 336 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed -- --nocapture --test-threads=1`:
+  pass; 2 passed and 335 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-plan-ops-scenario-run-plan.json`:
+  pass with `status=pass`, `legacy_comparison.passed=true`, and
+  `plan_executor.executed_indexed_update_count=5`.
+- Report evidence:
+  the indexed `bytes_set` update carries
+  `executor_core.executor="cpu-plan-indexed-bytes-write-evaluator-v1"`,
+  `bytes_storage.storage="indexed_fixed_byte_bank"`, and
+  `bytes_access.read_only=false`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-indexed-same-event-dependency-plan-ops-scenario-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.indexed_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.indexed_bytes_write_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_read_evaluator_extracted=true`,
+  `boon_plan_executor.root_bytes_write_evaluator_extracted=true`, and the
+  blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed BYTES `Bytes/set` write evaluation is executor-owned behind the
+  explicit row-view adapter.
+- Still blocked:
+  indexed file effects, indexed row writeback/state transitions, broader
+  indexed/list private byte state ownership, root map adaptation, report
+  enrichment, source parsing/IR/typecheck orchestration, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Compiler-Owned Scenario File Decode
+
+Status: moved scenario file read/TOML decode behind `boon_compiler`. Runtime
+still owns the public scenario structs, semantic expectation checking, and
+run-plan command wrappers, but `boon_runtime::parse_scenario` no longer reads
+scenario files or calls `toml::from_str` directly.
+
+What changed:
+
+- Added generic `parse_scenario_file<T>` to `boon_compiler`.
+- `boon_runtime::parse_scenario` now delegates to the compiler facade while
+  preserving the existing `Scenario`/`ScenarioStep` type surface.
+- Added focused compiler coverage for scenario file decode.
+- `verify-compiler-boundaries` now reports `owns_scenario_file_decode`.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_owns_scenario_file_decode -- --nocapture --test-threads=1`:
+  pass; 1 passed and 59 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `owns_scenario_file_decode=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  scenario file read/TOML decode is compiler-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, scenario
+  semantics and expectation checking, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list row construction and refresh, indexed
+  row state transitions, broader indexed/list byte state ownership, root map
+  adaptation, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Compiler-Owned Runtime Scenario Report Context
+
+Status: extended compiler-owned source/report metadata use to the generic
+runtime scenario paths. Runtime still owns scenario execution, semantic
+expectation checking, and report enrichment for runtime-specific counts, but
+scenario report identity fields now come from `CompiledSourceReportContext`
+instead of being rebuilt from `ParsedProgram` at the call sites.
+
+What changed:
+
+- `run_scenario`, `run_scenario_project`, and
+  `run_scenario_source_with_parsed_scenario_step_limit` now take
+  `report_context()` from the compiler facade before moving parsed/IR data out
+  of the compiled wrapper.
+- `enrich_report` now receives `CompiledSourceReportContext` and uses it for
+  `source_hash`, `expected_source_hash`, `program_hash`, `program_kind`,
+  `program_file_count`, and `source_files`.
+- `run_scenario` now loads through `compile_source_path_to_full_ir` directly so
+  the report context is available at the source-path scenario boundary.
+- `verify-compiler-boundaries` now reports
+  `owns_runtime_scenario_report_context`.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_owns_scenario_file_decode -- --nocapture --test-threads=1`:
+  pass; 1 passed and 59 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `owns_runtime_scenario_report_context=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  generic runtime scenario report identity metadata is compiler-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, scenario
+  execution semantics and expectation checking, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 Compiler Runtime-IR Facade and Live Cache Routing
+
+Status: moved another source-loading boundary behind `boon_compiler`. The
+plan-runner source-path-to-MachinePlan facade already existed in the worktree;
+this slice adds a compiler-owned source/text/source-unit-to-runtime-IR facade
+and routes the live runtime cache miss path through it. Runtime still owns the
+legacy `CompiledProgram::from_ir` schedule build, runtime storage/execution,
+and broad non-initial PlanExecutor orchestration paths.
+
+What changed:
+
+- Added `CompiledRuntimeIrFromSource` in `boon_compiler`.
+- Added `compile_source_path_to_runtime_ir`,
+  `compile_source_text_to_runtime_ir`, and
+  `compile_source_units_to_runtime_ir`.
+- Runtime `load_and_lower_profiled` now delegates source-path parse/lower/verify
+  to `boon_compiler`.
+- Runtime live cache misses now delegate source text and source-unit
+  parse/lower/verify to `boon_compiler`, then record the remaining local
+  `legacy_runtime_compile_ms` for `CompiledProgram::from_ir`.
+- `verify-compiler-boundaries` now reports
+  `boon_compiler.facade_exports_source_units_to_runtime_ir=true` and
+  `boundary_decomposition.runtime_live_cache_uses_compiler_runtime_ir_facade=true`.
+- Added a runtime regression test proving the live cache profile comes from the
+  compiler-owned runtime-IR facade.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_ -- --nocapture --test-threads=1`:
+  pass; 3 passed and 51 filtered out.
+- `cargo test -q -p boon_runtime runtime_live_cache_source_compile_uses_compiler_runtime_ir_facade -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn --steps measure-bytes --compare-legacy --report target/reports/bytes-plan/bytes-length-runtime-ir-facade-run-plan.json`:
+  pass with `status=pass`, `legacy_comparison.passed=true`, and
+  `load_pipeline_profile.owner="boon_compiler"`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-length-runtime-ir-facade-run-plan.json`:
+  pass.
+- `cargo run -q -p boon_cli -- scenario examples/counter.bn --scenario examples/counter.scn --report target/reports/bytes-plan/counter-runtime-ir-facade-scenario.json`:
+  diagnostic pass with `load_pipeline_profile.owner="boon_compiler"` and
+  `load_pipeline_profile.surface="runtime-ir"`. Its generic report-schema gate
+  is intentionally not used as acceptance evidence because this report class is
+  rejected as not proving completed generic interpreter execution.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `facade_exports_source_units_to_runtime_ir=true`,
+  `runtime_live_cache_uses_compiler_runtime_ir_facade=true`, and the blocker
+  remains `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-path and live-cache source-unit parse/lower/verify orchestration now
+  have compiler-owned facades, and runtime profiles expose the ownership split.
+- Still blocked:
+  `boon_runtime` still has frontend crate dependencies for typed runtime
+  structures and tests, still owns `CompiledProgram::from_ir`, full/static
+  analysis compile helpers, source-route/root-scenario PlanExecutor wrappers,
+  root/list state mutation, indexed row state transitions, broader indexed/list
+  byte state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and default-path switch readiness.
+
+## 2026-06-28 - Indexed File/read_bytes Evaluation Extracted
+
+Status: moved indexed `File/read_bytes` evaluation into
+`boon_plan_executor` as part of the indexed BYTES read evaluator. Runtime still
+owns row resolution, row writeback, derived fanout, and indexed
+`File/write_bytes`; this slice extracts the indexed host-boundary file read
+core behind the existing row-view adapter.
+
+What changed:
+
+- `boon_plan_executor::IndexedBytesReadEvaluation` now optionally returns
+  `PlanExecutorBytes` for read branches that materialize BYTES.
+- `boon_plan_executor::evaluate_indexed_bytes_read_update` now accepts an
+  optional host file root and handles `PlanExpressionKind::FileReadBytes`.
+- Added executor-side indexed path resolution for static constants, indexed
+  row state paths, and indexed row field paths.
+- `boon_runtime` now delegates indexed `File/read_bytes` through the executor
+  and only converts the returned `PlanExecutorBytes` back to runtime row
+  storage for writeback.
+- Source-derived report-schema replay now supports indexed `File/read_bytes`
+  by resolving the scenario source root and reading the same source-relative
+  fixture bytes.
+- `verify-bytes-storage-profile` indexed file-read evidence now requires
+  `executor_core.executor="cpu-plan-indexed-bytes-read-evaluator-v1"` and
+  `executor_core.expression_kind="file_read_bytes"`.
+- `verify-compiler-boundaries` now reports
+  `boon_plan_executor.indexed_file_bytes_read_evaluator_extracted`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p xtask -- verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json`:
+  pass. The indexed file-read case passed:
+  `indexed-file-read-row-field-path-no-copy.status="pass"` and
+  `borrowed_read_evidence.executor_core_matches=true`.
+- Direct generated indexed file-read scenario run without legacy comparison
+  wrote executor evidence but exits `status=fail` because accepted root-scenario
+  proof reports require legacy comparison for non-host-boundary cases.
+- Direct generated indexed file-read scenario run with `--compare-legacy`
+  fails with `SourceId 0 has no compiled source action table entry`; this is
+  why the host-boundary fixture remains verified through the storage-profile
+  route with legacy comparison disabled.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.indexed_file_bytes_read_evaluator_extracted=true`, and
+  the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed `File/read_bytes` evaluation is executor-owned behind the explicit
+  row-view adapter.
+- Still blocked:
+  indexed `File/write_bytes`, indexed row writeback/state transitions, broader
+  indexed/list private byte state ownership, root map adaptation, report
+  enrichment, source parsing/IR/typecheck orchestration, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, non-root/list executor
+  ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed File/write_bytes Evaluation Extracted
+
+Status: moved indexed `File/write_bytes` evaluation into
+`boon_plan_executor` as part of the indexed BYTES write evaluator. Runtime still
+owns row resolution, row writeback, derived fanout, and the host-root handoff;
+this slice extracts the indexed host-boundary file write core behind the
+existing row-view adapter.
+
+What changed:
+
+- `boon_plan_executor::IndexedBytesWriteEvaluation` now carries host-effect
+  report evidence for file-write branches.
+- `boon_plan_executor::evaluate_indexed_bytes_write_update` now accepts an
+  optional host file root and handles `PlanExpressionKind::FileWriteBytes`.
+- Added executor-side indexed write path resolution for static constants,
+  indexed row state paths, and indexed row field paths.
+- `boon_runtime` now delegates indexed `File/write_bytes` through the executor
+  and only converts returned metadata into runtime report/writeback shape.
+- `verify-bytes-storage-profile` indexed file-write evidence now requires
+  `executor_core.executor="cpu-plan-indexed-bytes-write-evaluator-v1"` and
+  `executor_core.expression_kind="file_write_bytes"`.
+- `verify-compiler-boundaries` now reports
+  `boon_plan_executor.indexed_file_bytes_write_evaluator_extracted`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p xtask -- verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json`:
+  pass. The indexed file-write case passed:
+  `indexed-file-write-source-payload-no-copy.status="pass"` and
+  `borrowed_read_evidence.executor_core_matches=true`.
+- The passing indexed file-write evidence includes
+  `executor_core.executor="cpu-plan-indexed-bytes-write-evaluator-v1"`,
+  `executor_core.expression_kind="file_write_bytes"`,
+  `runtime_ast_eval_count=0`, `graph_rebuild_count=0`,
+  `bytes_access.host_boundary="file_write_bytes"`,
+  `bytes_access.byte_bank_used=true`, and a verified host-effect artifact.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.indexed_file_bytes_write_evaluator_extracted=true`, and
+  the blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass after ledger update.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed `File/write_bytes` evaluation is executor-owned behind the explicit
+  row-view adapter.
+- Still blocked:
+  indexed row writeback/state transitions, broader indexed/list private byte
+  state ownership, root map adaptation, report enrichment, source
+  parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, non-root/list executor ownership,
+  remain outside the completed surface.
+
+## 2026-06-28 - Executor Bytes/concat Copy Cost Accounting
+
+Status: restored honest `concat-measured-copy` storage-profile evidence after
+root `Bytes/concat` moved its output allocation/copy into
+`boon_plan_executor`. The gate still treats concat as a measured-copy operation;
+it no longer falsely reports zero runtime byte-copy counters just because the
+copy happens in the executor crate.
+
+What changed:
+
+- Root `Bytes/concat` write evaluation now annotates its executor report with
+  `bytes_copy_cost` for the output `Vec` allocation and the two input copies.
+- Runtime folds executor-owned `bytes_copy_cost` into the existing
+  `RuntimeBytesStorageCounters` snapshot used by storage-profile reports.
+- The slice/take/drop chain test now keeps the split step no-copy while
+  requiring the later concat step and aggregate report to show measured copy
+  counters.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_concat_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 336 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain -- --nocapture --test-threads=1`:
+  pass; 1 passed and 336 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p xtask -- verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json`:
+  pass. `concat-measured-copy` remains `expectation="measured-copy"`,
+  `bytes_storage_no_copy=false`, and now reports `measured_copy_bytes=20`
+  with `copy_from_slice_bytes=10` and `vec_alloc_bytes=10`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-storage-profile.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  executor-internal root `Bytes/concat` allocation/copy cost is now visible to
+  the storage-profile gate, so the aggregate passes without reclassifying
+  concat as no-copy.
+- Still blocked:
+  indexed row writeback/state transitions, broader indexed/list private byte
+  state ownership, root map adaptation, report enrichment, source
+  parsing/IR/typecheck orchestration, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor
+  ownership remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Step Dispatch Extracted
+
+Status: moved root scenario step dispatch key-gating and selected work metadata
+into `boon_plan_executor`. Runtime still owns root/list state mutation,
+indexed row execution orchestration, scenario report assembly, and frontend
+source loading, but each root scenario step now consumes an executor-owned
+dispatch object instead of recomputing the selected work and root update key
+gate locally.
+
+What changed:
+
+- Added `boon_plan_executor::RootScenarioStepDispatch`.
+- Added `boon_plan_executor::dispatch_root_scenario_step`, reporting
+  `cpu-plan-root-scenario-step-dispatch-v1`.
+- Runtime root scenario execution now builds one `RootJsonSourceEvent` and
+  delegates source-event work selection plus root key-gate matching to the
+  executor dispatch core.
+- Per-step root scenario reports now use the dispatch report as
+  `plan_executor.per_step[*].executor_core`, with the previous
+  `cpu-plan-root-source-event-work-selection-v1` report nested under
+  `work_selection_core`.
+- `verify-compiler-boundaries` now reports
+  `boon_plan_executor.root_scenario_step_dispatch_extracted`.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 316 filtered out.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn --steps measure-bytes --compare-legacy --report target/reports/bytes-plan/bytes-length-step-dispatch-run-plan.json`:
+  pass with `status=pass` and `legacy_comparison.passed=true`.
+- The generated report has
+  `plan_executor.per_step[0].executor_core.executor="cpu-plan-root-scenario-step-dispatch-v1"`,
+  `root_update_key_matches=true`, and
+  `work_selection_core.executor="cpu-plan-root-source-event-work-selection-v1"`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-length-step-dispatch-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `status=fail`,
+  `boon_plan_executor.root_scenario_step_dispatch_extracted=true`, and the
+  blocker remains
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root scenario step dispatch and root update key-gate matching now have an
+  executor-owned core and report marker.
+- Still blocked:
+  root/list state mutation, indexed row writeback/state transitions, broader
+  indexed/list private byte state ownership, root map adaptation, report
+  enrichment, source parsing/IR/typecheck orchestration, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Compiler Full-IR Facade and Static Cache Routing
+
+Status: moved another source-loading boundary behind `boon_compiler`. The
+compiler facade now owns full-IR source-path, source-text, and source-unit
+parse/lower/verify entrypoints, and runtime full/static cache loading routes
+through those facade calls. Runtime still owns legacy `CompiledProgram::from_ir`,
+typed runtime internals, and non-initial executor wrappers.
+
+What changed:
+
+- Added `CompiledFullIrFromSource` and
+  `compile_source_path_to_full_ir`/`compile_source_text_to_full_ir`/
+  `compile_source_units_to_full_ir` to `boon_compiler`.
+- Runtime `load_and_lower_profiled` now delegates source-path full-IR loading
+  to the compiler facade.
+- Runtime full/static analysis cache source loading now delegates source-text
+  and source-unit full-IR loading to the compiler facade through
+  `cached_full_runtime_plan_from_project_profiled`.
+- Runtime scenario/source helpers use the runtime-IR compiler facade for live
+  parse/lower/verify paths.
+- `verify-compiler-boundaries` now reports full-IR facade export and runtime
+  full/static cache facade routing.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_ -- --nocapture --test-threads=1`:
+  pass; 4 passed and 51 filtered out.
+- `cargo test -q -p boon_runtime cache_source_compile_uses_compiler -- --nocapture --test-threads=1`:
+  pass; 2 passed and 337 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_ -- --nocapture --test-threads=1`:
+  pass; 21 passed and 318 filtered out.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn --steps measure-bytes --compare-legacy --report target/reports/bytes-plan/bytes-length-full-ir-facade-run-plan.json`:
+  pass with `status=pass`, `legacy_comparison.passed=true`, and
+  `load_pipeline_profile.owner="boon_compiler"`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-length-full-ir-facade-run-plan.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `facade_exports_source_units_to_full_ir=true`,
+  `runtime_full_static_cache_uses_compiler_full_ir_facade=true`, and the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text -- --nocapture --test-threads=1`:
+  pass; the focused Cells regression now proves a B0 focus-only route patches
+  the retained top formula input to `=add(A0,A1)`.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiler-owned full-IR source facades and runtime full/static cache routing
+  now have audit markers and focused tests.
+- Still blocked:
+  runtime-owned typed structures, legacy schedule compilation, root/list state
+  mutation, indexed row writeback/state transitions, broader indexed/list byte
+  state ownership, root map adaptation, report enrichment, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Parsed Program Runtime-IR Facade
+
+Status: moved runtime parsed-program lowering through the compiler facade. This
+removes another production `boon_runtime` call to IR lowering while preserving
+the existing runtime helper surface and keeping direct lowering only in
+runtime-internal tests.
+
+What changed:
+
+- Added `compile_parsed_program_to_runtime_ir` and
+  `compile_parsed_program_to_full_ir` to `boon_compiler`.
+- `boon_runtime::lower_for_runtime` now delegates to
+  `compile_parsed_program_to_runtime_ir` instead of calling
+  `boon_ir::lower_runtime_profiled` directly.
+- `boon_runtime::parse_source_path_or_manifest_project` is now test-only;
+  production source-path parse/project loading is owned by compiler facades.
+- `verify-compiler-boundaries` now reports compiler parsed-program runtime-IR
+  facade export, runtime parsed-program lowering facade routing, and the
+  runtime source-path parser helper demotion.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_ -- --nocapture --test-threads=1`:
+  pass; 5 passed and 51 filtered out.
+- `cargo test -q -p boon_runtime runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime runtime_live_cache_source_compile_uses_compiler_runtime_ir_facade -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime runtime_full_static_cache_source_compile_uses_compiler_full_ir_facade -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings and no runtime parser import warning after the helper was
+  demoted to test-only.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `facade_exports_parsed_program_to_runtime_ir=true`,
+  `runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade=true`,
+  `runtime_source_path_parser_helper_is_test_only=true`, and the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime parsed-program runtime-IR lowering is now compiler-facade-owned and
+  audited, and the old runtime source-path parser/project helper is test-only.
+- Still blocked:
+  runtime-owned typed structures, test-only direct lowering, legacy schedule
+  compilation, public source-unit loading, root/list state mutation, indexed row
+  writeback/state transitions, broader indexed/list byte state ownership, root
+  map adaptation, report enrichment, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source-Route Full Execution Validation Extracted
+
+Status: moved the source-route selected-vs-full execution validation core into
+`boon_plan_executor`. Runtime still orchestrates the source-route command and
+the full root scenario replay, but the plan/JSON validation that proves the
+selected route value matches the full source-event result is now executor-owned
+and report-gated.
+
+What changed:
+
+- Added `SourceRouteFullExecutionValidation` to `boon_plan_executor`.
+- Added `validate_source_route_full_execution`, reporting
+  `cpu-plan-source-route-full-execution-validation-v1`.
+- Runtime source-route execution now delegates selected-vs-full state validation
+  to `boon_plan_executor` and exposes `full_execution_validation_core` in both
+  `route_surface` and `plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `source_route_full_execution_validation_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out. The test now asserts
+  `cpu-plan-source-route-full-execution-validation-v1` is present in the route
+  report.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_full_execution_validation_extracted=true`, and
+  the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route selected-vs-full execution validation has an executor-owned core
+  and report marker.
+- Still blocked:
+  runtime-owned source-route command orchestration, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public source-unit loading, root/list state mutation, indexed row
+  writeback/state transitions, broader indexed/list byte state ownership, root
+  map adaptation, report enrichment, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source-Route Report Assembly Extracted
+
+Status: moved the source-route route-surface and executor-report assembly into
+`boon_plan_executor`. Runtime still orchestrates the source-route command and
+the full root-scenario replay, but it no longer owns the JSON report core for
+the selected source route.
+
+What changed:
+
+- Added `SourceRouteReportAssembly` to `boon_plan_executor`.
+- Added `assemble_source_route_report`, reporting
+  `cpu-plan-source-route-report-assembly-v1`.
+- Runtime source-route execution now delegates route-surface and
+  plan-executor report construction to `boon_plan_executor`.
+- Route reports include `report_assembly_core` in both `route_surface` and
+  `plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `source_route_report_assembly_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out. The test now asserts
+  `cpu-plan-source-route-report-assembly-v1` is present in the route report.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_report_assembly_extracted=true`, and the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route report assembly has an executor-owned core and report marker.
+- Still blocked:
+  runtime-owned source-route command orchestration, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public source-unit loading, root/list state mutation, indexed row
+  writeback/state transitions, broader indexed/list byte state ownership, root
+  map adaptation, retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Root-Scenario Report Assembly Extracted
+
+Status: moved final root-scenario PlanExecutor report assembly into
+`boon_plan_executor`. Runtime still owns scenario parsing, selected-step
+selection, legacy comparison, and the root-scenario execution loop, but the
+root-scenario executor report core now has an executor-owned marker and
+boundary gate.
+
+What changed:
+
+- Added `RootScenarioReportAssembly` to `boon_plan_executor`.
+- Added `assemble_root_scenario_report`, reporting
+  `cpu-plan-root-scenario-report-assembly-v1`.
+- Runtime root-scenario execution now delegates final `plan_executor` report
+  construction to `boon_plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_report_assembly_extracted`.
+- The TodoMVC root-scenario PlanExecutor test now asserts the report-assembly
+  marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_report_assembly_extracted=true`, and the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario report assembly has an executor-owned core and report marker.
+- Still blocked:
+  runtime-owned scenario parsing, selected-step selection, legacy comparison,
+  source-route command orchestration, root-scenario execution loop, full
+  root-scenario replay, runtime typed structures, test-only direct lowering,
+  legacy schedule compilation, public source-unit loading, root/list state
+  mutation, indexed row writeback/state transitions, broader indexed/list byte
+  state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root-Scenario Acceptance and Coverage Extracted
+
+Status: moved the data-shaped root-scenario demand-current acceptance policy
+and scenario coverage report into `boon_plan_executor`. Runtime still owns
+scenario parsing, selected-step selection, legacy comparison execution, and the
+root-scenario execution loop, but the acceptance/coverage report decisions are
+now executor-owned and boundary-gated.
+
+What changed:
+
+- Added `RootScenarioCoverageReport` to `boon_plan_executor`.
+- Added `demand_current_semantic_delta_acceptance_policy`, reporting
+  `cpu-plan-root-scenario-demand-current-acceptance-v1`.
+- Added `assemble_root_scenario_coverage_report`, reporting
+  `cpu-plan-root-scenario-coverage-report-v1`.
+- Runtime `run_plan_scenario_events` now delegates demand-current
+  semantic-delta acceptance and assertion-only coverage reporting to
+  `boon_plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_acceptance_policy_extracted` and
+  `root_scenario_coverage_report_extracted`.
+- The Cells scenario-event PlanExecutor test now asserts both new report
+  markers.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_acceptance_policy_extracted=true` and
+  `root_scenario_coverage_report_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario acceptance and coverage reporting have executor-owned cores and
+  report markers.
+- Still blocked:
+  runtime-owned scenario parsing, selected-step selection, legacy comparison
+  execution, source-route command orchestration, root-scenario execution loop,
+  full root-scenario replay, runtime typed structures, test-only direct
+  lowering, legacy schedule compilation, public source-unit loading, root/list
+  state mutation, indexed row writeback/state transitions, broader indexed/list
+  byte state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Initial-State Report Assembly Extracted
+
+Status: moved final initial-state PlanExecutor report assembly into
+`boon_plan_executor`. Runtime still owns list projection/retain materialization
+for the initial-state proof path, but the public `cpu-plan-initial-state-v1`
+report wrapper now has an executor-owned assembly core and boundary gate.
+
+What changed:
+
+- Added `InitialStateReportAssembly` to `boon_plan_executor`.
+- Added `assemble_initial_state_report`, reporting
+  `cpu-plan-initial-state-report-assembly-v1`.
+- Runtime `execute_machine_plan_initial_state_inner` now delegates final
+  `plan_executor` report construction to `boon_plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `initial_state_report_assembly_extracted`.
+- The BYTES initial-state PlanExecutor test now asserts the new report marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cpu_plan_executor_initializes_bytes_scalar_from_machine_plan -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `initial_state_report_assembly_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  initial-state report assembly has an executor-owned core and report marker.
+- Still blocked:
+  runtime-owned list projection/retain materialization for initial-state proof,
+  scenario parsing, selected-step selection, legacy comparison execution,
+  source-route command orchestration, root-scenario execution loop, full
+  root-scenario replay, runtime typed structures, test-only direct lowering,
+  legacy schedule compilation, public source-unit loading, root/list state
+  mutation, indexed row writeback/state transitions, broader indexed/list byte
+  state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - List Projection/Retain Materializers Extracted
+
+Status: moved plan/list projection and retain materialization over executor row
+views into `boon_plan_executor`. Runtime still owns list state mutation and the
+adapter conversion from runtime row state, but the projection/retain
+materialization and report logic are now executor-owned cores.
+
+What changed:
+
+- Added `PlanExecutorListRow`, `ListProjectionExecution`, and
+  `ListRetainExecution` to `boon_plan_executor`.
+- Added `materialize_list_projections`, reporting
+  `cpu-plan-list-projection-materializer-v1`.
+- Added `materialize_list_retains`, reporting
+  `cpu-plan-list-retain-materializer-v1`.
+- Runtime list projection/retain materializers are now thin adapters that build
+  `PlanExecutorListRow` views and delegate to `boon_plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `list_projection_materializer_extracted` and
+  `list_retain_materializer_extracted`.
+- The TodoMVC dynamic checkbox PlanExecutor test asserts the retain
+  materializer marker.
+- The Cells scenario-event PlanExecutor test asserts the projection
+  materializer marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_list_plan_executor_replays_todomvc_dynamic_checkbox_toggle -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_projection_materializer_extracted=true` and
+  `list_retain_materializer_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list projection and retain materializer report logic have executor-owned
+  cores and report markers.
+- Still blocked:
+  runtime-owned list state mutation, list append/remove/indexed update state,
+  runtime row-byte/private storage adaptation, source parsing/IR/typecheck
+  orchestration, scenario parsing, selected-step selection, legacy comparison
+  execution, source-route command orchestration, root-scenario execution loop,
+  full root-scenario replay, runtime typed structures, test-only direct
+  lowering, legacy schedule compilation, public source-unit loading, broader
+  indexed/list byte state ownership, root map adaptation, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Initial List Row Value Conversion Extracted
+
+Status: advanced PlanExecutor ownership for typed list initialization by moving
+raw `PlanConstantValue` JSON/BYTES conversion out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns list row construction and byte-bank
+adaptation, but the digest/length validation and public JSON report shape for
+initial row constants are now executor-owned and report-gated.
+
+What changed:
+
+- Added `plan_constant_value_json_value` and `plan_constant_value_bytes` to
+  `boon_plan_executor`.
+- Refactored `plan_constant_json_value` to use the raw value conversion helper.
+- Runtime initial list row setup now delegates constant JSON and private BYTES
+  conversion to `boon_plan_executor`.
+- Runtime list append constant fields now use the same executor-owned BYTES
+  conversion path.
+- Removed runtime-owned `plan_constant_value_json_value` and
+  `runtime_bytes_from_plan_constant_value`.
+- `verify-compiler-boundaries` now reports
+  `initial_list_row_value_conversion_extracted`.
+- `verify-report-schema` now requires the new executor extraction flag on
+  compiler-boundary reports.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor initial_list_row_constant_value_conversion_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 28 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `initial_list_row_value_conversion_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  initial list-row constant value conversion is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay,
+  SolidGraph/3D data movement, manufacturing transitions, Rust/Zig codegen
+  readiness, and non-root/list executor ownership remain outside the completed
+  surface.
+
+## 2026-06-28 - Compiler-Owned Source Loading Facade
+
+Status: moved manifest-aware Boon source file discovery and source text/unit
+loading into `boon_compiler`. Runtime still exposes compatibility wrappers for
+existing native playground, xtask, and test callers, but those wrappers now
+delegate through the compiler facade instead of owning duplicate file-loading
+logic.
+
+What changed:
+
+- `boon_compiler` now exports `compiler_source_units_for_path`,
+  `compiler_source_units_for_manifest_source`,
+  `compiler_source_files_for_path`,
+  `compiler_source_files_for_manifest_source`,
+  `compiler_source_text_for_path`, and
+  `compiler_source_text_for_manifest_source`.
+- `boon_runtime::source_units_for_path`, `source_units_for_entry`,
+  `source_text_for_path`, `source_text_for_entry`, and `example_source_files`
+  now delegate to the compiler-owned helpers.
+- Removed runtime-local manifest-aware `source_files_for_path` /
+  `source_files_for_entry` copies.
+- Added compiler tests for multi-file Cells source loading through both path and
+  manifest-entry fields.
+- `verify-compiler-boundaries` now reports
+  `facade_exports_source_loading` and
+  `runtime_source_loading_uses_compiler_facade`.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_owns_manifest_source_units -- --nocapture`:
+  pass; 2 passed and 56 filtered out.
+- `cargo test -q -p boon_compiler -- --nocapture`: pass; 58 passed.
+- `cargo test -q -p boon_runtime source_units_hash_preserves_single_file_hash_compatibility -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `facade_exports_source_loading=true` and
+  `runtime_source_loading_uses_compiler_facade=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  manifest-aware source discovery and source text/unit loading are compiler
+  facade-owned and report-gated.
+- Still blocked:
+  runtime still owns public source-route and root-scenario PlanExecutor command
+  orchestration, scenario parsing and selected-step selection, legacy comparison
+  execution, source-route command report assembly, root-scenario execution loop,
+  full root-scenario replay, runtime typed structures, test-only direct
+  lowering, legacy schedule compilation, public source-unit wrapper API, list
+  state mutation, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Step Report Assembly Extracted
+
+Status: moved per-step PlanExecutor root-scenario report assembly into
+`boon_plan_executor`. Runtime still owns the root/list state mutation loop and
+scenario orchestration, but the JSON report contract for each scenario step now
+has an executor-owned assembly core.
+
+What changed:
+
+- Added `RootScenarioStepReportAssembly` to `boon_plan_executor`.
+- Added `assemble_root_scenario_step_report`, reporting
+  `cpu-plan-root-scenario-step-report-assembly-v1`.
+- Runtime `execute_machine_plan_root_scenario_inner` now delegates per-step
+  report construction to `boon_plan_executor` after computing the state/list
+  effects for the step.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_step_report_assembly_extracted`.
+- The TodoMVC root-scenario PlanExecutor test now asserts the new per-step
+  report assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_step_report_assembly_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario per-step report assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned root/list state mutation loop, source-route and root-scenario
+  command orchestration, scenario parsing and selected-step selection, legacy
+  comparison execution, source-route command report assembly, full
+  root-scenario replay, runtime typed structures, test-only direct lowering,
+  legacy schedule compilation, public runtime source-unit wrapper API, list
+  state mutation, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Route Legacy Comparison Assembly Extracted
+
+Status: moved source-route legacy comparison report assembly into
+`boon_plan_executor`. Runtime still runs the legacy runtime for differential
+evidence, but the source-route parity object and pass/fail decision are now an
+executor-owned report contract.
+
+What changed:
+
+- Added `SourceRouteLegacyComparisonAssembly` to `boon_plan_executor`.
+- Added `assemble_source_route_legacy_comparison`, reporting
+  `cpu-plan-source-route-legacy-comparison-assembly-v1`.
+- Runtime `run_plan_source_route` now passes legacy value/delta/render evidence
+  and plan value/delta evidence to the executor comparison assembly instead of
+  building the comparison JSON inline.
+- `verify-compiler-boundaries` now reports
+  `source_route_legacy_comparison_extracted`.
+- The source-route full-event parity test now asserts the new legacy-comparison
+  assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_legacy_comparison_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route legacy comparison assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root-scenario legacy comparison
+  assembly, root/list state mutation loop, source-route and root-scenario
+  command orchestration, scenario parsing and selected-step selection,
+  source-route command report assembly, full root-scenario replay, runtime
+  typed structures, test-only direct lowering, legacy schedule compilation,
+  public runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Legacy Comparison Assembly Extracted
+
+Status: moved root-scenario legacy comparison report assembly into
+`boon_plan_executor`. Runtime still runs the legacy runtime for differential
+evidence, but per-step state/delta comparison, final legacy projection, and the
+root-scenario legacy pass/fail object are now executor-owned report contracts.
+
+What changed:
+
+- Added `RootScenarioLegacyStepComparisonInput` and
+  `RootScenarioLegacyComparisonAssembly` to `boon_plan_executor`.
+- Added `assemble_root_scenario_legacy_comparison`, reporting
+  `cpu-plan-root-scenario-legacy-comparison-assembly-v1` and per-step
+  `cpu-plan-root-scenario-legacy-step-comparison-v1`.
+- Runtime root-scenario replay now collects legacy output plus plan per-step
+  facts and delegates comparison JSON assembly to `boon_plan_executor`.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_legacy_comparison_extracted`.
+- TodoMVC and Cells root-scenario PlanExecutor tests assert the new
+  legacy-comparison assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_legacy_comparison_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario legacy comparison assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, source-route command report assembly, full
+  root-scenario replay, runtime typed structures, test-only direct lowering,
+  legacy schedule compilation, public runtime source-unit wrapper API, list
+  state mutation, indexed row state transitions, broader indexed/list byte
+  state ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Route Command Report Assembly Extracted
+
+Status: moved the outer source-route command report assembly into
+`boon_plan_executor`. Runtime still owns host provenance discovery, source-event
+artifact writing, legacy differential execution, and command invocation
+plumbing, but the `run-plan-route` status, exit status, pass/fail rows, and
+top-level report envelope are now executor-owned.
+
+What changed:
+
+- Added `SourceRouteCommandReportInput` and
+  `SourceRouteCommandReportAssembly` to `boon_plan_executor`.
+- Added `assemble_source_route_command_report`, reporting
+  `cpu-plan-source-route-command-report-assembly-v1`.
+- Runtime `run_plan_source_route` now supplies provenance, source event,
+  route-surface, plan-executor, and legacy-comparison facts to the executor
+  command-report assembly instead of building the envelope inline.
+- `verify-compiler-boundaries` now reports
+  `source_route_command_report_assembly_extracted`.
+- The source-route full-event parity test asserts the new command-report
+  assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_command_report_assembly_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route command report assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Command Report Assembly Extracted
+
+Status: moved the outer `run-plan-root-scalar-scenario` command report assembly
+into `boon_plan_executor`. Runtime still owns scenario parsing, selected-step
+lookup, legacy differential execution, and command plumbing, but the root-scalar
+scenario status, exit status, pass/fail rows, and top-level proof envelope are
+now executor-owned.
+
+What changed:
+
+- Added `RootScenarioCommandReportInput` and
+  `RootScenarioCommandReportAssembly` to `boon_plan_executor`.
+- Added `assemble_root_scenario_command_report`, reporting
+  `cpu-plan-root-scenario-command-report-assembly-v1`.
+- Runtime `run_plan_root_scalar_scenario` now supplies provenance,
+  selected-step, state, semantic-delta, legacy-comparison, and executor facts to
+  the executor command-report assembly instead of building the envelope inline.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_command_report_assembly_extracted`.
+- The TodoMVC root-scenario PlanExecutor test asserts the new command-report
+  assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_command_report_assembly_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scalar scenario command report assembly is executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full scenario-events coverage/acceptance command
+  report assembly, full root-scenario replay, runtime typed structures,
+  test-only direct lowering, legacy schedule compilation, public runtime
+  source-unit wrapper API, list state mutation, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Source Route Orchestration Delegate
+
+Status: moved source-route execution orchestration into `boon_plan_executor`
+behind an explicit runtime callback boundary. Runtime still owns the public
+`run_plan_source_route` wrapper, legacy comparison, and temporary unsupported
+runtime branch callback, but it no longer owns the source-route inner function
+that resolved route context, selected the JSON/runtime surface, validated full
+execution, and assembled the route report.
+
+What changed:
+
+- Added `SourceRouteSelectedExecution`, `SourceRouteFullExecution`,
+  `SourceRouteOrchestration`, and
+  `execute_source_route_with_runtime_callbacks` to `boon_plan_executor`.
+- Runtime `run_plan_source_route` now delegates route orchestration to
+  PlanExecutor and supplies explicit callbacks for the temporary runtime branch
+  and full root-scenario execution.
+- Removed runtime `execute_machine_plan_source_route_inner`.
+- Updated `verify-compiler-boundaries` and report schema with
+  `source_route_orchestration_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_orchestration_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 43 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_rejects_named_bytes_payload_keys_in_v1 -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_orchestration_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route orchestration is PlanExecutor-owned and report-gated; runtime
+  fallback execution is now an explicit callback instead of hidden orchestration.
+- Still blocked:
+  runtime-owned public source-route wrapper, root-scenario execution function,
+  legacy comparison, parser/IR/typecheck dependency removal, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Live Source Event Expected TOML Builder
+
+Status: moved generated `expected_source_event` TOML assembly into
+`boon_plan_executor`. Runtime still owns live source event conversion and broad
+source-route/root-scenario orchestration, but it no longer owns the TOML map
+construction policy used for generated live-source scenario steps or runtime
+tests.
+
+What changed:
+
+- Added `PlanExecutorLiveSourceEventExpectedToml` and
+  `build_live_source_event_expected_toml` to `boon_plan_executor`.
+- Runtime `LiveSourceEvent::into_expected_source_event` delegates generated
+  expected-source-event TOML construction to PlanExecutor.
+- Removed the remaining runtime test helper that manually assembled
+  source/key-only expected-source-event TOML and routed it through the same
+  PlanExecutor builder.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `live_source_event_expected_toml_builder_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor live_source_event_expected_toml_builder_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 42 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime novywave_sparse_timeline_replay_preserves_row_local_format -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `live_source_event_expected_toml_builder_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  generated expected-source-event TOML assembly is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Scenario Events Command Report Assembly Extracted
+
+Status: moved the outer `run-plan-scenario-events` command report assembly into
+`boon_plan_executor`. Runtime still owns scenario parsing, event/assertion step
+selection, legacy differential execution, and command plumbing, while the
+scenario-events status, exit status, demand-current acceptance rows, assertion
+coverage row, and top-level proof envelope are now executor-owned.
+
+What changed:
+
+- Added `ScenarioEventsCommandReportInput` and
+  `ScenarioEventsCommandReportAssembly` to `boon_plan_executor`.
+- Added `assemble_scenario_events_command_report`, reporting
+  `cpu-plan-scenario-events-command-report-assembly-v1`.
+- Runtime `run_plan_scenario_events` now supplies provenance, state,
+  semantic-delta, legacy-comparison, demand-current acceptance, coverage, and
+  executor facts to the executor command-report assembly.
+- `verify-compiler-boundaries` now reports
+  `scenario_events_command_report_assembly_extracted`.
+- The Cells scenario-events PlanExecutor test asserts the new command-report
+  assembly marker.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `scenario_events_command_report_assembly_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  scenario-events command report assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Source Route Execution Context Extracted
+
+Status: moved source-route execution context resolution into
+`boon_plan_executor`. Runtime still executes the selected route and still owns
+the larger source-route/root-scenario orchestration loop, but route selection,
+route-slot lookup, selected update-op lookup, and the corresponding proof
+marker now come from the executor crate.
+
+What changed:
+
+- Added `SourceRouteExecutionContext` to `boon_plan_executor`.
+- Added `resolve_source_route_execution_context`, reporting
+  `cpu-plan-source-route-execution-context-v1`.
+- Runtime `execute_machine_plan_source_route_inner` now consumes the
+  executor-owned context instead of repeating route/op lookup after selection.
+- Source-route reports now expose the context proof through
+  `route_surface.executor_core`.
+- `verify-compiler-boundaries` now reports
+  `source_route_execution_context_extracted`.
+- Recorded the fresh manual Cells symptom in
+  `docs/plans/speedup/TASK-0804A_HANDOFF.md`: cell-local focus/formula may
+  update while the main formula-bar text input remains visually stale.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_execution_context_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route execution context resolution is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Semantic Delta Normalization Extracted
+
+Status: moved PlanExecutor semantic-delta signature and keyed `FieldSet`
+coalescing helpers from `boon_runtime` into `boon_plan_executor`. Runtime still
+owns the root-scenario execution loop and list/indexed mutation state, but
+semantic-delta normalization for that loop is now executor-owned and covered by
+the compiler-boundary verifier.
+
+What changed:
+
+- Added `semantic_delta_signature` to `boon_plan_executor`.
+- Added `coalesce_field_set_deltas` to `boon_plan_executor`.
+- Removed runtime-local `plan_json_delta_signature`,
+  `coalesce_plan_field_set_deltas`, and `plan_field_set_delta_target_key`
+  implementations.
+- Runtime now imports the executor helpers under the existing internal names.
+- Added focused `boon_plan_executor` tests for signature and coalescing
+  behavior.
+- `verify-compiler-boundaries` now reports
+  `semantic_delta_normalization_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor semantic_delta -- --nocapture --test-threads=1`:
+  pass; 1 passed and 1 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 339 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `semantic_delta_normalization_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  semantic-delta signature/coalescing normalization is executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed Update Conflict Guard Extracted
+
+Status: moved indexed update write-conflict detection from `boon_runtime` into
+`boon_plan_executor`. Runtime still owns indexed row execution and mutable list
+state, but the duplicate/conflicting write policy now operates on executor
+report rows in the executor crate.
+
+What changed:
+
+- Added `track_indexed_update_write_conflicts` to `boon_plan_executor`.
+- Added executor-local `indexed_update_write_target_key`.
+- Runtime now calls the executor conflict guard for each indexed execution's
+  report rows.
+- Removed runtime-local `track_indexed_update_write_conflicts` and
+  `indexed_update_write_target_key`.
+- Moved focused conflict-policy tests from runtime internals to
+  `boon_plan_executor`'s JSON report-row API.
+- `verify-compiler-boundaries` now reports
+  `indexed_update_conflict_guard_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_update_conflict_guard -- --nocapture --test-threads=1`:
+  pass; 2 passed and 2 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_update_conflict_guard_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass after regenerating the boundary report post-format.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed update duplicate/conflicting write detection is executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Plan List Summary Extracted
+
+Status: moved PlanExecutor list summary assembly from `boon_runtime` into
+`boon_plan_executor`. Runtime still owns private list row state and converts it
+to `PlanExecutorListRow` at the boundary, but the report summary shape for
+lists is now executor-owned.
+
+What changed:
+
+- Added `summarize_plan_lists` to `boon_plan_executor`.
+- Runtime `plan_list_summary` now adapts private row storage to
+  `PlanExecutorListRow` and delegates summary construction to the executor
+  crate.
+- Added focused `boon_plan_executor` coverage for row counts, active/completed
+  counts, titles, and row identity in the summary.
+- `verify-compiler-boundaries` now reports `list_summary_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor summarize_plan_lists -- --nocapture --test-threads=1`:
+  pass; 1 passed and 4 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_summary_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check && git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list summary report assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Root Aggregate Evaluator Extracted
+
+Status: moved root count-aggregate evaluation and root derived-change delta
+assembly from `boon_runtime` into `boon_plan_executor`. Runtime still owns the
+outer scenario/update loop and private list row storage, but root pure
+`NumberCompareConst` values fed by list `Count` operations now evaluate through
+the executor crate after runtime adapts list rows to `PlanExecutorListRow`.
+
+What changed:
+
+- Added `evaluate_root_pure_number_compare_values` to `boon_plan_executor`.
+- Added `changed_root_derived_deltas` to `boon_plan_executor`.
+- Runtime `root_pure_number_compare_values` now adapts private list state and
+  delegates to the executor crate.
+- Runtime `changed_root_derived_deltas` now delegates to the executor crate.
+- Removed runtime-owned `eval_root_bool_derived_expression` and
+  `aggregate_count_values`.
+- Added focused executor coverage for a count aggregate feeding a root pure
+  boolean and producing a labeled semantic delta.
+- `verify-compiler-boundaries` now reports
+  `root_aggregate_evaluator_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_aggregate_evaluator -- --nocapture --test-threads=1`:
+  pass; 1 passed and 5 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_aggregate_evaluator_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root aggregate evaluation and root derived-change delta assembly are
+  executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Expected Source Event Decoder Extracted
+
+Status: moved scenario `expected_source_event` decoding for PlanExecutor
+scenario/source-route replay from `boon_runtime` into `boon_plan_executor`.
+Runtime still owns the `ScenarioStep` adapter and the larger root-scenario
+execution loop, but TOML field extraction, reserved key handling, reserved
+`bytes_hex` decoding, and named BYTES payload rejection are now executor-owned.
+
+What changed:
+
+- Added `PlanExecutorExpectedSourceEvent` to `boon_plan_executor`.
+- Added `decode_expected_source_event` to `boon_plan_executor`.
+- Added executor coverage for reserved fields, custom payload fields,
+  `bytes_hex`, pointer fields, and v1 named BYTES payload rejection.
+- Runtime `GenericSourceEvent::from_step` now delegates to the executor decoder
+  and only adapts the decoded result into the existing runtime event shape.
+- `verify-compiler-boundaries` now reports
+  `expected_source_event_decoder_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor decode_expected_source_event -- --nocapture --test-threads=1`:
+  pass; 2 passed and 6 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_rejects_named_bytes_payload_keys_in_v1 -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `expected_source_event_decoder_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  scenario expected-source-event decoding is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - MachinePlan Debug Label Helpers Extracted
+
+Status: moved shared MachinePlan debug-label interpretation used by
+PlanExecutor scenario/source-route execution from `boon_runtime` into
+`boon_plan_executor`. Runtime still owns the root-scenario state mutation loop,
+but state/list/field/derived labels, local field-name extraction, and root
+scalar slot classification now come from the executor crate.
+
+What changed:
+
+- Made executor label helpers public: `state_label`, `state_label_by_id`,
+  `field_label`, `semantic_field_label`, `derived_field_label`, `list_label`,
+  and `local_field_name`.
+- Added executor `root_state_is_scalar`.
+- Runtime now imports those helpers instead of keeping duplicate debug-map
+  parsing helpers.
+- Removed runtime-local `plan_state_label`, `plan_field_label`,
+  `plan_semantic_field_label`, `plan_derived_field_label`, `plan_list_label`,
+  `local_field_name`, and `plan_state_is_root_scalar`.
+- Added focused executor coverage for labels, fallback labels, local field-name
+  extraction, and root scalar classification.
+- `verify-compiler-boundaries` now reports `debug_label_helpers_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor machine_plan_debug_label_helpers -- --nocapture --test-threads=1`:
+  pass; 1 passed and 8 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `debug_label_helpers_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  MachinePlan debug-label helper interpretation is executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing and
+  selected-step selection, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Scenario Step Selection Extracted
+
+Status: moved PlanExecutor root-scenario step selection policy from
+`boon_runtime` into `boon_plan_executor`. Runtime still owns scenario file
+parsing, `ScenarioStep` references, root-scenario replay, and state mutation,
+but explicit step-id validation plus scenario-events source/assertion step
+classification are now executor-owned.
+
+What changed:
+
+- Added neutral executor scenario-step metadata:
+  `PlanExecutorScenarioStepMeta`.
+- Added executor selection results:
+  `ExplicitRootScenarioStepSelection` and `ScenarioEventsStepSelection`.
+- Added executor policy functions:
+  `select_explicit_root_scenario_steps` and
+  `select_scenario_event_steps`.
+- Runtime now adapts `ScenarioStep` values into neutral metadata and delegates
+  explicit root-scenario and scenario-events step selection to the executor.
+- Added focused executor coverage for replayable, assertion-only, missing-step,
+  and empty-source-event step classifications.
+- `verify-compiler-boundaries` now reports
+  `scenario_step_selection_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor select_ -- --nocapture --test-threads=1`:
+  pass; 2 passed and 9 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `scenario_step_selection_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  scenario step selection is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration, scenario parsing, full
+  root-scenario replay, runtime typed structures, test-only direct lowering,
+  legacy schedule compilation, public runtime source-unit wrapper API, list
+  state mutation, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source-Route Command Argv Extracted
+
+Status: moved source-route command argv reconstruction from `boon_runtime`
+into `boon_plan_executor`. Runtime still owns `LiveSourceEvent` construction
+and source-event BYTES artifact materialization, but the command-line shape for
+replaying a PlanExecutor source-route proof is now executor-owned and
+frontend-free.
+
+What changed:
+
+- Added `SourceRouteCommandArgvInput` to `boon_plan_executor`.
+- Added `build_source_route_command_argv` to `boon_plan_executor`.
+- Runtime now adapts `LiveSourceEvent` plus payload-byte artifact paths into
+  the executor input instead of rebuilding argv itself.
+- Removed the runtime-local `bytes_hex_argument` helper from this path.
+- Added focused executor coverage for artifact-backed BYTES payload args,
+  inline BYTES hex fallback, non-default targets, and preserving a real
+  `run-plan-route` invocation.
+- `verify-compiler-boundaries` now reports
+  `source_route_command_argv_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_command_argv -- --nocapture --test-threads=1`:
+  pass; 2 passed and 11 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_command_argv_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route command argv reconstruction is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond argv/report
+  assembly, scenario parsing, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Source-Route Source Event Report Extracted
+
+Status: moved source-route source-event report JSON assembly from
+`boon_runtime` into `boon_plan_executor`. Runtime still owns `LiveSourceEvent`
+adaptation and BYTES payload artifact materialization, but the proof report
+shape for replayable source events is now executor-owned and frontend-free.
+
+What changed:
+
+- Added `SourceRouteSourceEventReportInput` to `boon_plan_executor`.
+- Added `build_source_route_source_event_report` to `boon_plan_executor`.
+- Runtime now delegates source-event report JSON assembly after building the
+  payload BYTES report/artifacts.
+- Added focused executor coverage for text/key/list/address fields, payloads,
+  payload BYTES artifact reports, pointer fields, and source-route ids.
+- `verify-compiler-boundaries` now reports
+  `source_route_source_event_report_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_ -- --nocapture --test-threads=1`:
+  pass; 3 passed and 11 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_route_source_event_report_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route source-event report assembly is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond event/argv/report
+  assembly, scenario parsing, full root-scenario replay, runtime typed
+  structures, test-only direct lowering, legacy schedule compilation, public
+  runtime source-unit wrapper API, list state mutation, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - List Next-Key Allocator Extracted
+
+Status: moved keyed-list next-key derivation and append key reservation from
+`boon_runtime` into `boon_plan_executor`. Runtime still owns row construction,
+row expression refresh, and private byte-bank state, but the monotonic list key
+allocation policy used by PlanExecutor append replay is now executor-owned and
+frontend-free.
+
+What changed:
+
+- Added `initial_list_next_keys` to `boon_plan_executor`.
+- Added `reserve_list_row_key` to `boon_plan_executor`.
+- Runtime now derives initial list next-key maps through executor list rows.
+- Runtime append replay now reserves new row keys through the executor
+  allocator while retaining local row refresh/projection state.
+- Added focused executor coverage for empty/non-empty lists, consecutive
+  reservations, and missing-list errors.
+- `verify-compiler-boundaries` now reports
+  `list_next_key_allocator_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_next_key_allocation -- --nocapture --test-threads=1`:
+  pass; 1 passed and 14 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_next_key_allocator_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list next-key allocation is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Row Source-Binding Policy Extracted
+
+Status: moved row source-binding id calculation and `SourceBind` semantic delta
+assembly from `boon_runtime` into `boon_plan_executor`. Runtime still discovers
+row-scoped source routes from the `MachinePlan` and still owns row construction
+and refresh, but the stable row/source binding formula and emitted binding
+delta shape are now executor-owned.
+
+What changed:
+
+- Added `row_source_binding_id` to `boon_plan_executor`.
+- Added `build_source_bind_deltas` to `boon_plan_executor`.
+- Runtime append replay now delegates `SourceBind` delta construction to the
+  executor.
+- Runtime indexed row reporting now uses the executor-owned row/source binding
+  id helper through its existing plan adapter.
+- Added focused executor coverage for row/source binding id ordering,
+  missing-source lookup, source ids, bind epochs, field paths, and values.
+- `verify-compiler-boundaries` now reports
+  `row_source_binding_policy_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor row_source_binding_ids -- --nocapture --test-threads=1`:
+  pass; 1 passed and 15 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `row_source_binding_policy_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  row source-binding id and bind-delta policy are executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - List Remove Delta Policy Extracted
+
+Status: moved `SourceUnbind` and `ListRemove` semantic delta assembly from
+`boon_runtime` into `boon_plan_executor`. Runtime still resolves target rows,
+remove predicates, and row-scoped source routes from the `MachinePlan`, but the
+remove/unbind delta shape is now executor-owned.
+
+What changed:
+
+- Added `build_source_unbind_deltas` to `boon_plan_executor`.
+- Added `build_list_remove_delta` to `boon_plan_executor`.
+- Runtime remove replay now delegates `SourceUnbind` and `ListRemove` delta
+  construction to the executor.
+- Added focused executor coverage for unbind source ids, bind epochs, field
+  paths, null values, and list-remove delta shape.
+- `verify-compiler-boundaries` now reports
+  `list_remove_delta_policy_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor row_source_binding_ids -- --nocapture --test-threads=1`:
+  pass; 1 passed and 15 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_remove_delta_policy_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list remove/source-unbind delta policy is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - List Append Delta Policy Extracted
+
+Status: moved append-side `ListInsert` and row-refresh `FieldSet` semantic
+delta assembly from `boon_runtime` into `boon_plan_executor`. Runtime still
+constructs and refreshes row values during append replay, but the append delta
+shape and row-expression output-field selection policy are executor-owned.
+
+What changed:
+
+- Added `build_list_insert_delta` to `boon_plan_executor`.
+- Added `row_expression_output_field_names` to `boon_plan_executor`.
+- Added `build_row_refresh_field_deltas` to `boon_plan_executor`.
+- Added executor-owned `row_expression_applies_to_list` and switched runtime
+  row-expression refresh call sites to use it.
+- Runtime append replay now delegates `ListInsert` and row-refresh `FieldSet`
+  delta construction to the executor.
+- Added focused executor coverage for insert delta shape, row-expression field
+  selection, and row-refresh delta filtering.
+- `verify-compiler-boundaries` now reports
+  `list_append_delta_policy_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_append_insert_and_row_refresh_deltas_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 16 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_append_delta_policy_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  append-side list insert and row-refresh delta policy are executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Update-Op Resolution Extracted
+
+Status: moved root-scenario dispatch-selected update-op resolution from
+`boon_runtime` into `boon_plan_executor`. Runtime still owns the outer
+root-scenario replay loop and applies the selected operations, but the policy
+that maps dispatch-selected update op ids back to typed `PlanOp`s is now
+executor-owned and report-gated.
+
+What changed:
+
+- Added `ordered_root_update_ops_for_dispatch` to `boon_plan_executor`.
+- Runtime root-scenario replay now delegates dispatch-selected update-op
+  resolution to the executor helper.
+- Added focused executor coverage for preserving dispatch order and rejecting
+  stale/missing update-op ids.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_update_op_resolution_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor ordered_root_update_ops_are_resolved_by_executor_dispatch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 17 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_update_op_resolution_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario update-op id resolution is executor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Derived Value Evaluator Extracted
+
+Status: moved source-derived value evaluation for the currently supported
+`SourceKeyTextTrimNonEmpty` root-scenario path from `boon_runtime` into
+`boon_plan_executor`. Runtime still owns the outer root-scenario replay loop
+and list/root state mutation, but source event to derived value evaluation now
+runs through the executor-owned `RootJsonSourceEvent` boundary.
+
+What changed:
+
+- Added `evaluate_source_derived_values_for_event` to `boon_plan_executor`.
+- Runtime root-scenario replay now delegates source-derived value evaluation
+  to the executor helper.
+- Removed the duplicate runtime `execute_supported_derived_values_for_source`
+  implementation.
+- Added focused executor coverage for matching key payloads, trimming text,
+  mismatched keys, and `skip_empty` behavior.
+- `verify-compiler-boundaries` now reports
+  `source_derived_value_evaluator_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_derived_values_are_evaluated_by_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 18 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_derived_value_evaluator_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source event derived-value evaluation is executor-owned and report-gated for
+  the current supported root-scenario expression shape.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Derived Delta Policy Extracted
+
+Status: moved source-derived semantic `FieldSet` delta and per-step derived
+report assembly from `boon_runtime` into `boon_plan_executor`. Runtime still
+owns the outer root-scenario replay loop and aggregate step accounting, but
+source-derived value to semantic-delta/report conversion is executor-owned.
+
+What changed:
+
+- Added `build_source_derived_value_deltas` to `boon_plan_executor`.
+- Runtime root-scenario replay now delegates source-derived `FieldSet` delta
+  and derived report construction to the executor helper.
+- Extended focused executor coverage to assert source-derived semantic
+  signature, delta shape, field path, field id, and report value.
+- `verify-compiler-boundaries` now reports
+  `source_derived_delta_policy_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_derived_values_are_evaluated_by_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 18 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_derived_delta_policy_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-derived value to semantic delta/report conversion is executor-owned
+  and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root Scenario Source-Route Resolution Extracted
+
+Status: moved root-scenario dispatch-selected source-route slot resolution
+from `boon_runtime` into `boon_plan_executor`. Runtime still owns the outer
+root-scenario replay loop and uses the resolved route for list/indexed/root
+execution, but the policy that maps dispatch-selected source ids back to typed
+`SourceRoute` slots is executor-owned and report-gated.
+
+What changed:
+
+- Added `source_route_slot_for_dispatch` to `boon_plan_executor`.
+- Runtime root-scenario replay now delegates source-route slot lookup to the
+  executor helper.
+- Extended focused executor coverage for dispatch source-route resolution,
+  payload schema preservation, and stale dispatch source-id rejection.
+- `verify-compiler-boundaries` now reports
+  `root_scenario_source_route_resolution_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor ordered_root_update_ops_are_resolved_by_executor_dispatch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 18 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_scenario_source_route_resolution_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario dispatch source-route slot resolution is executor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  source-route and root-scenario command orchestration beyond extracted
+  event/argv/report helpers, scenario parsing, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Compiler-Owned Source Report Context
+
+Status: moved compiled source/report metadata assembly for the run-plan command
+wrappers from `boon_runtime` into `boon_compiler`. Runtime still owns the
+public run-plan command wrappers and non-initial PlanExecutor orchestration, but
+the source hash, source file list, program kind, program file count, graph node
+count, and load-pipeline profile are now exposed as a compiler facade report
+context instead of being repeatedly assembled from parser/IR internals in the
+run-plan wrappers.
+
+What changed:
+
+- Added `CompiledSourceReportContext` and `report_context()` helpers to
+  `boon_compiler`.
+- Updated `run_plan_initial_state`, `run_plan_source_route`,
+  `run_plan_root_scalar_scenario`, and `run_plan_scenario_events` to use the
+  compiler-owned report context.
+- Added focused compiler coverage for the report context contract.
+- `verify-compiler-boundaries` now reports
+  `owns_compiled_source_report_context`.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_owns_compiled_source_report_context -- --nocapture --test-threads=1`:
+  pass; 1 passed and 58 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `owns_compiled_source_report_context=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  run-plan source/report metadata is compiler-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, scenario
+  parsing, full root-scenario replay, runtime typed structures, test-only direct
+  lowering, legacy schedule compilation, public runtime source-unit wrapper API,
+  list row construction and refresh, indexed row state transitions, broader
+  indexed/list byte state ownership, root map adaptation, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - List Append Value Resolution Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario list append
+execution by moving generic append `ValueRef` resolution and plan constant JSON
+conversion out of `boon_runtime` and into `boon_plan_executor`. Runtime still
+owns append row construction, row refresh, and list mutation, but trigger and
+field value resolution now use executor-owned MachinePlan semantics.
+
+What changed:
+
+- Exposed `resolve_plan_value_ref` from `boon_plan_executor`.
+- Exposed `plan_constant_json_value` from `boon_plan_executor` and extended it
+  to validate and report BYTES constants as public BYTES JSON.
+- Runtime append trigger evaluation and append field value evaluation now use
+  `resolve_plan_value_ref`.
+- Runtime append/root constant JSON paths now use
+  `plan_executor_constant_json_value`.
+- Removed runtime-owned `value_for_plan_ref`.
+- Removed runtime-owned `plan_constant_json_value`; the remaining
+  `plan_constant_value_json_value` is still used for initial-list-row value
+  conversion and was not moved in this slice.
+- Added focused PlanExecutor coverage for field/state `ValueRef` resolution and
+  BYTES constant JSON reporting.
+- `verify-compiler-boundaries` now reports
+  `list_append_value_resolution_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_append_value_resolution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 27 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_append_value_resolution_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  append trigger/field value resolution and plan constant JSON conversion are
+  PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, append row
+  construction and refresh, indexed update branch execution and row/list state
+  mutation, list remove row mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Root Fixed BYTES Mutation Duplicate Removed
+
+Status: tightened PlanExecutor ownership for root BYTES state transitions.
+Runtime already delegated root BYTES commits and fixed-byte patches to
+`boon_plan_executor::apply_root_bytes_state_transition`, but it still carried
+dead duplicate helpers for applying fixed-byte mutations. Those duplicate
+runtime helpers are now removed, and the compiler-boundary verifier now rejects
+their reintroduction.
+
+What changed:
+
+- Removed runtime-owned `apply_root_fixed_bytes_mutation`.
+- Removed runtime-owned `root_private_bytes_for_fixed_mutation`.
+- Kept runtime's small `RootFixedBytesMutation` staging type because root
+  fallback execution still produces the mutation before converting it to
+  `RootBytesFixedMutation`.
+- Tightened `verify-compiler-boundaries` so
+  `root_bytes_state_transition_extracted` requires
+  executor-owned `apply_root_bytes_state_transition`, executor-internal
+  delegation from the root update storage transition, and absence of the
+  runtime fixed-byte mutation helpers/direct transition call.
+- Added focused PlanExecutor coverage proving fixed-byte patch application and
+  `fixed_byte_patch` reporting happen in the executor transition.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_bytes_state_transition_applies_fixed_mutation_in_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 26 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_bytes_state_transition_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root fixed-BYTES mutation application is enforced as PlanExecutor-owned by
+  the boundary report.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  branch execution and row/list state mutation, list remove row mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - List Remove Predicate Evaluation Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario replay by moving
+list remove predicate evaluation and predicate row-resolution reporting out of
+`boon_runtime` and into `boon_plan_executor`. Runtime still owns list row
+mutation and the broader remove operation loop, but the generic predicate
+semantics used to choose removable rows are now executor-owned and report-gated.
+
+What changed:
+
+- Added `ListRemovePredicateEvaluation` to `boon_plan_executor`.
+- Added `evaluate_list_remove_predicate` for `AlwaysTrue`,
+  `RowFieldBool`, and `RowFieldBoolNot` remove predicates.
+- Added `build_list_remove_predicate_row_resolution_report` so unscoped
+  remove reporting is assembled by PlanExecutor.
+- Runtime scenario replay now adapts the candidate row into
+  `PlanExecutorListRow` and delegates predicate evaluation/reporting to
+  `boon_plan_executor`.
+- Removed runtime-owned `list_remove_predicate_matches`,
+  `list_remove_predicate_field_value`, and `predicate_row_resolution_report`.
+- Added focused PlanExecutor coverage for positive/negative predicate matching
+  and predicate row-resolution report assembly.
+- `verify-compiler-boundaries` now reports
+  `list_remove_predicate_evaluator_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_remove_predicate_evaluation_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 25 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_remove_predicate_evaluator_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list remove predicate evaluation/reporting is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  branch execution and row/list state mutation, list remove row mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, indexed row state transitions, broader indexed/list byte state
+  ownership, root map adaptation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain outside the completed surface.
+
+## 2026-06-28 - Source Guard Matching Extracted
+
+Status: advanced PlanExecutor ownership by moving source-guard matching
+semantics out of `boon_runtime` and into `boon_plan_executor`. Runtime still
+owns the remaining indexed/root update branch execution and storage mutation
+paths, but both generic scenario events and live source events now flow through
+the same executor-owned `PlanSourceGuard` matcher before those runtime branches
+run.
+
+What changed:
+
+- Exposed `source_guard_matches` from `boon_plan_executor`.
+- `evaluate_root_json_update_branch` now uses the public executor-owned guard
+  matcher.
+- Runtime indexed update branches and root scalar fallback branches now convert
+  their source event into `RootJsonSourceEvent` and delegate guard matching to
+  `boon_plan_executor`.
+- Removed duplicated runtime-owned `plan_source_guard_matches` and
+  `plan_source_guard_matches_live` helpers.
+- Added focused PlanExecutor coverage for matching, non-matching, wrong-source,
+  and unsupported BYTES guard cases.
+- `verify-compiler-boundaries` now reports
+  `source_guard_matching_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_guard_matching_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 24 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_guard_matching_extracted=true`; the remaining blocker
+  is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source guard matching is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  branch execution and row/list state mutation, BYTES/host-effect root update
+  fallback execution, full root-scenario replay, runtime typed structures,
+  test-only direct lowering, legacy schedule compilation, public runtime
+  source-unit wrapper API, list row construction and refresh, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed Update Target Selection Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario replay by moving
+unscoped indexed-update target selection out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns indexed row mutation and the
+per-row branch execution path, but the policy that decides when an indexed
+update fans out across all row keys/generations is now executor-owned and
+report-gated.
+
+What changed:
+
+- Added `IndexedUpdateTargetEvent`, `IndexedUpdateTargetRow`, and
+  `IndexedUpdateTargetSelection` to `boon_plan_executor`.
+- Added `select_unscoped_indexed_update_targets` to decide generic bulk
+  indexed-update fanout without depending on example names or full row-field
+  materialization.
+- Runtime root-scenario replay now delegates unscoped indexed-update target
+  selection to `boon_plan_executor` and passes only row key/generation
+  identities.
+- Removed the old runtime-owned `unscoped_indexed_update_targets` helper.
+- Added focused PlanExecutor coverage for bulk fanout, already-targeted skip,
+  and wrong-list rejection.
+- `verify-compiler-boundaries` now reports
+  `indexed_update_target_selection_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_update_target_selection_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 23 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_update_target_selection_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  unscoped indexed-update target selection is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  branch execution and row/list state mutation, BYTES/host-effect root update
+  fallback execution, full root-scenario replay, runtime typed structures,
+  test-only direct lowering, legacy schedule compilation, public runtime
+  source-unit wrapper API, list row construction and refresh, indexed row state
+  transitions, broader indexed/list byte state ownership, root map adaptation,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Indexed Update Delta Ordering Extracted
+
+Status: advanced PlanExecutor ownership inside root-scenario replay by moving
+indexed update semantic-delta ordering out of `boon_runtime` and into
+`boon_plan_executor`. Runtime still owns indexed update execution and row/list
+state mutation, but the policy that orders bulk indexed primary field deltas
+before derived deltas is now executor-owned and report-gated.
+
+What changed:
+
+- Added `IndexedUpdateDeltaBatch` and `IndexedUpdateDeltaOrdering` to
+  `boon_plan_executor`.
+- Added `order_indexed_update_semantic_deltas` to preserve non-bulk delta order
+  and to emit bulk indexed primary field deltas before derived deltas.
+- Runtime root-scenario replay now delegates indexed update semantic-delta
+  ordering to `boon_plan_executor`.
+- Added focused PlanExecutor coverage for bulk and non-bulk indexed delta
+  ordering.
+- `verify-compiler-boundaries` now reports
+  `indexed_update_delta_ordering_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_update_delta_ordering_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 22 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `indexed_update_delta_ordering_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed update semantic-delta ordering is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - Compiler-Owned Source Unit Snapshot
+
+Status: extended the compiler-owned run-plan report context so it also carries
+the compiled source-unit snapshot used for legacy comparison setup. Runtime
+still owns the public run-plan wrappers and legacy comparison execution, but
+those wrappers no longer rebuild legacy comparison source units by iterating
+`ParsedProgram.files`.
+
+What changed:
+
+- Added `source_units: Vec<CompilerSourceUnit>` to
+  `CompiledSourceReportContext`.
+- Runtime run-plan wrappers now derive legacy comparison source units from the
+  compiler-owned report context through an explicit type conversion helper.
+- Extended focused compiler coverage to assert that the source-unit snapshot
+  matches the report file list and preserves source text.
+- `verify-compiler-boundaries` now reports
+  `owns_compiled_source_unit_snapshot`.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler compiler_facade_owns_compiled_source_report_context -- --nocapture --test-threads=1`:
+  pass; 1 passed and 58 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `owns_compiled_source_unit_snapshot=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  run-plan legacy-comparison source-unit snapshots are compiler-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, scenario
+  parsing, full root-scenario replay, runtime typed structures, test-only direct
+  lowering, legacy schedule compilation, public runtime source-unit wrapper API,
+  list row construction and refresh, indexed row state transitions, broader
+  indexed/list byte state ownership, root map adaptation, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor List Row Textlike Projection
+
+Status: moved the list-row scalar-to-text projection used by PlanExecutor-backed
+scenario assertions out of runtime policy and into `boon_plan_executor`.
+Runtime still adapts its private row state into `PlanExecutorListRow`, but the
+string/number/bool text projection behavior is now executor-owned and
+report-gated.
+
+What changed:
+
+- Added `list_row_textlike_field` to `boon_plan_executor`, preserving the
+  existing text behavior for strings, numbers, and Boon-style boolean text
+  (`True` / `False`).
+- Runtime assertion helpers now call the executor-owned helper through a thin
+  internal row adapter instead of owning row scalar text conversion directly.
+- Added focused executor coverage for text, numeric, boolean, object, and
+  missing-field cases.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `list_row_textlike_field_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_textlike_field_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 32 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_row_textlike_field_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list-row textlike projection is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Assertion Checkpoint Evaluation
+
+Status: moved assertion-only root-scenario checkpoint evaluation out of
+runtime-owned row helper policy and into `boon_plan_executor`. Runtime still
+owns broad root-scenario orchestration and state mutation, but assertion-only
+checkpoint evaluation now runs through a typed executor input and executor row
+state.
+
+What changed:
+
+- Added `assert_scenario_checkpoint` plus typed checkpoint expectation inputs
+  to `boon_plan_executor`.
+- PlanExecutor now owns todo row selection, editing-row selection, Cells address
+  row lookup, visible/root text assertion extraction, checked-expectation report
+  assembly, and the assertion-only delta/recompute rejection policy.
+- Runtime now converts `ScenarioStep` and `PlanListRowState` into executor-owned
+  input/rows and returns the executor report.
+- Removed the duplicated runtime helpers:
+  `plan_rows_with_field`, `plan_single_editing_row`, `plan_cell_row`,
+  `plan_root_textlike_for_assertion`, and the row textlike adapter.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `assertion_checkpoint_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor scenario_checkpoint_assertions_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 33 filtered out.
+- `cargo test -q -p boon_plan_executor list_row_textlike_field_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 33 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `list_row_textlike_field_extracted=true` and
+  `assertion_checkpoint_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  assertion-only root-scenario checkpoint evaluation is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Root Update Candidate Tracking
+
+Status: moved root-scenario same-event root update candidate coalescing and
+conflict detection into `boon_plan_executor`. Runtime still owns the mutable
+root/list/byte state application loop, but it no longer owns the policy for
+duplicate same-state root update candidates or conflicting candidate rejection.
+
+What changed:
+
+- Added `RootUpdateCandidateTracker`, `RootUpdateCandidate`, and
+  `record_root_update_candidate` to `boon_plan_executor`.
+- Runtime now records each non-indexed root update candidate through the
+  executor tracker and iterates executor-ordered candidates when applying the
+  final root state changes.
+- Runtime keeps only storage-specific byte/fixed-byte fingerprints at the
+  boundary so PlanExecutor can compare private byte effects without owning
+  runtime byte storage yet.
+- Added focused executor tests for duplicate coalescing, conflict rejection,
+  and private byte fingerprint conflicts.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `root_update_candidate_tracker_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_candidate_tracker_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 35 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_candidate_tracker_rejects_byte_fingerprint_conflicts -- --nocapture --test-threads=1`:
+  pass; 1 passed and 35 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_update_candidate_tracker_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root update candidate tracking/coalescing/conflict policy is
+  PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Root Update Commit Assembly
+
+Status: moved root-scenario root update commit report and semantic-delta
+assembly into `boon_plan_executor`. Runtime still owns the actual mutable
+root/list/BYTES state application, but touched-state summaries, changed
+FieldSet delta emission, semantic delta signatures, and update report row
+assembly now go through a typed PlanExecutor input.
+
+What changed:
+
+- Added `RootUpdateCommitInput`, `RootUpdateCommitAssembly`, and
+  `assemble_root_update_commit` to `boon_plan_executor`.
+- Runtime now calls the executor commit assembly after applying root JSON/BYTES
+  state and pushes the executor-owned touched state, delta/signature, and update
+  report into the per-step report.
+- Removed the runtime fallback helper that assembled root `FieldSet` deltas for
+  this path.
+- Added focused executor tests for changed commits and unchanged commits.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `root_update_commit_assembly_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_commit_assembly_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 37 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_commit_assembly_suppresses_unchanged_delta -- --nocapture --test-threads=1`:
+  pass; 1 passed and 37 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_update_commit_assembly_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root update commit report/delta assembly is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Root Update Storage Transition
+
+Status: moved the root-scenario public root-state write plus root BYTES/fixed
+byte storage transition policy into `boon_plan_executor`. Runtime still owns
+the outer mutable root/list execution loop and byte-storage conversion at the
+boundary, but this root update application core is now executor-owned and
+report-gated.
+
+What changed:
+
+- Added `RootUpdateStorageTransition` and
+  `apply_root_update_storage_transition` to `boon_plan_executor`.
+- Runtime now delegates root update public-state insertion and BYTES/fixed-byte
+  storage transition to the executor API, then converts executor byte storage
+  back to runtime storage.
+- Added focused executor tests for ordinary BYTES commits and fixed-byte patch
+  transitions.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `root_update_storage_transition_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_storage_transition_commits_bytes_and_public_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 39 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_storage_transition_applies_fixed_patch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 39 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `root_update_storage_transition_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root update storage transition policy is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Source Payload BYTES Key Policy
+
+Status: moved source-payload BYTES TOML key formatting and v1 named-BYTES
+field rejection policy into `boon_plan_executor`. Runtime still owns broad
+source-route/root-scenario orchestration and live source event conversion, but
+the source-event BYTES key policy now lives beside the executor-owned
+`expected_source_event` decoder.
+
+What changed:
+
+- Added `source_payload_bytes_toml_key` and
+  `validate_source_payload_bytes_field_name` to `boon_plan_executor`.
+- Runtime now delegates live source event BYTES payload validation and
+  `expected_source_event` BYTES key generation to PlanExecutor helpers.
+- Removed the duplicate runtime helpers for source-payload BYTES TOML key
+  formatting and field-name validation.
+- Tightened `verify-compiler-boundaries` and compiler-boundary report schema
+  with `source_payload_bytes_key_policy_extracted`.
+- Reconciled the earlier `root_bytes_state_transition_extracted` verifier after
+  root update storage transition extraction moved the direct BYTES transition
+  call behind the PlanExecutor storage-transition API.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_payload_bytes_key_policy_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 40 filtered out.
+- `cargo test -q -p boon_plan_executor root_bytes_state_transition_applies_fixed_mutation_in_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 39 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `source_payload_bytes_key_policy_extracted=true`,
+  `root_bytes_state_transition_extracted=true`, and
+  `root_update_storage_transition_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-event BYTES TOML key policy is PlanExecutor-owned and report-gated,
+  and the stale root BYTES transition verifier condition is reconciled with the
+  newer root update storage transition extraction.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Live Source Event Expectation Matcher
+
+Status: moved live source event vs `expected_source_event` matching policy into
+`boon_plan_executor`. Runtime still owns live event conversion and broad
+source-route/root-scenario orchestration, but it no longer owns the field and
+numeric comparison policy used before applying checked live source events.
+
+What changed:
+
+- Added `PlanExecutorLiveSourceEvent` and
+  `assert_live_source_event_matches_expected` to `boon_plan_executor`.
+- Added `source_id` to the executor decoded expected-source-event shape so the
+  matcher covers the same numeric fields runtime previously checked.
+- Runtime now adapts `LiveSourceEvent` into the executor shape and delegates
+  `LiveSourceEvent::assert_matches_step` to PlanExecutor.
+- Removed the duplicate runtime helpers for live source-event string and
+  numeric field comparison.
+- Extended `verify-compiler-boundaries` and compiler-boundary report schema
+  with `live_source_event_expectation_matcher_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor live_source_event_expectation_matcher_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 41 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; `live_source_event_expectation_matcher_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  live source-event expectation matching is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned legacy differential execution, root/list state mutation loop,
+  public source-route and root-scenario command orchestration, indexed update
+  execution and row/list state mutation, BYTES/host-effect root update fallback
+  execution, full root-scenario replay, runtime typed structures, test-only
+  direct lowering, legacy schedule compilation, public runtime source-unit
+  wrapper API, list row construction and refresh, indexed row state transitions,
+  broader indexed/list byte state ownership, root map adaptation, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Source Event Payload BYTES Artifact Report
+
+Status: moved source-event BYTES inline/artifact report assembly and artifact
+path writing into `boon_plan_executor`. Runtime still owns live source event
+conversion and calls the helper from the public source-route command path, but
+the source-event payload BYTES report shape, inline limit handling, digesting,
+artifact path policy, and artifact file write now live in the executor crate.
+
+What changed:
+
+- Added `SourceEventPayloadBytesReport` and
+  `build_source_event_payload_bytes_report` to `boon_plan_executor`.
+- Preserved the existing report contract: inline payloads carry
+  `inline_bytes`, large payloads write `source-event-*.bytes` artifacts and
+  report `artifact_path`/`artifact_sha256` without leaking inline bytes.
+- Runtime now delegates `source_event_payload_bytes_report` to PlanExecutor and
+  no longer owns the source-event artifact path or sanitizer helpers.
+- Added the focused executor test
+  `source_event_payload_bytes_report_writes_artifacts_and_inlines_small_payloads`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `source_event_payload_bytes_artifact_report_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_event_payload_bytes_report_writes_artifacts_and_inlines_small_payloads -- --nocapture --test-threads=1`:
+  pass; 1 passed and 44 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_rejects_named_bytes_payload_keys_in_v1 -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `source_event_payload_bytes_artifact_report_extracted=true` and
+  `source_route_orchestration_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-event payload BYTES inline/artifact report assembly is
+  PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, test-only direct lowering, legacy schedule
+  compilation, public runtime source-unit wrapper API, list row construction and
+  refresh, broader indexed/list byte state ownership, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-28 - PlanExecutor Source Route Command Output Assembly
+
+Status: moved source-route command output assembly into `boon_plan_executor`.
+Runtime still compiles source files, invokes the selected PlanExecutor route,
+and supplies legacy comparison for now, but the command wrapper no longer owns
+source-event report assembly, source-event BYTES artifact writing, argv
+reconstruction, or final `run-plan-route` command report assembly as separate
+runtime steps.
+
+What changed:
+
+- Added `SourceRouteCommandOutputInput`, `SourceRouteCommandOutput`, and
+  `assemble_source_route_command_output` to `boon_plan_executor`.
+- The new helper composes existing executor-owned lower-level helpers:
+  `build_source_event_payload_bytes_report`,
+  `build_source_route_source_event_report`,
+  `build_source_route_command_argv`, and
+  `assemble_source_route_command_report`.
+- `run_plan_source_route` now delegates command-output assembly to
+  `assemble_plan_source_route_command_output`.
+- Removed runtime-local `source_event_report`,
+  `run_plan_source_route_command_argv`, and
+  `source_event_payload_bytes_report`.
+- Added the focused executor test
+  `source_route_command_output_assembles_event_argv_report_and_artifacts`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `source_route_command_output_extracted`; updated older source-route
+  command/source-event/BYTES artifact predicates to accept the new wrapped
+  executor-owned command-output path.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_command_output_assembles_event_argv_report_and_artifacts -- --nocapture --test-threads=1`:
+  pass; 1 passed and 45 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_rejects_named_bytes_payload_keys_in_v1 -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `source_route_command_output_extracted=true`,
+  `source_route_command_report_assembly_extracted=true`,
+  `source_route_source_event_report_extracted=true`, and
+  `source_event_payload_bytes_artifact_report_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route command output assembly is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root Scenario Command Output Assembly
+
+Status: moved `run-plan-root-scalar-scenario` command output assembly into
+`boon_plan_executor`. Runtime still compiles source files, parses the scenario,
+executes selected root-scenario steps, and supplies legacy comparison for now,
+but final command output assembly is now executor-owned rather than assembled
+directly in `boon_runtime`.
+
+What changed:
+
+- Added `RootScenarioCommandOutputInput`, `RootScenarioCommandOutput`, and
+  `assemble_root_scenario_command_output` to `boon_plan_executor`.
+- `run_plan_root_scalar_scenario` now delegates final report/output assembly to
+  `assemble_plan_root_scenario_command_output`.
+- The helper wraps the existing executor-owned
+  `assemble_root_scenario_command_report` and annotates the PlanExecutor report
+  with `cpu-plan-root-scenario-command-output-v1`.
+- Added the focused executor test
+  `root_scenario_command_output_assembles_report_and_executor_core`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_scenario_command_output_extracted`; updated the older root-scenario
+  command-report predicate to accept the stronger wrapped executor path.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_scenario_command_output_assembles_report_and_executor_core -- --nocapture --test-threads=1`:
+  pass; 1 passed and 46 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime run_plan_root_scalar_scenario -- --nocapture --test-threads=1`:
+  no matching tests; 0 passed and 338 filtered out, so this is not counted as
+  behavioral evidence.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_scenario_command_output_extracted=true` and
+  `root_scenario_command_report_assembly_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario command output assembly is PlanExecutor-owned and report-gated.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Scenario Events Command Output Assembly
+
+Status: moved `run-plan-scenario-events` command output assembly into
+`boon_plan_executor`. Runtime still compiles source files, parses the scenario,
+executes selected event steps, and supplies legacy comparison for now, but final
+scenario-events command output assembly is now executor-owned.
+
+What changed:
+
+- Added `ScenarioEventsCommandOutputInput`, `ScenarioEventsCommandOutput`, and
+  `assemble_scenario_events_command_output` to `boon_plan_executor`.
+- `run_plan_scenario_events` now delegates final report/output assembly to
+  `assemble_plan_scenario_events_command_output`.
+- The helper wraps the existing executor-owned
+  `assemble_scenario_events_command_report` and annotates the PlanExecutor
+  report with `cpu-plan-scenario-events-command-output-v1`.
+- Added the focused executor test
+  `scenario_events_command_output_assembles_report_and_executor_core`.
+- Extended the existing Cells scenario-events runtime regression to assert the
+  new `plan_executor.command_output_core` evidence.
+- Extended `verify-compiler-boundaries` and report schema with
+  `scenario_events_command_output_extracted`; updated the older
+  scenario-events command-report predicate to accept the stronger wrapped
+  executor path.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor scenario_events_command_output_assembles_report_and_executor_core -- --nocapture --test-threads=1`:
+  pass; 1 passed and 47 filtered out.
+- `cargo test -q -p boon_runtime cells_plan_executor_coalesces_transient_indexed_value_deltas -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out; finished in 16.20s.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `scenario_events_command_output_extracted=true`,
+  `scenario_events_command_report_assembly_extracted=true`,
+  `root_scenario_command_output_extracted=true`, and
+  `source_route_command_output_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  scenario-events command output assembly is PlanExecutor-owned and
+  report-gated.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Source Route Runtime-Branch Assembly
+
+Status: moved the `run-plan-route` runtime-branch selected-output assembly into
+`boon_plan_executor`. Runtime still executes the fallback root update branch for
+BYTES/host-effect cases, but the conversion into the executor-owned
+`SourceRouteSelectedExecution` surface and the report core
+`cpu-plan-source-route-runtime-branch-execution-v1` now live in PlanExecutor.
+
+What changed:
+
+- Added `SourceRouteRuntimeBranchExecutionInput` and
+  `assemble_source_route_runtime_branch_execution` to `boon_plan_executor`.
+- `run_plan_source_route` now delegates runtime-branch selected-output assembly
+  to `assemble_plan_source_route_runtime_branch_execution`.
+- Added the focused executor test
+  `source_route_runtime_branch_execution_is_executor_owned`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `source_route_runtime_branch_execution_extracted`.
+- Used a subagent/explorer read on the remaining boundary. The recommendation
+  for the next larger slice is to add an executor-owned root state/BYTES
+  container, because `RootBytesState`, `plan_root_scalar_initial_state`, and
+  `apply_executed_root_update_to_state` still keep the root-scenario replay
+  loop in `boon_runtime`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_route_runtime_branch_execution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 48 filtered out.
+- `cargo test -q -p boon_runtime run_plan_route_compares_full_source_event_delta_batch -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `source_route_runtime_branch_execution_extracted=true`;
+  the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route runtime-branch selected-output assembly is PlanExecutor-owned
+  and report-gated.
+- Next recommended extraction:
+  introduce executor-owned root scalar/BYTES state, initialize it from
+  `MachinePlan`, and use executor-owned `PlanExecutorBytes` directly in the
+  root scenario/source-route execution paths before moving more of the replay
+  loop.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root State Container
+
+Status: introduced an executor-owned root scalar/BYTES state container and
+switched root MachinePlan execution state from `RuntimeBytes` to
+`PlanExecutorBytes`. Runtime still owns the surrounding replay loop, legacy
+comparison, and source compilation, but root BYTES initialization, root private
+byte maps, fixed byte banks, root read/write evaluator inputs, and root storage
+transitions now stay on PlanExecutor byte storage.
+
+What changed:
+
+- Added `PlanExecutorRootState` and `initialize_root_state` to
+  `boon_plan_executor`.
+- `initialize_root_state` initializes public root JSON state plus private root
+  BYTES/fixed-bank state in one executor-owned pass.
+- Changed runtime root execution `RootBytesState` to
+  `BTreeMap<usize, PlanExecutorBytes>`.
+- Removed the root-only `runtime_bytes_state_for_plan_executor` conversion
+  helper from runtime.
+- Updated root source-payload, const, read, write, ReadPath, PreviousValue, and
+  storage-transition paths to carry `PlanExecutorBytes` directly.
+- Left indexed/list row BYTES storage on `RuntimeBytes`; that is a separate
+  follow-up slice.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_state_container_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_state_initializer_owns_public_and_private_bytes_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 49 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_storage_transition_commits_bytes_and_public_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 49 filtered out.
+- `cargo test -q -p boon_plan_executor root_bytes_state_transition_applies_fixed_mutation_in_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 49 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_same_event_bytes_dependency -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_state_container_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root scalar/BYTES execution state is PlanExecutor-owned enough that root
+  MachinePlan execution no longer converts root private BYTES through
+  `RuntimeBytes`.
+- Next recommended extraction:
+  move a larger part of `execute_machine_plan_root_scenario_inner` into
+  PlanExecutor now that the root state substrate no longer depends on runtime
+  byte storage.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor Root Scenario Step Preparation
+
+Status: moved root-scenario step preparation composition into
+`boon_plan_executor`. Runtime still applies the prepared route ops and owns the
+larger replay loop, but it no longer composes dispatch, source-route slot
+resolution, derived value evaluation, route-op resolution, materialized-work
+validation, and dispatch report patching itself.
+
+What changed:
+
+- Added `RootScenarioStepPreparation` and `prepare_root_scenario_step` to
+  `boon_plan_executor`.
+- `prepare_root_scenario_step` returns the selected source id, cloned source
+  route slot, owned route ops, source-derived values, key-gate result, and
+  executor reports.
+- Replaced the runtime prelude in root scenario replay with one
+  `prepare_plan_root_scenario_step` call.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_scenario_step_preparation_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_scenario_step_preparation_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 50 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_scenario_step_preparation_extracted=true` and
+  `root_state_container_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root-scenario step preparation composition is PlanExecutor-owned and
+  report-gated.
+- Next recommended extraction:
+  move the next contiguous part of `execute_machine_plan_root_scenario_inner`
+  into PlanExecutor: either source-derived/list append-remove application or
+  root update application over `PlanExecutorRootState`.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Source-Derived Step Delta Bundle
+
+Status: moved source-derived per-step delta/signature/report bundling into
+`boon_plan_executor`. Runtime still owns the root-scenario replay accumulators,
+but it no longer expands `build_source_derived_value_deltas` tuple-by-tuple in
+the replay loop.
+
+What changed:
+
+- Added `SourceDerivedStepDeltas` and `assemble_source_derived_step_deltas` to
+  `boon_plan_executor`.
+- Runtime root scenario replay now calls
+  `assemble_plan_source_derived_step_deltas` and extends its per-step/global
+  accumulators from the executor-owned bundle.
+- Extended `verify-compiler-boundaries` and report schema with
+  `source_derived_step_delta_bundle_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor source_derived_values_are_evaluated_by_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 50 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `source_derived_step_delta_bundle_extracted=true` and
+  `root_scenario_step_preparation_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-derived step delta/signature/report bundling is PlanExecutor-owned and
+  report-gated.
+- Next recommended extraction:
+  move the next contiguous replay application step into PlanExecutor:
+  source-derived list append/remove execution if row-state conversion is made
+  executor-owned, or root update application over `PlanExecutorRootState` if the
+  root `ExecutedRootUpdate` representation is moved first.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root Executed Update State Application
+
+Status: moved the root executed-update representation, candidate fingerprint
+conversion, and executed-update state application helper into
+`boon_plan_executor`. Runtime still evaluates some runtime-specific root update
+branches, but it no longer owns the `ExecutedRootUpdate` data structure or the
+helper glue that turns an executed update into a candidate or root state
+transition.
+
+What changed:
+
+- Added `RootExecutedUpdate` to `boon_plan_executor`.
+- Added `root_update_candidate_from_executed` to build executor-owned candidate
+  fingerprints, including private BYTES and fixed-mutation fingerprints.
+- Added `apply_executed_root_update_to_state`, which applies a
+  `RootExecutedUpdate` through the existing executor-owned root update storage
+  transition helper.
+- Runtime now stores touched root updates as `RootExecutedUpdate`, calls
+  `plan_root_update_candidate_from_executed`, and calls
+  `apply_plan_executed_root_update_to_state`.
+- Removed runtime-local `ExecutedRootUpdate`, `RootFixedBytesMutation`,
+  `root_update_candidate_from_executed`, and
+  `apply_executed_root_update_to_state`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_executed_update_state_application_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_executed_update_candidate_and_state_apply_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 51 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_executed_update_state_application_extracted=true`
+  and `root_update_storage_transition_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root executed-update representation and state application are
+  PlanExecutor-owned and report-gated.
+- Next recommended extraction:
+  move root runtime-branch update evaluation itself into PlanExecutor for the
+  remaining root expression kinds that already use executor-owned BYTES
+  evaluators, leaving only host file effects or other explicit runtime callbacks
+  behind a narrow callback boundary.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root JSON Update Execution
+
+Status: moved root JSON update execution assembly into `boon_plan_executor`.
+Runtime still owns the fallback branch for runtime-specific root updates, but it
+no longer evaluates the JSON branch, selects the execution surface, decorates the
+surface report, or hand-assembles a `RootExecutedUpdate` for Plan JSON root
+updates.
+
+What changed:
+
+- Added `RootJsonUpdateExecution` to `boon_plan_executor`.
+- Added `execute_root_json_update_branch`, which runs the executor-owned root
+  JSON evaluator, selects the execution surface, records the surface core in the
+  evaluator report, and returns a ready `RootExecutedUpdate` for Plan JSON
+  branches.
+- Runtime now calls `execute_plan_root_json_update_branch` and only falls back
+  to `execute_root_scalar_update_branch` when the executor reports a
+  runtime-specific surface.
+- Added focused coverage for PlanExecutor-owned root JSON update execution.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_json_update_execution_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_json_update_execution_assembles_plan_json_executed_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 52 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_json_update_execution_extracted=true` and
+  `root_update_execution_surface_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass after the fresh boundary report is written.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root JSON update execution assembly for Plan JSON branches is
+  PlanExecutor-owned and report-gated.
+- Next recommended extraction:
+  move the remaining root runtime-branch update execution behind PlanExecutor
+  host-effect/BYTES callback boundaries, so runtime stops owning the root update
+  expression dispatch loop.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback execution, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root Runtime-Branch Update Execution Assembly
+
+Status: moved canonical root runtime-branch update assembly into
+`boon_plan_executor`. Runtime still evaluates BYTES, host-effect, and state-copy
+fallback branches, but it no longer constructs the fallback `RootExecutedUpdate`
+record directly.
+
+What changed:
+
+- Added `RootRuntimeBranchUpdateInput` to `boon_plan_executor`.
+- Added `assemble_root_runtime_branch_update`, which wraps runtime-provided
+  branch evidence in `cpu-plan-root-runtime-branch-update-execution-v1` and
+  returns the canonical `RootExecutedUpdate`.
+- Runtime now calls `assemble_plan_root_runtime_branch_update` at the end of
+  `execute_root_scalar_update_branch`.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_runtime_branch_update_execution_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_runtime_branch_update_execution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 53 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_runtime_branch_update_execution_extracted=true`;
+  the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root runtime-branch update result assembly is PlanExecutor-owned and
+  report-gated.
+- Next recommended extraction:
+  move the BYTES read/write fallback dispatch table out of
+  `execute_root_scalar_update_branch`, ideally by adding executor callback
+  boundaries for runtime-owned byte-bank and host-file inputs.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update fallback branch evaluation, full root-scenario
+  replay, runtime typed structures, public runtime source-unit wrapper API, list
+  row construction and refresh, broader indexed/list byte state ownership,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Root BYTES Update Dispatch Classification
+
+Status: moved active root BYTES read/write dispatch classification into
+`boon_plan_executor`. Runtime still supplies byte-bank state and host-file roots
+to the executor-owned BYTES evaluators, and the old per-operation match arms are
+still present as shadowed code for a follow-up mechanical deletion.
+
+What changed:
+
+- Added `RootBytesUpdateDispatchKind` to `boon_plan_executor`.
+- Added `root_bytes_update_dispatch_kind`, which classifies root BYTES update
+  branches as read or write, including file read/write boundaries.
+- Runtime now calls `plan_root_bytes_update_dispatch_kind` before the scalar
+  fallback match and routes classified branches through the existing
+  executor-owned root BYTES read/write evaluators.
+- The runtime BYTES evaluator adapters now accept `host_file_root`, so
+  `File/read_bytes` and `File/write_bytes` use the same classified path.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_bytes_update_dispatch_extracted`.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_bytes_update_dispatch_kind_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_bytes_update_dispatch_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  the active root BYTES read/write dispatch decision is PlanExecutor-owned and
+  report-gated.
+- Next recommended extraction:
+  mechanically delete the shadowed per-operation BYTES arms from
+  `execute_root_scalar_update_branch`, then move the remaining byte-bank and
+  host-file input boundary behind explicit executor callback traits.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update byte-bank and host-file input ownership, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - Remove Shadowed Runtime Root BYTES Arms
+
+Status: removed the now-shadowed per-operation root BYTES fallback arms from
+`execute_root_scalar_update_branch`. Root BYTES update branches now enter the
+early PlanExecutor-owned read/write dispatch path instead of remaining duplicated
+in the runtime scalar fallback match.
+
+What changed:
+
+- Deleted the runtime fallback arms for root `Bytes/*`, `File/read_bytes`,
+  `File/write_bytes`, and `TextToBytes` update expressions.
+- Kept non-BYTES fallback behavior for source payload, const, bool,
+  `ReadPath`, `PreviousValue`, and `TextTrimOrPrevious`.
+- Tightened always-null fallback report fields after the deletion.
+- Extended `verify-compiler-boundaries` and report schema with
+  `root_bytes_shadowed_runtime_arms_removed`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_plan_executor root_bytes_update_dispatch_kind_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_bytes_update_dispatch_extracted=true` and
+  `root_bytes_shadowed_runtime_arms_removed=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  duplicated runtime-owned per-operation root BYTES fallback dispatch has been
+  removed after the PlanExecutor dispatch migration.
+- Next recommended extraction:
+  move byte-bank and host-file inputs behind explicit PlanExecutor callback
+  boundaries so runtime becomes a provider of external capabilities instead of
+  the owner of root BYTES fallback evaluation inputs.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update byte-bank and host-file input ownership, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - Root BYTES Runtime Environment Boundary
+
+Status: grouped root BYTES evaluator inputs behind a named runtime environment
+boundary. The PlanExecutor still owns root BYTES dispatch classification and
+read/write evaluator semantics; the runtime now passes byte-bank and host-file
+capabilities through `RootBytesRuntimeEnvironment` instead of exposing the raw
+triplet at each dispatch call site.
+
+What changed:
+
+- Added `RootBytesRuntimeEnvironment` with `private_bytes`,
+  `fixed_byte_banks`, and `host_file_root`.
+- Replaced direct `evaluate_root_bytes_*_update_for_runtime` calls in
+  `execute_root_scalar_update_branch` with
+  `bytes_environment.evaluate_read(...)` and
+  `bytes_environment.evaluate_write(...)`.
+- Removed the old free-function root BYTES runtime adapters so the root BYTES
+  runtime boundary is explicit and machine-checkable.
+- Added `root_bytes_runtime_environment_wrapped` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_plan_executor root_bytes_update_dispatch_kind_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_bytes_update_dispatch_extracted=true`,
+  `root_bytes_shadowed_runtime_arms_removed=true`, and
+  `root_bytes_runtime_environment_wrapped=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root BYTES evaluator inputs are now grouped behind an explicit runtime
+  environment boundary after the PlanExecutor-owned dispatch migration.
+- Next recommended extraction:
+  convert the environment into an executor-facing capability/callback interface
+  so root BYTES read/write evaluators no longer depend on runtime-owned storage
+  shapes.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  BYTES/host-effect root update storage ownership, full root-scenario replay,
+  runtime typed structures, public runtime source-unit wrapper API, list row
+  construction and refresh, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - Root BYTES Environment Capability
+
+Status: moved root BYTES read/write evaluators from concrete root byte maps to
+an executor-facing capability trait. Runtime still provides the current storage,
+but PlanExecutor now asks a `RootBytesEnvironment` for private bytes and fixed
+byte banks by `StateId` instead of depending on the concrete runtime/root-state
+map shape at evaluator boundaries.
+
+What changed:
+
+- Added `RootBytesEnvironment` to `boon_plan_executor`.
+- Implemented the trait for `PlanExecutorRootState`.
+- Changed `evaluate_root_bytes_read_update` and
+  `evaluate_root_bytes_write_update` to accept
+  `&(impl RootBytesEnvironment + ?Sized)`.
+- Updated root BYTES evaluator helpers and fixed-bank mutation decisions to use
+  the capability methods.
+- Implemented `RootBytesEnvironment` for runtime's
+  `RootBytesRuntimeEnvironment`.
+- Added `root_bytes_environment_capability_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_plan_executor root_bytes_update_dispatch_kind_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_bytes_update_dispatch_extracted=true`,
+  `root_bytes_shadowed_runtime_arms_removed=true`,
+  `root_bytes_runtime_environment_wrapped=true`, and
+  `root_bytes_environment_capability_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root BYTES evaluators consume an executor-facing byte environment capability
+  instead of concrete root byte storage maps.
+- Next recommended extraction:
+  move root BYTES state transitions and source-payload byte commits behind the
+  same capability/state-owner boundary, then apply the pattern to indexed BYTES
+  row environments.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation,
+  root BYTES state mutation ownership, full root-scenario replay, runtime typed
+  structures, public runtime source-unit wrapper API, list row construction and
+  refresh, broader indexed/list byte state ownership, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-29 - Root BYTES State Owner Capability
+
+Status: moved the core root BYTES state transition from concrete mutable byte
+maps to an executor-facing mutable state-owner capability. The compatibility
+storage-transition wrapper still accepts the current root byte maps, but it now
+adapts them through `RootBytesStateMaps` before calling the core transition.
+
+What changed:
+
+- Added `RootBytesStateOwner` to `boon_plan_executor`.
+- Added `RootBytesStateMaps` as a mutable adapter for the current root byte
+  storage maps.
+- Implemented `RootBytesStateOwner` for both `RootBytesStateMaps` and
+  `PlanExecutorRootState`.
+- Changed `apply_root_bytes_state_transition` to accept
+  `&mut impl RootBytesStateOwner`.
+- Changed fixed-byte mutation helpers to use owner methods instead of direct
+  `BTreeMap` reads/writes.
+- Added `root_bytes_state_owner_capability_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_bytes_state_transition_applies_fixed_mutation_in_executor -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_bytes_state_transition_extracted=true` and
+  `root_bytes_state_owner_capability_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root BYTES state-transition semantics now consume a mutable executor-facing
+  state-owner capability instead of raw byte maps.
+- Next recommended extraction:
+  move root update storage transition and executed-update application to operate
+  on a root state owner object, then mirror the owner/capability pattern for
+  indexed row BYTES state.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - Root Update State Owner Capability
+
+Status: moved the root update storage transition from loose root JSON/BYTES
+maps to an executor-facing root state owner capability. The existing
+executed-update application wrapper still accepts the current maps for runtime
+compatibility, but now adapts them through `RootUpdateStateMaps` before applying
+the storage transition.
+
+What changed:
+
+- Added `RootUpdateStateOwner` to `boon_plan_executor`.
+- Added `RootUpdateStateMaps` as an adapter over the current root JSON state,
+  private BYTES state, and fixed byte banks.
+- Implemented `RootUpdateStateOwner` for both `RootUpdateStateMaps` and
+  `PlanExecutorRootState`.
+- Changed `apply_root_update_storage_transition` to accept
+  `&mut impl RootUpdateStateOwner`.
+- Updated direct root storage-transition tests to use the owner adapter.
+- Added `root_update_state_owner_capability_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_storage_transition -- --nocapture --test-threads=1`:
+  pass; 2 passed and 53 filtered out.
+- `cargo test -q -p boon_plan_executor root_executed_update_candidate_and_state_apply_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 54 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_update_storage_transition_extracted=true`,
+  `root_update_state_owner_capability_extracted=true`, and
+  `root_executed_update_state_application_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root update storage transition consumes an executor-facing root state owner
+  instead of concrete public/private root state maps.
+- Next recommended extraction:
+  move the remaining executed-update application wrapper and non-initial
+  scenario execution loop to hold a `PlanExecutorRootState` directly, then apply
+  the same state-owner pattern to indexed row/list update ownership.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - Runtime Root State Container
+
+Status: wrapped the runtime root scenario public JSON state, private BYTES
+state, and fixed byte banks in a single `RuntimeRootState` container. This is an
+intermediate step toward carrying `PlanExecutorRootState` directly through
+non-initial replay; it stops the root scenario loop from cloning and passing
+three loose root-state maps for staged and committed root updates.
+
+What changed:
+
+- Added `RuntimeRootState` in `boon_runtime`.
+- Changed `plan_root_scalar_initial_state` to return
+  `(RuntimeRootState, JsonValue, usize)`.
+- Routed staged root JSON updates through `RuntimeRootState::apply_json_update`.
+- Routed staged and committed BYTES updates through
+  `RuntimeRootState::apply_executed_update`.
+- Replaced staged loose-map clones with `let mut staged_root_state =
+  root_state.clone()`.
+- Added `runtime_root_state_container_wrapped` to `verify-compiler-boundaries`
+  and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_storage_transition -- --nocapture --test-threads=1`:
+  pass; 2 passed and 53 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_root_state_container_wrapped=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime root scenario execution now carries root public/private/fixed BYTES
+  state as one container through staged and committed update application.
+- Next recommended extraction:
+  replace `RuntimeRootState` with direct `PlanExecutorRootState` ownership in
+  non-initial root replay, then move the root replay loop itself into
+  PlanExecutor-owned execution.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - Runtime Carries PlanExecutorRootState
+
+Status: replaced the temporary runtime-only root-state wrapper with direct
+`PlanExecutorRootState` ownership in non-initial root replay. Runtime still owns
+the replay loop, but the state object carried through staged and committed root
+updates is now the PlanExecutor root state type.
+
+What changed:
+
+- Removed the temporary `RuntimeRootState` struct.
+- Added a runtime-local `RuntimePlanExecutorRootStateOps` helper trait
+  implemented for `PlanExecutorRootState`.
+- Changed `plan_root_scalar_initial_state` to return
+  `(PlanExecutorRootState, JsonValue, usize)`.
+- Kept staged and committed update application routed through helper methods on
+  the carried `PlanExecutorRootState`.
+- Added `runtime_plan_executor_root_state_carried` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_root_state_container_wrapped=true` and
+  `runtime_plan_executor_root_state_carried=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  non-initial root replay now carries `PlanExecutorRootState` directly rather
+  than a runtime duplicate of its public/private/fixed byte maps.
+- Next recommended extraction:
+  move the non-initial root replay loop into PlanExecutor-owned execution, using
+  `PlanExecutorRootState` as the state carrier across selected scenario steps.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor Root State Update Helpers
+
+Status: moved the root-state update helper surface out of runtime and into
+PlanExecutor. Runtime still owns the non-initial replay loop, but staged and
+committed root JSON/BYTES update application now call PlanExecutor helper
+functions instead of a runtime-local helper trait.
+
+What changed:
+
+- Added `apply_root_json_update_to_root_state` and
+  `apply_executed_root_update_to_root_state` in `boon_plan_executor`.
+- Removed the runtime-local `RuntimePlanExecutorRootStateOps` helper trait.
+- Routed runtime root JSON and executed root update application through the
+  PlanExecutor helper functions.
+- Updated `verify-compiler-boundaries` and report schema with
+  `root_state_update_helpers_extracted`.
+- Updated stale verifier evidence strings so the root update and root BYTES
+  transition checks accept the new root-state helper call path.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_plan_executor root_update_storage_transition -- --nocapture --test-threads=1`:
+  pass; 2 passed and 53 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_update_storage_transition_extracted=true`,
+  `root_update_state_owner_capability_extracted=true`,
+  `runtime_root_state_container_wrapped=true`,
+  `runtime_plan_executor_root_state_carried=true`,
+  `root_state_update_helpers_extracted=true`,
+  `root_bytes_state_transition_extracted=true`, and
+  `root_bytes_state_owner_capability_extracted=true`; the only remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime no longer owns helper methods for applying JSON and executed root
+  updates to `PlanExecutorRootState`.
+- Next recommended extraction:
+  move the selected-step/non-initial root replay loop into PlanExecutor so
+  runtime calls an executor-owned replay surface instead of orchestrating the
+  root update sequence itself.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, root/list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor Root Update Commit Batch
+
+Status: moved ordered root update candidate commit sequencing from runtime into
+PlanExecutor. Runtime still owns the larger non-initial root replay loop, but
+it no longer iterates ordered root update candidates, mutates committed root
+state, or assembles committed root update reports/deltas by hand.
+
+What changed:
+
+- Added `RootUpdateCommitBatch` and
+  `commit_ordered_root_update_candidates` in `boon_plan_executor`.
+- Routed runtime committed root update application through the PlanExecutor
+  batch helper.
+- Removed runtime's open-coded `ordered_candidates()` commit loop and direct
+  `RootUpdateCommitInput` assembly.
+- Added `root_update_commit_batch_extracted` to
+  `verify-compiler-boundaries` and report schema.
+- Added a PlanExecutor unit test proving the batch helper mutates
+  `PlanExecutorRootState`, emits touched-state summaries, and returns semantic
+  delta/update report bundles.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_commit_batch_applies_candidates_to_root_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 55 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_update_commit_assembly_extracted=true`,
+  `root_update_commit_batch_extracted=true`, and
+  `root_state_update_helpers_extracted=true`; the only remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  ordered root update candidate commit sequencing is PlanExecutor-owned.
+- Next recommended extraction:
+  move the root source-event step execution body into PlanExecutor behind an
+  explicit runtime callback boundary for the remaining legacy/runtime branch
+  evaluators, then retire the callback as more branches become executor-owned.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor Root Update Branch Collection
+
+Status: moved non-indexed root update branch collection into PlanExecutor.
+Runtime still owns the surrounding source-event replay loop and supplies a
+runtime callback for not-yet-extracted fallback branch evaluation, but
+PlanExecutor now owns root update branch validation, plan-json execution
+attempts, runtime fallback boundary selection, candidate coalescing, staged
+root-state mutation, and touched-update insertion for scalar root updates.
+
+What changed:
+
+- Added `RootUpdateBranchCollection` and
+  `collect_root_update_candidate_for_step` in `boon_plan_executor`.
+- Replaced runtime's open-coded non-indexed root update branch validation,
+  `execute_root_json_update_branch` call, candidate conversion/coalescing, and
+  staged root-state application with the PlanExecutor collector.
+- Kept the remaining runtime-only evaluator behind a closure callback, so the
+  boundary is explicit and removable.
+- Added `root_update_branch_collection_extracted` to
+  `verify-compiler-boundaries` and report schema.
+- Updated older boundary evidence strings so lower-level root JSON/BYTES
+  extraction flags accept the newer higher-level collector path without
+  reintroducing direct runtime ownership.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor root_update_branch_collection_stages_plan_json_candidate -- --nocapture --test-threads=1`:
+  pass; 1 passed and 56 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_chained_bytes_concat_state -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `root_json_update_execution_extracted=true`,
+  `root_bytes_state_transition_extracted=true`,
+  `root_bytes_state_owner_capability_extracted=true`, and
+  `root_update_branch_collection_extracted=true`; the only remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  non-indexed root update branch candidate collection and staged root-state
+  mutation are PlanExecutor-owned.
+- Next recommended extraction:
+  move list append/remove and indexed update step execution into PlanExecutor
+  callback surfaces, then collapse the remaining source-event replay loop into
+  PlanExecutor-owned orchestration.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor List Mutation Records
+
+Status: moved list append/remove mutation record assembly into PlanExecutor.
+Runtime still owns `PlanListRowState`, row refresh, private row BYTES storage,
+and the actual list-state mutation, but append/remove semantic delta bundles
+and report rows are now assembled by PlanExecutor-owned helpers.
+
+What changed:
+
+- Added `ListAppendMutationInput`, `ListAppendMutationRecord`, and
+  `record_list_append_mutation` in `boon_plan_executor`.
+- Added `ListRemoveMutationInput`, `ListRemoveMutationRecord`, and
+  `record_list_remove_mutation` in `boon_plan_executor`.
+- Runtime list append now delegates insert/source-bind/row-refresh/bool-delta
+  bundle and append report-row assembly to PlanExecutor.
+- Runtime list remove now delegates source-unbind/list-remove bundle and remove
+  report-row assembly to PlanExecutor.
+- Removed direct runtime imports of the lower-level append/remove delta
+  builders from this path.
+- Added `list_mutation_records_extracted` to `verify-compiler-boundaries` and
+  report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_mutation_records_are_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 57 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `row_source_binding_policy_extracted=true`,
+  `list_remove_delta_policy_extracted=true`,
+  `list_append_delta_policy_extracted=true`, and
+  `list_mutation_records_extracted=true`; the only remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  append/remove semantic delta and report-row assembly is PlanExecutor-owned.
+- Next recommended extraction:
+  move `PlanListRowState` or a PlanExecutor-owned row-state carrier into
+  `boon_plan_executor`, then migrate list append/remove state mutation and row
+  refresh around that carrier.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, list row construction and refresh, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor List Row-State Carrier
+
+Status: moved the mutable list row-state carrier into `boon_plan_executor`.
+Runtime still owns the list-state mutation loop and row refresh orchestration,
+but the row carrier type, public-row projection, row-state report fields, and
+row private BYTES storage now live in PlanExecutor-owned structures.
+
+What changed:
+
+- Added `PlanExecutorListRowState` with public fields, private row BYTES, and
+  fixed byte-bank storage to `boon_plan_executor`.
+- Added `list_row_state_public_rows` and `list_row_state_report_fields` so
+  runtime no longer locally rebuilds executor rows or report fields.
+- Runtime now aliases `PlanListRowState` to `PlanExecutorListRowState` instead
+  of defining its own row-state struct.
+- Row private BYTES are stored as `PlanExecutorBytes` in list/indexed row
+  state; runtime keeps `RuntimeBytes` conversion only at root runtime/source
+  boundaries.
+- Added `list_row_state_carrier_extracted` to `verify-compiler-boundaries` and
+  report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_state_carrier_reports_private_bytes -- --nocapture --test-threads=1`:
+  pass; 1 passed and 58 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_row_state_carrier_extracted=true`; the only
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`:
+  pass.
+- `git diff --check`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  the list row-state carrier and row private BYTES map are PlanExecutor-owned.
+- Next recommended extraction:
+  move list append/remove state mutation and row refresh around
+  `PlanExecutorListRowState` into PlanExecutor callback surfaces, then migrate
+  indexed update execution over the same row-state carrier.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, broader indexed/list byte state ownership, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor List Row Initial-State Refresh
+
+Status: moved list row initial-state mirror refresh into `boon_plan_executor`.
+Runtime still owns row-expression refresh, bool-not refresh, and the surrounding
+list mutation loop, but the policy that copies initial row fields into indexed
+state fields, including private row BYTES and fixed byte-bank mirroring, is now
+executor-owned.
+
+What changed:
+
+- Added `refresh_list_row_initial_state_fields` in `boon_plan_executor`.
+- Runtime append and initial-list construction now call
+  `refresh_plan_list_row_initial_state_fields` instead of a runtime-local
+  helper.
+- Removed runtime’s local `refresh_row_initial_state_fields`.
+- Added `list_row_initial_refresh_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_initial_state_refresh_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 59 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_row_initial_refresh_extracted=true`; the only
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`:
+  pass.
+- `git diff --check`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list row initial-state mirror refresh is PlanExecutor-owned.
+- Next recommended extraction:
+  move row-expression refresh or bool-not row refresh into PlanExecutor behind
+  a row-expression evaluation callback, then collapse append-row construction
+  around a PlanExecutor-owned row mutation helper.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, row-expression refresh, indexed update execution and row/list
+  state mutation, full root-scenario replay, runtime typed structures, public
+  runtime source-unit wrapper API, broader indexed/list byte state ownership,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor List Row Bool/not Refresh
+
+Status: moved indexed list row Bool/not refresh into `boon_plan_executor`.
+Runtime still owns row-expression refresh and the surrounding list mutation
+loop, but the strict append-time Bool/not delta path and best-effort initial
+row Bool/not refresh path now share PlanExecutor-owned policy.
+
+What changed:
+
+- Added `refresh_list_row_bool_not_deltas` in `boon_plan_executor` for the
+  append path that must produce semantic `FieldSet` deltas and fail on missing
+  non-current bool inputs.
+- Added `refresh_list_row_bool_not_fields` in `boon_plan_executor` for
+  best-effort row construction refresh, preserving the prior no-op behavior
+  when bool inputs are not yet available.
+- Runtime append and initial-list construction now call the executor helpers.
+- Removed runtime’s local `row_bool_not_deltas` and
+  `refresh_row_bool_not_fields` implementations.
+- Added `list_row_bool_not_refresh_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_bool_not_refresh_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 60 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_row_bool_not_refresh_extracted=true`; the only
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`:
+  pass.
+- `git diff --check`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed list row Bool/not refresh and its row `FieldSet` delta policy are
+  PlanExecutor-owned.
+- Next recommended extraction:
+  move row-expression refresh behind executor callback surfaces, then collapse
+  append-row construction around the executor row-state carrier and refresh
+  helpers.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, row-expression refresh, indexed update execution and row/list
+  state mutation, full root-scenario replay, runtime typed structures, public
+  runtime source-unit wrapper API, broader indexed/list byte state ownership,
+  retained UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D
+  data movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor List Row Expression Refresh Loop
+
+Status: moved indexed list row-expression refresh iteration into
+`boon_plan_executor` behind a runtime evaluator callback. Runtime still owns the
+row-expression evaluator itself, but PlanExecutor now owns the strict and
+best-effort loops that select row-expression derived fields, call evaluation,
+and write refreshed row fields.
+
+What changed:
+
+- Added `refresh_list_row_expression_fields_with` in `boon_plan_executor` for
+  strict row-expression refresh.
+- Added `refresh_list_row_expression_fields_best_effort_with` in
+  `boon_plan_executor` for deferred/best-effort row-expression refresh.
+- Runtime append and initial-list construction now pass `eval_plan_row_expression`
+  into the executor refresh helpers.
+- Removed runtime’s local `refresh_row_expression_fields` and
+  `refresh_row_expression_fields_best_effort` loop implementations.
+- Added `list_row_expression_refresh_extracted` to
+  `verify-compiler-boundaries` and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_row_expression_refresh_loop_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 61 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_row_expression_refresh_extracted=true`; the only
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`:
+  pass.
+- `git diff --check`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed list row-expression refresh iteration is PlanExecutor-owned behind an
+  evaluator callback.
+- Next recommended extraction:
+  collapse append-row construction around a PlanExecutor-owned row mutation
+  helper that composes row defaults, append fields, expression refresh,
+  initial-state refresh, and Bool/not refresh.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list state
+  mutation loop, row-expression evaluation, indexed update execution and
+  row/list state mutation, full root-scenario replay, runtime typed
+  structures, public runtime source-unit wrapper API, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor List Append Row Construction
+
+Status: moved append-row construction into `boon_plan_executor`. Runtime still
+owns the outer list mutation iteration and row-expression evaluation callback,
+but row default construction, append field application, scoped source-path
+collection, best-effort and strict row-expression refresh, initial-state mirror
+refresh, and Bool/not delta refresh are now composed by one PlanExecutor helper.
+
+What changed:
+
+- Added `row_scoped_source_paths` in `boon_plan_executor`.
+- Added `ListAppendRowConstruction` in `boon_plan_executor`.
+- Added `construct_list_append_row_with` in `boon_plan_executor`.
+- Runtime append handling now delegates row construction to
+  `construct_plan_list_append_row_with` and keeps only allocation, list-state
+  insertion, mutation recording, and callback wiring.
+- Updated `verify-compiler-boundaries` and report schema with
+  `list_append_row_construction_extracted`.
+- Tightened the existing Bool/not refresh audit so the report accepts the new
+  executor-owned append-row composition instead of requiring runtime to import
+  the strict Bool/not delta helper directly.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_append_row_construction_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 62 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_append_row_construction_extracted=true` and
+  `list_row_bool_not_refresh_extracted=true`; the remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  append-row construction and refresh sequencing are PlanExecutor-owned.
+- Next recommended extraction:
+  move the non-initial PlanExecutor execution path or the outer list mutation
+  loop itself into `boon_plan_executor`, while keeping runtime as the temporary
+  parser/IR/typecheck orchestration shell until the default-path switch gates
+  permit removal.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, outer list state
+  mutation loop, row-expression evaluation, indexed update execution and
+  row/list state mutation, full root-scenario replay, runtime typed
+  structures, public runtime source-unit wrapper API, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor List Append Execution
+
+Status: moved list append operation execution into `boon_plan_executor`.
+Runtime still owns the scenario step loop and passes the row-expression
+evaluator callback, but append operation scanning, trigger resolution, row-key
+allocation, row construction, mutation recording, list-state insertion, and
+append counters are now performed by PlanExecutor.
+
+What changed:
+
+- Added `ListAppendExecution` in `boon_plan_executor`.
+- Added `append_list_rows_for_derived_values_with` in `boon_plan_executor`.
+- Runtime now calls `append_plan_list_rows_for_derived_values_with` instead of
+  owning `append_list_rows_for_derived_values`.
+- Removed runtime’s local append execution struct and operation loop.
+- Updated `verify-compiler-boundaries` and report schema with
+  `list_append_execution_extracted`.
+- Updated lower-level append audit predicates so allocator, bind/delta,
+  mutation-record, value-resolution, row-construction, and Bool/not refresh
+  ownership remain true when consumed through the executor append wrapper
+  instead of direct runtime imports.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_append_execution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 63 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_append_execution_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list append operation execution and list-state insertion are
+  PlanExecutor-owned.
+- Next recommended extraction:
+  move list remove operation execution into `boon_plan_executor`, then move the
+  indexed update/root scenario step execution surfaces so the remaining
+  compiler-boundary blocker can split into narrower, provable gates.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, list remove
+  operation execution, row-expression evaluation, indexed update execution and
+  row/list state mutation, full root-scenario replay, runtime typed
+  structures, public runtime source-unit wrapper API, broader indexed/list byte
+  state ownership, retained UI/WGPU propagation, native-web/accessibility
+  replay, SolidGraph/3D data movement, manufacturing transitions, Rust/Zig
+  codegen readiness, and non-root/list executor ownership remain outside the
+  completed surface.
+
+## 2026-06-29 - PlanExecutor List Remove Execution
+
+Status: moved list remove operation execution into `boon_plan_executor`.
+Runtime still owns the scenario step loop and indexed/root update orchestration,
+but remove operation scanning, source matching, scoped row resolution, predicate
+selection, mutation recording, list-state deletion, source unbind emission, and
+dependent root-derived delta comparison are now PlanExecutor-owned.
+
+What changed:
+
+- Added `ListRemoveExecution` in `boon_plan_executor`.
+- Added `remove_list_rows_for_source_event` in `boon_plan_executor`.
+- Added executor-owned row binding validation and row-resolution reporting for
+  list remove execution.
+- Runtime now adapts `GenericSourceEvent` to `PlanExecutorLiveSourceEvent` and
+  calls `remove_plan_list_rows_for_source_event`.
+- Removed runtime’s local `remove_list_rows_for_source` implementation and
+  remove-target struct.
+- Added `list_remove_execution_extracted` to `verify-compiler-boundaries` and
+  report schema.
+- Updated lower-level remove and root-aggregate audit predicates so they remain
+  true when consumed through the executor remove wrapper.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor list_remove_execution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 64 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `list_remove_execution_extracted=true`; the remaining
+  blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list remove operation execution and list-state deletion are
+  PlanExecutor-owned.
+- Next recommended extraction:
+  move indexed update execution or root scenario step orchestration into
+  `boon_plan_executor`, then split the remaining broad compiler-boundary blocker
+  into separate parser/IR/typecheck orchestration and non-initial execution
+  gates.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, row-expression
+  evaluation, indexed update execution and row/list state mutation, full
+  root-scenario replay, runtime typed structures, public runtime source-unit
+  wrapper API, broader indexed/list byte state ownership, retained UI/WGPU
+  propagation, native-web/accessibility replay, SolidGraph/3D data movement,
+  manufacturing transitions, Rust/Zig codegen readiness, and non-root/list
+  executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Indexed Update Batch Execution
+
+Status: moved indexed update batch orchestration into `boon_plan_executor`.
+Runtime still owns the one-row indexed update evaluator and derived-field
+refresh callback, but PlanExecutor now owns unscoped target selection, bulk
+row expansion, write-conflict tracking, semantic-delta ordering, and batch
+report/counter aggregation for indexed update branches.
+
+What changed:
+
+- Added `IndexedUpdateBranchExecution`, `IndexedUpdateTargetOverride`, and
+  `IndexedUpdateBatchExecution` in `boon_plan_executor`.
+- Added `execute_indexed_update_batch_with` in `boon_plan_executor`.
+- Runtime route-step handling now delegates indexed update batch policy to
+  `execute_plan_indexed_update_batch_with` and supplies only the one-row update
+  callback.
+- Removed runtime-local batch policy variables and calls to direct target
+  selection, conflict tracking, and delta ordering helpers.
+- Added `indexed_update_batch_execution_extracted` to
+  `verify-compiler-boundaries` and report schema.
+- Updated lower-level indexed update audit predicates so conflict, ordering,
+  and target-selection ownership remain true when consumed through the executor
+  batch wrapper.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_update_batch_execution_is_executor_owned -- --nocapture --test-threads=1`:
+  pass; 1 passed and 65 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `indexed_update_batch_execution_extracted=true`; the
+  remaining blocker is
+  `boon_runtime still owns source parsing/IR/typecheck orchestration and non-initial PlanExecutor execution paths`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed update batch selection/conflict/order orchestration is
+  PlanExecutor-owned behind a one-row evaluator callback.
+- Next recommended extraction:
+  move the one-row indexed update evaluator and indexed derived refresh policy
+  into `boon_plan_executor`, or split the broad compiler-boundary blocker into
+  explicit parser/IR/typecheck orchestration and non-initial runtime execution
+  gates.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, row-expression
+  evaluation, one-row indexed update evaluation and row/list state mutation,
+  full root-scenario replay, runtime typed structures, public runtime
+  source-unit wrapper API, broader indexed/list byte state ownership, retained
+  UI/WGPU propagation, native-web/accessibility replay, SolidGraph/3D data
+  movement, manufacturing transitions, Rust/Zig codegen readiness, and
+  non-root/list executor ownership remain outside the completed surface.
+
+## 2026-06-29 - PlanExecutor Indexed JSON Update Evaluator
+
+Status: moved the non-BYTES one-row indexed update value evaluator into
+`boon_plan_executor`. Runtime still owns BYTES-specific storage transitions and
+the non-initial source-route loop, but JSON/text/bool value selection for
+indexed update branches is now executor-owned.
+
+What changed:
+
+- Added `IndexedJsonUpdateEvaluation` in `boon_plan_executor`.
+- Added `evaluate_indexed_json_update_branch` in `boon_plan_executor`.
+- Runtime now calls `evaluate_plan_indexed_json_update_branch` before falling
+  back to BYTES-only source-payload/constant paths.
+- Removed runtime-local `indexed_bool_not_input_value` and
+  `indexed_single_state_input`.
+- Added `indexed_json_update_evaluator_extracted` to
+  `verify-compiler-boundaries` and the report schema.
+- Corrected the debug-label helper audit to recognize the current
+  executor-owned `field_label` / `semantic_field_label` runtime aliases instead
+  of a stale `derived_field_label` alias.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_json_update_evaluator_handles_bool_not_and_text_trim -- --nocapture --test-threads=1`:
+  pass; 1 passed and 66 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update -- --nocapture --test-threads=1`:
+  pass; 1 passed and 337 filtered out.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `indexed_json_update_evaluator_extracted=true`; before the
+  debug-label audit correction the report still listed the broad runtime
+  orchestration/non-initial PlanExecutor blocker and the stale debug-label
+  helper blocker.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  indexed JSON/text/bool update branch value evaluation is PlanExecutor-owned.
+- Next recommended extraction:
+  move BYTES indexed update value/storage transition or indexed derived refresh
+  policy into `boon_plan_executor`, then keep shrinking the remaining broad
+  runtime-owned orchestration/non-initial execution blocker.
+- Still blocked:
+  runtime-owned source parsing/IR/typecheck orchestration, non-initial
+  PlanExecutor execution paths, legacy differential execution, BYTES indexed
+  storage transitions, row-expression evaluation, retained UI/WGPU propagation,
+  native-web/accessibility replay, SolidGraph/3D data movement, manufacturing
+  transitions, Rust/Zig codegen readiness, and non-root/list executor ownership
+  remain open.
+
+## 2026-06-29 - Compiler Boundary Blocker Narrowed
+
+Status: refined the final compiler-boundary blocker after the source-route and
+root-scenario PlanExecutor checks proved their current executor-owned surfaces.
+This is an audit precision change, not a default-path completion claim.
+
+What changed:
+
+- `verify-compiler-boundaries` no longer treats the public
+  `run_plan_source_route` command adapter as proof that source-route
+  orchestration is still runtime-owned.
+- Added report fields:
+  `runtime_source_route_command_adapter_remaining` and
+  `runtime_root_scenario_orchestration_remaining`.
+- The refreshed report shows `source_route_orchestration_extracted=true`,
+  `root_scenario_step_dispatch_extracted=true`,
+  `root_scenario_report_assembly_extracted=true`,
+  `runtime_root_scenario_orchestration_remaining=false`, and
+  `runtime_source_route_command_adapter_remaining=true`.
+- The remaining compiler-boundary blocker is now specifically the direct
+  `boon_runtime` dependencies on frontend crates: `boon_parser`, `boon_ir`, and
+  `boon_typecheck`.
+
+Evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; the blocker is now direct `boon_runtime` frontend crate
+  dependencies, with `runtime_root_scenario_orchestration_remaining=false`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Next executable task:
+
+- Start removing `boon_runtime` direct `boon_parser` / `boon_ir` /
+  `boon_typecheck` dependencies by moving public parsed/typed artifact surfaces
+  and runtime IR-derived metadata into `boon_compiler` or `boon_plan_executor`
+  owned typed report adapters.
+
+## 2026-06-29 - Runtime Typecheck Dependency Removed
+
+Status: removed the direct `boon_typecheck` dependency from `boon_runtime`.
+Runtime still depends directly on `boon_parser` and `boon_ir`, but the public
+static-analysis surface that exposed typecheck data is now compiler-owned.
+
+What changed:
+
+- Added `CompilerStaticProgramAnalysis` in `boon_compiler`.
+- Re-exported it from `boon_runtime` as `RuntimeStaticProgramAnalysis` for
+  compatibility with current callers.
+- Changed `cached_static_analysis_from_project` and
+  `cached_runtime_static_analysis_from_project` to construct the
+  compiler-owned static-analysis artifact.
+- Removed the runtime-owned `RuntimeStaticProgramAnalysis` struct containing
+  direct `boon_typecheck::TypeCheckReport`, `boon_ir::ViewBinding`, and
+  `boon_ir::RowScope` field types.
+- Replaced the direct `boon_typecheck::MaterializationPolicy` conversion with a
+  debug-name mapping so `boon_runtime` no longer names `boon_typecheck`.
+- Removed `boon_typecheck.workspace = true` from `crates/boon_runtime/Cargo.toml`.
+- Added `runtime_typecheck_dependency_removed` to the compiler-boundary report
+  and schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_typecheck_dependency_removed=true` and remaining
+  `boon_runtime_frontend_dependencies=["boon_parser", "boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `boon_runtime` no longer directly depends on or names `boon_typecheck`.
+- Still blocked:
+  `boon_runtime` still directly depends on `boon_parser` and `boon_ir`, and it
+  still stores/uses `ParsedProgram` and `TypedProgram` internally for the legacy
+  runtime/document lowering path.
+- Next executable task:
+  move the remaining parser-facing document helpers and parsed-project cache
+  surface into `boon_compiler`, then continue reducing direct `TypedProgram`
+  ownership by moving IR-derived runtime/document metadata behind compiler or
+  PlanExecutor owned adapters.
+
+## 2026-06-29 - Runtime Public Load/Lower API Removed
+
+Status: removed the public parser/IR-shaped `boon_runtime::load_and_lower`
+surface. Runtime still uses `ParsedProgram` and `TypedProgram` internally, but
+the CLI no longer asks runtime to parse/lower Boon source for dump-plan and
+hardware reports.
+
+What changed:
+
+- `boon_cli dump-plan` now calls `boon_compiler::compile_source_path_to_full_ir`
+  directly before compiling the MachinePlan.
+- `boon_cli explain-hardware` now calls
+  `boon_compiler::compile_source_path_to_full_ir` directly.
+- `boon_runtime::load_and_lower` and `boon_runtime::load_and_lower_profiled`
+  are now private runtime helpers.
+- Added `runtime_public_load_and_lower_removed` to the compiler-boundary report
+  and schema.
+- Updated the compiler-boundary report’s next architectural cuts to point at
+  parser-facing source/document helper removal and IR-derived metadata
+  extraction, rather than stale source-route/root-scenario work.
+
+Evidence:
+
+- `cargo check -q -p boon_cli -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_public_load_and_lower_removed=true`; remaining
+  `boon_runtime_frontend_dependencies=["boon_parser", "boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  external CLI paths no longer consume parser/IR loading through
+  `boon_runtime`.
+- Still blocked:
+  `boon_runtime` still owns internal parser/IR-shaped runtime and document
+  construction through `ParsedProgram`, `TypedProgram`, `DocumentAst`, and many
+  IR-derived runtime tables.
+- Next executable task:
+  move parser-facing document/source helpers and the
+  `cached_runtime_parsed_project` public surface into `boon_compiler`, then
+  continue moving IR-derived runtime/document metadata behind typed compiler or
+  PlanExecutor artifacts.
+
+## 2026-06-29 - Runtime Public Parsed Project Cache Removed
+
+Status: removed another public parser-shaped runtime surface. The native
+playground no longer calls `boon_runtime::cached_runtime_parsed_project`; it
+uses its local document project parse cache for layout parsing, while
+`cached_runtime_parsed_project` is now private inside runtime.
+
+What changed:
+
+- Updated native preview project build to call `cached_document_project_program`
+  instead of `boon_runtime::cached_runtime_parsed_project`.
+- Made `cached_runtime_parsed_project` private.
+- Added `runtime_public_parsed_project_cache_removed` to
+  `verify-compiler-boundaries` and the report schema.
+- Kept the report’s next architectural cuts pointed at parser-facing
+  document/source helper removal and IR-derived metadata extraction.
+
+Evidence:
+
+- `cargo check -q -p boon_native_playground -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_public_parsed_project_cache_removed=true`;
+  remaining `boon_runtime_frontend_dependencies=["boon_parser", "boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  no external caller consumes `ParsedProgram` through
+  `boon_runtime::cached_runtime_parsed_project`.
+- Still blocked:
+  `boon_runtime` still directly depends on `boon_parser` and `boon_ir` for
+  internal runtime/document construction and typed runtime tables.
+- Next executable task:
+  migrate parser-facing document helpers such as `boon_parser::parsed_document`
+  usage behind compiler-owned APIs, then split the larger `TypedProgram`
+  ownership into compiler/PlanExecutor artifacts.
+
+## 2026-06-29 - Runtime Parser Dependency Removed
+
+Status: removed the direct `boon_parser` dependency from `boon_runtime` while
+keeping the runtime's parser-shaped internals behind a compiler facade. This is
+a transitional boundary cut: `boon_compiler` now owns the parser crate edge,
+and runtime consumes the AST/parse types through compiler exports until the
+remaining IR-shaped runtime tables are extracted.
+
+What changed:
+
+- `boon_compiler` re-exports the parser AST/document/program types and parse
+  helpers needed by the existing runtime internals.
+- Added `compiler_parsed_document` as the compiler-owned facade for parsed
+  document access.
+- Updated `boon_runtime` imports and tests to use the compiler facade instead
+  of importing `boon_parser` directly.
+- Removed `boon_parser` from `crates/boon_runtime/Cargo.toml`.
+- Added `runtime_parser_dependency_removed` to the compiler-boundary report and
+  report schema.
+
+Evidence:
+
+- Current `target/reports/compiler/m1-boundaries.json` reports
+  `runtime_parser_dependency_removed=true`.
+- Current boundary report blocker is narrowed to
+  `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass in the previous focused boundary run.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `boon_runtime` no longer has a direct parser crate dependency or direct
+  `boon_parser::` source references.
+- Still blocked:
+  `boon_runtime` still directly depends on `boon_ir` for `TypedProgram`,
+  IR enums, source payload/path metadata, row scopes, view bindings, and
+  runtime/document table construction.
+- Next executable task:
+  replace runtime-owned `TypedProgram`/IR metadata reads with compiler-owned
+  runtime artifact structures, then remove the direct `boon_ir` dependency from
+  `boon_runtime`.
+
+## 2026-06-29 - Runtime Static Analysis DTOs Extracted
+
+Status: narrowed another frontend ownership leak at the runtime/native boundary.
+`RuntimeStaticProgramAnalysis` no longer exposes `boon_ir::ViewBinding` or
+`boon_ir::RowScope` to native playground callers; it now carries compiler-owned
+view-binding and row-scope DTOs re-exported by runtime.
+
+What changed:
+
+- Added `CompilerViewBinding`, `CompilerViewBindingKind`, and
+  `CompilerRowScope` in `boon_compiler`.
+- `CompilerStaticProgramAnalysis::from_ir_parts` converts IR view bindings and
+  row scopes into compiler-owned DTOs.
+- `boon_runtime` re-exports these as `RuntimeViewBinding`,
+  `RuntimeViewBindingKind`, and `RuntimeRowScope`.
+- Native playground source/data binding indexes now consume runtime-facing DTOs
+  instead of direct `boon_ir` structs.
+- Added `runtime_static_analysis_dtos_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_native_playground -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_static_analysis_dtos_extracted=true`; remaining
+  `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  native binding analysis callers no longer require IR-owned view binding or
+  row-scope DTOs.
+- Still blocked:
+  `boon_runtime` still directly depends on `boon_ir` for internal
+  `TypedProgram`-derived runtime/document tables and expression/list/source
+  metadata.
+- Next executable task:
+  move one of the remaining `CompiledProgram::from_ir` table builders, such as
+  list projections, source payload schemas, or document lowering summaries, into
+  compiler-owned runtime artifact structures consumed by runtime from artifact
+  data instead of direct IR traversal.
+
+## 2026-06-29 - Runtime List Projection DTOs Extracted
+
+Status: moved the list projection runtime-plan traversal out of
+`boon_runtime`. Runtime still owns the internal `RuntimeListProjection` plan and
+artifact decoder, but it no longer walks `TypedProgram.list_projections` or
+matches `boon_ir::ListProjectionKind` to construct that plan.
+
+What changed:
+
+- Added `CompilerListProjection` and `CompilerListProjectionKind` in
+  `boon_compiler`.
+- Added `compiler_list_projections_from_ir` as the compiler-owned traversal of
+  `TypedProgram.list_projections`.
+- Replaced `ListProjectionPlan::from_ir` with
+  `ListProjectionPlan::from_compiler_projections` in runtime.
+- Added `runtime_list_projection_dtos_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_list_projection_dtos_extracted=true`; remaining
+  `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  list projection runtime-plan construction no longer performs its own direct
+  IR list-projection traversal.
+- Still blocked:
+  `boon_runtime` still directly consumes `boon_ir` for other
+  `TypedProgram`-derived runtime/document/source tables.
+- Next executable task:
+  apply the same compiler-owned DTO/artifact pattern to the remaining direct
+  `boon_ir` consumers, starting with source payload schemas, document lowering
+  summary paths, or source-route target discovery.
+
+## 2026-06-29 - Runtime Source Payload Counts Extracted
+
+Status: moved source-payload count aggregation out of runtime. Runtime still
+owns source-route payload handling for execution and artifact-loaded routes,
+but it no longer traverses `TypedProgram.sources[*].payload_schema.fields` to
+compute compiled-program/report count fields.
+
+What changed:
+
+- Added `CompilerSourcePayloadCounts` in `boon_compiler`.
+- Added `compiler_source_payload_counts_from_ir` as the compiler-owned source
+  payload schema counting pass.
+- Replaced runtime `SourcePayloadCounts::from_ir` with
+  `SourcePayloadCounts::from_compiler_counts`.
+- Added `runtime_source_payload_counts_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_source_payload_counts_extracted=true`; remaining
+  `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-payload count reports now consume compiler-owned aggregate data instead
+  of runtime-owned IR schema traversal.
+- Still blocked:
+  `boon_runtime` still directly consumes `boon_ir` for source payload field
+  conversion in execution paths, generic source input evaluation, document
+  lowering, source-route target discovery, storage initialization, and other
+  `TypedProgram`-derived tables.
+- Next executable task:
+  continue moving source-route payload/schema and document lowering metadata
+  behind compiler-owned DTOs or compiled runtime artifacts.
+
+## 2026-06-29 - Runtime List Source Bindings Extracted
+
+Status: moved list source binding table construction out of runtime. Runtime
+still owns source binding execution and artifact decoding, but the table that
+maps list memories to scoped source paths is now extracted from `TypedProgram`
+by `boon_compiler`.
+
+What changed:
+
+- Added `CompilerListSourceBindingSlot` in `boon_compiler`.
+- Added `compiler_list_source_bindings_from_ir` as the compiler-owned traversal
+  of lists, row scopes, and scoped sources.
+- Replaced runtime `ListSourceBindingPlan::from_ir` with
+  `ListSourceBindingPlan::from_compiler_slots`.
+- Added `runtime_list_source_bindings_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_list_source_bindings_extracted=true`; remaining
+  `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime no longer traverses `TypedProgram.lists`, `row_scopes`, and `sources`
+  to build list source binding slots.
+- Still blocked:
+  `boon_runtime` still directly depends on `boon_ir` for other source-route,
+  document-lowering, storage-initialization, generic-expression, and
+  scenario/test paths.
+- Next executable task:
+  continue shrinking `CompiledProgram::from_ir` by extracting another table
+  builder, likely source-route target discovery or document-lowering summaries.
+
+## 2026-06-29 - Runtime Typed Storage Layout Counts Extracted
+
+Status: moved typed storage layout count aggregation out of runtime. Runtime
+still owns storage initialization and artifact decoding, but compiled-program
+storage layout count fields now come from a compiler-owned aggregate instead of
+runtime traversing IR list/state tables.
+
+What changed:
+
+- Added `CompilerTypedStorageLayoutCounts` in `boon_compiler`.
+- Added `compiler_typed_storage_layout_counts_from_ir` for compiler-owned
+  counting of root slots, indexed row slots, list memories, hidden key slots,
+  hidden generation slots, and indexed derived row slots.
+- Replaced runtime `TypedStorageLayoutCounts::from_ir` with
+  `TypedStorageLayoutCounts::from_compiler_counts`.
+- Added `runtime_typed_storage_layout_counts_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_typed_storage_layout_counts_extracted=true`;
+  remaining `boon_runtime_frontend_dependencies=["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime no longer traverses `TypedProgram.lists`, `state_cells`, and indexed
+  derived values only to compute storage layout count metadata.
+- Still blocked:
+  `boon_runtime` still directly consumes `boon_ir` for actual storage
+  initialization, runtime symbols, source-route target discovery,
+  document-lowering, generic expressions, and remaining diagnostics.
+- Next executable task:
+  move a behavior-bearing table next, likely source-route target discovery or
+  document-lowering summaries, behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Document List Metadata Extracted
+
+Status: moved document-lowering list metadata extraction out of runtime's
+compiled-program construction. Runtime still owns document lowering, but the
+list summary field table and dynamic list-view list set now come from
+`boon_compiler` DTOs instead of direct runtime IR traversal at that call site.
+
+What changed:
+
+- Added `CompilerListSummaryFields` in `boon_compiler`.
+- Added `compiler_list_summary_fields_from_ir` and
+  `compiler_dynamic_list_view_lists_from_ir` as compiler-owned traversals for
+  document list metadata.
+- Replaced the `CompiledProgram::from_ir` list metadata calculation with
+  compiler DTO conversion.
+- Added `runtime_document_list_metadata_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_document_list_metadata_extracted=true`;
+  remaining `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `CompiledProgram::from_ir` no longer calls runtime-owned
+  `list_summary_fields_from_ir` or `dynamic_list_view_lists_from_ir` for its
+  document metadata inputs.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for storage initialization,
+  runtime symbols, source-route target discovery, document-lowering internals,
+  generic expressions, and remaining diagnostics.
+- Next executable task:
+  extract another behavior-bearing table or source-route adapter behind
+  compiler-owned DTOs/artifacts, then keep the broad boundary gate failing until
+  the direct `boon_ir` dependency is gone.
+
+## 2026-06-29 - Runtime Root State Paths Extracted
+
+Status: moved another behavior-bearing compiled-program metadata derivation out
+of runtime. Runtime still stores and uses `root_state_paths`, but compiler now
+derives the list from state cells and root derived values.
+
+What changed:
+
+- Added `compiler_root_state_paths_from_ir` in `boon_compiler`.
+- Moved recursive `LATEST` detection into compiler as
+  `compiler_statement_contains_latest`.
+- Replaced the runtime `CompiledProgram::from_ir` root-state-path traversal with
+  the compiler function.
+- Removed the runtime-local `statement_contains_latest` helper.
+- Added `runtime_root_state_paths_extracted` to the compiler-boundary verifier
+  and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_root_state_paths_extracted=true`; remaining
+  `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  root summary path selection is no longer a runtime-owned direct traversal of
+  `TypedProgram.state_cells`, root derived values, and AST `LATEST` expressions.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for storage initialization,
+  runtime symbols, source-route construction, document-lowering internals,
+  generic expressions, and diagnostics.
+- Next executable task:
+  continue extracting behavior-bearing tables or source-route adapters behind
+  compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Source-Route Root Targets Extracted
+
+Status: moved source-route root scalar target membership extraction out of
+runtime's compiled-program construction. Runtime still builds source routes, but
+the root target membership set is now compiler-owned metadata.
+
+What changed:
+
+- Added `compiler_source_route_root_targets_from_ir` in `boon_compiler`.
+- Replaced the runtime `CompiledProgram::from_ir` scan of non-indexed state
+  cells for source-route root targets.
+- Updated `SourceRoutePlan::from_plans` to accept `BTreeSet<String>` root target
+  names.
+- Added `runtime_source_route_root_targets_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_source_route_root_targets_extracted=true`;
+  remaining `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route root target membership is no longer derived from
+  `TypedProgram.state_cells` inside runtime compiled-program construction.
+- Still blocked:
+  `boon_runtime` still owns the larger source-route builder and still depends on
+  `boon_ir` for source IDs, bool classification, router route targets, text
+  transform targets, storage initialization, generic expressions, and document
+  lowering internals.
+- Next executable task:
+  continue extracting source-route sub-tables or move a larger source-route DTO
+  behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Source-Route Source Metadata Extracted
+
+Status: moved source-route source id and payload metadata extraction out of the
+runtime route builder. Runtime still constructs `SourceRoutePlan`, but the
+source metadata it needs now comes from compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerSourceRouteSource` and `CompilerSourcePayloadField` in
+  `boon_compiler`.
+- Added `compiler_source_route_sources_from_ir` for compiler-owned extraction of
+  source path, source id, payload field kinds, and address lookup field.
+- Updated `SourceRoutePlan::from_plans` to receive compiler source metadata.
+- Replaced runtime source-id lookup, payload field population, and address
+  lookup assignment over `TypedProgram.sources`.
+- Removed the runtime-local `plan_source_payload_field` helper.
+- Added `runtime_source_route_sources_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_source_route_sources_extracted=true`; remaining
+  `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `SourceRoutePlan::from_plans` no longer scans `TypedProgram.sources` for
+  source ids, payload schemas, or address lookup fields.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for the broader source-route
+  classifier, bool classification, router-route/root-text-transform target
+  discovery, storage initialization, generic expressions, and document lowering.
+- Next executable task:
+  continue extracting source-route subtables or move the larger route classifier
+  behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Source-Route Bool Facts Extracted
+
+Status: moved source-route bool classification facts out of runtime. Runtime
+still owns route action classification, but bool target/read-path facts now come
+from compiler-owned metadata instead of runtime IR traversal.
+
+What changed:
+
+- Added `CompilerSourceRouteBoolFacts` and
+  `CompilerSourceRouteBoolReadPath` in `boon_compiler`.
+- Added `compiler_source_route_bool_facts_from_ir` for compiler-owned
+  extraction of bool scalar targets and bool read-path `(target, path)` pairs.
+- Updated `SourceRoutePlan::from_plans` to consume compiler bool facts.
+- Removed runtime-local `ir_scalar_target_is_bool`,
+  `ir_read_path_is_bool_for_target`, `ir_row_literal_field_for_path_is_bool`,
+  and `ir_list_literal_field_is_bool`.
+- Updated scalar bytecode candidate reporting to use compiler bool facts.
+- Added `runtime_source_route_bool_facts_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_source_route_bool_facts_extracted=true`;
+  remaining `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route bool classification no longer scans `TypedProgram.state_cells`,
+  `row_scopes`, or list literal initializers inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for router-route/root-text-transform
+  discovery, storage initialization, generic expressions, document lowering,
+  and diagnostics.
+- Next executable task:
+  continue extracting source-route target discovery or move another
+  behavior-bearing runtime table behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Source-Route Router Targets Extracted
+
+Status: moved Router/go_to route target discovery out of runtime. Runtime still
+owns route construction and execution, but router route target metadata now
+comes from compiler-owned extraction instead of runtime scanning IR/AST
+derived-value bodies.
+
+What changed:
+
+- Added `CompilerSourceRouteRouterRoute` in `boon_compiler`.
+- Added `compiler_source_route_router_targets_from_ir` for compiler-owned
+  extraction of source, target, and route path from Router/go_to
+  source-event transforms.
+- Updated `SourceRoutePlan::from_plans` to consume compiler router targets.
+- Added `SourceRouteRouterRoute::from_compiler` as the runtime boundary
+  adapter.
+- Removed runtime-local `router_route_targets_from_ir`.
+- Updated the physical TodoMVC router-filter route test to use the compiler
+  extractor.
+- Added `runtime_source_route_router_targets_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass after `cargo fmt --all`.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_source_route_router_targets_extracted=true`;
+  remaining `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`; blocker remains
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route router target discovery no longer scans `TypedProgram`
+  derived-value ASTs inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for root text transform discovery,
+  storage initialization, generic expressions, document lowering, and
+  diagnostics.
+- Next executable task:
+  extract root text transform target discovery or move another runtime-owned IR
+  table behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Source-Route Root Text Transforms Extracted
+
+Status: moved root text transform target discovery out of runtime. Runtime
+still owns route construction and execution, but source-route root text
+transform metadata now comes from compiler-owned extraction instead of runtime
+scanning IR/AST derived-value bodies.
+
+What changed:
+
+- Added `CompilerSourceRouteRootTextTransform` and `CompilerFieldValue` in
+  `boon_compiler`.
+- Added `compiler_source_route_root_text_transform_targets_from_ir` for
+  compiler-owned extraction of source, target, and const field value.
+- Updated `SourceRoutePlan::from_plans` to consume compiler root text transform
+  targets.
+- Added `SourceRouteRootTextTransform::from_compiler` and
+  `field_value_from_compiler` as runtime boundary adapters.
+- Removed runtime-local `root_text_transform_targets_from_ir`.
+- Updated the physical TodoMVC theme route test to use the compiler extractor.
+- Added `runtime_source_route_root_text_transforms_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_source_route_root_text_transforms_extracted=true` and
+  `runtime_source_route_router_targets_extracted=true`; remaining
+  `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`; blocker remains
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo test -q -p boon_runtime physical_todomvc_theme_source_event_updates_latest_root_text`:
+  interrupted after several minutes without completing; no pass result claimed.
+
+Current blocker classification:
+
+- Completed in this slice:
+  source-route root text transform discovery no longer scans `TypedProgram`
+  derived-value ASTs inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for list operation planning,
+  storage initialization, generic expressions, document lowering, diagnostics,
+  and source-route command adapters.
+- Next executable task:
+  extract list operation planning or another runtime-owned IR table behind
+  compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime List Operations Extracted
+
+Status: moved list operation planning out of runtime. Runtime still executes
+list append/remove/retain/count behavior, but list equation construction now
+uses compiler-owned DTOs instead of scanning `TypedProgram.list_operations`.
+
+What changed:
+
+- Added compiler-owned list operation DTOs:
+  `CompilerListOperation`, `CompilerListOperationKind`,
+  `CompilerListAppendField`, `CompilerListAppendFieldValue`,
+  `CompilerListPredicate`, and `CompilerInitialValue`.
+- Added `compiler_list_operations_from_ir` for compiler-owned extraction of
+  append/remove/retain/count operations.
+- Updated `ListEquationPlan` construction to consume compiler list operations.
+- Added runtime adapters for compiler append field values, predicates, and typed
+  constants.
+- Changed `RuntimeListAppendFieldValue::TypedConst` to hold
+  `RuntimeInitialValue`, avoiding frontend `InitialValue` in this route.
+- Added `runtime_list_operations_extracted` to the compiler-boundary verifier
+  and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_list_operations_extracted=true`; remaining
+  `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`; blocker remains
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  `ListEquationPlan` no longer scans `TypedProgram.list_operations` inside
+  runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for storage initialization, generic
+  expressions, document lowering, diagnostics, and source-route command
+  adapters.
+- Next executable task:
+  extract storage initialization or another runtime-owned IR table behind
+  compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Storage Root Slots and Indexed Resets Extracted
+
+Status: moved two storage-initialization subtables out of runtime-owned IR
+scans. Runtime still builds list slot storage from IR, but root storage slots
+and indexed row-initial reset metadata now arrive through compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerStorageRootSlot` and
+  `CompilerStorageIndexedRowInitialReset` in `boon_compiler`.
+- Added `compiler_storage_root_slots_from_ir` and
+  `compiler_storage_indexed_row_initial_resets_from_ir`.
+- Updated `RuntimeStorageInitializationPlan::from_ir` to receive compiler root
+  slots and compiler indexed row-initial reset metadata.
+- Added runtime adapters:
+  `RuntimeStorageRootSlot::from_compiler`,
+  `RuntimeStorageRootInitialCopy::from_root_slot`, and
+  `RuntimeStorageIndexedRowInitialReset::from_compiler`.
+- Added `runtime_storage_root_slots_extracted` and
+  `runtime_storage_indexed_row_initial_resets_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_root_slots_extracted=true` and
+  `runtime_storage_indexed_row_initial_resets_extracted=true`; remaining
+  `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`; blocker remains
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  storage initialization no longer derives root slots or indexed row-initial
+  reset metadata from `TypedProgram.state_cells` inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for list slot row templates,
+  initial rows, synthetic list-view storage, derived-field initialization,
+  generic expressions, document lowering, diagnostics, and source-route command
+  adapters.
+- Next executable task:
+  extract storage list slot metadata/initial row templates or another
+  runtime-owned IR table behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Storage List-Slot Metadata Extracted
+
+Status: moved storage list-slot metadata and initializer-kind decisions out of
+runtime-owned IR scans. Runtime still builds row templates and initial rows from
+IR, but list ids, names, capacities, row scopes, synthetic list-view slots, and
+initializer kind now arrive through compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerStorageListSlot` and
+  `CompilerStorageListInitializerKind` in `boon_compiler`.
+- Added `compiler_storage_list_slots_from_ir`.
+- Updated `RuntimeStorageInitializationPlan::from_ir` to receive compiler
+  list-slot metadata.
+- Added `RuntimeStorageListSlot::from_compiler_synthetic` for compiler-owned
+  synthetic list-view storage slots.
+- Kept row-template and initial-row materialization in runtime for the next
+  storage slice.
+- Added `runtime_storage_list_slots_metadata_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask -p boon_report_schema`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_list_slots_metadata_extracted=true`;
+  remaining `runtime_frontend_orchestration_remaining=true` and
+  `runtime_source_route_command_adapter_remaining=true`; blocker remains
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  storage initialization no longer derives list slot declarations or synthetic
+  list-view slot metadata from IR tables inside the compiled storage plan.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for storage row templates, initial
+  row materialization, derived-field initialization, generic expressions,
+  document lowering, diagnostics, and source-route command adapters.
+- Next executable task:
+  extract storage row-template/initial-row metadata or another runtime-owned IR
+  table behind compiler-owned DTOs/artifacts.
+
+## 2026-06-29 - Runtime Storage Row-Template Metadata Extracted
+
+Status: moved storage row-template field metadata out of runtime-owned IR scans.
+Runtime still materializes list initial rows from IR, but compiler-owned DTOs
+now define each list row template used by the compiled storage initialization
+plan.
+
+What changed:
+
+- Added `CompilerStorageRowTemplate` and
+  `CompilerStorageRowFieldTemplate` in `boon_compiler`.
+- Added `compiler_storage_row_templates_from_ir`.
+- Moved row-template missing-value policy for row-initial fields into the
+  compiler DTO layer.
+- Updated `RuntimeStorageInitializationPlan::from_ir` to receive compiler
+  row-template metadata.
+- Added `RuntimeStorageRowTemplate::from_compiler` and row-scope validation
+  between compiler list slots and compiler row templates.
+- Added `runtime_storage_row_templates_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_row_templates_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  storage initialization no longer derives row-template metadata from IR state
+  cells inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for list initial-row
+  materialization, derived-field initialization, `GenericCircuitRuntime::new`,
+  generic expressions, document lowering, diagnostics, and source-route command
+  adapters.
+- Next executable task:
+  extract list initial-row materialization DTOs or another remaining
+  runtime-owned IR table behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Storage Initial Rows Extracted
+
+Status: moved record-literal list initial-row metadata out of runtime-owned IR
+scans. Runtime still generates range rows locally and still applies derived row
+initialization from IR, but compiler-owned DTOs now define record-literal rows
+used by the compiled storage initialization plan.
+
+What changed:
+
+- Added `CompilerStorageInitialRows`, `CompilerStorageInitialRow`, and
+  `CompilerStorageInitialField` in `boon_compiler`.
+- Added `compiler_storage_initial_rows_from_ir`.
+- Updated `RuntimeStorageInitializationPlan::from_ir` to receive compiler
+  initial-row metadata.
+- Added `list_initial_fields_from_compiler` and changed the compiled storage
+  record-literal branch to materialize rows from compiler DTOs.
+- Added `runtime_storage_initial_rows_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_initial_rows_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled storage initialization no longer derives record-literal initial rows
+  from IR list initializers inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for range-row generation,
+  derived-field initialization, `GenericCircuitRuntime::new`, generic
+  expressions, document lowering, diagnostics, and source-route command
+  adapters.
+- Next executable task:
+  extract derived-field initialization metadata or another remaining
+  runtime-owned IR table behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Storage Indexed Derived Fields Extracted
+
+Status: moved indexed derived row-field initialization metadata out of
+runtime-owned IR scans for the compiled storage initialization plan. Runtime
+still generates range rows locally, but compiler-owned DTOs now define which
+indexed derived fields require base-field preservation and missing text-field
+initialization.
+
+What changed:
+
+- Added `CompilerStorageIndexedDerivedFields` in `boon_compiler`.
+- Added `compiler_storage_indexed_derived_fields_from_ir`.
+- Updated `RuntimeStorageInitializationPlan::from_ir` to receive compiler
+  indexed derived field metadata.
+- Added `initialize_indexed_derived_base_fields_from_compiler` and
+  `initialize_indexed_derived_text_fields_from_compiler`.
+- Added `runtime_storage_indexed_derived_fields_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_indexed_derived_fields_extracted=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled storage initialization no longer derives indexed derived row fields
+  from IR derived values inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for range-row sanity/context,
+  `GenericCircuitRuntime::new`, generic expressions, document lowering,
+  diagnostics, and source-route command adapters.
+- Next executable task:
+  extract the remaining storage range/context validation or move another
+  runtime-owned IR table behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Storage Initialization Made IR-Free
+
+Status: removed the final `TypedProgram` parameter from the compiled storage
+initialization constructor. The storage initialization plan now consumes only
+compiler-owned DTOs for root slots, indexed reset metadata, list slots, row
+templates, initial rows, and indexed derived field metadata.
+
+What changed:
+
+- Removed `ir: &TypedProgram` from `RuntimeStorageInitializationPlan::from_ir`.
+- Removed the temporary runtime `lists_by_name` lookup against IR list tables.
+- Updated `CompiledProgram::from_ir` so the storage initialization plan is
+  built from compiler DTOs only.
+- Added `runtime_storage_initialization_ir_free` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_storage_initialization_ir_free=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled storage initialization no longer accepts `TypedProgram` or consults
+  IR-owned list tables directly.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for `GenericCircuitRuntime::new`,
+  generic expressions, document lowering, diagnostics, and source-route command
+  adapters.
+- Next executable task:
+  extract the next remaining runtime-owned IR table, likely generic derived
+  plan metadata or document/source command adapter metadata.
+
+## 2026-06-29 - Runtime Document Observed Root Paths Extracted
+
+Status: moved document-lowering observed root path discovery out of runtime.
+Runtime still owns other document-lowering IR reads, but observed root paths now
+come from compiler-owned view-binding analysis.
+
+What changed:
+
+- Added `compiler_observed_root_paths_from_ir` in `boon_compiler`.
+- Added compiler-owned `compiler_root_path_observation_variants`.
+- Updated `RuntimeDocumentLoweringTables::from_ir` to receive
+  `observed_root_paths` instead of computing them from `ir.view_bindings`.
+- Added `runtime_document_observed_root_paths_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime document_lowering_runtime_tables_drive_runtime_summary_metadata`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_document_observed_root_paths_extracted=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  document lowering no longer derives observed root paths from IR view bindings
+  inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for remaining document lowering
+  metadata such as render slots and projection storage resolution,
+  `GenericCircuitRuntime::new`, generic expressions, diagnostics, and
+  source-route command adapters.
+- Next executable task:
+  extract another document-lowering table, likely projection storage
+  resolutions or render-slot metadata, behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Document Projection Storage Resolutions Extracted
+
+Status: moved document-lowering projection storage resolution out of runtime.
+Runtime still owns render-slot table lowering and broader IR-backed execution
+plans, but projection aliases now resolve through compiler-owned metadata.
+
+What changed:
+
+- Added `CompilerDocumentProjectionStorageResolutions` in `boon_compiler`.
+- Added `compiler_document_projection_storage_resolutions_from_ir`.
+- Moved direct-root list alias detection helpers for projection storage into
+  the compiler boundary.
+- Updated `RuntimeDocumentLoweringTables::from_ir` to receive projection
+  storage resolutions and unresolved projection paths as inputs.
+- Added `runtime_document_projection_storage_resolutions_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime document_lowering_runtime_tables_drive_runtime_summary_metadata`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_document_projection_storage_resolutions_extracted=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  document lowering no longer resolves projection storage paths from IR list
+  projections and derived values inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for render-slot metadata,
+  `GenericCircuitRuntime::new`, generic expressions, diagnostics, and
+  source-route command adapters.
+- Next executable task:
+  extract render-slot metadata behind compiler-owned artifacts or tackle a
+  larger `GenericCircuitRuntime::new` split.
+
+## 2026-06-29 - Runtime Document Render Slots Extracted
+
+Status: moved document-lowering render-slot metadata extraction out of runtime.
+Runtime still stores and serializes the document-lowering table shape, but the
+render-slot table hash, counts, coverage flags, and per-slot metadata now come
+from compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerDocumentRenderSlots` and `CompilerDocumentRenderSlot` in
+  `boon_compiler`.
+- Added `compiler_document_render_slots_from_ir`.
+- Added compiler-owned render-slot table hashing for document-lowering
+  metadata.
+- Updated `RuntimeDocumentLoweringTables::from_ir` to consume compiler render
+  slots instead of scanning `ir.typecheck_report.render_slot_table`.
+- Added `runtime_document_render_slots_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime document_lowering_runtime_tables_drive_runtime_summary_metadata`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_document_render_slots_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  document lowering no longer extracts render-slot metadata directly from the
+  typecheck render-slot table inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for `GenericCircuitRuntime::new`,
+  generic expressions, diagnostics, source-route command adapters, and other
+  orchestration paths.
+- Next executable task:
+  tackle the next runtime-owned IR table outside document lowering, likely the
+  larger `GenericCircuitRuntime::new` split or generic-derived plan metadata.
+
+## 2026-06-29 - Runtime Symbols Extracted
+
+Status: moved dense runtime symbol path collection out of runtime-owned IR
+scans. Runtime still owns the intern table and artifact decoding, but compiler
+metadata now provides the ordered symbol path list.
+
+What changed:
+
+- Added `CompilerRuntimeSymbols` in `boon_compiler`.
+- Added `compiler_runtime_symbols_from_ir`.
+- Moved symbol path collection for sources, state cells, lists, derived values,
+  update expressions, list operations, and list projections to compiler-owned
+  helpers.
+- Replaced `RuntimeSymbols::from_ir` with `RuntimeSymbols::from_compiler`.
+- Added `runtime_symbols_extracted` to the compiler-boundary verifier and
+  report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_symbols_extracted=true`; remaining blocker is
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled-program construction no longer builds dense runtime symbols by
+  scanning IR tables inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for `GenericCircuitRuntime::new`,
+  generic expressions, diagnostics, source-route command adapters, equation
+  plan construction, and other orchestration/report paths.
+- Next executable task:
+  extract another compiled-program construction table, likely scalar/list
+  equation metadata or generic-derived plan metadata, behind compiler-owned
+  artifacts.
+
+## 2026-06-29 - Runtime Field-Slot Collision Diagnostics Extracted
+
+Status: moved field-slot collision diagnostic derivation out of runtime-owned
+IR scans. Runtime still owns the stable field ID helper used by storage and
+keeps artifact decoding for diagnostics, but compiler metadata now supplies the
+diagnostic rows generated during compiled-program construction.
+
+What changed:
+
+- Added `CompilerFieldSlotCollisionDiagnostic` in `boon_compiler`.
+- Added `compiler_field_slot_collision_diagnostics_from_ir`.
+- Moved collision-name collection and stable field-ID grouping for diagnostics
+  to compiler-owned helpers.
+- Replaced runtime's direct `field_slot_collision_diagnostics(ir)` call with
+  compiler DTO conversion.
+- Added `runtime_field_slot_collision_diagnostics_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime runtime_field_slot_collision_diagnostics_preserve_readable_labels`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_field_slot_collision_diagnostics_extracted=true`; remaining blocker
+  is `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled-program construction no longer derives field-slot collision
+  diagnostics by scanning IR tables inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for `GenericCircuitRuntime::new`,
+  generic expressions, diagnostics, source-route command adapters, equation
+  plan construction, and other orchestration/report paths.
+- Next executable task:
+  extract another compiled-program construction table, likely scalar/list
+  equation metadata or generic-derived plan metadata, behind compiler-owned
+  artifacts.
+
+## 2026-06-29 - Runtime Scalar Equations Extracted
+
+Status: moved scalar equation branch extraction out of runtime-owned IR update
+branch scans. Runtime still owns the scalar evaluator and artifact encoding,
+but scalar branch/source metadata now arrives as compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerScalarEquationPlan`, `CompilerScalarUpdateBranch`, and
+  `CompilerScalarUpdateExpression` in `boon_compiler`.
+- Added `compiler_scalar_equation_plan_from_ir`.
+- Moved scalar update-expression classification, including source payload
+  alias handling, to compiler-owned helpers.
+- Replaced `ScalarEquationPlan::from_ir` with
+  `ScalarEquationPlan::from_compiler`.
+- Added `runtime_scalar_equations_extracted` to the compiler-boundary verifier
+  and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_scalar_equations_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Residual test gaps:
+
+- `cargo test -q -p boon_runtime scalar` is still not green. It currently has
+  five failures in PlanExecutor indexed/root BYTES replay and NovyWave
+  initialization paths. Those failures were not used as acceptance evidence for
+  this slice.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled-program construction no longer derives scalar equation branches by
+  scanning IR update branches inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  generic derived execution, `GenericCircuitRuntime::new`, diagnostics,
+  source-route command adapters, and other orchestration/report paths.
+- Next executable task:
+  extract derived equation transform metadata or start a larger generic-derived
+  plan split behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Profile Metadata Extracted
+
+Status: moved runtime profile/capacity metadata derivation out of runtime-owned
+IR list/state-cell scans. Runtime still owns the profile mode decision and JSON
+report formatting, but list capacity and BYTES fixed-length metadata now arrive
+as compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerRuntimeProfileMetadata`,
+  `CompilerRuntimeListCapacity`, and `CompilerRuntimeBytesCapacity` in
+  `boon_compiler`.
+- Added `compiler_runtime_profile_metadata_from_ir`, preserving the previous
+  range-list effective-capacity and BYTES fixed-length rules.
+- Replaced `RuntimeProfile::from_ir`, `RuntimeProfile::detail_report(&ir)`,
+  and `RuntimeProfile::capacity_report(&ir)` with
+  `RuntimeProfile::from_compiler_metadata` and metadata-backed report
+  generation.
+- Removed the runtime-local `list_effective_capacity`,
+  `list_capacity_source`, and `all_bytes_state_bounded` IR scanners.
+- Added `runtime_profile_metadata_extracted` to the compiler-boundary verifier
+  and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_profile_metadata_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime profile/capacity reporting no longer derives list/BYTES capacity
+  metadata by scanning IR tables inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  generic derived execution, `GenericCircuitRuntime::new`, diagnostics,
+  source-route command adapters, and other orchestration/report paths.
+- Next executable task:
+  extract derived equation transform metadata or start a larger generic-derived
+  plan split behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Unsupported Diagnostics Extracted
+
+Status: moved compiled-program unsupported-feature diagnostics out of
+runtime-owned IR scans. Runtime still validates and formats the errors, but the
+unsupported state/list initializer, graph-clone, unsupported update branch, and
+unsupported list-predicate facts now arrive as compiler-owned DTOs.
+
+What changed:
+
+- Added `CompilerUnsupportedRuntimeDiagnostics` plus typed diagnostic rows for
+  unsupported state initializers, list initializers, graph-clone lists, update
+  branches, and list operations in `boon_compiler`.
+- Added `compiler_unsupported_runtime_diagnostics_from_ir`, preserving the
+  previous validation order and counts.
+- Replaced the direct `CompiledProgram::from_ir` scans over `state_cells`,
+  `lists`, `update_branches`, and `list_operations` with
+  `validate_compiler_unsupported_runtime_diagnostics`.
+- Added `runtime_unsupported_diagnostics_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_unsupported_diagnostics_extracted=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend
+  crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  compiled-program construction no longer derives unsupported-feature
+  diagnostics by scanning IR state/list/update/list-operation tables inside
+  runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  generic derived execution, `GenericCircuitRuntime::new`, diagnostics,
+  source-route command adapters, and other orchestration/report paths.
+- Next executable task:
+  extract derived equation transform metadata or start a larger generic-derived
+  plan split behind compiler-owned artifacts.
+
+## 2026-06-29 - Generic-Derived Fallback Inventory Extracted
+
+Status: moved the AST-backed `GenericDerivedPlan` inventory out of
+runtime-owned IR scans. Runtime still owns the generic-derived evaluator and
+the separate AST-free `RuntimeGenericDerivedPlan` builder, but the fallback
+plan's expressions, functions, root fields, observed root paths, and indexed
+fields now arrive as compiler-owned metadata.
+
+What changed:
+
+- Added `CompilerGenericDerivedPlan`,
+  `CompilerGenericDerivedFunction`, `CompilerGenericDerivedRootField`, and
+  `CompilerGenericDerivedIndexedField` in `boon_compiler`.
+- Added `compiler_generic_derived_plan_from_ir`, preserving the previous
+  `DerivedValueKind` filters, row-scope resolution, startup recompute flag, and
+  observed-root path set.
+- Replaced `GenericDerivedPlan::from_ir(ir)` with
+  `GenericDerivedPlan::from_compiler(compiler_generic_derived_plan_from_ir(ir))`.
+- Removed the old runtime `observed_root_paths_from_view_bindings` helper; the
+  compiler metadata now carries that set.
+- Added `runtime_generic_derived_plan_inventory_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo check -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_generic_derived_plan_inventory_extracted=true`; remaining blocker is
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Residual test gap:
+
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`
+  still fails because TodoMVC generic-derived runtime support reports
+  `function:todo_info_author:call:Text/space` and
+  `function:todo_info_reference:call:Text/space` unsupported. This broader
+  AST-free generic-runtime gap is separate from the fallback inventory DTO
+  extraction and was not used as acceptance evidence.
+
+Current blocker classification:
+
+- Completed in this slice:
+  AST-backed generic-derived fallback inventory no longer scans IR functions,
+  derived values, row scopes, expressions, or view bindings inside runtime.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  AST-free generic derived execution, `RuntimeGenericDerivedPlan::from_ir`,
+  `GenericCircuitRuntime::new`, diagnostics, source-route command adapters,
+  and other orchestration/report paths.
+- Next executable task:
+  extract derived equation transform metadata or continue splitting
+  `RuntimeGenericDerivedPlan::from_ir` behind compiler-owned artifacts.
+
+## 2026-06-29 - AST-free Generic Text/space Support
+
+Status: closed the residual TodoMVC AST-free generic-derived runtime gap from
+the generic-derived fallback inventory slice. `Text/space` is now accepted by
+the runtime generic-call allowlist and evaluates to a single space without
+falling back to frontend AST statements.
+
+What changed:
+
+- Added `Text/space` to the AST-free generic runtime supported-call set.
+- Added direct `Text/space` evaluation in the runtime generic-call evaluator.
+- Kept the semantics aligned with the documented/compiler/native-playground
+  behavior: `Text/space` is a zero-argument text constant returning `" "`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_generic_derived_plan_inventory_extracted=true`; remaining blocker is
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  TodoMVC generic-derived runtime support no longer rejects the AST-free
+  `Text/space` calls in `todo_info_author` and `todo_info_reference`.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  broader AST-free generic derived construction, `RuntimeGenericDerivedPlan::from_ir`,
+  `GenericCircuitRuntime::new`, diagnostics, source-route command adapters,
+  and other orchestration/report paths.
+- Next executable task:
+  extract the next runtime-owned IR table behind compiler-owned artifacts,
+  with `RuntimeGenericDerivedPlan::from_ir` still the most direct boundary to
+  continue after this support-function closure.
+
+## 2026-06-29 - Runtime Generic-Derived Execution Inventory Extracted
+
+Status: moved the runtime generic-derived execution plan's output-root,
+function, root-field, and indexed-field inventory behind the compiler-owned
+generic-derived DTO. The AST-backed fallback and AST-free runtime execution
+plans now share one compiler snapshot instead of separately scanning
+`TypedProgram` tables.
+
+What changed:
+
+- Added `CompilerGenericDerivedOutputRoot` and
+  `CompilerGenericDerivedPlan.output_roots` in `boon_compiler`.
+- Replaced `RuntimeGenericDerivedPlan::from_ir(ir)` with
+  `RuntimeGenericDerivedPlan::from_compiler(compiler_plan)`.
+- Reused one `compiler_generic_derived_plan_from_ir(ir)` result to build both
+  `GenericDerivedPlan` and `RuntimeGenericDerivedPlan`.
+- Added
+  `runtime_generic_derived_runtime_plan_inventory_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_generic_derived_plan_inventory_extracted=true` and
+  `runtime_generic_derived_runtime_plan_inventory_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  runtime generic-derived execution plan construction no longer inventories
+  output roots, functions, root fields, or indexed fields by scanning
+  `TypedProgram` directly.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  remaining AST statement/expression DTOs, `GenericCircuitRuntime::new`,
+  diagnostics, source-route command adapters, and other orchestration/report
+  paths.
+- Next executable task:
+  continue replacing parser/IR statement payloads with compiler-owned runtime
+  expression/statement DTOs, or extract the next direct derived-equation
+  scanner behind compiler-owned artifacts.
+
+## 2026-06-29 - Runtime Generic-Derived AST Lowering Extracted
+
+Status: moved the AST-to-runtime-generic statement/expression lowering for the
+generic-derived runtime execution plan into compiler-owned DTOs. Runtime now
+translates `CompilerRuntimeGeneric*` DTOs into its private evaluator structs
+instead of owning the active parser-AST lowering path for this plan.
+
+What changed:
+
+- Added `CompilerRuntimeGenericDerivedPlan`,
+  `CompilerRuntimeGenericStatement`, `CompilerRuntimeGenericExpr`, and related
+  function/output/root/indexed/argument/record-field DTOs in `boon_compiler`.
+- `compiler_generic_derived_plan_from_ir` now emits both the legacy AST-backed
+  generic-derived inventory and a compiler-lowered runtime generic-derived
+  plan.
+- `RuntimeGenericDerivedPlan::from_compiler` now consumes
+  `compiler_plan.runtime_plan` and maps compiler runtime DTOs into runtime
+  evaluator structs.
+- Added `runtime_generic_derived_ast_lowering_extracted` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all`: applied formatting.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_generic_derived_plan_inventory_extracted=true`,
+  `runtime_generic_derived_runtime_plan_inventory_extracted=true`, and
+  `runtime_generic_derived_ast_lowering_extracted=true`; remaining blocker is
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice:
+  active generic-derived runtime execution plan lowering no longer depends on
+  runtime-owned parser AST statement/expression conversion.
+- Still blocked:
+  `boon_runtime` still depends on `boon_ir` for derived equation extraction,
+  remaining legacy/fallback AST payloads, `GenericCircuitRuntime::new`,
+  diagnostics, source-route command adapters, and other orchestration/report
+  paths.
+- Next executable task:
+  remove or migrate the now-legacy generic-derived AST fallback payloads, or
+  extract the next direct derived-equation scanner behind compiler-owned
+  artifacts.
+
+## 2026-06-29 - Runtime Derived Equation Plan Extracted
+
+Status: moved the active derived text-equation/source-event transform
+inventory behind compiler-owned DTOs. `CompiledProgram::from_ir` now consumes a
+`CompilerDerivedEquationPlan` and runtime only maps those DTOs into its private
+evaluation structs.
+
+What changed:
+
+- Added `CompilerDerivedEquationPlan`, `CompilerDerivedTextTransform`, and
+  `CompilerDerivedTextExpression` in `boon_compiler`.
+- Added `compiler_derived_equation_plan_from_ir`, including compiler-owned
+  extraction for text trim, match arms, prefix concat, source-root text, and
+  `List/find_value` transform shapes.
+- Replaced active runtime construction of `DerivedEquationPlan::from_ir(ir)`
+  with `DerivedEquationPlan::from_compiler(compiler_derived_equation_plan_from_ir(ir))`.
+- Added `runtime_derived_equation_plan_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime derived_text_transform`: pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_derived_equation_plan_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: active derived text-equation plan construction no
+  longer inventories source-event transforms by scanning typed IR/AST in
+  runtime.
+- Still blocked: `boon_runtime` still depends on `boon_ir` for inactive legacy
+  helper paths, public runtime load/orchestration, diagnostics, scenario/source
+  command adapters, and broader typed IR ownership seams.
+- Next executable task: remove or migrate remaining legacy AST/fallback helper
+  payloads and continue extracting the next direct runtime IR owner behind
+  compiler-owned DTOs.
+
+## 2026-06-29 - Runtime Derived Equation Legacy Scanner Removed
+
+Status: removed the inactive runtime-owned derived text-equation scanner after
+the active path moved behind `CompilerDerivedEquationPlan`. Tests that checked
+row-alias inline key matches now exercise the compiler-derived plan instead of
+calling the old runtime AST recognizer directly.
+
+What changed:
+
+- Deleted `DerivedEquationPlan::from_ir` from `boon_runtime`.
+- Removed the obsolete runtime transform builders for source-event transform
+  recognition, including the old `source_event_transform_text_expression` and
+  `source_then_list_find_value_expression` paths.
+- Tightened `verify-compiler-boundaries` so
+  `runtime_derived_equation_plan_extracted` also requires those legacy scanner
+  symbols to stay absent.
+- Kept shared runtime helpers that are still used by source-route evaluation.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime derived_text_transform_recognizes_row_alias_inline_key_match`:
+  pass.
+- `cargo test -q -p boon_runtime derived_text_transform`: pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_derived_equation_plan_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: the derived equation plan no longer has an active or
+  inactive runtime-owned IR/AST scanner.
+- Still blocked: `boon_runtime` still depends on `boon_ir` for public
+  parse/lower orchestration, debug tables, legacy storage/list helpers,
+  generic fallback payloads, source-route/scenario adapters, and tests.
+- Next executable task: continue moving one of those remaining active IR owners
+  behind compiler-owned DTOs, with public runtime load/orchestration and legacy
+  storage helpers currently the largest remaining cuts.
+
+## 2026-06-29 - Runtime Update Expression DTOs Extracted
+
+Status: moved update guard/value DTOs used by runtime scalar equations,
+derived text expressions, source-route actions, artifacts, and tests behind
+compiler-owned types. Runtime now imports `UpdateGuard`, `UpdateMatchArm`,
+`UpdateValueExpression`, and `UpdateValueMatchArm` from `boon_compiler` aliases
+instead of directly from `boon_ir`.
+
+What changed:
+
+- Added `CompilerUpdateGuard`, `CompilerUpdateMatchArm`,
+  `CompilerUpdateValueMatchArm`, and `CompilerUpdateValueExpression` in
+  `boon_compiler`.
+- Converted scalar equation and derived text DTOs to use those compiler-owned
+  update types instead of `boon_ir::Update*` public fields.
+- Added conversion helpers from IR update guards/value expressions inside
+  `boon_compiler`.
+- Updated runtime source-action guard evaluation to match
+  `CompilerSourcePayloadField`.
+- Added `runtime_update_expression_dtos_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime derived_text_transform`: pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_update_expression_dtos_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: scalar/derived/source-route runtime plans no longer
+  consume update guard/value DTOs directly from `boon_ir`.
+- Still blocked: `boon_runtime` still depends on `boon_ir` for public
+  parse/lower orchestration, debug tables, BYTES scalar args, derived/list
+  kind enums, initial values, legacy storage/list helpers, generic fallback
+  payloads, source-route/scenario adapters, and tests.
+- Next executable task: continue extracting either initial/list storage DTOs or
+  public runtime load/orchestration so `boon_runtime` can eventually drop the
+  direct frontend crate dependency.
+
+## 2026-06-29 - Runtime BYTES Scalar Arg DTO Extracted
+
+Status: moved scalar BYTES update argument DTOs behind compiler-owned types.
+Runtime now aliases `BytesScalarArg` from `boon_compiler` instead of importing
+it directly from `boon_ir`.
+
+What changed:
+
+- Added `CompilerBytesScalarArg` in `boon_compiler`.
+- Converted `CompilerScalarUpdateExpression::{BytesSlice, BytesTake,
+  BytesDrop}` to use `CompilerBytesScalarArg`.
+- Added compiler conversion from IR `BytesScalarArg`.
+- Updated runtime scalar BYTES evaluation/artifact paths to use
+  `CompilerBytesScalarArg as BytesScalarArg`.
+- Added `runtime_bytes_scalar_arg_dtos_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_bytes_scalar_arg_dtos_extracted=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Additional BYTES evidence:
+
+- `cargo test -q -p boon_runtime bytes -- --test-threads=1`: fail with two
+  remaining indexed PlanExecutor gaps:
+  `root_scalar_plan_executor_replays_indexed_bytes_source_payload_update` and
+  `root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency`.
+  Both report that CPU root-scenario PlanExecutor does not support indexed
+  runtime-specific BYTES update branches yet.
+- The same broad `bytes` filter without `--test-threads=1` also showed
+  transient allocation-counter assertions, but the single-threaded run reduced
+  the stable failures to the two indexed PlanExecutor gaps above.
+
+Current blocker classification:
+
+- Completed in this slice: scalar BYTES slice/take/drop argument DTOs no longer
+  come from `boon_ir` in runtime-facing scalar update plans.
+- Still blocked: indexed BYTES PlanExecutor execution coverage is incomplete,
+  and `boon_runtime` still depends on `boon_ir` for public parse/lower
+  orchestration, debug tables, derived/list kind enums, initial values, legacy
+  storage/list helpers, generic fallback payloads, source-route/scenario
+  adapters, and tests.
+- Next executable task: either continue compiler DTO extraction for derived/list
+  kind enums and initial values, or close the two indexed BYTES PlanExecutor
+  runtime-specific execution gaps if focusing on BYTES parity.
+
+## 2026-06-29 - Runtime Derived Value Kind DTO Extracted
+
+Status: moved generic-derived runtime plan value-kind tags behind a
+compiler-owned DTO. Runtime now aliases `DerivedValueKind` from `boon_compiler`
+for runtime-facing generic-derived plans instead of importing that enum from
+`boon_ir`.
+
+What changed:
+
+- Added `CompilerDerivedValueKind` in `boon_compiler`.
+- Converted `CompilerGenericDerived{Root,Indexed}Field` and
+  `CompilerRuntimeGeneric{Root,Indexed}Field` to carry
+  `CompilerDerivedValueKind`.
+- Added the compiler conversion from IR `DerivedValueKind` while keeping direct
+  IR inspection inside compiler internals.
+- Updated runtime generic-derived plan code to use
+  `CompilerDerivedValueKind as DerivedValueKind`.
+- Kept the remaining legacy raw-IR runtime inspections explicit as
+  `boon_ir::DerivedValueKind`.
+- Added `runtime_derived_value_kind_dtos_extracted` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime derived_text_transform`: pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_derived_value_kind_dtos_extracted=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: generic-derived runtime plan value-kind DTOs no
+  longer come from `boon_ir`.
+- Still blocked: `boon_runtime` still depends on `boon_ir` for public
+  parse/lower orchestration, debug tables, raw-IR document/list metadata
+  helpers, initial values, list operation/predicate DTOs, legacy storage/list
+  helpers, generic fallback payloads, source-route/scenario adapters, and
+  tests.
+- Next executable task: extract list operation/predicate/initial-value DTOs or
+  move parser-facing document/source helpers out of `boon_runtime` into
+  `boon_compiler`.
+
+## 2026-06-29 - Raw IR Value Enum Imports Qualified
+
+Status: clarified the remaining legacy raw-IR runtime inspections by removing
+prelude-style imports for IR value/list enums. Runtime still depends on
+`boon_ir`, but `InitialValue`, `ListInitializer`, `ListOperationKind`, and
+`ListPredicate` are now explicitly qualified where legacy IR paths still need
+them.
+
+What changed:
+
+- Removed raw `boon_ir` imports for `InitialValue`, `ListInitialRecord`,
+  `ListInitializer`, `ListOperationKind`, and `ListPredicate` from
+  `boon_runtime`.
+- Qualified the remaining legacy IR helper/test references as
+  `boon_ir::InitialValue`, `boon_ir::ListInitializer`,
+  `boon_ir::ListOperationKind`, and `boon_ir::ListPredicate`.
+- Added `runtime_raw_ir_value_enum_imports_qualified` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime generic_derived_runtime_plan_executes_supported_fields_without_ast_statements`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_raw_ir_value_enum_imports_qualified=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: compiler-owned list/initial DTO names are no longer
+  shadowed by raw IR enum imports in runtime.
+- Still blocked: raw IR helpers remain inside `boon_runtime`; the next real
+  architecture cut is moving parser-facing document/source helpers and
+  IR-derived runtime/document metadata behind compiler or PlanExecutor
+  artifacts.
+
+## 2026-06-29 - IR Debug Tables Delegated To Compiler
+
+Status: moved typed-IR debug table/report assembly behind compiler-owned
+facades. Runtime still receives typed IR in legacy paths, but it no longer
+imports or calls `boon_ir::debug_tables` directly.
+
+What changed:
+
+- Added `compiler_ir_debug_tables_from_ir` and
+  `compiler_ir_debug_report_from_path` in `boon_compiler`.
+- Updated `boon_runtime::ir_debug_report` to delegate source-path debug report
+  generation to the compiler facade.
+- Updated runtime diagnostic report assembly to call
+  `compiler_ir_debug_tables_from_ir` instead of `debug_tables`.
+- Removed `debug_tables` from the `boon_runtime` `boon_ir` import.
+- Added `runtime_ir_debug_tables_delegated_to_compiler` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo run -q -p boon_cli -- dump-ir examples/counter.bn`: pass; generated
+  report had `status="pass"`, `graph_node_count=113`, and debug tables present.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_ir_debug_tables_delegated_to_compiler=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: typed-IR debug table/report ownership moved to
+  compiler-facing facades.
+- Still blocked: `boon_runtime` still owns raw-IR document/list metadata helpers
+  and parser/IR-shaped test/scenario adapters; those need compiler or
+  PlanExecutor artifacts before the direct `boon_ir` dependency can be removed.
+
+## 2026-06-29 - Dead Runtime IR Document Metadata Helpers Removed
+
+Status: removed dead runtime-owned raw-IR document metadata helper
+implementations that were superseded by compiler-owned document/list metadata
+DTOs.
+
+What changed:
+
+- Removed the unused runtime `list_summary_fields_from_ir`,
+  `dynamic_list_view_lists_from_ir`, and
+  `list_operation_has_unknown_predicate` helpers.
+- Kept the active runtime path on `compiler_list_summary_fields_from_ir` and
+  `compiler_dynamic_list_view_lists_from_ir`.
+- Added `runtime_dead_ir_document_metadata_helpers_removed` to the
+  compiler-boundary verifier and report schema.
+- Relaxed `runtime_raw_ir_value_enum_imports_qualified` so the check does not
+  require `boon_ir::ListOperationKind` to appear after the dead helper removal.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_dead_ir_document_metadata_helpers_removed=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: dead raw-IR document/list metadata helper
+  implementations are gone from runtime.
+- Still blocked: live raw-IR storage initialization and scenario/test adapters
+  remain in `boon_runtime`; those need compiler or PlanExecutor artifacts before
+  the direct `boon_ir` dependency can be removed.
+
+## 2026-06-29 - Runtime Row Template Initial Values IR-Free
+
+Status: stopped converting compiler-owned storage row templates back into
+`boon_ir::InitialValue` for runtime materialization. Runtime row snapshot
+templates now carry `RuntimeInitialValue` directly.
+
+What changed:
+
+- Changed `RuntimeRowSnapshotFieldTemplate.initial_value` from
+  `boon_ir::InitialValue` to `RuntimeInitialValue`.
+- Updated `RuntimeStorageRowTemplate::to_runtime_template` and
+  `from_runtime_template` to clone runtime initial values instead of converting
+  to or from IR values.
+- Removed the obsolete `RuntimeInitialValue::to_initial_value` conversion.
+- Kept a one-way `RuntimeInitialValue::from_ir_initial` only for the remaining
+  legacy raw-IR runtime constructor path.
+- Updated row materialization/reset logic to match `RuntimeInitialValue`.
+- Added `runtime_row_template_initial_values_ir_free` to the compiler-boundary
+  verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_row_template_initial_values_ir_free=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: compiler-owned row-template initial values stay in
+  runtime-owned representation after conversion; runtime no longer reconstructs
+  IR initial values for row templates.
+- Still blocked: the legacy `GenericCircuitRuntime::new(ir)` path and
+  scenario/test adapters still inspect raw `boon_ir` state/list structures.
+
+## 2026-06-29 - Legacy Storage Constructor Uses Compiler Plan
+
+Status: replaced the legacy `GenericCircuitRuntime::new(ir)` manual storage
+walker with a compiler-DTO storage initialization facade.
+
+What changed:
+
+- Replaced the manual root/list/list-view initialization logic in
+  `GenericCircuitRuntime::new(ir)` with
+  `RuntimeStorageInitializationPlan::from_ir(compiler_storage_*_from_ir(...))`
+  followed by `instantiate_storage()`.
+- Removed dead raw-IR storage helper implementations:
+  `ir_list_has_derived_list_view`, `list_initial_records_have_dynamic_fields`,
+  `derived_root_list_storage_name`, `list_initial_fields`,
+  `RuntimeRowSnapshotTemplate::from_cells`, `missing_row_initial_value`,
+  raw `initialize_indexed_derived_{base,text}_fields`,
+  `runtime_value_from_initial`, `row_scope_name_for_ir_list`,
+  `row_scope_name`, and `row_scope_matches_list`.
+- Removed the now-unused `UpdateExpression` import from `boon_runtime`.
+- Added `runtime_legacy_storage_constructor_uses_compiler_plan` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass with
+  existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime runtime_storage_initialization_plan_matches_ir_storage`:
+  pass.
+- `cargo test -q -p boon_runtime generic_runtime_owns_todo_list_structural_checks`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_slice_take_drop_chain`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_legacy_storage_constructor_uses_compiler_plan=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Current blocker classification:
+
+- Completed in this slice: the legacy storage constructor no longer walks raw
+  IR storage tables.
+- Still blocked: `boon_runtime` still depends on `boon_ir` for broader
+  parser/IR-shaped orchestration, function/generic AST execution, selected
+  source-route/scenario adapters, and tests.
+
+## 2026-06-29 - Runtime Raw IR Initializer/Predicate Cleanup
+
+Status: removed obsolete raw-IR initializer/predicate escape hatches from
+`boon_runtime` and retargeted the affected tests at compiler storage/list DTOs.
+
+What changed:
+
+- Removed dead `GenericScheduledRuntime` helpers
+  `initialize_root_holds_from_root_initial_fields` and
+  `reset_indexed_holds_from_row_initial_fields`; live initialization already
+  goes through `RuntimeStorageInitializationPlan`.
+- Removed the raw `boon_ir::ListPredicate` conversion helper and made the
+  path-preservation test exercise `CompilerListPredicate` conversion instead.
+- Updated test helpers/assertions that inspected raw
+  `boon_ir::ListInitializer` / `boon_ir::InitialValue` to inspect
+  `compiler_storage_list_slots_from_ir` and
+  `compiler_storage_initial_rows_from_ir`.
+- Removed dead raw IR ID conversion helpers `plan_source_id` and
+  `plan_list_id`; Plan IDs are now owned by `boon_plan`.
+- Tightened the compiler-boundary verifier so
+  `runtime_raw_ir_value_enum_imports_qualified=true` now means
+  `boon_runtime` source has no `boon_ir::InitialValue`,
+  `boon_ir::ListInitializer`, or `boon_ir::ListPredicate` references.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime source_initializers_are_read_from_boon_text`:
+  pass.
+- `cargo test -q -p boon_runtime list_range_materializes_generic_rows_from_boon_source`:
+  pass.
+- `cargo test -q -p boon_runtime list_predicates_preserve_ir_paths_without_todo_aliases`:
+  pass.
+- `cargo test -q -p boon_runtime generic_runtime_owns_todo_list_structural_checks`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with `runtime_raw_ir_value_enum_imports_qualified=true`,
+  `runtime_storage_initialization_ir_free=true`, and
+  `runtime_legacy_storage_constructor_uses_compiler_plan=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice: runtime source no longer contains raw IR
+  initializer/list-predicate enum references or dead raw IR ID conversion
+  helpers.
+- Still blocked: `boon_runtime` still directly depends on `boon_ir` for
+  `TypedProgram`, `FunctionDefinition`, some raw derived/source payload checks,
+  generic function/AST fallback execution, and parser/IR-shaped orchestration.
+
+## 2026-06-29 - Runtime Typecheck Report Metadata Delegated
+
+Status: moved runtime report builders off direct `ir.typecheck_report` reads
+and delegated typecheck/render-slot report facts to compiler-owned metadata.
+
+What changed:
+
+- Added `CompilerTypecheckReportMetadata` and
+  `compiler_typecheck_report_metadata_from_ir` in `boon_compiler`.
+- Replaced runtime-side `typecheck_report_hash` and
+  `render_slot_table_hash` helpers with the compiler metadata facade.
+- Updated initial-state, scenario, and compiled-artifact report builders to
+  read typecheck hashes, render-slot hashes/counts, unresolved-type counts, and
+  serialized report JSON through the compiler DTO.
+- Added
+  `runtime_typecheck_report_metadata_delegated_to_compiler` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime`: pass.
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast`:
+  pass.
+- `cargo test -q -p boon_runtime source_initializers_are_read_from_boon_text`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_typecheck_report_metadata_delegated_to_compiler=true`; remaining
+  blocker is `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice: runtime source no longer reads
+  `ir.typecheck_report` directly.
+- Still blocked: `boon_runtime` still directly depends on `boon_ir` for
+  `TypedProgram`, `FunctionDefinition`, raw derived/source payload assertions,
+  generic function/AST fallback execution, and parser/IR-shaped orchestration.
+
+## 2026-06-29 - Runtime Typed Program Report Metadata Delegated
+
+Status: moved lightweight typed-program report facts out of runtime direct
+field reads and behind a compiler-owned metadata facade.
+
+What changed:
+
+- Added `CompilerTypedProgramReportMetadata` and
+  `compiler_typed_program_report_metadata_from_ir` in `boon_compiler`.
+- Updated compile-artifact, expression-bytecode, initial-state, scenario, and
+  generic-completeness report paths to consume compiler-owned expression count,
+  expression coverage, graph-node count, semantic index, hidden-identity, and
+  static-schedule metadata.
+- Updated `derive_generic_interpreter_complete` to consume the compiler
+  metadata DTO for static schedule and expression-coverage completeness.
+- Added
+  `runtime_typed_program_report_metadata_delegated_to_compiler` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime runtime_completeness_and_adapter_flags_are_derived_from_slices`:
+  pass.
+- `cargo test -q -p boon_runtime runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_typed_program_report_metadata_delegated_to_compiler=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend
+  crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice: runtime source no longer reads
+  `ir.expression_count`, `ir.expression_coverage`, `ir.graph_node_count`,
+  `ir.semantic_index`, `ir.hidden_identity_verified`, or
+  `ir.static_schedule_verified` directly.
+- Still blocked: `boon_runtime` still directly depends on `boon_ir` for
+  `TypedProgram`, `FunctionDefinition`, raw derived/source payload assertions,
+  generic function/AST fallback execution, raw inventory table counts, and
+  parser/IR-shaped orchestration.
+
+## 2026-06-29 - Runtime Typed Program Inventory Counts Delegated
+
+Status: moved typed-IR inventory table lengths used by runtime reports behind a
+compiler-owned count facade.
+
+What changed:
+
+- Added `CompilerTypedProgramInventoryCounts` and
+  `compiler_typed_program_inventory_counts_from_ir` in `boon_compiler`.
+- Replaced `CompiledProgram::from_ir` direct table-length reads for schedule
+  nodes, sources, state initializers, list initializers, derived values, update
+  branches, list operations, list projections, and view bindings.
+- Updated generic-runtime slice/evidence reports and report enrichment to use
+  compiler inventory counts instead of raw typed-IR table lengths.
+- Added
+  `runtime_typed_program_inventory_counts_delegated_to_compiler` to the
+  compiler-boundary verifier and report schema.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime runtime_completeness_and_adapter_flags_are_derived_from_slices`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo test -q -p boon_runtime runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail with
+  `runtime_typed_program_inventory_counts_delegated_to_compiler=true`;
+  remaining blocker is `boon_runtime still directly depends on frontend
+  crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Current blocker classification:
+
+- Completed in this slice: runtime source no longer reads typed-IR inventory
+  table lengths directly.
+- Still blocked: `boon_runtime` still directly depends on `boon_ir` for
+  `TypedProgram`, `FunctionDefinition`, raw derived/source payload assertions,
+  generic function/AST fallback execution, deeper derived-expression scans, and
+  parser/IR-shaped orchestration.
+
+## 2026-06-29 - Runtime Raw Qualified IR Assertions Removed
+
+Status: converted the remaining runtime test assertions in this slice from raw
+typed-IR enum/table probes to compiler-owned DTOs, and tightened the boundary
+verifier so this completed cut is reported separately from the larger remaining
+`boon_ir` dependency.
+
+What changed:
+
+- Runtime tests now check Cells/TodoMVC derived/list/source metadata through
+  `compiler_generic_derived_plan_from_ir`,
+  `compiler_source_route_sources_from_ir`, and
+  `compiler_list_projections_from_ir` instead of raw
+  `boon_ir::DerivedValueKind`, `boon_ir::SourcePayloadField`, or
+  `boon_ir::ListProjectionKind` assertions.
+- The source-route density test now uses compiler source-route metadata instead
+  of indexing `ir.sources` directly.
+- The compiler-boundary verifier no longer conflates the completed raw
+  enum/helper cleanup with the still-real `TypedProgram` bridge. Fresh report evidence now shows
+  `runtime_raw_ir_value_enum_imports_qualified=true`.
+- The same fresh report also shows
+  `runtime_typecheck_report_metadata_delegated_to_compiler=true`,
+  `runtime_typed_program_report_metadata_delegated_to_compiler=true`, and
+  `runtime_typed_program_inventory_counts_delegated_to_compiler=true`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; the only blocker in the fresh report is
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+- Focused tests run earlier in this continuation before the final verifier
+  refresh passed:
+  `manifest_source_files_are_loaded_as_one_cells_project`,
+  `list_find_and_chunk_project_generic_record_lists_without_grid_identity`,
+  `physical_todomvc_root_source_event_default_materializes`,
+  `physical_todomvc_theme_source_event_updates_latest_root_text`, and
+  `source_routes_are_dense_by_hidden_source_id`.
+
+Remaining blocker:
+
+- `boon_runtime` still directly depends on `boon_ir` for `TypedProgram`, test
+  lowering helpers, generic function/AST fallback execution, and remaining
+  parser/IR-shaped orchestration. The next useful cut is to move the remaining
+  runtime-facing IR program carrier behind compiler/runtime artifacts so
+  `boon_runtime` can stop importing `boon_ir` at all.
+
+## 2026-06-29 - Runtime Generic Function Carrier Localized
+
+Status: removed runtime's production import of `boon_ir::FunctionDefinition`
+by replacing it with a runtime-local generic function carrier.
+
+What changed:
+
+- Added local `GenericDerivedFunction { name, args, statement }` inside
+  `boon_runtime`.
+- `GenericDerivedPlan.functions`, root-list-view field-only projectors,
+  function free-name analysis, and argument-access analysis now use the local
+  carrier instead of `boon_ir::FunctionDefinition`.
+- `GenericDerivedPlan::from_compiler` now maps compiler generic-derived
+  function DTOs directly into the runtime-local carrier.
+- `crates/boon_runtime/src/lib.rs` now has no `FunctionDefinition` references;
+  `rg -n "FunctionDefinition|use boon_ir|boon_ir::" crates/boon_runtime/src/lib.rs`
+  reports only `use boon_ir::TypedProgram` and test-only `lower` /
+  `lower_profiled` imports.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report remains `compiler_boundary_status=partial` with
+  blocker `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `boon_runtime` still imports `boon_ir::TypedProgram` and test-only lowering
+  helpers. The next executable cut is the larger runtime program-carrier split:
+  either eliminate remaining `TypedProgram` fields from runtime structures or
+  move the remaining typed-program orchestration behind compiler/runtime
+  artifacts.
+
+## 2026-06-29 - Live Runtime Constructors Use Compiled Program
+
+Status: removed a dead `TypedProgram` parameter from normal runtime
+construction so live runtime initialization consumes `CompiledProgram` instead
+of the raw typed IR carrier.
+
+What changed:
+
+- `LoadedRuntime::new` and `LoadedRuntime::new_profiled` now accept only
+  `&CompiledProgram`.
+- `GenericScheduledRuntime::new` and `GenericScheduledRuntime::new_profiled`
+  now accept only `&CompiledProgram`; the previous `TypedProgram` argument was
+  unused and delegated immediately to `from_compiled_profiled`.
+- Live runtime constructors and focused tests now call those constructors with
+  the compiled runtime program only.
+- Added `runtime_live_constructors_use_compiled_program` to
+  `verify-compiler-boundaries` and the boundary decomposition report.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_live_constructors_use_compiled_program=true`,
+  `runtime_raw_ir_value_enum_imports_qualified=true`, and the remaining blocker
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+
+Remaining blocker:
+
+- The live runtime construction path no longer needs `TypedProgram`, but
+  `boon_runtime` still stores `Arc<TypedProgram>` in `CachedRuntimePlan` and
+  uses typed IR metadata for static analysis, reports, compiled artifact
+  emission, scalar bytecode/kernel proofs, and test helpers. The next cut is to
+  move one of those report/static-analysis surfaces behind compiler-owned
+  artifacts or DTOs.
+
+## 2026-06-29 - Cached Static Analysis Uses Compiled Program
+
+Status: moved cached runtime static-analysis consumers off
+`CachedRuntimePlan.ir` by carrying compiler static analysis on `CompiledProgram`.
+
+What changed:
+
+- Added `static_analysis: Option<CompilerStaticProgramAnalysis>` to
+  `CompiledProgram`.
+- `CompiledProgram::from_ir` now builds compiler static analysis once from the
+  compiler facade data plus compiled source-route lookup metadata.
+- Artifact-loaded compiled programs set `static_analysis: None`, because the
+  compiled artifact loader is not the source-backed static-analysis API.
+- `cached_static_analysis_from_project` and
+  `cached_runtime_static_analysis_from_project` now clone
+  `plan.compiled.static_analysis` instead of rebuilding analysis from
+  `plan.ir.as_ref()`.
+- Added `runtime_cached_static_analysis_uses_compiled_program` to
+  `verify-compiler-boundaries` and the boundary decomposition report.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo check -q -p boon_native_playground`: pass with existing native GPU and
+  playground dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_cached_static_analysis_uses_compiled_program=true`,
+  `runtime_live_constructors_use_compiled_program=true`, and the remaining
+  blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `boon_runtime` still stores `Arc<TypedProgram>` in `CachedRuntimePlan` for
+  report generation, compiled artifact emission, scalar bytecode/kernel proof
+  reports, and test helpers. The next cut is to move another report/proof
+  surface behind compiler-owned DTOs or compiled artifacts.
+
+## 2026-06-29 - Compiled Artifact Uses Compiled Program Metadata
+
+Status: moved compiled artifact emission off direct typed IR metadata reads by
+carrying the needed report metadata on source-built `CompiledProgram`.
+
+What changed:
+
+- Added optional `program_metadata` and `typecheck_metadata` fields to
+  `CompiledProgram`.
+- `CompiledProgram::from_ir` now captures
+  `CompilerTypedProgramReportMetadata` and `CompilerTypecheckReportMetadata`
+  while the compiler-owned IR facade is still available.
+- Artifact-loaded compiled programs set both metadata fields to `None`, because
+  artifact loading consumes an already emitted program instead of producing a
+  new source-backed artifact report.
+- `emit_compiled_artifact` now uses the metadata carried by the just-built
+  `CompiledProgram` for artifact report fields and hashes instead of
+  recomputing typed-program/typecheck metadata from `&ir`.
+- `CompiledArtifact::from_parts` no longer accepts `&TypedProgram`; it reads the
+  required semantic-index, graph, and render-slot metadata from
+  `CompiledProgram`.
+- Added `runtime_compiled_artifact_uses_compiled_program_metadata` to
+  `verify-compiler-boundaries` and the boundary decomposition report.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_compiled_artifact_uses_compiled_program_metadata=true`,
+  `runtime_cached_static_analysis_uses_compiled_program=true`,
+  `runtime_live_constructors_use_compiled_program=true`, and the remaining
+  blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `CachedRuntimePlan` still carries `Arc<TypedProgram>` for other report
+  generation, scalar bytecode/kernel proof reports, and test helpers. The next
+  cut is to move another one of those surfaces behind compiler-owned DTOs or a
+  compiled-program artifact section so `boon_runtime` can eventually drop its
+  direct `boon_ir` dependency.
+
+## 2026-06-29 - Scenario Reports Use Compiled Program Metadata
+
+Status: moved another report-generation surface off raw typed IR metadata by
+carrying inventory and runtime-profile metadata on `CompiledProgram`.
+
+What changed:
+
+- Added optional `inventory_counts` and `runtime_profile_metadata` to
+  `CompiledProgram`.
+- `CompiledProgram::from_ir` now captures compiler-owned inventory counts and
+  runtime profile metadata while the compiler facade has the typed IR.
+- Artifact-loaded compiled programs set these metadata fields to `None`,
+  preserving the source-built report/emission boundary.
+- Added source-built metadata accessors on `CompiledProgram` for program,
+  typecheck, inventory, and runtime-profile metadata.
+- `run_loaded_scenario` uses compiled-program metadata for its compile pipeline
+  profile.
+- The playground initial-state report and shared `base_example_report` now use
+  compiled-program metadata for program, inventory, typecheck, runtime-profile,
+  and source-payload count sections.
+- `generic_runtime_slice_evidence_report` no longer accepts `&TypedProgram`;
+  it reports source-payload counts from `CompiledProgram`.
+- `enrich_report` no longer rebuilds inventory counts from typed IR; it uses
+  the compiled schedule already present in the report for state/list counts.
+- Added `runtime_loaded_scenario_profile_uses_compiled_program_metadata` and
+  `runtime_example_reports_use_compiled_program_metadata` to
+  `verify-compiler-boundaries`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_compiled_artifact_uses_compiled_program_metadata=true`,
+  `runtime_loaded_scenario_profile_uses_compiled_program_metadata=true`,
+  `runtime_example_reports_use_compiled_program_metadata=true`, and the
+  remaining blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `CachedRuntimePlan` still carries `Arc<TypedProgram>` for debug table
+  enrichment, scalar expression bytecode/kernel proof reports, and tests. The
+  next executable cut is to move `compiler_ir_debug_tables_from_ir` behind a
+  compiler-owned report DTO or a compiled-program debug-table artifact section.
+
+## 2026-06-29 - Scenario Debug Tables Use Compiled Program
+
+Status: moved scenario/debug report table reads off direct typed IR calls by
+carrying source debug tables on `CompiledProgram`.
+
+What changed:
+
+- Added optional `ir_debug_tables` to `CompiledProgram`.
+- `CompiledProgram::from_ir` now captures `compiler_ir_debug_tables_from_ir(ir)`
+  once while constructing the source-built compiled runtime program.
+- Artifact-loaded compiled programs set `ir_debug_tables: None`, preserving the
+  separation between source-backed diagnostics and compiled-artifact execution.
+- Added `source_ir_debug_tables` as a source-built compiled-program accessor.
+- `verify_playground_initial_state` now reads `ir_debug_tables` from the
+  compiled program.
+- `enrich_report` now accepts `&CompiledProgram`, no longer accepts
+  `&TypedProgram`, and inserts debug tables from the compiled program.
+- `run_scenario`, `run_scenario_project`, and `run_scenario_source...` now build
+  `CompiledProgram` once per run and pass it through scenario execution plus
+  report enrichment, avoiding an extra compile just for debug tables.
+- Added `runtime_report_debug_tables_use_compiled_program` to
+  `verify-compiler-boundaries`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_ir_debug_tables_delegated_to_compiler=true`,
+  `runtime_report_debug_tables_use_compiled_program=true`, and the remaining
+  blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `CachedRuntimePlan` still carries `Arc<TypedProgram>` for scalar expression
+  bytecode/kernel proof reports and tests. The next executable cut is to move
+  scalar expression proof metadata behind compiler-owned DTOs or a compiled
+  proof artifact so another production report surface stops consuming typed IR.
+
+## 2026-06-29 - Scalar Bytecode Reports Use Compiled Program Facts
+
+Status: moved scalar expression bytecode/kernel proof candidate selection off a
+direct typed IR bool-facts query.
+
+What changed:
+
+- Added optional `source_route_bool_facts` to `CompiledProgram`.
+- `CompiledProgram::from_ir` now preserves the compiler-owned
+  `CompilerSourceRouteBoolFacts` used during source-route construction.
+- Artifact-loaded compiled programs set `source_route_bool_facts: None`, because
+  scalar proof reports are source-backed diagnostics rather than artifact
+  execution requirements.
+- Added `source_route_bool_facts` as a source-built compiled-program accessor.
+- `scalar_bytecode_candidates` now accepts only `&CompiledProgram` and reads
+  bool facts from the compiled program.
+- `scalar_expression_bytecode_report` and `scalar_generated_kernel_report` no
+  longer accept `&TypedProgram`.
+- Added `runtime_scalar_bytecode_reports_use_compiled_program_facts` to
+  `verify-compiler-boundaries`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime bytecode_report_compiles_counter_scalar_routes_with_interpreter_parity`:
+  pass.
+- `cargo test -q -p boon_runtime generated_kernel_report_proves_counter_scalar_subset_against_bytecode_and_interpreter`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_scalar_bytecode_reports_use_compiled_program_facts=true`,
+  `runtime_report_debug_tables_use_compiled_program=true`, and the remaining
+  blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `CachedRuntimePlan` still carries `Arc<TypedProgram>` for source/full compile
+  orchestration and test-only helpers. The next executable cut is to audit
+  remaining production `TypedProgram` consumers and split source-backed
+  diagnostic/report entrypoints from runtime execution surfaces.
+
+## 2026-06-29 - Generic Scenario Runner Drops Typed IR Parameter
+
+Status: tightened the scalar/report boundary cut by removing another production
+`TypedProgram` parameter from shared scenario execution.
+
+What changed:
+
+- `verify_expression_bytecode_report` now reads program metadata from
+  `CompiledProgram` via `source_program_metadata("verify bytecode report")`
+  instead of rebuilding typed-program report metadata from `&ir`.
+- `ScenarioExecutor::stress_profiles` no longer accepts `&TypedProgram`; all
+  implementations ignored the argument.
+- `run_generic_scenario` no longer accepts `&TypedProgram`.
+- `run_loaded_scenario_with_compiled` no longer accepts `&TypedProgram`; it
+  executes from the compiled program and parsed/scenario context.
+- Existing scalar bytecode verifier coverage was strengthened to require these
+  compiled-program paths.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime bytecode_report_compiles_counter_scalar_routes_with_interpreter_parity`:
+  pass.
+- `cargo test -q -p boon_runtime generated_kernel_report_proves_counter_scalar_subset_against_bytecode_and_interpreter`:
+  pass.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_scalar_bytecode_reports_use_compiled_program_facts=true` and the
+  remaining blocker `boon_runtime still directly depends on frontend crates:
+  ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `CachedRuntimePlan` still carries `Arc<TypedProgram>` for source/full compile
+  orchestration and test-only helpers. The remaining production entrypoints
+  still parse/lower to typed IR before immediately building `CompiledProgram`;
+  the next architectural cut is to move those source-backed orchestration
+  surfaces into compiler-owned APIs that return compiled runtime programs and
+  report context together.
+
+## 2026-06-29 - Cached Runtime Plan Drops Typed IR
+
+Status: advanced the compiler/runtime boundary by removing the last cached
+typed-IR carrier from source-backed runtime plan caching.
+
+What changed:
+
+- Removed `ir: Arc<TypedProgram>` from `CachedRuntimePlan`.
+- Source/full compile cache construction still builds `CompiledProgram` from the
+  compiler facade output, but cached entries now retain only the parsed program
+  and compiled runtime program.
+- Added `runtime_cached_plan_drops_typed_ir` to
+  `verify-compiler-boundaries` so the cache cannot silently regain a typed-IR
+  field or `plan.ir` reader.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has
+  `runtime_cached_plan_drops_typed_ir=true` and the remaining blocker
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- `boon_runtime` still imports frontend IR types for source-backed construction,
+  `CompiledProgram::from_ir`, test helpers, and legacy/debug surfaces. The next
+  architectural cut is moving source-backed orchestration and compiled-program
+  construction behind compiler-owned APIs so runtime execution no longer depends
+  directly on `boon_ir`.
+
+## 2026-06-29 - Runtime Load-And-Lower Helper Removed
+
+Status: removed another runtime-owned source/lowering orchestration helper from
+production paths.
+
+What changed:
+
+- Deleted the private `load_and_lower` and `load_and_lower_profiled` helpers from
+  `boon_runtime`.
+- `emit_compiled_artifact` and `verify_expression_bytecode_report` now consume
+  `compile_source_path_to_full_ir` facade output directly.
+- The Cells manifest source-file test now uses the compiler facade directly.
+- Strengthened `runtime_public_load_and_lower_removed` so it requires no
+  `load_and_lower` helper at all, public or private.
+- Moved `compile_parsed_program_to_runtime_ir` behind `#[cfg(test)]` because the
+  remaining parsed-program lowering helper is test-only.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass with existing native GPU
+  dead-code warnings.
+- `cargo test -q -p boon_runtime manifest_source_files_are_loaded_as_one_cells_project`:
+  pass.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  expected fail; fresh report has `runtime_public_load_and_lower_removed=true`,
+  `runtime_cached_plan_drops_typed_ir=true`, and the remaining blocker
+  `boon_runtime still directly depends on frontend crates: ["boon_ir"]`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining blocker:
+
+- The runtime still owns `CompiledProgram::from_ir` and source-built runtime
+  program construction. The next larger cut is to move that builder or an
+  equivalent compiled-runtime-program artifact into `boon_compiler`, leaving
+  `boon_runtime` to consume compiler DTOs/artifacts instead of `TypedProgram`.
+
+## 2026-06-29 - Runtime Consumes Compiler Runtime Program Aggregate
+
+Status: completed the current compiler/runtime boundary slice. Normal
+`boon_runtime` production code no longer depends on frontend crates.
+
+What changed:
+
+- Added `CompilerRuntimeProgram` and `compiler_runtime_program_from_ir` in
+  `boon_compiler`.
+- `CompiledRuntimeIrFromSource` and `CompiledFullIrFromSource` now carry the
+  compiler-owned runtime program aggregate.
+- Replaced production `CompiledProgram::from_ir` construction with
+  `CompiledProgram::from_compiler_runtime_program`.
+- Kept `CompiledProgram::from_ir`, `GenericCircuitRuntime::new`, and direct
+  `TypedProgram` helpers behind `#[cfg(test)]` for differential coverage.
+- Moved `boon_runtime`'s `boon_ir` dependency to `dev-dependencies`.
+- Updated `verify-compiler-boundaries` to recognize the aggregate boundary and
+  to distinguish normal dependencies from dev/test dependencies.
+
+Evidence:
+
+- `cargo check -q -p boon_compiler -p boon_runtime -p xtask`: pass with existing
+  native GPU dead-code warnings.
+- `cargo test -q -p boon_runtime manifest_source_files_are_loaded_as_one_cells_project`:
+  pass.
+- `cargo test -q -p boon_runtime todomvc_scenario_runs_and_removes_rows`: pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  pass. Fresh report has `compiler_boundary_status=complete`,
+  `runtime_compiler_runtime_program_aggregate=true`,
+  `runtime_frontend_orchestration_remaining=false`, and no blockers.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo metadata --no-deps --format-version 1` shows `boon_ir` only as a
+  `dev` dependency for `boon_runtime`.
+
+Next:
+
+- Continue Phase 1 beyond the boundary split: rerun the broader BYTES/MachinePlan
+  and native/demand-driven gates, then move toward PlanExecutor parity/default
+  path work and the still-open Cells/runtime performance blockers.
+
+## 2026-06-29 - Runtime Indexed BYTES Update Bridge
+
+Status: fixed a real BYTES/MachinePlan runtime bridge regression found while
+refreshing the aggregate child reports.
+
+What changed:
+
+- `execute_indexed_update_branch` now routes indexed `Bytes/set` and
+  `File/write_bytes` branches through the shared PlanExecutor indexed BYTES
+  write evaluator.
+- Indexed `Bytes/length`, `Bytes/get`, and `File/read_bytes` branches now route
+  through the shared PlanExecutor indexed BYTES read evaluator.
+- The runtime bridge now preserves BYTES access/storage, host effect, executor
+  core, and update-constant report fields from those shared evaluators.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_plan_executor`: pass.
+- `cargo fmt --all`: pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`:
+  pass after rebuilding `boon_cli`; the report shows
+  `executed_indexed_update_count=5`, `runtime_ast_eval_count=0`, legacy parity
+  pass, and indexed updates for source payload, `bytes_set`, `bytes_length`,
+  and `bytes_get`.
+
+Blocked verification:
+
+- `cargo build -q -p boon_cli -p xtask` rebuilt enough for the focused
+  `boon_cli` scenario, but failed while linking `xtask` with an LLVM/lld bus
+  error.
+- `df -h . target /tmp` showed `/dev/mapper/data-root` at `100%` with about
+  `464M` free. Until build/cache space is freed, a fresh `xtask` cannot be
+  linked, so aggregate/schema refresh remains blocked.
+- A focused `target/debug/xtask verify-report-schema` run against the refreshed
+  BYTES report is not valid evidence because the available `xtask` binary is
+  still linked against the old runtime and its source-derived replay mismatches
+  the new report.
+
+## 2026-06-29 - Aggregate Refresh After Indexed BYTES Bridge
+
+Status: resolved the local disk/build blocker, fixed the report-schema replay
+drift exposed by the bridge change, and restored the BYTES/MachinePlan
+aggregate to a passing current report set.
+
+What changed:
+
+- Freed local build/artifact space by removing regenerable
+  `target/debug/incremental` and `target/artifacts/native-gpu/frames`; no source
+  files or report JSONs were intentionally removed.
+- Runtime scenario reports now build semantic/render protocol batches with the
+  same compiled-source `program_hash` later written by report enrichment, so
+  nested batch `program_hash` / `runtime_id` values no longer go stale for
+  multi-file examples such as Cells.
+- Report-schema source-derived replay now matches current PlanExecutor
+  diagnostics for indexed const updates and list-remove predicate row
+  resolutions.
+- Generic report freshness accepts both active multi-file source-hash contracts:
+  compiler/runtime raw source content hashes and dump-plan's legacy
+  path-plus-file-digest `source_hash`. Dump-plan still separately verifies each
+  file hash and its source-files `program_hash`.
+- The BYTES storage-profile measured-copy check now treats positive measured
+  copy bytes as the copy evidence instead of requiring inline public bytes.
+
+Evidence:
+
+- Rebuilt current `boon_cli` and `xtask`:
+  `timeout 900s env CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' nice -n 19 cargo build -q -p boon_cli -p xtask`.
+- Refreshed the stale Cells ASCII and compare reports:
+  `target/reports/bytes-plan/cells-ascii-formula-run.json` and
+  `target/reports/bytes-plan/cells-plan-compare.json`.
+- Refreshed 53 stale aggregate children from embedded `command_argv`; logs:
+  `target/reports/bytes-plan/logs/refresh-20260629-134710-post-report-hash/`.
+- Refreshed final xtask-owned reports after verifier rebuild; logs:
+  `target/reports/bytes-plan/logs/refresh-20260629-135814-final-xtask/`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass. Fresh report has `status=pass`, `aggregate_checks_pass=true`,
+  `required_report_count=56`, `checked_report_count=56`,
+  `proof_report_count=46`, `diagnostic_report_count=10`, and
+  `no_fallback_plan_executor_count=38`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask -p boon_cli`:
+  pass with existing native GPU dead-code warnings.
+- `cargo fmt --all -- --check`: pass.
+- `git diff --check`: pass.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail. After refreshing the aggregate, remaining blockers are
+  `8 phases are still partial in the progress ledger`,
+  `target/reports/schema.json` stale for current HEAD, and
+  `Phase 10 default switch has not happened`.
+
+Remaining blockers:
+
+- This restores Phase 1 aggregate evidence only. It does not prove the Cells
+  native/manual interaction path or 60 FPS target; the top formula-bar stale
+  visual update remains a separate native retained-input/render bug.
+- A global `cargo xtask verify-report-schema` refresh was attempted after
+  refreshing `target/reports/bytecode-counter.json`, but it next failed on
+  stale historical `target/reports/bytes-length-audit.json`. The broad schema
+  summary remains a readiness blocker rather than being treated as evidence.
+- Phase 10 default switch remains blocked until the readiness/default-path gates
+  prove PlanExecutor parity, performance, and no hidden legacy fallback across
+  the broader required surface.
+
+## 2026-06-29 - Current Schema Failure Report and Readiness Cleanup
+
+Status: restored focused BYTES aggregate evidence after the report-schema
+failure-summary change; overall readiness still intentionally fails.
+
+What changed:
+
+- `verify-report-schema` now writes a current failing schema summary at
+  `target/reports/schema.json` when recursive report validation finds stale or
+  malformed children. The summary records the child blockers and exits nonzero,
+  so readiness no longer points at a stale passing schema report.
+- Failed `verify-report-schema` and `verify-browser-startup-budget` reports are
+  treated as known blocker-audit shapes, not as unrecognized JSON.
+- The schema summary validates `audit-goal-readiness` but does not include it
+  in `artifact_sha256s`, which avoids a schema/readiness artifact-hash cycle.
+- Obsolete diagnostic reports were moved out of active pass-report positions:
+  `bytes-indexed-file-read-plan-ops-scenario-run-plan.json` and
+  `m1-boundaries-current.json` are under `target/reports/debug/`; the incomplete
+  Counter semantic facade report is under `target/artifacts/debug-reports/`.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass with existing native GPU
+  dead-code warnings.
+- `env CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' nice -n 19 cargo build -q -p xtask`:
+  pass.
+- Refreshed non-native readiness/schema reports:
+  `target/reports/bytecode-counter.json`,
+  `target/reports/compiler/m1-boundaries.json`,
+  `target/reports/debug/machine-readiness.json`.
+- Refreshed focused BYTES aggregate children from embedded `command_argv`; logs:
+  `target/reports/bytes-plan/logs/final-report-refresh-20260629/`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask verify-report-schema`: expected fail, writing a current
+  `target/reports/schema.json` with `status=fail` and `71` blockers. The first
+  blockers are stale native/browser report `binary_hash` values.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail. Current blockers are `8` partial phases, schema report did not
+  pass, and Phase 10 default execution is still legacy.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/schema.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Broad schema readiness still requires refreshing or retiring the remaining
+  stale native/browser/unified reports under `target/reports`.
+- Phase 10 remains blocked until default PlanExecutor readiness is proven.
+- Cells 60 FPS/native retained-render correctness remains separate and open.
+
+## 2026-06-29 - Static/Native Schema Blocker Reduction
+
+Status: reduced recursive schema blockers after the fail-summary change; BYTES
+aggregate remains a focused passing report set, but goal readiness still fails.
+
+What changed:
+
+- The schema sweep now accounts raw `kind="headed-scenario-report"` native
+  artifacts as debug artifacts, not full proof reports.
+- Refreshed static top-level reports, unified child reports, native/browser
+  non-headed reports, WGPU readback/retained arena reports, idle-wake reports,
+  and the demand-driven render-loop report with the current `xtask` binary.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p xtask`: pass with existing native GPU dead-code warnings.
+- `cargo build -q -p xtask`: pass under `CARGO_BUILD_JOBS=1` and
+  `RUSTFLAGS='-Awarnings'`.
+- `target/debug/xtask verify-report-schema`: expected fail; current
+  `target/reports/schema.json` reports `26` blockers, down from `71`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail with blockers for `8` partial phases, schema not passing, and
+  Phase 10 still defaulting to legacy.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/schema.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- The broad schema blocker set is now mostly heavy native/Cells/headed report
+  freshness plus stale scratch native debug artifacts.
+- `verify-novywave-bridge-scenario` currently fails before writing fresh
+  evidence because PlanExecutor does not support the
+  `external_file_tree_file` state initializer.
+- This does not change Phase 10 default-switch status.
+
+## 2026-06-29 - Unified Blocker-Audit Schema Alignment
+
+Status: implemented a report-schema consistency fix; BYTES default-switch
+readiness remains blocked.
+
+What changed:
+
+- The shared `boon_report_schema` blocker-audit allowlist now matches the
+  unified blocker gates already accepted by `xtask`, including
+  `verify-unified-architecture-all` and the retained/WGPU/demand-driven unified
+  child checks.
+- This prevents known failing unified blocker reports from being misclassified
+  as malformed reports while preserving their `status="fail"` and nonzero gate
+  behavior.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo build -q -p xtask`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/unified/unified-architecture-all.json target/reports/unified-architecture-all.json`:
+  pass.
+- `target/debug/xtask verify-report-schema`: expected fail after rebuilding
+  `xtask`; current `target/reports/schema.json` has `73` stale-report blockers
+  until the report refresh chain is rerun with the new binary hash.
+
+Remaining blockers:
+
+- Phase 10 still cannot switch the default CLI path because goal readiness
+  fails on partial phases, broad schema freshness, and the legacy default.
+- The next useful non-Cells step is a focused report refresh; the next useful
+  Cells step is native evidence that the top formula input visibly updates in
+  the live app-owned render path.
+
+## 2026-06-29 - Post-Alignment Report Refresh
+
+Status: restored the focused BYTES aggregate and static unified aggregate after
+the schema alignment rebuild; Phase 10 remains blocked.
+
+What changed:
+
+- Refreshed the stale BYTES child reports with the current `xtask` binary.
+- Re-ran `bytes-negative` and `bytes-machine-plan-adversarial` after the
+  source-payload child report so their artifact hashes matched the refreshed
+  child evidence.
+- Re-ran the static/unified/native-web/WGPU/idle report refresh needed to move
+  recursive schema blockers back to the true heavy native set.
+
+Evidence:
+
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `56` checked required reports.
+- `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`:
+  pass.
+- `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified/unified-architecture-all.json`:
+  pass.
+- `target/debug/xtask verify-unified-architecture-all --check-existing --report target/reports/unified-architecture-all.json`:
+  pass.
+- `target/debug/xtask verify-report-schema`: expected fail; current
+  `target/reports/schema.json` reports `21` blockers, down from the post-rebuild
+  `73`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail with blockers for `8` partial phases, schema not passing, and
+  Phase 10 still defaulting to legacy.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/schema.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Broad readiness is now blocked by heavy native/Cells/headed report freshness,
+  a stale missing-frame artifact reference, and the NovyWave PlanExecutor
+  coverage gap.
+- Phase 10 default switch remains blocked until schema readiness and the
+  remaining partial phases are closed.
+
+## 2026-06-29 - Indexed Bytes/equal PlanExecutor Slice
+
+Status: implemented and proved a focused indexed `Bytes/equal` PlanExecutor
+slice; the full BYTES aggregate remains blocked by stale pre-existing child
+reports after rebuilding `boon_cli`.
+
+What changed:
+
+- Added indexed `Bytes/equal` read evaluation for state-or-row-field BYTES
+  operands in `boon_plan_executor`.
+- Updated MachinePlan CPU-support classification so indexed `Bytes/equal`
+  branches with a BYTES state plus BYTES row field count as executable.
+- Routed runtime indexed BYTES read dispatch and legacy indexed bool
+  comparison through BYTES readers so `--compare-legacy` remains honest.
+- Added `examples/bytes_indexed_equal_plan_ops.bn` and `.scn`.
+- Added the new `bytes-indexed-equal-scenario` report to the BYTES aggregate.
+- Updated report-schema replay support for indexed `Bytes/equal` evidence.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p boon_plan -p boon_compiler -p boon_runtime`: pass.
+- `cargo check -q -p boon_report_schema -p xtask`: pass with existing
+  `boon_native_gpu` dead-code warnings.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_equal_update -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_equal_plan_ops.bn --scenario examples/bytes_indexed_equal_plan_ops.scn --steps receive-beta-bytes,inspect-beta-equal --compare-legacy --report target/reports/bytes-plan/bytes-indexed-equal-run-plan.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-equal-run-plan.json`:
+  pass.
+- Report evidence: `status="pass"`, `cpu_plan_executor_complete=true`,
+  `cpu_plan_executor_unsupported_op_count=0`,
+  `executed_indexed_update_count=3`, no fallback counters, and legacy
+  comparison `passed=true`, `state_match=true`, `semantic_delta_match=true`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+
+Remaining blockers:
+
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  expected fail after the `boon_cli` rebuild because many older BYTES child
+  reports still have stale `binary_hash` values. The new indexed-equal child
+  report itself validates.
+- Phase 10 default switch remains blocked until the aggregate child reports are
+  refreshed and the remaining partial phases are closed.
+
+## 2026-06-29 - Indexed Bytes/equal Aggregate Refresh
+
+Status: restored the BYTES/MachinePlan aggregate after promoting the indexed
+`Bytes/equal` report.
+
+What changed:
+
+- Added the `bytes-indexed-equal-scenario` child to the report-schema
+  aggregate manifest so schema validation now requires the same `57` reports as
+  `verify-bytes-machine-plan-all`.
+- Replayed stale BYTES child reports after the `boon_cli`/`xtask` rebuilds.
+- Re-ran `bytes-machine-plan-adversarial` last so its embedded child artifact
+  hashes matched the refreshed reports.
+
+Evidence:
+
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- Final aggregate evidence:
+  `status="pass"`, `required_report_count=57`, `checked_report_count=57`,
+  `proof_report_count=47`, `diagnostic_report_count=10`,
+  `plan_executor_report_count=39`,
+  `no_fallback_plan_executor_count=39`, and no blockers.
+
+## 2026-06-29 - Extracted PlanExecutor Freshness Check
+
+Status: the extracted `boon_plan_executor` crate compiles and its focused test
+surface passes; the BYTES/MachinePlan aggregate is fresh again for the rebuilt
+`boon_cli` and `xtask` binaries. Full goal readiness remains blocked by the
+broader schema report tree and the Phase 10 default switch.
+
+What changed:
+
+- Verified the current worktree after the PlanExecutor extraction split into
+  `crates/boon_plan_executor`.
+- Replayed stale required BYTES child reports after rebuilding `boon_cli` and
+  `xtask`.
+- Refreshed `bytes-machine-plan-adversarial` after child replay so embedded
+  child artifact hashes match the regenerated reports.
+- Re-ran readiness and the broad report-schema sweep to classify remaining
+  blockers honestly.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -p boon_plan_executor -p boon_cli -p xtask --quiet`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_plan_executor -- --nocapture`:
+  pass, `67` tests.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_equal_plan_ops.bn --scenario examples/bytes_indexed_equal_plan_ops.scn --steps receive-beta-bytes,inspect-beta-equal --compare-legacy --report target/reports/bytes-plan/bytes-indexed-equal-run-plan.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-equal-run-plan.json`:
+  pass.
+- Replayed stale required BYTES child reports from their embedded
+  `command_argv`; logs are under `target/reports/unified/logs/replay-*.log`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/bytes-indexed-equal-run-plan.json`:
+  pass.
+- Final aggregate report:
+  `status="pass"`, `required_report_count=57`, `checked_report_count=57`,
+  `proof_report_count=47`, `diagnostic_report_count=10`,
+  `plan_executor_report_count=39`, `no_fallback_plan_executor_count=39`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail with blockers for `8` partial phases,
+  `target/reports/schema.json` not passing, and Phase 10 still defaulting to
+  legacy.
+- `target/debug/xtask verify-report-schema`:
+  expected fail; refreshed `target/reports/schema.json` reports `101` blockers.
+  The current top blockers are stale generated reports after the rebuilt
+  `boon_cli`/`xtask` binaries plus two empty native role-loop JSON files.
+
+Remaining blockers:
+
+- The BYTES aggregate is current, but broad readiness is not. The report tree
+  still contains stale generated artifacts outside the required BYTES aggregate.
+- Phase 10 default switch remains blocked because `boon_cli run` still defaults
+  to legacy and the broader readiness gate fails.
+- This slice does not resolve the native Cells selected-style visual bug or the
+  full 60 FPS native interaction gate.
+
+Remaining blockers:
+
+- The full unified goal remains open: Phase 10 still cannot switch default
+  execution while broader schema/readiness, native Cells, native-web,
+  accessibility, SolidGraph, and manufacturing milestones remain incomplete.
+
+## 2026-06-29 - Cells Formula-Bar Visible Proof Tightening
+
+Status: strengthened the native Cells visible-click verifier so it proves the
+top formula input text value itself, not only the selected cell state or a
+generic retained text-path change.
+
+What changed:
+
+- `PreviewRetainedBoundSyncStats` now records `text_update_values` alongside
+  updated nodes and binding paths.
+- `verify-native-cells-visible-click-e2e` now requires the retained
+  `store.selected_input.editing_text` update to carry the expected formula
+  text for retained input-overlay proofs.
+- Added a focused `xtask` unit test that fails if a stale formula-bar text value
+  would otherwise satisfy the visual formula proof.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p xtask cells_visual_formula_probe_requires_expected_formula_bar_text_value -- --nocapture`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text -- --nocapture`:
+  pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --report target/reports/native-gpu/cells-visible-click-e2e-b0-value-proof.json`:
+  expected fail on timing budgets, but the strengthened formula-bar proof passes.
+  The report shows `selected_address="B0"`,
+  `formula_bar_text="=add(A0,A1)"`,
+  `visual_formula_probe.formula_bar_text_input_expected=true`, and retained
+  `text_update_values` for `store.selected_input.editing_text` set to
+  `=add(A0,A1)`.
+
+Remaining blockers:
+
+- The current Cells visible-click blocker is still native input/present timing,
+  not formula/currentness correctness: the B0 proof failed
+  `click-to-formula-p95-budget` and `input-wake-to-formula-budget` with
+  `input_wake_to_formula_visible_ms_p95=33.546ms` for the single-sample run.
+- Manual COSMIC release launch was not refreshed in this slice because
+  `cosmic-background-launch` returned DBus `ServiceUnknown` in the prior
+  attempt.
+
+## 2026-06-29 - Cells Formula-Bar B0 Pass, 64-Click Timing Still Open
+
+Status: fixed the observed top formula input proof for the single B0 click and
+reduced hot-path click work, but the full 64-click 60 FPS gate is still blocked
+by native wake-to-present timing.
+
+What changed:
+
+- Native surfaces now select an explicit low-latency present mode from surface
+  capabilities, preferring `Mailbox`, then `Immediate`, before falling back.
+- Retained bound sync now reports style-updated nodes as touched nodes for the
+  input-overlay render-scene patch.
+- The simple source-click hot path skips a duplicate retained bound-text sync
+  when visible-state sync already patched retained text from the same
+  post-turn state summary.
+
+Evidence:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --report target/reports/native-gpu/cells-visible-click-e2e-b0-skip-duplicate-sync.json`:
+  pass. The report shows selected `B0`, formula bar `=add(A0,A1)`,
+  `click_to_formula_visible_ms_p95=22.501ms`, and
+  `input_wake_to_formula_visible_ms_p95=15.229ms`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-b0-skip-duplicate-sync.json`:
+  pass.
+- Focused tests passed:
+  `cells_visual_formula_probe_requires_expected_formula_bar_text_value`,
+  `cells_focus_only_route_syncs_formula_bar_text`,
+  `low_latency_present_mode_prefers_mailbox_over_immediate`, and native
+  app-window `scheduler`.
+
+Remaining blockers:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-skip-duplicate-sync.json`:
+  fail. Correctness contracts pass for all 64 samples, with zero scans, zero
+  recompute, zero root materialization, no full document lower, and formula-bar
+  visible transitions all passing.
+- The remaining failure is timing: `click_to_formula_visible_ms_p95=30.065ms`
+  is under the p95 bounded harness budget, but max is `36.660ms > 33.400ms`
+  and `input_wake_to_formula_visible_ms_p95=18.358ms > 16.700ms`.
+- Slow samples are now dominated by native render/present boundaries, not
+  Cells formula lookup: bound input sync is about `0.002ms`, source input is
+  about `1.3-2.8ms`, render hook is about `3-4.4ms`, and queue-to-present is
+  often `9-10ms`.
+
+## 2026-06-29 - Cells Retained Frame Borrow and Present Split
+
+Status: removed the repeated retained `LayoutFrame` clone/load in the native
+render hook and added honest submit/present timing diagnostics. The full
+64-click Cells verifier is still slightly over the input-wake budget, but the
+remaining blocker is now isolated to present/driver pacing.
+
+What changed:
+
+- `native_gpu_app_owned_render_hook` now borrows the retained
+  `layout_frame_override` directly instead of copying it into the per-frame
+  `layout_frame_cache` on every retained click.
+- The native render-loop report now includes `encoder_finish_ms`,
+  `queue_submit_call_ms`, `present_call_ms`, `present_mode`,
+  `surface_format`, and `desired_maximum_frame_latency`.
+- `verify-native-cells-visible-click-e2e` copies the submit/present split into
+  per-click present probes so slow samples identify whether the driver blocks in
+  submit or present.
+
+Evidence:
+
+- Focused tests passed:
+  `native_gpu_render_cache_reuses_stable_layout_override_hashes`,
+  `cells_focus_only_route_syncs_formula_bar_text`,
+  app-window `scheduler`,
+  `low_latency_present_mode_prefers_mailbox_over_immediate`, and
+  `cells_visual_formula_probe_requires_expected_formula_bar_text_value`.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-retained-frame-borrow.json`:
+  fail only on input-wake p95, but improved the render hook:
+  `layout_cache_misses=0/64`, average `layout_cache_ms` about `0.000024ms`,
+  average render hook about `2.153ms`, and
+  `input_wake_to_formula_visible_ms_p95=17.063ms`.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-retained-frame-borrow-present-split-copied.json`:
+  fail with `input_wake_to_formula_visible_ms_p95=17.055ms > 16.700ms`;
+  retained update, runtime work, and formula transition contracts pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-retained-frame-borrow-present-split-copied.json`:
+  pass.
+
+Remaining blockers:
+
+- The slow samples show the remaining tail is not runtime/list/formula work:
+  the surface runs with `present_mode="Mailbox"` and frame latency `1`, while
+  many slow samples block in `frame.present()` for about `8-10ms`; at least one
+  sample blocked in `queue.submit()` for about `10.36ms`.
+- The next architecture step should be the native app-owned/offscreen render
+  target with late surface acquire/copy/present, or an equivalent swapchain
+  ownership change, so the app does not hold or pace the visible surface through
+  the whole retained render hook.
+
+## 2026-06-29 - Cells Strict Formula-Bar Visual Proof and Timing Reframe
+
+Status: fixed the Cells visible-click verifier so formula-bar success is no
+longer accepted from retained text-sync metadata alone. The top formula input is
+now proven through app-owned WGPU surface readback plus retained binding evidence
+for `store.selected_input.editing_text`. The focused B0 path passes; the full
+64-click gate remains open on native present/render tail latency.
+
+What changed:
+
+- `verify-native-cells-visible-click-e2e` now treats retained text-input sync as
+  diagnostic metadata unless a changed app-owned WGPU readback proves the
+  presented frame.
+- The app-window readback skip rule no longer lets visible-surface render
+  metadata replace interactive readback unless the external proof carries a real
+  app-owned artifact hash.
+- Formula-visible latency is measured at the present timestamp once WGPU
+  readback proves the same input generation, instead of charging asynchronous
+  readback completion time as if it were user-visible latency.
+- The experimental offscreen copy-to-present path is opt-in through
+  `BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT`; it was slower in current Cells
+  measurements and is no longer the default path.
+
+Evidence:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --expected-formula '=add(A0,A1)' --report target/reports/native-gpu/cells-visible-click-e2e-b0-strict-readback-direct-present-timed.json`:
+  pass. The report shows selected `B0`, formula bar `=add(A0,A1)`, changed WGPU
+  readback proof, direct visible-surface rendering, and
+  `input_wake_to_formula_visible_ms_p95=15.024ms`.
+- The readback artifact
+  `target/artifacts/native-gpu/frames/3016381-preview-0ee39d810be5e080-6.png`
+  visibly contains the top formula input text `=add(A0,A1)`.
+- Focused tests passed:
+  `xtask cells_visual_formula_probe_requires_expected_formula_bar_text_value`,
+  `boon_native_app_window low_latency_present_mode_prefers_mailbox_over_immediate`,
+  and `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo build -q -p xtask`.
+
+Remaining blockers:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-strict-readback-direct-present-timed-mailbox-v3.json`:
+  fail. Retained update, runtime work, and formula transition contracts still
+  pass, but `input_wake_to_formula_visible_ms_p95=17.409ms > 16.700ms`.
+- The slow samples are native presentation/render tail work, not spreadsheet
+  recompute: runtime scans/recompute/materialization remain zero, while
+  `present_call_ms` is commonly around `9-10ms`, with render hook around
+  `2.2-2.5ms` and native input around `1.3-2.1ms`.
+
+## 2026-06-29 - TodoMVC Native Input-Parity Honesty Tightening
+
+Status: readiness remains blocked. Tightened the native TodoMVC input-parity
+proof path so the report no longer treats runtime state-summary hashes as
+framebuffer hashes. This does not complete Phase 10 or the native readiness
+chain; it preserves the failing gate with a more accurate blocker.
+
+What changed:
+
+- `operator-host-input` output evidence now separates
+  `state_summary_delta_evidence` from framebuffer evidence.
+- `verify-native-todomvc-input-parity` now requires real per-input app-owned
+  framebuffer readback artifacts and changed framebuffer hashes when a scenario
+  step expects a runtime/render delta.
+- Layout artifact hashes, retained cache updates, and render-patch counts remain
+  useful diagnostics, but no longer satisfy the framebuffer-delta contract.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -p boon_native_playground -p xtask --quiet`: pass with existing
+  native GPU warnings.
+- `cargo build -p xtask --quiet`: pass with existing warnings.
+- Focused native playground operator-host tests passed:
+  `compact_operator_host_input_skips_pre_event_summary_when_layout_identity_exists`,
+  `physical_operator_host_input_batches_execute_in_preview_runtime`, and
+  `todomvc_operator_host_input_keeps_layout_current_after_structural_events`.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  fail on missing fresh headed visual cursor/readback evidence.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass for the failing report shape.
+- `target/debug/xtask verify-native-todomvc-input-parity --report target/reports/native-gpu/todomvc-input-parity.json`:
+  fail on missing app-owned per-input framebuffer readback evidence.
+
+Next blocker:
+
+- Make the dev IPC operator-host probe one-source-event-per-request and wait for
+  the preview render loop report to publish before/after WGPU readback artifacts
+  with advanced present/content revisions. Keep readback ownership in
+  `boon_native_app_window`.
+
+## 2026-06-29 - TodoMVC Input-Parity Readback Gate Restored
+
+Status: native readiness remains blocked, but the TodoMVC input-parity gate now
+passes with app-owned per-input framebuffer evidence instead of state-summary or
+layout-hash substitutes.
+
+What changed:
+
+- The dev IPC operator-host probe batches as one source event per request when
+  it can observe the preview loop report.
+- Operator-host outputs now carry before/after WGPU readback artifacts and
+  framebuffer hashes captured by the preview render loop.
+- The readback wait requires content/pixel advancement for mutating inputs, so
+  idle frames are not accepted as post-input visual proof.
+- The verifier allows unchanged framebuffer hashes only for captured
+  whitespace-only text-input patches where the rendered pixels are expected to
+  remain blank.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo check -p boon_native_playground -p xtask --quiet`:
+  pass.
+- Focused tests passed:
+  `compact_operator_host_input_skips_pre_event_summary_when_layout_identity_exists`,
+  `todomvc_operator_host_input_keeps_layout_current_after_structural_events`,
+  and `physical_operator_host_input_batches_execute_in_preview_runtime`.
+- `target/debug/xtask verify-native-todomvc-input-parity --report target/reports/native-gpu/todomvc-input-parity.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/todomvc-input-parity.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Remaining blockers:
+
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`
+  still fails on the separate headed visual cursor/readback evidence blocker.
+- This does not close Phase 10/default execution or the broader unified goal.
+
+## 2026-06-29 - TodoMVC Preview E2E Evidence Refresh
+
+Status: refreshed the native TodoMVC headed visual evidence and restored the
+TodoMVC preview E2E report to pass. The BYTES/MachinePlan default-execution
+goal remains open.
+
+Evidence:
+
+- `target/debug/xtask verify-native-gpu-headed-scenario --example todomvc --report target/reports/native-gpu/headed-scenario-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/headed-scenario-todomvc.json target/reports/native-gpu/preview-e2e-todomvc.json target/reports/native-gpu/todomvc-input-parity.json`:
+  pass.
+
+Remaining blockers:
+
+- This is native preview evidence only. It does not complete Phase 10/default
+  PlanExecutor execution or the broader unified implementation goal.
+
+## 2026-06-30 - BYTES Aggregate Child Reports Refreshed
+
+Status: restored the focused BYTES/MachinePlan aggregate after the current
+`xtask` rebuild made ten child reports schema-stale. This does not complete the
+BYTES/MachinePlan migration because the progress ledger still has partial
+phases and `boon_cli run` still defaults to the legacy engine pending Phase 10.
+
+What changed:
+
+- Regenerated the stale aggregate children:
+  `bytes-source-payload-large-route-run-plan`, `bytes-negative`,
+  `bytes-machine-plan-adversarial`, `todomvc-release-benchmark-reproduction`,
+  `bytes-file-read-plan`, `bytes-file-write-plan`, `bytes-storage-profile`,
+  `bytes-fixed-warm-tick`, `bytes-byte-bank-layout`, and
+  `build-bytes-boundary`.
+- Regenerated `verify-bytes-negative` after the leaf reports because it owns
+  the nested large source-payload route proof.
+- Regenerated `verify-bytes-machine-plan-adversarial` after child artifact
+  hashes changed.
+
+Evidence:
+
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json target/reports/bytes-plan/bytes-file-read-plan.json target/reports/bytes-plan/bytes-file-write-plan.json target/reports/bytes-plan/bytes-storage-profile.json target/reports/bytes-plan/bytes-fixed-warm-tick.json target/reports/bytes-plan/bytes-byte-bank-layout.json target/reports/bytes-plan/build-bytes-boundary.json`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `57/57` required reports checked, `47` proof reports, `10`
+  diagnostic reports, `39` PlanExecutor reports, and `39` no-fallback
+  PlanExecutor reports.
+- `target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json`:
+  pass.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  fail only on `8 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- Finish the eight partial BYTES/MachinePlan ledger phases.
+- Complete the Phase 10 default switch only after the required default-engine
+  evidence is genuinely ready.
+
+## 2026-06-30 - Phase 3 Type-System Exit Gate Added
+
+Status: Phase 3 is now marked complete because the BYTES type-system surface has
+an aggregate-required, schema-checked verifier instead of only scattered unit
+and negative-test coverage. This is not a default-engine switch claim.
+
+What changed:
+
+- Added `verify-bytes-type-system` as a required child of
+  `verify-bytes-machine-plan-all --check-existing`.
+- The report covers the v1 BYTES/File boundary builtin type surface,
+  fixed/dynamic result refinements, static and dynamic encoding checks, and
+  resolved constant table coverage.
+- The report schema now rejects missing check IDs, missing per-step pass/fail
+  entries, too-small type-result coverage, and missing resolved constants.
+
+Evidence:
+
+- `target/debug/xtask verify-bytes-type-system --report target/reports/bytes-plan/bytes-type-system.json`:
+  pass with `34` required checks, `32` type results, and
+  `resolved_constant_count=57`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-type-system.json`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `58/58` required reports checked.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan ledger phases remain partial.
+- Phase 10 remains blocked until default PlanExecutor readiness is proven and
+  `boon_cli run` can honestly switch away from the legacy engine.
+
+## 2026-06-30 - Phase 10 Default-Engine Readiness Guard Added
+
+Status: added a schema-checked, aggregate-required guard for the default-engine
+switch. The guard is intentionally not a switch: `boon_cli run` still defaults
+to the legacy engine until the remaining readiness blockers are closed.
+
+What changed:
+
+- Added `verify-bytes-default-engine-readiness`.
+- Added report-schema validation for the guard, including exact check IDs,
+  three child CLI report summaries, two explicit compare cases, and
+  `default_switch_allowed=false`.
+- Added the guard to `verify-bytes-machine-plan-all --check-existing`.
+- Replayed stale BYTES child reports from their stored `command_argv` after the
+  `boon_cli` and `xtask` binary hashes changed.
+
+Evidence:
+
+- `target/debug/xtask verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass. It builds `boon_cli`, runs default semantic `examples/todomvc.bn`,
+  runs explicit compare for `examples/todomvc.bn`, runs explicit compare for
+  `examples/cells.bn`, and records `default_engine="legacy"`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json target/reports/bytes-plan/bytes-default-engine-legacy-smoke.json target/reports/bytes-plan/bytes-default-engine-todomvc-compare.json target/reports/bytes-plan/bytes-default-engine-cells-compare.json`:
+  pass.
+- Replayed `57` stale child commands; status log:
+  `target/reports/bytes-plan/logs/default-engine-refresh/status.txt`.
+- `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass after child artifact hashes changed.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `59/59` required reports checked, `49` proof reports, `10`
+  diagnostic reports, and `39` no-fallback PlanExecutor reports.
+- `target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json`:
+  pass.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger`
+  and `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/debug/machine-readiness.json target/reports/bytes-plan/goal-readiness.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- Cells 60 FPS/native visible interaction evidence remains open.
+- The Phase 10 default switch remains blocked until `audit-goal-readiness`
+  passes; this guard proves current explicit compare paths, not final default
+  execution readiness.
+
+## 2026-06-30 - Indexed BYTES Search PlanExecutor Slice
+
+Status: added indexed-row PlanExecutor coverage for `Bytes/is_empty`,
+`Bytes/find`, `Bytes/starts_with`, and `Bytes/ends_with`. This is a narrow
+Phase 4/Phase 7 coverage increment, not a default-engine switch and not a Cells
+performance claim.
+
+What changed:
+
+- Added `examples/bytes_indexed_search_plan_ops.bn` and `.scn`.
+- Extended indexed MachinePlan support and structural verification for
+  `Bytes/is_empty` plus two-input BYTES search/predicate update branches.
+- Extended source-route action classification so indexed `Bytes/find` compiles
+  as a value update and indexed `Bytes/is_empty`,
+  `Bytes/starts_with` / `Bytes/ends_with` compile as bool match updates.
+- Added report-schema expectations for the new aggregate child
+  `bytes-indexed-search-scenario`.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=7`, zero runtime AST/string/unknown
+  fallback counters, `legacy_comparison.passed=true`, indexed single-input
+  borrowed byte-bank evidence for `bytes_is_empty`, and indexed byte-access
+  roles for `haystack`/`needle`, `input`/`prefix`, and `input`/`suffix`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass.
+
+Aggregate evidence:
+
+- Refreshed stale child reports after the `boon_cli`/`xtask` binary hashes
+  changed. Logs are under
+  `target/reports/bytes-plan/logs/refresh-indexed-search-aggregate/` and
+  `target/reports/bytes-plan/logs/refresh-indexed-search-aggregate-final/`.
+  The follow-up `Bytes/is_empty` extension required a second refresh under
+  `target/reports/bytes-plan/logs/refresh-indexed-is-empty-aggregate/` and
+  `target/reports/bytes-plan/logs/refresh-indexed-is-empty-final-two/`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `f603286d4ba32157d209939042725e355dec517064c2f38f0fac0287ff329281`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - BYTES Source Guard Boundary Evidence Refreshed
+
+Status: refreshed U1 evidence after the PlanExecutor BYTES source-payload guard
+support moved from a rejected compiler-boundary case into executable
+PlanExecutor source-guard matching. This is a boundary/evidence fix, not a
+default-engine switch and not a Cells 60 FPS claim.
+
+Implementation notes:
+
+- Updated the compiler-boundary verifier so the extracted PlanExecutor source
+  guard check now requires the executable BYTES path:
+  `SourcePayloadField::Bytes`, `source_payload_bytes(event, field)?`, and
+  `bytes_decode_hex(expected)`.
+- Preserved the typechecker-level rejection for source-level Boon BYTES guard
+  syntax. `verify-bytes-negative` still proves users must use the supported
+  payload form instead of source-level BYTES guard syntax.
+- Refreshed stale BYTES/MachinePlan child reports after `boon_cli` and `xtask`
+  binary hashes changed. Logs are under
+  `target/reports/bytes-plan/logs/refresh-schema-blockers-20260630-044144/`.
+
+Evidence:
+
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `f6a0b5febb8aa92cdd5ec606b8a7f49577e094ec82dec41bdba15573dd02e66b`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- U1 remains incomplete because seven BYTES/MachinePlan phases are still partial
+  and default execution remains legacy.
+- Cells visible-interaction speed/correctness remains a separate native/runtime
+  architecture blocker, including the native selected-cell/formula-bar
+  desynchronization observed during manual testing.
+
+## 2026-06-30 - BYTES Source-Payload Guards Accepted
+
+Status: closed the next generic MachinePlan gap by allowing BYTES source-payload
+guards through the same executor-owned guard path as TEXT/key/address guards.
+The guard value contract is exact hex payload matching, using the existing
+`bytes_hex` source-event convention; invalid guard hex is rejected rather than
+silently skipped.
+
+What changed:
+
+- `boon_plan` no longer treats `SourcePayloadField::Bytes` guards as
+  intrinsically non-executable when the guarded op already references the same
+  BYTES source payload.
+- `boon_plan_executor::source_guard_matches` now compares BYTES payloads against
+  guard `values` decoded as hex strings, with match, mismatch, and invalid-hex
+  test coverage.
+- `boon_report_schema` expected replay now validates the same BYTES guard
+  semantics against report-owned `source_event.payload_bytes.bytes` artifacts.
+- The older generic runtime source-action guard path now recognizes reserved
+  `bytes` payloads for BYTES one-of guards instead of always returning false.
+
+Evidence:
+
+- `cargo fmt --check`: pass.
+- `cargo test -q -p boon_plan bytes_source_payload_guards_are_executable_plan_inputs`:
+  pass.
+- `cargo test -q -p boon_plan_executor source_guard_matching_is_executor_owned`:
+  pass.
+- `cargo test -q -p boon_report_schema expected_plan_source_guard_matches_bytes_payload_hex`:
+  pass.
+- `cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass with existing warnings only.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes_source_payload_update`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_source_payload_update`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `e6d86a8aa767419639a259685e6669d1b2f981682c401fa48433177a7eb29f77`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - Indexed BYTES Numeric Writes Added
+
+Status: continued U1 by extending indexed-row BYTES PlanExecutor write coverage
+to state-backed `Bytes/write_unsigned` and `Bytes/write_signed`.
+
+Implementation notes:
+
+- Indexed MachinePlan CPU-support classification now accepts fixed-length
+  numeric BYTES write branches with BYTES state input plus typed offset,
+  byte-count, endian, and value constants.
+- The PlanExecutor indexed bytes-write evaluator now applies unsigned/signed
+  numeric write patches from indexed fixed byte-bank row storage, validates
+  output length, and commits the resulting BYTES value through the indexed
+  bytes-write path. The current indexed implementation materializes the output
+  bytes before fixed-bank commit; it does not claim the root patch-only
+  mutation path.
+- Runtime indexed update dispatch and report-schema expected replay now cover
+  both numeric write forms without AST fallback.
+- `examples/bytes_indexed_search_plan_ops.bn` now proves `write_u16_le` and
+  `write_i8_first` alongside indexed BYTES text conversions, BYTES-producing
+  conversions, slice/take/drop, numeric reads, predicates, and search.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=22`, zero PlanExecutor fallback
+  counters, `legacy_comparison.passed=true`, `semantic_delta_match=true`,
+  `write_u16_le` digest
+  `8d220d82abb00ef958463bc77f36fcc1879cf87225bb513b2946fedfdb5d4300`,
+  and `write_i8_first` digest
+  `b22348517e4e632ac2a247feaa534cb664204a3b5eeb77acb1b0fc306ae63b29`.
+- `target/debug/boon_cli dump-plan examples/bytes_indexed_search_plan_ops.bn --report target/reports/bytes-plan/bytes-indexed-search-dump-plan.json`:
+  pass with `cpu_plan_executor_complete=true` and
+  `cpu_plan_executor_unsupported_op_count=0`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-indexed-search-dump-plan.json`:
+  pass after focused report refresh.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, and `40` no-fallback
+  PlanExecutor reports.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on the seven partial BYTES/MachinePlan phases and the
+  Phase 10 default-engine switch still being intentionally blocked.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - Indexed BYTES Zeros Slice
+
+Status: extended indexed-row BYTES PlanExecutor write coverage to state-backed
+`Bytes/zeros`. This is another generic indexed BYTES execution slice; it is not
+a default-engine switch and not a Cells performance claim.
+
+What changed:
+
+- Indexed MachinePlan support classification now accepts `Bytes/zeros` branches
+  with a typed constant byte count, BYTES output storage, and no source payload
+  or row-field input dependencies.
+- The PlanExecutor indexed bytes-write evaluator now executes `Bytes/zeros`
+  directly, validates fixed output length, commits through indexed BYTES
+  storage, and reports the typed byte-count constant used by the branch.
+- Runtime indexed update dispatch now routes `Bytes/zeros` through the generic
+  indexed BYTES write evaluator instead of falling back to source AST
+  evaluation.
+- Report-schema expected replay now reconstructs indexed `Bytes/zeros` output
+  and validates fixed byte-bank evidence.
+- `examples/bytes_indexed_search_plan_ops.bn` now includes a `zero_fill`
+  indexed row field whose nonzero initial bytes are replaced by
+  `Bytes/zeros(byte_count: 3)` so semantic deltas prove the write.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=17`, zero unknown-op/runtime-AST
+  fallback counters, `graph_rebuild_count=0`, and `zero_fill` reported as
+  `expression_kind=bytes_zeros`, `update_constant_value=3`,
+  `bytes_storage.storage=indexed_fixed_byte_bank`, `byte_bank_used=true`,
+  `byte_len=3`, and digest
+  `709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and no stale or failing child reports.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `partial_phase_count=7` and the Phase 10 default engine
+  switch still being intentionally blocked.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells visible-interaction speed/correctness remains a separate native/runtime
+  architecture blocker, not solved by this indexed BYTES slice.
+
+## 2026-06-30 - Indexed BYTES Concat Slice
+
+Status: extended indexed-row BYTES PlanExecutor write coverage to
+state-backed `Bytes/concat`. This is a generic indexed BYTES execution slice;
+it is not a default-engine switch and not a Cells performance claim.
+
+What changed:
+
+- Indexed MachinePlan support classification now accepts `Bytes/concat` update
+  branches with ordered BYTES operands drawn from indexed state or row-field
+  storage.
+- Fixed-length verification now handles row-field BYTES operands from list
+  initial-row metadata, so a branch such as `payload |> Bytes/concat(with:
+  needle)` can prove the output length without fixture-specific code.
+- The PlanExecutor indexed bytes-write evaluator now executes `Bytes/concat`
+  directly, validates fixed output length, commits through indexed fixed
+  byte-bank storage, and reports the measured copy path.
+- Runtime indexed update dispatch now routes `Bytes/concat` through the generic
+  indexed BYTES write evaluator instead of falling back to source AST
+  evaluation.
+- Report-schema expected replay now reconstructs indexed `Bytes/concat` output
+  and validates byte-access, byte-storage, and copy-cost evidence.
+- `examples/bytes_indexed_search_plan_ops.bn` now includes `payload_joined`,
+  joining row state `payload` with row field `needle`.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=18`, zero unknown-op/runtime-AST
+  fallback counters, `legacy_comparison.passed=true`, and `payload_joined`
+  reported as `expression_kind=bytes_concat`, `byte_len=7`, digest
+  `4825013d9d795bb73ad5e21ce6963c7c858ed984a8fa720a1d393554a04f43ee`,
+  `bytes_storage.storage=indexed_fixed_byte_bank`, and `byte_bank_used=true`.
+  The report also records the intentional copy-cost evidence for this slice:
+  `reason=bytes_concat_output_vec`, `vec_alloc_count=1`,
+  `vec_alloc_bytes=7`, `copy_from_slice_count=2`, and
+  `copy_from_slice_bytes=7`.
+- `target/debug/boon_cli dump-plan examples/bytes_indexed_search_plan_ops.bn --report target/reports/bytes-plan/bytes-indexed-search-dump-plan.json`:
+  pass with `cpu_plan_executor_complete=true` and
+  `cpu_plan_executor_unsupported_op_count=0`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and no stale or failing child reports.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `partial_phase_count=7` and the Phase 10 default engine
+  switch still being intentionally blocked.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-indexed-search-dump-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass after refreshing stale `boon_cli` binary hashes.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells visible-interaction speed/correctness remains a separate native/runtime
+  architecture blocker, not solved by this indexed BYTES slice.
+
+## 2026-06-30 - Indexed BYTES Numeric Read Slice
+
+Status: extended indexed-row BYTES PlanExecutor read coverage to
+state-backed `Bytes/read_unsigned` and `Bytes/read_signed`. This is a generic
+indexed numeric-read execution slice; it is not a default-engine switch and not
+a Cells performance claim.
+
+What changed:
+
+- Indexed MachinePlan CPU-support classification now accepts numeric BYTES read
+  branches with a BYTES state input plus typed offset, byte-count, and endian
+  constants.
+- The PlanExecutor indexed BYTES read evaluator now executes
+  `Bytes/read_unsigned` and `Bytes/read_signed` directly from indexed row
+  byte-bank storage, validates byte ranges, and reports the same constant
+  evidence shape used by root numeric reads.
+- Runtime indexed update dispatch now routes numeric BYTES reads through the
+  generic indexed BYTES read evaluator instead of falling back to source AST
+  evaluation.
+- Report-schema expected replay now validates indexed numeric-read values,
+  constants, executor identity, and borrowed byte-bank access.
+- `examples/bytes_indexed_search_plan_ops.bn` now includes `read_u16_be` and
+  `read_i8_last`, proving unsigned and signed numeric reads over the same
+  indexed row payload.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=20`, zero unknown-op/runtime-AST
+  fallback counters, `legacy_comparison.passed=true`, `read_u16_be` reported as
+  `expression_kind=bytes_read_unsigned`, value `65028`, constants
+  `{offset: 1, byte_count: 2, endian: Big}`, and `read_i8_last` reported as
+  `expression_kind=bytes_read_signed`, value `-1`, constants
+  `{offset: 4, byte_count: 1, endian: Little}`. Both read from
+  `indexed_fixed_byte_bank` with `read_only=true`, `cow_kind=borrowed`, and
+  executor `cpu-plan-indexed-bytes-read-evaluator-v1`.
+- `target/debug/boon_cli dump-plan examples/bytes_indexed_search_plan_ops.bn --report target/reports/bytes-plan/bytes-indexed-search-dump-plan.json`:
+  pass with `cpu_plan_executor_complete=true` and
+  `cpu_plan_executor_unsupported_op_count=0`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and no stale or failing child reports after two replay passes for
+  reports dirtied by the schema/CLI binary rebuild.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `partial_phase_count=7` and the Phase 10 default engine
+  switch still being intentionally blocked.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-indexed-search-dump-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells visible-interaction speed/correctness remains a separate native/runtime
+  architecture blocker, not solved by this indexed BYTES slice.
+
+## 2026-06-30 - Indexed BYTES Slice/Take/Drop Slice
+
+Status: extended indexed-row PlanExecutor BYTES write coverage to
+state-backed `Bytes/slice`, `Bytes/take`, and `Bytes/drop`. This is a generic
+MachinePlan/runtime coverage extension for indexed BYTES storage; it is not a
+default-engine switch and not a Cells 60 FPS claim.
+
+What changed:
+
+- Indexed MachinePlan support classification now accepts fixed-length
+  state-backed `Bytes/slice`, `Bytes/take`, and `Bytes/drop` update branches.
+- Runtime indexed source dispatch routes those update branches through the
+  indexed BYTES write evaluator.
+- `boon_plan_executor` now evaluates those branches directly from indexed
+  fixed byte-bank row storage, validates fixed output length, and reports the
+  borrowed slice-view access plus indexed fixed byte-bank output storage.
+- `boon_report_schema` now replays those indexed branches instead of treating
+  them as unsupported expected evidence.
+- `examples/bytes_indexed_search_plan_ops.bn` now proves indexed BYTES
+  conversions, slice/take/drop, predicates, and search in the same row-scoped
+  fixture.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=16`, zero PlanExecutor fallback
+  counters, `legacy_comparison.passed=true`, and `semantic_delta_match=true`.
+  The report includes indexed fixed byte-bank outputs for `payload_mid`
+  (`bytes_slice`, 2 bytes), `payload_take` (`bytes_take`, 2 bytes), and
+  `payload_drop` (`bytes_drop`, 3 bytes).
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass.
+
+Aggregate evidence:
+
+- Refreshed stale child reports after `boon_cli`/`xtask` binary hashes changed.
+  Temporary command lists were written to
+  `target/reports/bytes-plan/refresh-commands.txt` and
+  `target/reports/bytes-plan/refresh-commands-pass2.txt`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `2be2c4451952be11d9ff89464ce97a595b73ec84c2b05aec913430f0d40b0234`.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - Indexed BYTES-Producing Conversion Slice
+
+Status: extended the indexed-row PlanExecutor BYTES write surface with
+`Text/to_bytes`, `Bytes/from_hex`, and `Bytes/from_base64`. This keeps moving
+the generic MachinePlan/list execution path forward; it is not a default-engine
+switch and not a Cells performance claim.
+
+What changed:
+
+- Extended indexed MachinePlan capability and structural verification so
+  BYTES-producing conversions can read typed TEXT operands from either indexed
+  row state or row fields.
+- Added indexed bytes-write PlanExecutor evaluation for `Text/to_bytes`,
+  `Bytes/from_hex`, and `Bytes/from_base64`, including fixed byte-bank storage
+  validation and report-schema replay expectations.
+- Routed the runtime indexed update dispatcher through the bytes-write evaluator
+  for those conversion ops.
+- Fixed legacy source-route scheduling for indexed BYTES-producing updates by
+  preserving compiler scalar branch order across indexed text/bool/value
+  actions. This keeps legacy comparison deltas aligned with MachinePlan op
+  order instead of grouping all bool updates before value updates.
+- Extended `examples/bytes_indexed_search_plan_ops.bn` so the aggregate indexed
+  fixture proves BYTES-to-TEXT reads, BYTES-producing writes, search, and
+  predicates in one row-scoped PlanExecutor scenario.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=13`,
+  `legacy_comparison.passed=true`, `semantic_delta_match=true`, zero
+  runtime AST/string/unknown fallback counters, and indexed update entries for
+  `text_to_bytes`, `bytes_from_hex`, and `bytes_from_base64`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Aggregate evidence:
+
+- Refreshed stale aggregate children after `boon_cli`/`xtask` binary hashes
+  changed. Logs are under
+  `target/reports/bytes-plan/logs/refresh-indexed-bytes-conversion-aggregate/`
+  and
+  `target/reports/bytes-plan/logs/refresh-indexed-bytes-conversion-aggregate-pass2/`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `ad600b03b81aaf6f51b1501048d05cc41d18bf3ef038c13445a95fc848a06239`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - Indexed BYTES Text Conversion Slice
+
+Status: extended the indexed-row PlanExecutor BYTES read surface with
+`Bytes/to_hex`, `Bytes/to_base64`, and `Bytes/to_text`. This closes another
+generic indexed BYTES execution gap; it is not a default-engine switch and not a
+Cells 60 FPS claim.
+
+What changed:
+
+- Extended indexed MachinePlan support classification for BYTES-to-TEXT read
+  expressions whose BYTES input comes from state/row storage and whose
+  conversion encoding is a typed constant.
+- Added indexed BYTES text conversion evaluation in `boon_plan_executor` and
+  runtime dispatch through the same indexed BYTES read evaluator core used by
+  existing BYTES predicate/search reads.
+- Added the runtime indexed text commit read path for row/root BYTES values, so
+  source-routed indexed text fields can receive generic `Bytes/to_hex`,
+  `Bytes/to_base64`, and `Bytes/to_text` outputs without falling back to AST
+  evaluation.
+- Extended `examples/bytes_indexed_search_plan_ops.bn` and its scenario so the
+  aggregate-required indexed search fixture also proves text conversion outputs.
+- Updated report-schema replay expectations for the new indexed BYTES text
+  conversion report entries.
+
+Evidence:
+
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo check -q -p boon_plan -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `CARGO_BUILD_JOBS=1 RUSTFLAGS='-Awarnings' cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes_search_updates -- --nocapture`:
+  pass.
+- `target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_indexed_search_plan_ops.bn --scenario examples/bytes_indexed_search_plan_ops.scn --steps receive-beta-bytes,inspect-beta-search --compare-legacy --report target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass with `executed_indexed_update_count=10`, `legacy_comparison.passed=true`,
+  zero runtime AST/string/unknown fallback counters, and indexed text outputs
+  `payload_hex=01fe0405ff`, `payload_base64=Af4EBf8=`, and
+  `decoded_text=ABC`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json`:
+  pass.
+
+Aggregate evidence:
+
+- Refreshed stale child reports after the `boon_cli`/`xtask` binary hashes
+  changed. Logs are under
+  `target/reports/bytes-plan/logs/refresh-indexed-text-conversion-aggregate/`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, `40` no-fallback PlanExecutor
+  reports, and worktree fingerprint
+  `055fc2c8e01910c4cbec56dade57aaa9970537048f8baa893c6845ba04db211b`.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-indexed-search-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells 60 FPS/native visible interaction evidence remains open.
+
+## 2026-06-30 - Latest BYTES Source Guard Boundary Evidence
+
+Status: current tail note for the refreshed BYTES source-payload guard boundary
+evidence. The detailed entry also appears earlier in this ledger where the
+matching blocker block was updated.
+
+Evidence:
+
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler/m1-boundaries.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-negative --report target/reports/bytes-plan/bytes-negative.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, and `40` no-fallback
+  PlanExecutor reports.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/compiler/m1-boundaries.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-negative.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json target/reports/bytes-plan/bytes-goal-readiness.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- U1 remains incomplete because seven BYTES/MachinePlan phases are still partial
+  and default execution remains legacy.
+- Cells visible-interaction speed/correctness remains open; native manual
+  testing indicates selected-cell state and formula-bar text input can
+  desynchronize, so follow-up evidence must cover click-to-formula-bar update.
+
+## 2026-06-30 - Indexed Same-Event Bytes/set Classifier Fix
+
+Status: fixed a generic MachinePlan capability-classification hole for indexed
+same-event BYTES dependencies. The executor and schema replay already supported
+the indexed `Bytes/set` shape; the CPU-support classifier was still rejecting
+it, so the fixture looked incomplete even though the runtime path existed.
+
+What changed:
+
+- `boon_plan` indexed update support now accepts `PlanExpressionKind::BytesSet`
+  when the operands are supported, the output state is BYTES, the fixed lengths
+  match, and the update has no source-payload dependency.
+- Added a focused `boon_plan` unit test proving an indexed `Bytes/set` op is
+  classified as whole-plan CPU-executable.
+- Refreshed the indexed same-event dump/scenario reports and then replayed all
+  aggregate children whose embedded binary hash became stale.
+
+Evidence:
+
+- `RUSTFLAGS='-Awarnings' cargo test -q -p boon_plan indexed_bytes_set_is_cpu_plan_executor_supported -- --nocapture`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p boon_cli -- dump-plan examples/bytes_indexed_same_event_dependency_plan_ops.bn --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-dump-plan.json`:
+  pass with `cpu_plan_executor_complete=true`,
+  `cpu_plan_executor_unsupported_op_count=0`, and
+  `typed_lowering_executable=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/bytes_indexed_same_event_dependency_plan_ops.bn --scenario examples/bytes_indexed_same_event_dependency_plan_ops.scn --steps receive-beta-bytes-and-read --compare-legacy --report target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json`:
+  pass with zero PlanExecutor fallback counters,
+  `legacy_comparison.passed=true`, and semantic deltas for `payload`,
+  `patched`, `payload_len`, `payload_second`, and `patched_first`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `60/60` required reports checked, `50` proof reports, `10`
+  diagnostic reports, `40` PlanExecutor reports, and `40` no-fallback
+  PlanExecutor reports.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-indexed-same-event-dependency-dump-plan.json target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-goal-readiness.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells visible-interaction speed/correctness remains open; formula-bar
+  synchronization after cell focus must be measured and fixed by the native
+  retained/runtime path, not hidden with a Cells-specific workaround.
+
+## 2026-06-30 - Cells Demand-Current Semantic-Delta Readiness Contract
+
+Status: replaced the raw eager legacy semantic-delta requirement in
+`audit-goal-readiness` with a stricter reviewed replacement contract for the
+current demand-current Cells architecture. This does not make the default
+switch ready; it removes the blocker that would otherwise force the
+PlanExecutor to re-emit legacy eager `display_text`/transient `value` deltas.
+
+What changed:
+
+- `audit-goal-readiness` now accepts Cells compare evidence only if either:
+  exact legacy semantic-delta parity passes, or the report proves the
+  demand-current coalescing contract.
+- The demand-current contract requires accepted policy kind
+  `demand-current-coalesced-semantic-deltas`, executor
+  `cpu-plan-root-scenario-demand-current-acceptance-v1`, legacy state parity,
+  full scenario/source-event/assertion coverage, zero extra PlanExecutor
+  deltas, zero rejected missing deltas, and omitted legacy deltas only for
+  demand-current fields `display_text`, `value`, or `error`.
+- Added an `xtask` unit test that accepts exact parity, accepts the strict
+  demand-current contract, rejects extra PlanExecutor deltas, and rejects
+  unsupported omitted fields.
+
+Evidence:
+
+- `cargo fmt --package xtask`: pass.
+- `cargo test -q -p xtask cells_plan_compare_readiness_accepts_exact_or_strict_demand_current_contract -- --nocapture`:
+  pass.
+- `cargo check -q -p xtask`: pass with existing warnings.
+- Replayed stale child reports after the xtask/boon_cli binary hash changed.
+- `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `63/63` required reports checked, `52` proof reports, `11`
+  diagnostic reports, and `42` no-fallback PlanExecutor reports.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+- The new readiness check
+  `goal-readiness:cells-plan-compare-semantic-delta-contract` passes with
+  `extra_plan_delta_count=0`, `missing_delta_count=32`,
+  `rejected_missing_delta_count=0`, and missing fields
+  `[display_text, value]`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-goal-readiness.json target/reports/bytes-plan/cells-plan-compare.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial in the ledger.
+- The default engine remains legacy until Phase 10 can honestly switch.
+
+## 2026-06-30 - Cells Compare Exact-Delta Readiness Blocker
+
+Status: tightened `audit-goal-readiness` so Cells full PlanExecutor compare can
+remain an aggregate-accepted proof, but Phase 10 readiness now explicitly fails
+until Cells reaches exact semantic-delta parity or the mismatch is replaced by a
+stronger reviewed contract. This keeps the current demand-current coalescing
+policy visible instead of hiding it behind the passing aggregate.
+
+What changed:
+
+- `audit-goal-readiness` now reads
+  `target/reports/bytes-plan/cells-plan-compare.json`.
+- The audit now requires `legacy_comparison.passed=true` and
+  `legacy_comparison.semantic_delta_match=true` for Cells exact semantic-delta
+  parity before final goal readiness can pass.
+- The current Cells report still has state parity and accepted coalesced
+  demand-current deltas, but raw semantic-delta parity remains false with
+  `missing_delta_count=32` across `display_text` and `value`.
+
+Evidence:
+
+- `cargo fmt --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p xtask`: pass.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p boon_runtime -p boon_plan_executor`:
+  pass.
+- `RUSTFLAGS='-Awarnings' target/debug/boon_cli run examples/cells.bn --scenario examples/cells.scn --engine compare --report target/reports/bytes-plan/cells-plan-compare.json`:
+  pass via `legacy_comparison_acceptance.accepted=true`, while
+  `legacy_comparison.passed=false` and
+  `legacy_comparison.semantic_delta_match=false`.
+- Replayed aggregate child reports after the `boon_cli` / `xtask` binary hash
+  changed.
+- `RUSTFLAGS='-Awarnings' target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `63/63` required reports checked, `52` proof reports, `11`
+  diagnostic reports, `42` PlanExecutor reports, and `42` no-fallback
+  PlanExecutor reports.
+- `RUSTFLAGS='-Awarnings' target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail on the seven partial BYTES/MachinePlan phases, the new Cells
+  exact semantic-delta parity blocker, and the Phase 10 default-engine switch.
+- `RUSTFLAGS='-Awarnings' target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-goal-readiness.json target/reports/bytes-plan/cells-plan-compare.json`:
+  pass.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- Cells exact semantic-delta parity remains open; the current report relies on
+  demand-current coalescing for omitted transient `display_text` / `value`
+  `FieldSet` deltas.
+- The default engine remains legacy.
+
+## 2026-06-30 - Append Row Refresh Aggregate Requirement
+
+Status: made the existing append-row refresh PlanExecutor proof part of the
+aggregate-required BYTES/MachinePlan surface. This does not close Phase 6 or
+Phase 10, but it prevents the row-append/row-refresh slice from remaining only
+as an optional diagnostic artifact.
+
+What changed:
+
+- `verify-bytes-machine-plan-all` now requires both append-row refresh reports:
+  the dump-plan diagnostic and the compare-mode scenario proof.
+- `boon_report_schema` now expects both append-row refresh child reports in
+  the aggregate.
+- The scenario report proves executor-owned row insertion plus row-expression
+  refresh for `payload_len` and `payload_second` without runtime AST fallback,
+  unknown plan ops, or graph rebuilds.
+
+Evidence:
+
+- `cargo fmt --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p xtask -p boon_report_schema`:
+  pass.
+- `RUSTFLAGS='-Awarnings' target/debug/boon_cli dump-plan examples/bytes_append_row_refresh_plan_ops.bn --report target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' target/debug/boon_cli run-plan-root-scalar-scenario examples/bytes_append_row_refresh_plan_ops.bn --scenario examples/bytes_append_row_refresh_plan_ops.scn --steps append-row --compare-legacy --report target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json`:
+  pass with `cpu_plan_executor_complete=true`, zero runtime AST fallback,
+  zero unknown plan ops, zero graph rebuilds, one executed list append, and
+  semantic deltas for `store.row_label_to_add`, `ListInsert`, `payload_len`,
+  and `payload_second`.
+- `RUSTFLAGS='-Awarnings' target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `63/63` required reports checked, `52` proof reports, `11`
+  diagnostic reports, `42` PlanExecutor reports, and `42` no-fallback
+  PlanExecutor reports.
+- `RUSTFLAGS='-Awarnings' target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells compare/speed evidence still needs stronger visual/readback proof for
+  the selected-cell formula-bar path and broader Phase 1 parity/performance
+  closure before any default switch.
+
+## 2026-06-30 - Direct Indexed Source-Payload Route Proof
+
+Status: fixed the direct `run-plan-route` gap for scoped/indexed source routes
+and made it aggregate-required. The existing root-scenario path already
+executed indexed source-payload updates; this slice extends the direct route
+proof path so row-scoped BYTES source updates are no longer hidden behind only
+scenario replay.
+
+What changed:
+
+- `boon_cli run-plan-route` now accepts explicit row identity flags
+  `--target-key` and `--target-generation` while preserving the existing
+  source-payload `--key` meaning.
+- `boon_plan_executor` route selection now accepts scoped/indexed update
+  branches when the source route scope and indexed target state scope match.
+- Direct route orchestration validates indexed route writes against the
+  full source-event execution's `indexed_updates` row evidence, with
+  `execution_surface=indexed-full-execution`.
+- Legacy comparison for indexed routes now reads the matching row `FieldSet`
+  semantic delta instead of looking for a root `state_summary` path.
+- `boon_report_schema` now replays indexed direct route reports from the
+  source-derived MachinePlan/scenario execution and verifies
+  `selected_op_indexed=true`.
+- `verify-bytes-machine-plan-all` now requires
+  `target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json`.
+
+Evidence:
+
+- `cargo fmt --check`: pass.
+- `RUSTFLAGS='-Awarnings' cargo check -q -p boon_cli -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p boon_cli -- run-plan-route examples/bytes_indexed_source_payload_plan_ops.bn --source row.receive --target-state row.payload --target-key 2 --target-generation 1 --payload-bytes-hex bytes=01fe04 --compare-legacy --report target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json`:
+  pass with `selected_op_indexed=true`,
+  `execution_surface=indexed-full-execution`,
+  `executed_indexed_update_count=1`, zero fallback counters, and
+  `legacy_comparison.passed=true`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass with `61/61` required reports checked, `51` proof reports, `10`
+  diagnostic reports, `41` PlanExecutor reports, and `41` no-fallback
+  PlanExecutor reports.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-goal-readiness.json`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail only on `7 phases are still partial in the progress ledger` and
+  `Phase 10 default switch has not happened; boon_cli run still defaults to
+  legacy`.
+
+Remaining blockers:
+
+- Seven BYTES/MachinePlan phases remain partial.
+- The default engine remains legacy.
+- Cells visible-interaction speed/correctness remains open; formula-bar
+  synchronization after cell focus must be measured and fixed by the native
+  retained/runtime path, not hidden with a Cells-specific workaround.

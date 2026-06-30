@@ -1,0 +1,165 @@
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[5] {}, text_payload: BYTES[3] { 16u41, 16u42, 16u43 }, text_source: TEXT { ABC }, hex_source: TEXT { 414243 }, base64_source: TEXT { QUJD }, needle: BYTES[2] { 16uFE, 16u04 }, missing: BYTES[2] { 16uAA, 16uBB }, prefix: BYTES[2] { 16u01, 16uFE }, suffix: BYTES[2] { 16u05, 16uFF }, wrong_suffix: BYTES[2] { 16uFE, 16u04 }]
+            [name: TEXT { beta }, payload: BYTES[5] {}, text_payload: BYTES[3] { 16u41, 16u42, 16u43 }, text_source: TEXT { ABC }, hex_source: TEXT { 414243 }, base64_source: TEXT { QUJD }, needle: BYTES[2] { 16uFE, 16u04 }, missing: BYTES[2] { 16uAA, 16uBB }, prefix: BYTES[2] { 16u01, 16uFE }, suffix: BYTES[2] { 16u05, 16uFF }, wrong_suffix: BYTES[2] { 16uFE, 16u04 }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        receive_text: SOURCE
+        inspect: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                }
+            }
+        text_payload:
+            row.text_payload |> HOLD text_payload {
+                LATEST {
+                    receive_text.bytes |> THEN { receive_text.bytes }
+                }
+            }
+        text_source: row.text_source
+        hex_source: row.hex_source
+        base64_source: row.base64_source
+        needle: row.needle
+        missing: row.missing
+        prefix: row.prefix
+        suffix: row.suffix
+        wrong_suffix: row.wrong_suffix
+        payload_hex:
+            TEXT {} |> HOLD payload_hex {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/to_hex }
+                }
+            }
+        payload_base64:
+            TEXT {} |> HOLD payload_base64 {
+                LATEST {
+                    inspect |> THEN { Bytes/to_base64(input: payload) }
+                }
+            }
+        decoded_text:
+            TEXT {} |> HOLD decoded_text {
+                LATEST {
+                    inspect |> THEN { text_payload |> Bytes/to_text(encoding: Utf8) }
+                }
+            }
+        encoded_text_bytes:
+            BYTES[3] {} |> HOLD encoded_text_bytes {
+                LATEST {
+                    inspect |> THEN { text_source |> Text/to_bytes(encoding: Utf8) }
+                }
+            }
+        decoded_hex_bytes:
+            BYTES[3] {} |> HOLD decoded_hex_bytes {
+                LATEST {
+                    inspect |> THEN { hex_source |> Bytes/from_hex }
+                }
+            }
+        decoded_base64_bytes:
+            BYTES[3] {} |> HOLD decoded_base64_bytes {
+                LATEST {
+                    inspect |> THEN { Bytes/from_base64(input: base64_source) }
+                }
+            }
+        payload_mid:
+            BYTES[2] {} |> HOLD payload_mid {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/slice(offset: 1, byte_count: 2) }
+                }
+            }
+        payload_take:
+            BYTES[2] {} |> HOLD payload_take {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/take(byte_count: 2) }
+                }
+            }
+        payload_drop:
+            BYTES[3] {} |> HOLD payload_drop {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/drop(byte_count: 2) }
+                }
+            }
+        zero_fill:
+            BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD zero_fill {
+                LATEST {
+                    inspect |> THEN { Bytes/zeros(byte_count: 3) }
+                }
+            }
+        payload_joined:
+            BYTES[7] {} |> HOLD payload_joined {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/concat(with: needle) }
+                }
+            }
+        read_u16_be:
+            0 |> HOLD read_u16_be {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/read_unsigned(offset: 1, byte_count: 2, endian: Big) }
+                }
+            }
+        read_i8_last:
+            0 |> HOLD read_i8_last {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/read_signed(offset: 4, byte_count: 1, endian: Little) }
+                }
+            }
+        write_u16_le:
+            BYTES[5] {} |> HOLD write_u16_le {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/write_unsigned(offset: 2, byte_count: 2, endian: Little, value: 4660) }
+                }
+            }
+        write_i8_first:
+            BYTES[5] {} |> HOLD write_i8_first {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/write_signed(offset: 0, byte_count: 1, endian: Little, value: -1) }
+                }
+            }
+        payload_empty:
+            True |> HOLD payload_empty {
+                LATEST {
+                    inspect |> THEN { Bytes/is_empty(input: payload) }
+                }
+            }
+        starts:
+            False |> HOLD starts {
+                LATEST {
+                    inspect |> THEN { Bytes/starts_with(input: payload, prefix: prefix) }
+                }
+            }
+        ends:
+            False |> HOLD ends {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/ends_with(suffix: suffix) }
+                }
+            }
+        not_ends:
+            True |> HOLD not_ends {
+                LATEST {
+                    inspect |> THEN { Bytes/ends_with(input: payload, suffix: wrong_suffix) }
+                }
+            }
+        found_index:
+            0 |> HOLD found_index {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/find(needle: needle) }
+                }
+            }
+        missing_index:
+            9 |> HOLD missing_index {
+                LATEST {
+                    inspect |> THEN { Bytes/find(input: payload, needle: missing) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed BYTES search }))

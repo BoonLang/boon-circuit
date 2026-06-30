@@ -21,6 +21,7 @@ const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
+const LOW_LATENCY_SURFACE_FRAME_LATENCY: u32 = 1;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -772,6 +773,7 @@ pub struct NativeRenderLoopState {
     pub last_role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub current_scheduler_reason: Option<NativeSchedulerReason>,
     pub current_role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub last_render_target_kind: Option<String>,
     pub last_poll_started_elapsed_ms: Option<f64>,
     pub last_dirty_poll_elapsed_ms: Option<f64>,
     pub last_external_wake_generation: u64,
@@ -781,6 +783,9 @@ pub struct NativeRenderLoopState {
     pub last_render_hook_completed_elapsed_ms: Option<f64>,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
+    pub last_encoder_finish_ms: Option<f64>,
+    pub last_queue_submit_call_ms: Option<f64>,
+    pub last_present_call_ms: Option<f64>,
     pub last_poll_diagnostics: Option<serde_json::Value>,
     #[serde(skip)]
     pub next_wake_at: Option<Instant>,
@@ -824,6 +829,7 @@ impl NativeRenderLoopState {
             last_role_dirty_reason: None,
             current_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
             current_role_dirty_reason: None,
+            last_render_target_kind: None,
             last_poll_started_elapsed_ms: None,
             last_dirty_poll_elapsed_ms: None,
             last_external_wake_generation: 0,
@@ -833,6 +839,9 @@ impl NativeRenderLoopState {
             last_render_hook_completed_elapsed_ms: None,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
+            last_encoder_finish_ms: None,
+            last_queue_submit_call_ms: None,
+            last_present_call_ms: None,
             last_poll_diagnostics: None,
             next_wake_at: None,
         }
@@ -916,6 +925,15 @@ impl NativeRenderLoopState {
         self.last_input_resample_kind = Some("pre_present_drop".to_owned());
     }
 
+    pub fn note_input_post_present_stale_readback_skip(&mut self, event_gap_count: u64) {
+        self.input_deferred_resample_count = self.input_deferred_resample_count.saturating_add(1);
+        self.input_deferred_resample_event_gap_count = self
+            .input_deferred_resample_event_gap_count
+            .saturating_add(event_gap_count);
+        self.last_input_resample_event_gap_count = event_gap_count;
+        self.last_input_resample_kind = Some("post_present_stale_readback_skip".to_owned());
+    }
+
     pub fn note_idle_poll_substeps(
         &mut self,
         size_scale: Duration,
@@ -980,6 +998,21 @@ impl NativeRenderLoopState {
 
     pub fn note_present_completed(&mut self, elapsed_ms: f64) {
         self.last_present_completed_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_submit_phase_durations(
+        &mut self,
+        encoder_finish_ms: f64,
+        queue_submit_call_ms: f64,
+        present_call_ms: f64,
+    ) {
+        self.last_encoder_finish_ms = Some(encoder_finish_ms);
+        self.last_queue_submit_call_ms = Some(queue_submit_call_ms);
+        self.last_present_call_ms = Some(present_call_ms);
+    }
+
+    pub fn note_render_target_kind(&mut self, render_target_kind: &'static str) {
+        self.last_render_target_kind = Some(render_target_kind.to_owned());
     }
 
     pub fn note_idle_wait(
@@ -1282,6 +1315,7 @@ pub struct AppWindowSurfaceProof {
     pub adapter_is_software: bool,
     pub surface_format: String,
     pub present_mode: String,
+    pub desired_maximum_frame_latency: u32,
     pub alpha_mode: String,
     pub logical_size: Viewport,
     pub physical_size: PhysicalSize,
@@ -1306,6 +1340,27 @@ pub struct AppWindowSurfaceProof {
     pub input_adapter: NativeInputAdapterProof,
     pub external_render_proof: Option<serde_json::Value>,
     pub readback_artifact: Option<AppWindowReadbackArtifact>,
+}
+
+fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::Immediate)
+    {
+        wgpu::PresentMode::Immediate
+    } else if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::AutoNoVsync)
+    {
+        wgpu::PresentMode::AutoNoVsync
+    } else if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::Mailbox)
+    {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1441,12 +1496,57 @@ struct PendingSurfaceReadback {
     format: wgpu::TextureFormat,
 }
 
+struct NativeOffscreenPresentTarget {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    texture: wgpu::Texture,
+}
+
+fn cached_offscreen_present_target<'a>(
+    target: &'a mut Option<NativeOffscreenPresentTarget>,
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> &'a wgpu::Texture {
+    let stale = target.as_ref().is_none_or(|target| {
+        target.width != width || target.height != height || target.format != format
+    });
+    if stale {
+        *target = Some(NativeOffscreenPresentTarget {
+            width,
+            height,
+            format,
+            texture: device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("boon-native-offscreen-present-target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            }),
+        });
+    }
+    &target
+        .as_ref()
+        .expect("offscreen present target should be initialized")
+        .texture
+}
+
 pub struct NativeRenderFrameContext<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
     pub encoder: &'a mut wgpu::CommandEncoder,
     pub surface_view: &'a wgpu::TextureView,
     pub surface_texture_format: wgpu::TextureFormat,
+    pub render_target_kind: &'static str,
     pub surface_id: SurfaceId,
     pub surface_epoch: u64,
     pub surface_format: String,
@@ -1650,15 +1750,24 @@ async fn run_surface_probe_inner(
     .await;
     let mut app_surface = window.surface().await;
     let resize_wake_count = Arc::new(AtomicU64::new(0));
+    let latest_surface_size = Arc::new(Mutex::new(Size::ZERO));
     {
+        let latest_surface_size = Arc::clone(&latest_surface_size);
         let resize_wake_count = Arc::clone(&resize_wake_count);
         let resize_wake_handle = wake_handle.clone();
-        app_surface.size_update(move |_| {
+        app_surface.size_update(move |size| {
+            if let Ok(mut latest) = latest_surface_size.lock() {
+                *latest = size;
+            }
             resize_wake_count.fetch_add(1, Ordering::Relaxed);
             resize_wake_handle.wake();
         });
     }
     let (size, scale) = app_surface.size_scale().await;
+    if let Ok(mut latest) = latest_surface_size.lock() {
+        *latest = size;
+    }
+    let cached_surface_scale = scale;
     let raw_display_handle = app_surface.raw_display_handle();
     let raw_window_handle = app_surface.raw_window_handle();
     let window_hash = stable_debug_hash(&raw_window_handle);
@@ -1759,7 +1868,13 @@ async fn run_surface_probe_inner(
     {
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
     }
-    config.present_mode = wgpu::PresentMode::AutoNoVsync;
+    config.present_mode = low_latency_present_mode(&capabilities);
+    config.desired_maximum_frame_latency = LOW_LATENCY_SURFACE_FRAME_LATENCY;
+    let surface_copy_to_present_supported =
+        capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
+    if surface_copy_to_present_supported {
+        config.usage |= wgpu::TextureUsages::COPY_DST;
+    }
     if options.readback_artifact_dir.is_some() {
         if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             return Err(NativeWindowError::Failed(format!(
@@ -1771,6 +1886,7 @@ async fn run_surface_probe_inner(
     }
     let surface_format = format!("{:?}", config.format);
     let present_mode = format!("{:?}", config.present_mode);
+    let desired_maximum_frame_latency = config.desired_maximum_frame_latency;
     let alpha_mode = format!("{:?}", config.alpha_mode);
     surface.configure(&device, &config);
     let warmup_frame_count = options.warmup_frame_count;
@@ -1852,6 +1968,7 @@ async fn run_surface_probe_inner(
                     encoder: &mut encoder,
                     surface_view: &view,
                     surface_texture_format: config.format,
+                    render_target_kind: "visible-surface-direct",
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
@@ -1883,6 +2000,9 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                present_mode.as_str(),
+                                surface_format.as_str(),
+                                desired_maximum_frame_latency,
                                 None,
                                 &app_surface,
                                 None,
@@ -1956,6 +2076,9 @@ async fn run_surface_probe_inner(
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
+                    present_mode.as_str(),
+                    surface_format.as_str(),
+                    desired_maximum_frame_latency,
                     None,
                     &app_surface,
                     None,
@@ -2096,6 +2219,7 @@ async fn run_surface_probe_inner(
                     encoder: &mut encoder,
                     surface_view: &view,
                     surface_texture_format: config.format,
+                    render_target_kind: "visible-surface-direct",
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
@@ -2127,6 +2251,9 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                present_mode.as_str(),
+                                surface_format.as_str(),
+                                desired_maximum_frame_latency,
                                 None,
                                 &app_surface,
                                 Some(&input_adapter),
@@ -2228,7 +2355,8 @@ async fn run_surface_probe_inner(
         adapter_vendor: adapter_info.vendor,
         adapter_is_software: matches!(adapter_info.device_type, wgpu::DeviceType::Cpu),
         surface_format: surface_format.clone(),
-        present_mode,
+        present_mode: present_mode.clone(),
+        desired_maximum_frame_latency,
         alpha_mode,
         logical_size: Viewport {
             surface: 1,
@@ -2268,8 +2396,10 @@ async fn run_surface_probe_inner(
     let mut last_interactive_readback_completed_elapsed_ms: Option<f64> = None;
     let mut last_interactive_surface_readback_queued = false;
     let mut last_interactive_surface_readback_skipped_for_external_proof = false;
+    let mut last_interactive_surface_readback_skipped_for_stale_input = false;
     let mut last_interactive_surface_readback_pending = false;
     let mut last_render_loop_report_write_ms: Option<f64> = None;
+    let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
@@ -2283,7 +2413,11 @@ async fn run_surface_probe_inner(
             break;
         }
         let size_scale_started = Instant::now();
-        let (current_size, current_scale) = app_surface.size_scale().await;
+        let current_size = latest_surface_size
+            .lock()
+            .map(|latest| *latest)
+            .unwrap_or(size);
+        let current_scale = cached_surface_scale;
         let size_scale_elapsed = size_scale_started.elapsed();
         let raw_width = (current_size.width() * current_scale).round();
         let raw_height = (current_size.height() * current_scale).round();
@@ -2462,33 +2596,39 @@ async fn run_surface_probe_inner(
         }
         let rendered_revision = render_loop_state.dirty_revision;
         render_loop_state.note_render_started(hold_started.elapsed().as_secs_f64() * 1000.0);
-        let Some(frame) = acquire_surface_texture_for_present(
-            &surface,
-            &device,
-            &config,
-            &mut surface_lifecycle,
-            &mut render_loop_state,
-            "interactive loop",
-        )?
-        else {
-            continue;
-        };
-        render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-interactive-encoder"),
         });
         let mut rendered_content_revision = rendered_revision;
-        match hooks.as_mut() {
-            Some(hooks) => {
+        let use_offscreen_copy_to_present = hooks.is_some()
+            && surface_copy_to_present_supported
+            && (std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some()
+                || (options.role == NativeWindowRole::Preview && options.demand_driven_loop));
+        let render_target_kind = if use_offscreen_copy_to_present {
+            "app-owned-offscreen-copy-to-present"
+        } else {
+            "visible-surface-direct"
+        };
+        render_loop_state.note_render_target_kind(render_target_kind);
+
+        let frame = if use_offscreen_copy_to_present {
+            let offscreen_texture = cached_offscreen_present_target(
+                &mut offscreen_present_target,
+                &device,
+                width,
+                height,
+                config.format,
+            );
+            let offscreen_view =
+                offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            if let Some(hooks) = hooks.as_mut() {
                 let render_result = (hooks.render)(NativeRenderFrameContext {
                     device: &device,
                     queue: &queue,
                     encoder: &mut encoder,
-                    surface_view: &view,
+                    surface_view: &offscreen_view,
                     surface_texture_format: config.format,
+                    render_target_kind,
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
@@ -2520,6 +2660,9 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                present_mode.as_str(),
+                                surface_format.as_str(),
+                                desired_maximum_frame_latency,
                                 input_event_last_wake_elapsed_ms(
                                     &input_event_last_wake_at,
                                     hold_started,
@@ -2543,27 +2686,163 @@ async fn run_surface_probe_inner(
                 render_loop_state
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
-            None => {
-                let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("boon-native-app-window-interactive-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(clear_color(options.role)),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                render_loop_state
-                    .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
+            let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+            if pre_present_input_event_wake_count > sampled_input_event_wake_count
+                && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+            {
+                render_loop_state.note_input_pre_present_resample(
+                    pre_present_input_event_wake_count
+                        .saturating_sub(sampled_input_event_wake_count),
+                );
+                consecutive_unsampled_input_resamples =
+                    consecutive_unsampled_input_resamples.saturating_add(1);
+                render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+                render_loop_state.scheduled_wake_count =
+                    render_loop_state.scheduled_wake_count.saturating_add(1);
+                continue;
             }
-        }
+            if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
+                consecutive_unsampled_input_resamples = 0;
+            }
+            let Some(frame) = acquire_surface_texture_for_present(
+                &surface,
+                &device,
+                &config,
+                &mut surface_lifecycle,
+                &mut render_loop_state,
+                "interactive offscreen copy-to-present",
+            )?
+            else {
+                continue;
+            };
+            render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: offscreen_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            frame
+        } else {
+            let Some(frame) = acquire_surface_texture_for_present(
+                &surface,
+                &device,
+                &config,
+                &mut surface_lifecycle,
+                &mut render_loop_state,
+                "interactive loop",
+            )?
+            else {
+                continue;
+            };
+            render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            match hooks.as_mut() {
+                Some(hooks) => {
+                    let render_result = (hooks.render)(NativeRenderFrameContext {
+                        device: &device,
+                        queue: &queue,
+                        encoder: &mut encoder,
+                        surface_view: &view,
+                        surface_texture_format: config.format,
+                        render_target_kind,
+                        surface_id: surface_id.clone(),
+                        surface_epoch: surface_lifecycle.epoch(),
+                        surface_format: surface_format.clone(),
+                        width,
+                        height,
+                        input: input.clone(),
+                    })
+                    .map_err(|error| {
+                        NativeWindowError::Failed(format!("external render hook: {error}"))
+                    })?;
+                    if let Err(error) = render_result
+                        .validate_for_presented_revision_with_scheduler(
+                            rendered_revision,
+                            render_loop_state.current_scheduler_reason,
+                            render_loop_state.current_role_dirty_reason,
+                        )
+                    {
+                        surface_lifecycle.note_validation_error();
+                        if let Some(report) = options.render_loop_state_report.as_deref() {
+                            let _ = write_render_loop_state_report(
+                                Path::new(report),
+                                options.role,
+                                std::process::id(),
+                                &window_id,
+                                &surface_id,
+                                surface_lifecycle.report(),
+                                &render_loop_state,
+                                hold_started.elapsed(),
+                                wake_handle.generation(),
+                                last_interactive_readback_artifact.as_ref(),
+                                render_loop_report_extras(
+                                    resize_wake_count.load(Ordering::Relaxed),
+                                    input_event_wake_count.load(Ordering::Relaxed),
+                                    present_mode.as_str(),
+                                    surface_format.as_str(),
+                                    desired_maximum_frame_latency,
+                                    input_event_last_wake_elapsed_ms(
+                                        &input_event_last_wake_at,
+                                        hold_started,
+                                    ),
+                                    &app_surface,
+                                    Some(&observed_input_adapter),
+                                ),
+                                Some(&error),
+                            );
+                        }
+                        return Err(NativeWindowError::Failed(format!(
+                            "external render hook: {error}"
+                        )));
+                    }
+                    rendered_content_revision = render_result.presented_content_revision(
+                        rendered_revision,
+                        render_loop_state.current_scheduler_reason,
+                        render_loop_state.current_role_dirty_reason,
+                    );
+                    external_render_proof = Some(render_result.proof);
+                    render_loop_state
+                        .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                None => {
+                    let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("boon-native-app-window-interactive-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color(options.role)),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    render_loop_state
+                        .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            frame
+        };
         let skip_interactive_surface_readback = options
             .skip_interactive_surface_readback_when_external_proof
             && options.role == NativeWindowRole::Preview
@@ -2579,8 +2858,8 @@ async fn run_surface_probe_inner(
                             &mut encoder,
                             &frame.texture,
                             options.role,
-                            width.min(480),
-                            height.min(260),
+                            width,
+                            height,
                             config.format,
                             &options.title,
                             surface_id.clone(),
@@ -2593,33 +2872,62 @@ async fn run_surface_probe_inner(
             } else {
                 None
             };
-        let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
-        if pre_present_input_event_wake_count > sampled_input_event_wake_count
-            && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
-        {
-            render_loop_state.note_input_pre_present_resample(
-                pre_present_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
-            );
-            consecutive_unsampled_input_resamples =
-                consecutive_unsampled_input_resamples.saturating_add(1);
-            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
-            render_loop_state.scheduled_wake_count =
-                render_loop_state.scheduled_wake_count.saturating_add(1);
-            continue;
-        }
-        if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
-            consecutive_unsampled_input_resamples = 0;
+        if !use_offscreen_copy_to_present {
+            let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+            if pre_present_input_event_wake_count > sampled_input_event_wake_count
+                && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+            {
+                render_loop_state.note_input_pre_present_resample(
+                    pre_present_input_event_wake_count
+                        .saturating_sub(sampled_input_event_wake_count),
+                );
+                consecutive_unsampled_input_resamples =
+                    consecutive_unsampled_input_resamples.saturating_add(1);
+                render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+                render_loop_state.scheduled_wake_count =
+                    render_loop_state.scheduled_wake_count.saturating_add(1);
+                continue;
+            }
+            if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
+                consecutive_unsampled_input_resamples = 0;
+            }
         }
         last_interactive_surface_readback_queued = interactive_readback.is_some();
         last_interactive_surface_readback_skipped_for_external_proof =
             skip_interactive_surface_readback;
-        queue.submit(Some(encoder.finish()));
+        let encoder_finish_started = Instant::now();
+        let command_buffer = encoder.finish();
+        let encoder_finish_ms = elapsed_ms(encoder_finish_started);
+        let queue_submit_started = Instant::now();
+        queue.submit(Some(command_buffer));
+        let queue_submit_call_ms = elapsed_ms(queue_submit_started);
         render_loop_state.note_queue_submitted(hold_started.elapsed().as_secs_f64() * 1000.0);
+        let present_call_started = Instant::now();
         frame.present();
+        let present_call_ms = elapsed_ms(present_call_started);
         last_presented_input_event_wake_count = sampled_input_event_wake_count;
         render_loop_state.mark_presented_with_content(rendered_revision, rendered_content_revision);
         render_loop_state.note_present_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
-        last_interactive_surface_readback_pending = interactive_readback.is_some();
+        render_loop_state.note_submit_phase_durations(
+            encoder_finish_ms,
+            queue_submit_call_ms,
+            present_call_ms,
+        );
+        let post_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        let skip_interactive_surface_readback_for_stale_input = interactive_readback.is_some()
+            && post_present_input_event_wake_count > sampled_input_event_wake_count;
+        if skip_interactive_surface_readback_for_stale_input {
+            render_loop_state.note_input_post_present_stale_readback_skip(
+                post_present_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
+            );
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+        }
+        last_interactive_surface_readback_skipped_for_stale_input =
+            skip_interactive_surface_readback_for_stale_input;
+        last_interactive_surface_readback_pending =
+            interactive_readback.is_some() && !skip_interactive_surface_readback_for_stale_input;
         if let Some(report) = options.render_loop_state_report.as_deref() {
             let report_write_started = Instant::now();
             write_render_loop_state_report(
@@ -2636,6 +2944,9 @@ async fn run_surface_probe_inner(
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
+                    present_mode.as_str(),
+                    surface_format.as_str(),
+                    desired_maximum_frame_latency,
                     input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                     &app_surface,
                     Some(&observed_input_adapter),
@@ -2660,12 +2971,16 @@ async fn run_surface_probe_inner(
                     last_interactive_readback_completed_elapsed_ms,
                     last_interactive_surface_readback_queued,
                     last_interactive_surface_readback_skipped_for_external_proof,
+                    last_interactive_surface_readback_skipped_for_stale_input,
                     last_interactive_surface_readback_pending,
                 )
                 .with_external_render_proof(external_render_proof.as_ref()),
                 None,
             )?;
             last_render_loop_report_write_ms = Some(elapsed_ms(report_write_started));
+        }
+        if skip_interactive_surface_readback_for_stale_input {
+            continue;
         }
         if let Some((artifact_dir, pending)) = interactive_readback {
             let readback_finish_started = Instant::now();
@@ -2694,6 +3009,9 @@ async fn run_surface_probe_inner(
                     render_loop_report_extras(
                         resize_wake_count.load(Ordering::Relaxed),
                         input_event_wake_count.load(Ordering::Relaxed),
+                        present_mode.as_str(),
+                        surface_format.as_str(),
+                        desired_maximum_frame_latency,
                         input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                         &app_surface,
                         Some(&observed_input_adapter),
@@ -2718,6 +3036,7 @@ async fn run_surface_probe_inner(
                         last_interactive_readback_completed_elapsed_ms,
                         last_interactive_surface_readback_queued,
                         last_interactive_surface_readback_skipped_for_external_proof,
+                        last_interactive_surface_readback_skipped_for_stale_input,
                         last_interactive_surface_readback_pending,
                     )
                     .with_external_render_proof(external_render_proof.as_ref()),
@@ -2745,6 +3064,9 @@ async fn run_surface_probe_inner(
             render_loop_report_extras(
                 resize_wake_count.load(Ordering::Relaxed),
                 input_event_wake_count.load(Ordering::Relaxed),
+                present_mode.as_str(),
+                surface_format.as_str(),
+                desired_maximum_frame_latency,
                 input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                 &app_surface,
                 Some(&observed_input_adapter),
@@ -2769,6 +3091,7 @@ async fn run_surface_probe_inner(
                 last_interactive_readback_completed_elapsed_ms,
                 last_interactive_surface_readback_queued,
                 last_interactive_surface_readback_skipped_for_external_proof,
+                last_interactive_surface_readback_skipped_for_stale_input,
                 last_interactive_surface_readback_pending,
             )
             .with_external_render_proof(external_render_proof.as_ref()),
@@ -2889,6 +3212,9 @@ fn acquire_surface_texture_for_present(
 struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
     input_event_wake_count: u64,
+    present_mode: String,
+    surface_format: String,
+    desired_maximum_frame_latency: u32,
     last_input_event_wake_elapsed_ms: Option<f64>,
     sampled_input_event_wake_count: Option<u64>,
     presented_input_event_wake_count: Option<u64>,
@@ -2899,6 +3225,7 @@ struct NativeRenderLoopReportExtras {
     last_interactive_readback_completed_elapsed_ms: Option<f64>,
     last_interactive_surface_readback_queued: bool,
     last_interactive_surface_readback_skipped_for_external_proof: bool,
+    last_interactive_surface_readback_skipped_for_stale_input: bool,
     last_interactive_surface_readback_pending: bool,
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
@@ -2927,6 +3254,7 @@ impl NativeRenderLoopReportExtras {
         readback_completed_elapsed_ms: Option<f64>,
         surface_readback_queued: bool,
         surface_readback_skipped_for_external_proof: bool,
+        surface_readback_skipped_for_stale_input: bool,
         surface_readback_pending: bool,
     ) -> Self {
         self.last_render_loop_report_write_ms = report_write_ms;
@@ -2935,6 +3263,8 @@ impl NativeRenderLoopReportExtras {
         self.last_interactive_surface_readback_queued = surface_readback_queued;
         self.last_interactive_surface_readback_skipped_for_external_proof =
             surface_readback_skipped_for_external_proof;
+        self.last_interactive_surface_readback_skipped_for_stale_input =
+            surface_readback_skipped_for_stale_input;
         self.last_interactive_surface_readback_pending = surface_readback_pending;
         self
     }
@@ -2948,6 +3278,9 @@ impl NativeRenderLoopReportExtras {
 fn render_loop_report_extras(
     resize_wake_count: u64,
     input_event_wake_count: u64,
+    present_mode: &str,
+    surface_format: &str,
+    desired_maximum_frame_latency: u32,
     last_input_event_wake_elapsed_ms: Option<f64>,
     app_surface: &app_window::surface::Surface,
     observed_input_adapter: Option<&NativeInputAdapterProof>,
@@ -2955,6 +3288,9 @@ fn render_loop_report_extras(
     NativeRenderLoopReportExtras {
         resize_wake_count,
         input_event_wake_count,
+        present_mode: present_mode.to_owned(),
+        surface_format: surface_format.to_owned(),
+        desired_maximum_frame_latency,
         last_input_event_wake_elapsed_ms,
         sampled_input_event_wake_count: None,
         presented_input_event_wake_count: None,
@@ -2965,6 +3301,7 @@ fn render_loop_report_extras(
         last_interactive_readback_completed_elapsed_ms: None,
         last_interactive_surface_readback_queued: false,
         last_interactive_surface_readback_skipped_for_external_proof: false,
+        last_interactive_surface_readback_skipped_for_stale_input: false,
         last_interactive_surface_readback_pending: false,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
@@ -3043,39 +3380,7 @@ fn external_render_proof_has_app_owned_readback(proof: Option<&serde_json::Value
 }
 
 fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
-    if external_render_proof_has_app_owned_readback(proof) {
-        return true;
-    }
-    let Some(proof) = proof else {
-        return false;
-    };
-    let visible_rendered = proof
-        .get("visible_surface_rendered")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let visible_present_path = proof
-        .get("visible_present_path")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let proof_pass = proof.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-        && proof
-            .pointer("/proof/status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-    let retained_text_changed = proof
-        .pointer("/retained_bound_sync/status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass")
-        && proof
-            .pointer("/retained_bound_sync/changed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && proof
-            .pointer("/retained_bound_sync/text_update_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            > 0;
-    visible_rendered && visible_present_path && proof_pass && retained_text_changed
+    external_render_proof_has_app_owned_readback(proof)
 }
 
 fn is_sha256_hex_string(value: &str) -> bool {
@@ -3285,6 +3590,7 @@ fn write_render_loop_state_report(
         "last_render_hook_completed_elapsed_ms": state.last_render_hook_completed_elapsed_ms,
         "last_queue_submitted_elapsed_ms": state.last_queue_submitted_elapsed_ms,
         "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
+        "last_render_target_kind": state.last_render_target_kind,
         "last_poll_diagnostics": state.last_poll_diagnostics,
         "loop_exit_reason": state.loop_exit_reason,
         "forced_frame_count": state.forced_frame_count,
@@ -3326,6 +3632,7 @@ fn write_render_loop_state_report(
         "last_interactive_readback_completed_elapsed_ms": extras.last_interactive_readback_completed_elapsed_ms,
         "last_interactive_surface_readback_queued": extras.last_interactive_surface_readback_queued,
         "last_interactive_surface_readback_skipped_for_external_proof": extras.last_interactive_surface_readback_skipped_for_external_proof,
+        "last_interactive_surface_readback_skipped_for_stale_input": extras.last_interactive_surface_readback_skipped_for_stale_input,
         "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
@@ -3338,6 +3645,42 @@ fn write_render_loop_state_report(
         "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
     if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "present_mode".to_owned(),
+            serde_json::json!(extras.present_mode),
+        );
+        object.insert(
+            "surface_format".to_owned(),
+            serde_json::json!(extras.surface_format),
+        );
+        object.insert(
+            "desired_maximum_frame_latency".to_owned(),
+            serde_json::json!(extras.desired_maximum_frame_latency),
+        );
+        object.insert(
+            "last_encoder_finish_ms".to_owned(),
+            serde_json::json!(state.last_encoder_finish_ms),
+        );
+        object.insert(
+            "last_queue_submit_call_ms".to_owned(),
+            serde_json::json!(state.last_queue_submit_call_ms),
+        );
+        object.insert(
+            "last_present_call_ms".to_owned(),
+            serde_json::json!(state.last_present_call_ms),
+        );
+        object.insert(
+            "encoder_finish_ms".to_owned(),
+            serde_json::json!(state.last_encoder_finish_ms),
+        );
+        object.insert(
+            "queue_submit_call_ms".to_owned(),
+            serde_json::json!(state.last_queue_submit_call_ms),
+        );
+        object.insert(
+            "present_call_ms".to_owned(),
+            serde_json::json!(state.last_present_call_ms),
+        );
         object.insert(
             "input_inline_resample_count".to_owned(),
             serde_json::json!(state.input_inline_resample_count),
@@ -4082,6 +4425,17 @@ mod tests {
             state.last_input_resample_kind.as_deref(),
             Some("pre_present_drop")
         );
+
+        state.note_input_post_present_stale_readback_skip(5);
+        assert_eq!(state.input_inline_resample_count, 1);
+        assert_eq!(state.input_deferred_resample_count, 3);
+        assert_eq!(state.input_inline_resample_event_gap_count, 2);
+        assert_eq!(state.input_deferred_resample_event_gap_count, 12);
+        assert_eq!(state.last_input_resample_event_gap_count, 5);
+        assert_eq!(
+            state.last_input_resample_kind.as_deref(),
+            Some("post_present_stale_readback_skip")
+        );
     }
 
     #[test]
@@ -4516,6 +4870,53 @@ mod tests {
 
         assert_eq!(observed, 1);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn low_latency_present_mode_prefers_non_vsync_modes_before_mailbox() {
+        let mut capabilities = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![
+                wgpu::PresentMode::Fifo,
+                wgpu::PresentMode::Immediate,
+                wgpu::PresentMode::Mailbox,
+            ],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        };
+
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::Immediate
+        );
+
+        capabilities.present_modes = vec![
+            wgpu::PresentMode::Fifo,
+            wgpu::PresentMode::AutoNoVsync,
+            wgpu::PresentMode::Mailbox,
+        ];
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::AutoNoVsync
+        );
+
+        capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::Mailbox
+        );
+
+        capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::AutoNoVsync];
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::AutoNoVsync
+        );
+
+        capabilities.present_modes = vec![wgpu::PresentMode::Fifo];
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::Fifo
+        );
     }
 
     #[test]

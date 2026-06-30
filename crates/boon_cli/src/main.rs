@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use boon_compiler::compile_typed_program;
+use boon_compiler::{compile_source_path_to_full_ir, compile_typed_program};
 use boon_plan::{TargetProfile, verify_plan};
 use boon_runtime::{
     VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report,
@@ -18,7 +18,7 @@ usage:
   boon_cli run <source> [--scenario <path>] [--engine <legacy|plan|compare>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
-  boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli run-plan-root-scalar-scenario <source> --scenario <path> --steps <id[,id...]> [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli compile <source> --out <path.boonc> [--report <path>]
   boon_cli inspect-artifact <path.boonc> [--report <path>]
@@ -181,6 +181,8 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut text = None;
     let mut key = None;
     let mut address = None;
+    let mut target_key = None;
+    let mut target_generation = None;
     let mut payload = BTreeMap::new();
     let mut payload_bytes = BTreeMap::new();
     let mut compare_legacy = false;
@@ -202,6 +204,27 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--key" => {
                 key = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--target-key" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target-key")?;
+                target_key = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --target-key `{value}`: {error}"))?,
+                );
+                index += 2;
+            }
+            "--target-generation" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target-generation")?;
+                target_generation =
+                    Some(value.parse::<u64>().map_err(|error| {
+                        format!("invalid --target-generation `{value}`: {error}")
+                    })?);
                 index += 2;
             }
             "--address" => {
@@ -282,6 +305,8 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         text,
         key,
         address,
+        target_key,
+        target_generation,
         payload,
         payload_bytes,
         ..Default::default()
@@ -460,7 +485,9 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let target_profile = TargetProfile::from_name(&target)?;
-    let (parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
+    let compiled = compile_source_path_to_full_ir(Path::new(source))?;
+    let parsed = compiled.parsed;
+    let ir = compiled.ir;
     let plan = compile_typed_program(&ir, target_profile)?;
     let verification = verify_plan(&plan)?;
     let program_hash = parsed_program_hash(&parsed);
@@ -556,7 +583,7 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(|window| window[1].clone())
         .unwrap_or_else(|| "software_bounded".to_owned());
     let hardware_profile = HardwareProfile::for_name(&profile)?;
-    let (_parsed, ir) = boon_runtime::load_and_lower(Path::new(source))?;
+    let ir = compile_source_path_to_full_ir(Path::new(source))?.ir;
     hardware_profile.validate_program(&ir)?;
     let source_hash =
         boon_runtime::sha256_file(Path::new(source)).unwrap_or_else(|_| "missing".to_owned());

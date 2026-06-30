@@ -409,6 +409,30 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_artifact_hashes(&report, path)?;
         return Ok(());
     }
+    if report_command_is(&report, "verify-bytes-type-system") {
+        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+            return Err(format!(
+                "{} verify-bytes-type-system report did not pass",
+                path.display()
+            )
+            .into());
+        }
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
+        verify_bytes_type_system_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-bytes-default-engine-readiness")
+        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
+    {
+        verify_common_report_shape(&report, path)?;
+        verify_measurement_mode(&report, path)?;
+        verify_bytes_default_engine_readiness_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
     if report_command_is(&report, "verify-bytes-machine-plan-adversarial") {
         if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
             return Err(format!(
@@ -681,6 +705,405 @@ fn expected_bytes_negative_case_ids() -> &'static [&'static str] {
         "hardware-bounded-unbounded-bytes-rejected",
         "fake-benchmark-profile-rejected",
     ]
+}
+
+fn expected_bytes_type_system_check_ids() -> &'static [&'static str] {
+    &[
+        "bytes-type-system:no-typecheck-errors",
+        "bytes-type-system:Bytes/length:Number",
+        "bytes-type-system:Bytes/is_empty:Bool",
+        "bytes-type-system:Bytes/get:Byte",
+        "bytes-type-system:Bytes/slice:Bytes[2]",
+        "bytes-type-system:Bytes/take:Bytes[2]",
+        "bytes-type-system:Bytes/drop:Bytes[2]",
+        "bytes-type-system:Bytes/concat:Bytes[5]",
+        "bytes-type-system:Bytes/equal:Bool",
+        "bytes-type-system:Bytes/find:Number",
+        "bytes-type-system:Bytes/starts_with:Bool",
+        "bytes-type-system:Bytes/ends_with:Bool",
+        "bytes-type-system:Bytes/to_hex:Text",
+        "bytes-type-system:Bytes/to_base64:Text",
+        "bytes-type-system:Bytes/from_hex:Bytes[4]",
+        "bytes-type-system:Bytes/from_base64:Bytes[4]",
+        "bytes-type-system:Text/to_bytes:Bytes[2]",
+        "bytes-type-system:Bytes/to_text:Text",
+        "bytes-type-system:Bytes/read_unsigned:Number",
+        "bytes-type-system:Bytes/read_signed:Number",
+        "bytes-type-system:Bytes/write_unsigned:Bytes[4]",
+        "bytes-type-system:Bytes/write_signed:Bytes[4]",
+        "bytes-type-system:Bytes/zeros:Bytes[4]",
+        "bytes-type-system:File/read_bytes:Bytes",
+        "bytes-type-system:File/read_text:Text",
+        "bytes-type-system:File/write_bytes:Text",
+        "bytes-type-system:static-from-hex:Bytes[4]",
+        "bytes-type-system:static-from-base64:Bytes[4]",
+        "bytes-type-system:static-utf8:Bytes[2]",
+        "bytes-type-system:static-ascii:Bytes[2]",
+        "bytes-type-system:dynamic-from-hex:Bytes",
+        "bytes-type-system:dynamic-from-base64:Bytes",
+        "bytes-type-system:dynamic-utf8:Bytes",
+        "bytes-type-system:resolved-constant-table-present",
+    ]
+}
+
+fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
+    &[
+        "bytes-default-engine:cli-build",
+        "bytes-default-engine:source-default-legacy",
+        "bytes-default-engine:default-run-semantic",
+        "bytes-default-engine:todomvc-compare",
+        "bytes-default-engine:cells-compare",
+        "bytes-default-engine:phase10-switch-still-blocked",
+    ]
+}
+
+fn verify_bytes_type_system_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let expected = expected_bytes_type_system_check_ids();
+    let required_ids = report
+        .get("required_check_ids")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-type-system required_check_ids is missing",
+                report_path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-type-system required_check_ids contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if required_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-type-system required_check_ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let checks = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-type-system per_step_pass_fail is missing",
+                report_path.display()
+            )
+        })?;
+    let mut check_ids = Vec::with_capacity(checks.len());
+    for (index, check) in checks.iter().enumerate() {
+        let object = check.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-type-system per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-type-system per_step_pass_fail[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-type-system check `{id}` is not passing",
+                report_path.display()
+            )
+            .into());
+        }
+        let detail = object
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-type-system check `{id}` missing detail",
+                    report_path.display()
+                )
+            })?;
+        if detail.trim().is_empty() {
+            return Err(format!(
+                "{} verify-bytes-type-system check `{id}` has empty detail",
+                report_path.display()
+            )
+            .into());
+        }
+        check_ids.push(id);
+    }
+    if check_ids.as_slice() != expected {
+        return Err(format!(
+            "{} verify-bytes-type-system per_step_pass_fail ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let type_results = report
+        .get("type_results")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-type-system type_results is missing",
+                report_path.display()
+            )
+        })?;
+    if type_results.len() < 32 {
+        return Err(format!(
+            "{} verify-bytes-type-system type_results does not cover the BYTES builtin/refinement surface",
+            report_path.display()
+        )
+        .into());
+    }
+    for (index, result) in type_results.iter().enumerate() {
+        let object = result.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-type-system type_results[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        for key in ["kind", "name", "expected_type", "actual_type"] {
+            if object
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!(
+                    "{} verify-bytes-type-system type_results[{index}] missing `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-type-system type_results[{index}] did not pass",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if report
+        .get("resolved_constant_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
+        < 7
+    {
+        return Err(format!(
+            "{} verify-bytes-type-system resolved_constant_count is too low",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("typecheck_report")
+        .and_then(|value| value.get("resolved_constant_table"))
+        .and_then(|value| value.get("entries"))
+        .and_then(JsonValue::as_array)
+        .is_none_or(|entries| entries.len() < 7)
+    {
+        return Err(format!(
+            "{} verify-bytes-type-system typecheck_report.resolved_constant_table is missing coverage",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_default_engine_readiness_report(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let expected = expected_bytes_default_engine_check_ids();
+    let required = report
+        .get("required_check_ids")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness required_check_ids is missing",
+                report_path.display()
+            )
+        })?;
+    let required = required
+        .iter()
+        .map(|item| {
+            item.as_str().ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-default-engine-readiness required_check_ids contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if required != expected {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness required_check_ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let steps = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness per_step_pass_fail is missing",
+                report_path.display()
+            )
+        })?;
+    let mut actual_ids = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let step = step.as_object().ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = step.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness per_step_pass_fail[{index}] missing id",
+                report_path.display()
+            )
+        })?;
+        if step.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness check `{id}` is not passing",
+                report_path.display()
+            )
+            .into());
+        }
+        if step
+            .get("detail")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness check `{id}` has empty detail",
+                report_path.display()
+            )
+            .into());
+        }
+        actual_ids.push(id);
+    }
+    if actual_ids != expected {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness per_step_pass_fail ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+
+    if report.get("default_engine").and_then(JsonValue::as_str) != Some("legacy") {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness default_engine must remain legacy before Phase 10",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("default_switch_allowed")
+        .and_then(JsonValue::as_bool)
+        != Some(false)
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness default_switch_allowed must be false",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("default_switch_blocker")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness default_switch_blocker is missing",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("explicit_compare_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(2)
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness must prove exactly two explicit compare cases",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let children = report
+        .get("child_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness child_reports is missing",
+                report_path.display()
+            )
+        })?;
+    let expected_children = [
+        ("default-run-semantic", "default", "semantic"),
+        ("todomvc-compare", "compare", "run-plan-scenario-events"),
+        ("cells-compare", "compare", "run-plan-scenario-events"),
+    ];
+    if children.len() != expected_children.len() {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness child_reports length is wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    for (child, (expected_id, expected_engine, expected_command)) in
+        children.iter().zip(expected_children)
+    {
+        if child.get("id").and_then(JsonValue::as_str) != Some(expected_id)
+            || child.get("engine").and_then(JsonValue::as_str) != Some(expected_engine)
+            || child.get("expected_command").and_then(JsonValue::as_str) != Some(expected_command)
+            || child.get("command").and_then(JsonValue::as_str) != Some(expected_command)
+            || child.get("status").and_then(JsonValue::as_str) != Some("pass")
+            || child.get("process_success").and_then(JsonValue::as_bool) != Some(true)
+            || child.get("schema_valid").and_then(JsonValue::as_bool) != Some(true)
+            || child
+                .get("argv_matches_expected_command")
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+        {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness child report `{expected_id}` does not match the expected command proof",
+                report_path.display()
+            )
+            .into());
+        }
+        let path = child
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-default-engine-readiness child `{expected_id}` missing path",
+                    report_path.display()
+                )
+            })?;
+        if !Path::new(path).is_file() {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness child `{expected_id}` path `{path}` is missing",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn verify_bytes_negative_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -2093,7 +2516,13 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         .into());
     }
 
-    for key in ["boon_compiler", "dependency_direction", "acceptance"] {
+    for key in [
+        "boon_compiler",
+        "boon_plan_executor",
+        "boundary_decomposition",
+        "dependency_direction",
+        "acceptance",
+    ] {
         if report.get(key).and_then(JsonValue::as_object).is_none() {
             return Err(format!("{} missing object `{key}`", report_path.display()).into());
         }
@@ -2109,6 +2538,7 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "workspace_dependency",
         "facade_exports_compile_typed_program",
         "facade_delegates_to_plan_backend",
+        "compiler_owns_legacy_backend_source",
     ] {
         if compiler.get(key).and_then(JsonValue::as_bool).is_none() {
             return Err(format!(
@@ -2117,6 +2547,198 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
             )
             .into());
         }
+    }
+
+    let plan_executor = report
+        .get("boon_plan_executor")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} missing boon_plan_executor object",
+                report_path.display()
+            )
+        })?;
+    for key in [
+        "crate_present",
+        "workspace_member",
+        "workspace_dependency",
+        "depends_on_boon_plan",
+        "initial_state_executor_extracted",
+        "source_route_selection_extracted",
+        "source_route_json_execution_extracted",
+        "root_source_event_work_selection_extracted",
+        "root_json_update_evaluator_extracted",
+        "root_json_update_execution_extracted",
+        "root_runtime_branch_update_execution_extracted",
+        "root_bytes_update_dispatch_extracted",
+        "root_bytes_shadowed_runtime_arms_removed",
+        "root_bytes_runtime_environment_wrapped",
+        "root_bytes_environment_capability_extracted",
+        "root_json_state_write_extracted",
+        "root_bytes_source_payload_report_extracted",
+        "root_bytes_initial_storage_extracted",
+        "root_bytes_read_evaluator_extracted",
+        "root_bytes_write_evaluator_extracted",
+        "root_bytes_source_payload_commit_extracted",
+        "root_bytes_state_transition_extracted",
+        "root_bytes_state_owner_capability_extracted",
+        "initial_list_row_value_conversion_extracted",
+        "indexed_fixed_byte_bank_lookup_extracted",
+        "indexed_update_batch_execution_extracted",
+        "indexed_json_update_evaluator_extracted",
+        "list_mutation_records_extracted",
+        "list_append_row_construction_extracted",
+        "list_append_execution_extracted",
+        "list_remove_execution_extracted",
+        "list_row_default_fields_extracted",
+        "list_row_report_fields_extracted",
+        "list_row_state_carrier_extracted",
+        "list_row_initial_refresh_extracted",
+        "list_row_bool_not_refresh_extracted",
+        "list_row_expression_refresh_extracted",
+        "list_row_textlike_field_extracted",
+        "assertion_checkpoint_extracted",
+        "root_update_candidate_tracker_extracted",
+        "root_update_commit_assembly_extracted",
+        "root_update_commit_batch_extracted",
+        "root_update_storage_transition_extracted",
+        "root_update_state_owner_capability_extracted",
+        "runtime_root_state_container_wrapped",
+        "runtime_plan_executor_root_state_carried",
+        "root_state_update_helpers_extracted",
+        "root_executed_update_state_application_extracted",
+        "root_update_branch_collection_extracted",
+        "root_state_container_extracted",
+        "source_payload_bytes_key_policy_extracted",
+        "live_source_event_expectation_matcher_extracted",
+        "live_source_event_expected_toml_builder_extracted",
+        "source_route_command_output_extracted",
+        "root_scenario_command_output_extracted",
+        "scenario_events_command_output_extracted",
+        "source_event_payload_bytes_artifact_report_extracted",
+        "source_route_orchestration_extracted",
+        "source_route_runtime_branch_execution_extracted",
+        "root_scenario_step_preparation_extracted",
+        "source_derived_step_delta_bundle_extracted",
+    ] {
+        if plan_executor
+            .get(key)
+            .and_then(JsonValue::as_bool)
+            .is_none()
+        {
+            return Err(format!(
+                "{} boon_plan_executor.{key} must be boolean",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if plan_executor
+        .get("frontend_dependency_count")
+        .and_then(JsonValue::as_u64)
+        .is_none()
+    {
+        return Err(format!(
+            "{} boon_plan_executor.frontend_dependency_count must be a count",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let decomposition = report
+        .get("boundary_decomposition")
+        .and_then(JsonValue::as_object)
+        .unwrap();
+    for key in [
+        "lowering_still_owned_by_plan_backend",
+        "plan_schema_still_uses_ir_ids",
+        "plan_schema_still_uses_ir_source_schema",
+        "boon_plan_frontend_dependencies_optional_only",
+        "boon_plan_legacy_ir_adapter_feature_present",
+        "boon_plan_legacy_backend_feature_present",
+        "boon_compiler_enables_legacy_backend_feature",
+        "boon_compiler_enables_legacy_ir_adapter_feature",
+        "boon_plan_default_build_schema_only",
+        "parser_ast_still_in_plan_lowering",
+        "plan_executor_core_still_frontend_coupled",
+        "runtime_frontend_orchestration_remaining",
+        "runtime_document_list_metadata_extracted",
+        "runtime_document_observed_root_paths_extracted",
+        "runtime_document_projection_storage_resolutions_extracted",
+        "runtime_document_render_slots_extracted",
+        "runtime_list_operations_extracted",
+        "runtime_list_projection_dtos_extracted",
+        "runtime_list_source_bindings_extracted",
+        "runtime_parser_dependency_removed",
+        "runtime_public_load_and_lower_removed",
+        "runtime_public_parsed_project_cache_removed",
+        "runtime_root_scenario_orchestration_remaining",
+        "runtime_root_state_paths_extracted",
+        "runtime_source_payload_counts_extracted",
+        "runtime_symbols_extracted",
+        "runtime_field_slot_collision_diagnostics_extracted",
+        "runtime_scalar_equations_extracted",
+        "runtime_profile_metadata_extracted",
+        "runtime_unsupported_diagnostics_extracted",
+        "runtime_generic_derived_plan_inventory_extracted",
+        "runtime_generic_derived_runtime_plan_inventory_extracted",
+        "runtime_generic_derived_ast_lowering_extracted",
+        "runtime_derived_equation_plan_extracted",
+        "runtime_update_expression_dtos_extracted",
+        "runtime_bytes_scalar_arg_dtos_extracted",
+        "runtime_derived_value_kind_dtos_extracted",
+        "runtime_raw_ir_value_enum_imports_qualified",
+        "runtime_row_template_initial_values_ir_free",
+        "runtime_ir_debug_tables_delegated_to_compiler",
+        "runtime_typecheck_report_metadata_delegated_to_compiler",
+        "runtime_typed_program_report_metadata_delegated_to_compiler",
+        "runtime_typed_program_inventory_counts_delegated_to_compiler",
+        "runtime_dead_ir_document_metadata_helpers_removed",
+        "runtime_source_route_bool_facts_extracted",
+        "runtime_source_route_root_targets_extracted",
+        "runtime_source_route_root_text_transforms_extracted",
+        "runtime_source_route_router_targets_extracted",
+        "runtime_source_route_sources_extracted",
+        "runtime_source_route_command_adapter_remaining",
+        "runtime_static_analysis_dtos_extracted",
+        "runtime_storage_indexed_derived_fields_extracted",
+        "runtime_storage_initialization_ir_free",
+        "runtime_legacy_storage_constructor_uses_compiler_plan",
+        "runtime_storage_initial_rows_extracted",
+        "runtime_storage_indexed_row_initial_resets_extracted",
+        "runtime_storage_list_slots_metadata_extracted",
+        "runtime_storage_row_templates_extracted",
+        "runtime_storage_root_slots_extracted",
+        "runtime_typed_storage_layout_counts_extracted",
+        "runtime_typecheck_dependency_removed",
+    ] {
+        if decomposition
+            .get(key)
+            .and_then(JsonValue::as_bool)
+            .is_none()
+        {
+            return Err(format!(
+                "{} boundary_decomposition.{key} must be boolean",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let next_cuts = decomposition
+        .get("next_architectural_cuts")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} boundary_decomposition.next_architectural_cuts must be an array",
+                report_path.display()
+            )
+        })?;
+    if next_cuts.is_empty() || !next_cuts.iter().all(|item| item.as_str().is_some()) {
+        return Err(format!(
+            "{} boundary_decomposition.next_architectural_cuts must contain strings",
+            report_path.display()
+        )
+        .into());
     }
 
     let direction = report
@@ -2138,6 +2760,7 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
     for key in [
         "external_direct_plan_compile_calls",
         "facade_call_sites",
+        "boon_plan_executor_frontend_dependencies",
         "boon_runtime_frontend_dependencies",
     ] {
         if direction.get(key).and_then(JsonValue::as_array).is_none() {
@@ -2150,7 +2773,11 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
     }
     for key in [
         "boon_plan_depends_on_boon_ir",
+        "boon_plan_optionally_depends_on_boon_ir",
         "boon_plan_depends_on_boon_parser",
+        "boon_plan_optionally_depends_on_boon_parser",
+        "boon_plan_optionally_depends_on_boon_typecheck",
+        "boon_plan_legacy_ir_adapter_feature_present",
         "boon_plan_imports_parser_ast",
     ] {
         if direction.get(key).and_then(JsonValue::as_bool).is_none() {
@@ -2215,6 +2842,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
             "audit-machine-readiness"
                 | "audit-goal-readiness"
                 | "audit-manual-readiness"
+                | "verify-report-schema"
                 | "boon-native-playground-role"
                 | "verify-runtime-finality"
                 | "verify-cells-wayland-scroll-speed"
@@ -2227,6 +2855,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
                 | "verify-browser-webgpu-world-scene"
+                | "verify-browser-startup-budget"
                 | "verify-native-web-render-comparison"
                 | "verify-native-web-render-parity"
                 | "verify-native-gpu-idle-wake"
@@ -2236,14 +2865,23 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-gpu-scroll-speed"
                 | "verify-native-dev-editor-scroll-speed"
                 | "verify-native-example-switch-speed"
+                | "verify-wgpu-retained-arenas"
+                | "verify-demand-driven-render-loop"
                 | "verify-native-gpu-negative"
                 | "verify-native-gpu-all"
+                | "verify-runtime-change-sets"
+                | "verify-document-batch-patches"
+                | "verify-retained-layout-deltas"
+                | "verify-text-cache-layers"
+                | "verify-render-patch-contract"
+                | "verify-unified-architecture-all"
                 | "verify-boon-source-syntax"
                 | "verify-scenario-manifest-integrity"
                 | "verify-metamorphic-hidden-fixtures"
                 | "verify-bytes-storage-profile"
                 | "verify-bytes-fixed-warm-tick"
                 | "verify-bytes-byte-bank-layout"
+                | "verify-bytes-default-engine-readiness"
                 | "verify-bytes-machine-plan-adversarial"
                 | "verify-bytes-release-benchmark-reproduction"
                 | "verify-bytes-machine-plan-all"
@@ -3153,10 +3791,10 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
     if route_surface
         .get("selected_op_indexed")
         .and_then(JsonValue::as_bool)
-        != Some(false)
+        != Some(expected.selected_op_indexed)
     {
         return Err(format!(
-            "{} run-plan-route selected_op_indexed must be false",
+            "{} run-plan-route selected_op_indexed does not match source-derived MachinePlan",
             report_path.display()
         )
         .into());
@@ -3199,7 +3837,7 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
     if route_surface
         .get("expression_kind")
         .and_then(JsonValue::as_str)
-        != Some(expected.expression_kind)
+        != Some(expected.expression_kind.as_str())
     {
         return Err(format!(
             "{} run-plan-route expression_kind does not match source-derived MachinePlan",
@@ -3309,7 +3947,7 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
         || executor.get("update_op_id").and_then(JsonValue::as_u64)
             != Some(expected.update_op_id as u64)
         || executor.get("expression_kind").and_then(JsonValue::as_str)
-            != Some(expected.expression_kind)
+            != Some(expected.expression_kind.as_str())
         || executor.get("source_payload_field") != Some(&expected.source_payload_field)
         || executor.get("update_constant_id") != Some(&expected.update_constant_id)
         || executor.get("update_constant_value") != Some(&expected.update_constant_value)
@@ -7376,9 +8014,51 @@ fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachine
             measurement_mode: "diagnostic",
         },
         ExpectedBytesMachinePlanChildReport {
+            label: "bytes-indexed-source-payload-route",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
             label: "bytes-indexed-source-payload-scenario",
             path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
             command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-indexed-equal-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-indexed-search-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-search-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-append-row-refresh-dump-plan",
+            path: "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-append-row-refresh-scenario",
+            path: "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-type-system",
+            path: "target/reports/bytes-plan/bytes-type-system.json",
+            command: "verify-bytes-type-system",
+            measurement_mode: "proof",
+        },
+        ExpectedBytesMachinePlanChildReport {
+            label: "bytes-default-engine-readiness",
+            path: "target/reports/bytes-plan/bytes-default-engine-readiness.json",
+            command: "verify-bytes-default-engine-readiness",
             measurement_mode: "proof",
         },
         ExpectedBytesMachinePlanChildReport {
@@ -8118,6 +8798,23 @@ fn expected_bytes_child_expression_kinds(label: &str) -> &'static [&'static str]
         "bytes-indexed-same-event-dependency-scenario" => {
             &["source_payload", "bytes_set", "bytes_get", "bytes_length"]
         }
+        "bytes-indexed-search-scenario" => &[
+            "source_payload",
+            "bytes_is_empty",
+            "bytes_to_hex",
+            "bytes_to_base64",
+            "bytes_to_text",
+            "text_to_bytes",
+            "bytes_from_hex",
+            "bytes_from_base64",
+            "bytes_slice",
+            "bytes_take",
+            "bytes_drop",
+            "bytes_zeros",
+            "bytes_find",
+            "bytes_starts_with",
+            "bytes_ends_with",
+        ],
         _ => &[],
     }
 }
@@ -9897,7 +10594,7 @@ fn mutate_expected_bytes_file_write_plan(
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
@@ -9905,7 +10602,7 @@ fn mutate_expected_bytes_file_write_plan(
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathInputMissing => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
             *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
@@ -9957,7 +10654,7 @@ fn mutate_expected_bytes_file_write_plan(
         ExpectedBytesFileWriteFabricatedPlanMutation::ExtraSourceInput => {
             plan.regions[region_index].ops[op_index]
                 .inputs
-                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                .push(boon_plan::ValueRef::Source(boon_plan::SourceId(
                     source_id.0.saturating_add(999_999),
                 )));
         }
@@ -9965,7 +10662,7 @@ fn mutate_expected_bytes_file_write_plan(
             plan.regions[region_index].ops[op_index].inputs.push(
                 boon_plan::ValueRef::SourcePayload {
                     source_id,
-                    field: boon_ir::SourcePayloadField::Text,
+                    field: boon_plan::SourcePayloadField::Text,
                 },
             );
         }
@@ -9983,7 +10680,7 @@ fn mutate_expected_bytes_file_write_plan(
                 ..
             } = &mut plan.regions[region_index].ops[op_index].kind
             {
-                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+                *source_payload_field = Some(boon_plan::SourcePayloadField::Text);
             }
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::InputNotBytes => {
@@ -10014,15 +10711,15 @@ fn mutate_expected_bytes_file_write_plan(
 
 fn install_expected_foreign_row_field_path_scope(
     plan: &mut boon_plan::MachinePlan,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     output_value_type: boon_plan::PlanValueType,
-) -> RuntimeResult<boon_ir::FieldId> {
-    let output_scope_id = boon_ir::ScopeId(900_001);
-    let foreign_scope_id = boon_ir::ScopeId(900_002);
-    let output_field_id = boon_ir::FieldId(900_003);
-    let foreign_path_field_id = boon_ir::FieldId(900_004);
-    let output_list_id = boon_ir::ListId(900_005);
-    let foreign_list_id = boon_ir::ListId(900_006);
+) -> RuntimeResult<boon_plan::FieldId> {
+    let output_scope_id = boon_plan::ScopeId(900_001);
+    let foreign_scope_id = boon_plan::ScopeId(900_002);
+    let output_field_id = boon_plan::FieldId(900_003);
+    let foreign_path_field_id = boon_plan::FieldId(900_004);
+    let output_list_id = boon_plan::ListId(900_005);
+    let foreign_list_id = boon_plan::ListId(900_006);
 
     let output_slot = plan
         .storage_layout
@@ -10155,7 +10852,7 @@ fn expected_bytes_file_write_input_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
         &plan.regions[region_index].ops[op_index].kind
     else {
@@ -10171,7 +10868,7 @@ fn expected_bytes_file_write_output_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let Some(boon_plan::ValueRef::State(state_id)) =
         plan.regions[region_index].ops[op_index].output.as_ref()
     else {
@@ -12376,7 +13073,7 @@ fn mutate_expected_bytes_file_read_plan(
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
@@ -12384,7 +13081,7 @@ fn mutate_expected_bytes_file_read_plan(
                 vec![field_ref];
         }
         ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathInputMissing => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
             *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
                 vec![field_ref];
@@ -12436,7 +13133,7 @@ fn mutate_expected_bytes_file_read_plan(
         ExpectedBytesFileReadFabricatedPlanMutation::ExtraSourceInput => {
             plan.regions[region_index].ops[op_index]
                 .inputs
-                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                .push(boon_plan::ValueRef::Source(boon_plan::SourceId(
                     source_id.0.saturating_add(999_999),
                 )));
         }
@@ -12449,7 +13146,7 @@ fn mutate_expected_bytes_file_read_plan(
             plan.regions[region_index].ops[op_index].inputs.push(
                 boon_plan::ValueRef::SourcePayload {
                     source_id,
-                    field: boon_ir::SourcePayloadField::Text,
+                    field: boon_plan::SourcePayloadField::Text,
                 },
             );
         }
@@ -12467,7 +13164,7 @@ fn mutate_expected_bytes_file_read_plan(
                 ..
             } = &mut plan.regions[region_index].ops[op_index].kind
             {
-                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+                *source_payload_field = Some(boon_plan::SourcePayloadField::Text);
             }
         }
         ExpectedBytesFileReadFabricatedPlanMutation::OutputNotBytes => {
@@ -12530,7 +13227,7 @@ fn expected_bytes_file_read_output_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let Some(boon_plan::ValueRef::State(state_id)) =
         plan.regions[region_index].ops[op_index].output.as_ref()
     else {
@@ -12647,6 +13344,12 @@ fn expected_root_scalar_scenario_execution(
     selected_step_ids: &[String],
     report_path: &Path,
 ) -> RuntimeResult<ExpectedRootScalarScenario> {
+    let source_root = scenario
+        .source
+        .as_deref()
+        .and_then(|source| Path::new(source).parent())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let (mut state, mut bytes_state, initialized_root_state_count) =
         expected_root_scalar_initial_state(plan, report_path)?;
     let mut list_state = expected_initial_list_state(plan, report_path)?;
@@ -12733,7 +13436,7 @@ fn expected_root_scalar_scenario_execution(
                         operation_kind: boon_plan::PlanListOperationKind::Remove,
                         remove: Some(remove),
                         ..
-                    } if remove.source == boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)),
+                    } if remove.source == boon_plan::ValueRef::Source(boon_plan::SourceId(source_id)),
                 )
             });
         if route_ops.is_empty() && derived_values.is_empty() && !route_has_list_remove {
@@ -12847,6 +13550,7 @@ fn expected_root_scalar_scenario_execution(
                             &mut list_state,
                             &mut per_row_resolution_cache,
                             &root_derived_values_before_updates,
+                            &source_root,
                             report_path,
                         )?);
                     }
@@ -12860,6 +13564,7 @@ fn expected_root_scalar_scenario_execution(
                         &mut list_state,
                         &mut row_resolution_cache,
                         &root_derived_values_before_updates,
+                        &source_root,
                         report_path,
                     )?);
                 }
@@ -13144,7 +13849,7 @@ fn expected_derived_values_for_source(
     source_event: &serde_json::Map<String, JsonValue>,
     root_state: &serde_json::Map<String, JsonValue>,
     report_path: &Path,
-) -> RuntimeResult<BTreeMap<boon_ir::FieldId, JsonValue>> {
+) -> RuntimeResult<BTreeMap<boon_plan::FieldId, JsonValue>> {
     let mut values = BTreeMap::new();
     for op in plan
         .regions
@@ -13198,11 +13903,11 @@ fn expected_derived_values_for_source(
                     }
                     boon_plan::ValueRef::SourcePayload {
                         source_id: payload_source_id,
-                        field: boon_ir::SourcePayloadField::Text,
+                        field: boon_plan::SourcePayloadField::Text,
                     } if payload_source_id.0 == source_id => {
                         let payload = expected_source_payload_json_value(
                             source_event,
-                            &boon_ir::SourcePayloadField::Text,
+                            &boon_plan::SourcePayloadField::Text,
                             report_path,
                         )?;
                         payload
@@ -13274,7 +13979,7 @@ fn expected_root_semantic_delta_value(value: &JsonValue) -> JsonValue {
 fn expected_append_list_rows(
     plan: &boon_plan::MachinePlan,
     list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
-    derived_values: &BTreeMap<boon_ir::FieldId, JsonValue>,
+    derived_values: &BTreeMap<boon_plan::FieldId, JsonValue>,
     report_path: &Path,
 ) -> RuntimeResult<ExpectedListAppendExecution> {
     let mut semantic_deltas = Vec::new();
@@ -13532,7 +14237,7 @@ fn expected_remove_list_rows_for_source(
         else {
             continue;
         };
-        if remove.source != boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)) {
+        if remove.source != boon_plan::ValueRef::Source(boon_plan::SourceId(source_id)) {
             continue;
         }
         if op.unresolved_executable_ref_count != 0 {
@@ -13780,6 +14485,7 @@ fn expected_predicate_row_resolution_report(
 ) -> RuntimeResult<JsonValue> {
     match predicate {
         boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({
+            "executor": "cpu-plan-list-remove-predicate-row-resolution-v1",
             "method": "predicate",
             "predicate": "always_true",
             "predicate_field": null,
@@ -13792,6 +14498,7 @@ fn expected_predicate_row_resolution_report(
         boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
             let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
             Ok(json!({
+                "executor": "cpu-plan-list-remove-predicate-row-resolution-v1",
                 "method": "predicate",
                 "predicate": "row_field_bool",
                 "predicate_field": field_name,
@@ -13805,6 +14512,7 @@ fn expected_predicate_row_resolution_report(
         boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
             let (field_name, value) = expected_list_remove_predicate_field_value(plan, input, row)?;
             Ok(json!({
+                "executor": "cpu-plan-list-remove-predicate-row-resolution-v1",
                 "method": "predicate",
                 "predicate": "row_field_bool_not",
                 "predicate_field": field_name,
@@ -14001,6 +14709,7 @@ fn expected_indexed_update_branch(
     list_state: &mut BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
     row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
+    source_root: &Path,
     report_path: &Path,
 ) -> RuntimeResult<ExpectedIndexedUpdateExecution> {
     if op.unresolved_executable_ref_count != 0 {
@@ -14139,6 +14848,7 @@ fn expected_indexed_update_branch(
     };
     let mut bytes_access = JsonValue::Null;
     let mut bytes_storage = JsonValue::Null;
+    let mut executor_core = JsonValue::Null;
     let mut update_constant_id = JsonValue::Null;
     let mut update_constant_value = JsonValue::Null;
 
@@ -14181,6 +14891,21 @@ fn expected_indexed_update_branch(
                 field,
                 report_path,
             )?;
+            if let Some(bytes) = private_bytes.as_ref() {
+                let output_byte_bank_declared =
+                    expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+                bytes_storage = json!({
+                    "storage": if output_byte_bank_declared {
+                        "indexed_fixed_byte_bank"
+                    } else {
+                        "indexed_row_private_bytes"
+                    },
+                    "output_state_id": output_state_id.0,
+                    "byte_bank_declared": output_byte_bank_declared,
+                    "byte_bank_used": output_byte_bank_declared,
+                    "byte_len": bytes.len(),
+                });
+            }
             (value, private_bytes, "source_payload")
         }
         boon_plan::PlanOpKind::UpdateBranch {
@@ -14201,8 +14926,10 @@ fn expected_indexed_update_branch(
                         constant_id.0
                     )
                 })?;
+            update_constant_id = json!(constant_id.0);
+            update_constant_value = plan_constant_json_value(constant, report_path)?;
             (
-                plan_constant_json_value(constant, report_path)?,
+                update_constant_value.clone(),
                 expected_constant_private_bytes_for_output(
                     plan,
                     output_state_id,
@@ -14239,6 +14966,8 @@ fn expected_indexed_update_branch(
                 expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
             bytes_access =
                 expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_length");
             let byte_len = i64::try_from(bytes.len() as u64).map_err(|_| {
                 format!(
                     "{} indexed Bytes/length update branch {} byte_len exceeds Boon NUMBER",
@@ -14249,9 +14978,92 @@ fn expected_indexed_update_branch(
             (json!(byte_len), None, "bytes_length")
         }
         boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesIsEmpty,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_is_empty");
+            (JsonValue::Bool(bytes.is_empty()), None, "bytes_is_empty")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToHex,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_to_hex");
+            (
+                JsonValue::String(expected_bytes_encode_hex(&bytes)),
+                None,
+                "bytes_to_hex",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToBase64,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_state_id =
+                expected_indexed_single_state_input(op, output_state_id, report_path)?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_to_base64");
+            (
+                JsonValue::String(expected_bytes_encode_base64(&bytes)),
+                None,
+                "bytes_to_base64",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesToText,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, encoding, encoding_constant_id) =
+                expected_root_text_bytes_conversion_operands(
+                    plan,
+                    op,
+                    report_path,
+                    "Bytes/to_text",
+                )?;
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_to_text");
+            update_constant_id = json!(encoding_constant_id.0);
+            update_constant_value = json!(encoding);
+            (
+                JsonValue::String(expected_row_bytes_to_text(&bytes, &encoding, report_path)?),
+                None,
+                "bytes_to_text",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
             expression_kind: boon_plan::PlanExpressionKind::BytesGet,
             source_payload_field: None,
-            update_constant_id: Some(update_constant_id),
+            update_constant_id: Some(index_constant_id),
             ..
         } => {
             let input_state_id =
@@ -14260,13 +15072,13 @@ fn expected_indexed_update_branch(
             let index_constant = plan
                 .constants
                 .iter()
-                .find(|constant| constant.id == *update_constant_id)
+                .find(|constant| constant.id == *index_constant_id)
                 .ok_or_else(|| {
                     format!(
                         "{} indexed Bytes/get update branch {} references missing index constant {}",
                         report_path.display(),
                         op.id.0,
-                        update_constant_id.0
+                        index_constant_id.0
                     )
                 })?;
             let boon_plan::PlanConstantValue::Number { value: index } = &index_constant.value
@@ -14275,7 +15087,7 @@ fn expected_indexed_update_branch(
                     "{} indexed Bytes/get update branch {} index constant {} is not a number",
                     report_path.display(),
                     op.id.0,
-                    update_constant_id.0
+                    index_constant_id.0
                 )
                 .into());
             };
@@ -14284,7 +15096,7 @@ fn expected_indexed_update_branch(
                     "{} indexed Bytes/get update branch {} index constant {} is negative or too large",
                     report_path.display(),
                     op.id.0,
-                    update_constant_id.0
+                    index_constant_id.0
                 )
             })?;
             let bytes =
@@ -14295,6 +15107,10 @@ fn expected_indexed_update_branch(
                 bytes.len(),
                 Some(index),
             );
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_get");
+            update_constant_id = json!(index_constant_id.0);
+            update_constant_value = json!(index);
             let byte = bytes.get(index).ok_or_else(|| {
                 format!(
                     "{} indexed Bytes/get update branch {} index {index} is out of bounds for `{input_name}`",
@@ -14303,6 +15119,350 @@ fn expected_indexed_update_branch(
                 )
             })?;
             (json!(i64::from(*byte)), None, "bytes_get")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesReadUnsigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+            ) = expected_root_bytes_numeric_read_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/read_unsigned",
+            )?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core = expected_indexed_bytes_read_executor_report(
+                op,
+                output_state_id,
+                "bytes_read_unsigned",
+            );
+            update_constant_id = json!([
+                offset_constant_id.0,
+                byte_count_constant_id.0,
+                endian_constant_id.0
+            ]);
+            update_constant_value = json!({
+                "offset": offset,
+                "byte_count": byte_count,
+                "endian": expected_bytes_endian_label(endian)
+            });
+            let value = expected_bytes_read_unsigned(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                report_path,
+                op,
+                &input_name,
+            )?;
+            (json!(value), None, "bytes_read_unsigned")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesReadSigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+            ) = expected_root_bytes_numeric_read_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/read_signed",
+            )?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            bytes_access =
+                expected_indexed_bytes_access_report(plan, input_state_id, bytes.len(), None);
+            executor_core = expected_indexed_bytes_read_executor_report(
+                op,
+                output_state_id,
+                "bytes_read_signed",
+            );
+            update_constant_id = json!([
+                offset_constant_id.0,
+                byte_count_constant_id.0,
+                endian_constant_id.0
+            ]);
+            update_constant_value = json!({
+                "offset": offset,
+                "byte_count": byte_count,
+                "endian": expected_bytes_endian_label(endian)
+            });
+            let value = expected_bytes_read_signed(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                report_path,
+                op,
+                &input_name,
+            )?;
+            (json!(value), None, "bytes_read_signed")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesEqual,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (left_bytes, left_access, right_bytes, right_access) =
+                expected_indexed_bytes_equal_inputs(plan, row, op, report_path)?;
+            bytes_access = json!({
+                "read_only": true,
+                "inputs": [
+                    left_access,
+                    right_access,
+                ],
+            });
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_equal");
+            (
+                JsonValue::Bool(left_bytes == right_bytes),
+                None,
+                "bytes_equal",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFind,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (haystack, haystack_access, needle, needle_access) =
+                expected_indexed_bytes_ordered_inputs(plan, row, op, "Bytes/find", report_path)?;
+            bytes_access = json!({
+                "read_only": true,
+                "inputs": [
+                    with_bytes_access_role(haystack_access, "haystack"),
+                    with_bytes_access_role(needle_access, "needle"),
+                ],
+            });
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_find");
+            let value = expected_bytes_find(&haystack, &needle)
+                .map(|index| json!(index as i64))
+                .unwrap_or(JsonValue::Null);
+            (value, None, "bytes_find")
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesStartsWith,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input, input_access, prefix, prefix_access) =
+                expected_indexed_bytes_ordered_inputs(
+                    plan,
+                    row,
+                    op,
+                    "Bytes/starts_with",
+                    report_path,
+                )?;
+            bytes_access = json!({
+                "read_only": true,
+                "inputs": [
+                    with_bytes_access_role(input_access, "input"),
+                    with_bytes_access_role(prefix_access, "prefix"),
+                ],
+            });
+            executor_core = expected_indexed_bytes_read_executor_report(
+                op,
+                output_state_id,
+                "bytes_starts_with",
+            );
+            (
+                JsonValue::Bool(input.starts_with(&prefix)),
+                None,
+                "bytes_starts_with",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesEndsWith,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input, input_access, suffix, suffix_access) =
+                expected_indexed_bytes_ordered_inputs(
+                    plan,
+                    row,
+                    op,
+                    "Bytes/ends_with",
+                    report_path,
+                )?;
+            bytes_access = json!({
+                "read_only": true,
+                "inputs": [
+                    with_bytes_access_role(input_access, "input"),
+                    with_bytes_access_role(suffix_access, "suffix"),
+                ],
+            });
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "bytes_ends_with");
+            (
+                JsonValue::Bool(input.ends_with(&suffix)),
+                None,
+                "bytes_ends_with",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::TextToBytes,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_ref, encoding, encoding_constant_id) =
+                expected_indexed_text_to_bytes_operands(plan, op, report_path, "Text/to_bytes")?;
+            let text = expected_indexed_row_text_input(plan, row, &input_ref, op, report_path)?;
+            let output = expected_row_text_to_bytes(&text, &encoding, report_path)?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Text/to_bytes",
+                report_path,
+            )?;
+            let private_bytes = output;
+            bytes_access = json!({
+                "read_only": true,
+                "input": expected_indexed_text_input_access_json(plan, &input_ref),
+                "input_kind": "text",
+                "output_state_id": output_state_id.0,
+                "encoding": encoding,
+            });
+            bytes_storage = json!({
+                "storage": if expected_indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_bank_used": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_len": private_bytes.len() as u64,
+            });
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "text_to_bytes");
+            update_constant_id = json!(encoding_constant_id.0);
+            update_constant_value = json!(encoding);
+            (
+                expected_inline_bytes_summary(&private_bytes),
+                Some(private_bytes),
+                "text_to_bytes",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFromHex,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_ref = expected_indexed_single_text_input(op, output_state_id, report_path)?;
+            let input_label = expected_indexed_text_input_label(plan, &input_ref);
+            let text = expected_indexed_row_text_input(plan, row, &input_ref, op, report_path)?;
+            let private_bytes = expected_bytes_decode_hex(&text, report_path, op, &input_label)?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                private_bytes.len(),
+                "Bytes/from_hex",
+                report_path,
+            )?;
+            bytes_access = json!({
+                "read_only": true,
+                "input": expected_indexed_text_input_access_json(plan, &input_ref),
+                "input_kind": "text",
+                "output_state_id": output_state_id.0,
+            });
+            bytes_storage = json!({
+                "storage": if expected_indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_bank_used": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_len": private_bytes.len() as u64,
+            });
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_from_hex");
+            (
+                expected_inline_bytes_summary(&private_bytes),
+                Some(private_bytes),
+                "bytes_from_hex",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesFromBase64,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_ref = expected_indexed_single_text_input(op, output_state_id, report_path)?;
+            let input_label = expected_indexed_text_input_label(plan, &input_ref);
+            let text = expected_indexed_row_text_input(plan, row, &input_ref, op, report_path)?;
+            let private_bytes = expected_bytes_decode_base64(&text, report_path, op, &input_label)?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                private_bytes.len(),
+                "Bytes/from_base64",
+                report_path,
+            )?;
+            bytes_access = json!({
+                "read_only": true,
+                "input": expected_indexed_text_input_access_json(plan, &input_ref),
+                "input_kind": "text",
+                "output_state_id": output_state_id.0,
+            });
+            bytes_storage = json!({
+                "storage": if expected_indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_bank_used": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "byte_len": private_bytes.len() as u64,
+            });
+            executor_core = expected_indexed_bytes_write_executor_report(
+                op,
+                output_state_id,
+                "bytes_from_base64",
+            );
+            (
+                expected_inline_bytes_summary(&private_bytes),
+                Some(private_bytes),
+                "bytes_from_base64",
+            )
         }
         boon_plan::PlanOpKind::UpdateBranch {
             expression_kind: boon_plan::PlanExpressionKind::BytesSet,
@@ -14359,6 +15519,8 @@ fn expected_indexed_update_branch(
             );
             bytes_access["read_only"] = json!(false);
             bytes_access["value"] = json!(byte_value);
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_set");
             let output_byte_bank_declared =
                 expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
             bytes_storage = json!({
@@ -14381,6 +15543,541 @@ fn expected_indexed_update_branch(
                 expected_inline_bytes_summary(&output),
                 Some(output),
                 "bytes_set",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesSlice,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, offset, byte_count, offset_constant_id, byte_count_constant_id) =
+                expected_indexed_bytes_slice_operands(plan, op, report_path)?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                offset,
+                byte_count,
+                "Bytes/slice",
+                op,
+                &input_name,
+                report_path,
+            )?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/slice",
+                report_path,
+            )?;
+            bytes_access = expected_indexed_bytes_slice_access_report(
+                plan,
+                input_state_id,
+                output_state_id,
+                offset,
+                byte_count,
+                output.len(),
+            );
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_slice");
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            update_constant_id = json!([offset_constant_id.0, byte_count_constant_id.0]);
+            update_constant_value = json!({
+                "offset": offset,
+                "byte_count": byte_count,
+            });
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_slice",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesTake,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, byte_count, byte_count_constant_id) =
+                expected_indexed_bytes_count_operand(plan, op, report_path, "Bytes/take")?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                0,
+                byte_count,
+                "Bytes/take",
+                op,
+                &input_name,
+                report_path,
+            )?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/take",
+                report_path,
+            )?;
+            bytes_access = expected_indexed_bytes_slice_access_report(
+                plan,
+                input_state_id,
+                output_state_id,
+                0,
+                byte_count,
+                output.len(),
+            );
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_take");
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            update_constant_id = json!(byte_count_constant_id.0);
+            update_constant_value = json!(byte_count);
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_take",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesDrop,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (input_state_id, byte_count, byte_count_constant_id) =
+                expected_indexed_bytes_count_operand(plan, op, report_path, "Bytes/drop")?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            if byte_count > bytes.len() {
+                return Err(format!(
+                    "{} indexed Bytes/drop update branch {} byte_count {byte_count} is out of bounds for `{input_name}`",
+                    report_path.display(),
+                    op.id.0
+                )
+                .into());
+            }
+            let output_len = bytes.len() - byte_count;
+            let output = expected_checked_bytes_slice(
+                &bytes,
+                byte_count,
+                output_len,
+                "Bytes/drop",
+                op,
+                &input_name,
+                report_path,
+            )?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/drop",
+                report_path,
+            )?;
+            bytes_access = expected_indexed_bytes_slice_access_report(
+                plan,
+                input_state_id,
+                output_state_id,
+                byte_count,
+                output_len,
+                output.len(),
+            );
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_drop");
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            update_constant_id = json!(byte_count_constant_id.0);
+            update_constant_value = json!(byte_count);
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_drop",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesZeros,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (byte_count, byte_count_constant_id) =
+                expected_indexed_bytes_zeros_operand(plan, op, report_path)?;
+            let output = vec![0; byte_count];
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/zeros",
+                report_path,
+            )?;
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_zeros");
+            update_constant_id = json!(byte_count_constant_id.0);
+            update_constant_value = json!(byte_count);
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_zeros",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesConcat,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (left, left_access, right, right_access) =
+                expected_indexed_bytes_ordered_inputs(plan, row, op, "Bytes/concat", report_path)?;
+            let output_len = left.len().saturating_add(right.len());
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output_len,
+                "Bytes/concat",
+                report_path,
+            )?;
+            let mut output = Vec::with_capacity(output_len);
+            output.extend_from_slice(&left);
+            output.extend_from_slice(&right);
+            bytes_access = json!({
+                "read_only": false,
+                "output_state_id": output_state_id.0,
+                "output_storage_kind": "bytes_concat_output_vec",
+                "output_cow_kind": "owned_vec",
+                "output_byte_len": output_len,
+                "inputs": [
+                    with_bytes_access_role(left_access, "left"),
+                    with_bytes_access_role(right_access, "right"),
+                ],
+            });
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            executor_core =
+                expected_indexed_bytes_write_executor_report(op, output_state_id, "bytes_concat");
+            executor_core["bytes_copy_cost"] = json!({
+                "reason": "bytes_concat_output_vec",
+                "vec_alloc_count": 1,
+                "vec_alloc_bytes": output_len as u64,
+                "copy_from_slice_count": 2,
+                "copy_from_slice_bytes": output_len as u64,
+            });
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_concat",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesWriteUnsigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                numeric_value,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+                value_constant_id,
+            ) = expected_root_bytes_numeric_write_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/write_unsigned",
+            )?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            let output = expected_bytes_write_unsigned(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                numeric_value,
+                report_path,
+                op,
+                &input_name,
+            )?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/write_unsigned",
+                report_path,
+            )?;
+            let input_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, input_state_id);
+            bytes_access = json!({
+                "read_only": false,
+                "input_state_id": input_state_id.0,
+                "output_state_id": output_state_id.0,
+                "access_source": if input_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "cow_kind": "borrowed",
+                "byte_len": bytes.len(),
+                "byte_bank_declared": input_byte_bank_declared,
+                "byte_bank_used": input_byte_bank_declared,
+                "mutation_kind": "inline_bytes_copy",
+                "patch_count": byte_count,
+            });
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            executor_core = expected_indexed_bytes_write_executor_report(
+                op,
+                output_state_id,
+                "bytes_write_unsigned",
+            );
+            update_constant_id = json!([
+                offset_constant_id.0,
+                byte_count_constant_id.0,
+                endian_constant_id.0,
+                value_constant_id.0
+            ]);
+            update_constant_value = json!({
+                "offset": offset,
+                "byte_count": byte_count,
+                "endian": expected_bytes_endian_label(endian),
+                "value": numeric_value,
+            });
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_write_unsigned",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::BytesWriteSigned,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (
+                input_state_id,
+                offset,
+                byte_count,
+                endian,
+                numeric_value,
+                offset_constant_id,
+                byte_count_constant_id,
+                endian_constant_id,
+                value_constant_id,
+            ) = expected_root_bytes_numeric_write_operands(
+                plan,
+                op,
+                report_path,
+                "Bytes/write_signed",
+            )?;
+            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+            let bytes =
+                expected_indexed_row_inline_bytes(plan, row, input_state_id, op, report_path)?;
+            let output = expected_bytes_write_signed(
+                &bytes,
+                offset,
+                byte_count,
+                endian,
+                numeric_value,
+                report_path,
+                op,
+                &input_name,
+            )?;
+            expected_validate_bytes_output_len(
+                plan,
+                op,
+                output_state_id,
+                output.len(),
+                "Bytes/write_signed",
+                report_path,
+            )?;
+            let input_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, input_state_id);
+            bytes_access = json!({
+                "read_only": false,
+                "input_state_id": input_state_id.0,
+                "output_state_id": output_state_id.0,
+                "access_source": if input_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "cow_kind": "borrowed",
+                "byte_len": bytes.len(),
+                "byte_bank_declared": input_byte_bank_declared,
+                "byte_bank_used": input_byte_bank_declared,
+                "mutation_kind": "inline_bytes_copy",
+                "patch_count": byte_count,
+            });
+            let output_byte_bank_declared =
+                expected_indexed_state_has_fixed_byte_bank(plan, output_state_id);
+            bytes_storage = json!({
+                "storage": if output_byte_bank_declared {
+                    "indexed_fixed_byte_bank"
+                } else {
+                    "indexed_row_private_bytes"
+                },
+                "output_state_id": output_state_id.0,
+                "byte_bank_declared": output_byte_bank_declared,
+                "byte_bank_used": output_byte_bank_declared,
+                "byte_len": output.len(),
+            });
+            executor_core = expected_indexed_bytes_write_executor_report(
+                op,
+                output_state_id,
+                "bytes_write_signed",
+            );
+            update_constant_id = json!([
+                offset_constant_id.0,
+                byte_count_constant_id.0,
+                endian_constant_id.0,
+                value_constant_id.0
+            ]);
+            update_constant_value = json!({
+                "offset": offset,
+                "byte_count": byte_count,
+                "endian": expected_bytes_endian_label(endian),
+                "value": numeric_value,
+            });
+            (
+                expected_inline_bytes_summary(&output),
+                Some(output),
+                "bytes_write_signed",
+            )
+        }
+        boon_plan::PlanOpKind::UpdateBranch {
+            expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (path, path_update_constant_id, path_update_constant_value, path_source) =
+                expected_indexed_file_read_path(plan, row, op, report_path)?;
+            let bytes = expected_read_source_relative_file_bytes(source_root, &path, report_path)?;
+            let output_slot = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == output_state_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed File/read_bytes update branch {} has no output storage slot",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            if let boon_plan::PlanValueType::Bytes {
+                fixed_len: Some(fixed_len),
+            } = &output_slot.value_type
+                && *fixed_len != bytes.len() as u64
+            {
+                return Err(format!(
+                    "{} indexed File/read_bytes update branch {} fixed length {} does not match produced length {}",
+                    report_path.display(),
+                    op.id.0,
+                    fixed_len,
+                    bytes.len()
+                )
+                .into());
+            }
+            bytes_access = json!({
+                "read_only": true,
+                "output_state_id": output_state_id.0,
+                "host_boundary": "file_read_bytes",
+                "byte_len": bytes.len(),
+                "byte_bank_declared": expected_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                "path_source": path_source,
+            });
+            executor_core =
+                expected_indexed_bytes_read_executor_report(op, output_state_id, "file_read_bytes");
+            update_constant_id = path_update_constant_id;
+            update_constant_value = path_update_constant_value;
+            (
+                expected_inline_bytes_summary(&bytes),
+                Some(bytes),
+                "file_read_bytes",
             )
         }
         boon_plan::PlanOpKind::UpdateBranch {
@@ -14583,6 +16280,7 @@ fn expected_indexed_update_branch(
             "bytes_access": bytes_access,
             "bytes_storage": bytes_storage,
             "host_effect": null,
+            "executor_core": executor_core,
             "selected_op_indexed": true,
             "selected_op_unresolved_executable_ref_count": 0,
             "list_id": list_slot.list_id.0,
@@ -14604,7 +16302,7 @@ fn expected_indexed_update_branch(
 
 fn expected_indexed_bytes_access_report(
     plan: &boon_plan::MachinePlan,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
     byte_len: usize,
     index: Option<usize>,
 ) -> JsonValue {
@@ -14628,9 +16326,266 @@ fn expected_indexed_bytes_access_report(
     access
 }
 
+fn expected_indexed_bytes_slice_access_report(
+    plan: &boon_plan::MachinePlan,
+    input_state_id: boon_plan::StateId,
+    output_state_id: boon_plan::StateId,
+    offset: usize,
+    byte_count: usize,
+    output_byte_len: usize,
+) -> JsonValue {
+    let byte_bank_declared = expected_indexed_state_has_fixed_byte_bank(plan, input_state_id);
+    json!({
+        "read_only": false,
+        "input_state_id": input_state_id.0,
+        "output_state_id": output_state_id.0,
+        "input_access_source": if byte_bank_declared {
+            "indexed_fixed_byte_bank"
+        } else {
+            "indexed_row_private_bytes"
+        },
+        "input_cow_kind": "borrowed",
+        "byte_bank_declared": byte_bank_declared,
+        "byte_bank_used": byte_bank_declared,
+        "output_storage_kind": "bytes_slice_view",
+        "output_cow_kind": "borrowed_view",
+        "offset": offset,
+        "byte_count": byte_count,
+        "output_byte_len": output_byte_len,
+    })
+}
+
+fn expected_indexed_bytes_read_executor_report(
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_plan::StateId,
+    expression_kind: &str,
+) -> JsonValue {
+    json!({
+        "executor": "cpu-plan-indexed-bytes-read-evaluator-v1",
+        "update_op_id": op.id.0,
+        "target_state_id": output_state_id.0,
+        "supported": true,
+        "unsupported_reason": null,
+        "expression_kind": expression_kind,
+        "runtime_ast_eval_count": 0,
+        "executable_string_path_count": 0,
+        "unknown_plan_op_count": 0,
+        "graph_rebuild_count": 0,
+        "graph_clones_per_item": 0,
+    })
+}
+
+fn expected_indexed_bytes_write_executor_report(
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_plan::StateId,
+    expression_kind: &str,
+) -> JsonValue {
+    json!({
+        "executor": "cpu-plan-indexed-bytes-write-evaluator-v1",
+        "update_op_id": op.id.0,
+        "target_state_id": output_state_id.0,
+        "supported": true,
+        "unsupported_reason": null,
+        "expression_kind": expression_kind,
+        "bytes_commit": true,
+        "runtime_ast_eval_count": 0,
+        "executable_string_path_count": 0,
+        "unknown_plan_op_count": 0,
+        "graph_rebuild_count": 0,
+        "graph_clones_per_item": 0,
+    })
+}
+
+fn expected_indexed_file_read_path(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(String, JsonValue, JsonValue, &'static str)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed File/read_bytes update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [path_ref] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed File/read_bytes update branch {} expected one path operand, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    match path_ref {
+        boon_plan::ValueRef::Constant(constant_id) => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed File/read_bytes update branch {} references missing path constant {}",
+                        report_path.display(),
+                        op.id.0,
+                        constant_id.0
+                    )
+                })?;
+            let boon_plan::PlanConstantValue::Text { value } = &constant.value else {
+                return Err(format!(
+                    "{} indexed File/read_bytes update branch {} path constant {} is not TEXT",
+                    report_path.display(),
+                    op.id.0,
+                    constant_id.0
+                )
+                .into());
+            };
+            Ok((
+                value.clone(),
+                json!(constant_id.0),
+                json!({
+                    "path": value,
+                    "path_source": "static_constant",
+                }),
+                "static_constant",
+            ))
+        }
+        boon_plan::ValueRef::State(state_id) => {
+            let label = plan_state_label(plan, state_id.0);
+            let field_name = local_field_name(&label);
+            let path = row
+                .fields
+                .get(&field_name)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed File/read_bytes update branch {} path state `{field_name}` is missing or not TEXT",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            Ok((
+                path.to_owned(),
+                JsonValue::Null,
+                json!({
+                    "path": path,
+                    "path_source": "state",
+                    "path_state": label,
+                    "path_state_id": state_id.0,
+                }),
+                "state",
+            ))
+        }
+        boon_plan::ValueRef::Field(field_id) => {
+            let label = plan_semantic_field_label(plan, field_id.0);
+            let field_name = local_field_name(&label);
+            let path = row
+                .fields
+                .get(&field_name)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} indexed File/read_bytes update branch {} path row field `{field_name}` is missing or not TEXT",
+                        report_path.display(),
+                        op.id.0
+                    )
+                })?;
+            Ok((
+                path.to_owned(),
+                JsonValue::Null,
+                json!({
+                    "path": path,
+                    "path_source": "row_field",
+                    "path_field": label,
+                    "path_field_id": field_id.0,
+                }),
+                "row_field",
+            ))
+        }
+        other => Err(format!(
+            "{} indexed File/read_bytes update branch {} path operand must be TEXT constant, state, or row field, got {other:?}",
+            report_path.display(),
+            op.id.0
+        )
+        .into()),
+    }
+}
+
+fn expected_read_source_relative_file_bytes(
+    source_root: &Path,
+    path: &str,
+    report_path: &Path,
+) -> RuntimeResult<Vec<u8>> {
+    let path_ref = Path::new(path);
+    if path_ref.as_os_str().is_empty() || path_ref.is_absolute() {
+        return Err(format!(
+            "{} indexed File/read_bytes path `{}` must be source-relative",
+            report_path.display(),
+            path_ref.display()
+        )
+        .into());
+    }
+    let root = source_root.canonicalize().map_err(|error| {
+        format!(
+            "{} cannot canonicalize source root `{}`: {error}",
+            report_path.display(),
+            source_root.display()
+        )
+    })?;
+    let mut resolved = root.clone();
+    for component in path_ref.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => resolved.push(part),
+            Component::ParentDir => {
+                return Err(format!(
+                    "{} indexed File/read_bytes path `{}` may not contain parent-directory segments",
+                    report_path.display(),
+                    path_ref.display()
+                )
+                .into());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "{} indexed File/read_bytes path `{}` must be source-relative",
+                    report_path.display(),
+                    path_ref.display()
+                )
+                .into());
+            }
+        }
+    }
+    let canonical = resolved.canonicalize().map_err(|error| {
+        format!(
+            "{} cannot read indexed File/read_bytes path `{}`: {error}",
+            report_path.display(),
+            path_ref.display()
+        )
+    })?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err(format!(
+            "{} indexed File/read_bytes path `{}` escapes source root `{}`",
+            report_path.display(),
+            path_ref.display(),
+            root.display()
+        )
+        .into());
+    }
+    fs::read(canonical).map_err(|error| {
+        format!(
+            "{} cannot read indexed File/read_bytes path `{}`: {error}",
+            report_path.display(),
+            path_ref.display()
+        )
+        .into()
+    })
+}
+
 fn expected_indexed_state_has_fixed_byte_bank(
     plan: &boon_plan::MachinePlan,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
 ) -> bool {
     plan.storage_layout
         .byte_banks
@@ -14765,13 +16720,6 @@ fn expected_plan_source_guard_matches(
             field,
             values,
         } => {
-            if matches!(field, boon_ir::SourcePayloadField::Bytes) {
-                return Err(format!(
-                    "{} BYTES source payload guards are not supported in v1",
-                    report_path.display()
-                )
-                .into());
-            }
             if source_id.0 != active_source_id {
                 return Err(format!(
                     "{} source guard targets source {}, but active source is {}",
@@ -14780,6 +16728,22 @@ fn expected_plan_source_guard_matches(
                     active_source_id
                 )
                 .into());
+            }
+            if matches!(field, boon_plan::SourcePayloadField::Bytes) {
+                let payload = source_event_payload_bytes(source_event, report_path)?;
+                for expected in values {
+                    let expected_bytes =
+                        expected_row_bytes_decode_hex(expected, report_path).map_err(|error| {
+                            format!(
+                                "{} BYTES source payload guard value `{expected}` is invalid hex: {error}",
+                                report_path.display()
+                            )
+                        })?;
+                    if expected_bytes == payload {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
             }
             let value = expected_source_payload_json_value(source_event, field, report_path)?;
             Ok(value
@@ -14791,9 +16755,9 @@ fn expected_plan_source_guard_matches(
 
 fn expected_indexed_single_state_input(
     op: &boon_plan::PlanOp,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     report_path: &Path,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let inputs = op
         .inputs
         .iter()
@@ -14814,10 +16778,171 @@ fn expected_indexed_single_state_input(
     Ok(*input)
 }
 
+fn expected_indexed_row_text_state(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    state_id: boon_plan::StateId,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<String> {
+    let field_name = local_field_name(&plan_state_label(plan, state_id.0));
+    row.fields
+        .get(&field_name)
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "{} indexed update branch {} state field `{field_name}` is missing or not TEXT",
+                report_path.display(),
+                op.id.0
+            )
+            .into()
+        })
+}
+
+fn expected_indexed_single_text_input(
+    op: &boon_plan::PlanOp,
+    output_state_id: boon_plan::StateId,
+    report_path: &Path,
+) -> RuntimeResult<boon_plan::ValueRef> {
+    let inputs = op
+        .inputs
+        .iter()
+        .filter(|input| match input {
+            boon_plan::ValueRef::State(state_id) => *state_id != output_state_id,
+            boon_plan::ValueRef::Field(_) => true,
+            _ => false,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed update branch {} expected one TEXT input, found {}",
+            report_path.display(),
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok(input.clone())
+}
+
+fn expected_indexed_text_to_bytes_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(boon_plan::ValueRef, String, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [input, boon_plan::ValueRef::Constant(encoding_constant_id)] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} expected TEXT input plus encoding constant",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *encoding_constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} indexed {operation} update branch {} references missing encoding constant {}",
+                report_path.display(),
+                op.id.0,
+                encoding_constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Text { value: encoding } = &constant.value else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} encoding constant {} is not TEXT",
+            report_path.display(),
+            op.id.0,
+            encoding_constant_id.0
+        )
+        .into());
+    };
+    Ok((input.clone(), encoding.clone(), *encoding_constant_id))
+}
+
+fn expected_indexed_row_text_input(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    input: &boon_plan::ValueRef,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<String> {
+    let field_name =
+        match input {
+            boon_plan::ValueRef::State(state_id) => {
+                local_field_name(&plan_state_label(plan, state_id.0))
+            }
+            boon_plan::ValueRef::Field(field_id) => {
+                local_field_name(&plan_semantic_field_label(plan, field_id.0))
+            }
+            other => return Err(format!(
+                "{} indexed update branch {} TEXT input must be state or row field, got {other:?}",
+                report_path.display(),
+                op.id.0
+            )
+            .into()),
+        };
+    row.fields
+        .get(&field_name)
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "{} indexed update branch {} TEXT field `{field_name}` is missing or not TEXT",
+                report_path.display(),
+                op.id.0
+            )
+            .into()
+        })
+}
+
+fn expected_indexed_text_input_label(
+    plan: &boon_plan::MachinePlan,
+    input: &boon_plan::ValueRef,
+) -> String {
+    match input {
+        boon_plan::ValueRef::State(state_id) => plan_state_label(plan, state_id.0),
+        boon_plan::ValueRef::Field(field_id) => plan_semantic_field_label(plan, field_id.0),
+        other => format!("{other:?}"),
+    }
+}
+
+fn expected_indexed_text_input_access_json(
+    plan: &boon_plan::MachinePlan,
+    input: &boon_plan::ValueRef,
+) -> JsonValue {
+    match input {
+        boon_plan::ValueRef::State(state_id) => json!({
+            "input_kind": "state",
+            "input_state_id": state_id.0,
+        }),
+        boon_plan::ValueRef::Field(field_id) => json!({
+            "input_kind": "field",
+            "input_field_id": field_id.0,
+            "input_field": plan_semantic_field_label(plan, field_id.0),
+        }),
+        _ => JsonValue::Null,
+    }
+}
+
 fn expected_indexed_row_inline_bytes(
     plan: &boon_plan::MachinePlan,
     row: &ExpectedPlanListRowState,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
     op: &boon_plan::PlanOp,
     report_path: &Path,
 ) -> RuntimeResult<Vec<u8>> {
@@ -14855,10 +16980,243 @@ fn expected_indexed_row_inline_bytes(
     Ok(bytes.clone())
 }
 
+fn expected_indexed_bytes_equal_inputs(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(Vec<u8>, JsonValue, Vec<u8>, JsonValue)> {
+    let mut inputs = Vec::new();
+    for input in &op.inputs {
+        if matches!(
+            input,
+            boon_plan::ValueRef::State(_) | boon_plan::ValueRef::Field(_)
+        ) && !inputs.contains(input)
+        {
+            inputs.push(input.clone());
+        }
+    }
+    let [left, right] = inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed Bytes/equal update branch {} expected two BYTES state/field inputs, found {}",
+            report_path.display(),
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    let (left_bytes, left_access) =
+        expected_indexed_bytes_equal_input(plan, row, op, left, "left", report_path)?;
+    let (right_bytes, right_access) =
+        expected_indexed_bytes_equal_input(plan, row, op, right, "right", report_path)?;
+    Ok((left_bytes, left_access, right_bytes, right_access))
+}
+
+fn expected_indexed_bytes_equal_input(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    input: &boon_plan::ValueRef,
+    role: &str,
+    report_path: &Path,
+) -> RuntimeResult<(Vec<u8>, JsonValue)> {
+    let (field_name, input_kind, input_id, byte_bank_declared) = match input {
+        boon_plan::ValueRef::State(state_id) => (
+            local_field_name(&plan_state_label(plan, state_id.0)),
+            "state",
+            state_id.0,
+            expected_indexed_state_has_fixed_byte_bank(plan, *state_id),
+        ),
+        boon_plan::ValueRef::Field(field_id) => (
+            local_field_name(&plan_semantic_field_label(plan, field_id.0)),
+            "field",
+            field_id.0,
+            false,
+        ),
+        _ => {
+            return Err(format!(
+                "{} indexed Bytes/equal update branch {} {role} input is not a state or row field",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+    };
+    let public_value = row.fields.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed Bytes/equal update branch {} {role} row field `{field_name}` is missing",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if public_value.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES") {
+        return Err(format!(
+            "{} indexed Bytes/equal update branch {} {role} row field `{field_name}` is not BYTES",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed Bytes/equal update branch {} {role} row field `{field_name}` has no private BYTES state",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if expected_inline_bytes_summary(bytes) != *public_value {
+        return Err(format!(
+            "{} indexed Bytes/equal update branch {} {role} row field `{field_name}` public summary does not match private byte state",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let mut access = json!({
+        "role": role,
+        "input_kind": input_kind,
+        "input_id": input_id,
+        "access_source": if byte_bank_declared {
+            "indexed_fixed_byte_bank"
+        } else {
+            "indexed_row_private_bytes"
+        },
+        "cow_kind": "borrowed",
+        "byte_len": bytes.len(),
+        "byte_bank_declared": byte_bank_declared,
+        "byte_bank_used": byte_bank_declared,
+    });
+    if input_kind == "state" {
+        access["input_state_id"] = json!(input_id);
+    } else {
+        access["input_field_id"] = json!(input_id);
+    }
+    Ok((bytes.clone(), access))
+}
+
+fn expected_indexed_bytes_ordered_inputs(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    operation: &str,
+    report_path: &Path,
+) -> RuntimeResult<(Vec<u8>, JsonValue, Vec<u8>, JsonValue)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [left, right] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} expected two ordered BYTES state/field inputs, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    let (left_bytes, left_access) =
+        expected_indexed_bytes_input(plan, row, op, left, "left", operation, report_path)?;
+    let (right_bytes, right_access) =
+        expected_indexed_bytes_input(plan, row, op, right, "right", operation, report_path)?;
+    Ok((left_bytes, left_access, right_bytes, right_access))
+}
+
+fn expected_indexed_bytes_input(
+    plan: &boon_plan::MachinePlan,
+    row: &ExpectedPlanListRowState,
+    op: &boon_plan::PlanOp,
+    input: &boon_plan::ValueRef,
+    role: &str,
+    operation: &str,
+    report_path: &Path,
+) -> RuntimeResult<(Vec<u8>, JsonValue)> {
+    let (field_name, input_kind, input_id, byte_bank_declared) = match input {
+        boon_plan::ValueRef::State(state_id) => (
+            local_field_name(&plan_state_label(plan, state_id.0)),
+            "state",
+            state_id.0,
+            expected_indexed_state_has_fixed_byte_bank(plan, *state_id),
+        ),
+        boon_plan::ValueRef::Field(field_id) => (
+            local_field_name(&plan_semantic_field_label(plan, field_id.0)),
+            "field",
+            field_id.0,
+            false,
+        ),
+        _ => {
+            return Err(format!(
+                "{} indexed {operation} update branch {} {role} input is not a state or row field",
+                report_path.display(),
+                op.id.0
+            )
+            .into());
+        }
+    };
+    let public_value = row.fields.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed {operation} update branch {} {role} row field `{field_name}` is missing",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if public_value.get("$boon_type").and_then(JsonValue::as_str) != Some("BYTES") {
+        return Err(format!(
+            "{} indexed {operation} update branch {} {role} row field `{field_name}` is not BYTES",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
+        format!(
+            "{} indexed {operation} update branch {} {role} row field `{field_name}` has no private BYTES state",
+            report_path.display(),
+            op.id.0
+        )
+    })?;
+    if expected_inline_bytes_summary(bytes) != *public_value {
+        return Err(format!(
+            "{} indexed {operation} update branch {} {role} row field `{field_name}` public summary does not match private byte state",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let mut access = json!({
+        "role": role,
+        "input_kind": input_kind,
+        "input_id": input_id,
+        "access_source": if byte_bank_declared {
+            "indexed_fixed_byte_bank"
+        } else {
+            "indexed_row_private_bytes"
+        },
+        "cow_kind": "borrowed",
+        "byte_len": bytes.len(),
+        "byte_bank_declared": byte_bank_declared,
+        "byte_bank_used": byte_bank_declared,
+    });
+    if input_kind == "state" {
+        access["input_state_id"] = json!(input_id);
+    } else {
+        access["input_field_id"] = json!(input_id);
+    }
+    Ok((bytes.clone(), access))
+}
+
+fn with_bytes_access_role(mut access: JsonValue, role: &str) -> JsonValue {
+    access["role"] = json!(role);
+    access
+}
+
 fn expected_root_single_state_input(
     op: &boon_plan::PlanOp,
     report_path: &Path,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let mut inputs = Vec::new();
     for input in &op.inputs {
         if let boon_plan::ValueRef::State(state_id) = input
@@ -14882,7 +17240,7 @@ fn expected_root_single_state_input(
 fn expected_root_bytes_equal_state_inputs(
     op: &boon_plan::PlanOp,
     report_path: &Path,
-) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+) -> RuntimeResult<(boon_plan::StateId, boon_plan::StateId)> {
     let mut inputs = Vec::new();
     for input in &op.inputs {
         if let boon_plan::ValueRef::State(state_id) = input
@@ -14906,7 +17264,7 @@ fn expected_root_bytes_equal_state_inputs(
 fn expected_root_bytes_concat_state_inputs(
     op: &boon_plan::PlanOp,
     report_path: &Path,
-) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+) -> RuntimeResult<(boon_plan::StateId, boon_plan::StateId)> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "{} root Bytes/concat update branch {} is not an update branch",
@@ -14953,7 +17311,7 @@ fn expected_root_bytes_ordered_state_inputs(
     op: &boon_plan::PlanOp,
     report_path: &Path,
     operation: &str,
-) -> RuntimeResult<(boon_ir::StateId, boon_ir::StateId)> {
+) -> RuntimeResult<(boon_plan::StateId, boon_plan::StateId)> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "{} root {operation} update branch {} is not an update branch",
@@ -14993,7 +17351,7 @@ fn expected_root_bytes_set_operands(
     op: &boon_plan::PlanOp,
     report_path: &Path,
 ) -> RuntimeResult<(
-    boon_ir::StateId,
+    boon_plan::StateId,
     usize,
     u8,
     boon_plan::PlanConstantId,
@@ -15087,7 +17445,7 @@ fn expected_indexed_bytes_set_operands(
     op: &boon_plan::PlanOp,
     report_path: &Path,
 ) -> RuntimeResult<(
-    boon_ir::StateId,
+    boon_plan::StateId,
     usize,
     u8,
     boon_plan::PlanConstantId,
@@ -15176,12 +17534,210 @@ fn expected_indexed_bytes_set_operands(
     Ok((*input, index, value, *index_constant_id, *value_constant_id))
 }
 
+fn expected_indexed_bytes_slice_operands(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(
+    boon_plan::StateId,
+    usize,
+    usize,
+    boon_plan::PlanConstantId,
+    boon_plan::PlanConstantId,
+)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed Bytes/slice update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(offset_constant_id),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} indexed Bytes/slice update branch {} expected state, offset, and byte_count operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} indexed Bytes/slice update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let offset = expected_usize_number_constant(
+        plan,
+        *offset_constant_id,
+        "indexed Bytes/slice",
+        "offset",
+        op,
+        report_path,
+    )?;
+    let byte_count = expected_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        "indexed Bytes/slice",
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((
+        *input,
+        offset,
+        byte_count,
+        *offset_constant_id,
+        *byte_count_constant_id,
+    ))
+}
+
+fn expected_indexed_bytes_count_operand(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+    operation: &str,
+) -> RuntimeResult<(boon_plan::StateId, usize, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        boon_plan::ValueRef::State(input),
+        boon_plan::ValueRef::Constant(byte_count_constant_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "{} indexed {operation} update branch {} expected state and byte_count operands, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if !op.inputs.contains(&boon_plan::ValueRef::State(*input)) {
+        return Err(format!(
+            "{} indexed {operation} update branch {} state operand is not declared as an op input",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let byte_count = expected_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        &format!("indexed {operation}"),
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((*input, byte_count, *byte_count_constant_id))
+}
+
+fn expected_indexed_bytes_zeros_operand(
+    plan: &boon_plan::MachinePlan,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<(usize, boon_plan::PlanConstantId)> {
+    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "{} indexed Bytes/zeros update branch {} is not an update branch",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    };
+    let [boon_plan::ValueRef::Constant(byte_count_constant_id)] = ordered_inputs.as_slice() else {
+        return Err(format!(
+            "{} indexed Bytes/zeros update branch {} expected byte_count constant operand, found {}",
+            report_path.display(),
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    if op.inputs.iter().any(|input| {
+        matches!(
+            input,
+            boon_plan::ValueRef::State(_) | boon_plan::ValueRef::Field(_)
+        )
+    }) {
+        return Err(format!(
+            "{} indexed Bytes/zeros update branch {} must not declare state or row-field inputs",
+            report_path.display(),
+            op.id.0
+        )
+        .into());
+    }
+    let byte_count = expected_usize_number_constant(
+        plan,
+        *byte_count_constant_id,
+        "indexed Bytes/zeros",
+        "byte_count",
+        op,
+        report_path,
+    )?;
+    Ok((byte_count, *byte_count_constant_id))
+}
+
+fn expected_usize_number_constant(
+    plan: &boon_plan::MachinePlan,
+    constant_id: boon_plan::PlanConstantId,
+    operation: &str,
+    label: &str,
+    op: &boon_plan::PlanOp,
+    report_path: &Path,
+) -> RuntimeResult<usize> {
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "{} {operation} update branch {} references missing {label} constant {}",
+                report_path.display(),
+                op.id.0,
+                constant_id.0
+            )
+        })?;
+    let boon_plan::PlanConstantValue::Number { value } = constant.value else {
+        return Err(format!(
+            "{} {operation} update branch {} {label} constant {} is not a number",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into());
+    };
+    usize::try_from(value).map_err(|_| {
+        format!(
+            "{} {operation} update branch {} {label} constant {} is negative or too large",
+            report_path.display(),
+            op.id.0,
+            constant_id.0
+        )
+        .into()
+    })
+}
+
 fn expected_root_bytes_slice_operands(
     plan: &boon_plan::MachinePlan,
     state: &serde_json::Map<String, JsonValue>,
     op: &boon_plan::PlanOp,
     report_path: &Path,
-) -> RuntimeResult<(boon_ir::StateId, usize, usize, JsonValue, JsonValue)> {
+) -> RuntimeResult<(boon_plan::StateId, usize, usize, JsonValue, JsonValue)> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "{} root Bytes/slice update branch {} is not an update branch",
@@ -15245,7 +17801,7 @@ fn expected_root_bytes_count_operand(
     op: &boon_plan::PlanOp,
     report_path: &Path,
     operation: &str,
-) -> RuntimeResult<(boon_ir::StateId, usize, JsonValue)> {
+) -> RuntimeResult<(boon_plan::StateId, usize, JsonValue)> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "{} root {operation} update branch {} is not an update branch",
@@ -15334,7 +17890,7 @@ fn expected_root_bytes_numeric_read_operands(
     report_path: &Path,
     operation: &str,
 ) -> RuntimeResult<(
-    boon_ir::StateId,
+    boon_plan::StateId,
     usize,
     usize,
     ExpectedBytesEndian,
@@ -15416,7 +17972,7 @@ fn expected_root_bytes_numeric_write_operands(
     report_path: &Path,
     operation: &str,
 ) -> RuntimeResult<(
-    boon_ir::StateId,
+    boon_plan::StateId,
     usize,
     usize,
     ExpectedBytesEndian,
@@ -15714,7 +18270,7 @@ fn expected_checked_bytes_slice(
 fn expected_validate_bytes_output_len(
     plan: &boon_plan::MachinePlan,
     op: &boon_plan::PlanOp,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     actual_len: usize,
     operation: &str,
     report_path: &Path,
@@ -15753,7 +18309,7 @@ fn expected_root_text_bytes_conversion_operands(
     op: &boon_plan::PlanOp,
     report_path: &Path,
     operation: &str,
-) -> RuntimeResult<(boon_ir::StateId, String, boon_plan::PlanConstantId)> {
+) -> RuntimeResult<(boon_plan::StateId, String, boon_plan::PlanConstantId)> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
         return Err(format!(
             "{} root {operation} update branch {} is not an update branch",
@@ -15828,7 +18384,7 @@ fn expected_root_single_source_payload_input(
     op: &boon_plan::PlanOp,
     active_source_id: usize,
     report_path: &Path,
-) -> RuntimeResult<Option<boon_ir::SourcePayloadField>> {
+) -> RuntimeResult<Option<boon_plan::SourcePayloadField>> {
     let mut inputs = Vec::new();
     for input in &op.inputs {
         if let boon_plan::ValueRef::SourcePayload { source_id, field } = input
@@ -15852,9 +18408,9 @@ fn expected_root_single_source_payload_input(
 
 fn expected_root_text_trim_input(
     op: &boon_plan::PlanOp,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     report_path: &Path,
-) -> RuntimeResult<boon_ir::StateId> {
+) -> RuntimeResult<boon_plan::StateId> {
     let mut non_output_inputs = Vec::new();
     let mut output_present = false;
     for input in &op.inputs {
@@ -15888,7 +18444,7 @@ fn expected_root_text_trim_input(
 fn expected_root_state_value<'a>(
     plan: &boon_plan::MachinePlan,
     state: &'a serde_json::Map<String, JsonValue>,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
     op: &boon_plan::PlanOp,
     report_path: &Path,
 ) -> RuntimeResult<&'a JsonValue> {
@@ -15907,7 +18463,7 @@ fn expected_root_state_inline_bytes(
     plan: &boon_plan::MachinePlan,
     state: &serde_json::Map<String, JsonValue>,
     bytes_state: &ExpectedRootBytesState,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
     op: &boon_plan::PlanOp,
     report_path: &Path,
 ) -> RuntimeResult<Vec<u8>> {
@@ -16880,7 +19436,7 @@ fn expected_later_indexed_derived_feeding_states_for_source(
     plan: &boon_plan::MachinePlan,
     source_id: usize,
     current_op_id: usize,
-) -> Vec<boon_ir::StateId> {
+) -> Vec<boon_plan::StateId> {
     plan.regions
         .iter()
         .filter(|region| region.kind == boon_plan::RegionKind::UpdateBranches)
@@ -16890,7 +19446,7 @@ fn expected_later_indexed_derived_feeding_states_for_source(
                 || op.id.0 <= current_op_id
                 || !op
                     .inputs
-                    .contains(&boon_plan::ValueRef::Source(boon_ir::SourceId(source_id)))
+                    .contains(&boon_plan::ValueRef::Source(boon_plan::SourceId(source_id)))
             {
                 return None;
             }
@@ -16905,7 +19461,7 @@ fn expected_later_indexed_derived_feeding_states_for_source(
 
 fn expected_indexed_state_feeds_indexed_derived_expression(
     plan: &boon_plan::MachinePlan,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
 ) -> bool {
     plan.regions
         .iter()
@@ -16928,7 +19484,7 @@ fn expected_indexed_state_feeds_indexed_derived_expression(
 
 fn expected_plan_derived_expression_contains_state(
     expression: &boon_plan::PlanDerivedExpression,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
 ) -> bool {
     match expression {
         boon_plan::PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state, .. } => {
@@ -16955,7 +19511,7 @@ fn expected_plan_derived_expression_contains_state(
 
 fn expected_plan_row_expression_contains_state(
     expression: &boon_plan::PlanRowExpression,
-    state_id: boon_ir::StateId,
+    state_id: boon_plan::StateId,
 ) -> bool {
     match expression {
         boon_plan::PlanRowExpression::Field { input } => {
@@ -17148,7 +19704,7 @@ fn expected_eval_indexed_derived_row_value(
     list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
     row: &ExpectedPlanListRowState,
     op: &boon_plan::PlanOp,
-    output_id: boon_ir::FieldId,
+    output_id: boon_plan::FieldId,
     report_path: &Path,
 ) -> RuntimeResult<Option<JsonValue>> {
     let boon_plan::PlanOpKind::DerivedValue {
@@ -17308,7 +19864,7 @@ fn expected_row_bool_not_deltas(
 fn expected_value_for_plan_ref(
     plan: &boon_plan::MachinePlan,
     value_ref: &boon_plan::ValueRef,
-    derived_values: &BTreeMap<boon_ir::FieldId, JsonValue>,
+    derived_values: &BTreeMap<boon_plan::FieldId, JsonValue>,
     row_fields: Option<&BTreeMap<String, JsonValue>>,
     report_path: &Path,
 ) -> RuntimeResult<Option<JsonValue>> {
@@ -18796,9 +21352,9 @@ fn expected_root_scalar_update(
 
 fn expected_source_payload_value_for_output(
     plan: &boon_plan::MachinePlan,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     source_event: &serde_json::Map<String, JsonValue>,
-    field: &boon_ir::SourcePayloadField,
+    field: &boon_plan::SourcePayloadField,
     report_path: &Path,
 ) -> RuntimeResult<(JsonValue, Option<Vec<u8>>)> {
     let slot = plan
@@ -18814,7 +21370,7 @@ fn expected_source_payload_value_for_output(
             )
         })?;
     match field {
-        boon_ir::SourcePayloadField::Bytes => {
+        boon_plan::SourcePayloadField::Bytes => {
             let boon_plan::PlanValueType::Bytes { fixed_len } = &slot.value_type else {
                 return Err(format!(
                     "{} source-payload BYTES update targets non-BYTES state `{}`",
@@ -18836,10 +21392,10 @@ fn expected_source_payload_value_for_output(
             }
             Ok((expected_dynamic_bytes_summary(&bytes), Some(bytes)))
         }
-        boon_ir::SourcePayloadField::Address
-        | boon_ir::SourcePayloadField::Key
-        | boon_ir::SourcePayloadField::Named(_)
-        | boon_ir::SourcePayloadField::Text => {
+        boon_plan::SourcePayloadField::Address
+        | boon_plan::SourcePayloadField::Key
+        | boon_plan::SourcePayloadField::Named(_)
+        | boon_plan::SourcePayloadField::Text => {
             if slot.value_type != boon_plan::PlanValueType::Text {
                 return Err(format!(
                     "{} source-payload text update targets non-TEXT state `{}`",
@@ -19208,7 +21764,7 @@ fn expected_row_expression_output_field_names(
 fn expected_row_expression_applies_to_list(
     plan: &boon_plan::MachinePlan,
     list_slot: &boon_plan::ListStorageSlot,
-    output_id: boon_ir::FieldId,
+    output_id: boon_plan::FieldId,
 ) -> bool {
     plan.debug_map
         .fields
@@ -20364,7 +22920,7 @@ fn expected_eval_plan_row_expression_with_stack(
 
 fn expected_eval_plan_row_list_ref(
     list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
-    list_id: boon_ir::ListId,
+    list_id: boon_plan::ListId,
     report_path: &Path,
 ) -> RuntimeResult<JsonValue> {
     let rows = list_state.get(&list_id.0).ok_or_else(|| {
@@ -20499,7 +23055,7 @@ fn expected_row_value_to_text(value: &JsonValue, report_path: &Path) -> RuntimeR
 
 fn expected_plan_row_field_local_name(
     plan: &boon_plan::MachinePlan,
-    field_id: boon_ir::FieldId,
+    field_id: boon_plan::FieldId,
 ) -> String {
     local_field_name(&plan_semantic_field_label(plan, field_id.0))
 }
@@ -20507,9 +23063,9 @@ fn expected_plan_row_field_local_name(
 fn expected_eval_plan_row_lookup_field(
     plan: &boon_plan::MachinePlan,
     list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
-    list_id: boon_ir::ListId,
+    list_id: boon_plan::ListId,
     row: &ExpectedPlanListRowState,
-    field: boon_ir::FieldId,
+    field: boon_plan::FieldId,
     report_path: &Path,
     stack: &[ExpectedPlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
@@ -20546,7 +23102,7 @@ fn expected_eval_plan_row_lookup_field(
 
 fn expected_plan_indexed_row_expression_for_field(
     plan: &boon_plan::MachinePlan,
-    field: boon_ir::FieldId,
+    field: boon_plan::FieldId,
 ) -> Option<&boon_plan::PlanRowExpression> {
     plan.regions
         .iter()
@@ -21492,6 +24048,7 @@ fn expected_materialize_plan_list_retains(
             .summary
             .insert(target_label.clone(), summary.clone());
         execution.reports.push(json!({
+            "executor": "cpu-plan-list-retain-materializer-v1",
             "op_id": op.id.0,
             "kind": "retain",
             "target_field_id": target_field_id.0,
@@ -21811,13 +24368,106 @@ fn first_array_mismatch_detail(actual: Option<&JsonValue>, expected: &JsonValue)
                 .into_iter()
                 .filter(|key| actual_item.get(key) != expected_item.get(key))
                 .collect::<Vec<_>>();
+            let first_key_detail = differing_keys
+                .first()
+                .map(|key| {
+                    format!(
+                        "; first differing key `{key}`{} actual={} expected={}",
+                        first_json_difference_path(actual_item.get(key), expected_item.get(key))
+                            .map(|path| format!(" at {path}"))
+                            .unwrap_or_default(),
+                        compact_json_for_error(actual_item.get(key)),
+                        compact_json_for_error(expected_item.get(key))
+                    )
+                })
+                .unwrap_or_default();
             return format!(
-                "index {index} actual_step `{actual_step}` expected_step `{expected_step}` differing keys {:?}",
-                differing_keys
+                "index {index} actual_step `{actual_step}` expected_step `{expected_step}` differing keys {:?}{first_key_detail}",
+                differing_keys,
             );
         }
     }
     "no localized mismatch found".to_owned()
+}
+
+fn compact_json_for_error(value: Option<&JsonValue>) -> String {
+    const LIMIT: usize = 900;
+    let Some(value) = value else {
+        return "<missing>".to_owned();
+    };
+    let mut text = serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_owned());
+    if text.len() > LIMIT {
+        text.truncate(LIMIT);
+        text.push_str("...");
+    }
+    text
+}
+
+fn first_json_difference_path(
+    actual: Option<&JsonValue>,
+    expected: Option<&JsonValue>,
+) -> Option<String> {
+    fn inner(actual: &JsonValue, expected: &JsonValue, path: &mut String) -> bool {
+        if actual == expected {
+            return false;
+        }
+        match (actual, expected) {
+            (JsonValue::Array(actual_items), JsonValue::Array(expected_items)) => {
+                let min_len = actual_items.len().min(expected_items.len());
+                for index in 0..min_len {
+                    let original_len = path.len();
+                    path.push_str(&format!("[{index}]"));
+                    if inner(&actual_items[index], &expected_items[index], path) {
+                        return true;
+                    }
+                    path.truncate(original_len);
+                }
+                path.push_str(&format!(
+                    ".len(actual={},expected={})",
+                    actual_items.len(),
+                    expected_items.len()
+                ));
+                true
+            }
+            (JsonValue::Object(actual_object), JsonValue::Object(expected_object)) => {
+                let mut keys = BTreeSet::new();
+                keys.extend(actual_object.keys());
+                keys.extend(expected_object.keys());
+                for key in keys {
+                    if actual_object.get(key) != expected_object.get(key) {
+                        path.push('.');
+                        path.push_str(key);
+                        if let (Some(actual_child), Some(expected_child)) =
+                            (actual_object.get(key), expected_object.get(key))
+                        {
+                            inner(actual_child, expected_child, path);
+                        }
+                        return true;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            let mut path = String::new();
+            if inner(actual, expected, &mut path) {
+                Some(if path.is_empty() {
+                    "<root>".to_owned()
+                } else {
+                    path
+                })
+            } else {
+                None
+            }
+        }
+        (None, None) => None,
+        (Some(_), None) => Some("<expected-missing>".to_owned()),
+        (None, Some(_)) => Some("<actual-missing>".to_owned()),
+    }
 }
 
 fn normalized_plan_executor_per_step_for_semantic_compare(value: &JsonValue) -> JsonValue {
@@ -21834,6 +24484,8 @@ fn normalized_plan_executor_per_step_for_semantic_compare(value: &JsonValue) -> 
                 let mut normalized = object.clone();
                 normalized.remove("bytes_storage_counters");
                 normalized.remove("bytes_storage_no_copy");
+                normalized.remove("executor_core");
+                normalized.remove("report_assembly_core");
                 if let Some(updates) = normalized
                     .get_mut("updates")
                     .and_then(JsonValue::as_array_mut)
@@ -21841,6 +24493,9 @@ fn normalized_plan_executor_per_step_for_semantic_compare(value: &JsonValue) -> 
                     for update in updates {
                         if let Some(update_object) = update.as_object_mut() {
                             update_object.remove("bytes_access");
+                            update_object.remove("bytes_state_core");
+                            update_object.remove("executor_core");
+                            update_object.remove("state_write_core");
                         }
                     }
                 }
@@ -22079,11 +24734,11 @@ fn source_event_payload_bytes_artifact(bytes: &[u8]) -> JsonValue {
 
 fn expected_source_payload_json_value(
     source_event: &serde_json::Map<String, JsonValue>,
-    field: &boon_ir::SourcePayloadField,
+    field: &boon_plan::SourcePayloadField,
     report_path: &Path,
 ) -> RuntimeResult<JsonValue> {
     match field {
-        boon_ir::SourcePayloadField::Text => source_event
+        boon_plan::SourcePayloadField::Text => source_event
             .get("text")
             .filter(|value| !value.is_null())
             .cloned()
@@ -22094,7 +24749,7 @@ fn expected_source_payload_json_value(
                 )
                 .into()
             }),
-        boon_ir::SourcePayloadField::Key => source_event
+        boon_plan::SourcePayloadField::Key => source_event
             .get("key")
             .filter(|value| !value.is_null())
             .cloned()
@@ -22105,7 +24760,7 @@ fn expected_source_payload_json_value(
                 )
                 .into()
             }),
-        boon_ir::SourcePayloadField::Address => source_event
+        boon_plan::SourcePayloadField::Address => source_event
             .get("address")
             .filter(|value| !value.is_null())
             .cloned()
@@ -22116,11 +24771,11 @@ fn expected_source_payload_json_value(
                 )
                 .into()
             }),
-        boon_ir::SourcePayloadField::Bytes => {
+        boon_plan::SourcePayloadField::Bytes => {
             let bytes = source_event_payload_bytes(source_event, report_path)?;
             Ok(expected_inline_bytes_summary(&bytes))
         }
-        boon_ir::SourcePayloadField::Named(name) => source_event
+        boon_plan::SourcePayloadField::Named(name) => source_event
             .get("payload")
             .and_then(JsonValue::as_object)
             .and_then(|payload| payload.get(name))
@@ -22329,7 +24984,8 @@ struct ExpectedRouteExecution {
     source_id: usize,
     target_state_id: usize,
     update_op_id: usize,
-    expression_kind: &'static str,
+    selected_op_indexed: bool,
+    expression_kind: String,
     source_payload_field: JsonValue,
     update_constant_id: JsonValue,
     update_constant_value: JsonValue,
@@ -22377,13 +25033,6 @@ fn expected_route_execution(
                 report_path.display()
             )
         })?;
-    if source_route_slot.scoped {
-        return Err(format!(
-            "{} run-plan-route schema accepts only unscoped root route proofs",
-            report_path.display()
-        )
-        .into());
-    }
     let route_ops = plan
         .regions
         .iter()
@@ -22403,13 +25052,93 @@ fn expected_route_execution(
         )
         .into());
     };
-    if op.indexed || op.unresolved_executable_ref_count != 0 {
-        return Err(format!(
-            "{} selected route op is indexed or unresolved",
-            report_path.display()
-        )
-        .into());
+    if op.unresolved_executable_ref_count != 0 {
+        return Err(format!("{} selected route op is unresolved", report_path.display()).into());
     }
+    let scenario = route_scenario_from_source_event(source_event, report_path)?;
+    let selected_step_ids = vec!["live-source-event-0".to_owned()];
+    let full_expected =
+        expected_root_scalar_scenario_execution(plan, &scenario, &selected_step_ids, report_path)?;
+
+    if op.indexed {
+        let mut matches = Vec::new();
+        for step in full_expected.per_step.as_array().ok_or_else(|| {
+            format!(
+                "{} expected per_step is not an array",
+                report_path.display()
+            )
+        })? {
+            let Some(indexed_updates) = step.get("indexed_updates").and_then(JsonValue::as_array)
+            else {
+                continue;
+            };
+            for update in indexed_updates {
+                if update.get("update_op_id").and_then(JsonValue::as_u64) == Some(op.id.0 as u64)
+                    && update.get("target_state_id").and_then(JsonValue::as_u64)
+                        == Some(target_state_id as u64)
+                {
+                    matches.push(update.clone());
+                }
+            }
+        }
+        let [indexed_update] = matches.as_slice() else {
+            return Err(format!(
+                "{} expected exactly one indexed route update for `{source}` -> `{target_state}`, found {}",
+                report_path.display(),
+                matches.len()
+            )
+            .into());
+        };
+        let expected_value = indexed_update.get("value").cloned().ok_or_else(|| {
+            format!(
+                "{} indexed route update has no value",
+                report_path.display()
+            )
+        })?;
+        let expression_kind = indexed_update
+            .get("expression_kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} indexed route update has no expression_kind",
+                    report_path.display()
+                )
+            })?
+            .to_owned();
+        return Ok(ExpectedRouteExecution {
+            source_id,
+            target_state_id,
+            update_op_id: op.id.0,
+            selected_op_indexed: true,
+            expression_kind,
+            source_payload_field: indexed_update
+                .get("source_payload_field")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+            update_constant_id: indexed_update
+                .get("update_constant_id")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+            update_constant_value: indexed_update
+                .get("update_constant_value")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+            expected_value,
+            payload_schema: serde_json::to_value(&source_route_slot.payload_schema)?,
+            full_state_summary: full_expected.state_summary,
+            semantic_delta_signatures: full_expected.semantic_delta_signatures,
+            semantic_deltas: full_expected.semantic_deltas,
+            per_step: full_expected.per_step,
+            executed_update_branch_count: full_expected.executed_update_branch_count,
+            executed_derived_value_count: full_expected.executed_derived_value_count,
+            executed_list_append_count: full_expected.executed_list_append_count,
+            executed_list_remove_count: full_expected.executed_list_remove_count,
+            executed_indexed_update_count: full_expected.executed_indexed_update_count,
+            emitted_source_bind_count: full_expected.emitted_source_bind_count,
+            emitted_source_unbind_count: full_expected.emitted_source_unbind_count,
+        });
+    }
+
     let (root_state, bytes_state, _) = expected_root_scalar_initial_state(plan, report_path)?;
     let expected_update = expected_root_scalar_update(
         plan,
@@ -22428,10 +25157,6 @@ fn expected_route_execution(
             op.id.0
         )
     })?;
-    let scenario = route_scenario_from_source_event(source_event, report_path)?;
-    let selected_step_ids = vec!["live-source-event-0".to_owned()];
-    let full_expected =
-        expected_root_scalar_scenario_execution(plan, &scenario, &selected_step_ids, report_path)?;
     let full_expected_value = json_value_at_dotted_path(&full_expected.state_summary, target_state)
         .cloned()
         .ok_or_else(|| {
@@ -22451,7 +25176,8 @@ fn expected_route_execution(
         source_id,
         target_state_id,
         update_op_id: op.id.0,
-        expression_kind: expected_update.expression_kind,
+        selected_op_indexed: false,
+        expression_kind: expected_update.expression_kind.to_owned(),
         source_payload_field: expected_update.source_payload_field,
         update_constant_id: expected_update.update_constant_id,
         update_constant_value: expected_update.update_constant_value,
@@ -22617,7 +25343,7 @@ fn expected_private_bytes_from_plan_constant_value(
 
 fn expected_constant_private_bytes_for_output(
     plan: &boon_plan::MachinePlan,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     constant: &boon_plan::PlanConstant,
     report_path: &Path,
 ) -> RuntimeResult<Option<Vec<u8>>> {
@@ -26248,7 +28974,8 @@ fn verify_report_source_files_hash(
         return Ok(false);
     }
     let actual = sha256_combined_source_files(&paths)?;
-    if actual != expected {
+    let legacy_actual = sha256_combined_source_file_digests(&paths)?;
+    if actual != expected && legacy_actual != expected {
         return Err(format!(
             "{} has stale `source_hash` for manifest {files_key}",
             report_path.display()
@@ -26259,6 +28986,20 @@ fn verify_report_source_files_hash(
 }
 
 fn sha256_combined_source_files(paths: &[&str]) -> RuntimeResult<String> {
+    if paths.len() == 1 {
+        return Ok(sha256_bytes(&fs::read(paths[0])?));
+    }
+    let mut canonical = Vec::new();
+    for path in paths {
+        canonical.extend_from_slice(path.as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(&fs::read(path)?);
+        canonical.push(0xff);
+    }
+    Ok(sha256_bytes(&canonical))
+}
+
+fn sha256_combined_source_file_digests(paths: &[&str]) -> RuntimeResult<String> {
     if paths.len() == 1 {
         return Ok(sha256_bytes(&fs::read(paths[0])?));
     }
@@ -29165,6 +31906,41 @@ expected_source_event = {{ source = "store.input.change", text = "Typed payload"
 
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn expected_plan_source_guard_matches_bytes_payload_hex() {
+        let guard = Some(boon_plan::PlanSourceGuard::SourcePayloadOneOf {
+            source_id: boon_plan::SourceId(9),
+            field: boon_plan::SourcePayloadField::Bytes,
+            values: vec!["00".to_owned(), "01 fe 04".to_owned()],
+        });
+        let mut source_event = serde_json::Map::new();
+        source_event.insert(
+            "payload_bytes".to_owned(),
+            json!({
+                "bytes": source_event_payload_bytes_artifact(&[0x01, 0xfe, 0x04]),
+            }),
+        );
+        assert!(
+            expected_plan_source_guard_matches(&guard, 9, &source_event, Path::new("test-report"))
+                .expect("matching BYTES guard should replay")
+        );
+
+        let non_matching_guard = Some(boon_plan::PlanSourceGuard::SourcePayloadOneOf {
+            source_id: boon_plan::SourceId(9),
+            field: boon_plan::SourcePayloadField::Bytes,
+            values: vec!["01fe05".to_owned()],
+        });
+        assert!(
+            !expected_plan_source_guard_matches(
+                &non_matching_guard,
+                9,
+                &source_event,
+                Path::new("test-report"),
+            )
+            .expect("non-matching BYTES guard should replay")
+        );
     }
 
     #[test]

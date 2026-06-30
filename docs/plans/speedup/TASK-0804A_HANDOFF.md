@@ -1,12 +1,24 @@
 # TASK-0804A Handoff: Cells Demand-Driven Speed Blocker
 
 Date: 2026-06-25
-Updated: 2026-06-27
+Updated: 2026-06-28
 
 Status: historically this was unfinished and explicitly postponed. As of the
 2026-06-27 refresh, the focused Cells runtime/currentness/input gates now pass
 on fresh reports. This is still not a default-switch completion claim and does
 not replace the full native GPU handoff gate set.
+
+2026-06-28 manual observation update: do not treat the 2026-06-27 focused
+passes as proof that visible Cells selection is fully fixed. A fresh human
+observation reports that clicking/focusing a cell may reveal the cell-local
+formula/value state correctly, while the main formula text input above the
+grid remains visually stale. That symptom points more specifically at
+`store.selected_input` currentness, bound text-input sync, or retained
+formula-bar patching than at raw mouse delivery. Future Cells verification must
+measure this exact visible transition: click a cell whose formula differs from
+the previous selected cell, then prove both runtime
+`store.selected_input.editing_text` and the formula-bar text-input pixels/bound
+text update to the expected formula within the interaction budget.
 
 This file exists so another AI can start from the real evidence instead of
 repeating the same blind debugging loop.
@@ -1016,3 +1028,367 @@ Remaining architecture options:
 - Runtime/list/currentness work should not resume unless counters regress:
   latest visible-click evidence still shows targeted patch paths, zero
   `List/find` scans, no full summary scan, and no generic click fallback.
+
+## 2026-06-29 Formula-Bar Visible Click Follow-Up
+
+User observation: focusing a cell appeared to resolve the cell formula, but the
+main formula input above the Cells grid could remain visually stale. The old
+visible-click report was too easy to trust because it asserted runtime/frame
+text and accepted retained-bound sync without forcing the formula-bar text nodes
+into the direct render-scene patch.
+
+Implemented fix:
+
+- cached native surface size from resize callbacks to avoid an extra hot-loop
+  `size_scale().await` before input polling;
+- expanded retained bound text-input sync to include selection-dependent
+  formula-bar bindings;
+- added retained bound text-update nodes to the native input-overlay
+  render-scene patch so the cached base scene is reused but formula-bar
+  text/address chunks are replaced.
+
+Fresh focused evidence:
+
+- `cargo fmt --all`: pass.
+- Focused `boon_native_playground` tests for retained content revision,
+  focus-only formula-bar sync, and real-window click/formula-bar sync: pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --expected-formula '=add(A0,A1)' --report target/reports/native-gpu/cells-visible-click-e2e-b0-current.json`:
+  pass.
+- The refreshed B0 report has `input_wake_to_formula_visible_ms=15.365523999999825`,
+  `click_to_formula_visible_ms=22.013412`, `render_scene_cache_hit=true`,
+  `render_scene_cache_ms=0.28293300000000005`,
+  `input_overlay_render_scene_patch_touched_node_count=4`, zero runtime
+  scans/recompute/root materialization, and formula-bar text
+  `=add(A0,A1)`.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --report target/reports/native-gpu/cells-visible-click-e2e-a2-current.json`:
+  pass.
+- The refreshed A2 report has `formula_bar_text="15"`,
+  `input_wake_to_formula_visible_ms=14.410942000000432`,
+  `click_to_formula_visible_ms=21.336541`, zero runtime
+  scans/recompute/root materialization, and `selected_address="A2"`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-current.json`:
+  pass.
+
+Do not mark TASK-0804A complete from this alone. The remaining acceptance still
+needs the full multi-target Cells interaction-speed, scroll-speed, preview E2E,
+headed, schema aggregate, and 60 FPS report refreshes. Also harden the verifier
+with a cropped formula-bar pixel/readback artifact or equivalent app-owned
+pixel inventory.
+
+Follow-up status:
+
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`:
+  pass.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass after refreshing the headed child report, with
+  `interaction_latency_ms_p95=8.572534999999998`,
+  `interaction_latency_ms_max=13.825261`, `logical_cell_count=2600`,
+  `rendered_cell_count=210`, `materialized_cell_count_max=240`,
+  and `formula_evaluated_cell_count_max=4`.
+- `BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED=1 target/debug/xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`:
+  still fails. The run proves real-window wheel delivery, two native child
+  windows, installed app-window wheel adapter, and per-window input provenance,
+  but the isolated launch proof reports
+  `isolated Weston native launch did not prove real-window wheel delivery for this native scroll run`.
+- Manual COSMIC workspace launch is separately blocked by
+  `org.freedesktop.DBus.Error.ServiceUnknown`. Do not treat that as a Cells
+  click/formula-bar runtime failure without a fresh manual launch path.
+
+Update:
+
+- The scroll-speed verifier contract was corrected so the isolated scroll step
+  checks wheel-delivery evidence directly instead of inheriting an unrelated
+  shared desktop supervisor status failure.
+- `BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED=1 target/debug/xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/scroll-speed-cells.json`:
+  pass.
+- Fresh scroll evidence has `evidence_tier="real-window"`,
+  `real_wheel_input=true`, vertical and horizontal real-window wheel input both
+  true, no per-step failures, and the nested isolated shared-launch proof still
+  honestly records its unrelated `status="fail"` while exposing
+  `driver_pass=true`, `desktop_pass=true`, `measured_loop_pass=true`,
+  `real_os_events_observed=true`, `driver_effect_observed=true`, and
+  `wheel_events=4`.
+
+## 2026-06-30 Cells Formula-Bar Headed Proof and Speed Refresh
+
+Status: refreshed the exact user-observed Cells click/focus symptom in the
+native headed and interaction-speed gates. The top formula input above the
+Cells grid is now covered by app-owned native events plus WGPU/readback
+evidence; the final headed C0 click asserts both runtime
+`/store/selected_input/editing_text` and the retained formula-bar text node as
+`=sum(A0:A2)`.
+
+Implemented fix:
+
+- Added a configurable headed-scenario timeout to the native preview role and
+  xtask wrapper. Cells uses a longer runner timeout/hold because all steps were
+  already passing but the old fixed 12s runner timeout could fail at the final
+  formula-bar assertion.
+- Prefer the already-current `store.selected_input` summary when refreshing
+  focused Cells text instead of recursively scanning visible list summaries
+  first. This keeps the generic selected-input/currentness path hot without
+  adding a Cells Boon workaround or shrinking the grid.
+
+Fresh evidence:
+
+- `RUSTFLAGS='-Awarnings' cargo check -q -p xtask -p boon_native_playground`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo test -q -p boon_native_playground cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path -- --nocapture`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text -- --nocapture`:
+  pass.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`:
+  pass with `visual_capture_method="app-owned-wgpu-readback-with-visible-cursor-overlay"`,
+  `cursor_visible=true`, `key_hud_visible=true`, scenario timeout `20000ms`,
+  and final formula-bar retained text `=sum(A0:A2)`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass with `requested_event_count=64`, `interaction_latency_ms_p95=13.40666`,
+  `interaction_latency_ms_max=16.604776`, `workflow_coverage_pass=true`,
+  `selection_formula_full_layout_count=0`, `logical_cell_count=2600`,
+  `materialized_cell_count_max=240`, `rendered_cell_count=210`,
+  `formula_evaluated_cell_count_max=4`, and
+  `formula_recomputed_field_count_max=6`.
+- `RUSTFLAGS='-Awarnings' cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu/headed-scenario-cells.json target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass.
+
+Remaining caution:
+
+- This clears the current native headed formula-bar proof and 64-event release
+  interaction-speed report, but the larger unified goal still needs the broader
+  native GPU aggregate/readiness refreshes and the non-Cells BYTES/MachinePlan
+  phases. Do not treat a manual desktop observation as evidence unless it is
+  backed by a fresh app-owned report.
+
+## 2026-06-30 Focused B0 Correctness Restored, Budget Still Misses
+
+Latest focused B0 work restored the proof boundary after the manual formula-bar
+and selected-cell concerns:
+
+- The top formula input and grid selected paint now both pass in app-owned WGPU
+  readback for B0.
+- The verifier now refreshes pre-click selected address/formula text after
+  calibration/preposition, so it no longer compares a B0 click against stale
+  initial A0 metadata when the immediate pre-click selected cell is C3.
+- The render-scene patch now preserves per-node draw order and no longer uses
+  the broad 243-visible-cell replacement path for ordinary selected-state
+  changes. Latest focused report has
+  `input_overlay_render_scene_patch_touched_node_count=5` and
+  `input_overlay_render_scene_patch_build_ms=0.321596`.
+
+Fresh focused command:
+
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --expected-formula '=add(A0,A1)' --report target/reports/native-gpu/cells-visible-click-e2e-b0-selected-current.json`
+
+Latest status:
+
+- Still fail, but only on the strict timing budget:
+  `input_wake_to_formula_visible_ms=18.68868500000008 > 16.7`.
+- Correctness fields pass:
+  `sample_status="pass"`, `visual_formula_probe.status="pass"`,
+  `selected_cell_visual_pass=true`, selected address `B0`, formula text
+  `=add(A0,A1)`.
+- Remaining timing shape:
+  native input `total_ms=7.122748`,
+  `selection_proxy_refresh_ms=4.33797`,
+  render hook `total_before_report_json_ms=2.439897`,
+  `present_call_ms=8.124693`.
+
+Next return should focus on native scheduling and indexed retained selection
+state. Do not reintroduce the broad visible selectable-node render patch unless
+previous/current selected identity is unavailable; that path fixed correctness
+but made the patch cost too high.
+
+Follow-up update:
+
+- Retained selection state is now indexed enough for the focused B0 hot path.
+  Latest report has native input `total_ms=2.430272`,
+  `selection_proxy_refresh_ms=0.324137`,
+  `selected_overlay_patch_ms=0.32217`,
+  `selection_proxy_text_refresh_ms=0.001298`, and
+  `selection_focus_overlay_state_ms=0.0005589999999999999`.
+- Render hook remains bounded:
+  `input_overlay_render_scene_patch_build_ms=0.313894`,
+  `total_before_report_json_ms=2.53656`.
+- The focused gate still fails on timing:
+  `input_wake_to_formula_visible_ms=26.32301499999994 > 16.7`.
+- Remaining timing shape now points at native loop scheduling/present:
+  `input_wake_to_dirty_poll_ms=14.202577000000929`,
+  `present_call_ms=9.149435`.
+
+Next return should inspect native app-window input generation attribution and
+dirty-poll scheduling before doing more retained UI micro-optimizations.
+
+## 2026-06-30 Layout-Derived Formula-Bar Proof and Offscreen Timing Probe
+
+Follow-up tightened the focused B0 visible-click verifier instead of trusting
+hardcoded crop coordinates:
+
+- `cells_visual_formula_probe_from_readback` now derives the top formula-bar
+  address label and text-input crop bounds from the app-owned layout artifact.
+  Latest proof resolves the formula input as `x=80,y=8,width=832,height=30`.
+- The formula-bar visual proof still passes with app-owned WGPU readback and
+  selected-cell crop proof; the main text input above the grid is therefore
+  covered by the report, not just retained-frame metadata.
+- Focused unit/schema checks passed:
+  `cargo test -q -p xtask cells_visual_formula_probe_requires_expected_formula_bar_text_value -- --nocapture`,
+  `cargo test -q -p boon_native_app_window requested_animation_can_repaint_existing_scheduler_only_content -- --nocapture`,
+  and `cargo xtask verify-report-schema` for the new reports.
+
+Architecture probe:
+
+- Enabling the existing `app-owned-offscreen-copy-to-present` path can pass the
+  focused B0 gate in one run:
+  `input_wake_to_formula_visible_ms=15.412932999999612`,
+  `input_wake_to_dirty_poll_ms=3.1144829999993817`, and
+  `render_target_kind="app-owned-offscreen-copy-to-present"`.
+- Making that path the demand-driven Preview default is not sufficient by
+  itself. A fresh default run still failed with
+  `input_wake_to_formula_visible_ms=29.39201099999991`,
+  `input_wake_to_dirty_poll_ms=13.959326999999575`, and
+  `present_call_ms=12.364903`, even though the report confirmed
+  `render_target_kind="app-owned-offscreen-copy-to-present"` and the visual
+  formula-bar proof passed.
+
+Current conclusion:
+
+- Do not spend the next iteration on more Cells formula/runtime micro-tuning for
+  this focused B0 miss. Runtime/source work is around 2.5-2.7ms and retained
+  render-patch work is bounded. The remaining miss is in native scheduling and
+  surface presentation timing: wake-to-poll can still consume most of a frame,
+  and `frame.present()` can block for another 9-12ms.
+- Next return should either make app-window input wake preempt the sleeping/
+  presenting loop more directly, or split render preparation/presentation so a
+  late input event can be sampled and committed before the next visible present.
+
+## 2026-06-30 Immediate Present Mode and Stale Readback Skip
+
+Focused B0 work moved the remaining miss from Cells formula/runtime into the
+native app-window presentation policy and fixed the current single-click gate.
+
+What changed:
+
+- `low_latency_present_mode` now prefers non-vsync modes before Mailbox:
+  `Immediate`, then `AutoNoVsync`, then `Mailbox`, then `Fifo`.
+- Demand-driven Preview still uses the app-owned offscreen copy-to-present path
+  when the surface supports `COPY_DST`.
+- The native loop now records `post_present_stale_readback_skip` and skips
+  finishing interactive readback for a frame if a newer input generation arrived
+  during/after present. The report exposes
+  `last_interactive_surface_readback_skipped_for_stale_input` so this is honest
+  diagnostic behavior, not hidden proof loss.
+
+Evidence:
+
+- `cargo check -q -p boon_native_app_window`: pass.
+- `cargo test -q -p boon_native_app_window present_mode -- --nocapture`: pass.
+- `cargo test -q -p boon_native_app_window input_resample_counters_distinguish_inline_and_deferred_turns -- --nocapture`:
+  pass.
+- Failed comparison before present-mode reorder:
+  `target/reports/native-gpu/cells-visible-click-e2e-b0-post-present-skip.json`
+  had correct visual/runtime proof but failed timing with
+  `input_wake_to_formula_visible_ms=20.466770000000903`,
+  `present_mode="Mailbox"`, `present_call_ms=14.461043`, and
+  `queue_to_present_ms=14.462157000000843`.
+- Passing focused report:
+  `target/reports/native-gpu/cells-visible-click-e2e-b0-present-mode.json`
+  has `status=pass`, selected address `B0`, formula text `=add(A0,A1)`,
+  `input_wake_to_formula_visible_ms=15.465542000000823`,
+  `click_to_formula_visible_ms=21.444083`, `present_mode="Immediate"`,
+  `present_call_ms=9.673265`, `queue_to_present_ms=9.673957000000884`,
+  `input_wake_to_poll_started_ms=0.28535199999987526`, and
+  `input_wake_to_dirty_poll_ms=2.9513510000006136`.
+- The same report proves the top formula text input crop changed at
+  `x=80,y=8,width=832,height=30` with app-owned WGPU readback, and
+  `verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-b0-present-mode.json`
+  passes.
+
+Remaining caution:
+
+- This fixes the focused B0 click/formula-bar gate in one fresh run. It does not
+  complete TASK-0804A by itself. The broader Cells 60 FPS verifier, scroll gate,
+  native GPU aggregate, and BYTES/MachinePlan default-path gates still need a
+  fresh sweep before claiming the whole task or unified goal is complete.
+- Manual testing should use the latest release playground binary. A stale
+  visible playground can still contradict the app-owned report if it was
+  launched before these native-loop changes.
+
+## 2026-06-30 Broader Cells Gate Refresh and Manual Formula-Bar Caution
+
+Fresh child reports now unblock the demand-driven aggregate, but manual testing
+still raised a formula-bar concern that must stay visible.
+
+Evidence:
+
+- `target/debug/xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells.json`:
+  pass.
+- `target/debug/xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json`:
+  pass with `interaction_latency_ms_p95=9.128491`,
+  `interaction_latency_ms_max=14.988123000000002`,
+  `selection_formula_full_layout_count=0`, `logical_cell_count=2600`,
+  `materialized_cell_count_max=240`, `rendered_cell_count=210`,
+  `formula_evaluated_cell_count_max=4`, and
+  `formula_recomputed_field_count_max=6`.
+- `target/debug/xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`:
+  pass, but the isolated run used a software Vulkan adapter. The report keeps
+  `scroll_frame_ms_p95=19.23486`, `wall_clock_frame_budget_pass=false`, and
+  `software_adapter_wall_clock_budget_exempt=true`; this is not production GPU
+  wall-clock proof.
+- Refreshed `verify-native-gpu-idle-wake` reports for counter, todomvc, cells,
+  and custom projects all pass.
+- `target/debug/xtask verify-demand-driven-render-loop --check-existing --report target/reports/native-gpu/demand-driven-render-loop.json`:
+  pass after the idle-wake child report refresh.
+- `cargo xtask verify-report-schema` passes for the refreshed headed scenario,
+  Cells interaction-speed, Cells scroll-speed, idle-wake children, and
+  demand-driven aggregate reports.
+
+Manual caution:
+
+- The app-owned readback for the focused B0 run visibly shows the top formula
+  input updated to `=add(A0,A1)` and the selected address updated to `B0`.
+  However, manual testing reported that focusing a cell appears to reveal the
+  formula somewhere while the main text input above the grid does not visibly
+  change. Treat that as an unresolved manual/live-playground mismatch until a
+  freshly launched release playground reproduces the same app-owned frame path
+  and the verifier includes stronger visible text/OCR-style proof for the
+  formula input, not just retained text metadata plus crop-hash changes.
+
+## 2026-06-30 Retained Binding Sync Replaces Formula-Bar Geometry Patch
+
+The latest native playground slice removes the remaining coordinate-based
+formula-bar address mutation from the focus/render overlay path. Formula-bar
+address and formula input updates now come from the retained document binding
+sync, and the render hook uses the retained bound-sync node list as WGPU
+render-scene patch targets. This keeps the selected-cell/formula-bar path on the
+generic retained binding architecture instead of Cells-specific geometry.
+
+Evidence:
+
+- `cargo fmt --package boon_native_playground`: pass.
+- `cargo test -q -p boon_native_playground cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path -- --nocapture`:
+  pass. The test now asserts that the formula-bar text input node is included in
+  retained text update nodes, so the direct WGPU render-scene patch replaces the
+  old glyphs instead of only changing runtime or retained frame state.
+- `cargo test -q -p boon_native_playground cells_input_overlay_render_scene_patch_updates_stale_selected_cell_primitives -- --nocapture`:
+  pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --address B0 --expected-formula '=add(A0,A1)' --report target/reports/native-gpu/cells-visible-click-e2e-b0-current.json`:
+  expected fail on timing only. Runtime state and app-owned visible proof pass:
+  selected address `B0`, formula-bar text `=add(A0,A1)`,
+  `visual_formula_probe.status=pass`, formula input crop changed, selected-cell
+  crop changed, `runtime_work_contract.status=pass`, and
+  `retained_update_contract.status=pass`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-b0-current.json`:
+  pass.
+
+Remaining blocker:
+
+- The focused visible-click report still fails the strict 60 FPS timing budget:
+  `input_wake_to_formula_visible_ms_p95=17.582675999999992` against the
+  `16.7ms` budget, and `click_to_formula_visible_ms_p95=24.012844`. The report
+  points away from formula/runtime work: the measured native input click path is
+  about `2.505137ms`, the render hook is about `2.665924ms`, runtime scans and
+  recomputes are zero, while `input_wake_to_dirty_poll_ms` is about `3.232466ms`
+  and `present_call_ms` is about `11.336246ms`. The next TASK-0804A work should
+  target wake scheduling and present/copy-to-present latency rather than another
+  Cells Boon workaround.

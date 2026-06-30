@@ -2938,8 +2938,31 @@ fn replace_borrowed_document_entries_for_nodes<'a, T: Clone>(
         });
     }
     let insert_at = first.unwrap_or(entries.len());
-    entries.retain(|entry| !entry_belongs_to_nodes(node_for_entry(entry.as_ref()), node_set));
-    entries.splice(insert_at..insert_at, replacements.iter().map(Cow::Borrowed));
+    let original = std::mem::take(entries);
+    let mut inserted_nodes = BTreeSet::new();
+    for entry in original {
+        let node = node_for_entry(entry.as_ref()).clone();
+        if entry_belongs_to_nodes(&node, node_set) {
+            if inserted_nodes.insert(node.clone()) {
+                entries.extend(
+                    replacements
+                        .iter()
+                        .filter(|replacement| node_for_entry(replacement) == &node)
+                        .map(Cow::Borrowed),
+                );
+            }
+        } else {
+            entries.push(entry);
+        }
+    }
+    let remaining = replacements
+        .iter()
+        .filter(|replacement| !inserted_nodes.contains(node_for_entry(replacement)))
+        .map(Cow::Borrowed)
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        entries.splice(insert_at..insert_at, remaining);
+    }
     Ok(())
 }
 

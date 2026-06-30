@@ -6,9 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-boon_ir.workspace = true
-boon_parser.workspace = true
-boon_typecheck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

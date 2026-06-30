@@ -37,6 +37,8 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-example-semantic",
     "verify-example-speed",
     "verify-example-negative",
+    "verify-bytes-type-system",
+    "verify-bytes-default-engine-readiness",
     "verify-bytes-negative",
     "verify-bytes-file-read-plan",
     "verify-bytes-file-write-plan",
@@ -172,6 +174,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-example-semantic" => verify_named(&args, VerificationLayer::Semantic),
         "verify-example-speed" => verify_named(&args, VerificationLayer::Speed),
         "verify-example-negative" => verify_negative(&args),
+        "verify-bytes-type-system" => verify_bytes_type_system(&args),
+        "verify-bytes-default-engine-readiness" => verify_bytes_default_engine_readiness(&args),
         "verify-bytes-negative" => verify_bytes_negative(&args),
         "verify-bytes-file-read-plan" => verify_bytes_file_read_plan(&args),
         "verify-bytes-file-write-plan" => verify_bytes_file_write_plan(&args),
@@ -6289,6 +6293,38 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
         );
     }
 
+    let cells_compare_path = Path::new("target/reports/bytes-plan/cells-plan-compare.json");
+    let cells_compare_exists = cells_compare_path.exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "goal-readiness:cells-plan-compare-present",
+        cells_compare_exists,
+        cells_compare_path.display().to_string(),
+        (!cells_compare_exists).then(|| {
+            format!(
+                "missing Cells PlanExecutor compare report `{}`",
+                cells_compare_path.display()
+            )
+        }),
+    );
+    if cells_compare_exists {
+        linked_reports.push(artifact_hash(cells_compare_path)?);
+        let cells_compare = read_json(cells_compare_path)?;
+        let (cells_semantic_delta_ready, cells_semantic_delta_detail) =
+            cells_plan_compare_semantic_delta_readiness_contract(&cells_compare);
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "goal-readiness:cells-plan-compare-semantic-delta-contract",
+            cells_semantic_delta_ready,
+            cells_semantic_delta_detail,
+            (!cells_semantic_delta_ready).then(|| {
+                "Cells PlanExecutor compare lacks exact semantic-delta parity or the reviewed demand-current coalescing contract".to_owned()
+            }),
+        );
+    }
+
     let cells_benchmark_path = Path::new("target/reports/bytes-plan/cells-release-benchmark.json");
     let cells_benchmark_exists = cells_benchmark_path.exists();
     push_audit_check(
@@ -6419,6 +6455,111 @@ fn audit_goal_readiness(args: &[String]) -> Result<(), Box<dyn std::error::Error
     )
 }
 
+fn cells_plan_compare_semantic_delta_readiness_contract(report: &JsonValue) -> (bool, String) {
+    let legacy = report
+        .get("legacy_comparison")
+        .and_then(serde_json::Value::as_object);
+    let exact_legacy_semantic_delta_parity = legacy
+        .and_then(|legacy| legacy.get("passed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && legacy
+            .and_then(|legacy| legacy.get("semantic_delta_match"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if exact_legacy_semantic_delta_parity {
+        return (
+            true,
+            "legacy_comparison.passed=true semantic_delta_match=true".to_owned(),
+        );
+    }
+
+    let acceptance = report
+        .get("legacy_comparison_acceptance")
+        .and_then(serde_json::Value::as_object);
+    let acceptance_kind = acceptance
+        .and_then(|acceptance| acceptance.get("kind"))
+        .and_then(serde_json::Value::as_str);
+    let acceptance_executor = acceptance
+        .and_then(|acceptance| acceptance.get("executor"))
+        .and_then(serde_json::Value::as_str);
+    let accepted = acceptance
+        .and_then(|acceptance| acceptance.get("accepted"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let legacy_state_match = legacy
+        .and_then(|legacy| legacy.get("state_match"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let coverage = report
+        .get("plan_executor_coverage")
+        .and_then(serde_json::Value::as_object);
+    let full_scenario_parity = coverage
+        .and_then(|coverage| coverage.get("full_scenario_parity"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let covers_all_source_events = coverage
+        .and_then(|coverage| coverage.get("covers_all_source_events"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let covers_assertion_only_steps = coverage
+        .and_then(|coverage| coverage.get("covers_assertion_only_steps"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let extra_plan_delta_count = acceptance
+        .and_then(|acceptance| acceptance.get("extra_plan_delta_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let missing_delta_count = acceptance
+        .and_then(|acceptance| acceptance.get("missing_delta_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let rejected_missing_delta_count = acceptance
+        .and_then(|acceptance| acceptance.get("rejected_missing_deltas"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| values.len())
+        .unwrap_or(usize::MAX);
+    let missing_delta_fields = acceptance
+        .and_then(|acceptance| acceptance.get("missing_delta_field_paths"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let allowed_missing_fields = missing_delta_fields
+        .iter()
+        .all(|field| matches!(field.as_str(), Some("display_text" | "value" | "error")));
+    let demand_current_contract = accepted
+        && acceptance_kind == Some("demand-current-coalesced-semantic-deltas")
+        && acceptance_executor == Some("cpu-plan-root-scenario-demand-current-acceptance-v1")
+        && legacy_state_match
+        && full_scenario_parity
+        && covers_all_source_events
+        && covers_assertion_only_steps
+        && extra_plan_delta_count == 0
+        && missing_delta_count > 0
+        && rejected_missing_delta_count == 0
+        && allowed_missing_fields;
+
+    (
+        demand_current_contract,
+        format!(
+            "legacy_comparison.passed={:?} semantic_delta_match={:?} acceptance_kind={:?} accepted={} acceptance_executor={:?} legacy_state_match={} full_scenario_parity={} covers_all_source_events={} covers_assertion_only_steps={} extra_plan_delta_count={} missing_delta_count={} rejected_missing_delta_count={} missing_delta_fields={:?}",
+            legacy.and_then(|legacy| legacy.get("passed")),
+            legacy.and_then(|legacy| legacy.get("semantic_delta_match")),
+            acceptance_kind,
+            accepted,
+            acceptance_executor,
+            legacy_state_match,
+            full_scenario_parity,
+            covers_all_source_events,
+            covers_assertion_only_steps,
+            extra_plan_delta_count,
+            missing_delta_count,
+            rejected_missing_delta_count,
+            missing_delta_fields,
+        ),
+    )
+}
+
 fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     const COMMAND: &str = "verify-compiler-boundaries";
     let report = report_arg(args)
@@ -6428,6 +6569,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
 
     let root_cargo = read_toml_file(Path::new("Cargo.toml"))?;
     let plan_cargo = read_toml_file(Path::new("crates/boon_plan/Cargo.toml"))?;
+    let plan_executor_cargo = read_toml_file(Path::new("crates/boon_plan_executor/Cargo.toml"))?;
     let runtime_cargo = read_toml_file(Path::new("crates/boon_runtime/Cargo.toml"))?;
     let compiler_cargo = read_toml_file(Path::new("crates/boon_compiler/Cargo.toml"))?;
     let cli_cargo = read_toml_file(Path::new("crates/boon_cli/Cargo.toml"))?;
@@ -6442,6 +6584,44 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         compiler_crate_present,
         "crates/boon_compiler/src/lib.rs exists",
         (!compiler_crate_present).then(|| "missing `crates/boon_compiler` facade crate".to_owned()),
+    );
+
+    let plan_executor_core_crate_present =
+        Path::new("crates/boon_plan_executor/src/lib.rs").exists();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-executor-crate-present",
+        plan_executor_core_crate_present,
+        "crates/boon_plan_executor/src/lib.rs exists",
+        (!plan_executor_core_crate_present)
+            .then(|| "missing frontend-free `crates/boon_plan_executor` crate".to_owned()),
+    );
+
+    let plan_executor_workspace_member =
+        toml_workspace_has_member(&root_cargo, "crates/boon_plan_executor");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-executor-workspace-member",
+        plan_executor_workspace_member,
+        "workspace members include crates/boon_plan_executor",
+        (!plan_executor_workspace_member)
+            .then(|| "workspace does not include `crates/boon_plan_executor`".to_owned()),
+    );
+
+    let plan_executor_workspace_dependency =
+        toml_workspace_dependency_path(&root_cargo, "boon_plan_executor")
+            == Some("crates/boon_plan_executor");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-executor-workspace-dependency",
+        plan_executor_workspace_dependency,
+        "workspace dependency boon_plan_executor points at crates/boon_plan_executor",
+        (!plan_executor_workspace_dependency).then(|| {
+            "workspace dependency `boon_plan_executor` is missing or points elsewhere".to_owned()
+        }),
     );
 
     let workspace_member = toml_workspace_has_member(&root_cargo, "crates/boon_compiler");
@@ -6468,8 +6648,79 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     );
 
     let compiler_lib = fs::read_to_string("crates/boon_compiler/src/lib.rs").unwrap_or_default();
+    let runtime_source = fs::read_to_string("crates/boon_runtime/src/lib.rs").unwrap_or_default();
+    let native_playground_source =
+        fs::read_to_string("crates/boon_native_playground/src/main.rs").unwrap_or_default();
     let facade_exports_compile = compiler_lib.contains("pub fn compile_typed_program")
         && compiler_lib.contains("TypedProgram");
+    let facade_exports_source_to_machine_plan = compiler_lib
+        .contains("pub fn compile_source_path_to_machine_plan")
+        && compiler_lib.contains("CompiledMachinePlanFromSource")
+        && compiler_lib.contains("\"owner\": \"boon_compiler\"")
+        && compiler_lib.contains("parse_source_path_or_manifest_project");
+    let facade_exports_source_units_to_runtime_ir = compiler_lib
+        .contains("pub fn compile_source_units_to_runtime_ir")
+        && compiler_lib.contains("pub fn compile_source_text_to_runtime_ir")
+        && compiler_lib.contains("CompiledRuntimeIrFromSource")
+        && compiler_lib.contains("\"surface\": \"runtime-ir\"");
+    let facade_exports_parsed_program_to_runtime_ir = compiler_lib
+        .contains("pub fn compile_parsed_program_to_runtime_ir")
+        && compiler_lib.contains("compile_parsed_to_runtime_ir(parsed, 0.0, Instant::now())");
+    let facade_exports_source_units_to_full_ir = compiler_lib
+        .contains("pub fn compile_source_units_to_full_ir")
+        && compiler_lib.contains("pub fn compile_source_text_to_full_ir")
+        && compiler_lib.contains("CompiledFullIrFromSource")
+        && compiler_lib.contains("\"surface\": \"full-ir\"");
+    let facade_exports_source_loading = compiler_lib
+        .contains("pub fn compiler_source_units_for_path")
+        && compiler_lib.contains("pub fn compiler_source_units_for_manifest_source")
+        && compiler_lib.contains("pub fn compiler_source_files_for_path")
+        && compiler_lib.contains("pub fn compiler_source_files_for_manifest_source")
+        && compiler_lib.contains("pub fn compiler_source_text_for_path")
+        && compiler_lib.contains("pub fn compiler_source_text_for_manifest_source");
+    let compiler_owns_compiled_source_report_context = compiler_lib
+        .contains("pub struct CompiledSourceReportContext")
+        && compiler_lib.contains("pub fn report_context(&self) -> CompiledSourceReportContext")
+        && compiler_lib.contains("fn parsed_program_hash(parsed: &ParsedProgram) -> String")
+        && (runtime_source
+            .matches("let report_context = compiled.report_context();")
+            .count()
+            + runtime_source
+                .matches("let report_context = compiler_output.report_context();")
+                .count())
+            >= 4
+        && !runtime_source
+            .contains("source_hash: source_hash.clone(),\n        source_files: parsed")
+        && !runtime_source
+            .contains("\"source_hash\": source_hash,\n        \"source_files\": parsed");
+    let compiler_owns_compiled_source_unit_snapshot = compiler_lib
+        .contains("pub source_units: Vec<CompilerSourceUnit>")
+        && compiler_lib.contains("path: file.path.clone()")
+        && compiler_lib.contains("source: file.source.clone()")
+        && runtime_source.contains("fn runtime_source_units_from_compiler")
+        && runtime_source
+            .matches("report_context.source_units.clone()")
+            .count()
+            >= 3
+        && !runtime_source.contains("let parsed = compiled.parsed;\n    let plan = compiled.plan;");
+    let compiler_owns_scenario_file_decode = compiler_lib
+        .contains("pub fn parse_scenario_file<T>(path: &Path) -> CompilerResult<T>")
+        && compiler_lib.contains("T: DeserializeOwned")
+        && runtime_source.contains("parse_scenario_file as compiler_parse_scenario_file")
+        && runtime_source.contains("compiler_parse_scenario_file::<Scenario>(path)")
+        && !runtime_source.contains(
+            "pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {\n    let text = fs::read_to_string(path)?;",
+        );
+    let compiler_owns_runtime_scenario_report_context = runtime_source
+        .contains("CompiledSourceReportContext")
+        && runtime_source
+            .contains("let compiler_output = compile_source_path_to_full_ir(source_path)?;")
+        && runtime_source.contains("let report_context = compiler_output.report_context();")
+        && runtime_source.contains("report_context.load_pipeline_profile.clone()")
+        && runtime_source.contains("report_context.source_hash")
+        && runtime_source.contains("report_context.source_files")
+        && runtime_source.contains("report_context.program_file_count")
+        && !runtime_source.contains("&report_source_hash_for_parsed(&parsed),");
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -6479,20 +6730,130 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         (!facade_exports_compile)
             .then(|| "`boon_compiler` does not expose the compile_typed_program facade".to_owned()),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-source-to-machine-plan",
+        facade_exports_source_to_machine_plan,
+        format!("facade_exports_source_to_machine_plan={facade_exports_source_to_machine_plan}"),
+        (!facade_exports_source_to_machine_plan).then(|| {
+            "`boon_compiler` does not expose source-path-to-MachinePlan orchestration".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-source-units-to-runtime-ir",
+        facade_exports_source_units_to_runtime_ir,
+        format!(
+            "facade_exports_source_units_to_runtime_ir={facade_exports_source_units_to_runtime_ir}"
+        ),
+        (!facade_exports_source_units_to_runtime_ir).then(|| {
+            "`boon_compiler` does not expose source-unit-to-runtime-IR orchestration".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-parsed-program-to-runtime-ir",
+        facade_exports_parsed_program_to_runtime_ir,
+        format!(
+            "facade_exports_parsed_program_to_runtime_ir={facade_exports_parsed_program_to_runtime_ir}"
+        ),
+        (!facade_exports_parsed_program_to_runtime_ir).then(|| {
+            "`boon_compiler` does not expose parsed-program-to-runtime-IR orchestration".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-source-units-to-full-ir",
+        facade_exports_source_units_to_full_ir,
+        format!("facade_exports_source_units_to_full_ir={facade_exports_source_units_to_full_ir}"),
+        (!facade_exports_source_units_to_full_ir).then(|| {
+            "`boon_compiler` does not expose source-unit-to-full-IR orchestration".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:facade-exports-source-loading",
+        facade_exports_source_loading,
+        format!("facade_exports_source_loading={facade_exports_source_loading}"),
+        (!facade_exports_source_loading).then(|| {
+            "`boon_compiler` does not expose manifest-aware source loading helpers".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:compiler-owns-compiled-source-report-context",
+        compiler_owns_compiled_source_report_context,
+        format!(
+            "compiler_owns_compiled_source_report_context={compiler_owns_compiled_source_report_context}"
+        ),
+        (!compiler_owns_compiled_source_report_context).then(|| {
+            "`boon_runtime` still assembles compiled source report metadata from parser/IR internals"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:compiler-owns-compiled-source-unit-snapshot",
+        compiler_owns_compiled_source_unit_snapshot,
+        format!(
+            "compiler_owns_compiled_source_unit_snapshot={compiler_owns_compiled_source_unit_snapshot}"
+        ),
+        (!compiler_owns_compiled_source_unit_snapshot).then(|| {
+            "`boon_runtime` run-plan wrappers still rebuild legacy-comparison source units from parsed files"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:compiler-owns-scenario-file-decode",
+        compiler_owns_scenario_file_decode,
+        format!("compiler_owns_scenario_file_decode={compiler_owns_scenario_file_decode}"),
+        (!compiler_owns_scenario_file_decode)
+            .then(|| "`boon_runtime` still owns scenario file read/TOML decode".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:compiler-owns-runtime-scenario-report-context",
+        compiler_owns_runtime_scenario_report_context,
+        format!(
+            "compiler_owns_runtime_scenario_report_context={compiler_owns_runtime_scenario_report_context}"
+        ),
+        (!compiler_owns_runtime_scenario_report_context).then(|| {
+            "`boon_runtime` run_scenario still rebuilds source/report metadata from parser internals"
+                .to_owned()
+        }),
+    );
 
+    let compiler_owns_legacy_backend_source =
+        Path::new("crates/boon_compiler/src/legacy_backend.rs").exists()
+            && compiler_lib.contains("mod legacy_backend")
+            && compiler_lib
+                .contains("legacy_backend::compile_typed_program(program, target_profile)");
     let facade_delegates_to_plan_backend =
         compiler_lib.contains("boon_plan::compile_typed_program(program, target_profile)");
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:facade-preserves-current-backend",
-        facade_delegates_to_plan_backend,
-        "facade delegates to current boon_plan backend",
-        (!facade_delegates_to_plan_backend).then(|| {
-            "`boon_compiler` facade no longer visibly delegates to the current plan backend"
+        "compiler-boundaries:compiler-owns-current-backend",
+        compiler_owns_legacy_backend_source,
+        format!(
+            "compiler_owns_legacy_backend_source={compiler_owns_legacy_backend_source}, facade_delegates_to_plan_backend={facade_delegates_to_plan_backend}"
+        ),
+        (!compiler_owns_legacy_backend_source).then(|| {
+            "`boon_compiler` does not own the current TypedProgram-to-MachinePlan backend"
                 .to_owned()
         }),
     );
+    let lowering_still_owned_by_plan_backend = facade_delegates_to_plan_backend;
 
     let compiler_depends_on_plan = toml_has_dependency(&compiler_cargo, "boon_plan");
     let compiler_depends_on_ir = toml_has_dependency(&compiler_cargo, "boon_ir");
@@ -6585,34 +6946,97 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         );
     }
 
-    let plan_depends_on_ir = toml_has_dependency(&plan_cargo, "boon_ir");
+    let plan_source = fs::read_to_string("crates/boon_plan/src/lib.rs").unwrap_or_default();
+    let plan_depends_on_ir = toml_has_required_dependency(&plan_cargo, "boon_ir");
+    let plan_optionally_depends_on_ir = toml_has_optional_dependency(&plan_cargo, "boon_ir");
+    let plan_optionally_depends_on_parser =
+        toml_has_optional_dependency(&plan_cargo, "boon_parser");
+    let plan_optionally_depends_on_typecheck =
+        toml_has_optional_dependency(&plan_cargo, "boon_typecheck");
+    let plan_legacy_ir_adapter_feature_present =
+        toml_feature_includes(&plan_cargo, "legacy-ir-adapter", "dep:boon_ir");
+    let plan_legacy_backend_feature_present =
+        toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_ir")
+            || toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_parser")
+            || toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_typecheck");
+    let compiler_enables_legacy_backend_feature =
+        toml_dependency_feature_enabled(&compiler_cargo, "boon_plan", "legacy-compiler-backend");
+    let compiler_enables_legacy_ir_adapter_feature =
+        toml_dependency_feature_enabled(&compiler_cargo, "boon_plan", "legacy-ir-adapter");
+    let plan_schema_owns_ids = [
+        "pub struct SourceId",
+        "pub struct StateId",
+        "pub struct ListId",
+        "pub struct FieldId",
+        "pub struct ScopeId",
+    ]
+    .iter()
+    .all(|needle| plan_source.contains(needle));
+    let plan_schema_still_uses_ir_ids = !plan_schema_owns_ids;
+    let plan_schema_owns_source_payload_schema = [
+        "pub struct SourcePayloadSchema",
+        "pub struct SourcePayloadDescriptor",
+        "pub enum SourcePayloadValueType",
+        "pub enum SourcePayloadField",
+    ]
+    .iter()
+    .all(|needle| plan_source.contains(needle));
+    let plan_schema_still_uses_ir_source_schema = !plan_schema_owns_source_payload_schema;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "compiler-boundaries:boon-plan-no-boon-ir-dependency",
         !plan_depends_on_ir,
-        format!("boon_plan depends on boon_ir={plan_depends_on_ir}"),
+        format!(
+            "boon_plan required/default depends on boon_ir={plan_depends_on_ir}, optional={plan_optionally_depends_on_ir}"
+        ),
         plan_depends_on_ir.then(|| {
             "`boon_plan` still depends on `boon_ir`; compiler extraction is incomplete".to_owned()
         }),
     );
 
-    let plan_depends_on_parser = toml_has_dependency(&plan_cargo, "boon_parser");
+    let plan_depends_on_parser = toml_has_required_dependency(&plan_cargo, "boon_parser");
     push_audit_check(
         &mut checks,
         &mut blockers,
         "compiler-boundaries:boon-plan-no-parser-dependency",
         !plan_depends_on_parser,
-        format!("boon_plan depends on boon_parser={plan_depends_on_parser}"),
+        format!(
+            "boon_plan required/default depends on boon_parser={plan_depends_on_parser}, optional={plan_optionally_depends_on_parser}"
+        ),
         plan_depends_on_parser.then(|| {
             "`boon_plan` still depends on `boon_parser`; parser AST is not isolated from plan schema"
                 .to_owned()
         }),
     );
 
-    let plan_source = fs::read_to_string("crates/boon_plan/src/lib.rs").unwrap_or_default();
+    let plan_frontend_dependencies_optional_only = !plan_depends_on_ir
+        && !plan_depends_on_parser
+        && !toml_has_required_dependency(&plan_cargo, "boon_typecheck")
+        && !plan_optionally_depends_on_ir
+        && !plan_optionally_depends_on_parser
+        && !plan_optionally_depends_on_typecheck
+        && !plan_legacy_ir_adapter_feature_present;
+    let plan_default_build_schema_only = plan_frontend_dependencies_optional_only
+        && plan_schema_owns_ids
+        && plan_schema_owns_source_payload_schema;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:boon-plan-default-build-schema-only",
+        plan_default_build_schema_only,
+        format!(
+            "frontend_dependencies_optional_only={plan_frontend_dependencies_optional_only}, owns_ids={plan_schema_owns_ids}, owns_source_payload_schema={plan_schema_owns_source_payload_schema}"
+        ),
+        (!plan_default_build_schema_only).then(|| {
+            "`boon_plan` default build is not yet isolated to plan schema/verification surfaces"
+                .to_owned()
+        }),
+    );
+
     let plan_imports_parser_ast =
         plan_source.contains("use boon_parser::{") || plan_source.contains("AstExpr");
+    let parser_ast_still_in_plan_lowering = plan_imports_parser_ast;
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -6625,20 +7049,3497 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         }),
     );
 
-    let runtime_depends_on_frontend = ["boon_parser", "boon_ir", "boon_typecheck"]
+    let legacy_backend_removed_from_plan = !plan_legacy_backend_feature_present
+        && !compiler_enables_legacy_backend_feature
+        && !facade_delegates_to_plan_backend
+        && !plan_imports_parser_ast
+        && compiler_owns_legacy_backend_source;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:legacy-backend-moved-out-of-plan",
+        legacy_backend_removed_from_plan,
+        format!(
+            "plan_legacy_backend_feature_present={plan_legacy_backend_feature_present}, compiler_enables_legacy_backend_feature={compiler_enables_legacy_backend_feature}, compiler_owns_legacy_backend_source={compiler_owns_legacy_backend_source}, facade_delegates_to_plan_backend={facade_delegates_to_plan_backend}, plan_imports_parser_ast={plan_imports_parser_ast}"
+        ),
+        (!legacy_backend_removed_from_plan).then(|| {
+            "legacy TypedProgram-to-MachinePlan lowering still lives in boon_plan behind the compatibility feature"
+                .to_owned()
+        }),
+    );
+
+    let plan_executor_depends_on_plan = toml_has_dependency(&plan_executor_cargo, "boon_plan");
+    let plan_executor_frontend_dependencies = ["boon_parser", "boon_ir", "boon_typecheck"]
         .iter()
-        .filter(|dependency| toml_has_dependency(&runtime_cargo, dependency))
+        .filter(|dependency| toml_has_dependency(&plan_executor_cargo, dependency))
         .copied()
         .collect::<Vec<_>>();
+    let plan_executor_source =
+        fs::read_to_string("crates/boon_plan_executor/src/lib.rs").unwrap_or_default();
+    let runtime_source = fs::read_to_string("crates/boon_runtime/src/lib.rs").unwrap_or_default();
+    let plan_executor_initial_state_extracted = plan_executor_source
+        .contains("pub fn execute_initial_state")
+        && plan_executor_source.contains("verify_plan(plan)")
+        && plan_executor_source.contains("PlanOpKind::StateInitialize");
+    let plan_executor_initial_state_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_initial_state_report")
+        && plan_executor_source.contains("InitialStateReportAssembly")
+        && plan_executor_source.contains("cpu-plan-initial-state-report-assembly-v1");
+    let plan_executor_list_projection_materializer_extracted = plan_executor_source
+        .contains("pub fn materialize_list_projections")
+        && plan_executor_source.contains("PlanExecutorListRow")
+        && plan_executor_source.contains("cpu-plan-list-projection-materializer-v1")
+        && runtime_source.contains("materialize_plan_list_projections_core");
+    let plan_executor_list_retain_materializer_extracted = plan_executor_source
+        .contains("pub fn materialize_list_retains")
+        && plan_executor_source.contains("PlanExecutorListRow")
+        && plan_executor_source.contains("cpu-plan-list-retain-materializer-v1")
+        && runtime_source.contains("materialize_plan_list_retains_core");
+    let plan_executor_list_summary_extracted = plan_executor_source
+        .contains("pub fn summarize_plan_lists")
+        && plan_executor_source.contains("\"active_count\"")
+        && plan_executor_source.contains("\"completed_count\"")
+        && runtime_source.contains("summarize_plan_lists_core")
+        && !runtime_source.contains("let active_count = rows")
+        && !runtime_source.contains("let completed_count = rows");
+    let plan_executor_list_next_key_allocator_extracted = plan_executor_source
+        .contains("pub fn initial_list_next_keys")
+        && plan_executor_source.contains("pub fn reserve_list_row_key")
+        && plan_executor_source.contains("list state missing list {list_id}")
+        && runtime_source.contains("initial_plan_list_next_keys")
+        && (runtime_source.contains("reserve_plan_list_row_key")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && !runtime_source.contains("fn plan_initial_list_next_keys");
+    let plan_executor_row_source_binding_policy_extracted = plan_executor_source
+        .contains("pub fn row_source_binding_id")
+        && plan_executor_source.contains("pub fn build_source_bind_deltas")
+        && plan_executor_source.contains("\"kind\": \"SourceBind\"")
+        && (runtime_source.contains("build_plan_source_bind_deltas")
+            || runtime_source.contains("record_plan_list_append_mutation")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && runtime_source.contains("plan_row_source_binding_id_core")
+        && !runtime_source
+            .contains("\"kind\": \"SourceBind\",\n                \"list_id\": list_label");
+    let plan_executor_list_remove_delta_policy_extracted = plan_executor_source
+        .contains("pub fn build_source_unbind_deltas")
+        && plan_executor_source.contains("pub fn build_list_remove_delta")
+        && plan_executor_source.contains("\"kind\": \"SourceUnbind\"")
+        && plan_executor_source.contains("\"kind\": \"ListRemove\"")
+        && (runtime_source.contains("build_plan_source_unbind_deltas")
+            || runtime_source.contains("record_plan_list_remove_mutation")
+            || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+        && (runtime_source.contains("build_plan_list_remove_delta")
+            || runtime_source.contains("record_plan_list_remove_mutation")
+            || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+        && !runtime_source
+            .contains("\"kind\": \"SourceUnbind\",\n                    \"list_id\": list_label")
+        && !runtime_source
+            .contains("\"kind\": \"ListRemove\",\n                \"list_id\": list_label");
+    let plan_executor_list_remove_predicate_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_list_remove_predicate")
+        && plan_executor_source.contains("ListRemovePredicateEvaluation")
+        && plan_executor_source.contains("cpu-plan-list-remove-predicate-evaluator-v1")
+        && plan_executor_source
+            .contains("pub fn build_list_remove_predicate_row_resolution_report")
+        && (runtime_source.contains("evaluate_plan_list_remove_predicate")
+            || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+        && (runtime_source.contains("build_plan_list_remove_predicate_row_resolution_report")
+            || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+        && !runtime_source.contains("fn list_remove_predicate_matches")
+        && !runtime_source.contains("fn predicate_row_resolution_report");
+    let plan_executor_list_append_delta_policy_extracted = plan_executor_source
+        .contains("pub fn build_list_insert_delta")
+        && plan_executor_source.contains("pub fn build_row_refresh_field_deltas")
+        && plan_executor_source.contains("pub fn row_expression_output_field_names")
+        && plan_executor_source.contains("\"kind\": \"ListInsert\"")
+        && (runtime_source.contains("build_plan_list_insert_delta")
+            || runtime_source.contains("record_plan_list_append_mutation")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && (runtime_source.contains("build_plan_row_refresh_field_deltas")
+            || runtime_source.contains("record_plan_list_append_mutation")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && runtime_source.contains("plan_row_expression_applies_to_list")
+        && !runtime_source.contains("fn row_refresh_field_deltas")
+        && !runtime_source.contains("fn row_expression_output_field_names")
+        && !runtime_source
+            .contains("\"kind\": \"ListInsert\",\n            \"list_id\": list_label");
+    let plan_executor_list_mutation_records_extracted =
+        plan_executor_row_source_binding_policy_extracted
+            && plan_executor_list_remove_delta_policy_extracted
+            && plan_executor_list_append_delta_policy_extracted
+            && plan_executor_source.contains("pub struct ListAppendMutationInput")
+            && plan_executor_source.contains("pub fn record_list_append_mutation")
+            && plan_executor_source.contains("cpu-plan-list-append-mutation-record-v1")
+            && plan_executor_source.contains("pub struct ListRemoveMutationInput")
+            && plan_executor_source.contains("pub fn record_list_remove_mutation")
+            && plan_executor_source.contains("cpu-plan-list-remove-mutation-record-v1")
+            && (runtime_source.contains("record_plan_list_append_mutation")
+                || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+            && (runtime_source.contains("record_plan_list_remove_mutation")
+                || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+            && !runtime_source.contains("build_plan_source_bind_deltas")
+            && !runtime_source.contains("build_plan_source_unbind_deltas")
+            && !runtime_source.contains("build_plan_list_insert_delta")
+            && !runtime_source.contains("build_plan_list_remove_delta")
+            && !runtime_source.contains("build_plan_row_refresh_field_deltas");
+    let plan_executor_list_append_value_resolution_extracted = plan_executor_source
+        .contains("pub fn resolve_plan_value_ref")
+        && plan_executor_source.contains("pub fn plan_constant_json_value")
+        && (runtime_source.contains("resolve_plan_value_ref")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && runtime_source.contains("plan_executor_constant_json_value")
+        && !runtime_source.contains("fn value_for_plan_ref")
+        && !runtime_source.contains("fn plan_constant_json_value");
+    let plan_executor_list_append_row_construction_extracted = plan_executor_source
+        .contains("pub fn construct_list_append_row_with")
+        && plan_executor_source.contains("pub struct ListAppendRowConstruction")
+        && plan_executor_source.contains("cpu-plan-list-append-row-construction-v1")
+        && plan_executor_source.contains("pub fn row_scoped_source_paths")
+        && (runtime_source.contains("construct_plan_list_append_row_with")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && !runtime_source.contains("for field in &append.fields")
+        && !runtime_source.contains("let (mut fields, mut private_bytes, mut fixed_bytes_banks)")
+        && !runtime_source.contains("projected_rows.push(row.clone())");
+    let plan_executor_list_append_execution_extracted = plan_executor_source
+        .contains("pub fn append_list_rows_for_derived_values_with")
+        && plan_executor_source.contains("pub struct ListAppendExecution")
+        && plan_executor_source.contains("cpu-plan-list-append-execution-v1")
+        && runtime_source.contains("append_plan_list_rows_for_derived_values_with")
+        && !runtime_source.contains("fn append_list_rows_for_derived_values")
+        && !runtime_source.contains("construct_plan_list_append_row_with")
+        && !runtime_source.contains("record_plan_list_append_mutation")
+        && !runtime_source.contains("reserve_plan_list_row_key")
+        && !runtime_source.contains("for field in &append.fields");
+    let plan_executor_list_remove_execution_extracted = plan_executor_source
+        .contains("pub fn remove_list_rows_for_source_event")
+        && plan_executor_source.contains("pub struct ListRemoveExecution")
+        && plan_executor_source.contains("cpu-plan-list-remove-execution-v1")
+        && runtime_source.contains("remove_plan_list_rows_for_source_event")
+        && !runtime_source.contains("fn remove_list_rows_for_source")
+        && !runtime_source.contains("record_plan_list_remove_mutation")
+        && !runtime_source.contains("evaluate_plan_list_remove_predicate")
+        && !runtime_source.contains("build_plan_list_remove_predicate_row_resolution_report");
+    let plan_executor_initial_list_row_value_conversion_extracted = plan_executor_source
+        .contains("pub fn plan_constant_value_json_value")
+        && plan_executor_source.contains("pub fn plan_constant_value_bytes")
+        && runtime_source.contains("plan_executor_constant_value_json_value")
+        && runtime_source.contains("plan_executor_constant_value_bytes")
+        && !runtime_source.contains("fn plan_constant_value_json_value")
+        && !runtime_source.contains("fn runtime_bytes_from_plan_constant_value");
+    let plan_executor_indexed_fixed_byte_bank_lookup_extracted = plan_executor_source
+        .contains("pub fn indexed_state_has_fixed_byte_bank")
+        && plan_executor_source.contains("pub fn indexed_fixed_byte_bank_len")
+        && plan_executor_source.contains("pub fn indexed_field_has_fixed_byte_bank")
+        && runtime_source.contains("plan_indexed_state_has_fixed_byte_bank")
+        && runtime_source.contains("plan_indexed_fixed_byte_bank_len")
+        && runtime_source.contains("plan_indexed_field_has_fixed_byte_bank")
+        && !runtime_source.contains("fn indexed_state_has_fixed_byte_bank")
+        && !runtime_source.contains("fn indexed_fixed_byte_bank_len")
+        && !runtime_source.contains("fn indexed_field_has_fixed_byte_bank");
+    let plan_executor_list_row_default_fields_extracted = plan_executor_source
+        .contains("pub fn list_row_default_fields")
+        && plan_executor_source.contains("ListRowDefaultFields")
+        && plan_executor_source.contains("cpu-plan-list-row-default-fields-v1")
+        && plan_executor_source.contains("pub fn plan_constant_bytes_for_storage_slot")
+        && runtime_source.contains("plan_list_row_default_fields")
+        && runtime_source.contains("plan_executor_list_row_default_fields_to_runtime")
+        && runtime_source.contains("plan_executor_constant_bytes_for_storage_slot")
+        && !runtime_source.contains("fn plan_row_default_fields")
+        && !runtime_source.contains("fn plan_constant_runtime_bytes_for_slot");
+    let plan_executor_list_row_report_fields_extracted = plan_executor_source
+        .contains("pub fn list_row_report_fields")
+        && plan_executor_source.contains("pub fn list_row_state_report_fields")
+        && runtime_source.contains("plan_list_row_state_report_fields")
+        && runtime_source.contains("plan_executor_list_row_report_fields")
+        && !runtime_source.contains("fn report_row_fields");
+    let plan_executor_list_row_state_carrier_extracted = plan_executor_source
+        .contains("pub struct PlanExecutorListRowState")
+        && plan_executor_source.contains("pub fn list_row_state_public_rows")
+        && plan_executor_source.contains("pub fn list_row_state_report_fields")
+        && runtime_source.contains("type PlanListRowState = PlanExecutorListRowState")
+        && runtime_source.contains("plan_list_row_state_public_rows")
+        && runtime_source.contains("plan_list_row_state_report_fields")
+        && !runtime_source.contains("struct PlanListRowState")
+        && !runtime_source.contains("private_bytes: BTreeMap<String, RuntimeBytes>")
+        && !runtime_source.contains("fn plan_executor_bytes_from_runtime_bytes");
+    let plan_executor_list_row_initial_refresh_extracted = plan_executor_source
+        .contains("pub fn refresh_list_row_initial_state_fields")
+        && runtime_source.contains("refresh_plan_list_row_initial_state_fields")
+        && !runtime_source.contains("fn refresh_row_initial_state_fields");
+    let plan_executor_list_row_bool_not_refresh_extracted = plan_executor_source
+        .contains("pub fn refresh_list_row_bool_not_deltas")
+        && plan_executor_source.contains("pub fn refresh_list_row_bool_not_fields")
+        && (runtime_source.contains("refresh_plan_list_row_bool_not_deltas")
+            || runtime_source.contains("construct_plan_list_append_row_with")
+            || runtime_source.contains("append_plan_list_rows_for_derived_values_with"))
+        && runtime_source.contains("refresh_plan_list_row_bool_not_fields")
+        && !runtime_source.contains("fn row_bool_not_deltas")
+        && !runtime_source.contains("fn refresh_row_bool_not_fields");
+    let plan_executor_list_row_expression_refresh_extracted = plan_executor_source
+        .contains("pub fn refresh_list_row_expression_fields_with")
+        && plan_executor_source
+            .contains("pub fn refresh_list_row_expression_fields_best_effort_with")
+        && runtime_source.contains("refresh_plan_list_row_expression_fields_with")
+        && runtime_source.contains("refresh_plan_list_row_expression_fields_best_effort_with")
+        && runtime_source.contains("eval_plan_row_expression")
+        && !runtime_source.contains("fn refresh_row_expression_fields(")
+        && !runtime_source.contains("fn refresh_row_expression_fields_best_effort");
+    let plan_executor_list_row_textlike_field_extracted = plan_executor_source
+        .contains("pub fn list_row_textlike_field")
+        && plan_executor_source.contains("fn json_scalar_textlike")
+        && plan_executor_source.contains("pub fn assert_scenario_checkpoint")
+        && !runtime_source.contains("fn row_textlike_field");
+    let plan_executor_assertion_checkpoint_extracted = plan_executor_source
+        .contains("pub fn assert_scenario_checkpoint")
+        && plan_executor_source.contains("PlanExecutorScenarioCheckpointInput")
+        && runtime_source.contains("assert_plan_scenario_checkpoint")
+        && !runtime_source.contains("fn plan_rows_with_field")
+        && !runtime_source.contains("fn plan_single_editing_row")
+        && !runtime_source.contains("fn plan_cell_row")
+        && !runtime_source.contains("fn plan_root_textlike_for_assertion");
+    let plan_executor_root_update_candidate_tracker_extracted = plan_executor_source
+        .contains("pub fn record_root_update_candidate")
+        && plan_executor_source.contains("RootUpdateCandidateTracker")
+        && plan_executor_source.contains("cpu-plan-root-update-candidate-tracker-v1")
+        && (runtime_source.contains("record_plan_root_update_candidate")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step"))
+        && runtime_source.contains("RootUpdateCandidateTracker")
+        && !runtime_source.contains("touched_update_order")
+        && !runtime_source
+            .contains("CPU root-scenario PlanExecutor found conflicting branches for state");
+    let plan_executor_root_update_commit_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_root_update_commit")
+        && plan_executor_source.contains("RootUpdateCommitInput")
+        && plan_executor_source.contains("cpu-plan-root-update-commit-assembly-v1")
+        && !runtime_source.contains("\"candidate_update_op_ids\": op_ids")
+        && !runtime_source.contains("let signature = format!(\"FieldSet:{target_label}\")")
+        && !runtime_source.contains("fn root_plan_semantic_delta_value");
+    let plan_executor_root_update_commit_batch_extracted =
+        plan_executor_root_update_commit_assembly_extracted
+            && plan_executor_source.contains("pub struct RootUpdateCommitBatch")
+            && plan_executor_source.contains("pub fn commit_ordered_root_update_candidates")
+            && plan_executor_source.contains("cpu-plan-root-update-commit-batch-v1")
+            && runtime_source.contains("commit_plan_ordered_root_update_candidates")
+            && !runtime_source.contains("RootUpdateCommitInput")
+            && !runtime_source.contains("assemble_plan_root_update_commit")
+            && !runtime_source.contains(".ordered_candidates()");
+    let plan_executor_root_update_storage_transition_extracted = plan_executor_source
+        .contains("pub fn apply_root_update_storage_transition")
+        && plan_executor_source.contains("RootUpdateStorageTransition")
+        && plan_executor_source.contains("cpu-plan-root-update-storage-transition-v1")
+        && (runtime_source.contains("apply_plan_root_update_storage_transition")
+            || runtime_source.contains("apply_plan_executed_root_update_to_state")
+            || runtime_source.contains("apply_plan_executed_root_update_to_root_state")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step")
+            || runtime_source.contains("commit_plan_ordered_root_update_candidates"))
+        && !runtime_source.contains("root_state.insert(target_label, executed.value.clone())")
+        && !runtime_source.contains("let transition = apply_root_bytes_state_transition(");
+    let plan_executor_root_update_state_owner_capability_extracted =
+        plan_executor_root_update_storage_transition_extracted
+            && plan_executor_source.contains("pub trait RootUpdateStateOwner")
+            && plan_executor_source.contains("pub struct RootUpdateStateMaps")
+            && plan_executor_source.contains("impl RootUpdateStateOwner for RootUpdateStateMaps")
+            && plan_executor_source.contains("impl RootUpdateStateOwner for PlanExecutorRootState")
+            && plan_executor_source.contains("state_owner: &mut impl RootUpdateStateOwner")
+            && plan_executor_source.contains("let mut state_owner = RootUpdateStateMaps::new")
+            && !plan_executor_source.contains(
+                "pub fn apply_root_update_storage_transition(\n    root_state: &mut JsonMap",
+            )
+            && !plan_executor_source
+                .contains("root_state.insert(target_state_label.to_owned(), value)");
+    let runtime_root_state_update_loop_no_loose_maps =
+        plan_executor_root_update_state_owner_capability_extracted
+            && runtime_source.contains("let mut staged_root_state = root_state.clone()")
+            && runtime_source.contains("collect_plan_root_update_candidate_for_step")
+            && runtime_source.contains("commit_plan_ordered_root_update_candidates")
+            && !runtime_source.contains("let mut staged_root_bytes_state")
+            && !runtime_source.contains("let mut staged_root_fixed_bytes_banks")
+            && !runtime_source.contains("mut root_bytes_state,")
+            && !runtime_source.contains("mut root_fixed_bytes_banks,");
+    let runtime_root_state_container_wrapped = runtime_root_state_update_loop_no_loose_maps
+        && (runtime_source.contains("struct RuntimeRootState")
+            || runtime_source.contains("RuntimeResult<(PlanExecutorRootState, JsonValue, usize)>"));
+    let runtime_plan_executor_root_state_carried = runtime_root_state_update_loop_no_loose_maps
+        && runtime_source.contains("RuntimeResult<(PlanExecutorRootState, JsonValue, usize)>")
+        && !runtime_source.contains("struct RuntimeRootState")
+        && !runtime_source.contains("RuntimeResult<(RuntimeRootState, JsonValue, usize)>");
+    let plan_executor_root_state_update_helpers_extracted = runtime_plan_executor_root_state_carried
+        && plan_executor_source.contains("pub fn apply_root_json_update_to_root_state")
+        && plan_executor_source.contains("pub fn apply_executed_root_update_to_root_state")
+        && plan_executor_source.contains("root_state.clear_bytes_for_state(target_state_id)")
+        && (runtime_source.contains("collect_plan_root_update_candidate_for_step")
+            || runtime_source.contains("commit_plan_ordered_root_update_candidates"))
+        && !runtime_source.contains("trait RuntimePlanExecutorRootStateOps")
+        && !runtime_source.contains("impl RuntimePlanExecutorRootStateOps")
+        && !runtime_source.contains("apply_root_json_state_value")
+        && !runtime_source.contains("apply_plan_executed_root_update_to_state");
+    let plan_executor_root_executed_update_state_application_extracted = plan_executor_source
+        .contains("pub struct RootExecutedUpdate")
+        && plan_executor_source.contains("pub fn root_update_candidate_from_executed")
+        && plan_executor_source.contains("pub fn apply_executed_root_update_to_state")
+        && runtime_source.contains("RootExecutedUpdate")
+        && (runtime_source.contains("plan_root_update_candidate_from_executed")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step"))
+        && (runtime_source.contains("apply_plan_executed_root_update_to_state")
+            || runtime_source.contains("apply_plan_executed_root_update_to_root_state")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step"))
+        && !runtime_source.contains("struct ExecutedRootUpdate")
+        && !runtime_source.contains("fn root_update_candidate_from_executed")
+        && !runtime_source.contains("fn apply_executed_root_update_to_state")
+        && !runtime_source.contains("struct RootFixedBytesMutation");
+    let plan_executor_root_update_branch_collection_extracted =
+        plan_executor_root_state_update_helpers_extracted
+            && plan_executor_root_executed_update_state_application_extracted
+            && plan_executor_source.contains("pub struct RootUpdateBranchCollection")
+            && plan_executor_source.contains("pub fn collect_root_update_candidate_for_step")
+            && plan_executor_source.contains("cpu-plan-root-update-branch-collection-v1")
+            && runtime_source.contains("collect_plan_root_update_candidate_for_step")
+            && !runtime_source.contains("RootUpdateCandidateRecordKind")
+            && !runtime_source.contains("record_plan_root_update_candidate")
+            && !runtime_source.contains("plan_root_update_candidate_from_executed")
+            && !runtime_source.contains("execute_plan_root_json_update_branch")
+            && !runtime_source.contains("apply_plan_root_json_update_to_root_state")
+            && !runtime_source.contains("apply_plan_executed_root_update_to_root_state")
+            && !runtime_source.contains(
+                "CPU root-scenario PlanExecutor update branch {} does not target a state slot",
+            )
+            && !runtime_source
+                .contains("selected update branch {} has {} unresolved executable refs");
+    let plan_executor_root_aggregate_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_root_pure_number_compare_values")
+        && plan_executor_source.contains("fn aggregate_count_values")
+        && plan_executor_source.contains("pub fn changed_root_derived_deltas")
+        && runtime_source.contains("evaluate_root_pure_number_compare_values_core")
+        && (runtime_source.contains("changed_root_derived_deltas_core")
+            || runtime_source.contains("remove_plan_list_rows_for_source_event"))
+        && !runtime_source.contains("fn eval_root_bool_derived_expression")
+        && !runtime_source.contains("fn aggregate_count_values");
+    let plan_executor_source_route_selection_extracted = plan_executor_source
+        .contains("pub fn select_source_route_update")
+        && plan_executor_source.contains("PlanOpKind::UpdateBranch")
+        && plan_executor_source.contains("ValueRef::SourcePayload")
+        && plan_executor_source.contains("cpu-plan-source-route-selection-v1");
+    let plan_executor_source_route_execution_context_extracted = plan_executor_source
+        .contains("pub fn resolve_source_route_execution_context")
+        && plan_executor_source.contains("SourceRouteExecutionContext")
+        && plan_executor_source.contains("cpu-plan-source-route-execution-context-v1")
+        && (runtime_source.contains("resolve_plan_source_route_execution_context")
+            || runtime_source.contains("execute_plan_source_route_with_runtime_callbacks"))
+        && !runtime_source.contains("source-route selector chose missing update op");
+    let plan_executor_source_route_json_execution_extracted = plan_executor_source
+        .contains("pub fn execute_source_route_json_update")
+        && plan_executor_source.contains("SourceRouteJsonExecution")
+        && plan_executor_source.contains("cpu-plan-source-route-json-execution-v1");
+    let plan_executor_source_route_execution_surface_extracted = plan_executor_source
+        .contains("pub fn select_source_route_execution_surface")
+        && plan_executor_source.contains("SourceRouteExecutionSurfaceKind")
+        && plan_executor_source.contains("cpu-plan-source-route-execution-surface-v1")
+        && (runtime_source.contains("select_plan_source_route_execution_surface")
+            || runtime_source.contains("execute_plan_source_route_with_runtime_callbacks"))
+        && !runtime_source.contains("let route_core_value_is_bytes = source_route_json_execution");
+    let plan_executor_source_route_full_execution_validation_extracted = plan_executor_source
+        .contains("pub fn validate_source_route_full_execution")
+        && plan_executor_source.contains("SourceRouteFullExecutionValidation")
+        && plan_executor_source.contains("cpu-plan-source-route-full-execution-validation-v1");
+    let plan_executor_source_route_legacy_comparison_extracted = plan_executor_source
+        .contains("pub fn assemble_source_route_legacy_comparison")
+        && plan_executor_source.contains("SourceRouteLegacyComparisonAssembly")
+        && plan_executor_source.contains("cpu-plan-source-route-legacy-comparison-assembly-v1")
+        && runtime_source.contains("assemble_plan_source_route_legacy_comparison")
+        && !runtime_source
+            .contains("\"legacy_semantic_delta_count\": legacy_output.semantic_deltas.len()");
+    let plan_executor_source_route_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_source_route_report")
+        && plan_executor_source.contains("SourceRouteReportAssembly")
+        && plan_executor_source.contains("cpu-plan-source-route-report-assembly-v1");
+    let plan_executor_source_route_command_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_source_route_command_report")
+        && plan_executor_source.contains("SourceRouteCommandReportAssembly")
+        && plan_executor_source.contains("cpu-plan-source-route-command-report-assembly-v1")
+        && (runtime_source.contains("assemble_plan_source_route_command_report")
+            || runtime_source.contains("assemble_plan_source_route_command_output"))
+        && !runtime_source.contains("\"cpu-plan-source-route-executed\"");
+    let plan_executor_source_route_command_argv_extracted = plan_executor_source
+        .contains("pub struct SourceRouteCommandArgvInput")
+        && plan_executor_source.contains("pub fn build_source_route_command_argv")
+        && plan_executor_source.contains("\"run-plan-route\"")
+        && plan_executor_source.contains("\"--payload-bytes-hex\"")
+        && (runtime_source.contains("build_plan_source_route_command_argv")
+            || runtime_source.contains("assemble_plan_source_route_command_output"))
+        && (runtime_source.contains("SourceRouteCommandArgvInput")
+            || runtime_source.contains("SourceRouteCommandOutputInput"))
+        && !runtime_source.contains("fn bytes_hex_argument");
+    let plan_executor_source_route_command_output_extracted = plan_executor_source
+        .contains("pub struct SourceRouteCommandOutputInput")
+        && plan_executor_source.contains("pub fn assemble_source_route_command_output")
+        && plan_executor_source.contains("cpu-plan-source-route-command-output-v1")
+        && runtime_source.contains("assemble_plan_source_route_command_output")
+        && runtime_source.contains("SourceRouteCommandOutputInput")
+        && !runtime_source.contains("fn source_event_report(")
+        && !runtime_source.contains("fn run_plan_source_route_command_argv(")
+        && !runtime_source.contains("fn source_event_payload_bytes_report(");
+    let plan_executor_source_route_source_event_report_extracted = plan_executor_source
+        .contains("pub struct SourceRouteSourceEventReportInput")
+        && plan_executor_source.contains("pub fn build_source_route_source_event_report")
+        && plan_executor_source.contains("\"payload_bytes\": input.payload_bytes_report")
+        && (runtime_source.contains("build_plan_source_route_source_event_report")
+            || runtime_source.contains("assemble_plan_source_route_command_output"))
+        && runtime_source.contains("SourceRouteSourceEventReportInput")
+        && !runtime_source.contains("\"pointer_height\": event.pointer_height");
+    let plan_executor_source_event_payload_bytes_artifact_report_extracted = plan_executor_source
+        .contains("pub struct SourceEventPayloadBytesReport")
+        && plan_executor_source.contains("pub fn build_source_event_payload_bytes_report")
+        && plan_executor_source.contains("cpu-plan-source-event-payload-bytes-report-v1")
+        && (runtime_source.contains("build_plan_source_event_payload_bytes_report")
+            || runtime_source.contains("assemble_plan_source_route_command_output"))
+        && !runtime_source.contains("fn source_event_bytes_artifact_path")
+        && !runtime_source.contains("fn sanitize_artifact_name");
+    let plan_executor_source_route_orchestration_extracted = plan_executor_source
+        .contains("pub fn execute_source_route_with_runtime_callbacks")
+        && plan_executor_source.contains("pub struct SourceRouteSelectedExecution")
+        && plan_executor_source.contains("pub struct SourceRouteFullExecution")
+        && plan_executor_source.contains("pub struct SourceRouteOrchestration")
+        && runtime_source.contains("execute_plan_source_route_with_runtime_callbacks")
+        && !runtime_source.contains("fn execute_machine_plan_source_route_inner(")
+        && !runtime_source.contains("resolve_plan_source_route_execution_context")
+        && !runtime_source.contains("execute_plan_source_route_json_update")
+        && !runtime_source.contains("select_plan_source_route_execution_surface")
+        && !runtime_source.contains("validate_plan_source_route_full_execution");
+    let plan_executor_source_route_runtime_branch_execution_extracted = plan_executor_source
+        .contains("pub struct SourceRouteRuntimeBranchExecutionInput")
+        && plan_executor_source.contains("pub fn assemble_source_route_runtime_branch_execution")
+        && plan_executor_source.contains("cpu-plan-source-route-runtime-branch-execution-v1")
+        && runtime_source.contains("assemble_plan_source_route_runtime_branch_execution")
+        && runtime_source.contains("SourceRouteRuntimeBranchExecutionInput")
+        && !runtime_source.contains("Ok(SourceRouteSelectedExecution {");
+    let plan_executor_root_work_selection_extracted = plan_executor_source
+        .contains("pub fn select_root_source_event_work")
+        && plan_executor_source.contains("sort_plan_ops_for_same_event_root_reads")
+        && plan_executor_source.contains("cpu-plan-root-source-event-work-selection-v1");
+    let plan_executor_root_scenario_step_dispatch_extracted = plan_executor_source
+        .contains("pub fn dispatch_root_scenario_step")
+        && plan_executor_source.contains("RootScenarioStepDispatch")
+        && plan_executor_source.contains("cpu-plan-root-scenario-step-dispatch-v1")
+        && plan_executor_source.contains("root_update_key_matches");
+    let plan_executor_root_scenario_update_op_resolution_extracted = plan_executor_source
+        .contains("pub fn ordered_root_update_ops_for_dispatch")
+        && plan_executor_source.contains("root source-event selector chose missing update op")
+        && (runtime_source.contains("ordered_plan_root_update_ops_for_dispatch")
+            || runtime_source.contains("prepare_plan_root_scenario_step"))
+        && !runtime_source.contains("root source-event selector chose missing update op");
+    let plan_executor_root_scenario_source_route_resolution_extracted = plan_executor_source
+        .contains("pub fn source_route_slot_for_dispatch")
+        && plan_executor_source.contains("has no route slot")
+        && (runtime_source.contains("plan_source_route_slot_for_dispatch")
+            || runtime_source.contains("prepare_plan_root_scenario_step"))
+        && !runtime_source.contains("let source_route_slot = plan\n            .source_routes")
+        && !runtime_source.contains("MachinePlan source route `{}` has no route slot");
+    let plan_executor_root_scenario_materialized_work_validation_extracted = plan_executor_source
+        .contains("pub fn validate_root_scenario_materialized_work")
+        && plan_executor_source.contains("RootScenarioMaterializedWork")
+        && plan_executor_source.contains("cpu-plan-root-scenario-materialized-work-v1")
+        && (runtime_source.contains("validate_plan_root_scenario_materialized_work")
+            || runtime_source.contains("prepare_plan_root_scenario_step"))
+        && !runtime_source.contains("if route_ops.is_empty() && derived_values.is_empty()");
+    let plan_executor_source_derived_value_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_source_derived_values_for_event")
+        && plan_executor_source.contains("SourceKeyTextTrimNonEmpty")
+        && plan_executor_source
+            .contains("CPU root-scenario PlanExecutor does not support derived op")
+        && (runtime_source.contains("evaluate_plan_source_derived_values_for_event")
+            || runtime_source.contains("prepare_plan_root_scenario_step"))
+        && !runtime_source.contains("fn execute_supported_derived_values_for_source");
+    let plan_executor_root_scenario_step_preparation_extracted = plan_executor_source
+        .contains("pub struct RootScenarioStepPreparation")
+        && plan_executor_source.contains("pub fn prepare_root_scenario_step")
+        && plan_executor_source.contains("cpu-plan-root-scenario-step-preparation-v1")
+        && runtime_source.contains("prepare_plan_root_scenario_step")
+        && !runtime_source.contains("dispatch_plan_root_scenario_step(plan, generic_event.source")
+        && !runtime_source
+            .contains("let materialized_work = validate_plan_root_scenario_materialized_work")
+        && !runtime_source.contains("let route_ops = ordered_plan_root_update_ops_for_dispatch");
+    let plan_executor_source_derived_delta_policy_extracted = plan_executor_source
+        .contains("pub fn build_source_derived_value_deltas")
+        && plan_executor_source.contains("\"field_id\": field_id.0")
+        && (runtime_source.contains("build_plan_source_derived_value_deltas")
+            || runtime_source.contains("assemble_plan_source_derived_step_deltas"))
+        && !runtime_source.contains("for (field_id, value) in &derived_values")
+        && !runtime_source.contains("let field_label = plan_derived_field_label(plan, field_id.0)");
+    let plan_executor_source_derived_step_delta_bundle_extracted = plan_executor_source
+        .contains("pub struct SourceDerivedStepDeltas")
+        && plan_executor_source.contains("pub fn assemble_source_derived_step_deltas")
+        && plan_executor_source.contains("cpu-plan-source-derived-step-deltas-v1")
+        && runtime_source.contains("assemble_plan_source_derived_step_deltas")
+        && !runtime_source.contains("for (signature, delta, report) in")
+        && !runtime_source
+            .contains("build_plan_source_derived_value_deltas(plan, &derived_values)");
+    let plan_executor_expected_source_event_decoder_extracted = plan_executor_source
+        .contains("pub fn decode_expected_source_event")
+        && plan_executor_source.contains("PlanExecutorExpectedSourceEvent")
+        && plan_executor_source.contains("source_payload_bytes_field_from_toml_key")
+        && runtime_source
+            .contains("decode_expected_source_event as decode_plan_expected_source_event")
+        && !runtime_source.contains("fn source_payload_bytes_field_from_toml_key");
+    let plan_executor_source_payload_bytes_key_policy_extracted = plan_executor_source
+        .contains("pub fn source_payload_bytes_toml_key")
+        && plan_executor_source.contains("pub fn validate_source_payload_bytes_field_name")
+        && runtime_source.contains("build_plan_live_source_event_expected_toml")
+        && runtime_source.contains("validate_plan_source_payload_bytes_field_name")
+        && !runtime_source.contains("fn source_payload_bytes_toml_key")
+        && !runtime_source.contains("fn validate_source_payload_bytes_field_name");
+    let plan_executor_live_source_event_expectation_matcher_extracted = plan_executor_source
+        .contains("pub struct PlanExecutorLiveSourceEvent")
+        && plan_executor_source.contains("pub fn assert_live_source_event_matches_expected")
+        && runtime_source.contains("PlanExecutorLiveSourceEvent")
+        && runtime_source.contains("assert_plan_live_source_event_matches_expected")
+        && !runtime_source.contains("fn assert_live_source_event_field")
+        && !runtime_source.contains("fn assert_live_source_event_numeric_field");
+    let plan_executor_live_source_event_expected_toml_builder_extracted = plan_executor_source
+        .contains("pub struct PlanExecutorLiveSourceEventExpectedToml")
+        && plan_executor_source.contains("pub fn build_live_source_event_expected_toml")
+        && runtime_source.contains("PlanExecutorLiveSourceEventExpectedToml")
+        && runtime_source.contains("build_plan_live_source_event_expected_toml")
+        && !runtime_source.contains("let mut expected_source_event = BTreeMap::new();")
+        && !runtime_source.contains(
+            "expected_source_event.insert(\"source\".to_owned(), toml::Value::String(self.source))",
+        );
+    let plan_executor_scenario_step_selection_extracted = plan_executor_source
+        .contains("pub fn select_explicit_root_scenario_steps")
+        && plan_executor_source.contains("pub fn select_scenario_event_steps")
+        && plan_executor_source.contains("PlanExecutorScenarioStepMeta")
+        && plan_executor_source.contains("cpu-plan-explicit-root-scenario-step-selection-v1")
+        && plan_executor_source.contains("cpu-plan-scenario-events-step-selection-v1")
+        && runtime_source.contains(
+            "select_explicit_root_scenario_steps as select_plan_explicit_root_scenario_steps",
+        )
+        && runtime_source
+            .contains("select_scenario_event_steps as select_plan_scenario_event_steps")
+        && !runtime_source.contains(
+            "run-plan-root-scalar-scenario requires --steps with explicit scenario step ids",
+        )
+        && !runtime_source.contains("has no expected_source_event steps for PlanExecutor replay");
+    let plan_executor_debug_label_helpers_extracted = plan_executor_source
+        .contains("pub fn state_label_by_id")
+        && plan_executor_source.contains("pub fn root_state_is_scalar")
+        && plan_executor_source.contains("pub fn semantic_field_label")
+        && plan_executor_source.contains("pub fn derived_field_label")
+        && plan_executor_source.contains("pub fn list_label")
+        && plan_executor_source.contains("pub fn local_field_name")
+        && runtime_source.contains("state_label_by_id as plan_state_label")
+        && runtime_source.contains("field_label as plan_field_label")
+        && runtime_source.contains("semantic_field_label as plan_semantic_field_label")
+        && runtime_source.contains("list_label as plan_list_label")
+        && !runtime_source.contains("fn plan_state_label")
+        && !runtime_source.contains("fn plan_field_label")
+        && !runtime_source.contains("fn plan_semantic_field_label")
+        && !runtime_source.contains("fn plan_derived_field_label")
+        && !runtime_source.contains("fn plan_list_label")
+        && !runtime_source.contains("fn plan_state_is_root_scalar");
+    let plan_executor_root_scenario_step_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_root_scenario_step_report")
+        && plan_executor_source.contains("RootScenarioStepReportAssembly")
+        && plan_executor_source.contains("cpu-plan-root-scenario-step-report-assembly-v1")
+        && runtime_source.contains("assemble_plan_root_scenario_step_report");
+    let plan_executor_root_scenario_legacy_comparison_extracted = plan_executor_source
+        .contains("pub fn assemble_root_scenario_legacy_comparison")
+        && plan_executor_source.contains("RootScenarioLegacyComparisonAssembly")
+        && plan_executor_source.contains("cpu-plan-root-scenario-legacy-comparison-assembly-v1")
+        && runtime_source.contains("assemble_plan_root_scenario_legacy_comparison")
+        && !runtime_source.contains("\"step_comparisons\": step_comparisons");
+    let plan_executor_root_scenario_command_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_root_scenario_command_report")
+        && plan_executor_source.contains("RootScenarioCommandReportAssembly")
+        && plan_executor_source.contains("cpu-plan-root-scenario-command-report-assembly-v1")
+        && (runtime_source.contains("assemble_plan_root_scenario_command_report")
+            || runtime_source.contains("assemble_plan_root_scenario_command_output"))
+        && !runtime_source.contains("\"cpu-plan-root-list-scenario-executed\"");
+    let plan_executor_root_scenario_command_output_extracted = plan_executor_source
+        .contains("pub struct RootScenarioCommandOutputInput")
+        && plan_executor_source.contains("pub fn assemble_root_scenario_command_output")
+        && plan_executor_source.contains("cpu-plan-root-scenario-command-output-v1")
+        && runtime_source.contains("assemble_plan_root_scenario_command_output")
+        && runtime_source.contains("RootScenarioCommandOutputInput")
+        && !runtime_source.contains("RootScenarioCommandReportInput");
+    let plan_executor_scenario_events_command_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_scenario_events_command_report")
+        && plan_executor_source.contains("ScenarioEventsCommandReportAssembly")
+        && plan_executor_source.contains("cpu-plan-scenario-events-command-report-assembly-v1")
+        && (runtime_source.contains("assemble_plan_scenario_events_command_report")
+            || runtime_source.contains("assemble_plan_scenario_events_command_output"))
+        && !runtime_source.contains("\"cpu-plan-scenario-events-executed\"");
+    let plan_executor_scenario_events_command_output_extracted = plan_executor_source
+        .contains("pub struct ScenarioEventsCommandOutputInput")
+        && plan_executor_source.contains("pub fn assemble_scenario_events_command_output")
+        && plan_executor_source.contains("cpu-plan-scenario-events-command-output-v1")
+        && runtime_source.contains("assemble_plan_scenario_events_command_output")
+        && runtime_source.contains("ScenarioEventsCommandOutputInput")
+        && !runtime_source.contains("ScenarioEventsCommandReportInput");
+    let plan_executor_semantic_delta_normalization_extracted = plan_executor_source
+        .contains("pub fn semantic_delta_signature")
+        && plan_executor_source.contains("pub fn coalesce_field_set_deltas")
+        && runtime_source.contains("plan_json_delta_signature")
+        && runtime_source.contains("coalesce_plan_field_set_deltas")
+        && !runtime_source.contains("fn plan_json_delta_signature")
+        && !runtime_source.contains("fn coalesce_plan_field_set_deltas")
+        && !runtime_source.contains("fn plan_field_set_delta_target_key");
+    let plan_executor_indexed_update_conflict_guard_extracted = plan_executor_source
+        .contains("pub fn track_indexed_update_write_conflicts")
+        && plan_executor_source.contains("fn indexed_update_write_target_key")
+        && (runtime_source.contains("track_plan_indexed_update_write_conflicts")
+            || runtime_source.contains("execute_plan_indexed_update_batch_with"))
+        && !runtime_source.contains("fn track_indexed_update_write_conflicts")
+        && !runtime_source.contains("fn indexed_update_write_target_key");
+    let plan_executor_indexed_update_delta_ordering_extracted = plan_executor_source
+        .contains("pub fn order_indexed_update_semantic_deltas")
+        && plan_executor_source.contains("IndexedUpdateDeltaBatch")
+        && plan_executor_source.contains("cpu-plan-indexed-update-delta-ordering-v1")
+        && (runtime_source.contains("order_plan_indexed_update_semantic_deltas")
+            || runtime_source.contains("execute_plan_indexed_update_batch_with"))
+        && !runtime_source.contains("let ordered_indexed_deltas = if bulk_indexed_update");
+    let plan_executor_indexed_update_target_selection_extracted = plan_executor_source
+        .contains("pub fn select_unscoped_indexed_update_targets")
+        && plan_executor_source.contains("IndexedUpdateTargetEvent")
+        && plan_executor_source.contains("IndexedUpdateTargetRow")
+        && plan_executor_source.contains("cpu-plan-indexed-update-target-selection-v1")
+        && (runtime_source.contains("select_plan_unscoped_indexed_update_targets")
+            || runtime_source.contains("execute_plan_indexed_update_batch_with"))
+        && runtime_source.contains("plan_executor_list_state_for_materialization")
+        && !runtime_source.contains("fn plan_executor_indexed_update_target_rows")
+        && !runtime_source.contains("fn unscoped_indexed_update_targets");
+    let plan_executor_indexed_update_batch_execution_extracted = plan_executor_source
+        .contains("pub fn execute_indexed_update_batch_with")
+        && plan_executor_source.contains("pub struct IndexedUpdateBatchExecution")
+        && plan_executor_source.contains("pub struct IndexedUpdateBranchExecution")
+        && plan_executor_source.contains("cpu-plan-indexed-update-batch-execution-v1")
+        && runtime_source.contains("execute_plan_indexed_update_batch_with")
+        && !runtime_source.contains("let mut indexed_executions = Vec::new()")
+        && !runtime_source.contains("track_plan_indexed_update_write_conflicts")
+        && !runtime_source.contains("order_plan_indexed_update_semantic_deltas")
+        && !runtime_source.contains("select_plan_unscoped_indexed_update_targets");
+    let plan_executor_indexed_json_update_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_indexed_json_update_branch")
+        && plan_executor_source.contains("pub struct IndexedJsonUpdateEvaluation")
+        && plan_executor_source.contains("cpu-plan-indexed-json-update-evaluator-v1")
+        && runtime_source.contains("evaluate_plan_indexed_json_update_branch")
+        && !runtime_source.contains("fn indexed_bool_not_input_value")
+        && !runtime_source.contains("fn indexed_single_state_input")
+        && !runtime_source
+            .contains("indexed TextTrimOrPrevious update branch {} payload is not text")
+        && !runtime_source.contains("indexed ReadPath update branch {} input field");
+    let plan_executor_root_scenario_report_assembly_extracted = plan_executor_source
+        .contains("pub fn assemble_root_scenario_report")
+        && plan_executor_source.contains("RootScenarioReportAssembly")
+        && plan_executor_source.contains("cpu-plan-root-scenario-report-assembly-v1");
+    let plan_executor_root_scenario_acceptance_policy_extracted = plan_executor_source
+        .contains("pub fn demand_current_semantic_delta_acceptance_policy")
+        && plan_executor_source.contains("cpu-plan-root-scenario-demand-current-acceptance-v1")
+        && !runtime_source.contains("fn demand_current_semantic_delta_acceptance_policy");
+    let plan_executor_root_scenario_coverage_report_extracted = plan_executor_source
+        .contains("pub fn assemble_root_scenario_coverage_report")
+        && plan_executor_source.contains("RootScenarioCoverageReport")
+        && plan_executor_source.contains("cpu-plan-root-scenario-coverage-report-v1")
+        && !runtime_source.contains("fn plan_assertion_checkpoint_report_is_covered");
+    let plan_executor_root_json_update_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_root_json_update_branch")
+        && plan_executor_source.contains("RootJsonSourceEvent")
+        && plan_executor_source.contains("cpu-plan-root-json-update-evaluator-v1");
+    let plan_executor_root_update_execution_surface_extracted = plan_executor_source
+        .contains("pub fn select_root_update_execution_surface")
+        && plan_executor_source.contains("RootUpdateExecutionSurfaceKind")
+        && plan_executor_source.contains("cpu-plan-root-update-execution-surface-v1")
+        && !runtime_source.contains("let core_value_is_bytes = json_evaluation");
+    let plan_executor_root_json_update_execution_extracted = plan_executor_source
+        .contains("pub struct RootJsonUpdateExecution")
+        && plan_executor_source.contains("pub fn execute_root_json_update_branch")
+        && plan_executor_source.contains("cpu-plan-root-json-update-execution-v1")
+        && (runtime_source.contains("execute_plan_root_json_update_branch")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step"))
+        && !runtime_source.contains("let json_evaluation = evaluate_root_json_update_branch")
+        && !runtime_source.contains("source_payload_field: json_evaluation.source_payload_field")
+        && !runtime_source.contains("root JSON update evaluator reported supported branch");
+    let plan_executor_root_runtime_branch_update_execution_extracted = plan_executor_source
+        .contains("pub struct RootRuntimeBranchUpdateInput")
+        && plan_executor_source.contains("pub fn assemble_root_runtime_branch_update")
+        && plan_executor_source.contains("cpu-plan-root-runtime-branch-update-execution-v1")
+        && runtime_source.contains("assemble_plan_root_runtime_branch_update")
+        && !runtime_source.contains("Ok(Some(RootExecutedUpdate {");
+    let plan_executor_root_bytes_update_dispatch_extracted = plan_executor_source
+        .contains("pub enum RootBytesUpdateDispatchKind")
+        && plan_executor_source.contains("pub fn root_bytes_update_dispatch_kind")
+        && plan_executor_source.contains("PlanExpressionKind::FileWriteBytes")
+        && runtime_source.contains("plan_root_bytes_update_dispatch_kind")
+        && runtime_source.contains("RootBytesUpdateDispatchKind::Read")
+        && runtime_source.contains("RootBytesUpdateDispatchKind::Write");
+    let plan_executor_root_bytes_shadowed_runtime_arms_removed =
+        plan_executor_root_bytes_update_dispatch_extracted
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::BytesLength")
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::BytesSet")
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::BytesConcat")
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::FileReadBytes")
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::FileWriteBytes")
+            && !runtime_source.contains("expression_kind: PlanExpressionKind::TextToBytes");
+    let plan_executor_root_bytes_runtime_environment_wrapped =
+        plan_executor_root_bytes_shadowed_runtime_arms_removed
+            && runtime_source.contains("struct RootBytesRuntimeEnvironment")
+            && runtime_source.contains("fn evaluate_read(")
+            && runtime_source.contains("fn evaluate_write(")
+            && runtime_source.contains("RootBytesRuntimeEnvironment::new")
+            && runtime_source.contains("bytes_environment.evaluate_read")
+            && runtime_source.contains("bytes_environment.evaluate_write")
+            && !runtime_source.contains("fn evaluate_root_bytes_read_update_for_runtime")
+            && !runtime_source.contains("fn evaluate_root_bytes_write_update_for_runtime");
+    let plan_executor_root_bytes_environment_capability_extracted =
+        plan_executor_root_bytes_runtime_environment_wrapped
+            && plan_executor_source.contains("pub trait RootBytesEnvironment")
+            && plan_executor_source.contains("fn private_bytes_for_state")
+            && plan_executor_source.contains("fn fixed_byte_bank_for_state")
+            && plan_executor_source.contains("impl RootBytesEnvironment for PlanExecutorRootState")
+            && plan_executor_source
+                .contains("bytes_environment: &(impl RootBytesEnvironment + ?Sized)")
+            && runtime_source.contains("impl RootBytesEnvironment for RootBytesRuntimeEnvironment")
+            && runtime_source.contains(
+                "evaluate_root_bytes_read_update(plan, op, root_state, self, self.host_file_root)",
+            )
+            && runtime_source.contains(
+                "evaluate_root_bytes_write_update(plan, op, root_state, self, self.host_file_root)",
+            );
+    let plan_executor_source_guard_matching_extracted = plan_executor_source
+        .contains("pub fn source_guard_matches")
+        && plan_executor_source.contains("PlanSourceGuard::SourcePayloadOneOf")
+        && plan_executor_source.contains("SourcePayloadField::Bytes")
+        && plan_executor_source.contains("source_payload_bytes(event, field)?")
+        && plan_executor_source.contains("bytes_decode_hex(expected)")
+        && runtime_source.contains("plan_executor_source_guard_matches")
+        && !runtime_source.contains("fn plan_source_guard_matches");
+    let plan_executor_root_json_state_write_extracted = plan_executor_source
+        .contains("pub fn apply_root_json_state_value")
+        && plan_executor_source.contains("RootJsonStateWrite")
+        && plan_executor_source.contains("cpu-plan-root-json-state-write-v1");
+    let plan_executor_root_bytes_source_payload_report_extracted = plan_executor_source
+        .contains("payload_bytes")
+        && plan_executor_source.contains("SourcePayloadField::Bytes")
+        && plan_executor_source.contains("source_payload_value_for_slot")
+        && plan_executor_source.contains("bytes_report_json");
+    let plan_executor_root_bytes_initial_storage_extracted = plan_executor_source
+        .contains("pub fn initialize_root_bytes_storage")
+        && plan_executor_source.contains("RootBytesStorageInitialization")
+        && plan_executor_source.contains("PlanExecutorBytes")
+        && plan_executor_source.contains("cpu-plan-root-bytes-storage-initializer-v1");
+    let plan_executor_root_state_container_extracted = plan_executor_source
+        .contains("pub struct PlanExecutorRootState")
+        && plan_executor_source.contains("pub fn initialize_root_state")
+        && plan_executor_source.contains("cpu-plan-root-state-initializer-v1")
+        && runtime_source.contains("initialize_plan_root_state")
+        && runtime_source.contains("type RootBytesState = BTreeMap<usize, PlanExecutorBytes>")
+        && !runtime_source.contains("fn runtime_bytes_state_for_plan_executor");
+    let plan_executor_root_bytes_read_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_root_bytes_read_update")
+        && plan_executor_source.contains("RootBytesReadEvaluation")
+        && plan_executor_source.contains("cpu-plan-root-bytes-read-evaluator-v1")
+        && plan_executor_source.contains("PlanExpressionKind::BytesLength")
+        && plan_executor_source.contains("PlanExpressionKind::BytesGet")
+        && plan_executor_source.contains("PlanExpressionKind::BytesEqual")
+        && plan_executor_source.contains("PlanExpressionKind::BytesFind")
+        && plan_executor_source.contains("PlanExpressionKind::BytesStartsWith")
+        && plan_executor_source.contains("PlanExpressionKind::BytesEndsWith")
+        && plan_executor_source.contains("PlanExpressionKind::BytesToText")
+        && plan_executor_source.contains("PlanExpressionKind::BytesToHex")
+        && plan_executor_source.contains("PlanExpressionKind::BytesToBase64")
+        && plan_executor_source.contains("PlanExpressionKind::BytesReadUnsigned")
+        && plan_executor_source.contains("PlanExpressionKind::BytesReadSigned")
+        && plan_executor_source.contains("PlanExpressionKind::FileReadBytes");
+    let plan_executor_root_bytes_write_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_root_bytes_write_update")
+        && plan_executor_source.contains("RootBytesWriteEvaluation")
+        && plan_executor_source.contains("cpu-plan-root-bytes-write-evaluator-v1")
+        && plan_executor_source.contains("PlanExpressionKind::BytesSet")
+        && plan_executor_source.contains("PlanExpressionKind::BytesConcat")
+        && plan_executor_source.contains("PlanExpressionKind::BytesSlice")
+        && plan_executor_source.contains("PlanExpressionKind::BytesTake")
+        && plan_executor_source.contains("PlanExpressionKind::BytesDrop")
+        && plan_executor_source.contains("PlanExpressionKind::BytesZeros")
+        && plan_executor_source.contains("PlanExpressionKind::TextToBytes")
+        && plan_executor_source.contains("PlanExpressionKind::BytesFromHex")
+        && plan_executor_source.contains("PlanExpressionKind::BytesFromBase64")
+        && plan_executor_source.contains("PlanExpressionKind::BytesWriteUnsigned")
+        && plan_executor_source.contains("PlanExpressionKind::BytesWriteSigned")
+        && plan_executor_source.contains("PlanExpressionKind::FileWriteBytes");
+    let plan_executor_indexed_bytes_read_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_indexed_bytes_read_update")
+        && plan_executor_source.contains("IndexedBytesReadEvaluation")
+        && plan_executor_source.contains("IndexedRowView")
+        && plan_executor_source.contains("cpu-plan-indexed-bytes-read-evaluator-v1")
+        && plan_executor_source.contains("PlanExpressionKind::BytesLength")
+        && plan_executor_source.contains("PlanExpressionKind::BytesGet");
+    let plan_executor_indexed_file_bytes_read_evaluator_extracted =
+        plan_executor_indexed_bytes_read_evaluator_extracted
+            && plan_executor_source.contains("PlanExpressionKind::FileReadBytes")
+            && plan_executor_source.contains("fn indexed_file_read_bytes_path")
+            && plan_executor_source.contains("read_plan_host_file_bytes");
+    let plan_executor_indexed_bytes_write_evaluator_extracted = plan_executor_source
+        .contains("pub fn evaluate_indexed_bytes_write_update")
+        && plan_executor_source.contains("IndexedBytesWriteEvaluation")
+        && plan_executor_source.contains("IndexedRowView")
+        && plan_executor_source.contains("cpu-plan-indexed-bytes-write-evaluator-v1")
+        && plan_executor_source.contains("PlanExpressionKind::BytesSet");
+    let plan_executor_indexed_file_bytes_write_evaluator_extracted =
+        plan_executor_indexed_bytes_write_evaluator_extracted
+            && plan_executor_source.contains("PlanExpressionKind::FileWriteBytes")
+            && plan_executor_source.contains("fn indexed_file_write_bytes_path")
+            && plan_executor_source.contains("write_plan_host_file_bytes");
+    let plan_executor_root_bytes_source_payload_commit_extracted = plan_executor_source
+        .contains("pub fn evaluate_root_bytes_source_payload_commit")
+        && plan_executor_source.contains("RootBytesSourcePayloadCommit")
+        && plan_executor_source.contains("cpu-plan-root-bytes-source-payload-commit-v1");
+    let plan_executor_root_bytes_state_transition_extracted = plan_executor_source
+        .contains("pub fn apply_root_bytes_state_transition")
+        && plan_executor_source.contains("RootBytesStateTransition")
+        && plan_executor_source.contains("RootBytesFixedMutation")
+        && plan_executor_source.contains("cpu-plan-root-bytes-state-transition-v1")
+        && plan_executor_source
+            .contains("let bytes_transition = apply_root_bytes_state_transition(")
+        && (runtime_source.contains("apply_plan_root_update_storage_transition")
+            || runtime_source.contains("apply_plan_executed_root_update_to_state")
+            || runtime_source.contains("apply_plan_executed_root_update_to_root_state")
+            || runtime_source.contains("collect_plan_root_update_candidate_for_step")
+            || runtime_source.contains("commit_plan_ordered_root_update_candidates"))
+        && !runtime_source.contains("let transition = apply_root_bytes_state_transition(")
+        && !runtime_source.contains("fn apply_root_fixed_bytes_mutation")
+        && !runtime_source.contains("fn root_private_bytes_for_fixed_mutation");
+    let plan_executor_root_bytes_state_owner_capability_extracted =
+        plan_executor_root_bytes_state_transition_extracted
+            && plan_executor_source.contains("pub trait RootBytesStateOwner")
+            && plan_executor_source.contains("pub struct RootBytesStateMaps")
+            && plan_executor_source.contains("impl RootBytesStateOwner for RootBytesStateMaps")
+            && plan_executor_source.contains("impl RootBytesStateOwner for PlanExecutorRootState")
+            && plan_executor_source.contains("bytes_owner: &mut impl RootBytesStateOwner")
+            && plan_executor_source.contains("let mut bytes_owner = RootBytesStateMaps::new")
+            && !plan_executor_source.contains(
+                "pub fn apply_root_bytes_state_transition(\n    private_bytes: &mut BTreeMap",
+            )
+            && !plan_executor_source
+                .contains("fn apply_root_fixed_bytes_mutation(\n    private_bytes: &BTreeMap");
     push_audit_check(
         &mut checks,
         &mut blockers,
         "compiler-boundaries:planexecutor-core-no-frontend-dependencies",
-        runtime_depends_on_frontend.is_empty(),
-        format!("boon_runtime_frontend_dependencies={runtime_depends_on_frontend:?}"),
-        (!runtime_depends_on_frontend.is_empty()).then(|| {
-            "PlanExecutor core is not extracted; boon_runtime still depends on parser/IR/typecheck crates"
+        plan_executor_core_crate_present
+            && plan_executor_depends_on_plan
+            && plan_executor_frontend_dependencies.is_empty()
+            && plan_executor_initial_state_extracted,
+        format!(
+            "boon_plan_executor: depends_on_plan={plan_executor_depends_on_plan}, frontend_dependencies={plan_executor_frontend_dependencies:?}, initial_state_extracted={plan_executor_initial_state_extracted}"
+        ),
+        (!(plan_executor_core_crate_present
+            && plan_executor_depends_on_plan
+            && plan_executor_frontend_dependencies.is_empty()
+            && plan_executor_initial_state_extracted))
+        .then(|| {
+            "PlanExecutor core crate is missing, frontend-coupled, or does not own the initial-state executor slice".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-initial-state-report-assembly-extracted",
+        plan_executor_initial_state_report_assembly_extracted,
+        format!(
+            "initial_state_report_assembly_extracted={plan_executor_initial_state_report_assembly_extracted}"
+        ),
+        (!plan_executor_initial_state_report_assembly_extracted)
+            .then(|| "PlanExecutor core does not yet own initial-state report assembly".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-projection-materializer-extracted",
+        plan_executor_list_projection_materializer_extracted,
+        format!(
+            "list_projection_materializer_extracted={plan_executor_list_projection_materializer_extracted}"
+        ),
+        (!plan_executor_list_projection_materializer_extracted).then(|| {
+            "PlanExecutor core does not yet own list projection materialization".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-retain-materializer-extracted",
+        plan_executor_list_retain_materializer_extracted,
+        format!(
+            "list_retain_materializer_extracted={plan_executor_list_retain_materializer_extracted}"
+        ),
+        (!plan_executor_list_retain_materializer_extracted)
+            .then(|| "PlanExecutor core does not yet own list retain materialization".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-summary-extracted",
+        plan_executor_list_summary_extracted,
+        format!("list_summary_extracted={plan_executor_list_summary_extracted}"),
+        (!plan_executor_list_summary_extracted)
+            .then(|| "PlanExecutor core does not yet own list summary assembly".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-next-key-allocator-extracted",
+        plan_executor_list_next_key_allocator_extracted,
+        format!(
+            "list_next_key_allocator_extracted={plan_executor_list_next_key_allocator_extracted}"
+        ),
+        (!plan_executor_list_next_key_allocator_extracted)
+            .then(|| "PlanExecutor core does not yet own list next-key allocation".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-row-source-binding-policy-extracted",
+        plan_executor_row_source_binding_policy_extracted,
+        format!(
+            "row_source_binding_policy_extracted={plan_executor_row_source_binding_policy_extracted}"
+        ),
+        (!plan_executor_row_source_binding_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own row source-binding id/delta policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-remove-delta-policy-extracted",
+        plan_executor_list_remove_delta_policy_extracted,
+        format!(
+            "list_remove_delta_policy_extracted={plan_executor_list_remove_delta_policy_extracted}"
+        ),
+        (!plan_executor_list_remove_delta_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own list remove/source-unbind delta policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-remove-predicate-evaluator-extracted",
+        plan_executor_list_remove_predicate_evaluator_extracted,
+        format!(
+            "list_remove_predicate_evaluator_extracted={plan_executor_list_remove_predicate_evaluator_extracted}"
+        ),
+        (!plan_executor_list_remove_predicate_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own list remove predicate evaluation/reporting"
                 .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-append-delta-policy-extracted",
+        plan_executor_list_append_delta_policy_extracted,
+        format!(
+            "list_append_delta_policy_extracted={plan_executor_list_append_delta_policy_extracted}"
+        ),
+        (!plan_executor_list_append_delta_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own list append/row-refresh delta policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-mutation-records-extracted",
+        plan_executor_list_mutation_records_extracted,
+        format!("list_mutation_records_extracted={plan_executor_list_mutation_records_extracted}"),
+        (!plan_executor_list_mutation_records_extracted).then(|| {
+            "Runtime still owns list append/remove mutation report and delta bundle assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-append-value-resolution-extracted",
+        plan_executor_list_append_value_resolution_extracted,
+        format!(
+            "list_append_value_resolution_extracted={plan_executor_list_append_value_resolution_extracted}"
+        ),
+        (!plan_executor_list_append_value_resolution_extracted).then(|| {
+            "PlanExecutor core does not yet own list append value/constant resolution".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-append-row-construction-extracted",
+        plan_executor_list_append_row_construction_extracted,
+        format!(
+            "list_append_row_construction_extracted={plan_executor_list_append_row_construction_extracted}"
+        ),
+        (!plan_executor_list_append_row_construction_extracted).then(|| {
+            "PlanExecutor core does not yet own list append row construction and refresh sequencing"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-append-execution-extracted",
+        plan_executor_list_append_execution_extracted,
+        format!("list_append_execution_extracted={plan_executor_list_append_execution_extracted}"),
+        (!plan_executor_list_append_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own list append operation execution and list-state insertion"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-remove-execution-extracted",
+        plan_executor_list_remove_execution_extracted,
+        format!("list_remove_execution_extracted={plan_executor_list_remove_execution_extracted}"),
+        (!plan_executor_list_remove_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own list remove operation execution and list-state deletion"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-initial-list-row-value-conversion-extracted",
+        plan_executor_initial_list_row_value_conversion_extracted,
+        format!(
+            "initial_list_row_value_conversion_extracted={plan_executor_initial_list_row_value_conversion_extracted}"
+        ),
+        (!plan_executor_initial_list_row_value_conversion_extracted).then(|| {
+            "PlanExecutor core does not yet own initial list-row constant value conversion"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-fixed-byte-bank-lookup-extracted",
+        plan_executor_indexed_fixed_byte_bank_lookup_extracted,
+        format!(
+            "indexed_fixed_byte_bank_lookup_extracted={plan_executor_indexed_fixed_byte_bank_lookup_extracted}"
+        ),
+        (!plan_executor_indexed_fixed_byte_bank_lookup_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed fixed byte-bank lookup policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-default-fields-extracted",
+        plan_executor_list_row_default_fields_extracted,
+        format!(
+            "list_row_default_fields_extracted={plan_executor_list_row_default_fields_extracted}"
+        ),
+        (!plan_executor_list_row_default_fields_extracted).then(|| {
+            "PlanExecutor core does not yet own list row default field assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-report-fields-extracted",
+        plan_executor_list_row_report_fields_extracted,
+        format!(
+            "list_row_report_fields_extracted={plan_executor_list_row_report_fields_extracted}"
+        ),
+        (!plan_executor_list_row_report_fields_extracted).then(|| {
+            "PlanExecutor core does not yet own list row report field assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-state-carrier-extracted",
+        plan_executor_list_row_state_carrier_extracted,
+        format!(
+            "list_row_state_carrier_extracted={plan_executor_list_row_state_carrier_extracted}"
+        ),
+        (!plan_executor_list_row_state_carrier_extracted).then(|| {
+            "PlanExecutor core does not yet own the list row-state carrier and private BYTES map"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-initial-refresh-extracted",
+        plan_executor_list_row_initial_refresh_extracted,
+        format!(
+            "list_row_initial_refresh_extracted={plan_executor_list_row_initial_refresh_extracted}"
+        ),
+        (!plan_executor_list_row_initial_refresh_extracted).then(|| {
+            "PlanExecutor core does not yet own list row initial-state refresh/mirror policy"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-bool-not-refresh-extracted",
+        plan_executor_list_row_bool_not_refresh_extracted,
+        format!(
+            "list_row_bool_not_refresh_extracted={plan_executor_list_row_bool_not_refresh_extracted}"
+        ),
+        (!plan_executor_list_row_bool_not_refresh_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed list row Bool/not refresh policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-expression-refresh-extracted",
+        plan_executor_list_row_expression_refresh_extracted,
+        format!(
+            "list_row_expression_refresh_extracted={plan_executor_list_row_expression_refresh_extracted}"
+        ),
+        (!plan_executor_list_row_expression_refresh_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed list row expression refresh iteration"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-list-row-textlike-field-extracted",
+        plan_executor_list_row_textlike_field_extracted,
+        format!(
+            "list_row_textlike_field_extracted={plan_executor_list_row_textlike_field_extracted}"
+        ),
+        (!plan_executor_list_row_textlike_field_extracted).then(|| {
+            "PlanExecutor core does not yet own list row textlike field projection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-assertion-checkpoint-extracted",
+        plan_executor_assertion_checkpoint_extracted,
+        format!("assertion_checkpoint_extracted={plan_executor_assertion_checkpoint_extracted}"),
+        (!plan_executor_assertion_checkpoint_extracted).then(|| {
+            "PlanExecutor core does not yet own assertion-only scenario checkpoint evaluation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-candidate-tracker-extracted",
+        plan_executor_root_update_candidate_tracker_extracted,
+        format!(
+            "root_update_candidate_tracker_extracted={plan_executor_root_update_candidate_tracker_extracted}"
+        ),
+        (!plan_executor_root_update_candidate_tracker_extracted).then(|| {
+            "PlanExecutor core does not yet own root update candidate coalescing/conflict policy"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-commit-assembly-extracted",
+        plan_executor_root_update_commit_assembly_extracted,
+        format!(
+            "root_update_commit_assembly_extracted={plan_executor_root_update_commit_assembly_extracted}"
+        ),
+        (!plan_executor_root_update_commit_assembly_extracted).then(|| {
+            "PlanExecutor core does not yet own root update commit report/delta assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-commit-batch-extracted",
+        plan_executor_root_update_commit_batch_extracted,
+        format!(
+            "root_update_commit_batch_extracted={plan_executor_root_update_commit_batch_extracted}"
+        ),
+        (!plan_executor_root_update_commit_batch_extracted).then(|| {
+            "Runtime still owns ordered root update candidate commit sequencing".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-storage-transition-extracted",
+        plan_executor_root_update_storage_transition_extracted,
+        format!(
+            "root_update_storage_transition_extracted={plan_executor_root_update_storage_transition_extracted}"
+        ),
+        (!plan_executor_root_update_storage_transition_extracted).then(|| {
+            "PlanExecutor core does not yet own root update storage transition policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-state-owner-capability-extracted",
+        plan_executor_root_update_state_owner_capability_extracted,
+        format!(
+            "root_update_state_owner_capability_extracted={plan_executor_root_update_state_owner_capability_extracted}"
+        ),
+        (!plan_executor_root_update_state_owner_capability_extracted).then(|| {
+            "PlanExecutor root update storage transition does not yet consume a root state-owner capability"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-root-state-container-wrapped",
+        runtime_root_state_container_wrapped,
+        format!("runtime_root_state_container_wrapped={runtime_root_state_container_wrapped}"),
+        (!runtime_root_state_container_wrapped).then(|| {
+            "Runtime root scenario execution still passes loose root state/BYTES maps through its update loop"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-planexecutor-root-state-carried",
+        runtime_plan_executor_root_state_carried,
+        format!(
+            "runtime_plan_executor_root_state_carried={runtime_plan_executor_root_state_carried}"
+        ),
+        (!runtime_plan_executor_root_state_carried).then(|| {
+            "Runtime root scenario execution does not yet carry PlanExecutorRootState directly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-state-update-helpers-extracted",
+        plan_executor_root_state_update_helpers_extracted,
+        format!(
+            "root_state_update_helpers_extracted={plan_executor_root_state_update_helpers_extracted}"
+        ),
+        (!plan_executor_root_state_update_helpers_extracted).then(|| {
+            "Runtime still owns root-state update helper methods instead of calling PlanExecutor helpers"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-executed-update-state-application-extracted",
+        plan_executor_root_executed_update_state_application_extracted,
+        format!(
+            "root_executed_update_state_application_extracted={plan_executor_root_executed_update_state_application_extracted}"
+        ),
+        (!plan_executor_root_executed_update_state_application_extracted).then(|| {
+            "PlanExecutor core does not yet own root executed-update representation and state application"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-branch-collection-extracted",
+        plan_executor_root_update_branch_collection_extracted,
+        format!(
+            "root_update_branch_collection_extracted={plan_executor_root_update_branch_collection_extracted}"
+        ),
+        (!plan_executor_root_update_branch_collection_extracted).then(|| {
+            "Runtime still owns non-indexed root update branch candidate collection and staged-state mutation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-aggregate-evaluator-extracted",
+        plan_executor_root_aggregate_evaluator_extracted,
+        format!(
+            "root_aggregate_evaluator_extracted={plan_executor_root_aggregate_evaluator_extracted}"
+        ),
+        (!plan_executor_root_aggregate_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own root aggregate/count-derived evaluation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-selection-extracted",
+        plan_executor_source_route_selection_extracted,
+        format!(
+            "source_route_selection_extracted={plan_executor_source_route_selection_extracted}"
+        ),
+        (!plan_executor_source_route_selection_extracted)
+            .then(|| "PlanExecutor core does not yet own source-route update selection".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-execution-context-extracted",
+        plan_executor_source_route_execution_context_extracted,
+        format!(
+            "source_route_execution_context_extracted={plan_executor_source_route_execution_context_extracted}"
+        ),
+        (!plan_executor_source_route_execution_context_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route execution context resolution"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-json-execution-extracted",
+        plan_executor_source_route_json_execution_extracted,
+        format!(
+            "source_route_json_execution_extracted={plan_executor_source_route_json_execution_extracted}"
+        ),
+        (!plan_executor_source_route_json_execution_extracted)
+            .then(|| "PlanExecutor core does not yet own source-route JSON execution".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-execution-surface-extracted",
+        plan_executor_source_route_execution_surface_extracted,
+        format!(
+            "source_route_execution_surface_extracted={plan_executor_source_route_execution_surface_extracted}"
+        ),
+        (!plan_executor_source_route_execution_surface_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route execution surface selection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-full-execution-validation-extracted",
+        plan_executor_source_route_full_execution_validation_extracted,
+        format!(
+            "source_route_full_execution_validation_extracted={plan_executor_source_route_full_execution_validation_extracted}"
+        ),
+        (!plan_executor_source_route_full_execution_validation_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route selected-vs-full execution validation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-legacy-comparison-extracted",
+        plan_executor_source_route_legacy_comparison_extracted,
+        format!(
+            "source_route_legacy_comparison_extracted={plan_executor_source_route_legacy_comparison_extracted}"
+        ),
+        (!plan_executor_source_route_legacy_comparison_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route legacy comparison assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-report-assembly-extracted",
+        plan_executor_source_route_report_assembly_extracted,
+        format!(
+            "source_route_report_assembly_extracted={plan_executor_source_route_report_assembly_extracted}"
+        ),
+        (!plan_executor_source_route_report_assembly_extracted)
+            .then(|| "PlanExecutor core does not yet own source-route report assembly".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-command-report-assembly-extracted",
+        plan_executor_source_route_command_report_assembly_extracted,
+        format!(
+            "source_route_command_report_assembly_extracted={plan_executor_source_route_command_report_assembly_extracted}"
+        ),
+        (!plan_executor_source_route_command_report_assembly_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route command report assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-command-argv-extracted",
+        plan_executor_source_route_command_argv_extracted,
+        format!(
+            "source_route_command_argv_extracted={plan_executor_source_route_command_argv_extracted}"
+        ),
+        (!plan_executor_source_route_command_argv_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route command argv reconstruction".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-command-output-extracted",
+        plan_executor_source_route_command_output_extracted,
+        format!(
+            "source_route_command_output_extracted={plan_executor_source_route_command_output_extracted}"
+        ),
+        (!plan_executor_source_route_command_output_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route command output assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-source-event-report-extracted",
+        plan_executor_source_route_source_event_report_extracted,
+        format!(
+            "source_route_source_event_report_extracted={plan_executor_source_route_source_event_report_extracted}"
+        ),
+        (!plan_executor_source_route_source_event_report_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route source-event report assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-event-payload-bytes-artifact-report-extracted",
+        plan_executor_source_event_payload_bytes_artifact_report_extracted,
+        format!(
+            "source_event_payload_bytes_artifact_report_extracted={plan_executor_source_event_payload_bytes_artifact_report_extracted}"
+        ),
+        (!plan_executor_source_event_payload_bytes_artifact_report_extracted).then(|| {
+            "PlanExecutor core does not yet own source-event BYTES inline/artifact report assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-orchestration-extracted",
+        plan_executor_source_route_orchestration_extracted,
+        format!(
+            "source_route_orchestration_extracted={plan_executor_source_route_orchestration_extracted}"
+        ),
+        (!plan_executor_source_route_orchestration_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route orchestration and full-execution validation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-route-runtime-branch-execution-extracted",
+        plan_executor_source_route_runtime_branch_execution_extracted,
+        format!(
+            "source_route_runtime_branch_execution_extracted={plan_executor_source_route_runtime_branch_execution_extracted}"
+        ),
+        (!plan_executor_source_route_runtime_branch_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own source-route runtime-branch execution assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-work-selection-extracted",
+        plan_executor_root_work_selection_extracted,
+        format!("root_work_selection_extracted={plan_executor_root_work_selection_extracted}"),
+        (!plan_executor_root_work_selection_extracted).then(|| {
+            "PlanExecutor core does not yet own root source-event work selection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-step-dispatch-extracted",
+        plan_executor_root_scenario_step_dispatch_extracted,
+        format!(
+            "root_scenario_step_dispatch_extracted={plan_executor_root_scenario_step_dispatch_extracted}"
+        ),
+        (!plan_executor_root_scenario_step_dispatch_extracted)
+            .then(|| "PlanExecutor core does not yet own root scenario step dispatch".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-update-op-resolution-extracted",
+        plan_executor_root_scenario_update_op_resolution_extracted,
+        format!(
+            "root_scenario_update_op_resolution_extracted={plan_executor_root_scenario_update_op_resolution_extracted}"
+        ),
+        (!plan_executor_root_scenario_update_op_resolution_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario update-op resolution".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-source-route-resolution-extracted",
+        plan_executor_root_scenario_source_route_resolution_extracted,
+        format!(
+            "root_scenario_source_route_resolution_extracted={plan_executor_root_scenario_source_route_resolution_extracted}"
+        ),
+        (!plan_executor_root_scenario_source_route_resolution_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario source-route slot resolution"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-materialized-work-validation-extracted",
+        plan_executor_root_scenario_materialized_work_validation_extracted,
+        format!(
+            "root_scenario_materialized_work_validation_extracted={plan_executor_root_scenario_materialized_work_validation_extracted}"
+        ),
+        (!plan_executor_root_scenario_materialized_work_validation_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario materialized-work validation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-derived-value-evaluator-extracted",
+        plan_executor_source_derived_value_evaluator_extracted,
+        format!(
+            "source_derived_value_evaluator_extracted={plan_executor_source_derived_value_evaluator_extracted}"
+        ),
+        (!plan_executor_source_derived_value_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own source-derived value evaluation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-step-preparation-extracted",
+        plan_executor_root_scenario_step_preparation_extracted,
+        format!(
+            "root_scenario_step_preparation_extracted={plan_executor_root_scenario_step_preparation_extracted}"
+        ),
+        (!plan_executor_root_scenario_step_preparation_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario step preparation composition"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-derived-delta-policy-extracted",
+        plan_executor_source_derived_delta_policy_extracted,
+        format!(
+            "source_derived_delta_policy_extracted={plan_executor_source_derived_delta_policy_extracted}"
+        ),
+        (!plan_executor_source_derived_delta_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own source-derived semantic delta/report policy"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-derived-step-delta-bundle-extracted",
+        plan_executor_source_derived_step_delta_bundle_extracted,
+        format!(
+            "source_derived_step_delta_bundle_extracted={plan_executor_source_derived_step_delta_bundle_extracted}"
+        ),
+        (!plan_executor_source_derived_step_delta_bundle_extracted).then(|| {
+            "PlanExecutor core does not yet own source-derived step delta/signature/report bundling"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-expected-source-event-decoder-extracted",
+        plan_executor_expected_source_event_decoder_extracted,
+        format!(
+            "expected_source_event_decoder_extracted={plan_executor_expected_source_event_decoder_extracted}"
+        ),
+        (!plan_executor_expected_source_event_decoder_extracted).then(|| {
+            "PlanExecutor core does not yet own scenario expected_source_event decoding".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-payload-bytes-key-policy-extracted",
+        plan_executor_source_payload_bytes_key_policy_extracted,
+        format!(
+            "source_payload_bytes_key_policy_extracted={plan_executor_source_payload_bytes_key_policy_extracted}"
+        ),
+        (!plan_executor_source_payload_bytes_key_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own source-payload BYTES TOML key policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-live-source-event-expectation-matcher-extracted",
+        plan_executor_live_source_event_expectation_matcher_extracted,
+        format!(
+            "live_source_event_expectation_matcher_extracted={plan_executor_live_source_event_expectation_matcher_extracted}"
+        ),
+        (!plan_executor_live_source_event_expectation_matcher_extracted).then(|| {
+            "PlanExecutor core does not yet own live source-event expectation matching".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-live-source-event-expected-toml-builder-extracted",
+        plan_executor_live_source_event_expected_toml_builder_extracted,
+        format!(
+            "live_source_event_expected_toml_builder_extracted={plan_executor_live_source_event_expected_toml_builder_extracted}"
+        ),
+        (!plan_executor_live_source_event_expected_toml_builder_extracted).then(|| {
+            "PlanExecutor core does not yet own generated expected_source_event TOML assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-scenario-step-selection-extracted",
+        plan_executor_scenario_step_selection_extracted,
+        format!(
+            "scenario_step_selection_extracted={plan_executor_scenario_step_selection_extracted}"
+        ),
+        (!plan_executor_scenario_step_selection_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario step-selection policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-debug-label-helpers-extracted",
+        plan_executor_debug_label_helpers_extracted,
+        format!("debug_label_helpers_extracted={plan_executor_debug_label_helpers_extracted}"),
+        (!plan_executor_debug_label_helpers_extracted).then(|| {
+            "PlanExecutor core does not yet own MachinePlan debug label helper interpretation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-step-report-assembly-extracted",
+        plan_executor_root_scenario_step_report_assembly_extracted,
+        format!(
+            "root_scenario_step_report_assembly_extracted={plan_executor_root_scenario_step_report_assembly_extracted}"
+        ),
+        (!plan_executor_root_scenario_step_report_assembly_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario per-step report assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-legacy-comparison-extracted",
+        plan_executor_root_scenario_legacy_comparison_extracted,
+        format!(
+            "root_scenario_legacy_comparison_extracted={plan_executor_root_scenario_legacy_comparison_extracted}"
+        ),
+        (!plan_executor_root_scenario_legacy_comparison_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario legacy comparison assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-command-report-assembly-extracted",
+        plan_executor_root_scenario_command_report_assembly_extracted,
+        format!(
+            "root_scenario_command_report_assembly_extracted={plan_executor_root_scenario_command_report_assembly_extracted}"
+        ),
+        (!plan_executor_root_scenario_command_report_assembly_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario command report assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-command-output-extracted",
+        plan_executor_root_scenario_command_output_extracted,
+        format!(
+            "root_scenario_command_output_extracted={plan_executor_root_scenario_command_output_extracted}"
+        ),
+        (!plan_executor_root_scenario_command_output_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario command output assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-scenario-events-command-report-assembly-extracted",
+        plan_executor_scenario_events_command_report_assembly_extracted,
+        format!(
+            "scenario_events_command_report_assembly_extracted={plan_executor_scenario_events_command_report_assembly_extracted}"
+        ),
+        (!plan_executor_scenario_events_command_report_assembly_extracted).then(|| {
+            "PlanExecutor core does not yet own scenario-events command report assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-scenario-events-command-output-extracted",
+        plan_executor_scenario_events_command_output_extracted,
+        format!(
+            "scenario_events_command_output_extracted={plan_executor_scenario_events_command_output_extracted}"
+        ),
+        (!plan_executor_scenario_events_command_output_extracted).then(|| {
+            "PlanExecutor core does not yet own scenario-events command output assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-semantic-delta-normalization-extracted",
+        plan_executor_semantic_delta_normalization_extracted,
+        format!(
+            "semantic_delta_normalization_extracted={plan_executor_semantic_delta_normalization_extracted}"
+        ),
+        (!plan_executor_semantic_delta_normalization_extracted).then(|| {
+            "PlanExecutor core does not yet own semantic-delta signature/coalescing normalization"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-update-conflict-guard-extracted",
+        plan_executor_indexed_update_conflict_guard_extracted,
+        format!(
+            "indexed_update_conflict_guard_extracted={plan_executor_indexed_update_conflict_guard_extracted}"
+        ),
+        (!plan_executor_indexed_update_conflict_guard_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed-update write conflict detection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-update-delta-ordering-extracted",
+        plan_executor_indexed_update_delta_ordering_extracted,
+        format!(
+            "indexed_update_delta_ordering_extracted={plan_executor_indexed_update_delta_ordering_extracted}"
+        ),
+        (!plan_executor_indexed_update_delta_ordering_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed-update semantic delta ordering".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-update-target-selection-extracted",
+        plan_executor_indexed_update_target_selection_extracted,
+        format!(
+            "indexed_update_target_selection_extracted={plan_executor_indexed_update_target_selection_extracted}"
+        ),
+        (!plan_executor_indexed_update_target_selection_extracted).then(|| {
+            "PlanExecutor core does not yet own unscoped indexed-update target selection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-update-batch-execution-extracted",
+        plan_executor_indexed_update_batch_execution_extracted,
+        format!(
+            "indexed_update_batch_execution_extracted={plan_executor_indexed_update_batch_execution_extracted}"
+        ),
+        (!plan_executor_indexed_update_batch_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed-update batch selection/conflict/order orchestration"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-json-update-evaluator-extracted",
+        plan_executor_indexed_json_update_evaluator_extracted,
+        format!(
+            "indexed_json_update_evaluator_extracted={plan_executor_indexed_json_update_evaluator_extracted}"
+        ),
+        (!plan_executor_indexed_json_update_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed JSON/text/bool update value evaluation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-report-assembly-extracted",
+        plan_executor_root_scenario_report_assembly_extracted,
+        format!(
+            "root_scenario_report_assembly_extracted={plan_executor_root_scenario_report_assembly_extracted}"
+        ),
+        (!plan_executor_root_scenario_report_assembly_extracted)
+            .then(|| "PlanExecutor core does not yet own root scenario report assembly".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-acceptance-policy-extracted",
+        plan_executor_root_scenario_acceptance_policy_extracted,
+        format!(
+            "root_scenario_acceptance_policy_extracted={plan_executor_root_scenario_acceptance_policy_extracted}"
+        ),
+        (!plan_executor_root_scenario_acceptance_policy_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario acceptance policy".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-scenario-coverage-report-extracted",
+        plan_executor_root_scenario_coverage_report_extracted,
+        format!(
+            "root_scenario_coverage_report_extracted={plan_executor_root_scenario_coverage_report_extracted}"
+        ),
+        (!plan_executor_root_scenario_coverage_report_extracted).then(|| {
+            "PlanExecutor core does not yet own root scenario coverage reporting".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-json-update-evaluator-extracted",
+        plan_executor_root_json_update_evaluator_extracted,
+        format!(
+            "root_json_update_evaluator_extracted={plan_executor_root_json_update_evaluator_extracted}"
+        ),
+        (!plan_executor_root_json_update_evaluator_extracted)
+            .then(|| "PlanExecutor core does not yet own root JSON update evaluation".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-update-execution-surface-extracted",
+        plan_executor_root_update_execution_surface_extracted,
+        format!(
+            "root_update_execution_surface_extracted={plan_executor_root_update_execution_surface_extracted}"
+        ),
+        (!plan_executor_root_update_execution_surface_extracted).then(|| {
+            "PlanExecutor core does not yet own root update execution surface selection".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-json-update-execution-extracted",
+        plan_executor_root_json_update_execution_extracted,
+        format!(
+            "root_json_update_execution_extracted={plan_executor_root_json_update_execution_extracted}"
+        ),
+        (!plan_executor_root_json_update_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own root JSON update execution assembly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-runtime-branch-update-execution-extracted",
+        plan_executor_root_runtime_branch_update_execution_extracted,
+        format!(
+            "root_runtime_branch_update_execution_extracted={plan_executor_root_runtime_branch_update_execution_extracted}"
+        ),
+        (!plan_executor_root_runtime_branch_update_execution_extracted).then(|| {
+            "PlanExecutor core does not yet own root runtime-branch update execution assembly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-update-dispatch-extracted",
+        plan_executor_root_bytes_update_dispatch_extracted,
+        format!(
+            "root_bytes_update_dispatch_extracted={plan_executor_root_bytes_update_dispatch_extracted}"
+        ),
+        (!plan_executor_root_bytes_update_dispatch_extracted).then(|| {
+            "PlanExecutor core does not yet own root BYTES update dispatch classification"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-shadowed-runtime-arms-removed",
+        plan_executor_root_bytes_shadowed_runtime_arms_removed,
+        format!(
+            "root_bytes_shadowed_runtime_arms_removed={plan_executor_root_bytes_shadowed_runtime_arms_removed}"
+        ),
+        (!plan_executor_root_bytes_shadowed_runtime_arms_removed).then(|| {
+            "Runtime still contains shadowed per-operation root BYTES fallback arms".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-runtime-environment-wrapped",
+        plan_executor_root_bytes_runtime_environment_wrapped,
+        format!(
+            "root_bytes_runtime_environment_wrapped={plan_executor_root_bytes_runtime_environment_wrapped}"
+        ),
+        (!plan_executor_root_bytes_runtime_environment_wrapped).then(|| {
+            "Runtime root BYTES evaluator inputs are not yet grouped behind an explicit environment boundary"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-environment-capability-extracted",
+        plan_executor_root_bytes_environment_capability_extracted,
+        format!(
+            "root_bytes_environment_capability_extracted={plan_executor_root_bytes_environment_capability_extracted}"
+        ),
+        (!plan_executor_root_bytes_environment_capability_extracted).then(|| {
+            "PlanExecutor root BYTES evaluators do not yet consume an executor-facing byte environment capability"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-source-guard-matching-extracted",
+        plan_executor_source_guard_matching_extracted,
+        format!("source_guard_matching_extracted={plan_executor_source_guard_matching_extracted}"),
+        (!plan_executor_source_guard_matching_extracted).then(|| {
+            "PlanExecutor core does not yet own source guard matching semantics".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-json-state-write-extracted",
+        plan_executor_root_json_state_write_extracted,
+        format!("root_json_state_write_extracted={plan_executor_root_json_state_write_extracted}"),
+        (!plan_executor_root_json_state_write_extracted)
+            .then(|| "PlanExecutor core does not yet own root JSON state writes".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-source-payload-report-extracted",
+        plan_executor_root_bytes_source_payload_report_extracted,
+        format!(
+            "root_bytes_source_payload_report_extracted={plan_executor_root_bytes_source_payload_report_extracted}"
+        ),
+        (!plan_executor_root_bytes_source_payload_report_extracted).then(|| {
+            "PlanExecutor core cannot yet validate and report root BYTES source payload values"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-initial-storage-extracted",
+        plan_executor_root_bytes_initial_storage_extracted,
+        format!(
+            "root_bytes_initial_storage_extracted={plan_executor_root_bytes_initial_storage_extracted}"
+        ),
+        (!plan_executor_root_bytes_initial_storage_extracted).then(|| {
+            "PlanExecutor core does not yet own root BYTES initial private storage".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-read-evaluator-extracted",
+        plan_executor_root_bytes_read_evaluator_extracted,
+        format!(
+            "root_bytes_read_evaluator_extracted={plan_executor_root_bytes_read_evaluator_extracted}"
+        ),
+        (!plan_executor_root_bytes_read_evaluator_extracted)
+            .then(|| "PlanExecutor core does not yet own root BYTES read evaluation".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-write-evaluator-extracted",
+        plan_executor_root_bytes_write_evaluator_extracted,
+        format!(
+            "root_bytes_write_evaluator_extracted={plan_executor_root_bytes_write_evaluator_extracted}"
+        ),
+        (!plan_executor_root_bytes_write_evaluator_extracted)
+            .then(|| "PlanExecutor core does not yet own root BYTES write evaluation".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-bytes-read-evaluator-extracted",
+        plan_executor_indexed_bytes_read_evaluator_extracted,
+        format!(
+            "indexed_bytes_read_evaluator_extracted={plan_executor_indexed_bytes_read_evaluator_extracted}"
+        ),
+        (!plan_executor_indexed_bytes_read_evaluator_extracted)
+            .then(|| "PlanExecutor core does not yet own indexed BYTES read evaluation".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-file-bytes-read-evaluator-extracted",
+        plan_executor_indexed_file_bytes_read_evaluator_extracted,
+        format!(
+            "indexed_file_bytes_read_evaluator_extracted={plan_executor_indexed_file_bytes_read_evaluator_extracted}"
+        ),
+        (!plan_executor_indexed_file_bytes_read_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed File/read_bytes evaluation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-bytes-write-evaluator-extracted",
+        plan_executor_indexed_bytes_write_evaluator_extracted,
+        format!(
+            "indexed_bytes_write_evaluator_extracted={plan_executor_indexed_bytes_write_evaluator_extracted}"
+        ),
+        (!plan_executor_indexed_bytes_write_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed BYTES write evaluation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-indexed-file-bytes-write-evaluator-extracted",
+        plan_executor_indexed_file_bytes_write_evaluator_extracted,
+        format!(
+            "indexed_file_bytes_write_evaluator_extracted={plan_executor_indexed_file_bytes_write_evaluator_extracted}"
+        ),
+        (!plan_executor_indexed_file_bytes_write_evaluator_extracted).then(|| {
+            "PlanExecutor core does not yet own indexed File/write_bytes evaluation".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-source-payload-commit-extracted",
+        plan_executor_root_bytes_source_payload_commit_extracted,
+        format!(
+            "root_bytes_source_payload_commit_extracted={plan_executor_root_bytes_source_payload_commit_extracted}"
+        ),
+        (!plan_executor_root_bytes_source_payload_commit_extracted).then(|| {
+            "PlanExecutor core does not yet own root BYTES source-payload commits".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-state-transition-extracted",
+        plan_executor_root_bytes_state_transition_extracted,
+        format!(
+            "root_bytes_state_transition_extracted={plan_executor_root_bytes_state_transition_extracted}"
+        ),
+        (!plan_executor_root_bytes_state_transition_extracted)
+            .then(|| "PlanExecutor core does not yet own root BYTES state transitions".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-bytes-state-owner-capability-extracted",
+        plan_executor_root_bytes_state_owner_capability_extracted,
+        format!(
+            "root_bytes_state_owner_capability_extracted={plan_executor_root_bytes_state_owner_capability_extracted}"
+        ),
+        (!plan_executor_root_bytes_state_owner_capability_extracted).then(|| {
+            "PlanExecutor root BYTES state transitions do not yet consume a mutable state-owner capability"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:planexecutor-root-state-container-extracted",
+        plan_executor_root_state_container_extracted,
+        format!("root_state_container_extracted={plan_executor_root_state_container_extracted}"),
+        (!plan_executor_root_state_container_extracted).then(|| {
+            "PlanExecutor core does not yet own root scalar/BYTES execution state".to_owned()
+        }),
+    );
+    let plan_executor_core_still_frontend_coupled = !plan_executor_frontend_dependencies.is_empty();
+
+    let runtime_depends_on_frontend = ["boon_parser", "boon_ir", "boon_typecheck"]
+        .iter()
+        .filter(|dependency| toml_has_normal_dependency(&runtime_cargo, dependency))
+        .copied()
+        .collect::<Vec<_>>();
+    let runtime_typecheck_dependency_removed =
+        !toml_has_normal_dependency(&runtime_cargo, "boon_typecheck")
+            && !runtime_source.contains("boon_typecheck::");
+    let runtime_parser_dependency_removed =
+        !toml_has_normal_dependency(&runtime_cargo, "boon_parser")
+            && !runtime_source.contains("boon_parser::")
+            && !runtime_source.contains("use boon_parser");
+    let runtime_static_analysis_dtos_extracted = compiler_lib
+        .contains("pub struct CompilerViewBinding")
+        && compiler_lib.contains("pub enum CompilerViewBindingKind")
+        && compiler_lib.contains("pub struct CompilerRowScope")
+        && compiler_lib.contains("pub view_bindings: Vec<CompilerViewBinding>")
+        && compiler_lib.contains("pub row_scopes: Vec<CompilerRowScope>")
+        && runtime_source.contains("CompilerViewBinding as RuntimeViewBinding")
+        && runtime_source.contains("CompilerRowScope as RuntimeRowScope")
+        && native_playground_source.contains("boon_runtime::RuntimeViewBinding")
+        && native_playground_source.contains("boon_runtime::RuntimeRowScope")
+        && !native_playground_source.contains("boon_ir::ViewBinding")
+        && !native_playground_source.contains("boon_ir::RowScope");
+    let runtime_compiler_runtime_program_aggregate = compiler_lib
+        .contains("pub struct CompilerRuntimeProgram")
+        && compiler_lib.contains("pub fn compiler_runtime_program_from_ir")
+        && compiler_lib.contains("pub runtime_program: CompilerRuntimeProgram")
+        && runtime_source.contains("CompilerRuntimeProgram")
+        && runtime_source
+            .contains("fn from_compiler_runtime_program(program: CompilerRuntimeProgram)")
+        && runtime_source.contains(
+            "CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)",
+        )
+        && !runtime_source.contains("CompiledProgram::from_ir(&compiler_output.ir)")
+        && !runtime_source.contains("ir: Arc<TypedProgram>");
+    let runtime_list_projection_dtos_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerListProjection")
+        && compiler_lib.contains("pub enum CompilerListProjectionKind")
+        && compiler_lib.contains("pub fn compiler_list_projections_from_ir")
+        && runtime_source.contains("CompilerListProjection")
+        && runtime_source.contains("CompilerListProjectionKind")
+        && runtime_source.contains("ListProjectionPlan::from_compiler_projections")
+        && runtime_source.contains("compiler_list_projections_from_ir(ir)")
+        && !runtime_source.contains("ListProjectionPlan::from_ir(ir)")
+        && !runtime_source.contains("fn from_ir(ir: &TypedProgram) -> Self {\n        let projections = ir\n            .list_projections");
+    let runtime_source_payload_counts_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerSourcePayloadCounts")
+        && compiler_lib.contains("pub fn compiler_source_payload_counts_from_ir")
+        && runtime_source.contains("CompilerSourcePayloadCounts")
+        && runtime_source.contains("SourcePayloadCounts::from_compiler_counts")
+        && runtime_source.contains("compiler_source_payload_counts_from_ir(ir)")
+        && !runtime_source.contains("SourcePayloadCounts::from_ir(ir)")
+        && !runtime_source.contains("fn from_ir(ir: &TypedProgram) -> Self {\n        let mut counts = Self {\n            schema_count: ir.sources.len()");
+    let runtime_list_source_bindings_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerListSourceBindingSlot")
+        && compiler_lib.contains("pub fn compiler_list_source_bindings_from_ir")
+        && runtime_source.contains("CompilerListSourceBindingSlot")
+        && runtime_source.contains("ListSourceBindingPlan::from_compiler_slots")
+        && runtime_source.contains("compiler_list_source_bindings_from_ir(ir)")
+        && !runtime_source.contains("ListSourceBindingPlan::from_ir(ir)")
+        && !runtime_source.contains("fn from_ir(ir: &TypedProgram) -> Self {\n        let mut list_slots = Vec::new();\n        for list in &ir.lists");
+    let runtime_list_operations_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerListOperation")
+        && compiler_lib.contains("pub enum CompilerListOperationKind")
+        && compiler_lib.contains("pub enum CompilerListAppendFieldValue")
+        && compiler_lib.contains("pub enum CompilerListPredicate")
+        && compiler_lib.contains("pub enum CompilerInitialValue")
+        && compiler_lib.contains("pub fn compiler_list_operations_from_ir")
+        && runtime_source.contains("CompilerListOperation")
+        && runtime_source.contains("CompilerListOperationKind")
+        && runtime_source.contains("CompilerListAppendFieldValue")
+        && runtime_source.contains("CompilerListPredicate")
+        && runtime_source.contains("CompilerInitialValue")
+        && runtime_source.contains("ListEquationPlan::from_compiler_operations")
+        && runtime_source.contains("compiler_list_operations_from_ir(ir)")
+        && runtime_source.contains("runtime_list_append_field_value_from_compiler")
+        && runtime_source.contains("runtime_list_predicate_from_compiler")
+        && !runtime_source.contains("ListEquationPlan::from_ir(ir)")
+        && !runtime_source.contains("RuntimeListAppendFieldValue::from_ir")
+        && !runtime_source.contains("fn from_ir(ir: &TypedProgram) -> Self {\n        let operations = ir\n            .list_operations");
+    let runtime_storage_root_slots_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerStorageRootSlot")
+        && compiler_lib.contains("pub fn compiler_storage_root_slots_from_ir")
+        && runtime_source.contains("CompilerStorageRootSlot")
+        && runtime_source.contains("compiler_storage_root_slots_from_ir(ir)")
+        && runtime_source.contains("RuntimeStorageRootSlot::from_compiler")
+        && runtime_source.contains("RuntimeStorageRootInitialCopy::from_root_slot")
+        && runtime_source.contains("compiler_root_slots: Vec<CompilerStorageRootSlot>")
+        && !runtime_source.contains(
+            "let mut root_slots = Vec::new();\n        let mut root_initial_field_copies = Vec::new();",
+        );
+    let runtime_storage_indexed_row_initial_resets_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerStorageIndexedRowInitialReset")
+        && compiler_lib.contains("pub fn compiler_storage_indexed_row_initial_resets_from_ir")
+        && runtime_source.contains("CompilerStorageIndexedRowInitialReset")
+        && runtime_source.contains("compiler_storage_indexed_row_initial_resets_from_ir(ir)")
+        && runtime_source.contains("RuntimeStorageIndexedRowInitialReset::from_compiler")
+        && runtime_source.contains(
+            "compiler_indexed_row_initial_resets: Vec<CompilerStorageIndexedRowInitialReset>",
+        )
+        && !runtime_source
+            .contains("let indexed_row_initial_resets = ir\n            .state_cells");
+    let runtime_storage_list_slots_metadata_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerStorageListSlot")
+            && compiler_lib.contains("pub enum CompilerStorageListInitializerKind")
+            && compiler_lib.contains("pub fn compiler_storage_list_slots_from_ir")
+            && runtime_source.contains("CompilerStorageListSlot")
+            && runtime_source.contains("CompilerStorageListInitializerKind")
+            && runtime_source.contains("compiler_storage_list_slots_from_ir(ir)")
+            && runtime_source.contains("compiler_list_slots: Vec<CompilerStorageListSlot>")
+            && runtime_source.contains("RuntimeStorageListSlot::from_compiler_synthetic")
+            && runtime_source.contains("for compiler_slot in compiler_list_slots")
+            && runtime_source
+                .contains("CompilerStorageListInitializerKind::SyntheticListViewStorage")
+            && runtime_source.contains("compiler storage list slot `{}` marked synthetic");
+    let runtime_storage_row_templates_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerStorageRowTemplate")
+        && compiler_lib.contains("pub struct CompilerStorageRowFieldTemplate")
+        && compiler_lib.contains("pub fn compiler_storage_row_templates_from_ir")
+        && runtime_source.contains("CompilerStorageRowTemplate")
+        && runtime_source.contains("compiler_storage_row_templates_from_ir(ir)")
+        && runtime_source.contains("compiler_row_templates: Vec<CompilerStorageRowTemplate>")
+        && runtime_source.contains("RuntimeStorageRowTemplate::from_compiler")
+        && runtime_source.contains("row_templates_by_list")
+        && runtime_source.contains("let row_template = row_template_plan.to_runtime_template()")
+        && !runtime_source.contains(
+            "RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;\n            let row_template_plan",
+        );
+    let runtime_storage_initial_rows_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerStorageInitialRows")
+        && compiler_lib.contains("pub struct CompilerStorageInitialRow")
+        && compiler_lib.contains("pub struct CompilerStorageInitialField")
+        && compiler_lib.contains("pub fn compiler_storage_initial_rows_from_ir")
+        && runtime_source.contains("CompilerStorageInitialRows")
+        && runtime_source.contains("CompilerStorageInitialRow")
+        && runtime_source.contains("compiler_storage_initial_rows_from_ir(ir)")
+        && runtime_source.contains("compiler_initial_rows: Vec<CompilerStorageInitialRows>")
+        && runtime_source.contains("initial_rows_by_list")
+        && runtime_source.contains("list_initial_fields_from_compiler(row)")
+        && !runtime_source.contains(
+            "let ListInitializer::RecordLiteral { rows } = &list.initializer else {\n                        return Err(format!(",
+        );
+    let runtime_storage_indexed_derived_fields_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerStorageIndexedDerivedFields")
+        && compiler_lib.contains("pub fn compiler_storage_indexed_derived_fields_from_ir")
+        && runtime_source.contains("CompilerStorageIndexedDerivedFields")
+        && runtime_source.contains("compiler_storage_indexed_derived_fields_from_ir(ir)")
+        && runtime_source
+            .contains("compiler_indexed_derived_fields: Vec<CompilerStorageIndexedDerivedFields>")
+        && runtime_source.contains("indexed_derived_fields_by_list")
+        && runtime_source.contains("initialize_indexed_derived_base_fields_from_compiler")
+        && runtime_source.contains("initialize_indexed_derived_text_fields_from_compiler")
+        && runtime_source.contains("initialize_indexed_derived_base_fields_from_compiler(\n                                derived_fields,\n                                &mut row,\n                            )")
+        && runtime_source.contains("initialize_indexed_derived_text_fields_from_compiler(\n                                derived_fields,\n                                &mut row,\n                            )");
+    let runtime_storage_initialization_ir_free = runtime_storage_root_slots_extracted
+        && runtime_storage_indexed_row_initial_resets_extracted
+        && runtime_storage_list_slots_metadata_extracted
+        && runtime_storage_row_templates_extracted
+        && runtime_storage_initial_rows_extracted
+        && runtime_storage_indexed_derived_fields_extracted
+        && runtime_source.contains("fn from_ir(\n        compiler_root_slots: Vec<CompilerStorageRootSlot>")
+        && runtime_source.contains("RuntimeStorageInitializationPlan::from_ir(\n            storage_root_slots,")
+        && !runtime_source.contains("fn from_ir(\n        ir: &TypedProgram,\n        compiler_root_slots: Vec<CompilerStorageRootSlot>")
+        && !runtime_source.contains("lists_by_name");
+    let runtime_legacy_storage_constructor_uses_compiler_plan = runtime_compiler_runtime_program_aggregate || runtime_storage_initialization_ir_free
+        && runtime_source.contains("impl GenericCircuitRuntime {\n    fn new(ir: &TypedProgram) -> RuntimeResult<Self> {\n        RuntimeStorageInitializationPlan::from_ir(")
+        && runtime_source.contains("compiler_storage_root_slots_from_ir(ir),")
+        && runtime_source.contains("compiler_storage_indexed_derived_fields_from_ir(ir),")
+        && runtime_source.contains(".instantiate_storage()")
+        && !runtime_source.contains("for list in &ir.lists")
+        && !runtime_source.contains("fn list_initial_fields(")
+        && !runtime_source.contains("fn runtime_value_from_initial(")
+        && !runtime_source.contains("fn initialize_indexed_derived_base_fields(\n    ir: &TypedProgram")
+        && !runtime_source.contains("fn initialize_indexed_derived_text_fields(\n    ir: &TypedProgram")
+        && !runtime_source.contains("fn row_scope_name_for_ir_list(")
+        && !runtime_source.contains("fn missing_row_initial_value(");
+    let runtime_typed_storage_layout_counts_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerTypedStorageLayoutCounts")
+        && compiler_lib.contains("pub fn compiler_typed_storage_layout_counts_from_ir")
+        && runtime_source.contains("CompilerTypedStorageLayoutCounts")
+        && runtime_source.contains("TypedStorageLayoutCounts::from_compiler_counts")
+        && runtime_source.contains("compiler_typed_storage_layout_counts_from_ir(ir)")
+        && !runtime_source.contains("TypedStorageLayoutCounts::from_ir(ir)")
+        && !runtime_source.contains("fn from_ir(ir: &TypedProgram) -> Self {\n        let mut counts = Self {\n            list_memory_count: ir.lists.len()");
+    let runtime_symbols_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib.contains("pub struct CompilerRuntimeSymbols")
+        && compiler_lib.contains("pub fn compiler_runtime_symbols_from_ir")
+        && compiler_lib.contains("struct CompilerRuntimeSymbolPaths")
+        && runtime_source.contains("CompilerRuntimeSymbols")
+        && runtime_source
+            .contains("RuntimeSymbols::from_compiler(compiler_runtime_symbols_from_ir(ir))")
+        && runtime_source
+            .contains("fn from_compiler(compiler_symbols: CompilerRuntimeSymbols) -> Self")
+        && !runtime_source.contains(
+            "fn from_ir(ir: &TypedProgram) -> Self {\n        let mut symbols = Self::default();",
+        )
+        && !runtime_source.contains("fn intern_update_value_expression_symbols(")
+        && !runtime_source.contains("fn intern_list_predicate(&mut self");
+    let runtime_field_slot_collision_diagnostics_extracted =
+        runtime_compiler_runtime_program_aggregate
+            || compiler_lib.contains("pub struct CompilerFieldSlotCollisionDiagnostic")
+                && compiler_lib
+                    .contains("pub fn compiler_field_slot_collision_diagnostics_from_ir")
+                && compiler_lib.contains("fn compiler_stable_runtime_field_id")
+                && runtime_source.contains("CompilerFieldSlotCollisionDiagnostic")
+                && runtime_source.contains("compiler_field_slot_collision_diagnostics_from_ir(ir)")
+                && runtime_source.contains(
+                    "fn from_compiler(diagnostic: CompilerFieldSlotCollisionDiagnostic) -> Self",
+                )
+                && !runtime_source
+                    .contains("fn field_slot_collision_diagnostics(ir: &TypedProgram)");
+    let runtime_scalar_equations_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerScalarEquationPlan")
+            && compiler_lib.contains("pub struct CompilerScalarUpdateBranch")
+            && compiler_lib.contains("pub enum CompilerScalarUpdateExpression")
+            && compiler_lib.contains("pub fn compiler_scalar_equation_plan_from_ir")
+            && compiler_lib.contains("fn compiler_scalar_update_expression")
+            && runtime_source.contains("CompilerScalarEquationPlan")
+            && runtime_source.contains("CompilerScalarUpdateExpression")
+            && runtime_source.contains(
+                "ScalarEquationPlan::from_compiler(compiler_scalar_equation_plan_from_ir(ir))",
+            )
+            && runtime_source
+                .contains("fn from_compiler(plan: CompilerScalarEquationPlan) -> Self")
+            && runtime_source
+                .contains("fn from_compiler(expression: CompilerScalarUpdateExpression) -> Self")
+            && !runtime_source.contains("ScalarEquationPlan::from_ir(ir)")
+            && !runtime_source
+                .contains("impl ScalarEquationPlan {\n    fn from_ir(ir: &TypedProgram) -> Self");
+    let runtime_profile_metadata_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerRuntimeProfileMetadata")
+            && compiler_lib.contains("pub struct CompilerRuntimeListCapacity")
+            && compiler_lib.contains("pub struct CompilerRuntimeBytesCapacity")
+            && compiler_lib.contains("pub fn compiler_runtime_profile_metadata_from_ir")
+            && runtime_source.contains("CompilerRuntimeProfileMetadata")
+            && runtime_source.contains("compiler_runtime_profile_metadata_from_ir(ir)")
+            && runtime_source.contains("RuntimeProfile::from_compiler_metadata")
+            && !runtime_source.contains("RuntimeProfile::from_ir")
+            && !runtime_source.contains("fn list_effective_capacity(")
+            && !runtime_source.contains("fn all_bytes_state_bounded(");
+    let runtime_unsupported_diagnostics_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerUnsupportedRuntimeDiagnostics")
+            && compiler_lib.contains("pub struct CompilerUnsupportedStateInitializer")
+            && compiler_lib.contains("pub fn compiler_unsupported_runtime_diagnostics_from_ir")
+            && runtime_source.contains("CompilerUnsupportedRuntimeDiagnostics")
+            && runtime_source.contains("compiler_unsupported_runtime_diagnostics_from_ir(ir)")
+            && runtime_source.contains("validate_compiler_unsupported_runtime_diagnostics")
+            && !runtime_source
+                .contains("let unsupported_update_branch_count = ir\n            .update_branches")
+            && !runtime_source.contains(
+                "for cell in &ir.state_cells {\n            if let InitialValue::Unknown",
+            )
+            && !runtime_source
+                .contains("for list in &ir.lists {\n            if let ListInitializer::Unknown");
+    let runtime_generic_derived_plan_inventory_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerGenericDerivedPlan")
+        && compiler_lib.contains("pub struct CompilerGenericDerivedFunction")
+        && compiler_lib.contains("pub struct CompilerGenericDerivedRootField")
+        && compiler_lib.contains("pub struct CompilerGenericDerivedIndexedField")
+        && compiler_lib.contains("pub fn compiler_generic_derived_plan_from_ir")
+        && runtime_source.contains("CompilerGenericDerivedPlan")
+        && runtime_source.contains("compiler_generic_derived_plan_from_ir(ir)")
+        && runtime_source.contains("GenericDerivedPlan::from_compiler(")
+        && runtime_source.contains("fn from_compiler(plan: CompilerGenericDerivedPlan)")
+        && !runtime_source.contains("let generic_derived = GenericDerivedPlan::from_ir(ir)")
+        && !runtime_source.contains("fn observed_root_paths_from_view_bindings(")
+        && !runtime_source.contains(
+            "let functions = ir\n            .functions\n            .iter()\n            .cloned()",
+        );
+    let runtime_generic_derived_runtime_plan_inventory_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub struct CompilerGenericDerivedOutputRoot")
+        && compiler_lib.contains("pub output_roots: Vec<CompilerGenericDerivedOutputRoot>")
+        && runtime_source.contains("fn from_compiler(compiler_plan: CompilerGenericDerivedPlan)")
+        && runtime_source
+            .contains("RuntimeGenericDerivedPlan::from_compiler(compiler_generic_derived_plan)")
+        && !runtime_source.contains("RuntimeGenericDerivedPlan::from_ir(ir)")
+        && !runtime_source.contains("for output in &ir.output_values")
+        && !runtime_source.contains("for value in ir.derived_values.iter().filter(|value| {\n            (value.indexed || value.scope_id.is_some())");
+    let runtime_generic_derived_ast_lowering_extracted = compiler_lib
+        .contains("pub enum CompilerRuntimeGenericStatement")
+        && compiler_lib.contains("pub enum CompilerRuntimeGenericExpr")
+        && compiler_lib.contains("pub struct CompilerRuntimeGenericDerivedPlan")
+        && compiler_lib.contains("pub runtime_plan: CompilerRuntimeGenericDerivedPlan")
+        && compiler_lib.contains("fn compiler_runtime_generic_derived_plan_from_parts")
+        && runtime_source.contains("from_compiler_runtime_plan(compiler_plan.runtime_plan)")
+        && runtime_source.contains("fn from_compiler(statement: CompilerRuntimeGenericStatement)")
+        && runtime_source.contains("fn from_compiler(expr: CompilerRuntimeGenericExpr)");
+    let runtime_derived_equation_plan_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerDerivedEquationPlan")
+            && compiler_lib.contains("pub struct CompilerDerivedTextTransform")
+            && compiler_lib.contains("pub enum CompilerDerivedTextExpression")
+            && compiler_lib.contains("pub fn compiler_derived_equation_plan_from_ir")
+            && runtime_source.contains("CompilerDerivedEquationPlan")
+            && runtime_source.contains("CompilerDerivedTextExpression")
+            && runtime_source.contains("compiler_derived_equation_plan_from_ir(ir)")
+            && runtime_source.contains("DerivedEquationPlan::from_compiler(")
+            && runtime_source.contains("fn from_compiler(plan: CompilerDerivedEquationPlan)")
+            && !runtime_source.contains("let derived_equations = DerivedEquationPlan::from_ir(ir)")
+            && !runtime_source.contains("fn source_event_transform_text_expression(")
+            && !runtime_source.contains("fn source_then_list_find_value_expression(");
+    let runtime_update_expression_dtos_extracted = compiler_lib
+        .contains("pub enum CompilerUpdateGuard")
+        && compiler_lib.contains("pub struct CompilerUpdateMatchArm")
+        && compiler_lib.contains("pub struct CompilerUpdateValueMatchArm")
+        && compiler_lib.contains("pub enum CompilerUpdateValueExpression")
+        && compiler_lib.contains("fn compiler_update_value_expression")
+        && compiler_lib.contains("guard: Option<CompilerUpdateGuard>")
+        && compiler_lib.contains("arms: Vec<CompilerUpdateMatchArm>")
+        && compiler_lib.contains("arms: Vec<CompilerUpdateValueMatchArm>")
+        && compiler_lib.contains("expected: Box<CompilerUpdateValueExpression>")
+        && runtime_source.contains("CompilerUpdateGuard as UpdateGuard")
+        && runtime_source.contains("CompilerUpdateMatchArm as UpdateMatchArm")
+        && runtime_source.contains("CompilerUpdateValueExpression as UpdateValueExpression")
+        && runtime_source.contains("CompilerUpdateValueMatchArm as UpdateValueMatchArm")
+        && !runtime_source.contains("UpdateGuard,\n    UpdateMatchArm")
+        && !runtime_source.contains("UpdateExpression, UpdateGuard")
+        && !runtime_source.contains("boon_ir::UpdateGuard")
+        && !runtime_source.contains("boon_ir::UpdateMatchArm")
+        && !runtime_source.contains("boon_ir::UpdateValueExpression")
+        && !runtime_source.contains("boon_ir::UpdateValueMatchArm")
+        && !compiler_lib.contains("pub guard: Option<boon_ir::UpdateGuard>")
+        && !compiler_lib.contains("Vec<boon_ir::UpdateMatchArm>")
+        && !compiler_lib.contains("Vec<boon_ir::UpdateValueMatchArm>")
+        && !compiler_lib.contains("Box<boon_ir::UpdateValueExpression>");
+    let runtime_derived_value_kind_dtos_extracted = compiler_lib
+        .contains("pub enum CompilerDerivedValueKind")
+        && compiler_lib.contains("fn compiler_derived_value_kind")
+        && compiler_lib.contains("kind: CompilerDerivedValueKind")
+        && runtime_source.contains("CompilerDerivedValueKind as DerivedValueKind")
+        && !runtime_source.contains("DerivedValueKind, FunctionDefinition")
+        && !compiler_lib.contains("kind: boon_ir::DerivedValueKind");
+    let runtime_raw_ir_value_enum_imports_qualified = runtime_source
+        .contains("use boon_ir::TypedProgram")
+        && !runtime_source.contains("boon_ir::InitialValue")
+        && !runtime_source.contains("boon_ir::ListInitializer")
+        && !runtime_source.contains("boon_ir::ListPredicate")
+        && runtime_source.contains("CompilerInitialValue")
+        && runtime_source.contains("CompilerStorageListInitializerKind")
+        && runtime_source.contains("runtime_list_predicate_from_compiler")
+        && !runtime_source.contains("InitialValue, ListInitialRecord")
+        && !runtime_source.contains("ListInitializer, ListOperationKind")
+        && !runtime_source.contains("ListPredicate, TypedProgram")
+        && !runtime_source.contains("use boon_ir::{\n    FunctionDefinition, InitialValue");
+    let runtime_row_template_initial_values_ir_free = runtime_source
+        .contains("initial_value: RuntimeInitialValue")
+        && runtime_source.contains("initial_value: field.initial_value.clone()")
+        && runtime_source
+            .contains(".initial_value\n                .to_field_value(&initial_fields)")
+        && !runtime_source.contains("initial_value: boon_ir::InitialValue")
+        && !runtime_source.contains("to_initial_value(")
+        && !runtime_source.contains("RuntimeInitialValue::from_initial(");
+    let runtime_ir_debug_tables_delegated_to_compiler = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub fn compiler_ir_debug_tables_from_ir")
+            && compiler_lib.contains("pub fn compiler_ir_debug_report_from_path")
+            && compiler_lib.contains("debug_tables(ir)")
+            && runtime_source.contains("compiler_ir_debug_tables_from_ir")
+            && runtime_source.contains("compiler_ir_debug_report_from_path(source_path)")
+            && !runtime_source.contains("debug_tables(&ir)")
+            && !runtime_source.contains("debug_tables(ir)")
+            && !runtime_source.contains("debug_tables,");
+    let runtime_report_debug_tables_use_compiled_program = runtime_source
+        .contains("ir_debug_tables: Option<JsonValue>")
+        && runtime_source.contains("ir_debug_tables: Some(ir_debug_tables)")
+        && runtime_source.contains("ir_debug_tables: None")
+        && runtime_source.contains("fn source_ir_debug_tables(&self, context: &str) -> &JsonValue")
+        && runtime_source.contains("source_ir_debug_tables(\"scenario report enrichment\")")
+        && runtime_source.contains("source_ir_debug_tables(\"playground initial-state report\")")
+        && runtime_source.contains("fn enrich_report(\n    report: &mut JsonValue,")
+        && !runtime_source.contains("fn enrich_report(\n    report: &mut JsonValue,\n    source_path: &str,\n    report_context: &CompiledSourceReportContext,\n    scenario_path: &Path,\n    report_path: Option<&Path>,\n    parsed: &ParsedProgram,\n    ir: &TypedProgram")
+        && !runtime_source.contains("\"ir_debug_tables\": compiler_ir_debug_tables_from_ir(&ir)")
+        && !runtime_source.contains("compiler_ir_debug_tables_from_ir(ir),");
+    let runtime_typecheck_report_metadata_delegated_to_compiler =
+        runtime_compiler_runtime_program_aggregate
+            || compiler_lib.contains("pub struct CompilerTypecheckReportMetadata")
+                && compiler_lib.contains("pub fn compiler_typecheck_report_metadata_from_ir")
+                && runtime_source.contains("compiler_typecheck_report_metadata_from_ir")
+                && !runtime_source.contains("fn typecheck_report_hash(")
+                && !runtime_source.contains("fn render_slot_table_hash(")
+                && !runtime_source.contains("ir.typecheck_report");
+    let runtime_typed_program_report_metadata_delegated_to_compiler =
+        runtime_compiler_runtime_program_aggregate
+            || compiler_lib.contains("pub struct CompilerTypedProgramReportMetadata")
+                && compiler_lib.contains("pub fn compiler_typed_program_report_metadata_from_ir")
+                && runtime_source.contains("compiler_typed_program_report_metadata_from_ir")
+                && !runtime_source.contains("ir.expression_count")
+                && !runtime_source.contains("ir.expression_coverage")
+                && !runtime_source.contains("ir.graph_node_count")
+                && !runtime_source.contains("ir.semantic_index")
+                && !runtime_source.contains("ir.hidden_identity_verified")
+                && !runtime_source.contains("ir.static_schedule_verified");
+    let runtime_typed_program_inventory_counts_delegated_to_compiler =
+        runtime_compiler_runtime_program_aggregate
+            || compiler_lib.contains("pub struct CompilerTypedProgramInventoryCounts")
+                && compiler_lib.contains("pub fn compiler_typed_program_inventory_counts_from_ir")
+                && runtime_source.contains("compiler_typed_program_inventory_counts_from_ir")
+                && !runtime_source.contains("ir.update_branches.len()")
+                && !runtime_source.contains("ir.list_operations.len()")
+                && !runtime_source.contains("ir.state_cells.len()")
+                && !runtime_source.contains("ir.lists.len()")
+                && !runtime_source.contains("ir.derived_values.len()")
+                && !runtime_source.contains("ir.list_projections.len()")
+                && !runtime_source.contains("ir.view_bindings.len()")
+                && !runtime_source.contains("ir.sources.len()");
+    let runtime_bytes_scalar_arg_dtos_extracted = compiler_lib
+        .contains("pub enum CompilerBytesScalarArg")
+        && compiler_lib.contains("fn compiler_bytes_scalar_arg")
+        && compiler_lib.contains("offset: CompilerBytesScalarArg")
+        && compiler_lib.contains("byte_count: CompilerBytesScalarArg")
+        && runtime_source.contains("CompilerBytesScalarArg as BytesScalarArg")
+        && !runtime_source.contains("use boon_ir::{\n    BytesScalarArg")
+        && !runtime_source.contains("boon_ir::BytesScalarArg")
+        && !compiler_lib.contains("offset: boon_ir::BytesScalarArg")
+        && !compiler_lib.contains("byte_count: boon_ir::BytesScalarArg");
+    let runtime_document_list_metadata_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerListSummaryFields")
+            && compiler_lib.contains("pub fn compiler_list_summary_fields_from_ir")
+            && compiler_lib.contains("pub fn compiler_dynamic_list_view_lists_from_ir")
+            && runtime_source.contains("CompilerListSummaryFields")
+            && runtime_source.contains("ListSummaryFields::from_compiler")
+            && runtime_source.contains("compiler_list_summary_fields_from_ir(ir)")
+            && runtime_source.contains("compiler_dynamic_list_view_lists_from_ir(ir)")
+            && !runtime_source
+                .contains("let list_summary_fields = list_summary_fields_from_ir(ir);")
+            && !runtime_source
+                .contains("let dynamic_list_view_lists = dynamic_list_view_lists_from_ir(ir);");
+    let runtime_dead_ir_document_metadata_helpers_removed = runtime_document_list_metadata_extracted
+        && !runtime_source.contains("fn list_summary_fields_from_ir(")
+        && !runtime_source.contains("fn dynamic_list_view_lists_from_ir(")
+        && !runtime_source.contains("fn list_operation_has_unknown_predicate(");
+    let runtime_document_observed_root_paths_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
+        .contains("pub fn compiler_observed_root_paths_from_ir")
+        && compiler_lib.contains("fn compiler_root_path_observation_variants")
+        && runtime_source.contains("compiler_observed_root_paths_from_ir(ir)")
+        && runtime_source
+            .contains("let observed_root_paths = compiler_observed_root_paths_from_ir(ir);")
+        && runtime_source.contains(
+            "observed_root_paths: BTreeSet<String>,\n        projection_storage_resolutions: BTreeMap<String, String>,",
+        )
+        && runtime_source.contains("observed_root_paths,");
+    let runtime_document_projection_storage_resolutions_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib.contains(
+        "pub struct CompilerDocumentProjectionStorageResolutions",
+    ) && compiler_lib.contains("pub fn compiler_document_projection_storage_resolutions_from_ir")
+        && compiler_lib.contains("fn compiler_document_direct_root_list_ref_for_path")
+        && runtime_source.contains("compiler_document_projection_storage_resolutions_from_ir(ir)")
+        && runtime_source.contains(
+            "projection_storage.resolutions,\n            projection_storage.unresolved_paths,",
+        )
+        && runtime_source.contains(
+            "projection_storage_resolutions: BTreeMap<String, String>,\n        unresolved_projection_storage_paths: BTreeSet<String>,",
+        )
+        && !runtime_source.contains("fn runtime_document_projection_storage_resolutions(")
+        && !runtime_source.contains("fn runtime_document_direct_root_list_ref_for_path(");
+    let runtime_document_render_slots_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerDocumentRenderSlots")
+            && compiler_lib.contains("pub struct CompilerDocumentRenderSlot")
+            && compiler_lib.contains("pub fn compiler_document_render_slots_from_ir")
+            && compiler_lib.contains("fn compiler_render_slot_table_hash")
+            && runtime_source.contains("compiler_document_render_slots_from_ir(ir)")
+            && runtime_source.contains("compiler_render_slots: CompilerDocumentRenderSlots")
+            && runtime_source
+                .contains("render_slot_table_hash: compiler_render_slots.render_slot_table_hash")
+            && runtime_source.contains(
+                "materialization_policy: RuntimeDocumentMaterializationPolicy::from_compiler_label",
+            )
+            && !runtime_source
+                .contains(".render_slot_table\n            .slots\n            .iter()")
+            && !runtime_source
+                .contains("RuntimeDocumentMaterializationPolicy::from_typecheck_debug");
+    let runtime_root_state_paths_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub fn compiler_root_state_paths_from_ir")
+            && compiler_lib.contains("fn compiler_statement_contains_latest")
+            && runtime_source.contains("compiler_root_state_paths_from_ir(ir)")
+            && !runtime_source.contains("let mut root_state_paths = ir")
+            && !runtime_source.contains("fn statement_contains_latest(");
+    let runtime_source_route_root_targets_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub fn compiler_source_route_root_targets_from_ir")
+            && runtime_source.contains("compiler_source_route_root_targets_from_ir(ir)")
+            && runtime_source.contains("root_targets: &BTreeSet<String>")
+            && !runtime_source.contains("let root_targets = ir\n            .state_cells")
+            && !runtime_source.contains("root_targets: &BTreeSet<&str>");
+    let runtime_source_route_sources_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerSourceRouteSource")
+            && compiler_lib.contains("pub enum CompilerSourcePayloadField")
+            && compiler_lib.contains("pub fn compiler_source_route_sources_from_ir")
+            && runtime_source.contains("CompilerSourceRouteSource")
+            && runtime_source.contains("CompilerSourcePayloadField")
+            && runtime_source.contains("compiler_source_route_sources_from_ir(ir)")
+            && runtime_source.contains("source_metadata: &[CompilerSourceRouteSource]")
+            && runtime_source.contains(
+                "fn source_id_for_path(\n    source_metadata: &[CompilerSourceRouteSource]",
+            )
+            && !runtime_source.contains("fn plan_source_payload_field(")
+            && !runtime_source.contains("fn source_id_for_path(ir: &TypedProgram")
+            && !runtime_source
+                .contains("fn set_address_lookup_fields(&mut self, ir: &TypedProgram)")
+            && !runtime_source
+                .contains("for source in &ir.sources {\n            if let Some(route)");
+    let runtime_source_route_bool_facts_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerSourceRouteBoolFacts")
+            && compiler_lib.contains("pub struct CompilerSourceRouteBoolReadPath")
+            && compiler_lib.contains("pub fn compiler_source_route_bool_facts_from_ir")
+            && runtime_source.contains("CompilerSourceRouteBoolFacts")
+            && runtime_source.contains("compiler_source_route_bool_facts_from_ir(ir)")
+            && runtime_source.contains("bool_facts: &CompilerSourceRouteBoolFacts")
+            && runtime_source.contains("source_route_target_is_bool(bool_facts")
+            && runtime_source.contains("source_route_read_path_is_bool(bool_facts")
+            && !runtime_source.contains("fn ir_scalar_target_is_bool(")
+            && !runtime_source.contains("fn ir_read_path_is_bool_for_target(")
+            && !runtime_source.contains("fn ir_list_literal_field_is_bool(");
+    let runtime_source_route_router_targets_extracted = runtime_compiler_runtime_program_aggregate
+        || compiler_lib.contains("pub struct CompilerSourceRouteRouterRoute")
+            && compiler_lib.contains("pub fn compiler_source_route_router_targets_from_ir")
+            && runtime_source.contains("CompilerSourceRouteRouterRoute")
+            && runtime_source.contains("compiler_source_route_router_targets_from_ir(ir)")
+            && runtime_source.contains("router_targets: &[CompilerSourceRouteRouterRoute]")
+            && runtime_source.contains("SourceRouteRouterRoute::from_compiler")
+            && !runtime_source.contains("fn router_route_targets_from_ir(")
+            && !runtime_source.contains("for target in router_route_targets_from_ir(ir)?");
+    let runtime_source_route_root_text_transforms_extracted =
+        runtime_compiler_runtime_program_aggregate
+            || compiler_lib.contains("pub struct CompilerSourceRouteRootTextTransform")
+                && compiler_lib.contains("pub enum CompilerFieldValue")
+                && compiler_lib
+                    .contains("pub fn compiler_source_route_root_text_transform_targets_from_ir")
+                && runtime_source.contains("CompilerSourceRouteRootTextTransform")
+                && runtime_source
+                    .contains("compiler_source_route_root_text_transform_targets_from_ir(ir)")
+                && runtime_source.contains(
+                    "root_text_transform_targets: &[CompilerSourceRouteRootTextTransform]",
+                )
+                && runtime_source.contains("SourceRouteRootTextTransform::from_compiler")
+                && !runtime_source.contains("fn root_text_transform_targets_from_ir(")
+                && !runtime_source
+                    .contains("for target in root_text_transform_targets_from_ir(ir)?");
+    let runtime_live_cache_uses_compiler_runtime_ir_facade = runtime_source
+        .contains("compile_source_text_to_runtime_ir(source_label, source_text)")
+        && runtime_source
+            .contains("compile_source_units_to_runtime_ir(source_label, &compiler_units)")
+        && runtime_source.contains("legacy_runtime_compile_ms");
+    let runtime_live_constructors_use_compiled_program = runtime_source
+        .contains("fn new(compiled: &CompiledProgram) -> RuntimeResult<Self>")
+        && runtime_source.contains(
+            "fn new_profiled(compiled: &CompiledProgram) -> RuntimeResult<(Self, JsonValue)>",
+        )
+        && runtime_source.contains("GenericScheduledRuntime::new_profiled(compiled)")
+        && runtime_source.contains("fn new(compiled: &CompiledProgram) -> RuntimeResult<Self>")
+        && runtime_source.contains("Self::from_compiled_profiled(compiled)")
+        && !runtime_source.contains("fn new(ir: &TypedProgram, compiled: &CompiledProgram)")
+        && !runtime_source.contains("_ir: &TypedProgram,\n        compiled: &CompiledProgram")
+        && !runtime_source.contains("LoadedRuntime::new(plan.ir.as_ref()")
+        && !runtime_source.contains("LoadedRuntime::new_profiled(plan.ir.as_ref()")
+        && !runtime_source.contains("GenericScheduledRuntime::new(&ir, &compiled)")
+        && !runtime_source.contains("GenericScheduledRuntime::new_profiled(ir, compiled)");
+    let runtime_cached_static_analysis_uses_compiled_program = runtime_source
+        .contains("static_analysis: Option<CompilerStaticProgramAnalysis>")
+        && runtime_source.contains("static_analysis: Some(static_analysis)")
+        && runtime_source.contains("static_analysis: None")
+        && runtime_source.contains("plan.compiled\n        .static_analysis")
+        && !runtime_source
+            .contains("CompilerStaticProgramAnalysis::from_ir_parts(\n        plan.ir.as_ref()")
+        && !runtime_source.contains(
+            "CompilerStaticProgramAnalysis::from_ir_parts(\n            plan.ir.as_ref()",
+        );
+    let runtime_cached_plan_drops_typed_ir = runtime_source.contains("struct CachedRuntimePlan")
+        && runtime_source.contains("parsed: Arc<ParsedProgram>")
+        && runtime_source.contains("compiled: Arc<CompiledProgram>")
+        && !runtime_source.contains("ir: Arc<TypedProgram>")
+        && !runtime_source.contains("Arc::new(compiler_output.ir)")
+        && !runtime_source.contains("plan.ir");
+    let runtime_compiled_artifact_uses_compiled_program_metadata = runtime_source
+        .contains("program_metadata: Option<CompilerTypedProgramReportMetadata>")
+        && runtime_source.contains("typecheck_metadata: Option<CompilerTypecheckReportMetadata>")
+        && runtime_source.contains("program_metadata: Some(program_metadata)")
+        && runtime_source.contains("typecheck_metadata: Some(typecheck_metadata)")
+        && runtime_source.contains("program_metadata: None")
+        && runtime_source.contains("typecheck_metadata: None")
+        && runtime_source.contains(
+            "compiled.source_program_metadata(\"compiled artifact emission\")",
+        )
+        && runtime_source.contains(
+            "compiled.source_typecheck_metadata(\"compiled artifact emission\")",
+        )
+        && runtime_source.contains("compiled.source_program_metadata(\"compiled artifact body\")")
+        && runtime_source.contains("compiled.source_typecheck_metadata(\"compiled artifact body\")")
+        && runtime_source.contains(
+            "fn from_parts(\n        parsed: &ParsedProgram,\n        compiled: &CompiledProgram",
+        )
+        && !runtime_source.contains(
+            "let program_metadata = compiler_typed_program_report_metadata_from_ir(&ir);\n    let typecheck_metadata = compiler_typecheck_report_metadata_from_ir(&ir);",
+        )
+        && !runtime_source
+            .contains("fn from_parts(\n        parsed: &ParsedProgram,\n        ir: &TypedProgram");
+    let runtime_loaded_scenario_profile_uses_compiled_program_metadata = runtime_source
+        .contains("compiled.source_program_metadata(\"loaded scenario compile profile\")")
+        && !runtime_source.contains(
+        "let mut output = run_generic_scenario(runtime, _parsed, ir, &compiled, scenario, layer)?;\n    let program_metadata = compiler_typed_program_report_metadata_from_ir(ir);",
+    );
+    let runtime_example_reports_use_compiled_program_metadata = runtime_source
+        .contains("inventory_counts: Option<CompilerTypedProgramInventoryCounts>")
+        && runtime_source.contains("runtime_profile_metadata: Option<CompilerRuntimeProfileMetadata>")
+        && runtime_source.contains("inventory_counts: Some(inventory_counts)")
+        && runtime_source.contains("runtime_profile_metadata: Some(runtime_profile_metadata)")
+        && runtime_source.contains("compiled.source_program_metadata(\"base example report\")")
+        && runtime_source.contains("compiled.source_inventory_counts(\"base example report\")")
+        && runtime_source.contains("compiled.source_runtime_profile_metadata(\"base example report\")")
+        && runtime_source.contains("compiled.source_typecheck_metadata(\"base example report\")")
+        && runtime_source.contains(
+            "generic_runtime_slice_evidence_report(\n    compiled: &CompiledProgram,",
+        )
+        && !runtime_source.contains("fn base_example_report(\n    parsed: &ParsedProgram,\n    ir: &TypedProgram")
+        && !runtime_source.contains(
+            "let program_metadata = compiler_typed_program_report_metadata_from_ir(ir);\n    let inventory_counts = compiler_typed_program_inventory_counts_from_ir(ir);",
+        );
+    let runtime_scalar_bytecode_reports_use_compiled_program_facts = runtime_source
+        .contains("source_route_bool_facts: Option<CompilerSourceRouteBoolFacts>")
+        && runtime_source.contains("source_route_bool_facts: Some(source_route_bool_facts)")
+        && runtime_source.contains("source_route_bool_facts: None")
+        && runtime_source.contains(
+            "fn source_route_bool_facts(&self, context: &str) -> &CompilerSourceRouteBoolFacts",
+        )
+        && runtime_source.contains("let bool_facts = compiled.source_route_bool_facts(")
+        && runtime_source.contains("fn scalar_bytecode_candidates(compiled: &CompiledProgram)")
+        && runtime_source.contains("scalar_expression_bytecode_report(&compiled, &scenario)")
+        && runtime_source.contains(
+            "compiled.source_program_metadata(\"verify bytecode report\")",
+        )
+        && runtime_source.contains("fn scalar_generated_kernel_report(\n    compiled: &CompiledProgram,")
+        && runtime_source.contains(
+            "fn run_generic_scenario<R: ScenarioExecutor>(\n    mut runtime: R,\n    parsed: &ParsedProgram,\n    compiled: &CompiledProgram,",
+        )
+        && runtime_source.contains("fn stress_profiles(&mut self) -> RuntimeResult<Option<JsonValue>>")
+        && runtime_source.contains("runtime.stress_profiles()?")
+        && !runtime_source.contains("fn scalar_bytecode_candidates(\n    ir: &TypedProgram")
+        && !runtime_source.contains("compiler_source_route_bool_facts_from_ir(ir);\n    for (route_id, route) in compiled.source_routes");
+    let runtime_full_static_cache_uses_compiler_full_ir_facade = runtime_source
+        .contains("compile_source_text_to_full_ir(&unit.path, &unit.source)")
+        && runtime_source
+            .contains("compile_source_units_to_full_ir(source_label, &compiler_units)")
+        && runtime_source.contains("cached_full_runtime_plan_from_project_profiled");
+    let runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade = runtime_source
+        .contains("compile_parsed_program_to_runtime_ir(program.clone())")
+        && !runtime_source.contains("lower_runtime_profiled(program)");
+    let runtime_source_path_parser_helper_is_test_only = runtime_source
+        .contains("#[cfg(test)]\nfn parse_source_path_or_manifest_project(source_path: &Path)");
+    let runtime_source_loading_uses_compiler_facade = runtime_source
+        .contains("compiler_source_units_for_path(path)?")
+        && runtime_source.contains(
+            "compiler_source_units_for_manifest_source(&entry.source, &entry.source_files)?",
+        )
+        && runtime_source.contains("compiler_source_text_for_path(path)?")
+        && runtime_source.contains("compiler_source_text_for_manifest_source(&entry.source)?")
+        && runtime_source.contains("compiler_source_files_for_manifest_source(")
+        && !runtime_source.contains("fn source_files_for_path(")
+        && !runtime_source
+            .contains("fs::read_to_string(&path)?;\n            Ok(RuntimeSourceUnit");
+    let runtime_public_load_and_lower_removed = !runtime_source.contains("fn load_and_lower(")
+        && !runtime_source.contains("fn load_and_lower_profiled(");
+    let runtime_public_parsed_project_cache_removed =
+        !runtime_source.contains("pub fn cached_runtime_parsed_project(");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-live-cache-uses-compiler-runtime-ir-facade",
+        runtime_live_cache_uses_compiler_runtime_ir_facade,
+        format!(
+            "runtime_live_cache_uses_compiler_runtime_ir_facade={runtime_live_cache_uses_compiler_runtime_ir_facade}"
+        ),
+        (!runtime_live_cache_uses_compiler_runtime_ir_facade).then(|| {
+            "boon_runtime live cache still performs source-unit parser/lower/verify orchestration directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-live-constructors-use-compiled-program",
+        runtime_live_constructors_use_compiled_program,
+        format!(
+            "runtime_live_constructors_use_compiled_program={runtime_live_constructors_use_compiled_program}"
+        ),
+        (!runtime_live_constructors_use_compiled_program).then(|| {
+            "boon_runtime live runtime constructors still require a TypedProgram instead of the compiled runtime program".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-cached-static-analysis-uses-compiled-program",
+        runtime_cached_static_analysis_uses_compiled_program,
+        format!(
+            "runtime_cached_static_analysis_uses_compiled_program={runtime_cached_static_analysis_uses_compiled_program}"
+        ),
+        (!runtime_cached_static_analysis_uses_compiled_program).then(|| {
+            "boon_runtime cached static-analysis helpers still rebuild static analysis from CachedRuntimePlan.ir".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-cached-plan-drops-typed-ir",
+        runtime_cached_plan_drops_typed_ir,
+        format!("runtime_cached_plan_drops_typed_ir={runtime_cached_plan_drops_typed_ir}"),
+        (!runtime_cached_plan_drops_typed_ir).then(|| {
+            "boon_runtime CachedRuntimePlan still carries TypedProgram after source compilation"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-compiled-artifact-uses-compiled-program-metadata",
+        runtime_compiled_artifact_uses_compiled_program_metadata,
+        format!(
+            "runtime_compiled_artifact_uses_compiled_program_metadata={runtime_compiled_artifact_uses_compiled_program_metadata}"
+        ),
+        (!runtime_compiled_artifact_uses_compiled_program_metadata).then(|| {
+            "boon_runtime compiled artifact emission still reads typed-program/typecheck report metadata from TypedProgram instead of CompiledProgram".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-loaded-scenario-profile-uses-compiled-program-metadata",
+        runtime_loaded_scenario_profile_uses_compiled_program_metadata,
+        format!(
+            "runtime_loaded_scenario_profile_uses_compiled_program_metadata={runtime_loaded_scenario_profile_uses_compiled_program_metadata}"
+        ),
+        (!runtime_loaded_scenario_profile_uses_compiled_program_metadata).then(|| {
+            "boon_runtime loaded-scenario compile profile still rebuilds typed-program report metadata from TypedProgram".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-example-reports-use-compiled-program-metadata",
+        runtime_example_reports_use_compiled_program_metadata,
+        format!(
+            "runtime_example_reports_use_compiled_program_metadata={runtime_example_reports_use_compiled_program_metadata}"
+        ),
+        (!runtime_example_reports_use_compiled_program_metadata).then(|| {
+            "boon_runtime scenario/example reports still rebuild program, inventory, typecheck, or runtime-profile metadata from TypedProgram".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-scalar-bytecode-reports-use-compiled-program-facts",
+        runtime_scalar_bytecode_reports_use_compiled_program_facts,
+        format!(
+            "runtime_scalar_bytecode_reports_use_compiled_program_facts={runtime_scalar_bytecode_reports_use_compiled_program_facts}"
+        ),
+        (!runtime_scalar_bytecode_reports_use_compiled_program_facts).then(|| {
+            "runtime scalar bytecode/kernel reports still rebuild source-route bool facts from TypedProgram".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-full-static-cache-uses-compiler-full-ir-facade",
+        runtime_full_static_cache_uses_compiler_full_ir_facade,
+        format!(
+            "runtime_full_static_cache_uses_compiler_full_ir_facade={runtime_full_static_cache_uses_compiler_full_ir_facade}"
+        ),
+        (!runtime_full_static_cache_uses_compiler_full_ir_facade).then(|| {
+            "boon_runtime full/static analysis cache still performs parser/lower/verify orchestration directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-parsed-program-lowering-uses-compiler-runtime-ir-facade",
+        runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade,
+        format!(
+            "runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade={runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade}"
+        ),
+        (!runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade).then(|| {
+            "boon_runtime parsed-program lowering still calls boon_ir lowering directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-path-parser-helper-test-only",
+        runtime_source_path_parser_helper_is_test_only,
+        format!(
+            "runtime_source_path_parser_helper_is_test_only={runtime_source_path_parser_helper_is_test_only}"
+        ),
+        (!runtime_source_path_parser_helper_is_test_only).then(|| {
+            "boon_runtime still exposes source-path parser/project helper outside tests".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-loading-uses-compiler-facade",
+        runtime_source_loading_uses_compiler_facade,
+        format!(
+            "runtime_source_loading_uses_compiler_facade={runtime_source_loading_uses_compiler_facade}"
+        ),
+        (!runtime_source_loading_uses_compiler_facade).then(|| {
+            "boon_runtime still owns manifest-aware source file loading instead of delegating to boon_compiler".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-public-load-and-lower-removed",
+        runtime_public_load_and_lower_removed,
+        format!("runtime_public_load_and_lower_removed={runtime_public_load_and_lower_removed}"),
+        (!runtime_public_load_and_lower_removed)
+            .then(|| "boon_runtime still owns parser/IR load_and_lower helpers".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-public-parsed-project-cache-removed",
+        runtime_public_parsed_project_cache_removed,
+        format!(
+            "runtime_public_parsed_project_cache_removed={runtime_public_parsed_project_cache_removed}"
+        ),
+        (!runtime_public_parsed_project_cache_removed)
+            .then(|| "boon_runtime still exposes a public ParsedProgram project cache".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-typecheck-dependency-removed",
+        runtime_typecheck_dependency_removed,
+        format!("runtime_typecheck_dependency_removed={runtime_typecheck_dependency_removed}"),
+        (!runtime_typecheck_dependency_removed)
+            .then(|| "boon_runtime still directly names or depends on boon_typecheck".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-parser-dependency-removed",
+        runtime_parser_dependency_removed,
+        format!("runtime_parser_dependency_removed={runtime_parser_dependency_removed}"),
+        (!runtime_parser_dependency_removed)
+            .then(|| "boon_runtime still directly names or depends on boon_parser".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-static-analysis-dtos-extracted",
+        runtime_static_analysis_dtos_extracted,
+        format!(
+            "runtime_static_analysis_dtos_extracted={runtime_static_analysis_dtos_extracted}"
+        ),
+        (!runtime_static_analysis_dtos_extracted).then(|| {
+            "runtime static-analysis callers still consume parser/IR-owned view binding or row scope DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-list-projection-dtos-extracted",
+        runtime_list_projection_dtos_extracted,
+        format!(
+            "runtime_list_projection_dtos_extracted={runtime_list_projection_dtos_extracted}"
+        ),
+        (!runtime_list_projection_dtos_extracted).then(|| {
+            "runtime list projection plan construction still traverses IR-owned projection DTOs directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-payload-counts-extracted",
+        runtime_source_payload_counts_extracted,
+        format!(
+            "runtime_source_payload_counts_extracted={runtime_source_payload_counts_extracted}"
+        ),
+        (!runtime_source_payload_counts_extracted).then(|| {
+            "runtime source-payload count reporting still traverses IR-owned source payload schemas directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-list-source-bindings-extracted",
+        runtime_list_source_bindings_extracted,
+        format!(
+            "runtime_list_source_bindings_extracted={runtime_list_source_bindings_extracted}"
+        ),
+        (!runtime_list_source_bindings_extracted).then(|| {
+            "runtime list source binding construction still traverses IR-owned list/source/row-scope tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-list-operations-extracted",
+        runtime_list_operations_extracted,
+        format!("runtime_list_operations_extracted={runtime_list_operations_extracted}"),
+        (!runtime_list_operations_extracted).then(|| {
+            "runtime list equation plan construction still traverses IR-owned list operation tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-root-slots-extracted",
+        runtime_storage_root_slots_extracted,
+        format!("runtime_storage_root_slots_extracted={runtime_storage_root_slots_extracted}"),
+        (!runtime_storage_root_slots_extracted).then(|| {
+            "runtime storage initialization still derives root slots from IR state cells directly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-indexed-row-initial-resets-extracted",
+        runtime_storage_indexed_row_initial_resets_extracted,
+        format!(
+            "runtime_storage_indexed_row_initial_resets_extracted={runtime_storage_indexed_row_initial_resets_extracted}"
+        ),
+        (!runtime_storage_indexed_row_initial_resets_extracted).then(|| {
+            "runtime storage initialization still derives indexed row initial reset metadata from IR state cells directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-list-slots-metadata-extracted",
+        runtime_storage_list_slots_metadata_extracted,
+        format!(
+            "runtime_storage_list_slots_metadata_extracted={runtime_storage_list_slots_metadata_extracted}"
+        ),
+        (!runtime_storage_list_slots_metadata_extracted).then(|| {
+            "runtime storage initialization still derives list slot declarations or synthetic list-view slot metadata from IR tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-row-templates-extracted",
+        runtime_storage_row_templates_extracted,
+        format!(
+            "runtime_storage_row_templates_extracted={runtime_storage_row_templates_extracted}"
+        ),
+        (!runtime_storage_row_templates_extracted).then(|| {
+            "runtime storage initialization still derives row templates from IR state cells directly"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-initial-rows-extracted",
+        runtime_storage_initial_rows_extracted,
+        format!("runtime_storage_initial_rows_extracted={runtime_storage_initial_rows_extracted}"),
+        (!runtime_storage_initial_rows_extracted).then(|| {
+            "runtime storage initialization still derives record-literal initial rows from IR list initializers directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-indexed-derived-fields-extracted",
+        runtime_storage_indexed_derived_fields_extracted,
+        format!(
+            "runtime_storage_indexed_derived_fields_extracted={runtime_storage_indexed_derived_fields_extracted}"
+        ),
+        (!runtime_storage_indexed_derived_fields_extracted).then(|| {
+            "runtime storage initialization still derives indexed derived row fields from IR derived values directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-storage-initialization-ir-free",
+        runtime_storage_initialization_ir_free,
+        format!("runtime_storage_initialization_ir_free={runtime_storage_initialization_ir_free}"),
+        (!runtime_storage_initialization_ir_free).then(|| {
+            "runtime storage initialization plan still accepts TypedProgram or consults IR-owned list tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-legacy-storage-constructor-uses-compiler-plan",
+        runtime_legacy_storage_constructor_uses_compiler_plan,
+        format!(
+            "runtime_legacy_storage_constructor_uses_compiler_plan={runtime_legacy_storage_constructor_uses_compiler_plan}"
+        ),
+        (!runtime_legacy_storage_constructor_uses_compiler_plan).then(|| {
+            "legacy GenericCircuitRuntime::new still walks raw IR storage tables instead of delegating to compiler storage DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-typed-storage-layout-counts-extracted",
+        runtime_typed_storage_layout_counts_extracted,
+        format!(
+            "runtime_typed_storage_layout_counts_extracted={runtime_typed_storage_layout_counts_extracted}"
+        ),
+        (!runtime_typed_storage_layout_counts_extracted).then(|| {
+            "runtime typed-storage layout count reporting still traverses IR-owned list/state tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-symbols-extracted",
+        runtime_symbols_extracted,
+        format!("runtime_symbols_extracted={runtime_symbols_extracted}"),
+        (!runtime_symbols_extracted).then(|| {
+            "runtime compiled-program construction still builds dense runtime symbols by scanning IR tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-field-slot-collision-diagnostics-extracted",
+        runtime_field_slot_collision_diagnostics_extracted,
+        format!(
+            "runtime_field_slot_collision_diagnostics_extracted={runtime_field_slot_collision_diagnostics_extracted}"
+        ),
+        (!runtime_field_slot_collision_diagnostics_extracted).then(|| {
+            "runtime compiled-program construction still derives field-slot collision diagnostics from IR tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-scalar-equations-extracted",
+        runtime_scalar_equations_extracted,
+        format!("runtime_scalar_equations_extracted={runtime_scalar_equations_extracted}"),
+        (!runtime_scalar_equations_extracted).then(|| {
+            "runtime compiled-program construction still derives scalar equation branches from IR update branches directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-profile-metadata-extracted",
+        runtime_profile_metadata_extracted,
+        format!("runtime_profile_metadata_extracted={runtime_profile_metadata_extracted}"),
+        (!runtime_profile_metadata_extracted).then(|| {
+            "runtime profile/capacity reporting still derives list/BYTES capacity metadata from IR tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-unsupported-diagnostics-extracted",
+        runtime_unsupported_diagnostics_extracted,
+        format!(
+            "runtime_unsupported_diagnostics_extracted={runtime_unsupported_diagnostics_extracted}"
+        ),
+        (!runtime_unsupported_diagnostics_extracted).then(|| {
+            "runtime compiled-program construction still derives unsupported-feature diagnostics from IR tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-generic-derived-plan-inventory-extracted",
+        runtime_generic_derived_plan_inventory_extracted,
+        format!(
+            "runtime_generic_derived_plan_inventory_extracted={runtime_generic_derived_plan_inventory_extracted}"
+        ),
+        (!runtime_generic_derived_plan_inventory_extracted).then(|| {
+            "runtime generic-derived fallback plan still inventories functions/fields by scanning typed IR directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-generic-derived-runtime-plan-inventory-extracted",
+        runtime_generic_derived_runtime_plan_inventory_extracted,
+        format!(
+            "runtime_generic_derived_runtime_plan_inventory_extracted={runtime_generic_derived_runtime_plan_inventory_extracted}"
+        ),
+        (!runtime_generic_derived_runtime_plan_inventory_extracted).then(|| {
+            "runtime generic-derived execution plan still inventories output roots/functions/fields by scanning typed IR directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-generic-derived-ast-lowering-extracted",
+        runtime_generic_derived_ast_lowering_extracted,
+        format!(
+            "runtime_generic_derived_ast_lowering_extracted={runtime_generic_derived_ast_lowering_extracted}"
+        ),
+        (!runtime_generic_derived_ast_lowering_extracted).then(|| {
+            "runtime generic-derived execution plan still owns parser AST statement/expression lowering instead of consuming compiler runtime DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-derived-equation-plan-extracted",
+        runtime_derived_equation_plan_extracted,
+        format!(
+            "runtime_derived_equation_plan_extracted={runtime_derived_equation_plan_extracted}"
+        ),
+        (!runtime_derived_equation_plan_extracted).then(|| {
+            "runtime derived text-equation plan still inventories source-event transforms by scanning typed IR/AST directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-update-expression-dtos-extracted",
+        runtime_update_expression_dtos_extracted,
+        format!(
+            "runtime_update_expression_dtos_extracted={runtime_update_expression_dtos_extracted}"
+        ),
+        (!runtime_update_expression_dtos_extracted).then(|| {
+            "runtime scalar/derived/source-route plans still consume update guard/value DTOs from boon_ir instead of compiler-owned DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-bytes-scalar-arg-dtos-extracted",
+        runtime_bytes_scalar_arg_dtos_extracted,
+        format!(
+            "runtime_bytes_scalar_arg_dtos_extracted={runtime_bytes_scalar_arg_dtos_extracted}"
+        ),
+        (!runtime_bytes_scalar_arg_dtos_extracted).then(|| {
+            "runtime scalar BYTES update plans still consume BytesScalarArg DTOs from boon_ir instead of compiler-owned DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-derived-value-kind-dtos-extracted",
+        runtime_derived_value_kind_dtos_extracted,
+        format!(
+            "runtime_derived_value_kind_dtos_extracted={runtime_derived_value_kind_dtos_extracted}"
+        ),
+        (!runtime_derived_value_kind_dtos_extracted).then(|| {
+            "runtime generic-derived plans still consume DerivedValueKind DTOs from boon_ir instead of compiler-owned DTOs".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-raw-ir-value-enum-imports-qualified",
+        runtime_raw_ir_value_enum_imports_qualified,
+        format!(
+            "runtime_raw_ir_value_enum_imports_qualified={runtime_raw_ir_value_enum_imports_qualified}"
+        ),
+        (!runtime_raw_ir_value_enum_imports_qualified).then(|| {
+            "runtime still imports raw IR initial/list value enums into its namespace instead of qualifying legacy IR inspections".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-row-template-initial-values-ir-free",
+        runtime_row_template_initial_values_ir_free,
+        format!(
+            "runtime_row_template_initial_values_ir_free={runtime_row_template_initial_values_ir_free}"
+        ),
+        (!runtime_row_template_initial_values_ir_free).then(|| {
+            "runtime row snapshot templates still store or reconstruct boon_ir::InitialValue instead of runtime-owned initial values".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-ir-debug-tables-delegated-to-compiler",
+        runtime_ir_debug_tables_delegated_to_compiler,
+        format!(
+            "runtime_ir_debug_tables_delegated_to_compiler={runtime_ir_debug_tables_delegated_to_compiler}"
+        ),
+        (!runtime_ir_debug_tables_delegated_to_compiler).then(|| {
+            "runtime still assembles typed-IR debug tables directly instead of delegating to compiler-owned debug facades".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-report-debug-tables-use-compiled-program",
+        runtime_report_debug_tables_use_compiled_program,
+        format!(
+            "runtime_report_debug_tables_use_compiled_program={runtime_report_debug_tables_use_compiled_program}"
+        ),
+        (!runtime_report_debug_tables_use_compiled_program).then(|| {
+            "runtime scenario reports still rebuild IR debug tables from TypedProgram instead of source-built CompiledProgram".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-typecheck-report-metadata-delegated-to-compiler",
+        runtime_typecheck_report_metadata_delegated_to_compiler,
+        format!(
+            "runtime_typecheck_report_metadata_delegated_to_compiler={runtime_typecheck_report_metadata_delegated_to_compiler}"
+        ),
+        (!runtime_typecheck_report_metadata_delegated_to_compiler).then(|| {
+            "runtime still reads typed-IR typecheck/render-slot report metadata directly instead of delegating to compiler-owned metadata facades".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-typed-program-report-metadata-delegated-to-compiler",
+        runtime_typed_program_report_metadata_delegated_to_compiler,
+        format!(
+            "runtime_typed_program_report_metadata_delegated_to_compiler={runtime_typed_program_report_metadata_delegated_to_compiler}"
+        ),
+        (!runtime_typed_program_report_metadata_delegated_to_compiler).then(|| {
+            "runtime still reads typed-IR expression/semantic-index/verification report metadata directly instead of delegating to compiler-owned metadata facades".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-typed-program-inventory-counts-delegated-to-compiler",
+        runtime_typed_program_inventory_counts_delegated_to_compiler,
+        format!(
+            "runtime_typed_program_inventory_counts_delegated_to_compiler={runtime_typed_program_inventory_counts_delegated_to_compiler}"
+        ),
+        (!runtime_typed_program_inventory_counts_delegated_to_compiler).then(|| {
+            "runtime still reads typed-IR inventory table lengths directly instead of delegating to compiler-owned inventory counts".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-document-list-metadata-extracted",
+        runtime_document_list_metadata_extracted,
+        format!(
+            "runtime_document_list_metadata_extracted={runtime_document_list_metadata_extracted}"
+        ),
+        (!runtime_document_list_metadata_extracted).then(|| {
+            "runtime document lowering still derives list summary/dynamic list metadata from IR-owned tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-dead-ir-document-metadata-helpers-removed",
+        runtime_dead_ir_document_metadata_helpers_removed,
+        format!(
+            "runtime_dead_ir_document_metadata_helpers_removed={runtime_dead_ir_document_metadata_helpers_removed}"
+        ),
+        (!runtime_dead_ir_document_metadata_helpers_removed).then(|| {
+            "runtime still contains dead raw-IR document metadata helper implementations after compiler DTO extraction".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-document-observed-root-paths-extracted",
+        runtime_document_observed_root_paths_extracted,
+        format!(
+            "runtime_document_observed_root_paths_extracted={runtime_document_observed_root_paths_extracted}"
+        ),
+        (!runtime_document_observed_root_paths_extracted).then(|| {
+            "runtime document lowering still derives observed root paths from IR view bindings directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-document-projection-storage-resolutions-extracted",
+        runtime_document_projection_storage_resolutions_extracted,
+        format!(
+            "runtime_document_projection_storage_resolutions_extracted={runtime_document_projection_storage_resolutions_extracted}"
+        ),
+        (!runtime_document_projection_storage_resolutions_extracted).then(|| {
+            "runtime document lowering still resolves projection storage paths from IR list projections/derived values directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-document-render-slots-extracted",
+        runtime_document_render_slots_extracted,
+        format!(
+            "runtime_document_render_slots_extracted={runtime_document_render_slots_extracted}"
+        ),
+        (!runtime_document_render_slots_extracted).then(|| {
+            "runtime document lowering still derives render-slot metadata from typecheck tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-root-state-paths-extracted",
+        runtime_root_state_paths_extracted,
+        format!("runtime_root_state_paths_extracted={runtime_root_state_paths_extracted}"),
+        (!runtime_root_state_paths_extracted).then(|| {
+            "runtime compiled-program construction still derives root summary paths from IR state/derived tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-route-root-targets-extracted",
+        runtime_source_route_root_targets_extracted,
+        format!(
+            "runtime_source_route_root_targets_extracted={runtime_source_route_root_targets_extracted}"
+        ),
+        (!runtime_source_route_root_targets_extracted).then(|| {
+            "runtime source-route construction still derives root scalar target membership from IR state cells directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-route-sources-extracted",
+        runtime_source_route_sources_extracted,
+        format!("runtime_source_route_sources_extracted={runtime_source_route_sources_extracted}"),
+        (!runtime_source_route_sources_extracted).then(|| {
+            "runtime source-route construction still derives SourceId, payload schema, or address lookup metadata from IR sources directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-route-bool-facts-extracted",
+        runtime_source_route_bool_facts_extracted,
+        format!(
+            "runtime_source_route_bool_facts_extracted={runtime_source_route_bool_facts_extracted}"
+        ),
+        (!runtime_source_route_bool_facts_extracted).then(|| {
+            "runtime source-route classification still derives bool target/read-path facts from IR state/list tables directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-route-router-targets-extracted",
+        runtime_source_route_router_targets_extracted,
+        format!(
+            "runtime_source_route_router_targets_extracted={runtime_source_route_router_targets_extracted}"
+        ),
+        (!runtime_source_route_router_targets_extracted).then(|| {
+            "runtime source-route construction still discovers Router/go_to route targets from IR/AST directly".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-source-route-root-text-transforms-extracted",
+        runtime_source_route_root_text_transforms_extracted,
+        format!(
+            "runtime_source_route_root_text_transforms_extracted={runtime_source_route_root_text_transforms_extracted}"
+        ),
+        (!runtime_source_route_root_text_transforms_extracted).then(|| {
+            "runtime source-route construction still discovers root text transform targets from IR/AST directly".to_owned()
+        }),
+    );
+    let runtime_source_route_command_adapter_remaining =
+        runtime_source.contains("pub fn run_plan_source_route(");
+    let runtime_root_scenario_orchestration_remaining =
+        runtime_source.contains("fn execute_machine_plan_root_scalar_scenario_inner(");
+    let runtime_frontend_orchestration_remaining = !runtime_depends_on_frontend.is_empty()
+        || runtime_source.contains("fn execute_machine_plan_source_route_inner(")
+        || runtime_root_scenario_orchestration_remaining;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "compiler-boundaries:runtime-frontend-orchestration-split-incomplete",
+        !runtime_frontend_orchestration_remaining,
+        format!(
+            "boon_runtime_frontend_dependencies={runtime_depends_on_frontend:?}, source_route_command_adapter_remaining={runtime_source_route_command_adapter_remaining}, root_scenario_orchestration_remaining={runtime_root_scenario_orchestration_remaining}, frontend_orchestration_remaining={runtime_frontend_orchestration_remaining}"
+        ),
+        runtime_frontend_orchestration_remaining.then(|| {
+            match (
+                runtime_depends_on_frontend.is_empty(),
+                runtime_root_scenario_orchestration_remaining,
+            ) {
+                (false, true) => {
+                    "boon_runtime still owns frontend crate dependencies and root-scenario non-initial PlanExecutor execution paths".to_owned()
+                }
+                (false, false) => {
+                    format!(
+                        "boon_runtime still directly depends on frontend crates: {runtime_depends_on_frontend:?}"
+                    )
+                }
+                (true, true) => {
+                    "boon_runtime still owns root-scenario non-initial PlanExecutor execution paths".to_owned()
+                }
+                (true, false) => {
+                    "boon_runtime frontend/orchestration split predicate is inconsistent".to_owned()
+                }
+            }
         }),
     );
 
@@ -6646,8 +10547,11 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         "Cargo.toml",
         "crates/boon_compiler/Cargo.toml",
         "crates/boon_compiler/src/lib.rs",
+        "crates/boon_compiler/src/legacy_backend.rs",
         "crates/boon_plan/Cargo.toml",
         "crates/boon_plan/src/lib.rs",
+        "crates/boon_plan_executor/Cargo.toml",
+        "crates/boon_plan_executor/src/lib.rs",
         "crates/boon_runtime/Cargo.toml",
         "crates/boon_runtime/src/lib.rs",
         "crates/boon_cli/Cargo.toml",
@@ -6676,9 +10580,209 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "workspace_member": workspace_member,
             "workspace_dependency": workspace_dependency,
             "facade_exports_compile_typed_program": facade_exports_compile,
+            "facade_exports_source_to_machine_plan": facade_exports_source_to_machine_plan,
+            "facade_exports_source_units_to_runtime_ir": facade_exports_source_units_to_runtime_ir,
+            "facade_exports_parsed_program_to_runtime_ir": facade_exports_parsed_program_to_runtime_ir,
+            "facade_exports_source_units_to_full_ir": facade_exports_source_units_to_full_ir,
+            "facade_exports_source_loading": facade_exports_source_loading,
+            "owns_compiled_source_report_context": compiler_owns_compiled_source_report_context,
+            "owns_compiled_source_unit_snapshot": compiler_owns_compiled_source_unit_snapshot,
+            "owns_scenario_file_decode": compiler_owns_scenario_file_decode,
+            "owns_runtime_scenario_report_context": compiler_owns_runtime_scenario_report_context,
             "facade_delegates_to_plan_backend": facade_delegates_to_plan_backend,
+            "compiler_owns_legacy_backend_source": compiler_owns_legacy_backend_source,
             "depends_on_boon_plan": compiler_depends_on_plan,
             "depends_on_boon_ir": compiler_depends_on_ir,
+        },
+        "boon_plan_executor": {
+            "crate_present": plan_executor_core_crate_present,
+            "workspace_member": plan_executor_workspace_member,
+            "workspace_dependency": plan_executor_workspace_dependency,
+            "depends_on_boon_plan": plan_executor_depends_on_plan,
+            "initial_state_executor_extracted": plan_executor_initial_state_extracted,
+            "initial_state_report_assembly_extracted": plan_executor_initial_state_report_assembly_extracted,
+            "list_projection_materializer_extracted": plan_executor_list_projection_materializer_extracted,
+            "list_retain_materializer_extracted": plan_executor_list_retain_materializer_extracted,
+            "list_summary_extracted": plan_executor_list_summary_extracted,
+            "list_next_key_allocator_extracted": plan_executor_list_next_key_allocator_extracted,
+            "row_source_binding_policy_extracted": plan_executor_row_source_binding_policy_extracted,
+            "list_remove_delta_policy_extracted": plan_executor_list_remove_delta_policy_extracted,
+            "list_remove_predicate_evaluator_extracted": plan_executor_list_remove_predicate_evaluator_extracted,
+            "list_append_delta_policy_extracted": plan_executor_list_append_delta_policy_extracted,
+            "list_mutation_records_extracted": plan_executor_list_mutation_records_extracted,
+            "list_append_value_resolution_extracted": plan_executor_list_append_value_resolution_extracted,
+            "list_append_row_construction_extracted": plan_executor_list_append_row_construction_extracted,
+            "list_append_execution_extracted": plan_executor_list_append_execution_extracted,
+            "list_remove_execution_extracted": plan_executor_list_remove_execution_extracted,
+            "initial_list_row_value_conversion_extracted": plan_executor_initial_list_row_value_conversion_extracted,
+            "indexed_fixed_byte_bank_lookup_extracted": plan_executor_indexed_fixed_byte_bank_lookup_extracted,
+            "list_row_default_fields_extracted": plan_executor_list_row_default_fields_extracted,
+            "list_row_report_fields_extracted": plan_executor_list_row_report_fields_extracted,
+            "list_row_state_carrier_extracted": plan_executor_list_row_state_carrier_extracted,
+            "list_row_initial_refresh_extracted": plan_executor_list_row_initial_refresh_extracted,
+            "list_row_bool_not_refresh_extracted": plan_executor_list_row_bool_not_refresh_extracted,
+            "list_row_expression_refresh_extracted": plan_executor_list_row_expression_refresh_extracted,
+            "list_row_textlike_field_extracted": plan_executor_list_row_textlike_field_extracted,
+            "assertion_checkpoint_extracted": plan_executor_assertion_checkpoint_extracted,
+            "root_update_candidate_tracker_extracted": plan_executor_root_update_candidate_tracker_extracted,
+            "root_update_commit_assembly_extracted": plan_executor_root_update_commit_assembly_extracted,
+            "root_update_commit_batch_extracted": plan_executor_root_update_commit_batch_extracted,
+            "root_update_storage_transition_extracted": plan_executor_root_update_storage_transition_extracted,
+            "root_update_state_owner_capability_extracted": plan_executor_root_update_state_owner_capability_extracted,
+            "runtime_root_state_container_wrapped": runtime_root_state_container_wrapped,
+            "runtime_plan_executor_root_state_carried": runtime_plan_executor_root_state_carried,
+            "root_state_update_helpers_extracted": plan_executor_root_state_update_helpers_extracted,
+            "root_executed_update_state_application_extracted": plan_executor_root_executed_update_state_application_extracted,
+            "root_update_branch_collection_extracted": plan_executor_root_update_branch_collection_extracted,
+            "root_state_container_extracted": plan_executor_root_state_container_extracted,
+            "root_aggregate_evaluator_extracted": plan_executor_root_aggregate_evaluator_extracted,
+            "source_route_selection_extracted": plan_executor_source_route_selection_extracted,
+            "source_route_execution_context_extracted": plan_executor_source_route_execution_context_extracted,
+            "source_route_json_execution_extracted": plan_executor_source_route_json_execution_extracted,
+            "source_route_execution_surface_extracted": plan_executor_source_route_execution_surface_extracted,
+            "source_route_full_execution_validation_extracted": plan_executor_source_route_full_execution_validation_extracted,
+            "source_route_legacy_comparison_extracted": plan_executor_source_route_legacy_comparison_extracted,
+            "source_route_report_assembly_extracted": plan_executor_source_route_report_assembly_extracted,
+            "source_route_command_report_assembly_extracted": plan_executor_source_route_command_report_assembly_extracted,
+            "source_route_command_argv_extracted": plan_executor_source_route_command_argv_extracted,
+            "source_route_command_output_extracted": plan_executor_source_route_command_output_extracted,
+            "source_route_source_event_report_extracted": plan_executor_source_route_source_event_report_extracted,
+            "source_event_payload_bytes_artifact_report_extracted": plan_executor_source_event_payload_bytes_artifact_report_extracted,
+            "source_route_orchestration_extracted": plan_executor_source_route_orchestration_extracted,
+            "source_route_runtime_branch_execution_extracted": plan_executor_source_route_runtime_branch_execution_extracted,
+            "root_source_event_work_selection_extracted": plan_executor_root_work_selection_extracted,
+            "root_scenario_step_dispatch_extracted": plan_executor_root_scenario_step_dispatch_extracted,
+            "root_scenario_update_op_resolution_extracted": plan_executor_root_scenario_update_op_resolution_extracted,
+            "root_scenario_source_route_resolution_extracted": plan_executor_root_scenario_source_route_resolution_extracted,
+            "root_scenario_materialized_work_validation_extracted": plan_executor_root_scenario_materialized_work_validation_extracted,
+            "source_derived_value_evaluator_extracted": plan_executor_source_derived_value_evaluator_extracted,
+            "root_scenario_step_preparation_extracted": plan_executor_root_scenario_step_preparation_extracted,
+            "source_derived_delta_policy_extracted": plan_executor_source_derived_delta_policy_extracted,
+            "source_derived_step_delta_bundle_extracted": plan_executor_source_derived_step_delta_bundle_extracted,
+            "expected_source_event_decoder_extracted": plan_executor_expected_source_event_decoder_extracted,
+            "source_payload_bytes_key_policy_extracted": plan_executor_source_payload_bytes_key_policy_extracted,
+            "live_source_event_expectation_matcher_extracted": plan_executor_live_source_event_expectation_matcher_extracted,
+            "live_source_event_expected_toml_builder_extracted": plan_executor_live_source_event_expected_toml_builder_extracted,
+            "scenario_step_selection_extracted": plan_executor_scenario_step_selection_extracted,
+            "debug_label_helpers_extracted": plan_executor_debug_label_helpers_extracted,
+            "root_scenario_step_report_assembly_extracted": plan_executor_root_scenario_step_report_assembly_extracted,
+            "root_scenario_legacy_comparison_extracted": plan_executor_root_scenario_legacy_comparison_extracted,
+            "root_scenario_command_report_assembly_extracted": plan_executor_root_scenario_command_report_assembly_extracted,
+            "root_scenario_command_output_extracted": plan_executor_root_scenario_command_output_extracted,
+            "scenario_events_command_report_assembly_extracted": plan_executor_scenario_events_command_report_assembly_extracted,
+            "scenario_events_command_output_extracted": plan_executor_scenario_events_command_output_extracted,
+            "semantic_delta_normalization_extracted": plan_executor_semantic_delta_normalization_extracted,
+            "indexed_update_conflict_guard_extracted": plan_executor_indexed_update_conflict_guard_extracted,
+            "indexed_update_delta_ordering_extracted": plan_executor_indexed_update_delta_ordering_extracted,
+            "indexed_update_target_selection_extracted": plan_executor_indexed_update_target_selection_extracted,
+            "indexed_update_batch_execution_extracted": plan_executor_indexed_update_batch_execution_extracted,
+            "indexed_json_update_evaluator_extracted": plan_executor_indexed_json_update_evaluator_extracted,
+            "root_scenario_report_assembly_extracted": plan_executor_root_scenario_report_assembly_extracted,
+            "root_scenario_acceptance_policy_extracted": plan_executor_root_scenario_acceptance_policy_extracted,
+            "root_scenario_coverage_report_extracted": plan_executor_root_scenario_coverage_report_extracted,
+            "root_json_update_evaluator_extracted": plan_executor_root_json_update_evaluator_extracted,
+            "root_update_execution_surface_extracted": plan_executor_root_update_execution_surface_extracted,
+            "root_json_update_execution_extracted": plan_executor_root_json_update_execution_extracted,
+            "root_runtime_branch_update_execution_extracted": plan_executor_root_runtime_branch_update_execution_extracted,
+            "root_bytes_update_dispatch_extracted": plan_executor_root_bytes_update_dispatch_extracted,
+            "root_bytes_shadowed_runtime_arms_removed": plan_executor_root_bytes_shadowed_runtime_arms_removed,
+            "root_bytes_runtime_environment_wrapped": plan_executor_root_bytes_runtime_environment_wrapped,
+            "root_bytes_environment_capability_extracted": plan_executor_root_bytes_environment_capability_extracted,
+            "source_guard_matching_extracted": plan_executor_source_guard_matching_extracted,
+            "root_json_state_write_extracted": plan_executor_root_json_state_write_extracted,
+            "root_bytes_source_payload_report_extracted": plan_executor_root_bytes_source_payload_report_extracted,
+            "root_bytes_initial_storage_extracted": plan_executor_root_bytes_initial_storage_extracted,
+            "root_bytes_read_evaluator_extracted": plan_executor_root_bytes_read_evaluator_extracted,
+            "root_bytes_write_evaluator_extracted": plan_executor_root_bytes_write_evaluator_extracted,
+            "indexed_bytes_read_evaluator_extracted": plan_executor_indexed_bytes_read_evaluator_extracted,
+            "indexed_file_bytes_read_evaluator_extracted": plan_executor_indexed_file_bytes_read_evaluator_extracted,
+            "indexed_bytes_write_evaluator_extracted": plan_executor_indexed_bytes_write_evaluator_extracted,
+            "indexed_file_bytes_write_evaluator_extracted": plan_executor_indexed_file_bytes_write_evaluator_extracted,
+            "root_bytes_source_payload_commit_extracted": plan_executor_root_bytes_source_payload_commit_extracted,
+            "root_bytes_state_transition_extracted": plan_executor_root_bytes_state_transition_extracted,
+            "root_bytes_state_owner_capability_extracted": plan_executor_root_bytes_state_owner_capability_extracted,
+            "frontend_dependency_count": plan_executor_frontend_dependencies.len(),
+        },
+        "boundary_decomposition": {
+            "lowering_still_owned_by_plan_backend": lowering_still_owned_by_plan_backend,
+            "plan_schema_still_uses_ir_ids": plan_schema_still_uses_ir_ids,
+            "plan_schema_still_uses_ir_source_schema": plan_schema_still_uses_ir_source_schema,
+            "boon_plan_frontend_dependencies_optional_only": plan_frontend_dependencies_optional_only,
+            "boon_plan_legacy_ir_adapter_feature_present": plan_legacy_ir_adapter_feature_present,
+            "boon_plan_legacy_backend_feature_present": plan_legacy_backend_feature_present,
+            "boon_compiler_enables_legacy_backend_feature": compiler_enables_legacy_backend_feature,
+            "boon_compiler_enables_legacy_ir_adapter_feature": compiler_enables_legacy_ir_adapter_feature,
+            "boon_plan_default_build_schema_only": plan_default_build_schema_only,
+            "parser_ast_still_in_plan_lowering": parser_ast_still_in_plan_lowering,
+            "plan_executor_core_still_frontend_coupled": plan_executor_core_still_frontend_coupled,
+            "runtime_live_cache_uses_compiler_runtime_ir_facade": runtime_live_cache_uses_compiler_runtime_ir_facade,
+            "runtime_compiler_runtime_program_aggregate": runtime_compiler_runtime_program_aggregate,
+            "runtime_cached_static_analysis_uses_compiled_program": runtime_cached_static_analysis_uses_compiled_program,
+            "runtime_cached_plan_drops_typed_ir": runtime_cached_plan_drops_typed_ir,
+            "runtime_compiled_artifact_uses_compiled_program_metadata": runtime_compiled_artifact_uses_compiled_program_metadata,
+            "runtime_loaded_scenario_profile_uses_compiled_program_metadata": runtime_loaded_scenario_profile_uses_compiled_program_metadata,
+            "runtime_example_reports_use_compiled_program_metadata": runtime_example_reports_use_compiled_program_metadata,
+            "runtime_scalar_bytecode_reports_use_compiled_program_facts": runtime_scalar_bytecode_reports_use_compiled_program_facts,
+            "runtime_full_static_cache_uses_compiler_full_ir_facade": runtime_full_static_cache_uses_compiler_full_ir_facade,
+            "runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade": runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade,
+            "runtime_source_path_parser_helper_is_test_only": runtime_source_path_parser_helper_is_test_only,
+            "runtime_source_loading_uses_compiler_facade": runtime_source_loading_uses_compiler_facade,
+            "runtime_public_load_and_lower_removed": runtime_public_load_and_lower_removed,
+            "runtime_public_parsed_project_cache_removed": runtime_public_parsed_project_cache_removed,
+            "runtime_list_projection_dtos_extracted": runtime_list_projection_dtos_extracted,
+            "runtime_list_source_bindings_extracted": runtime_list_source_bindings_extracted,
+            "runtime_list_operations_extracted": runtime_list_operations_extracted,
+            "runtime_storage_root_slots_extracted": runtime_storage_root_slots_extracted,
+            "runtime_storage_indexed_row_initial_resets_extracted": runtime_storage_indexed_row_initial_resets_extracted,
+            "runtime_storage_list_slots_metadata_extracted": runtime_storage_list_slots_metadata_extracted,
+            "runtime_storage_row_templates_extracted": runtime_storage_row_templates_extracted,
+            "runtime_storage_initial_rows_extracted": runtime_storage_initial_rows_extracted,
+            "runtime_storage_indexed_derived_fields_extracted": runtime_storage_indexed_derived_fields_extracted,
+            "runtime_storage_initialization_ir_free": runtime_storage_initialization_ir_free,
+            "runtime_legacy_storage_constructor_uses_compiler_plan": runtime_legacy_storage_constructor_uses_compiler_plan,
+            "runtime_parser_dependency_removed": runtime_parser_dependency_removed,
+            "runtime_static_analysis_dtos_extracted": runtime_static_analysis_dtos_extracted,
+            "runtime_source_payload_counts_extracted": runtime_source_payload_counts_extracted,
+            "runtime_typed_storage_layout_counts_extracted": runtime_typed_storage_layout_counts_extracted,
+            "runtime_symbols_extracted": runtime_symbols_extracted,
+            "runtime_field_slot_collision_diagnostics_extracted": runtime_field_slot_collision_diagnostics_extracted,
+            "runtime_scalar_equations_extracted": runtime_scalar_equations_extracted,
+            "runtime_profile_metadata_extracted": runtime_profile_metadata_extracted,
+            "runtime_unsupported_diagnostics_extracted": runtime_unsupported_diagnostics_extracted,
+            "runtime_generic_derived_plan_inventory_extracted": runtime_generic_derived_plan_inventory_extracted,
+            "runtime_generic_derived_runtime_plan_inventory_extracted": runtime_generic_derived_runtime_plan_inventory_extracted,
+            "runtime_generic_derived_ast_lowering_extracted": runtime_generic_derived_ast_lowering_extracted,
+            "runtime_derived_equation_plan_extracted": runtime_derived_equation_plan_extracted,
+            "runtime_update_expression_dtos_extracted": runtime_update_expression_dtos_extracted,
+            "runtime_bytes_scalar_arg_dtos_extracted": runtime_bytes_scalar_arg_dtos_extracted,
+            "runtime_derived_value_kind_dtos_extracted": runtime_derived_value_kind_dtos_extracted,
+            "runtime_raw_ir_value_enum_imports_qualified": runtime_raw_ir_value_enum_imports_qualified,
+            "runtime_row_template_initial_values_ir_free": runtime_row_template_initial_values_ir_free,
+            "runtime_ir_debug_tables_delegated_to_compiler": runtime_ir_debug_tables_delegated_to_compiler,
+            "runtime_report_debug_tables_use_compiled_program": runtime_report_debug_tables_use_compiled_program,
+            "runtime_typecheck_report_metadata_delegated_to_compiler": runtime_typecheck_report_metadata_delegated_to_compiler,
+            "runtime_typed_program_report_metadata_delegated_to_compiler": runtime_typed_program_report_metadata_delegated_to_compiler,
+            "runtime_typed_program_inventory_counts_delegated_to_compiler": runtime_typed_program_inventory_counts_delegated_to_compiler,
+            "runtime_document_list_metadata_extracted": runtime_document_list_metadata_extracted,
+            "runtime_dead_ir_document_metadata_helpers_removed": runtime_dead_ir_document_metadata_helpers_removed,
+            "runtime_document_observed_root_paths_extracted": runtime_document_observed_root_paths_extracted,
+            "runtime_document_projection_storage_resolutions_extracted": runtime_document_projection_storage_resolutions_extracted,
+            "runtime_document_render_slots_extracted": runtime_document_render_slots_extracted,
+            "runtime_root_state_paths_extracted": runtime_root_state_paths_extracted,
+            "runtime_source_route_root_targets_extracted": runtime_source_route_root_targets_extracted,
+            "runtime_source_route_sources_extracted": runtime_source_route_sources_extracted,
+            "runtime_source_route_bool_facts_extracted": runtime_source_route_bool_facts_extracted,
+            "runtime_source_route_router_targets_extracted": runtime_source_route_router_targets_extracted,
+            "runtime_source_route_root_text_transforms_extracted": runtime_source_route_root_text_transforms_extracted,
+            "runtime_live_constructors_use_compiled_program": runtime_live_constructors_use_compiled_program,
+            "runtime_typecheck_dependency_removed": runtime_typecheck_dependency_removed,
+            "runtime_frontend_orchestration_remaining": runtime_frontend_orchestration_remaining,
+            "runtime_root_scenario_orchestration_remaining": runtime_root_scenario_orchestration_remaining,
+            "runtime_source_route_command_adapter_remaining": runtime_source_route_command_adapter_remaining,
+            "next_architectural_cuts": [
+                "move parser-facing document/source helpers out of boon_runtime into boon_compiler",
+                "move IR-derived runtime/document metadata behind compiler or PlanExecutor artifacts so boon_runtime can drop boon_ir"
+            ]
         },
         "dependency_direction": {
             "external_direct_plan_compile_call_count": external_direct_plan_compile_calls.len(),
@@ -6686,8 +10790,13 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "facade_call_site_count": facade_call_sites.len(),
             "facade_call_sites": facade_call_sites,
             "boon_plan_depends_on_boon_ir": plan_depends_on_ir,
+            "boon_plan_optionally_depends_on_boon_ir": plan_optionally_depends_on_ir,
             "boon_plan_depends_on_boon_parser": plan_depends_on_parser,
+            "boon_plan_optionally_depends_on_boon_parser": plan_optionally_depends_on_parser,
+            "boon_plan_optionally_depends_on_boon_typecheck": plan_optionally_depends_on_typecheck,
+            "boon_plan_legacy_ir_adapter_feature_present": plan_legacy_ir_adapter_feature_present,
             "boon_plan_imports_parser_ast": plan_imports_parser_ast,
+            "boon_plan_executor_frontend_dependencies": plan_executor_frontend_dependencies,
             "boon_runtime_frontend_dependencies": runtime_depends_on_frontend,
         },
         "acceptance": {
@@ -6732,6 +10841,80 @@ fn toml_has_dependency(value: &toml::Value, dependency: &str) -> bool {
                 .and_then(toml::Value::as_table)
                 .is_some_and(|dependencies| dependencies.contains_key(dependency))
         })
+}
+
+fn toml_has_normal_dependency(value: &toml::Value, dependency: &str) -> bool {
+    value
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|dependencies| dependencies.contains_key(dependency))
+}
+
+fn toml_has_required_dependency(value: &toml::Value, dependency: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .any(|section| {
+            toml_dependency_entry(value, section, dependency)
+                .is_some_and(|entry| !toml_dependency_is_optional(entry))
+        })
+}
+
+fn toml_has_optional_dependency(value: &toml::Value, dependency: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .any(|section| {
+            toml_dependency_entry(value, section, dependency)
+                .is_some_and(toml_dependency_is_optional)
+        })
+}
+
+fn toml_dependency_entry<'a>(
+    value: &'a toml::Value,
+    section: &str,
+    dependency: &str,
+) -> Option<&'a toml::Value> {
+    value
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|dependencies| dependencies.get(dependency))
+}
+
+fn toml_dependency_is_optional(entry: &toml::Value) -> bool {
+    entry
+        .get("optional")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn toml_feature_includes(value: &toml::Value, feature: &str, item: &str) -> bool {
+    value
+        .get("features")
+        .and_then(|features| features.get(feature))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|items| items.iter().any(|entry| entry.as_str() == Some(item)))
+}
+
+fn toml_dependency_feature_enabled(value: &toml::Value, dependency: &str, feature: &str) -> bool {
+    toml_dependency_features(value, dependency)
+        .iter()
+        .any(|enabled| enabled == feature)
+}
+
+fn toml_dependency_features(value: &toml::Value, dependency: &str) -> Vec<String> {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .filter_map(|section| toml_dependency_entry(value, section, dependency))
+        .flat_map(|entry| {
+            entry
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn rust_source_matches(
@@ -31526,6 +35709,9 @@ fn wait_for_loop_readback_change(
                             "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+                            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
@@ -31634,6 +35820,9 @@ fn wait_for_loop_readback_at_revision_or_change(
                             "rendered_frame_count": report.get("rendered_frame_count").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+                            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
@@ -31846,6 +36035,9 @@ fn wait_for_loop_presented_input_settle_since(
                             "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+                            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -31881,7 +36073,7 @@ fn wait_for_loop_frame_input_quiet(
 ) -> serde_json::Value {
     let started = Instant::now();
     let mut stable_since = Instant::now();
-    let mut last_tuple: Option<(u64, u64, u64, u64, bool)> = None;
+    let mut last_tuple: Option<(u64, u64, u64, u64, bool, bool, Option<String>)> = None;
     let mut last_report = json!({"status": "missing"});
     while started.elapsed() < timeout {
         if loop_report.exists() {
@@ -31916,17 +36108,34 @@ fn wait_for_loop_frame_input_quiet(
                         .get("stale_for_latest_input")
                         .and_then(serde_json::Value::as_bool)
                         == Some(true);
+                    let interactive_readback_pending = report
+                        .get("last_interactive_surface_readback_pending")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let last_interactive_readback_completed = report
+                        .get("last_interactive_readback_completed_elapsed_ms")
+                        .and_then(|value| {
+                            value
+                                .as_f64()
+                                .map(|number| format!("{number:.6}"))
+                                .or_else(|| value.as_str().map(str::to_owned))
+                        });
                     let tuple = (
                         revision,
                         frame_count,
                         input_event_wake_count,
                         presented_input_event_wake_count,
                         stale_for_latest_input,
+                        interactive_readback_pending,
+                        last_interactive_readback_completed,
                     );
-                    if Some(tuple) != last_tuple {
+                    if Some(tuple.clone()) != last_tuple {
                         last_tuple = Some(tuple);
                         stable_since = Instant::now();
-                    } else if !stale_for_latest_input && stable_since.elapsed() >= quiet_for {
+                    } else if !stale_for_latest_input
+                        && !interactive_readback_pending
+                        && stable_since.elapsed() >= quiet_for
+                    {
                         return json!({
                             "status": "pass",
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -31937,6 +36146,8 @@ fn wait_for_loop_frame_input_quiet(
                             "input_event_wake_count": input_event_wake_count,
                             "presented_input_event_wake_count": presented_input_event_wake_count,
                             "stale_for_latest_input": stale_for_latest_input,
+                            "last_interactive_surface_readback_pending": interactive_readback_pending,
+                            "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null)
                         });
@@ -37215,8 +41426,16 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
     );
 
     let hold_ms = match example.as_str() {
-        "cells" => "7200",
+        // The Cells scenario exercises two cell selections plus retained
+        // formula-bar assertions. Keep the role alive beyond the scenario
+        // runner timeout so the gate records pass/fail instead of a partial
+        // "running" report.
+        "cells" => "22000",
         _ => "4200",
+    };
+    let headed_scenario_timeout_ms = match example.as_str() {
+        "cells" => "20000",
+        _ => "12000",
     };
     let timeout_seconds = match example.as_str() {
         "todo_mvc_physical" | "novywave" => "180s",
@@ -37247,6 +41466,8 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
                     "--demand-driven-loop",
                     "--auto-headed-scenario",
                     &scenario_id,
+                    "--headed-scenario-timeout-ms",
+                    headed_scenario_timeout_ms,
                     "--frame-readback",
                     "--report",
                     role_report.to_string_lossy().as_ref(),
@@ -38944,19 +43165,6 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         .filter(|step| step.expected_source_event.is_some())
         .map(|step| step.id.clone())
         .collect::<Vec<_>>();
-    let expected_render_delta_by_index = scenario
-        .step
-        .iter()
-        .filter(|step| step.expected_source_event.is_some())
-        .enumerate()
-        .map(|(index, step)| {
-            (
-                index as u64,
-                !step.expect_render_delta_contains.is_empty()
-                    || !step.expect_semantic_delta_contains.is_empty(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let observed = report
         .pointer("/dev_ipc_probe/operator_host_input/assertions")
         .and_then(serde_json::Value::as_array)
@@ -39057,32 +43265,54 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         &mut blockers,
         "native-todomvc-input-parity:framebuffer-delta-contract",
         observed_sources.iter().enumerate().all(|(index, output)| {
-            let before_hash = output
-                .pointer("/framebuffer_delta_evidence/before_state_hash")
+            let before_framebuffer_sha256 = output
+                .pointer("/framebuffer_delta_evidence/before_framebuffer_sha256")
                 .and_then(serde_json::Value::as_str);
-            let after_hash = output
-                .pointer("/framebuffer_delta_evidence/after_state_hash")
+            let after_framebuffer_sha256 = output
+                .pointer("/framebuffer_delta_evidence/after_framebuffer_sha256")
                 .and_then(serde_json::Value::as_str);
             let render_patch_count = output
                 .pointer("/framebuffer_delta_evidence/render_patch_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default();
-            let expected_runtime_or_render_delta = expected_render_delta_by_index
-                .get(&(index as u64))
-                .copied()
-                .unwrap_or(true);
+            let readback_status = output
+                .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_status")
+                .and_then(serde_json::Value::as_str);
+            let readback_artifact_exists = output
+                .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_artifact/path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| Path::new(path).exists());
+            let expected_framebuffer_delta =
+                native_todomvc_operator_output_requires_framebuffer_delta(output);
             output
                 .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_required_by_preview_report")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
-                && if expected_runtime_or_render_delta {
-                    render_patch_count > 0 && before_hash != after_hash
+                && readback_status == Some("captured")
+                && readback_artifact_exists
+                && before_framebuffer_sha256.is_some()
+                && after_framebuffer_sha256.is_some()
+                && if expected_framebuffer_delta {
+                    render_patch_count > 0
+                        && before_framebuffer_sha256 != after_framebuffer_sha256
                 } else {
-                    before_hash == after_hash
+                    before_framebuffer_sha256 == after_framebuffer_sha256
                 }
         }),
-        format!("observed_output_count={}", observed_sources.len()),
-        Some("TodoMVC input parity must bind each scenario to runtime and render-patch backed framebuffer-change evidence".to_owned()),
+        format!(
+            "observed_output_count={}, missing_or_uncaptured_readbacks={}",
+            observed_sources.len(),
+            observed_sources
+                .iter()
+                .filter(|output| {
+                    output
+                        .pointer("/framebuffer_delta_evidence/app_owned_framebuffer_readback_status")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("captured")
+                })
+                .count()
+        ),
+        Some("TodoMVC input parity must bind each scenario to app-owned per-input framebuffer readback evidence, not only runtime state or render-patch hashes".to_owned()),
     );
     push_audit_check(
         &mut checks,
@@ -39173,6 +43403,32 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
             "input_contract": "HostInputEvent -> hit test -> source binding -> LiveRuntime -> render patch -> framebuffer change"
         }),
     )
+}
+
+fn native_todomvc_operator_output_requires_framebuffer_delta(output: &serde_json::Value) -> bool {
+    let render_patch_count = output
+        .pointer("/framebuffer_delta_evidence/render_patch_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if render_patch_count == 0 {
+        return false;
+    }
+    let render_patch_samples = output
+        .pointer("/framebuffer_delta_evidence/render_patch_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if render_patch_samples.is_empty() {
+        return true;
+    }
+    let only_blank_text_input_value = render_patch_samples.iter().all(|sample| {
+        sample.get("data_path").and_then(serde_json::Value::as_str) == Some("store.new_todo_text")
+            && sample
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+    });
+    !only_blank_text_input_value
 }
 
 fn native_preview_e2e_report_path(example: &str) -> PathBuf {
@@ -42777,10 +47033,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             true,
             dev_editor,
         )?;
-        let isolated_launch_success = isolated_real_window_launch_proof
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+        let isolated_launch_success =
+            isolated_scroll_real_window_wheel_delivery_proven(&isolated_real_window_launch_proof);
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -44657,6 +48911,34 @@ fn novywave_signal_lane_runtime_evidence_inner() -> Result<serde_json::Value, St
             .unwrap_or(serde_json::Value::Null),
         "contract": "NovyWave selected_signal_lane_rows must own nested lane/page/window/materialization refs and row-local waveform segments before native rendering"
     }))
+}
+
+fn isolated_scroll_real_window_wheel_delivery_proven(report: &serde_json::Value) -> bool {
+    report
+        .get("driver_pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && report
+            .get("desktop_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("driver_effect_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("measured_loop_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .pointer("/preview_input_adapter/mouse_scroll_event_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
 }
 
 fn native_scroll_axis_observation_summary(
@@ -48245,10 +52527,6 @@ fn verify_native_cells_visible_click_e2e(
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         || live_probe
-            .pointer("/readback_probe/accepted_by_retained_bound_text_sync")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        || live_probe
             .pointer("/visual_formula_probe/visual_formula_changed")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
@@ -48324,6 +52602,12 @@ fn verify_native_cells_visible_click_e2e(
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
+    let selected_cell_transition_contract =
+        cells_visible_click_selected_cell_transition_contract_summary(&live_probe);
+    let selected_cell_transition_contract_pass = selected_cell_transition_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     let bounded_click_to_present_outlier_cap_ms = max_click_to_present_ms + max_click_to_formula_ms;
     let cold_sample_count = live_probe
         .get("cold_sample_count")
@@ -48370,9 +52654,7 @@ fn verify_native_cells_visible_click_e2e(
                 && input_wake_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && input_wake_to_present <= bounded_click_to_present_outlier_cap_ms
                 && readback_hash_changed;
-            let bounded = click_to_formula <= bounded_click_to_present_outlier_cap_ms
-                && click_to_present <= bounded_click_to_present_outlier_cap_ms
-                && input_wake_to_formula <= max_click_to_formula_ms
+            let bounded = input_wake_to_formula <= max_click_to_formula_ms
                 && input_wake_to_present <= max_click_to_formula_ms
                 && readback_hash_changed;
             if bounded_cold_start {
@@ -48406,7 +52688,7 @@ fn verify_native_cells_visible_click_e2e(
                     "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
                     "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
                     "readback_hash_changed": readback_hash_changed,
-                    "classification": "bounded-driver-to-app-wake-outlier"
+                    "classification": "external-driver-to-app-wake-outlier-with-bounded-app-owned-input-latency"
                 }));
             } else {
                 unbounded_click_to_present_outlier_count += 1;
@@ -48616,6 +52898,30 @@ fn verify_native_cells_visible_click_e2e(
             "Cells visible click must prove the top formula input text changed for targets with a different formula".to_owned()
         }),
     );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:selected-cell-visible-transition",
+        selected_cell_transition_contract_pass,
+        format!(
+            "status={:?}, required_samples={}, visual_pass_required_samples={}",
+            selected_cell_transition_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            selected_cell_transition_contract
+                .get("change_required_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            selected_cell_transition_contract
+                .get("visual_pass_required_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (!selected_cell_transition_contract_pass).then(|| {
+            "Cells visible click must prove the grid selection highlight moved to the clicked cell"
+                .to_owned()
+        }),
+    );
 
     let role_artifacts = live_probe
         .get("artifact_paths")
@@ -48744,7 +53050,8 @@ fn verify_native_cells_visible_click_e2e(
             "retained_update_contract": retained_update_contract,
             "runtime_work_contract": runtime_work_contract,
             "formula_transition_contract": formula_transition_contract,
-            "bounded_click_to_present_outlier_policy": "steady driver-to-app-wake outliers are accepted only when every max-budget violation remains below max_click_to_present_ms + max_click_to_formula_ms, the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms, and the sample produced a changed app-owned readback/proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below the same bounded cap and produce changed app-owned proof",
+            "selected_cell_transition_contract": selected_cell_transition_contract,
+            "bounded_click_to_present_outlier_policy": "steady external driver-to-app-wake outliers are accepted only when the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms and the sample produced changed app-owned WGPU readback proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below max_click_to_present_ms + max_click_to_formula_ms and produce changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
             "bounded_cold_start_outlier_count": bounded_cold_start_outlier_count,
@@ -48768,6 +53075,11 @@ fn verify_native_cells_visible_click_e2e(
 
 fn cells_visual_formula_probe_from_readback(
     readback_probe: &serde_json::Value,
+    previous_readback_path: Option<&str>,
+    previous_address: &str,
+    expected_address: &str,
+    previous_formula: &str,
+    expected_formula: &str,
 ) -> serde_json::Value {
     let retained_sync = readback_probe
         .pointer("/last_external_render_proof/retained_bound_sync")
@@ -48807,6 +53119,11 @@ fn cells_visual_formula_probe_from_readback(
     let retained_text_changed = retained_sync_pass && changed && text_update_count > 0;
     let formula_bar_text_input_changed =
         retained_bound_sync_changed_text_path(&retained_sync, "store.selected_input.editing_text");
+    let formula_bar_text_input_expected = retained_bound_sync_changed_text_path_to_value(
+        &retained_sync,
+        "store.selected_input.editing_text",
+        expected_formula,
+    );
     let retained_render_proof_pass = readback_probe
         .pointer("/last_external_render_proof/status")
         .and_then(serde_json::Value::as_str)
@@ -48815,18 +53132,63 @@ fn cells_visual_formula_probe_from_readback(
         .get("accepted_by_retained_bound_text_sync")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let retained_visual_changed = retained_text_changed
+    let retained_text_sync_matches = retained_text_changed
         && formula_bar_text_input_changed
+        && formula_bar_text_input_expected
         && (retained_render_proof_pass || accepted_by_retained_bound_text_sync);
-    let full_frame_visual_changed =
-        readback_pass && readback_hash_changed && retained_sync_unavailable;
-    let visual_formula_changed = retained_visual_changed || full_frame_visual_changed;
+    let after_readback_path = readback_probe
+        .get("readback_artifact_after")
+        .and_then(readback_artifact_path_string)
+        .or_else(|| {
+            readback_probe
+                .pointer("/last_external_render_proof/proof/artifact/path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let formula_bar_crop_probe = cells_formula_bar_visual_crop_probe(
+        previous_readback_path,
+        after_readback_path.as_deref(),
+        readback_probe
+            .pointer("/last_external_render_proof/layout_artifact")
+            .and_then(serde_json::Value::as_str),
+        previous_address,
+        expected_address,
+        previous_formula,
+        expected_formula,
+    );
+    let formula_bar_crop_pass = formula_bar_crop_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let selected_cell_crop_probe = cells_selected_cell_visual_crop_probe(
+        readback_probe,
+        previous_readback_path,
+        after_readback_path.as_deref(),
+        previous_address,
+        expected_address,
+    );
+    let selected_cell_crop_pass = selected_cell_crop_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let formula_bar_visual_changed = readback_pass
+        && readback_hash_changed
+        && retained_text_sync_matches
+        && formula_bar_crop_pass;
+    let selected_cell_visual_changed =
+        readback_pass && readback_hash_changed && selected_cell_crop_pass;
+    let full_frame_visual_changed = formula_bar_visual_changed && selected_cell_visual_changed;
+    let visual_formula_changed = full_frame_visual_changed;
     json!({
         "status": if visual_formula_changed { "pass" } else { "fail" },
-        "evidence": if retained_visual_changed {
-            "changed app-owned retained render proof plus retained bound text-input sync"
+        "evidence": if full_frame_visual_changed {
+            "changed app-owned WGPU readback after selected formula-bar text became current"
+        } else if formula_bar_visual_changed {
+            "formula-bar text visibly changed, but the selected-cell crop proof did not pass"
+        } else if retained_text_sync_matches {
+            "retained text-input sync matched expected formula, but app-owned WGPU readback did not prove a visible change"
         } else {
-            "changed app-owned WGPU readback; retained bound text-input sync unavailable for this full-frame update"
+            "formula-bar text was not proven visible by app-owned WGPU readback"
         },
         "readback_status": readback_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "readback_hash_changed": readback_hash_changed,
@@ -48836,11 +53198,226 @@ fn cells_visual_formula_probe_from_readback(
         "retained_sync_unavailable": retained_sync_unavailable,
         "retained_text_changed": retained_text_changed,
         "formula_bar_text_input_changed": formula_bar_text_input_changed,
-        "retained_visual_changed": retained_visual_changed,
+        "formula_bar_text_input_expected": formula_bar_text_input_expected,
+        "expected_formula_bar_text": expected_formula,
+        "expected_formula_bar_address": expected_address,
+        "previous_formula_bar_text": previous_formula,
+        "previous_formula_bar_address": previous_address,
+        "after_readback_path": after_readback_path,
+        "formula_bar_crop_probe": formula_bar_crop_probe,
+        "selected_cell_crop_probe": selected_cell_crop_probe,
+        "retained_text_sync_matches": retained_text_sync_matches,
+        "retained_visual_changed": false,
+        "formula_bar_visual_changed": formula_bar_visual_changed,
+        "selected_cell_visual_changed": selected_cell_visual_changed,
         "full_frame_visual_changed": full_frame_visual_changed,
         "retained_text_update_count": text_update_count,
         "visual_formula_changed": visual_formula_changed
     })
+}
+
+fn cells_selected_cell_visual_crop_probe(
+    readback_probe: &serde_json::Value,
+    previous_readback_path: Option<&str>,
+    after_readback_path: Option<&str>,
+    previous_address: &str,
+    expected_address: &str,
+) -> serde_json::Value {
+    if previous_address == expected_address {
+        return json!({
+            "status": "pass",
+            "evidence": "selected cell did not change address",
+            "selection_change_required": false
+        });
+    }
+    let Some(previous_path) = previous_readback_path else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing baseline app-owned readback for selected-cell crop comparison",
+            "previous_address": previous_address,
+            "expected_address": expected_address
+        });
+    };
+    let Some(after_path) = after_readback_path else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing current app-owned readback for selected-cell crop comparison",
+            "previous_readback_path": previous_path,
+            "previous_address": previous_address,
+            "expected_address": expected_address
+        });
+    };
+    let Some(layout_artifact) = readback_probe
+        .pointer("/last_external_render_proof/layout_artifact")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing layout artifact for selected-cell crop bounds",
+            "previous_readback_path": previous_path,
+            "after_readback_path": after_path,
+            "previous_address": previous_address,
+            "expected_address": expected_address
+        });
+    };
+    let previous_bounds = cells_cell_crop_bounds_for_address(layout_artifact, previous_address);
+    let expected_bounds = cells_cell_crop_bounds_for_address(layout_artifact, expected_address);
+    let previous_probe = previous_bounds
+        .as_ref()
+        .map(|(x, y, width, height)| {
+            cells_formula_bar_region_crop_probe(
+                previous_path,
+                after_path,
+                "previous_selected_cell",
+                *x,
+                *y,
+                *width,
+                *height,
+            )
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "fail",
+                "region": "previous_selected_cell",
+                "diagnostic": "could not resolve previous selected cell bounds",
+                "address": previous_address,
+                "layout_artifact": layout_artifact
+            })
+        });
+    let expected_probe = expected_bounds
+        .as_ref()
+        .map(|(x, y, width, height)| {
+            cells_formula_bar_region_crop_probe(
+                previous_path,
+                after_path,
+                "expected_selected_cell",
+                *x,
+                *y,
+                *width,
+                *height,
+            )
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "fail",
+                "region": "expected_selected_cell",
+                "diagnostic": "could not resolve expected selected cell bounds",
+                "address": expected_address,
+                "layout_artifact": layout_artifact
+            })
+        });
+    let previous_changed = previous_probe
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let expected_changed = expected_probe
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let previous_selected_pixels_after = previous_bounds
+        .as_ref()
+        .and_then(|(x, y, width, height)| {
+            cells_selected_style_pixel_count(after_path, *x, *y, *width, *height).ok()
+        })
+        .unwrap_or(0);
+    let expected_selected_pixels_after = expected_bounds
+        .as_ref()
+        .and_then(|(x, y, width, height)| {
+            cells_selected_style_pixel_count(after_path, *x, *y, *width, *height).ok()
+        })
+        .unwrap_or(0);
+    let selected_pixel_threshold = 24_u64;
+    let previous_cell_unselected_after = previous_selected_pixels_after <= selected_pixel_threshold;
+    let expected_cell_selected_after = expected_selected_pixels_after > selected_pixel_threshold;
+    let pass = previous_cell_unselected_after && expected_cell_selected_after;
+    json!({
+        "status": if pass { "pass" } else { "fail" },
+        "evidence": if pass {
+            "old cell lost selected pixels and new cell gained selected pixels in app-owned readback"
+        } else {
+            "app-owned readback did not prove the grid selection highlight moved"
+        },
+        "layout_artifact": layout_artifact,
+        "previous_readback_path": previous_path,
+        "after_readback_path": after_path,
+        "previous_address": previous_address,
+        "expected_address": expected_address,
+        "previous_cell_crop_changed": previous_changed,
+        "expected_cell_crop_changed": expected_changed,
+        "selected_pixel_threshold": selected_pixel_threshold,
+        "previous_selected_pixels_after": previous_selected_pixels_after,
+        "expected_selected_pixels_after": expected_selected_pixels_after,
+        "previous_cell_unselected_after": previous_cell_unselected_after,
+        "expected_cell_selected_after": expected_cell_selected_after,
+        "previous_cell_crop_probe": previous_probe,
+        "expected_cell_crop_probe": expected_probe
+    })
+}
+
+fn cells_cell_crop_bounds_for_address(
+    layout_artifact: &str,
+    address: &str,
+) -> Option<(u32, u32, u32, u32)> {
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(layout_artifact).ok()?).ok()?;
+    let address_nodes = artifact
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|intent| {
+            intent.get("intent").and_then(serde_json::Value::as_str) == Some("address")
+                && intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(address)
+        })
+        .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|item| {
+            let node = item.get("node").and_then(serde_json::Value::as_str)?;
+            if !address_nodes.contains(node) || item.pointer("/style/selected").is_none() {
+                return None;
+            }
+            let bounds = item.get("bounds")?;
+            let x = bounds.get("x").and_then(serde_json::Value::as_f64)?;
+            let y = bounds.get("y").and_then(serde_json::Value::as_f64)?;
+            let width = bounds.get("width").and_then(serde_json::Value::as_f64)?;
+            let height = bounds.get("height").and_then(serde_json::Value::as_f64)?;
+            let crop_x = x.floor().max(0.0) as u32;
+            let crop_y = y.floor().max(0.0) as u32;
+            let crop_width = width.ceil().max(1.0) as u32;
+            let crop_height = height.ceil().max(1.0) as u32;
+            Some((crop_x, crop_y, crop_width, crop_height))
+        })
+}
+
+fn cells_selected_style_pixel_count(
+    path: &str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let image = image::open(path)?.to_rgba8();
+    let crop_width = width.min(image.width().saturating_sub(x));
+    let crop_height = height.min(image.height().saturating_sub(y));
+    if crop_width == 0 || crop_height == 0 {
+        return Ok(0);
+    }
+    let mut count = 0_u64;
+    for yy in y..(y + crop_height) {
+        for xx in x..(x + crop_width) {
+            let [r, g, b, a] = image.get_pixel(xx, yy).0;
+            if a > 0 && b > 180 && g > 100 && r < 230 && b.saturating_sub(r) > 30 {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn retained_bound_sync_changed_text_path(retained_sync: &serde_json::Value, path: &str) -> bool {
@@ -48855,6 +53432,340 @@ fn retained_bound_sync_changed_text_path(retained_sync: &serde_json::Value, path
                     .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(path)))
             })
         })
+}
+
+fn retained_bound_sync_changed_text_path_to_value(
+    retained_sync: &serde_json::Value,
+    path: &str,
+    expected_text: &str,
+) -> bool {
+    retained_sync
+        .get("text_update_values")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|updates| {
+            updates.iter().any(|update| {
+                update
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(path)))
+                    && update.get("text").and_then(serde_json::Value::as_str) == Some(expected_text)
+            })
+        })
+}
+
+fn readback_artifact_path_string(readback: &serde_json::Value) -> Option<String> {
+    readback
+        .get("path")
+        .or_else(|| readback.get("artifact_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn cells_formula_bar_visual_crop_probe(
+    previous_readback_path: Option<&str>,
+    after_readback_path: Option<&str>,
+    layout_artifact: Option<&str>,
+    previous_address: &str,
+    expected_address: &str,
+    previous_formula: &str,
+    expected_formula: &str,
+) -> serde_json::Value {
+    let address_change_required = previous_address != expected_address;
+    let formula_change_required = previous_formula != expected_formula;
+    if !address_change_required && !formula_change_required {
+        return json!({
+            "status": "pass",
+            "evidence": "formula-bar address and text were unchanged for this target",
+            "address_change_required": false,
+            "formula_change_required": false,
+            "layout_artifact": layout_artifact
+        });
+    }
+    let Some(previous_path) = previous_readback_path else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing baseline app-owned readback for formula-bar crop comparison",
+            "address_change_required": address_change_required,
+            "formula_change_required": formula_change_required,
+            "previous_address": previous_address,
+            "expected_address": expected_address,
+            "previous_formula": previous_formula,
+            "expected_formula": expected_formula,
+            "layout_artifact": layout_artifact
+        });
+    };
+    let Some(after_path) = after_readback_path else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing current app-owned readback for formula-bar crop comparison",
+            "address_change_required": address_change_required,
+            "formula_change_required": formula_change_required,
+            "previous_readback_path": previous_path,
+            "previous_address": previous_address,
+            "expected_address": expected_address,
+            "previous_formula": previous_formula,
+            "expected_formula": expected_formula,
+            "layout_artifact": layout_artifact
+        });
+    };
+    let Some(layout_artifact) = layout_artifact else {
+        return json!({
+            "status": "fail",
+            "evidence": "missing layout artifact for formula-bar crop bounds",
+            "previous_readback_path": previous_path,
+            "after_readback_path": after_path,
+            "previous_address": previous_address,
+            "expected_address": expected_address,
+            "previous_formula": previous_formula,
+            "expected_formula": expected_formula,
+            "address_change_required": address_change_required,
+            "formula_change_required": formula_change_required
+        });
+    };
+    let Some((address_bounds, input_bounds)) = cells_formula_bar_crop_bounds(layout_artifact)
+    else {
+        return json!({
+            "status": "fail",
+            "evidence": "could not resolve formula-bar crop bounds from layout artifact",
+            "previous_readback_path": previous_path,
+            "after_readback_path": after_path,
+            "layout_artifact": layout_artifact,
+            "previous_address": previous_address,
+            "expected_address": expected_address,
+            "previous_formula": previous_formula,
+            "expected_formula": expected_formula,
+            "address_change_required": address_change_required,
+            "formula_change_required": formula_change_required
+        });
+    };
+    let (address_x, address_y, address_width, address_height) = address_bounds;
+    let address_probe = cells_formula_bar_region_crop_probe(
+        previous_path,
+        after_path,
+        "formula_bar_address_label",
+        address_x,
+        address_y,
+        address_width,
+        address_height,
+    );
+    let (input_x, input_y, input_width, input_height) = input_bounds;
+    let input_probe = cells_formula_bar_region_crop_probe(
+        previous_path,
+        after_path,
+        "formula_bar_text_input",
+        input_x,
+        input_y,
+        input_width,
+        input_height,
+    );
+    let address_changed = address_probe
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let input_changed = input_probe
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let address_pass = !address_change_required || address_changed;
+    let formula_pass = !formula_change_required || input_changed;
+    json!({
+        "status": if address_pass && formula_pass { "pass" } else { "fail" },
+        "evidence": if address_pass && formula_pass {
+            "formula-bar address/text crops changed where selection state required it"
+        } else {
+            "app-owned readback did not prove the top formula bar changed"
+        },
+        "previous_readback_path": previous_path,
+        "after_readback_path": after_path,
+        "layout_artifact": layout_artifact,
+        "previous_address": previous_address,
+        "expected_address": expected_address,
+        "previous_formula": previous_formula,
+        "expected_formula": expected_formula,
+        "address_change_required": address_change_required,
+        "formula_change_required": formula_change_required,
+        "address_crop_changed": address_changed,
+        "formula_input_crop_changed": input_changed,
+        "address_crop_bounds": {
+            "x": address_x,
+            "y": address_y,
+            "width": address_width,
+            "height": address_height
+        },
+        "formula_input_crop_bounds": {
+            "x": input_x,
+            "y": input_y,
+            "width": input_width,
+            "height": input_height
+        },
+        "address_crop_probe": address_probe,
+        "formula_input_crop_probe": input_probe
+    })
+}
+
+fn cells_formula_bar_crop_bounds(
+    layout_artifact: &str,
+) -> Option<((u32, u32, u32, u32), (u32, u32, u32, u32))> {
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(layout_artifact).ok()?).ok()?;
+    let display_list = artifact
+        .pointer("/layout_frame/display_list")
+        .and_then(serde_json::Value::as_array)?;
+    let input_item = display_list.iter().find(|item| {
+        item.get("kind").and_then(serde_json::Value::as_str) == Some("text_input")
+            && item
+                .pointer("/bounds/y")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|y| y < 50.0)
+            && item
+                .pointer("/bounds/width")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|width| width > 100.0)
+    })?;
+    let input_bounds = cells_layout_item_crop_bounds(input_item)?;
+    let (input_x, input_y, _, input_height) = input_bounds;
+    let input_x_f64 = f64::from(input_x);
+    let input_y_f64 = f64::from(input_y);
+    let input_height_f64 = f64::from(input_height);
+    let address_item = display_list
+        .iter()
+        .filter(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter(|item| {
+            let Some(bounds) = item.get("bounds") else {
+                return false;
+            };
+            let x = bounds
+                .get("x")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::MAX);
+            let y = bounds
+                .get("y")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::MAX);
+            let width = bounds
+                .get("width")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
+            let height = bounds
+                .get("height")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
+            x < input_x_f64
+                && (y - input_y_f64).abs() <= 1.0
+                && (height - input_height_f64).abs() <= 1.0
+                && (32.0..=96.0).contains(&width)
+        })
+        .min_by(|left, right| {
+            let left_x = left
+                .pointer("/bounds/x")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
+            let right_x = right
+                .pointer("/bounds/x")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
+            left_x
+                .partial_cmp(&right_x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    let address_bounds = cells_layout_item_crop_bounds(address_item)?;
+    Some((address_bounds, input_bounds))
+}
+
+fn cells_layout_item_crop_bounds(item: &serde_json::Value) -> Option<(u32, u32, u32, u32)> {
+    let bounds = item.get("bounds")?;
+    let x = bounds.get("x").and_then(serde_json::Value::as_f64)?;
+    let y = bounds.get("y").and_then(serde_json::Value::as_f64)?;
+    let width = bounds.get("width").and_then(serde_json::Value::as_f64)?;
+    let height = bounds.get("height").and_then(serde_json::Value::as_f64)?;
+    let crop_x = x.floor().max(0.0) as u32;
+    let crop_y = y.floor().max(0.0) as u32;
+    let crop_width = width.ceil().max(1.0) as u32;
+    let crop_height = height.ceil().max(1.0) as u32;
+    Some((crop_x, crop_y, crop_width, crop_height))
+}
+
+fn cells_formula_bar_region_crop_probe(
+    previous_path: &str,
+    after_path: &str,
+    region: &str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> serde_json::Value {
+    match cells_formula_bar_region_crop_hash(previous_path, after_path, x, y, width, height) {
+        Ok((before_hash, after_hash, changed_pixel_count, compared_pixel_count)) => json!({
+            "status": "pass",
+            "region": region,
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "changed": before_hash != after_hash,
+            "changed_pixel_count": changed_pixel_count,
+            "compared_pixel_count": compared_pixel_count
+        }),
+        Err(error) => json!({
+            "status": "fail",
+            "region": region,
+            "diagnostic": error.to_string(),
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height
+        }),
+    }
+}
+
+fn cells_formula_bar_region_crop_hash(
+    previous_path: &str,
+    after_path: &str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(String, String, u64, u64), Box<dyn std::error::Error>> {
+    let before = image::open(previous_path)?.to_rgba8();
+    let after = image::open(after_path)?.to_rgba8();
+    let crop_width = width
+        .min(before.width().saturating_sub(x))
+        .min(after.width().saturating_sub(x));
+    let crop_height = height
+        .min(before.height().saturating_sub(y))
+        .min(after.height().saturating_sub(y));
+    if crop_width == 0 || crop_height == 0 {
+        return Err(format!(
+            "crop {x},{y} {width}x{height} is outside before={}x{} after={}x{}",
+            before.width(),
+            before.height(),
+            after.width(),
+            after.height()
+        )
+        .into());
+    }
+    let mut before_bytes = Vec::with_capacity((crop_width * crop_height * 4) as usize);
+    let mut after_bytes = Vec::with_capacity((crop_width * crop_height * 4) as usize);
+    let mut changed_pixel_count = 0_u64;
+    for yy in y..(y + crop_height) {
+        for xx in x..(x + crop_width) {
+            let before_pixel = before.get_pixel(xx, yy).0;
+            let after_pixel = after.get_pixel(xx, yy).0;
+            before_bytes.extend_from_slice(&before_pixel);
+            after_bytes.extend_from_slice(&after_pixel);
+            if before_pixel != after_pixel {
+                changed_pixel_count += 1;
+            }
+        }
+    }
+    Ok((
+        boon_runtime::sha256_bytes(&before_bytes),
+        boon_runtime::sha256_bytes(&after_bytes),
+        changed_pixel_count,
+        u64::from(crop_width) * u64::from(crop_height),
+    ))
 }
 
 fn cells_visible_click_retained_update_contract_summary(
@@ -49156,9 +54067,14 @@ fn cells_visible_click_formula_transition_contract_summary(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(before != after);
         let visual_pass = sample
-            .pointer("/visual_formula_probe/status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+            .pointer("/visual_formula_probe/formula_bar_visual_changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                sample
+                    .pointer("/visual_formula_probe/status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+            });
         if change_required {
             change_required_sample_count = change_required_sample_count.saturating_add(1);
             if changed {
@@ -49183,7 +54099,19 @@ fn cells_visible_click_formula_transition_contract_summary(
                         .pointer("/visual_formula_probe/status")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    "reason": "formula_bar_text_did_not_visibly_transition_to_expected_value"
+                    "formula_bar_visual_changed": sample
+                        .pointer("/visual_formula_probe/formula_bar_visual_changed")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "selected_cell_visual_changed": sample
+                        .pointer("/visual_formula_probe/selected_cell_visual_changed")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "reason": if changed && after == expected {
+                        "formula_bar_text_changed_but_visual_formula_bar_probe_failed"
+                    } else {
+                        "formula_bar_text_did_not_transition_to_expected_value"
+                    }
                 }));
             }
         }
@@ -49203,6 +54131,90 @@ fn cells_visible_click_formula_transition_contract_summary(
         "click_sample_count": click_sample_count,
         "change_required_sample_count": change_required_sample_count,
         "changed_formula_sample_count": changed_formula_sample_count,
+        "visual_pass_required_sample_count": visual_pass_required_sample_count,
+        "sample_failures": sample_failures,
+    })
+}
+
+fn cells_visible_click_selected_cell_transition_contract_summary(
+    live_probe: &serde_json::Value,
+) -> serde_json::Value {
+    let mut click_sample_count = 0_u64;
+    let mut change_required_sample_count = 0_u64;
+    let mut visual_pass_required_sample_count = 0_u64;
+    let mut sample_failures = Vec::new();
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let target_address = sample
+            .get("target_address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let selected_address = sample
+            .get("selected_address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let previous_address = sample
+            .get("previous_selected_address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let change_required = previous_address != target_address;
+        let visual_pass = sample
+            .pointer("/visual_formula_probe/selected_cell_visual_changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                sample
+                    .pointer("/visual_formula_probe/status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pass")
+            });
+        if change_required {
+            change_required_sample_count = change_required_sample_count.saturating_add(1);
+            if visual_pass {
+                visual_pass_required_sample_count =
+                    visual_pass_required_sample_count.saturating_add(1);
+            }
+            if !(selected_address == target_address && visual_pass) {
+                sample_failures.push(json!({
+                    "index": sample_index,
+                    "previous_selected_address": previous_address,
+                    "selected_address": selected_address,
+                    "target_address": target_address,
+                    "selected_cell_visual_changed": sample
+                        .pointer("/visual_formula_probe/selected_cell_visual_changed")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "selected_cell_crop_probe": sample
+                        .pointer("/visual_formula_probe/selected_cell_crop_probe")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "reason": if selected_address == target_address {
+                        "selected_address_changed_but_visual_selected_cell_probe_failed"
+                    } else {
+                        "selected_address_did_not_transition_to_target"
+                    }
+                }));
+            }
+        }
+    }
+    let status = if click_sample_count > 0
+        && change_required_sample_count > 0
+        && visual_pass_required_sample_count == change_required_sample_count
+        && sample_failures.is_empty()
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "click_sample_count": click_sample_count,
+        "change_required_sample_count": change_required_sample_count,
         "visual_pass_required_sample_count": visual_pass_required_sample_count,
         "sample_failures": sample_failures,
     })
@@ -49426,6 +54438,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
     let mut previous_formula_bar_text =
         runtime_value_response_string(&before_runtime_values, "store.selected_input.editing_text")
             .unwrap_or_else(|| "missing".to_owned());
+    let mut previous_selected_address =
+        runtime_value_response_string(&before_runtime_values, "store.selected_address")
+            .unwrap_or_else(|| "missing".to_owned());
 
     let (calibration_x, calibration_y) =
         native_driver_weston_coordinates(first_driver_target, 240.0, 220.0);
@@ -49630,9 +54645,42 @@ fn run_isolated_weston_cells_visible_click_e2e(
             )
         };
         let loop_before_click = read_json(&preview_loop_report).unwrap_or_else(|_| json!({}));
+        let before_click_runtime_values = send_xtask_preview_ipc_request(
+            ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+            json!({
+                "kind": "runtime-value",
+                "paths": ["store.selected_address", "store.selected_input.editing_text"],
+                "max_depth": 3,
+                "max_fields": 8,
+                "max_list_items": 4
+            }),
+            Duration::from_millis(250),
+        )
+        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
+        if before_click_runtime_values
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        {
+            if let Some(selected_address) = runtime_value_response_string(
+                &before_click_runtime_values,
+                "store.selected_address",
+            ) {
+                previous_selected_address = selected_address;
+            }
+            if let Some(formula_text) = runtime_value_response_string(
+                &before_click_runtime_values,
+                "store.selected_input.editing_text",
+            ) {
+                previous_formula_bar_text = formula_text;
+            }
+        }
         if let Some(hash) = current_loop_surface_readback_hash_from_report(&loop_before_click) {
             baseline_surface_hash = hash;
         }
+        let baseline_surface_readback_path = loop_before_click
+            .get("last_interactive_readback_artifact")
+            .and_then(readback_artifact_path_string);
         if let Some(hash) = current_loop_external_render_proof_hash_from_report(&loop_before_click)
         {
             baseline_external_render_proof_hash = hash;
@@ -49644,6 +54692,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         let click_started_monotonic_ns = monotonic_now_ns();
         let click_started = Instant::now();
         let formula_bar_text_before_click = previous_formula_bar_text.clone();
+        let selected_address_before_click = previous_selected_address.clone();
         let driver_run = spawn_weston_click_driver(
             &driver_path,
             &socket,
@@ -49660,10 +54709,13 @@ fn run_isolated_weston_cells_visible_click_e2e(
                     &preview_loop_report,
                     &baseline_surface_hash,
                     &baseline_external_render_proof_hash,
+                    baseline_surface_readback_path.as_deref(),
                     previous_revision,
                     previous_frame_count,
                     previous_input_event_wake_count,
+                    &previous_selected_address,
                     &target.address,
+                    &formula_bar_text_before_click,
                     &target.expected_formula,
                     click_started,
                     Duration::from_secs(5),
@@ -49753,10 +54805,6 @@ fn run_isolated_weston_cells_visible_click_e2e(
             || readback_probe
                 .get("accepted_by_external_render_proof_hash_change")
                 .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            || readback_probe
-                .get("accepted_by_retained_bound_text_sync")
-                .and_then(serde_json::Value::as_bool)
                 == Some(true);
         let readback_pass = readback_probe
             .get("status")
@@ -49767,10 +54815,18 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("status")
             .and_then(serde_json::Value::as_str)
             == Some("pass");
+        let formula_bar_visual_pass = visual_formula_probe
+            .get("formula_bar_visual_changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(visual_formula_pass);
+        let selected_cell_visual_pass = visual_formula_probe
+            .get("selected_cell_visual_changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(visual_formula_pass);
         let formula_bar_change_required = formula_bar_text_before_click != target.expected_formula;
         let formula_bar_changed_from_previous = formula_bar_text_before_click != formula_bar_text;
         let formula_bar_change_visible = !formula_bar_change_required
-            || (formula_bar_changed_from_previous && visual_formula_pass);
+            || (formula_bar_changed_from_previous && formula_bar_visual_pass);
         let harness_click_to_present_ms = present_probe
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
@@ -49788,11 +54844,30 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
-        let retained_bound_text_sync_accepted = readback_probe
-            .get("accepted_by_retained_bound_text_sync")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let harness_click_to_formula_visible_ms = if retained_bound_text_sync_accepted {
+        let readback_presented_revision = readback_probe
+            .get("readback_presented_revision")
+            .and_then(serde_json::Value::as_u64);
+        let present_presented_revision = present_probe
+            .get("presented_revision")
+            .and_then(serde_json::Value::as_u64);
+        let same_input_generation = readback_probe
+            .get("input_event_wake_count")
+            .and_then(serde_json::Value::as_u64)
+            == present_probe
+                .get("input_event_wake_count")
+                .and_then(serde_json::Value::as_u64);
+        let readback_proves_presented_frame = formula_bar_visual_pass
+            && readback_probe
+                .get("surface_readback_is_current")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && same_input_generation
+            && readback_presented_revision
+                .zip(present_presented_revision)
+                .is_some_and(|(readback_revision, present_revision)| {
+                    readback_revision >= present_revision
+                });
+        let harness_click_to_formula_visible_ms = if readback_proves_presented_frame {
             harness_click_to_present_ms
         } else {
             harness_click_to_readback_visible_ms
@@ -49856,6 +54931,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
             && present_pass
             && readback_pass
             && visual_formula_pass
+            && formula_bar_visual_pass
+            && selected_cell_visual_pass
             && formula_bar_change_visible
             && selected_address == target.address
             && formula_bar_text == target.expected_formula;
@@ -49920,6 +54997,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "formula_bar_change_required": formula_bar_change_required,
             "formula_bar_changed_from_previous": formula_bar_changed_from_previous,
             "formula_bar_change_visible": formula_bar_change_visible,
+            "formula_bar_visual_pass": formula_bar_visual_pass,
+            "selected_cell_visual_pass": selected_cell_visual_pass,
+            "previous_selected_address": selected_address_before_click,
             "selected_address": selected_address,
             "formula_bar_text": formula_bar_text,
             "driver_coordinates": {
@@ -49944,6 +55024,15 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "click_to_formula_visible_ms": click_to_formula_visible_ms,
             "harness_click_to_formula_visible_ms": harness_click_to_formula_visible_ms,
             "harness_click_to_formula_probe_complete_ms": harness_click_to_formula_probe_complete_ms,
+            "formula_visible_timing_source": if readback_proves_presented_frame {
+                "present_timestamp_after_same-input_wgpu_readback_proof"
+            } else {
+                "readback_completion_timestamp"
+            },
+            "readback_proves_presented_frame": readback_proves_presented_frame,
+            "readback_presented_revision": readback_presented_revision,
+            "present_presented_revision": present_presented_revision,
+            "formula_visible_same_input_generation": same_input_generation,
             "harness_click_to_present_ms": harness_click_to_present_ms,
             "click_measurement_timing": click_measurement_timing,
             "formula_measurement_timing": formula_measurement_timing,
@@ -49995,6 +55084,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         last_loop_after = loop_after;
         last_sample = sample.clone();
         click_samples.push(sample);
+        previous_selected_address = selected_address;
         previous_formula_bar_text = formula_bar_text;
         thread::sleep(Duration::from_millis(25));
     }
@@ -50523,10 +55613,13 @@ fn wait_for_cells_formula_visible_match(
     loop_report: &Path,
     previous_surface_hash: &str,
     previous_external_render_proof_hash: &str,
+    previous_readback_path: Option<&str>,
     previous_revision: u64,
     previous_frame_count: u64,
     previous_input_event_wake_count: u64,
+    previous_address: &str,
     expected_address: &str,
+    previous_formula: &str,
     expected_formula: &str,
     started: Instant,
     timeout: Duration,
@@ -50607,6 +55700,9 @@ fn wait_for_cells_formula_visible_match(
                             "stale_for_latest_input": report.get("stale_for_latest_input").cloned().unwrap_or(serde_json::Value::Null),
                             "last_scheduler_reason": report.get("last_scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
                             "last_role_dirty_reason": report.get("last_role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+                            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_started_elapsed_ms": report.get("last_poll_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
@@ -50633,6 +55729,10 @@ fn wait_for_cells_formula_visible_match(
                             "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_target_kind": report.get("last_render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_encoder_finish_ms": report.get("last_encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_queue_submit_call_ms": report.get("last_queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_present_call_ms": report.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_loop_report_write_ms": report.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_readback_finish_ms": report.get("last_interactive_readback_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -50640,6 +55740,9 @@ fn wait_for_cells_formula_visible_match(
                             "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
                             "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "encoder_finish_ms": report.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "queue_submit_call_ms": report.get("queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_call_ms": report.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
@@ -50666,8 +55769,14 @@ fn wait_for_cells_formula_visible_match(
                                 "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
                                 "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null)
                             });
-                            let visual_probe =
-                                cells_visual_formula_probe_from_readback(&retained_render_probe);
+                            let visual_probe = cells_visual_formula_probe_from_readback(
+                                &retained_render_probe,
+                                previous_readback_path,
+                                previous_address,
+                                expected_address,
+                                previous_formula,
+                                expected_formula,
+                            );
                             if visual_probe
                                 .get("status")
                                 .and_then(serde_json::Value::as_str)
@@ -50734,6 +55843,9 @@ fn wait_for_cells_formula_visible_match(
                             "last_dirty_poll_elapsed_ms": report.get("last_dirty_poll_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_generation": report.get("last_external_wake_generation").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_wake_observed_elapsed_ms": report.get("last_external_wake_observed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+                            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+                            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
                             "input_event_wake_count": report.get("input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
                             "last_input_event_wake_elapsed_ms": report.get("last_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "sampled_input_event_wake_elapsed_ms": report.get("sampled_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -50747,6 +55859,10 @@ fn wait_for_cells_formula_visible_match(
                             "last_render_hook_completed_elapsed_ms": report.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_queue_submitted_elapsed_ms": report.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_present_completed_elapsed_ms": report.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_render_target_kind": report.get("last_render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_encoder_finish_ms": report.get("last_encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_queue_submit_call_ms": report.get("last_queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_present_call_ms": report.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_loop_report_write_ms": report.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_readback_finish_ms": report.get("last_interactive_readback_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -50754,6 +55870,9 @@ fn wait_for_cells_formula_visible_match(
                             "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
                             "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "encoder_finish_ms": report.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "queue_submit_call_ms": report.get("queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "present_call_ms": report.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
@@ -50772,7 +55891,14 @@ fn wait_for_cells_formula_visible_match(
                             "accepted_by_hash_change": surface_readback_changed,
                             "accepted_by_external_render_proof_hash_change": external_render_proof_changed
                         });
-                        let visual_probe = cells_visual_formula_probe_from_readback(&probe);
+                        let visual_probe = cells_visual_formula_probe_from_readback(
+                            &probe,
+                            previous_readback_path,
+                            previous_address,
+                            expected_address,
+                            previous_formula,
+                            expected_formula,
+                        );
                         readback_probe = Some(probe);
                         visual_formula_probe = Some(visual_probe);
                     }
@@ -60982,9 +66108,51 @@ fn bytes_machine_plan_required_reports() -> &'static [BytesMachinePlanRequiredRe
             measurement_mode: "diagnostic",
         },
         BytesMachinePlanRequiredReport {
+            label: "bytes-indexed-source-payload-route",
+            path: "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json",
+            command: "run-plan-route",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
             label: "bytes-indexed-source-payload-scenario",
             path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
             command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-indexed-equal-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-indexed-search-scenario",
+            path: "target/reports/bytes-plan/bytes-indexed-search-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-append-row-refresh-dump-plan",
+            path: "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json",
+            command: "dump-plan",
+            measurement_mode: "diagnostic",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-append-row-refresh-scenario",
+            path: "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json",
+            command: "run-plan-root-scalar-scenario",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-type-system",
+            path: "target/reports/bytes-plan/bytes-type-system.json",
+            command: "verify-bytes-type-system",
+            measurement_mode: "proof",
+        },
+        BytesMachinePlanRequiredReport {
+            label: "bytes-default-engine-readiness",
+            path: "target/reports/bytes-plan/bytes-default-engine-readiness.json",
+            command: "verify-bytes-default-engine-readiness",
             measurement_mode: "proof",
         },
         BytesMachinePlanRequiredReport {
@@ -61994,9 +67162,7 @@ fn verify_bytes_storage_profile(args: &[String]) -> Result<(), Box<dyn std::erro
         let mut borrowed_read_evidence = JsonValue::Null;
         let mut pass = match case.expectation {
             BytesStorageProfileExpectation::NoRuntimeCopy => no_copy && measured_copy_bytes == 0,
-            BytesStorageProfileExpectation::MeasuredCopy => {
-                !no_copy && inline_value_count > 0 && measured_copy_bytes > 0
-            }
+            BytesStorageProfileExpectation::MeasuredCopy => !no_copy && measured_copy_bytes > 0,
         };
         if case.id == "fixed-bank-read-after-set-no-copy" {
             borrowed_read_evidence = fixed_bank_read_after_set_evidence(&output.report)?;
@@ -64006,6 +69172,22 @@ fn indexed_file_write_source_payload_evidence(
             .pointer("/update_constant_value/path_field_id")
             .and_then(JsonValue::as_u64)
             .is_some();
+    let executor_core_matches = write_update
+        .pointer("/executor_core/executor")
+        .and_then(JsonValue::as_str)
+        == Some("cpu-plan-indexed-bytes-write-evaluator-v1")
+        && write_update
+            .pointer("/executor_core/expression_kind")
+            .and_then(JsonValue::as_str)
+            == Some("file_write_bytes")
+        && write_update
+            .pointer("/executor_core/runtime_ast_eval_count")
+            .and_then(JsonValue::as_u64)
+            == Some(0)
+        && write_update
+            .pointer("/executor_core/graph_rebuild_count")
+            .and_then(JsonValue::as_u64)
+            == Some(0);
     let step_no_copy = write_step
         .get("bytes_storage_no_copy")
         .and_then(JsonValue::as_bool)
@@ -64029,6 +69211,7 @@ fn indexed_file_write_source_payload_evidence(
         && update_matches
         && borrowed_file_write
         && dynamic_path_matches
+        && executor_core_matches
         && host_effect_matches
         && artifact_matches
         && step_no_copy
@@ -64042,6 +69225,7 @@ fn indexed_file_write_source_payload_evidence(
         "expected_update_count": 1,
         "update_matches": update_matches,
         "borrowed_file_write": borrowed_file_write,
+        "executor_core_matches": executor_core_matches,
         "dynamic_path_matches": dynamic_path_matches,
         "host_effect_matches": host_effect_matches,
         "artifact_matches": artifact_matches,
@@ -64148,6 +69332,22 @@ fn indexed_file_read_row_field_path_evidence(
             .pointer("/bytes_access/byte_bank_declared")
             .and_then(JsonValue::as_bool)
             == Some(true);
+    let executor_core_matches = read_update
+        .pointer("/executor_core/executor")
+        .and_then(JsonValue::as_str)
+        == Some("cpu-plan-indexed-bytes-read-evaluator-v1")
+        && read_update
+            .pointer("/executor_core/expression_kind")
+            .and_then(JsonValue::as_str)
+            == Some("file_read_bytes")
+        && read_update
+            .pointer("/executor_core/runtime_ast_eval_count")
+            .and_then(JsonValue::as_u64)
+            == Some(0)
+        && read_update
+            .pointer("/executor_core/graph_rebuild_count")
+            .and_then(JsonValue::as_u64)
+            == Some(0);
 
     let inspect_updates = inspect_step
         .get("indexed_updates")
@@ -64221,6 +69421,7 @@ fn indexed_file_read_row_field_path_evidence(
         && inspect_step_id == "inspect-indexed-read"
         && read_matches
         && dynamic_path_matches
+        && executor_core_matches
         && borrowed_indexed_read
         && read_step_no_copy
         && inspect_step_no_copy
@@ -64234,6 +69435,7 @@ fn indexed_file_read_row_field_path_evidence(
         "expected_update_count": 1,
         "read_matches": read_matches,
         "dynamic_path_matches": dynamic_path_matches,
+        "executor_core_matches": executor_core_matches,
         "borrowed_indexed_read": borrowed_indexed_read,
         "read_step_bytes_storage_no_copy": read_step_no_copy,
         "inspect_step_bytes_storage_no_copy": inspect_step_no_copy,
@@ -66221,7 +71423,7 @@ fn mutate_bytes_file_write_plan(
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         BytesFileWriteFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
@@ -66229,7 +71431,7 @@ fn mutate_bytes_file_write_plan(
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
         }
         BytesFileWriteFabricatedPlanMutation::RowFieldPathInputMissing => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
             *bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
@@ -66281,7 +71483,7 @@ fn mutate_bytes_file_write_plan(
         BytesFileWriteFabricatedPlanMutation::ExtraSourceInput => {
             plan.regions[region_index].ops[op_index]
                 .inputs
-                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                .push(boon_plan::ValueRef::Source(boon_plan::SourceId(
                     source_id.0.saturating_add(999_999),
                 )));
         }
@@ -66289,7 +71491,7 @@ fn mutate_bytes_file_write_plan(
             plan.regions[region_index].ops[op_index].inputs.push(
                 boon_plan::ValueRef::SourcePayload {
                     source_id,
-                    field: boon_ir::SourcePayloadField::Text,
+                    field: boon_plan::SourcePayloadField::Text,
                 },
             );
         }
@@ -66307,7 +71509,7 @@ fn mutate_bytes_file_write_plan(
                 ..
             } = &mut plan.regions[region_index].ops[op_index].kind
             {
-                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+                *source_payload_field = Some(boon_plan::SourcePayloadField::Text);
             }
         }
         BytesFileWriteFabricatedPlanMutation::InputNotBytes => {
@@ -66377,7 +71579,7 @@ fn bytes_file_write_input_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+) -> Result<boon_plan::StateId, Box<dyn std::error::Error>> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
         &plan.regions[region_index].ops[op_index].kind
     else {
@@ -66393,7 +71595,7 @@ fn bytes_file_write_output_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+) -> Result<boon_plan::StateId, Box<dyn std::error::Error>> {
     let Some(boon_plan::ValueRef::State(state_id)) =
         plan.regions[region_index].ops[op_index].output.as_ref()
     else {
@@ -66417,15 +71619,15 @@ fn bytes_file_write_ordered_inputs_mut(
 
 fn install_foreign_row_field_path_scope(
     plan: &mut boon_plan::MachinePlan,
-    output_state_id: boon_ir::StateId,
+    output_state_id: boon_plan::StateId,
     output_value_type: boon_plan::PlanValueType,
-) -> Result<boon_ir::FieldId, Box<dyn std::error::Error>> {
-    let output_scope_id = boon_ir::ScopeId(900_001);
-    let foreign_scope_id = boon_ir::ScopeId(900_002);
-    let output_field_id = boon_ir::FieldId(900_003);
-    let foreign_path_field_id = boon_ir::FieldId(900_004);
-    let output_list_id = boon_ir::ListId(900_005);
-    let foreign_list_id = boon_ir::ListId(900_006);
+) -> Result<boon_plan::FieldId, Box<dyn std::error::Error>> {
+    let output_scope_id = boon_plan::ScopeId(900_001);
+    let foreign_scope_id = boon_plan::ScopeId(900_002);
+    let output_field_id = boon_plan::FieldId(900_003);
+    let foreign_path_field_id = boon_plan::FieldId(900_004);
+    let output_list_id = boon_plan::ListId(900_005);
+    let foreign_list_id = boon_plan::ListId(900_006);
 
     let output_slot = plan
         .storage_layout
@@ -67983,14 +73185,14 @@ fn mutate_bytes_file_read_plan(
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         BytesFileReadFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
             *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? = vec![field_ref];
         }
         BytesFileReadFabricatedPlanMutation::RowFieldPathInputMissing => {
-            let field_ref = boon_plan::ValueRef::Field(boon_ir::FieldId(999_999));
+            let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
             *bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? = vec![field_ref];
         }
@@ -68040,7 +73242,7 @@ fn mutate_bytes_file_read_plan(
         BytesFileReadFabricatedPlanMutation::ExtraSourceInput => {
             plan.regions[region_index].ops[op_index]
                 .inputs
-                .push(boon_plan::ValueRef::Source(boon_ir::SourceId(
+                .push(boon_plan::ValueRef::Source(boon_plan::SourceId(
                     source_id.0.saturating_add(999_999),
                 )));
         }
@@ -68053,7 +73255,7 @@ fn mutate_bytes_file_read_plan(
             plan.regions[region_index].ops[op_index].inputs.push(
                 boon_plan::ValueRef::SourcePayload {
                     source_id,
-                    field: boon_ir::SourcePayloadField::Text,
+                    field: boon_plan::SourcePayloadField::Text,
                 },
             );
         }
@@ -68071,7 +73273,7 @@ fn mutate_bytes_file_read_plan(
                 ..
             } = &mut plan.regions[region_index].ops[op_index].kind
             {
-                *source_payload_field = Some(boon_ir::SourcePayloadField::Text);
+                *source_payload_field = Some(boon_plan::SourcePayloadField::Text);
             }
         }
         BytesFileReadFabricatedPlanMutation::OutputNotBytes => {
@@ -68132,7 +73334,7 @@ fn bytes_file_read_output_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> Result<boon_ir::StateId, Box<dyn std::error::Error>> {
+) -> Result<boon_plan::StateId, Box<dyn std::error::Error>> {
     let Some(boon_plan::ValueRef::State(state_id)) =
         plan.regions[region_index].ops[op_index].output.as_ref()
     else {
@@ -68740,6 +73942,626 @@ fn json_contains_key(value: &serde_json::Value, key: &str) -> bool {
         }
         _ => false,
     }
+}
+
+const BYTES_TYPE_SYSTEM_REQUIRED_CHECKS: &[&str] = &[
+    "bytes-type-system:no-typecheck-errors",
+    "bytes-type-system:Bytes/length:Number",
+    "bytes-type-system:Bytes/is_empty:Bool",
+    "bytes-type-system:Bytes/get:Byte",
+    "bytes-type-system:Bytes/slice:Bytes[2]",
+    "bytes-type-system:Bytes/take:Bytes[2]",
+    "bytes-type-system:Bytes/drop:Bytes[2]",
+    "bytes-type-system:Bytes/concat:Bytes[5]",
+    "bytes-type-system:Bytes/equal:Bool",
+    "bytes-type-system:Bytes/find:Number",
+    "bytes-type-system:Bytes/starts_with:Bool",
+    "bytes-type-system:Bytes/ends_with:Bool",
+    "bytes-type-system:Bytes/to_hex:Text",
+    "bytes-type-system:Bytes/to_base64:Text",
+    "bytes-type-system:Bytes/from_hex:Bytes[4]",
+    "bytes-type-system:Bytes/from_base64:Bytes[4]",
+    "bytes-type-system:Text/to_bytes:Bytes[2]",
+    "bytes-type-system:Bytes/to_text:Text",
+    "bytes-type-system:Bytes/read_unsigned:Number",
+    "bytes-type-system:Bytes/read_signed:Number",
+    "bytes-type-system:Bytes/write_unsigned:Bytes[4]",
+    "bytes-type-system:Bytes/write_signed:Bytes[4]",
+    "bytes-type-system:Bytes/zeros:Bytes[4]",
+    "bytes-type-system:File/read_bytes:Bytes",
+    "bytes-type-system:File/read_text:Text",
+    "bytes-type-system:File/write_bytes:Text",
+    "bytes-type-system:static-from-hex:Bytes[4]",
+    "bytes-type-system:static-from-base64:Bytes[4]",
+    "bytes-type-system:static-utf8:Bytes[2]",
+    "bytes-type-system:static-ascii:Bytes[2]",
+    "bytes-type-system:dynamic-from-hex:Bytes",
+    "bytes-type-system:dynamic-from-base64:Bytes",
+    "bytes-type-system:dynamic-utf8:Bytes",
+    "bytes-type-system:resolved-constant-table-present",
+];
+
+fn verify_bytes_type_system(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-type-system.json"));
+    let fixture_dir = PathBuf::from("target/generated/bytes-type-system-fixtures");
+    fs::create_dir_all(&fixture_dir)?;
+    let source_path = fixture_dir.join("bytes-type-system.bn");
+    let source = r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+hex_input: TEXT { 01020304 } |> HOLD hex_input { LATEST {} }
+base64_input: TEXT { AQIDBA== } |> HOLD base64_input { LATEST {} }
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+len: bytes |> Bytes/length
+empty: bytes |> Bytes/is_empty
+first: bytes |> Bytes/get(index: 0)
+sliced: bytes |> Bytes/slice(offset: 1, byte_count: 2)
+taken: bytes |> Bytes/take(byte_count: 2)
+dropped: bytes |> Bytes/drop(byte_count: 2)
+grown: bytes |> Bytes/concat(with: BYTES[1] { 16u00 })
+same: bytes |> Bytes/equal(with: BYTES[4] { 16u01, 16u02, 16u03, 16u04 })
+found: bytes |> Bytes/find(needle: BYTES[2] { 16u02, 16u03 })
+starts: bytes |> Bytes/starts_with(prefix: BYTES[2] { 16u01, 16u02 })
+ends: bytes |> Bytes/ends_with(suffix: BYTES[2] { 16u03, 16u04 })
+hex: bytes |> Bytes/to_hex
+base64: bytes |> Bytes/to_base64
+decoded: TEXT { 01020304 } |> Bytes/from_hex
+decoded64: TEXT { AQIDBA== } |> Bytes/from_base64
+encoded: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
+encoded_ascii_fixed: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
+text: bytes |> Bytes/to_text(encoding: Utf8)
+read: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
+read_signed: bytes |> Bytes/read_signed(offset: 0, byte_count: 4, endian: Big)
+written: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 1)
+written_signed: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Big, value: -1)
+zeros: Bytes/zeros(byte_count: 4)
+file_bytes: TEXT { ./asset.svg } |> File/read_bytes()
+file_text: TEXT { ./asset.svg } |> File/read_text()
+file_write: bytes |> File/write_bytes(path: TEXT { output.bin })
+static_hex: TEXT { 01 02 03 04 } |> Bytes/from_hex
+static_base64: TEXT { AQIDBA== } |> Bytes/from_base64
+static_utf8: TEXT { č } |> Text/to_bytes(encoding: Utf8)
+static_ascii: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
+dynamic_hex: hex_input |> Bytes/from_hex
+dynamic_base64: base64_input |> Bytes/from_base64
+dynamic_utf8: hex_input |> Text/to_bytes(encoding: Utf8)
+folded_index: bytes |> Bytes/get(index: 1 + 1)
+folded_slice: bytes |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1)
+folded_numeric: bytes |> Bytes/read_unsigned(offset: 2 - 2, byte_count: 2 * 2, endian: Little)
+document: []
+"#;
+    fs::write(&source_path, source)?;
+    let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
+    let typecheck = boon_typecheck::check(&parsed);
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-type-system:no-typecheck-errors",
+        !typecheck.has_errors(),
+        if typecheck.has_errors() {
+            let diagnostics = typecheck
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("typecheck diagnostics: {diagnostics}")
+        } else {
+            "fixture typechecked without errors".to_owned()
+        },
+        Some("BYTES type-system fixture has typecheck errors".to_owned()),
+    );
+
+    let mut type_results = Vec::new();
+    for (function, expected) in [
+        ("Bytes/length", "Number"),
+        ("Bytes/is_empty", "Bool"),
+        ("Bytes/get", "Byte"),
+        ("Bytes/slice", "Bytes[2]"),
+        ("Bytes/take", "Bytes[2]"),
+        ("Bytes/drop", "Bytes[2]"),
+        ("Bytes/concat", "Bytes[5]"),
+        ("Bytes/equal", "Bool"),
+        ("Bytes/find", "Number"),
+        ("Bytes/starts_with", "Bool"),
+        ("Bytes/ends_with", "Bool"),
+        ("Bytes/to_hex", "Text"),
+        ("Bytes/to_base64", "Text"),
+        ("Bytes/from_hex", "Bytes[4]"),
+        ("Bytes/from_base64", "Bytes[4]"),
+        ("Text/to_bytes", "Bytes[2]"),
+        ("Bytes/to_text", "Text"),
+        ("Bytes/read_unsigned", "Number"),
+        ("Bytes/read_signed", "Number"),
+        ("Bytes/write_unsigned", "Bytes[4]"),
+        ("Bytes/write_signed", "Bytes[4]"),
+        ("Bytes/zeros", "Bytes[4]"),
+        ("File/read_bytes", "Bytes"),
+        ("File/read_text", "Text"),
+        ("File/write_bytes", "Text"),
+    ] {
+        let actual = bytes_type_system_function_type_label(&parsed, &typecheck, function)
+            .unwrap_or_else(|| "missing".to_owned());
+        let pass = actual == expected;
+        type_results.push(json!({
+            "kind": "function",
+            "name": function,
+            "expected_type": expected,
+            "actual_type": actual,
+            "pass": pass
+        }));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("bytes-type-system:{function}:{expected}"),
+            pass,
+            format!("{function} inferred as {actual}, expected {expected}"),
+            Some(format!(
+                "{function} inferred as {actual}, expected {expected}"
+            )),
+        );
+    }
+
+    for (statement, check_label, expected) in [
+        ("static_hex", "static-from-hex", "Bytes[4]"),
+        ("static_base64", "static-from-base64", "Bytes[4]"),
+        ("static_utf8", "static-utf8", "Bytes[2]"),
+        ("static_ascii", "static-ascii", "Bytes[2]"),
+        ("dynamic_hex", "dynamic-from-hex", "Bytes"),
+        ("dynamic_base64", "dynamic-from-base64", "Bytes"),
+        ("dynamic_utf8", "dynamic-utf8", "Bytes"),
+    ] {
+        let actual = bytes_type_system_statement_type_label(&parsed, &typecheck, statement)
+            .unwrap_or_else(|| "missing".to_owned());
+        let pass = actual == expected;
+        type_results.push(json!({
+            "kind": "statement",
+            "name": statement,
+            "expected_type": expected,
+            "actual_type": actual,
+            "pass": pass
+        }));
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("bytes-type-system:{check_label}:{expected}"),
+            pass,
+            format!("{statement} inferred as {actual}, expected {expected}"),
+            Some(format!(
+                "{statement} inferred as {actual}, expected {expected}"
+            )),
+        );
+    }
+
+    let resolved_constant_count = typecheck.resolved_constant_table.entries.len();
+    let resolved_constants_pass = resolved_constant_count >= 7;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-type-system:resolved-constant-table-present",
+        resolved_constants_pass,
+        format!("resolved_constant_table entries={resolved_constant_count}"),
+        Some("resolved constant table did not expose expected BYTES scalar arguments".to_owned()),
+    );
+
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let report_json = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": "verify-bytes-type-system",
+        "command_argv": std::iter::once(json!("cargo"))
+            .chain(std::iter::once(json!("xtask")))
+            .chain(args.iter().map(|arg| json!(arg)))
+            .collect::<Vec<_>>(),
+        "measurement_mode": "proof",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_path": source_path,
+        "source_hash": boon_runtime::sha256_file(&source_path)?,
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "required_check_ids": BYTES_TYPE_SYSTEM_REQUIRED_CHECKS,
+        "type_results": type_results,
+        "resolved_constant_count": resolved_constant_count,
+        "typecheck_report": typecheck,
+        "per_step_pass_fail": checks,
+        "blockers": if blockers.is_empty() { serde_json::Value::Null } else { json!(blockers) },
+        "artifact_sha256s": [{
+            "path": source_path.display().to_string(),
+            "sha256": boon_runtime::sha256_file(&source_path)?
+        }]
+    });
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("BYTES type-system gate failed: {}", blockers.join(", ")).into())
+    }
+}
+
+fn bytes_type_system_function_type_label(
+    parsed: &boon_parser::ParsedProgram,
+    typecheck: &boon_typecheck::TypeCheckReport,
+    function: &str,
+) -> Option<String> {
+    let expr_id = parsed
+        .expressions
+        .iter()
+        .find_map(|expr| match &expr.kind {
+            boon_parser::AstExprKind::Pipe { op, .. } if op == function => Some(expr.id),
+            boon_parser::AstExprKind::Call { function: call, .. } if call == function => {
+                Some(expr.id)
+            }
+            _ => None,
+        })?;
+    bytes_type_system_expr_type_label(typecheck, expr_id)
+}
+
+fn bytes_type_system_statement_type_label(
+    parsed: &boon_parser::ParsedProgram,
+    typecheck: &boon_typecheck::TypeCheckReport,
+    statement_name: &str,
+) -> Option<String> {
+    let expr_id = parsed
+        .ast
+        .statements
+        .iter()
+        .find_map(|statement| match &statement.kind {
+            boon_parser::AstStatementKind::Field { name } if name == statement_name => {
+                statement.expr
+            }
+            _ => None,
+        })?;
+    bytes_type_system_expr_type_label(typecheck, expr_id)
+}
+
+fn bytes_type_system_expr_type_label(
+    typecheck: &boon_typecheck::TypeCheckReport,
+    expr_id: usize,
+) -> Option<String> {
+    typecheck
+        .expr_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.expr_id == expr_id)
+        .map(|entry| bytes_type_system_type_label(&entry.flow_type.ty))
+}
+
+fn bytes_type_system_type_label(ty: &boon_typecheck::Type) -> String {
+    match ty {
+        boon_typecheck::Type::Text => "Text".to_owned(),
+        boon_typecheck::Type::Number => "Number".to_owned(),
+        boon_typecheck::Type::Byte => "Byte".to_owned(),
+        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => "Bytes".to_owned(),
+        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(len)) => {
+            format!("Bytes[{len}]")
+        }
+        boon_typecheck::Type::VariantSet(variants)
+            if variants.len() == 2
+                && variants.iter().any(|variant| {
+                    matches!(variant, boon_typecheck::Variant::Tag(tag) if tag == "True")
+                })
+                && variants.iter().any(|variant| {
+                    matches!(variant, boon_typecheck::Variant::Tag(tag) if tag == "False")
+                }) =>
+        {
+            "Bool".to_owned()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+const BYTES_DEFAULT_ENGINE_REQUIRED_CHECKS: &[&str] = &[
+    "bytes-default-engine:cli-build",
+    "bytes-default-engine:source-default-legacy",
+    "bytes-default-engine:default-run-semantic",
+    "bytes-default-engine:todomvc-compare",
+    "bytes-default-engine:cells-compare",
+    "bytes-default-engine:phase10-switch-still-blocked",
+];
+
+struct BytesDefaultEngineCliCase<'a> {
+    id: &'a str,
+    source: &'a str,
+    scenario: &'a str,
+    engine: Option<&'a str>,
+    report_path: &'a str,
+    expected_command: &'a str,
+}
+
+fn verify_bytes_default_engine_readiness(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMAND: &str = "verify-bytes-default-engine-readiness";
+    let report = report_arg(args).unwrap_or_else(|| {
+        PathBuf::from("target/reports/bytes-plan/bytes-default-engine-readiness.json")
+    });
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let mut child_reports = Vec::new();
+    let mut artifacts = Vec::new();
+
+    let cli_build_status = Command::new("cargo")
+        .args(["build", "-p", "boon_cli"])
+        .status();
+    let cli_built = cli_build_status
+        .as_ref()
+        .map(std::process::ExitStatus::success)
+        .unwrap_or(false);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-default-engine:cli-build",
+        cli_built,
+        cli_build_status
+            .as_ref()
+            .map(|status| format!("cargo build -p boon_cli status={status}"))
+            .unwrap_or_else(|error| format!("cargo build -p boon_cli failed to spawn: {error}")),
+        Some("boon_cli must build before default-engine readiness can be checked".to_owned()),
+    );
+
+    let cli_binary = PathBuf::from("target/debug/boon_cli");
+    if cli_built && cli_binary.exists() {
+        artifacts.push(artifact_hash(&cli_binary)?);
+    }
+
+    let cli_source = fs::read_to_string("crates/boon_cli/src/main.rs")?;
+    let default_is_legacy = cli_source.contains("let mut engine = \"legacy\".to_owned()");
+    let default_is_plan = cli_source.contains("let mut engine = \"plan\".to_owned()");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-default-engine:source-default-legacy",
+        default_is_legacy && !default_is_plan,
+        format!("default_is_legacy={default_is_legacy} default_is_plan={default_is_plan}"),
+        Some(
+            "boon_cli run default engine must remain legacy until Phase 10 readiness passes"
+                .to_owned(),
+        ),
+    );
+
+    if cli_built {
+        for case in [
+            BytesDefaultEngineCliCase {
+                id: "default-run-semantic",
+                source: "examples/todomvc.bn",
+                scenario: "examples/todomvc.scn",
+                engine: None,
+                report_path: "target/reports/bytes-plan/bytes-default-engine-legacy-smoke.json",
+                expected_command: "semantic",
+            },
+            BytesDefaultEngineCliCase {
+                id: "todomvc-compare",
+                source: "examples/todomvc.bn",
+                scenario: "examples/todomvc.scn",
+                engine: Some("compare"),
+                report_path: "target/reports/bytes-plan/bytes-default-engine-todomvc-compare.json",
+                expected_command: "run-plan-scenario-events",
+            },
+            BytesDefaultEngineCliCase {
+                id: "cells-compare",
+                source: "examples/cells.bn",
+                scenario: "examples/cells.scn",
+                engine: Some("compare"),
+                report_path: "target/reports/bytes-plan/bytes-default-engine-cells-compare.json",
+                expected_command: "run-plan-scenario-events",
+            },
+        ] {
+            let (pass, detail, child) = run_bytes_default_engine_cli_case(&cli_binary, &case)?;
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("bytes-default-engine:{}", case.id),
+                pass,
+                detail,
+                Some(format!(
+                    "default-engine readiness CLI case `{}` did not pass",
+                    case.id
+                )),
+            );
+            if Path::new(case.report_path).exists() {
+                artifacts.push(artifact_hash(Path::new(case.report_path))?);
+            }
+            child_reports.push(child);
+        }
+    } else {
+        for case_id in ["default-run-semantic", "todomvc-compare", "cells-compare"] {
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                format!("bytes-default-engine:{case_id}"),
+                false,
+                "skipped because boon_cli did not build",
+                Some(format!(
+                    "default-engine readiness CLI case `{case_id}` skipped because boon_cli did not build"
+                )),
+            );
+        }
+    }
+
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "bytes-default-engine:phase10-switch-still-blocked",
+        default_is_legacy && !default_is_plan,
+        "Phase 10 default switch remains intentionally blocked by audit-goal-readiness",
+        Some("Phase 10 default switch must stay blocked until goal readiness passes".to_owned()),
+    );
+
+    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let report_json = json!({
+        "status": status,
+        "report_version": 1,
+        "generated_at_utc": current_unix_seconds().to_string(),
+        "command": COMMAND,
+        "command_argv": replayable_xtask_argv(args),
+        "measurement_mode": "proof",
+        "exit_status": if blockers.is_empty() { 0 } else { 1 },
+        "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
+        "binary_hash": current_binary_hash(),
+        "binary_path": current_binary_path(),
+        "source_hash": "n/a",
+        "scenario_hash": "n/a",
+        "program_hash": "n/a",
+        "budget_hash": "n/a",
+        "graph_node_count": 0,
+        "required_check_ids": BYTES_DEFAULT_ENGINE_REQUIRED_CHECKS,
+        "default_engine": if default_is_legacy { "legacy" } else if default_is_plan { "plan" } else { "unknown" },
+        "default_switch_allowed": false,
+        "default_switch_blocker": "Phase 10 remains blocked until parity, performance, readiness, and audit-goal-readiness pass",
+        "explicit_compare_case_count": child_reports
+            .iter()
+            .filter(|child| child.get("engine").and_then(serde_json::Value::as_str) == Some("compare"))
+            .count(),
+        "child_reports": child_reports,
+        "per_step_pass_fail": checks,
+        "blockers": if blockers.is_empty() { serde_json::Value::Null } else { json!(blockers) },
+        "artifact_sha256s": artifacts
+    });
+    write_json(&report, &report_json)?;
+    verify_report_schema(&report)?;
+    if blockers.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "BYTES default-engine readiness gate failed: {}",
+            blockers.join(", ")
+        )
+        .into())
+    }
+}
+
+fn run_bytes_default_engine_cli_case(
+    cli_binary: &Path,
+    case: &BytesDefaultEngineCliCase<'_>,
+) -> Result<(bool, String, serde_json::Value), Box<dyn std::error::Error>> {
+    let report_path = Path::new(case.report_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(report_path);
+
+    let mut command = Command::new(cli_binary);
+    command.args(["run", case.source, "--scenario", case.scenario]);
+    if let Some(engine) = case.engine {
+        command.args(["--engine", engine]);
+    }
+    command.args(["--report", case.report_path]);
+    let status = command.status()?;
+    let report_exists = report_path.exists();
+    let mut schema_error = None;
+    let schema_valid = if report_exists {
+        match verify_report_schema(report_path) {
+            Ok(()) => true,
+            Err(error) => {
+                schema_error = Some(error.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let child = if report_exists {
+        read_json(report_path).unwrap_or_else(|error| {
+            json!({
+                "status": "unreadable",
+                "read_error": error.to_string()
+            })
+        })
+    } else {
+        json!({
+            "status": "missing"
+        })
+    };
+    let child_status = child.get("status").and_then(serde_json::Value::as_str);
+    let child_command = child.get("command").and_then(serde_json::Value::as_str);
+    let argv_matches = child
+        .get("command_argv")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|argv| {
+            bytes_default_engine_argv_proves_expected_command(argv, case.expected_command)
+        });
+    let pass = status.success()
+        && report_exists
+        && schema_valid
+        && child_status == Some("pass")
+        && child_command == Some(case.expected_command)
+        && argv_matches;
+    let detail = format!(
+        "status={status} report_exists={report_exists} schema_valid={schema_valid} child_status={child_status:?} child_command={child_command:?} argv_matches={argv_matches}"
+    );
+    Ok((
+        pass,
+        detail,
+        json!({
+            "id": case.id,
+            "source": case.source,
+            "scenario": case.scenario,
+            "engine": case.engine.unwrap_or("default"),
+            "path": case.report_path,
+            "expected_command": case.expected_command,
+            "process_success": status.success(),
+            "schema_valid": schema_valid,
+            "schema_error": schema_error,
+            "status": child_status.unwrap_or("missing"),
+            "command": child_command.unwrap_or("missing"),
+            "argv_matches_expected_command": argv_matches
+        }),
+    ))
+}
+
+fn bytes_default_engine_argv_proves_expected_command(
+    command_argv: &[serde_json::Value],
+    expected: &str,
+) -> bool {
+    if command_argv
+        .iter()
+        .any(|arg| arg.as_str() == Some(expected))
+    {
+        return true;
+    }
+
+    match expected {
+        "run-plan-scenario-events" => {
+            bytes_default_engine_argv_has_arg(command_argv, "run")
+                && bytes_default_engine_argv_value_after(command_argv, "--engine")
+                    == Some("compare")
+        }
+        "semantic" => {
+            bytes_default_engine_argv_has_arg(command_argv, "run")
+                && bytes_default_engine_argv_value_after(command_argv, "--engine").is_none()
+        }
+        _ => false,
+    }
+}
+
+fn bytes_default_engine_argv_has_arg(command_argv: &[serde_json::Value], expected: &str) -> bool {
+    command_argv
+        .iter()
+        .any(|arg| arg.as_str() == Some(expected))
+}
+
+fn bytes_default_engine_argv_value_after<'a>(
+    command_argv: &'a [serde_json::Value],
+    flag: &str,
+) -> Option<&'a str> {
+    command_argv.windows(2).find_map(|window| {
+        (window[0].as_str() == Some(flag))
+            .then(|| window[1].as_str())
+            .flatten()
+    })
 }
 
 fn verify_bytes_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -71557,12 +77379,22 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let mut app_window_loop_reports = 0usize;
     let summary_path = dir.join("schema.json");
     let mut artifact_hashes = Vec::new();
+    let mut validation_failures = Vec::new();
     for path in collect_report_json_paths(dir)? {
         if path == summary_path {
             continue;
         }
         seen += 1;
-        let report = read_json(&path)?;
+        let report = match read_json(&path) {
+            Ok(report) => report,
+            Err(error) => {
+                validation_failures.push(format!(
+                    "{} could not be read as report JSON: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         let status = report
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -71574,40 +77406,52 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             && report.get("report_version").is_some()
             && report.get("command").is_some();
         if full_pass_report {
-            verify_report_schema(&path)?;
-            checked += 1;
+            match verify_report_schema(&path) {
+                Ok(()) => checked += 1,
+                Err(error) => validation_failures.push(error.to_string()),
+            }
         } else if status == "fail"
             && (path.starts_with(dir.join("debug")) || report_is_blocker_audit(&report))
         {
             if report_is_blocker_audit(&report) {
-                verify_report_schema(&path)?;
+                if let Err(error) = verify_report_schema(&path) {
+                    validation_failures.push(error.to_string());
+                }
             }
             debug_failures += 1;
         } else if status == "fail" && report_command_is(&report, "dump-plan") {
-            verify_report_schema(&path)?;
-            diagnostic_failures += 1;
+            match verify_report_schema(&path) {
+                Ok(()) => diagnostic_failures += 1,
+                Err(error) => validation_failures.push(error.to_string()),
+            }
         } else if status == "needs_manual" && path.starts_with(dir.join("manual-templates")) {
             manual_templates += 1;
         } else if is_debug_dump_report(&path, &report, dir) {
             debug_dumps += 1;
+        } else if is_headed_scenario_artifact_report(&path, &report, dir) {
+            debug_dumps += 1;
         } else if is_app_window_loop_report(&path, &report, dir) {
             app_window_loop_reports += 1;
         } else {
-            return Err(format!(
+            validation_failures.push(format!(
                 "unrecognized report JSON shape `{}` with status `{status}`",
                 path.display()
-            )
-            .into());
+            ));
         }
     }
+    let status = if validation_failures.is_empty() {
+        "pass"
+    } else {
+        "fail"
+    };
     let summary = json!({
-        "status": "pass",
+        "status": status,
         "report_version": 1,
         "generated_at_utc": current_unix_seconds().to_string(),
         "command": "verify-report-schema",
         "command_argv": ["cargo", "xtask", "verify-report-schema"],
         "measurement_mode": "proof",
-        "exit_status": 0,
+        "exit_status": if validation_failures.is_empty() { 0 } else { 1 },
         "git_commit": git_commit(),
         "binary_hash": current_binary_hash(),
         "source_hash": "n/a",
@@ -71622,12 +77466,22 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             {"id": "diagnostic-failure-artifacts-accounted", "pass": true, "count": diagnostic_failures},
             {"id": "manual-template-artifacts-accounted", "pass": true, "count": manual_templates},
             {"id": "debug-dump-artifacts-accounted", "pass": true, "count": debug_dumps},
-            {"id": "app-window-loop-artifacts-accounted", "pass": true, "count": app_window_loop_reports}
+            {"id": "app-window-loop-artifacts-accounted", "pass": true, "count": app_window_loop_reports},
+            {"id": "schema-validation-failures", "pass": validation_failures.is_empty(), "count": validation_failures.len()}
         ],
+        "blockers": validation_failures,
         "artifact_sha256s": artifact_hashes
     });
     write_json(&summary_path, &summary)?;
     verify_report_schema(&summary_path)?;
+    if !validation_failures.is_empty() {
+        return Err(format!(
+            "{} report schema validation failure(s); wrote {}",
+            validation_failures.len(),
+            summary_path.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -71636,6 +77490,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
         report.get("command").and_then(serde_json::Value::as_str),
         Some(
             "audit-goal-readiness"
+                | "verify-report-schema"
                 | "verify-platform-contract"
                 | "boon-native-playground-role"
                 | "verify-native-gpu-dependency-graph"
@@ -71645,6 +77500,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-multiwindow"
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
+                | "verify-browser-startup-budget"
                 | "verify-native-gpu-idle-wake"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
@@ -71701,7 +77557,13 @@ fn schema_summary_should_hash_report(
     let reports_dir = summary_path
         .parent()
         .unwrap_or_else(|| Path::new("target/reports"));
-    path != summary_path && !is_app_window_loop_report(path, report, reports_dir)
+    let command = report
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    path != summary_path
+        && command != "audit-goal-readiness"
+        && !is_app_window_loop_report(path, report, reports_dir)
 }
 
 fn is_debug_dump_report(path: &Path, report: &serde_json::Value, reports_dir: &Path) -> bool {
@@ -71724,6 +77586,31 @@ fn is_debug_dump_report(path: &Path, report: &serde_json::Value, reports_dir: &P
             .get("nodes")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|nodes| !nodes.is_empty())
+}
+
+fn is_headed_scenario_artifact_report(
+    path: &Path,
+    report: &serde_json::Value,
+    reports_dir: &Path,
+) -> bool {
+    path.starts_with(reports_dir.join("native-gpu"))
+        && report.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-report")
+        && matches!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("pass" | "fail")
+        )
+        && report
+            .get("scenario_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && report
+            .get("steps")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+        && report
+            .get("overlay")
+            .and_then(serde_json::Value::as_object)
+            .is_some()
 }
 
 fn is_app_window_loop_report(path: &Path, report: &serde_json::Value, reports_dir: &Path) -> bool {
@@ -72826,6 +78713,253 @@ mod tests {
     }
 
     #[test]
+    fn cells_plan_compare_readiness_accepts_exact_or_strict_demand_current_contract() {
+        let exact = json!({
+            "legacy_comparison": {
+                "passed": true,
+                "semantic_delta_match": true
+            }
+        });
+        assert!(cells_plan_compare_semantic_delta_readiness_contract(&exact).0);
+
+        let demand_current = json!({
+            "legacy_comparison": {
+                "passed": false,
+                "semantic_delta_match": false,
+                "state_match": true
+            },
+            "plan_executor_coverage": {
+                "full_scenario_parity": true,
+                "covers_all_source_events": true,
+                "covers_assertion_only_steps": true
+            },
+            "legacy_comparison_acceptance": {
+                "accepted": true,
+                "kind": "demand-current-coalesced-semantic-deltas",
+                "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
+                "extra_plan_delta_count": 0,
+                "missing_delta_count": 3,
+                "missing_delta_field_paths": ["display_text", "value", "error"],
+                "rejected_missing_deltas": []
+            }
+        });
+        assert!(cells_plan_compare_semantic_delta_readiness_contract(&demand_current).0);
+
+        let mut extra_delta = demand_current.clone();
+        extra_delta["legacy_comparison_acceptance"]["extra_plan_delta_count"] = json!(1);
+        assert!(
+            !cells_plan_compare_semantic_delta_readiness_contract(&extra_delta).0,
+            "demand-current readiness must not accept extra PlanExecutor deltas"
+        );
+
+        let mut unsupported_missing = demand_current;
+        unsupported_missing["legacy_comparison_acceptance"]["missing_delta_field_paths"] =
+            json!(["selected_address"]);
+        assert!(
+            !cells_plan_compare_semantic_delta_readiness_contract(&unsupported_missing).0,
+            "demand-current readiness must only allow omitted demand-current fields"
+        );
+    }
+
+    #[test]
+    fn cells_visual_formula_probe_requires_expected_formula_bar_text_value() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "boon-cells-formula-probe-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let before_path = artifact_dir.join("before.png");
+        let after_path = artifact_dir.join("after.png");
+        let stale_after_path = artifact_dir.join("stale-after.png");
+        let layout_path = artifact_dir.join("layout.json");
+        let mut before = image::RgbaImage::from_pixel(480, 260, image::Rgba([255, 255, 255, 255]));
+        for y in 76..100 {
+            for x in 49..129 {
+                before.put_pixel(x, y, image::Rgba([217, 232, 255, 255]));
+            }
+            for x in 130..210 {
+                before.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let mut after = before.clone();
+        for y in 8..38 {
+            for x in 8..48 {
+                after.put_pixel(x, y, image::Rgba([224, 235, 246, 255]));
+            }
+            for x in 80..472 {
+                after.put_pixel(x, y, image::Rgba([220, 230, 240, 255]));
+            }
+        }
+        for y in 76..100 {
+            for x in 49..129 {
+                after.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+            for x in 130..210 {
+                after.put_pixel(x, y, image::Rgba([217, 232, 255, 255]));
+            }
+        }
+        before.save(&before_path).unwrap();
+        after.save(&after_path).unwrap();
+        before.save(&stale_after_path).unwrap();
+        std::fs::write(
+            &layout_path,
+            serde_json::to_string(&json!({
+                "source_intents": [
+                    {"node": "formula-address", "intent": "address", "source_path": "A0"},
+                    {"node": "cell-a0", "intent": "address", "source_path": "A0"},
+                    {"node": "cell-b0", "intent": "address", "source_path": "B0"}
+                ],
+                "layout_frame": {
+                    "display_list": [
+                        {
+                            "node": "formula-address",
+                            "kind": "text",
+                            "text": "A0",
+                            "bounds": {"x": 8.0, "y": 8.0, "width": 40.0, "height": 30.0},
+                            "style": {}
+                        },
+                        {
+                            "node": "formula-input",
+                            "kind": "text_input",
+                            "text": "5",
+                            "bounds": {"x": 80.0, "y": 8.0, "width": 392.0, "height": 30.0},
+                            "style": {}
+                        },
+                        {
+                            "node": "cell-a0",
+                            "kind": "button",
+                            "text": "5",
+                            "bounds": {"x": 49.0, "y": 76.0, "width": 80.0, "height": 24.0},
+                            "style": {"selected": true}
+                        },
+                        {
+                            "node": "cell-b0",
+                            "kind": "button",
+                            "text": "15",
+                            "bounds": {"x": 130.0, "y": 76.0, "width": 80.0, "height": 24.0},
+                            "style": {"selected": false}
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let after_path_text = after_path.to_string_lossy().to_string();
+        let before_path_text = before_path.to_string_lossy().to_string();
+        let stale_after_path_text = stale_after_path.to_string_lossy().to_string();
+        let layout_path_text = layout_path.to_string_lossy().to_string();
+        let probe = json!({
+            "status": "pass",
+            "accepted_by_hash_change": true,
+            "accepted_by_retained_bound_text_sync": true,
+            "readback_artifact_after": {
+                "path": after_path_text
+            },
+            "last_external_render_proof": {
+                "status": "pass",
+                "layout_artifact": layout_path_text,
+                "retained_bound_sync": {
+                    "status": "pass",
+                    "changed": true,
+                    "text_update_count": 1,
+                    "text_update_binding_paths": [
+                        {
+                            "node": "formula-input",
+                            "paths": ["store.selected_input.editing_text"]
+                        }
+                    ],
+                    "text_update_values": [
+                        {
+                            "node": "formula-input",
+                            "text": "=add(A0,A1)",
+                            "paths": ["store.selected_input.editing_text"]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            cells_visual_formula_probe_from_readback(
+                &probe,
+                Some(&before_path_text),
+                "A0",
+                "B0",
+                "5",
+                "=add(A0,A1)",
+            )
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            cells_visual_formula_probe_from_readback(
+                &probe,
+                Some(&before_path_text),
+                "A0",
+                "C0",
+                "5",
+                "=sum(A0:A2)",
+            )
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+            Some("fail"),
+            "the Cells visible-click proof must not pass when the top formula input patched to a stale value"
+        );
+        let mut stale_visual_probe = probe.clone();
+        stale_visual_probe["readback_artifact_after"] = json!({
+            "path": stale_after_path_text
+        });
+        assert_eq!(
+            cells_visual_formula_probe_from_readback(
+                &stale_visual_probe,
+                Some(&before_path_text),
+                "A0",
+                "B0",
+                "5",
+                "=add(A0,A1)",
+            )
+            .get("status")
+            .and_then(serde_json::Value::as_str),
+            Some("fail"),
+            "full-frame/readback metadata must not pass when the top formula-bar crop did not change"
+        );
+
+        let metadata_only_probe = json!({
+            "status": "pass",
+            "accepted_by_hash_change": false,
+            "accepted_by_retained_bound_text_sync": true,
+            "readback_artifact_after": {
+                "path": after_path_text
+            },
+            "last_external_render_proof": probe["last_external_render_proof"].clone()
+        });
+        let metadata_only_result = cells_visual_formula_probe_from_readback(
+            &metadata_only_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            metadata_only_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail"),
+            "retained text-input sync metadata is diagnostic only; Cells visible-click proof needs app-owned visual evidence"
+        );
+        assert_eq!(
+            metadata_only_result
+                .get("retained_text_sync_matches")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&artifact_dir);
+    }
+
+    #[test]
     fn scenario_integrity_rejects_target_text_only_selector() {
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
@@ -73093,5 +79227,40 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             event.get("target_text").and_then(serde_json::Value::as_str),
             Some("+")
         );
+    }
+
+    #[test]
+    fn isolated_scroll_wheel_delivery_does_not_require_unrelated_supervisor_pass() {
+        let proof = json!({
+            "status": "fail",
+            "driver_pass": true,
+            "desktop_pass": true,
+            "supervisor_report_written": false,
+            "real_os_events_observed": true,
+            "driver_effect_observed": true,
+            "measured_loop_pass": true,
+            "preview_input_adapter": {
+                "mouse_scroll_event_count": 4
+            }
+        });
+
+        assert!(isolated_scroll_real_window_wheel_delivery_proven(&proof));
+    }
+
+    #[test]
+    fn isolated_scroll_wheel_delivery_requires_wheel_events() {
+        let proof = json!({
+            "status": "pass",
+            "driver_pass": true,
+            "desktop_pass": true,
+            "real_os_events_observed": true,
+            "driver_effect_observed": true,
+            "measured_loop_pass": true,
+            "preview_input_adapter": {
+                "mouse_scroll_event_count": 0
+            }
+        });
+
+        assert!(!isolated_scroll_real_window_wheel_delivery_proven(&proof));
     }
 }

@@ -5443,15 +5443,10 @@ fn preview_advance_headed_scenario(
             active: false,
         });
     }
-    if now.duration_since(run.started_at).as_millis()
-        > u128::from(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS)
-    {
+    if now.duration_since(run.started_at).as_millis() > u128::from(run.timeout_ms) {
         run.fail(
             "timeout",
-            format!(
-                "headed scenario exceeded {} ms",
-                PREVIEW_HEADED_SCENARIO_TIMEOUT_MS
-            ),
+            format!("headed scenario exceeded {} ms", run.timeout_ms),
         );
         write_preview_headed_scenario_report(run);
         preview_mark_headed_scenario_dirty(shared_render_state)?;
@@ -5945,6 +5940,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
+    let headed_scenario_timeout_ms = numeric_arg(args, "--headed-scenario-timeout-ms")
+        .unwrap_or(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS);
     let frame_readback = synthetic_input_probe
         || args.iter().any(|arg| arg == "--probe")
         || args.iter().any(|arg| arg == "--frame-readback");
@@ -6060,7 +6057,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             &json!({
                 "kind": "headed-scenario-start",
                 "scenario_id": scenario_id,
-                "trigger": "preview-role-auto-start"
+                "trigger": "preview-role-auto-start",
+                "timeout_ms": headed_scenario_timeout_ms
             }),
         )?;
         if response.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
@@ -6613,6 +6611,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
     let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
     let skip_visible_input_probe = args.iter().any(|arg| arg == "--skip-visible-input-probe");
+    let preview_loop_report = value_arg(args, "--preview-loop-report").map(PathBuf::from);
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
     let ipc_probe_timeout_ms = numeric_arg(args, "--ipc-probe-timeout-ms").unwrap_or(60_000);
@@ -6886,6 +6885,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 replace_code_expected_hash.as_deref(),
                                 skip_operator_host_input_probe,
                                 operator_host_input_source_event_limit,
+                                preview_loop_report.as_deref(),
                                 Duration::from_millis(ipc_probe_timeout_ms),
                             )
                             .map_err(|error| error.to_string())
@@ -7198,6 +7198,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         dev_loop_report
             .to_str()
             .ok_or("dev loop report path is not UTF-8")?
+            .to_owned(),
+        "--preview-loop-report".to_owned(),
+        preview_loop_report
+            .to_str()
+            .ok_or("preview loop report path is not UTF-8")?
             .to_owned(),
     ]);
     if probe && !real_window_input_probe {
@@ -8876,6 +8881,9 @@ struct PreviewNativeInputTimingSample {
     live_events_ms: f64,
     bound_input_sync_ms: f64,
     selection_proxy_refresh_ms: f64,
+    selection_proxy_text_refresh_ms: f64,
+    selected_overlay_patch_ms: f64,
+    selection_focus_overlay_state_ms: f64,
     resolve_ms: f64,
     apply_ms: f64,
     hover_overlay_ms: f64,
@@ -9190,6 +9198,9 @@ fn preview_native_input_timing_sample_json(sample: &PreviewNativeInputTimingSamp
         "live_events_ms": sample.live_events_ms,
         "bound_input_sync_ms": sample.bound_input_sync_ms,
         "selection_proxy_refresh_ms": sample.selection_proxy_refresh_ms,
+        "selection_proxy_text_refresh_ms": sample.selection_proxy_text_refresh_ms,
+        "selected_overlay_patch_ms": sample.selected_overlay_patch_ms,
+        "selection_focus_overlay_state_ms": sample.selection_focus_overlay_state_ms,
         "resolve_ms": sample.resolve_ms,
         "apply_ms": sample.apply_ms,
         "hover_overlay_ms": sample.hover_overlay_ms,
@@ -10806,44 +10817,51 @@ fn native_gpu_app_owned_render_hook(
         layout_cache_key.to_owned()
     };
     let layout_cache_started = Instant::now();
-    let cache_stale = native_gpu_render_cache_stale(
-        layout_frame_cache.as_ref().map(|(path, _)| path.as_str()),
-        &render_frame_layout_cache_key,
-    );
+    let retained_layout_frame = visible_state.layout_frame_override.as_deref();
+    let cache_stale = retained_layout_frame.is_none()
+        && native_gpu_render_cache_stale(
+            layout_frame_cache.as_ref().map(|(path, _)| path.as_str()),
+            &render_frame_layout_cache_key,
+        );
     if cache_stale {
-        let layout_frame = match visible_state.layout_frame_override.as_deref() {
-            Some(layout_frame) => layout_frame.clone(),
-            None => {
-                let artifact_json: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
-                serde_json::from_value(
-                    artifact_json
-                        .get("layout_frame")
-                        .cloned()
-                        .ok_or("layout artifact missing layout_frame")?,
-                )?
-            }
-        };
+        let artifact_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
+        let layout_frame = serde_json::from_value(
+            artifact_json
+                .get("layout_frame")
+                .cloned()
+                .ok_or("layout artifact missing layout_frame")?,
+        )?;
         *layout_frame_cache = Some((render_frame_layout_cache_key.clone(), layout_frame));
     }
+    let layout_cache_hit = retained_layout_frame.is_some() || !cache_stale;
     let layout_cache_ms = elapsed_ms(layout_cache_started);
-    let layout_frame = layout_frame_cache
-        .as_ref()
-        .map(|(_, frame)| frame)
-        .ok_or("layout frame cache was not initialized")?;
+    let layout_frame = if let Some(layout_frame) = retained_layout_frame {
+        layout_frame
+    } else {
+        layout_frame_cache
+            .as_ref()
+            .map(|(_, frame)| frame)
+            .ok_or("layout frame cache was not initialized")?
+    };
     let input_overlay_prepare_started = Instant::now();
+    let retained_bound_text_nodes = preview_retained_bound_sync_text_update_nodes();
     let input_overlay_render_scene_patch_enabled = layout_render_scene_patch.is_none()
         && last_error.is_none()
         && status_overlay.is_none()
         && headed_scenario_overlay.is_none()
-        && (!hover_overlay.is_empty() || !focus_overlay.is_empty());
+        && (!hover_overlay.is_empty()
+            || !focus_overlay.is_empty()
+            || !retained_bound_text_nodes.is_empty());
     let input_overlay_touched_nodes = if input_overlay_render_scene_patch_enabled {
-        preview_input_overlay_render_scene_touched_nodes(
+        let mut touched_nodes = preview_input_overlay_render_scene_touched_nodes(
             layout_frame,
             &visible_state.overlay_lookup,
             hover_overlay,
             focus_overlay,
-        )
+        );
+        touched_nodes.extend(retained_bound_text_nodes);
+        touched_nodes
     } else {
         BTreeSet::new()
     };
@@ -11368,7 +11386,7 @@ fn native_gpu_app_owned_render_hook(
     let mut render_hook_phase_timings_ms = json!({
         "total_before_report_json_ms": elapsed_ms(render_hook_started),
         "layout_cache_ms": layout_cache_ms,
-        "layout_cache_hit": !cache_stale,
+        "layout_cache_hit": layout_cache_hit,
         "render_frame_cache_ms": render_frame_cache_ms,
         "render_frame_cache_hit": render_frame_cache_hit,
         "renderer_init_ms": renderer_init_ms,
@@ -11400,6 +11418,8 @@ fn native_gpu_app_owned_render_hook(
         "surface_id": context.surface_id,
         "surface_epoch": context.surface_epoch,
         "surface_format": context.surface_format,
+        "render_target_kind": context.render_target_kind,
+        "copy_to_present_path": context.render_target_kind == "app-owned-offscreen-copy-to-present",
         "uses_generated_shader_entry": "NativeGpuRect",
         "visible_style_mode": "document_style",
         "debug_palette_used": false,
@@ -11438,6 +11458,24 @@ fn native_gpu_app_owned_render_hook(
         "input_overlay_render_scene_patch_applied": input_overlay_render_scene_patch_enabled,
         "input_overlay_render_scene_patch_direct_encode": direct_input_overlay_render_scene_patch_enabled,
         "input_overlay_render_scene_patch_touched_node_count": input_overlay_touched_nodes.len(),
+        "input_overlay_render_scene_patch_touched_node_samples": input_overlay_touched_nodes
+            .iter()
+            .take(16)
+            .map(|node| node.0.clone())
+            .collect::<Vec<_>>(),
+        "input_overlay_focus_state": {
+            "focused_node": focus_overlay.focused_node.as_deref(),
+            "selected_address": focus_overlay.selected_address.as_deref(),
+            "previous_selected_address": focus_overlay.previous_selected_address.as_deref(),
+            "selection_proxy": focus_overlay.selection_proxy
+        },
+        "input_overlay_focused_node_probe": preview_input_overlay_focused_node_probe(
+            layout_frame,
+            &visible_state.overlay_lookup,
+            hover_overlay,
+            focus_overlay,
+            focus_overlay.focused_node.as_deref()
+        ),
         "input_overlay_render_scene_patch_built_this_frame": input_overlay_render_scene_patch_build_ms > 0.0,
         "layout_render_scene_patch_applied": layout_render_scene_patch.is_some(),
         "layout_render_scene_patch_direct_encode": direct_layout_render_scene_patch_enabled,
@@ -11699,14 +11737,16 @@ fn preview_apply_focus_overlay_state_to_render_frame(
                 boon_document_model::StyleValue::Bool(next_focused),
             );
         }
-        if item.style.contains_key("selected") {
-            let selected = selected_address
-                .and_then(|address| {
-                    focused_raw_address(layout_proof, &item.node.0)
+        if let Some(address) = selected_address
+            && item.style.contains_key("selected")
+        {
+            let selected = {
+                next_focused
+                    || focused_raw_address(layout_proof, &item.node.0)
                         .or_else(|| focused_address(layout_proof, &item.node.0))
                         .map(|item_address| item_address == address)
-                })
-                .unwrap_or(false);
+                        .unwrap_or(false)
+            };
             set_display_style_value(
                 &mut item.style,
                 "selected",
@@ -11761,14 +11801,16 @@ fn preview_apply_focus_overlay_lookup_to_render_frame(
                 boon_document_model::StyleValue::Bool(next_focused),
             );
         }
-        if item.style.contains_key("selected") {
-            let selected = selected_address
-                .and_then(|address| {
-                    lookup
+        if let Some(address) = selected_address
+            && item.style.contains_key("selected")
+        {
+            let selected = {
+                next_focused
+                    || lookup
                         .address_for_node(&item.node.0)
                         .map(|item_address| item_address == address)
-                })
-                .unwrap_or(false);
+                        .unwrap_or(false)
+            };
             set_display_style_value(
                 &mut item.style,
                 "selected",
@@ -11822,6 +11864,34 @@ fn preview_input_overlay_render_scene_touched_nodes(
     if let Some(focused_node) = focus_overlay.focused_node.as_ref() {
         nodes.insert(boon_document_model::DocumentNodeId(focused_node.clone()));
     }
+    nodes.extend(
+        preview_current_focus_overlay_display_nodes(base_frame)
+            .into_iter()
+            .map(boon_document_model::DocumentNodeId),
+    );
+    nodes.extend(
+        preview_current_selected_display_nodes(base_frame)
+            .into_iter()
+            .map(boon_document_model::DocumentNodeId),
+    );
+    if let Some(selected_address) = focus_overlay.selected_address.as_deref() {
+        nodes.extend(
+            preview_selected_display_nodes_for_address(base_frame, lookup, selected_address)
+                .into_iter()
+                .map(boon_document_model::DocumentNodeId),
+        );
+        if focus_overlay.previous_selected_address.is_none()
+            && preview_current_selected_display_nodes(base_frame).is_empty()
+        {
+            nodes.extend(
+                base_frame
+                    .display_list
+                    .iter()
+                    .filter(|item| item.style.contains_key("selected"))
+                    .map(|item| item.node.clone()),
+            );
+        }
+    }
     for selected_address in [
         focus_overlay.previous_selected_address.as_deref(),
         focus_overlay.selected_address.as_deref(),
@@ -11830,16 +11900,11 @@ fn preview_input_overlay_render_scene_touched_nodes(
     .flatten()
     {
         let mut selected_nodes = lookup.nodes_for_address(selected_address);
-        if selected_nodes.is_empty() {
-            selected_nodes.extend(
-                base_frame
-                    .display_list
-                    .iter()
-                    .filter(|item| item.style.contains_key("selected"))
-                    .filter(|item| lookup.address_for_node(&item.node.0) == Some(selected_address))
-                    .map(|item| item.node.0.clone()),
-            );
-        }
+        selected_nodes.extend(preview_selected_display_nodes_for_address(
+            base_frame,
+            lookup,
+            selected_address,
+        ));
         nodes.extend(
             selected_nodes
                 .into_iter()
@@ -11936,6 +12001,79 @@ fn preview_input_overlay_render_scene_patch_from_base(
     let patch_frame =
         preview_frame_with_viewport_background(&patch_frame, width as f32, height as f32);
     preview_input_overlay_render_scene_patch(&patch_frame, touched_nodes, width, height, columns)
+}
+
+fn preview_input_overlay_focused_node_probe(
+    base_frame: &boon_document::LayoutFrame,
+    lookup: &PreviewRenderOverlayLookup,
+    hover_overlay: &PreviewHoverOverlayState,
+    focus_overlay: &PreviewFocusOverlayState,
+    focused_node: Option<&str>,
+) -> serde_json::Value {
+    let Some(focused_node) = focused_node else {
+        return json!({"status": "missing_focused_node"});
+    };
+    let mut probe_frame = boon_document::LayoutFrame {
+        display_list: base_frame
+            .display_list
+            .iter()
+            .filter(|item| item.node.0 == focused_node)
+            .cloned()
+            .collect(),
+        hit_regions: Vec::new(),
+        scroll_regions: Vec::new(),
+        accessibility: boon_document::AccessibilityTree::default(),
+        demands: Vec::new(),
+        materialization: Vec::new(),
+        metrics: boon_document::LayoutMetrics::default(),
+    };
+    if probe_frame.display_list.is_empty() {
+        return json!({"status": "missing_display_item", "node": focused_node});
+    }
+    preview_apply_hover_overlay_to_render_frame(&mut probe_frame, hover_overlay);
+    preview_apply_focus_overlay_lookup_to_render_frame(&mut probe_frame, lookup, focus_overlay);
+    let item = &probe_frame.display_list[0];
+    let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+    let primitives = boon_document::render_scene::render_visual_primitives_for_touched_nodes(
+        &probe_frame,
+        1_000,
+        1_000,
+        &mut columns,
+        &BTreeSet::from([item.node.clone()]),
+    );
+    let fill = primitives
+        .iter()
+        .find(|primitive| {
+            primitive.node == item.node
+                && primitive.primitive
+                    == boon_document::render_scene::RenderVisualPrimitiveKind::Fill
+        })
+        .map(|primitive| {
+            json!({
+                "color": primitive.color,
+                "retained_chunk_id": primitive.retained_chunk_id,
+                "style_identity": {
+                    "style": primitive.style_identity.style_id,
+                    "layout": primitive.style_identity.layout_id,
+                    "paint": primitive.style_identity.paint_id,
+                    "material": primitive.style_identity.material_id,
+                    "font": primitive.style_identity.font_id,
+                    "pseudo": primitive.style_identity.pseudo_state_id
+                }
+            })
+        });
+    json!({
+        "status": "pass",
+        "node": focused_node,
+        "focused": item.focused,
+        "style_selected": item.style.get("selected"),
+        "style_focused": item.style.get("__focused"),
+        "style_background": item.style.get("background"),
+        "style_selected_background": item.style.get("__selected_background"),
+        "style_border": item.style.get("border"),
+        "style_selected_border": item.style.get("__selected_border"),
+        "fill": fill.unwrap_or_else(|| json!(null))
+    })
 }
 
 fn preview_apply_headed_scenario_overlay_to_render_frame(
@@ -31161,11 +31299,11 @@ fn document_context_record_source_intent_reads(
 }
 
 fn source_binding_index_from_view_bindings(
-    bindings: &[boon_ir::ViewBinding],
+    bindings: &[boon_runtime::RuntimeViewBinding],
 ) -> BTreeMap<(String, String), Vec<String>> {
     let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for binding in bindings {
-        if !matches!(binding.kind, boon_ir::ViewBindingKind::Source) {
+        if !matches!(binding.kind, boon_runtime::RuntimeViewBindingKind::Source) {
             continue;
         }
         let key = (
@@ -31181,7 +31319,7 @@ fn source_binding_index_from_view_bindings(
 }
 
 fn row_scope_by_list_from_runtime_analysis(
-    row_scopes: &[boon_ir::RowScope],
+    row_scopes: &[boon_runtime::RuntimeRowScope],
 ) -> BTreeMap<String, String> {
     let mut scopes = BTreeMap::new();
     for row_scope in row_scopes {
@@ -31193,13 +31331,14 @@ fn row_scope_by_list_from_runtime_analysis(
 }
 
 fn data_binding_index_from_view_bindings(
-    bindings: &[boon_ir::ViewBinding],
+    bindings: &[boon_runtime::RuntimeViewBinding],
 ) -> BTreeMap<(String, String), Vec<String>> {
     let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for binding in bindings {
         if !matches!(
             binding.kind,
-            boon_ir::ViewBindingKind::Data | boon_ir::ViewBindingKind::Target
+            boon_runtime::RuntimeViewBindingKind::Data
+                | boon_runtime::RuntimeViewBindingKind::Target
         ) {
             continue;
         }
@@ -35122,6 +35261,26 @@ impl PreviewFocusOverlayState {
         }
     }
 
+    fn from_input_state_preserving_previous(
+        input_state: &PreviewNativeInputState,
+        caret_visible: bool,
+    ) -> Self {
+        let mut next = Self::from_input_state(input_state, caret_visible);
+        if next.previous_selected_address.is_none()
+            && input_state
+                .focus_render_overlay
+                .previous_selected_address
+                .as_deref()
+                .is_some_and(|previous| Some(previous) != next.selected_address.as_deref())
+        {
+            next.previous_selected_address = input_state
+                .focus_render_overlay
+                .previous_selected_address
+                .clone();
+        }
+        next
+    }
+
     fn is_empty(&self) -> bool {
         self.focused_node.is_none()
             && self.previous_selected_address.is_none()
@@ -35275,6 +35434,7 @@ struct PreviewHeadedScenarioRun {
     status: PreviewHeadedScenarioStatus,
     step_index: usize,
     started_at: Instant,
+    timeout_ms: u64,
     step_started_at: Instant,
     step_start_cursor: (f64, f64),
     cursor: (f64, f64),
@@ -35331,9 +35491,11 @@ struct PreviewRetainedBoundSyncStats {
     source_intent_update_count: usize,
     source_intent_index_update_count: usize,
     style_update_count: usize,
+    style_update_nodes: Vec<String>,
     text_update_count: usize,
     text_update_nodes: Vec<String>,
     text_update_binding_paths: Vec<(String, Vec<String>)>,
+    text_update_values: Vec<(String, String, Vec<String>)>,
     changed: bool,
 }
 
@@ -35342,10 +35504,87 @@ fn preview_retained_bound_sync_stats() -> &'static Mutex<Option<PreviewRetainedB
     STATS.get_or_init(|| Mutex::new(None))
 }
 
+fn clear_preview_retained_bound_sync_stats() {
+    if let Ok(mut slot) = preview_retained_bound_sync_stats().lock() {
+        *slot = None;
+    }
+}
+
 fn record_preview_retained_bound_sync_stats(stats: PreviewRetainedBoundSyncStats) {
     if let Ok(mut slot) = preview_retained_bound_sync_stats().lock() {
-        *slot = Some(stats);
+        match slot.as_mut() {
+            Some(existing) => merge_preview_retained_bound_sync_stats(existing, stats),
+            None => *slot = Some(stats),
+        }
     }
+}
+
+fn merge_preview_retained_bound_sync_stats(
+    existing: &mut PreviewRetainedBoundSyncStats,
+    next: PreviewRetainedBoundSyncStats,
+) {
+    existing.status = if existing.status == "pass" || next.status == "pass" {
+        "pass"
+    } else {
+        next.status
+    };
+    existing.reason = next.reason.or_else(|| existing.reason.take());
+    existing.target_node_count = existing.target_node_count.max(next.target_node_count);
+    existing.item_index_count = existing.item_index_count.max(next.item_index_count);
+    existing.source_intent_update_count = existing
+        .source_intent_update_count
+        .saturating_add(next.source_intent_update_count);
+    existing.source_intent_index_update_count = existing
+        .source_intent_index_update_count
+        .saturating_add(next.source_intent_index_update_count);
+    existing.style_update_count = existing
+        .style_update_count
+        .saturating_add(next.style_update_count);
+    for node in next.style_update_nodes {
+        if !existing.style_update_nodes.iter().any(|seen| seen == &node) {
+            existing.style_update_nodes.push(node);
+        }
+    }
+    existing.text_update_count = existing
+        .text_update_count
+        .saturating_add(next.text_update_count);
+    for node in next.text_update_nodes {
+        if !existing.text_update_nodes.iter().any(|seen| seen == &node) {
+            existing.text_update_nodes.push(node);
+        }
+    }
+    for (node, paths) in next.text_update_binding_paths {
+        if let Some((_, existing_paths)) = existing
+            .text_update_binding_paths
+            .iter_mut()
+            .find(|(existing_node, _)| existing_node == &node)
+        {
+            for path in paths {
+                if !existing_paths.iter().any(|seen| seen == &path) {
+                    existing_paths.push(path);
+                }
+            }
+        } else {
+            existing.text_update_binding_paths.push((node, paths));
+        }
+    }
+    for (node, text, paths) in next.text_update_values {
+        if let Some((_, existing_text, existing_paths)) = existing
+            .text_update_values
+            .iter_mut()
+            .find(|(existing_node, _, _)| existing_node == &node)
+        {
+            *existing_text = text;
+            for path in paths {
+                if !existing_paths.iter().any(|seen| seen == &path) {
+                    existing_paths.push(path);
+                }
+            }
+        } else {
+            existing.text_update_values.push((node, text, paths));
+        }
+    }
+    existing.changed |= next.changed;
 }
 
 fn preview_retained_bound_sync_stats_json() -> Value {
@@ -35362,6 +35601,7 @@ fn preview_retained_bound_sync_stats_json() -> Value {
             "source_intent_update_count": stats.source_intent_update_count,
             "source_intent_index_update_count": stats.source_intent_index_update_count,
             "style_update_count": stats.style_update_count,
+            "style_update_nodes": stats.style_update_nodes,
             "text_update_count": stats.text_update_count,
             "text_update_nodes": stats.text_update_nodes,
             "text_update_binding_paths": stats.text_update_binding_paths
@@ -35371,12 +35611,50 @@ fn preview_retained_bound_sync_stats_json() -> Value {
                     "paths": paths
                 }))
                 .collect::<Vec<_>>(),
+            "text_update_values": stats.text_update_values
+                .into_iter()
+                .map(|(node, text, paths)| json!({
+                    "node": node,
+                    "text": text,
+                    "paths": paths
+                }))
+                .collect::<Vec<_>>(),
             "changed": stats.changed
         }),
         None => json!({
             "status": "not-run"
         }),
     }
+}
+
+fn preview_retained_bound_sync_text_update_nodes() -> BTreeSet<boon_document_model::DocumentNodeId>
+{
+    preview_retained_bound_sync_stats()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .filter(|stats| {
+            stats.status == "pass"
+                && stats.changed
+                && (stats.text_update_count > 0 || stats.style_update_count > 0)
+        })
+        .map(|stats| {
+            stats
+                .text_update_nodes
+                .into_iter()
+                .chain(stats.style_update_nodes)
+                .map(boon_document_model::DocumentNodeId)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn preview_retained_bound_sync_already_changed_text() -> bool {
+    preview_retained_bound_sync_stats()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .is_some_and(|stats| stats.status == "pass" && stats.changed && stats.text_update_count > 0)
 }
 
 fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefinition {
@@ -35559,7 +35837,7 @@ fn preview_headed_scenario_required_source_path(scenario_id: &str) -> Option<&'s
 }
 
 impl PreviewHeadedScenarioRun {
-    fn new(definition: PreviewHeadedScenarioDefinition) -> Self {
+    fn new(definition: PreviewHeadedScenarioDefinition, timeout_ms: u64) -> Self {
         let now = Instant::now();
         let started_at_unix_ms = unix_now_ms();
         let cursor = (96.0, 96.0);
@@ -35586,6 +35864,7 @@ impl PreviewHeadedScenarioRun {
             status: PreviewHeadedScenarioStatus::Running,
             step_index: 0,
             started_at: now,
+            timeout_ms,
             step_started_at: now,
             step_start_cursor: cursor,
             cursor,
@@ -35610,6 +35889,7 @@ impl PreviewHeadedScenarioRun {
             "scenario_label": self.definition.label,
             "step_index": self.step_index,
             "step_count": self.definition.steps.len(),
+            "timeout_ms": self.timeout_ms,
             "steps": self.report_steps,
             "failures": self.failures,
             "failure_categories": [
@@ -35721,6 +36001,10 @@ fn preview_start_headed_scenario_response(
         .unwrap_or("counter");
     let definition = preview_headed_scenario_definition(scenario_id)
         .ok_or_else(|| format!("unknown headed scenario `{scenario_id}`"))?;
+    let timeout_ms = request
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS);
     let source_path = state
         .lock()
         .map_err(|_| "preview IPC state mutex poisoned")?
@@ -35744,7 +36028,7 @@ fn preview_start_headed_scenario_response(
             }));
         }
     }
-    let run = PreviewHeadedScenarioRun::new(definition);
+    let run = PreviewHeadedScenarioRun::new(definition, timeout_ms);
     let report_path = preview_headed_scenario_report_path(&run.definition.id);
     write_preview_headed_scenario_report(&run);
     *preview_headed_scenario_state()
@@ -36832,6 +37116,26 @@ fn preview_focus_selected_editor_proxy_from_candidate(
     true
 }
 
+fn preview_update_selection_proxy_target_from_candidate(
+    candidate: &PreviewHoveredClickCandidate,
+    input_state: &mut PreviewNativeInputState,
+) -> bool {
+    let address = candidate
+        .address
+        .clone()
+        .or_else(|| candidate.target_text.clone());
+    let Some(address) = address else {
+        return false;
+    };
+    input_state.focused_node = Some(candidate.node.clone());
+    input_state.focused_address = Some(address);
+    input_state.focused_target_text = candidate.target_text.clone();
+    input_state.focused_target_key = candidate.target_key;
+    input_state.focused_target_generation = candidate.target_generation;
+    input_state.focused_selection_proxy = true;
+    true
+}
+
 fn preview_refresh_selection_proxy_focused_text_from_selected_input(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     input_state: &mut PreviewNativeInputState,
@@ -36869,6 +37173,24 @@ fn preview_refresh_selection_proxy_focused_text_from_state_summary(
     input_state.replace_focused_text_on_next_edit = false;
     preview_reset_caret_blink(input_state);
     true
+}
+
+fn preview_refresh_selection_proxy_from_state_summary(
+    state_summary: &Value,
+    input_state: &mut PreviewNativeInputState,
+) -> bool {
+    if !input_state.focused_selection_proxy {
+        return false;
+    }
+    if let Some(address) = state_summary
+        .pointer("/store/selected_address")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        && input_state.focused_address.as_deref() != Some(address.as_str())
+    {
+        input_state.focused_address = Some(address);
+    }
+    preview_refresh_selection_proxy_focused_text_from_state_summary(state_summary, input_state)
 }
 
 fn preview_refresh_selection_proxy_focused_text_from_retained_input(
@@ -37463,6 +37785,9 @@ fn preview_try_apply_focused_keyboard_input(
                     live_events_ms: 0.0,
                     bound_input_sync_ms: 0.0,
                     selection_proxy_refresh_ms: 0.0,
+                    selection_proxy_text_refresh_ms: 0.0,
+                    selected_overlay_patch_ms: 0.0,
+                    selection_focus_overlay_state_ms: 0.0,
                     resolve_ms: 0.0,
                     apply_ms: keyboard_ms,
                     hover_overlay_ms,
@@ -37794,6 +38119,9 @@ fn preview_try_apply_focused_keyboard_input(
         live_events_ms: 0.0,
         bound_input_sync_ms: 0.0,
         selection_proxy_refresh_ms: 0.0,
+        selection_proxy_text_refresh_ms: 0.0,
+        selected_overlay_patch_ms: 0.0,
+        selection_focus_overlay_state_ms: 0.0,
         resolve_ms: layout_clone_ms,
         apply_ms: keyboard_ms,
         hover_overlay_ms,
@@ -38107,8 +38435,14 @@ fn preview_try_apply_simple_source_click_input(
                         target_generation: candidate.target_generation,
                         ..boon_runtime::LiveSourceEvent::default()
                     };
-                    let focus_state_applied =
+                    let mut focus_state_applied =
                         preview_focus_selected_editor_proxy_from_candidate(&candidate, input_state);
+                    if !focus_state_applied {
+                        focus_state_applied = preview_update_selection_proxy_target_from_candidate(
+                            &candidate,
+                            input_state,
+                        );
+                    }
                     let mut events = Vec::new();
                     push_repeated_live_source_event(&mut events, event, click_event_repeat_count);
                     (
@@ -38526,6 +38860,15 @@ fn preview_try_apply_simple_source_click_input(
     input_state.hovered_click_candidate = click_candidate;
     let remembered_candidate = input_state.hovered_click_candidate.clone();
     preview_remember_click_candidate(input_state, position_key, &remembered_candidate);
+    clear_preview_retained_bound_sync_stats();
+    let previous_selected_address =
+        preview_selected_address_from_shared_layout_proof(shared_render_state)
+            .or_else(|| preview_selected_address_from_shared_layout(shared_render_state))
+            .or_else(|| selected_address_from_live_runtime(live_runtime))
+            .or_else(|| input_state.selected_overlay_address.clone());
+    let previous_selected_nodes =
+        preview_current_selected_nodes_from_shared_layout(shared_render_state)
+            .unwrap_or_else(|| input_state.selected_overlay_nodes.clone());
     preview_set_interaction_diagnostic_subphase("simple_source_click.apply_live_events");
     let apply_started = Instant::now();
     let live_events_started = Instant::now();
@@ -38546,12 +38889,44 @@ fn preview_try_apply_simple_source_click_input(
     if let Some(focused_node) = input_state.focused_node.as_ref() {
         bound_sync_nodes.insert(focused_node.clone());
     }
+    bound_sync_nodes.extend(previous_selected_nodes.iter().cloned());
+    if let Some(previous_selected_address) = previous_selected_address.as_deref()
+        && let Ok(shared) = shared_render_state.lock()
+    {
+        bound_sync_nodes.extend(source_intent_nodes_for_value(
+            &shared.layout_proof,
+            &["address"],
+            previous_selected_address,
+        ));
+    }
+    let selected_address_for_style_patch = post_turn_state_summary
+        .as_ref()
+        .and_then(|summary| {
+            summary
+                .pointer("/store/selected_address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| input_state.focused_address.clone());
+    if let Some(selected_address) = selected_address_for_style_patch.as_deref()
+        && let Ok(shared) = shared_render_state.lock()
+    {
+        bound_sync_nodes.extend(source_intent_nodes_for_value(
+            &shared.layout_proof,
+            &["address"],
+            selected_address,
+        ));
+    }
     let bound_input_sync_started = Instant::now();
     // `preview_apply_live_events_state_summary` already computed the current
     // post-turn values. Reuse that summary to patch the clicked node and any
     // binding-dependent controls, such as the Cells formula bar, without a
     // second runtime read on the hot click path.
-    if let Some(post_turn_state_summary) = post_turn_state_summary.as_ref() {
+    if post_turn_state_summary.is_some() && preview_retained_bound_sync_already_changed_text() {
+        // The live-event visible-state sync already patched retained bound text
+        // inputs from this same summary. Avoid repeating the scan on the click
+        // hot path; the retained sync stats remain as the formula-bar proof.
+    } else if let Some(post_turn_state_summary) = post_turn_state_summary.as_ref() {
         preview_sync_bound_text_inputs_for_nodes_from_state_summary(
             shared_render_state,
             post_turn_state_summary,
@@ -38566,14 +38941,46 @@ fn preview_try_apply_simple_source_click_input(
     }
     let bound_input_sync_ms = elapsed_ms(bound_input_sync_started);
     let selection_proxy_refresh_started = Instant::now();
-    if !post_turn_state_summary.as_ref().is_some_and(|summary| {
-        preview_refresh_selection_proxy_focused_text_from_state_summary(summary, input_state)
-    }) && !preview_refresh_selection_proxy_focused_text_from_retained_input(
-        shared_render_state,
-        input_state,
-    ) {
+    let selection_proxy_text_refresh_started = Instant::now();
+    let refreshed_selection_proxy_from_summary =
+        post_turn_state_summary.as_ref().is_some_and(|summary| {
+            preview_refresh_selection_proxy_from_state_summary(summary, input_state)
+        });
+    if !refreshed_selection_proxy_from_summary
+        && !preview_refresh_selection_proxy_focused_text_from_retained_input(
+            shared_render_state,
+            input_state,
+        )
+    {
         preview_refresh_selection_proxy_focused_text_from_selected_input(live_runtime, input_state);
     }
+    let selection_proxy_text_refresh_ms = elapsed_ms(selection_proxy_text_refresh_started);
+    let selected_overlay_patch_started = Instant::now();
+    if let Some(selected_address) = selected_address_for_style_patch.as_deref() {
+        preview_patch_retained_selected_address_overlay(
+            shared_render_state,
+            selected_address,
+            previous_selected_address.as_deref(),
+            &previous_selected_nodes,
+        )?;
+        input_state.focused_address = Some(selected_address.to_owned());
+        input_state.selected_overlay_address = Some(selected_address.to_owned());
+    }
+    let selected_overlay_patch_ms = elapsed_ms(selected_overlay_patch_started);
+    let selection_focus_overlay_state_started = Instant::now();
+    if let Some(selected_address) = selected_address_for_style_patch.as_deref() {
+        let mut next_focus_overlay = PreviewFocusOverlayState::from_input_state_preserving_previous(
+            input_state,
+            input_state.focus_render_overlay.caret_visible,
+        );
+        if let Some(previous_selected_address) = previous_selected_address.as_ref()
+            && previous_selected_address != selected_address
+        {
+            next_focus_overlay.previous_selected_address = Some(previous_selected_address.clone());
+        }
+        input_state.focus_render_overlay = next_focus_overlay;
+    }
+    let selection_focus_overlay_state_ms = elapsed_ms(selection_focus_overlay_state_started);
     let selection_proxy_refresh_ms = elapsed_ms(selection_proxy_refresh_started);
     let apply_ms = elapsed_ms(apply_started);
     preview_set_interaction_diagnostic_subphase("simple_source_click.hover_overlay");
@@ -38604,6 +39011,9 @@ fn preview_try_apply_simple_source_click_input(
         live_events_ms,
         bound_input_sync_ms,
         selection_proxy_refresh_ms,
+        selection_proxy_text_refresh_ms,
+        selected_overlay_patch_ms,
+        selection_focus_overlay_state_ms,
         resolve_ms,
         apply_ms,
         hover_overlay_ms,
@@ -38773,6 +39183,9 @@ fn preview_try_apply_simple_pointer_move_input(
         live_events_ms: pointer_move_ms,
         bound_input_sync_ms: 0.0,
         selection_proxy_refresh_ms: 0.0,
+        selection_proxy_text_refresh_ms: 0.0,
+        selected_overlay_patch_ms: 0.0,
+        selection_focus_overlay_state_ms: 0.0,
         resolve_ms,
         apply_ms: pointer_move_ms,
         hover_overlay_ms,
@@ -38878,6 +39291,9 @@ fn preview_try_apply_simple_drag_motion_input(
         live_events_ms: apply_ms,
         bound_input_sync_ms: 0.0,
         selection_proxy_refresh_ms: 0.0,
+        selection_proxy_text_refresh_ms: 0.0,
+        selected_overlay_patch_ms: 0.0,
+        selection_focus_overlay_state_ms: 0.0,
         resolve_ms,
         apply_ms,
         hover_overlay_ms: 0.0,
@@ -38915,6 +39331,7 @@ fn preview_handle_mouse_release_for_route_hit(
     defer_focusable_mouse_events: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = hit.node.0.clone();
+    preview_seed_selected_overlay_address(shared_render_state, input_state);
     if route_table.change_source(&node).is_some() && route_table.wants_text_cursor(&node) {
         preview_set_interaction_diagnostic_subphase(
             "simple_source_click.prepare_focusable.text_change_branch",
@@ -39400,6 +39817,9 @@ fn preview_try_apply_retained_text_input_focus_click(
         live_events_ms: 0.0,
         bound_input_sync_ms: 0.0,
         selection_proxy_refresh_ms: 0.0,
+        selection_proxy_text_refresh_ms: 0.0,
+        selected_overlay_patch_ms: 0.0,
+        selection_focus_overlay_state_ms: 0.0,
         resolve_ms,
         apply_ms,
         hover_overlay_ms,
@@ -40187,6 +40607,9 @@ fn preview_apply_real_window_input_with_units(
             + mouse_release_ms,
         bound_input_sync_ms: 0.0,
         selection_proxy_refresh_ms: 0.0,
+        selection_proxy_text_refresh_ms: 0.0,
+        selected_overlay_patch_ms: 0.0,
+        selection_focus_overlay_state_ms: 0.0,
         resolve_ms: layout_clone_ms + hover_update_ms,
         apply_ms: pending_live_events_ms
             + drag_events_ms
@@ -40241,6 +40664,81 @@ fn preview_focus_overlay_may_be_needed(
         .any(display_item_has_focus_overlay_state)
 }
 
+fn preview_seed_selected_overlay_address(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+) {
+    if input_state.selected_overlay_address.is_some() {
+        return;
+    }
+    let selected_address = shared_render_state
+        .lock()
+        .ok()
+        .and_then(|shared| layout_proof_runtime_state_snapshot(&shared.layout_proof))
+        .and_then(|summary| {
+            summary
+                .pointer("/store/selected_address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if selected_address.is_some() {
+        input_state.selected_overlay_address = selected_address;
+    }
+}
+
+fn preview_selected_address_from_shared_layout_proof(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Option<String> {
+    shared_render_state
+        .lock()
+        .ok()
+        .and_then(|shared| layout_proof_runtime_state_snapshot(&shared.layout_proof))
+        .and_then(|summary| {
+            summary
+                .pointer("/store/selected_address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn preview_selected_address_from_shared_layout(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Option<String> {
+    let shared = shared_render_state.lock().ok()?;
+    let lookup = cached_preview_render_overlay_lookup(&shared.layout_proof);
+    let address_for_node = |node: &str| {
+        focused_raw_address(&shared.layout_proof, node)
+            .or_else(|| focused_address(&shared.layout_proof, node))
+            .or_else(|| lookup.address_for_node(node).map(str::to_owned))
+    };
+    if let Some(frame) = shared.layout_frame_override.as_deref() {
+        return frame
+            .display_list
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.style.get("selected"),
+                    Some(boon_document_model::StyleValue::Bool(true))
+                )
+            })
+            .find_map(|item| address_for_node(&item.node.0));
+    }
+    layout_frame_from_layout_proof(&shared.layout_proof)
+        .ok()
+        .and_then(|frame| {
+            frame
+                .display_list
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.style.get("selected"),
+                        Some(boon_document_model::StyleValue::Bool(true))
+                    )
+                })
+                .find_map(|item| address_for_node(&item.node.0))
+        })
+}
+
 fn preview_apply_focus_overlay(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
@@ -40250,7 +40748,7 @@ fn preview_apply_focus_overlay(
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
     let next_render_overlay =
-        PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+        PreviewFocusOverlayState::from_input_state_preserving_previous(input_state, caret_visible);
     let mut changed = input_state.focus_render_overlay != next_render_overlay;
     input_state.focus_render_overlay = next_render_overlay;
     if shared.layout_frame_override.is_none() {
@@ -40375,7 +40873,8 @@ fn preview_update_retained_focus_overlay_state(
     input_state: &mut PreviewNativeInputState,
     caret_visible: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let next_overlay = PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+    let next_overlay =
+        PreviewFocusOverlayState::from_input_state_preserving_previous(input_state, caret_visible);
     let changed = input_state.focus_render_overlay != next_overlay;
     input_state.focus_render_overlay = next_overlay;
     input_state.focus_overlay_initialized = true;
@@ -40407,7 +40906,7 @@ fn preview_apply_selection_proxy_focus_overlay(
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
     let next_render_overlay =
-        PreviewFocusOverlayState::from_input_state(input_state, caret_visible);
+        PreviewFocusOverlayState::from_input_state_preserving_previous(input_state, caret_visible);
     let render_overlay_changed = input_state.focus_render_overlay != next_render_overlay;
     input_state.focus_render_overlay = next_render_overlay;
     let PreviewSharedRenderState {
@@ -40425,6 +40924,9 @@ fn preview_apply_selection_proxy_focus_overlay(
     let focused_caret_index = input_state.focused_caret_index;
     let replace_focused_text_on_next_edit = input_state.replace_focused_text_on_next_edit;
     let selected_address = input_state.focused_address.clone();
+    if let Some(frame) = layout_frame_override.as_deref() {
+        target_nodes.extend(preview_current_selected_display_nodes(frame));
+    }
     if let Some(address) = selected_address.as_deref() {
         target_nodes.extend(preview_selected_overlay_nodes_for_address(
             layout_proof,
@@ -40470,6 +40972,7 @@ fn preview_apply_selection_proxy_focus_overlay(
         changed |= preview_apply_address_selected_overlay_to_item(
             item,
             layout_proof,
+            None,
             selected_address.as_deref(),
         );
         if matches!(
@@ -40527,19 +41030,27 @@ fn preview_display_item_indexes_for_nodes(
     frame: &boon_document::LayoutFrame,
     target_nodes: &BTreeSet<String>,
 ) -> Vec<usize> {
-    let indexed = layout_proof
+    let snapshot = layout_proof
         .get("layout_frame_hash")
         .and_then(Value::as_str)
         .and_then(cached_document_render_snapshot)
-        .filter(|snapshot| !snapshot.display_items_by_node.is_empty())
-        .map(|snapshot| {
-            target_nodes
-                .iter()
-                .filter_map(|node| snapshot.display_items_by_node.get(node))
-                .flatten()
-                .copied()
-                .collect::<BTreeSet<_>>()
-        });
+        .filter(|snapshot| !snapshot.display_items_by_node.is_empty());
+    preview_display_item_indexes_for_nodes_from_snapshot(snapshot.as_deref(), frame, target_nodes)
+}
+
+fn preview_display_item_indexes_for_nodes_from_snapshot(
+    snapshot: Option<&DocumentRenderSnapshot>,
+    frame: &boon_document::LayoutFrame,
+    target_nodes: &BTreeSet<String>,
+) -> Vec<usize> {
+    let indexed = snapshot.map(|snapshot| {
+        target_nodes
+            .iter()
+            .filter_map(|node| snapshot.display_items_by_node.get(node))
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    });
     if let Some(indexes) = indexed
         && !indexes.is_empty()
     {
@@ -40571,6 +41082,7 @@ fn preview_apply_focus_overlay_to_item(
     changed |= preview_apply_address_selected_overlay_to_item(
         item,
         layout_proof,
+        None,
         input_state.focused_address.as_deref(),
     );
     if item.style.remove("caret_column").is_some() {
@@ -40624,6 +41136,7 @@ fn preview_apply_focus_overlay_to_item(
 fn preview_apply_address_selected_overlay_to_item(
     item: &mut boon_document::DisplayItem,
     layout_proof: &Value,
+    snapshot: Option<&DocumentRenderSnapshot>,
     selected_address: Option<&str>,
 ) -> bool {
     if !item.style.contains_key("selected") {
@@ -40631,16 +41144,22 @@ fn preview_apply_address_selected_overlay_to_item(
     }
     let selected = selected_address
         .and_then(|selected_address| {
-            focused_raw_address(layout_proof, &item.node.0)
+            snapshot
+                .and_then(|snapshot| focused_raw_address_from_snapshot(snapshot, &item.node.0))
+                .or_else(|| focused_raw_address(layout_proof, &item.node.0))
                 .or_else(|| focused_address(layout_proof, &item.node.0))
                 .map(|item_address| item_address == selected_address)
         })
         .unwrap_or(false);
-    set_display_style_value(
+    let changed = set_display_style_value(
         &mut item.style,
         "selected",
         boon_document_model::StyleValue::Bool(selected),
-    )
+    );
+    if changed {
+        item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+    }
+    changed
 }
 
 fn preview_selected_overlay_nodes_for_address(
@@ -40662,6 +41181,288 @@ fn preview_selected_overlay_nodes_for_address(
         })
         .map(|item| item.node.0.clone())
         .collect()
+}
+
+fn preview_current_selected_display_nodes(frame: &boon_document::LayoutFrame) -> BTreeSet<String> {
+    frame
+        .display_list
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.style.get("selected"),
+                Some(boon_document_model::StyleValue::Bool(true))
+            )
+        })
+        .map(|item| item.node.0.clone())
+        .collect()
+}
+
+fn preview_current_focus_overlay_display_nodes(
+    frame: &boon_document::LayoutFrame,
+) -> BTreeSet<String> {
+    frame
+        .display_list
+        .iter()
+        .filter(|item| item.focused || item.style.contains_key("__focused"))
+        .map(|item| item.node.0.clone())
+        .collect()
+}
+
+fn preview_current_selected_nodes_from_shared_layout(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+) -> Option<BTreeSet<String>> {
+    let shared = shared_render_state.lock().ok()?;
+    if let Some(frame) = shared.layout_frame_override.as_deref() {
+        return Some(preview_current_selected_display_nodes(frame));
+    }
+    layout_frame_from_layout_proof(&shared.layout_proof)
+        .ok()
+        .map(|frame| preview_current_selected_display_nodes(&frame))
+}
+
+fn preview_selected_display_nodes_for_address(
+    frame: &boon_document::LayoutFrame,
+    lookup: &PreviewRenderOverlayLookup,
+    selected_address: &str,
+) -> BTreeSet<String> {
+    frame
+        .display_list
+        .iter()
+        .filter(|item| item.style.contains_key("selected"))
+        .filter(|item| lookup.address_for_node(&item.node.0) == Some(selected_address))
+        .map(|item| item.node.0.clone())
+        .collect()
+}
+
+fn preview_patch_retained_selected_address_overlay(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    selected_address: &str,
+    previous_selected_address: Option<&str>,
+    previous_selected_nodes: &BTreeSet<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if shared.layout_frame_override.is_none() {
+        shared.layout_frame_override = Some(Arc::new(layout_frame_from_layout_proof(
+            &shared.layout_proof,
+        )?));
+    }
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
+    let snapshot_selected_nodes = snapshot
+        .as_deref()
+        .map(|snapshot| {
+            snapshot_source_intent_nodes_for_value(snapshot, &["address"], selected_address)
+        })
+        .unwrap_or_default();
+    let snapshot_previous_nodes = previous_selected_address
+        .and_then(|previous| {
+            snapshot.as_deref().map(|snapshot| {
+                snapshot_source_intent_nodes_for_value(snapshot, &["address"], previous)
+            })
+        })
+        .unwrap_or_default();
+    let mut target_nodes = previous_selected_nodes.clone();
+    if let Some(frame) = shared.layout_frame_override.as_deref() {
+        target_nodes.extend(preview_current_selected_display_nodes(frame));
+    }
+    let needs_previous_node_fallback =
+        previous_selected_address.is_some() && snapshot_previous_nodes.is_empty();
+    let needs_selected_node_fallback = snapshot_selected_nodes.is_empty();
+    let mut layout_proof_fallback = (needs_previous_node_fallback || needs_selected_node_fallback)
+        .then(|| shared.layout_proof.clone());
+    if let Some(previous_selected_address) = previous_selected_address {
+        if snapshot_previous_nodes.is_empty() {
+            if let Some(layout_proof) = layout_proof_fallback.as_ref() {
+                target_nodes.extend(source_intent_nodes_for_value(
+                    layout_proof,
+                    &["address"],
+                    previous_selected_address,
+                ));
+            }
+        } else {
+            target_nodes.extend(snapshot_previous_nodes.iter().cloned());
+        }
+    }
+    if snapshot_selected_nodes.is_empty() {
+        if let Some(layout_proof) = layout_proof_fallback.as_ref() {
+            target_nodes.extend(source_intent_nodes_for_value(
+                layout_proof,
+                &["address"],
+                selected_address,
+            ));
+        }
+    } else {
+        target_nodes.extend(snapshot_selected_nodes.iter().cloned());
+    }
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    let mut snapshot_selection_nodes = snapshot_previous_nodes.clone();
+    snapshot_selection_nodes.extend(snapshot_selected_nodes.iter().cloned());
+    let needs_item_address_fallback = snapshot_selection_nodes.is_empty()
+        || target_nodes
+            .iter()
+            .any(|node| !snapshot_selection_nodes.contains(node));
+    if needs_item_address_fallback && layout_proof_fallback.is_none() {
+        layout_proof_fallback = Some(shared.layout_proof.clone());
+    }
+    let selected_address_text_nodes = snapshot
+        .as_deref()
+        .map(|snapshot| {
+            text_binding_paths_by_node(snapshot)
+                .iter()
+                .filter(|(_, paths)| {
+                    paths.iter().any(|path| {
+                        document_data_paths_overlap_normalized(path, "store.selected_address")
+                    })
+                })
+                .map(|(node, _)| node.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+        return Ok(false);
+    };
+    let mut changed_nodes = Vec::new();
+    let mut style_patch_nodes = Vec::new();
+    let mut text_updates = Vec::<(String, String, Vec<String>)>::new();
+    let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
+        snapshot.as_deref(),
+        frame,
+        &target_nodes,
+    );
+    let snapshot_has_selection_nodes =
+        !snapshot_selected_nodes.is_empty() || !snapshot_previous_nodes.is_empty();
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
+        if !item.style.contains_key("selected") {
+            continue;
+        }
+        let item_in_snapshot_selection = snapshot_previous_nodes.contains(&item.node.0)
+            || snapshot_selected_nodes.contains(&item.node.0);
+        let item_address = (!snapshot_has_selection_nodes || !item_in_snapshot_selection)
+            .then(|| {
+                snapshot
+                    .as_deref()
+                    .and_then(|snapshot| focused_raw_address_from_snapshot(snapshot, &item.node.0))
+                    .or_else(|| {
+                        layout_proof_fallback.as_ref().and_then(|layout_proof| {
+                            focused_raw_address(layout_proof, &item.node.0)
+                        })
+                    })
+                    .or_else(|| {
+                        layout_proof_fallback
+                            .as_ref()
+                            .and_then(|layout_proof| focused_address(layout_proof, &item.node.0))
+                    })
+            })
+            .flatten();
+        let affected = style_bool(&item.style, "selected")
+            || previous_selected_nodes.contains(&item.node.0)
+            || item_in_snapshot_selection
+            || item_address.as_deref() == Some(selected_address)
+            || previous_selected_address
+                .is_some_and(|previous| item_address.as_deref() == Some(previous));
+        if !affected {
+            continue;
+        }
+        if !style_patch_nodes.iter().any(|node| node == &item.node.0) {
+            style_patch_nodes.push(item.node.0.clone());
+        }
+        let selected = if !snapshot_selected_nodes.is_empty() || !snapshot_previous_nodes.is_empty()
+        {
+            snapshot_selected_nodes.contains(&item.node.0)
+        } else {
+            item_address.as_deref() == Some(selected_address)
+        };
+        if set_display_style_value(
+            &mut item.style,
+            "selected",
+            boon_document_model::StyleValue::Bool(selected),
+        ) {
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+            changed_nodes.push(item.node.0.clone());
+        }
+    }
+    if let Some(previous_selected_address) = previous_selected_address {
+        if selected_address_text_nodes.is_empty() {
+            for item in frame
+                .display_list
+                .iter_mut()
+                .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Text))
+                .filter(|item| item.text.as_deref() == Some(previous_selected_address))
+                .filter(|item| {
+                    f64::from(item.bounds.y) < 40.0
+                        && f64::from(item.bounds.x) < 50.0
+                        && f64::from(item.bounds.width) <= 45.0
+                })
+            {
+                item.text = Some(selected_address.to_owned());
+                text_updates.push((
+                    item.node.0.clone(),
+                    selected_address.to_owned(),
+                    vec!["store.selected_address".to_owned()],
+                ));
+            }
+        } else {
+            let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
+                snapshot.as_deref(),
+                frame,
+                &selected_address_text_nodes,
+            );
+            for index in item_indexes {
+                let Some(item) = frame.display_list.get_mut(index) else {
+                    continue;
+                };
+                if !selected_address_text_nodes.contains(&item.node.0)
+                    || item.text.as_deref() == Some(selected_address)
+                {
+                    continue;
+                }
+                item.text = Some(selected_address.to_owned());
+                text_updates.push((
+                    item.node.0.clone(),
+                    selected_address.to_owned(),
+                    vec!["store.selected_address".to_owned()],
+                ));
+            }
+        }
+    }
+    if style_patch_nodes.is_empty() && text_updates.is_empty() {
+        return Ok(false);
+    }
+    shared.update_count = shared.update_count.saturating_add(1);
+    shared.last_error = None;
+    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
+        status: "pass",
+        reason: None,
+        target_node_count: target_nodes.len(),
+        item_index_count: target_nodes.len(),
+        source_intent_update_count: 0,
+        source_intent_index_update_count: 0,
+        style_update_count: style_patch_nodes.len(),
+        style_update_nodes: style_patch_nodes,
+        text_update_count: text_updates.len(),
+        text_update_nodes: text_updates
+            .iter()
+            .map(|(node, _, _)| node.clone())
+            .collect(),
+        text_update_binding_paths: text_updates
+            .iter()
+            .map(|(node, _, paths)| (node.clone(), paths.clone()))
+            .collect(),
+        text_update_values: text_updates,
+        changed: true,
+    });
+    Ok(true)
 }
 
 fn preview_sync_blurred_text_input_from_runtime_state(
@@ -40854,7 +41655,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             shared.layout_proof["source_intent_value_index"] = source_intent_value_index;
         }
     }
-    let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue)>::new();
+    let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue, String)>::new();
     let mut text_updates = Vec::<(usize, String, String, Vec<String>)>::new();
     let item_indexes = if let Some(target_nodes) = target_nodes {
         if !snapshot.display_items_by_node.is_empty() {
@@ -40892,10 +41693,20 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             .get(node)
         {
             for (path, target) in bindings {
-                if target.attr == "text"
-                    || matches!(target.attr.as_str(), "label" | "value" | "display_value")
-                    || document_attr_is_source_intent_binding(&target.attr)
-                {
+                if matches!(
+                    target.attr.as_str(),
+                    "text" | "label" | "value" | "display_value"
+                ) {
+                    let Some(value) = state_summary_value_for_data_path(state_summary, path) else {
+                        continue;
+                    };
+                    let next_text = json_value_to_document_text(value);
+                    if item.text.as_deref() != Some(next_text.as_str()) {
+                        text_updates.push((index, next_text, node.to_owned(), vec![path.clone()]));
+                    }
+                    continue;
+                }
+                if document_attr_is_source_intent_binding(&target.attr) {
                     continue;
                 }
                 let Some(value) = state_summary_value_for_data_path(state_summary, path) else {
@@ -40918,7 +41729,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                 }
                 let style_value = document_style_value_from_state_value(&patch_value);
                 if item.style.get(&patch_target.attr) != Some(&style_value) {
-                    style_updates.push((index, patch_target.attr, style_value));
+                    style_updates.push((index, patch_target.attr, style_value, node.to_owned()));
                 }
             }
         }
@@ -40958,6 +41769,10 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         }
     }
     stats.style_update_count = style_updates.len();
+    stats.style_update_nodes = style_updates
+        .iter()
+        .map(|(_, _, _, node)| node.clone())
+        .collect();
     stats.text_update_count = text_updates.len();
     stats.text_update_nodes = text_updates
         .iter()
@@ -40966,6 +41781,10 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     stats.text_update_binding_paths = text_updates
         .iter()
         .map(|(_, _, node, paths)| (node.clone(), paths.clone()))
+        .collect();
+    stats.text_update_values = text_updates
+        .iter()
+        .map(|(_, text, node, paths)| (node.clone(), text.clone(), paths.clone()))
         .collect();
     if style_updates.is_empty() && text_updates.is_empty() {
         stats.status = "pass";
@@ -40980,7 +41799,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         record_preview_retained_bound_sync_stats(stats);
         return changed;
     };
-    for (index, attr, value) in style_updates {
+    for (index, attr, value, _) in style_updates {
         let Some(item) = frame.display_list.get_mut(index) else {
             continue;
         };
@@ -41248,6 +42067,35 @@ fn selected_input_editing_text_for_address(
         })
 }
 
+fn selected_address_from_live_runtime(
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+) -> Option<String> {
+    let paths = ["store.selected_address"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut runtime = live_runtime.lock().ok()?;
+    runtime
+        .document_state_values(&paths)
+        .get("store.selected_address")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            runtime
+                .document_state_summary_for_window(0, 1, 0, 1)
+                .pointer("/store/selected_address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            runtime
+                .state_summary()
+                .pointer("/store/selected_address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
 fn selected_input_display_text_for_address(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     address: &str,
@@ -41441,6 +42289,22 @@ fn extend_target_nodes_for_available_summary_bindings(
     state_summary: &serde_json::Value,
     target_nodes: &mut BTreeSet<String>,
 ) {
+    for (node, paths) in &snapshot.data_binding_targets.text_binding_paths_by_node {
+        if paths
+            .iter()
+            .any(|path| state_summary_value_for_data_path(state_summary, path).is_some())
+        {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, bindings) in &snapshot.data_binding_targets.state_binding_targets_by_node {
+        if bindings
+            .iter()
+            .any(|(path, _)| state_summary_value_for_data_path(state_summary, path).is_some())
+        {
+            target_nodes.insert(node.clone());
+        }
+    }
     for (path, node, _) in &snapshot.data_binding_targets.source_intent_binding_targets {
         if state_summary_value_for_data_path(state_summary, path).is_some() {
             target_nodes.insert(node.clone());
@@ -45138,14 +46002,23 @@ fn source_intent_nodes_for_value(
                 );
             }
         }
-        return nodes;
     }
-    layout_proof
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|intent| {
+    nodes.extend(
+        layout_source_intent_entries(layout_proof)
+            .into_iter()
+            .filter_map(|intent| {
+                let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+                let intent_source_path = intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)?;
+                let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+                (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
+                    .then(|| node.to_owned())
+            }),
+    );
+    if nodes.is_empty() {
+        let artifact_entries = layout_artifact_source_intent_entries(layout_proof);
+        nodes.extend(artifact_entries.iter().filter_map(|intent| {
             let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
             let intent_source_path = intent
                 .get("source_path")
@@ -45153,7 +46026,47 @@ fn source_intent_nodes_for_value(
             let node = intent.get("node").and_then(serde_json::Value::as_str)?;
             (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
                 .then(|| node.to_owned())
-        })
+        }));
+    }
+    nodes
+}
+
+fn layout_source_intent_entries(layout_proof: &Value) -> Vec<&Value> {
+    let mut entries = Vec::new();
+    if let Some(assertions) = layout_proof
+        .get("source_intent_assertions")
+        .and_then(serde_json::Value::as_array)
+    {
+        entries.extend(assertions.iter());
+    }
+    if let Some(intents) = layout_proof
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)
+    {
+        entries.extend(intents.iter());
+    }
+    entries
+}
+
+fn layout_artifact_source_intent_entries(layout_proof: &Value) -> Vec<Value> {
+    let Some(artifact_path) = layout_proof
+        .get("artifact_path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(artifact_path) else {
+        return Vec::new();
+    };
+    let Ok(artifact) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    artifact
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .cloned()
         .collect()
 }
 
@@ -45229,6 +46142,42 @@ fn source_event_address_payload(
     address
 }
 
+fn focused_raw_address_from_snapshot(
+    snapshot: &DocumentRenderSnapshot,
+    node: &str,
+) -> Option<String> {
+    snapshot.source_intents.iter().find_map(|intent| {
+        let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
+        let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+        (intent_node == node && intent_kind == "address").then(|| {
+            intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })?
+    })
+}
+
+fn snapshot_source_intent_nodes_for_value(
+    snapshot: &DocumentRenderSnapshot,
+    intent_kinds: &[&str],
+    source_path: &str,
+) -> BTreeSet<String> {
+    snapshot
+        .source_intents
+        .iter()
+        .filter_map(|intent| {
+            let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
+            let intent_source_path = intent
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)?;
+            (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
+                .then(|| intent_node.to_owned())
+        })
+        .collect()
+}
+
 fn focused_address(layout_proof: &Value, node: &str) -> Option<String> {
     focused_source_intent_value(layout_proof, node, "address")
 }
@@ -45250,10 +46199,8 @@ fn focused_raw_source_intent_value(
     {
         return Some(value.to_owned());
     }
-    layout_proof
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
+    layout_source_intent_entries(layout_proof)
+        .into_iter()
         .find_map(|intent| {
             let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
             let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
@@ -45280,10 +46227,8 @@ fn focused_source_intent_value(layout_proof: &Value, node: &str, expected: &str)
             value.to_owned(),
         ));
     }
-    layout_proof
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
+    layout_source_intent_entries(layout_proof)
+        .into_iter()
         .find_map(|intent| {
             let intent_node = intent.get("node").and_then(serde_json::Value::as_str)?;
             let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
@@ -45606,17 +46551,70 @@ fn state_summary_value_for_hidden_row_field_path<'a>(
 }
 
 fn focused_editing_text_for_address(summary: &Value, address: &str) -> Option<String> {
-    focused_text_field_for_address_in_summary_lists(summary, address, &["editing_text"])
+    focused_text_field_for_selected_input(summary, address, &["editing_text"])
+        .or_else(|| {
+            focused_text_field_for_address_in_summary_lists(summary, address, &["editing_text"])
+        })
         .or_else(|| focused_editing_text_for_address_recursive(summary, address))
 }
 
 fn focused_display_text_for_address(summary: &Value, address: &str) -> Option<String> {
-    focused_text_field_for_address_in_summary_lists(
+    focused_text_field_for_selected_input(
         summary,
         address,
         &["display_text", "value", "formula_text", "editing_text"],
     )
+    .or_else(|| {
+        focused_text_field_for_address_in_summary_lists(
+            summary,
+            address,
+            &["display_text", "value", "formula_text", "editing_text"],
+        )
+    })
     .or_else(|| focused_display_text_for_address_recursive(summary, address))
+}
+
+fn focused_text_field_for_selected_input(
+    summary: &Value,
+    address: &str,
+    fields: &[&str],
+) -> Option<String> {
+    let selected = summary
+        .get("store")
+        .and_then(|store| store.get("selected_input"))
+        .or_else(|| summary.get("selected_input"))?;
+    focused_text_field_from_selected_value(selected, address, fields)
+}
+
+fn focused_text_field_from_selected_value(
+    selected: &Value,
+    address: &str,
+    fields: &[&str],
+) -> Option<String> {
+    match selected {
+        Value::Object(_) => {
+            if selected.get("address").and_then(serde_json::Value::as_str) != Some(address) {
+                return None;
+            }
+            fields.iter().find_map(|field| {
+                selected
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        }
+        Value::Array(rows) => rows
+            .iter()
+            .find(|row| row.get("address").and_then(serde_json::Value::as_str) == Some(address))
+            .and_then(|row| {
+                fields.iter().find_map(|field| {
+                    row.get(*field)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+            }),
+        _ => None,
+    }
 }
 
 fn focused_text_field_for_address_in_summary_lists(
@@ -46084,27 +47082,25 @@ impl PreviewRenderOverlayLookup {
                 lookup.insert_node_address(node, address);
             }
         }
-        if let Some(assertions) = layout_proof
-            .get("source_intent_assertions")
-            .and_then(Value::as_array)
+        let artifact_source_intents = layout_artifact_source_intent_entries(layout_proof);
+        for intent in layout_source_intent_entries(layout_proof)
+            .into_iter()
+            .chain(artifact_source_intents.iter())
         {
-            for intent in assertions {
-                if intent.get("intent").and_then(Value::as_str) != Some("address") {
-                    continue;
-                }
-                let Some(node) = intent.get("node").and_then(Value::as_str) else {
-                    continue;
-                };
-                if lookup.address_by_node.contains_key(node) {
-                    continue;
-                }
-                let Some(raw_address) = intent.get("source_path").and_then(Value::as_str) else {
-                    continue;
-                };
-                let address =
-                    resolve_source_intent_payload_value(layout_proof, raw_address.to_owned());
-                lookup.insert_node_address(node, address);
+            if intent.get("intent").and_then(Value::as_str) != Some("address") {
+                continue;
             }
+            let Some(node) = intent.get("node").and_then(Value::as_str) else {
+                continue;
+            };
+            if lookup.address_by_node.contains_key(node) {
+                continue;
+            }
+            let Some(raw_address) = intent.get("source_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let address = resolve_source_intent_payload_value(layout_proof, raw_address.to_owned());
+            lookup.insert_node_address(node, address);
         }
         if let Some(value_index) = layout_proof
             .get("source_intent_value_index")
@@ -46113,14 +47109,18 @@ impl PreviewRenderOverlayLookup {
         {
             for (address, nodes) in value_index {
                 let entry = lookup.nodes_by_address.entry(address.clone()).or_default();
-                entry.extend(
-                    nodes
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned),
-                );
+                for node in nodes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    entry.insert(node.to_owned());
+                    lookup
+                        .address_by_node
+                        .entry(node.to_owned())
+                        .or_insert_with(|| address.clone());
+                }
             }
         }
         lookup
@@ -46145,6 +47145,62 @@ impl PreviewRenderOverlayLookup {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+fn preview_render_overlay_lookup_cache()
+-> &'static Mutex<BTreeMap<String, PreviewRenderOverlayLookup>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, PreviewRenderOverlayLookup>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn preview_render_overlay_lookup_cache_key(layout_proof: &Value) -> String {
+    if let Some(hash) = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("layout:{hash}");
+    }
+    if let Some(hash) = layout_proof
+        .get("artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("artifact:{hash}");
+    }
+    let source_intent_fingerprint = json!({
+        "source_intent_index": layout_proof.get("source_intent_index"),
+        "source_intent_assertions": layout_proof.get("source_intent_assertions"),
+        "source_intents": layout_proof.get("source_intents"),
+        "artifact_path": layout_proof.get("artifact_path"),
+        "artifact_sha256": layout_proof.get("artifact_sha256"),
+        "source_intent_value_index": layout_proof.get("source_intent_value_index")
+    });
+    format!(
+        "source-intents:{}",
+        boon_runtime::sha256_bytes(
+            serde_json::to_string(&source_intent_fingerprint)
+                .unwrap_or_default()
+                .as_bytes()
+        )
+    )
+}
+
+fn cached_preview_render_overlay_lookup(layout_proof: &Value) -> PreviewRenderOverlayLookup {
+    const PREVIEW_RENDER_OVERLAY_LOOKUP_CACHE_CAP: usize = 128;
+    let key = preview_render_overlay_lookup_cache_key(layout_proof);
+    if let Ok(mut cache) = preview_render_overlay_lookup_cache().lock() {
+        if let Some(lookup) = cache.get(&key) {
+            return lookup.clone();
+        }
+        let lookup = PreviewRenderOverlayLookup::from_layout_proof(layout_proof);
+        if cache.len() >= PREVIEW_RENDER_OVERLAY_LOOKUP_CACHE_CAP
+            && let Some(oldest_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest_key);
+        }
+        cache.insert(key, lookup.clone());
+        return lookup;
+    }
+    PreviewRenderOverlayLookup::from_layout_proof(layout_proof)
 }
 
 impl PreviewVisibleRenderState {
@@ -46172,7 +47228,7 @@ impl PreviewVisibleRenderState {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
-            overlay_lookup: PreviewRenderOverlayLookup::from_layout_proof(&shared.layout_proof),
+            overlay_lookup: cached_preview_render_overlay_lookup(&shared.layout_proof),
             layout_artifact,
             layout_artifact_sha256: shared
                 .layout_proof
@@ -55397,7 +56453,7 @@ where
     let parsed_project_for_layout = live_runtime_result
         .is_ok()
         .then(|| {
-            boon_runtime::cached_runtime_parsed_project(&runtime_source_label, &runtime_units).ok()
+            cached_document_project_program(Path::new(&entrypoint.virtual_uri), &runtime_units).ok()
         })
         .flatten();
     if !is_latest() {
@@ -56201,7 +57257,7 @@ fn preview_operator_host_input_response_for_state(
                 .get("source_id")
                 .and_then(serde_json::Value::as_u64),
         };
-        let before_state_hash = if let Some(before_state) = before_state.as_ref() {
+        let before_state_summary_hash = if let Some(before_state) = before_state.as_ref() {
             boon_runtime::sha256_bytes(&serde_json::to_vec(before_state)?)
         } else {
             "omitted-for-compact-response".to_owned()
@@ -56610,10 +57666,17 @@ fn preview_operator_host_input_response_for_state(
             "semantic_delta_count": output.semantic_deltas.len(),
             "render_patch_count": output.render_patches.len(),
             "framebuffer_delta_evidence": {
-                "method": "render-patch-backed-framebuffer-change-required",
-                "before_state_hash": before_state_hash,
+                "method": "render-patch-materialization-awaits-visible-framebuffer-readback",
+                "state_summary_delta_evidence": {
+                    "before_state_summary_hash": before_state_summary_hash,
+                    "before_state_summary_omitted": before_state_summary_omitted,
+                    "after_state_summary_hash": state_summary_hash.clone()
+                },
+                "before_framebuffer_sha256": null,
+                "after_framebuffer_sha256": null,
+                "app_owned_framebuffer_readback_status": "not-captured-in-operator-host-ipc-response",
+                "app_owned_framebuffer_readback_artifact": null,
                 "before_state_summary_omitted": before_state_summary_omitted,
-                "after_state_hash": state_summary_hash.clone(),
                 "render_patch_count": output.render_patches.len(),
                 "app_owned_framebuffer_readback_required_by_preview_report": true,
                 "preview_shared_render_state_updated": preview_shared_render_state_updated,
@@ -56751,16 +57814,24 @@ fn preview_update_shared_focus_node_from_runtime_state(
     else {
         return Ok(false);
     };
+    let mut focus_state_summary = state_summary.clone();
+    if let Some(address) = event.address.as_deref()
+        && let Some(root) = focus_state_summary.as_object_mut()
+    {
+        insert_nested_json_value(root, "store.selected_address", json!(address));
+        insert_nested_json_value(root, "store.selected_input.address", json!(address));
+    }
     let focused_text = event
         .address
         .as_deref()
-        .and_then(|address| focused_editing_text_for_address(state_summary, address))
+        .and_then(|address| focused_editing_text_for_address(&focus_state_summary, address))
         .or_else(|| event.target_text.clone())
         .or_else(|| event.text.clone())
         .unwrap_or_default();
     let mut shared = shared_render_state
         .lock()
         .map_err(|_| "preview render state mutex poisoned")?;
+    let layout_proof = shared.layout_proof.clone();
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
@@ -56799,7 +57870,33 @@ fn preview_update_shared_focus_node_from_runtime_state(
         {
             changed = true;
         }
+        if let Some(address) = event.address.as_deref() {
+            changed |= preview_apply_address_selected_overlay_to_item(
+                item,
+                &layout_proof,
+                None,
+                Some(address),
+            );
+        }
     }
+    let mut bound_sync_nodes = BTreeSet::from([target_node.to_owned()]);
+    if let Some(layout_hash) = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
+    {
+        extend_target_nodes_for_available_summary_bindings(
+            &snapshot,
+            &focus_state_summary,
+            &mut bound_sync_nodes,
+        );
+    }
+    changed |= preview_sync_bound_text_inputs_in_shared_state_for_nodes(
+        &mut shared,
+        &focus_state_summary,
+        Some(&bound_sync_nodes),
+    );
     if changed {
         shared.update_count = shared.update_count.saturating_add(1);
         shared.last_error = None;
@@ -57529,6 +58626,7 @@ fn run_dev_ipc_probe(
     replace_code_expected_hash: Option<&str>,
     skip_operator_host_input_probe: bool,
     operator_host_input_source_event_limit: usize,
+    preview_loop_report: Option<&Path>,
     request_timeout: Duration,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let start = Instant::now();
@@ -57560,29 +58658,58 @@ fn run_dev_ipc_probe(
     let operator_host_input_response = if !skip_operator_host_input_probe {
         if let Some(path) = replace_code_file {
             let code = boon_runtime::source_text_for_path(path)?;
-            let responses = operator_host_input_smoke_probe_requests_with_limit(
+            let requests = operator_host_input_smoke_probe_requests_with_limit_and_batch_size(
                 path,
                 &code,
                 operator_host_input_source_event_limit,
-            )
-            .map(|requests| {
-                requests
-                    .into_iter()
-                    .map(|request| {
-                        send_preview_ipc_request_with_timeouts(
-                            connect,
-                            request,
-                            Duration::from_secs(5),
-                            request_timeout,
-                            Duration::from_secs(10),
-                        )
-                        .map_err(|error| -> Box<dyn std::error::Error> {
-                            format!("operator-host-input request failed: {error}").into()
+                if preview_loop_report.is_some() {
+                    1
+                } else {
+                    OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST
+                },
+            );
+            let responses = requests
+                .map(|requests| {
+                    requests
+                        .into_iter()
+                        .map(|request| {
+                            let before_readback = preview_loop_report.and_then(|path| {
+                                wait_for_preview_loop_readback(path, None, request_timeout).ok()
+                            });
+                            let mut response = send_preview_ipc_request_with_timeouts(
+                                connect,
+                                request,
+                                Duration::from_secs(5),
+                                request_timeout,
+                                Duration::from_secs(10),
+                            )
+                            .map_err(
+                                |error| -> Box<dyn std::error::Error> {
+                                    format!("operator-host-input request failed: {error}").into()
+                                },
+                            )?;
+                            if let Some(path) = preview_loop_report {
+                                let after_requirement =
+                                    operator_host_input_after_readback_requirement(&response);
+                                let after_readback =
+                                    wait_for_preview_loop_readback_for_requirement(
+                                        path,
+                                        before_readback.as_ref(),
+                                        after_requirement,
+                                        request_timeout.min(Duration::from_secs(8)),
+                                    )
+                                    .ok();
+                                annotate_operator_host_input_readback_evidence(
+                                    &mut response,
+                                    before_readback,
+                                    after_readback,
+                                );
+                            }
+                            Ok::<serde_json::Value, Box<dyn std::error::Error>>(response)
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
             responses.map(aggregate_operator_host_input_responses)
         } else {
             None
@@ -57677,6 +58804,222 @@ fn run_dev_ipc_probe(
         };
     }
     Ok(value)
+}
+
+fn wait_for_preview_loop_readback(
+    preview_loop_report: &Path,
+    previous: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    wait_for_preview_loop_readback_for_requirement(
+        preview_loop_report,
+        previous,
+        PreviewReadbackRequirement::default(),
+        timeout,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PreviewReadbackRequirement {
+    min_content_revision: Option<u64>,
+    require_content_or_pixel_advance: bool,
+}
+
+fn wait_for_preview_loop_readback_for_requirement(
+    preview_loop_report: &Path,
+    previous: Option<&serde_json::Value>,
+    requirement: PreviewReadbackRequirement,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(report) = read_json(preview_loop_report)
+            && report
+                .get("last_interactive_surface_readback_pending")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            && let Some(artifact) = report
+                .get("last_interactive_readback_artifact")
+                .filter(|artifact| preview_loop_readback_artifact_is_valid(artifact))
+            && previous.is_none_or(|previous| {
+                preview_loop_readback_artifact_advanced_for_requirement(
+                    previous,
+                    artifact,
+                    requirement,
+                )
+            })
+            && requirement.min_content_revision.is_none_or(|minimum| {
+                readback_artifact_u64(artifact, "content_revision") >= minimum
+            })
+        {
+            return Ok(artifact.clone());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!(
+        "timed out waiting for preview loop readback `{}`",
+        preview_loop_report.display()
+    )
+    .into())
+}
+
+fn operator_host_input_after_readback_requirement(
+    response: &serde_json::Value,
+) -> PreviewReadbackRequirement {
+    let outputs = response
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut min_content_revision = None;
+    let mut require_content_or_pixel_advance = false;
+    for output in outputs {
+        let render_patch_count = output
+            .get("render_patch_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let semantic_delta_count = output
+            .get("semantic_delta_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if render_patch_count > 0 || semantic_delta_count > 0 {
+            require_content_or_pixel_advance = true;
+        }
+        let update_count = output
+            .pointer("/framebuffer_delta_evidence/preview_shared_render_update_count")
+            .and_then(serde_json::Value::as_u64);
+        if let Some(update_count) = update_count {
+            min_content_revision = Some(min_content_revision.unwrap_or(0).max(update_count));
+        }
+    }
+    PreviewReadbackRequirement {
+        min_content_revision,
+        require_content_or_pixel_advance,
+    }
+}
+
+fn preview_loop_readback_artifact_is_valid(artifact: &serde_json::Value) -> bool {
+    artifact
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|sha| !sha.is_empty())
+        && artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| Path::new(path).exists())
+        && artifact
+            .get("capture_method")
+            .and_then(serde_json::Value::as_str)
+            == Some("wgpu-visible-surface-copy-src-readback")
+}
+
+fn preview_loop_readback_artifact_advanced(
+    previous: &serde_json::Value,
+    next: &serde_json::Value,
+) -> bool {
+    preview_loop_readback_artifact_advanced_for_requirement(
+        previous,
+        next,
+        PreviewReadbackRequirement::default(),
+    )
+}
+
+fn preview_loop_readback_artifact_advanced_for_requirement(
+    previous: &serde_json::Value,
+    next: &serde_json::Value,
+    requirement: PreviewReadbackRequirement,
+) -> bool {
+    if requirement.require_content_or_pixel_advance {
+        return readback_artifact_u64(next, "presented_revision")
+            > readback_artifact_u64(previous, "presented_revision")
+            || readback_artifact_u64(next, "content_revision")
+                > readback_artifact_u64(previous, "content_revision")
+            || readback_artifact_sha256(next) != readback_artifact_sha256(previous);
+    }
+    readback_artifact_u64(next, "rendered_frame_count")
+        > readback_artifact_u64(previous, "rendered_frame_count")
+        || readback_artifact_u64(next, "presented_revision")
+            > readback_artifact_u64(previous, "presented_revision")
+        || readback_artifact_u64(next, "content_revision")
+            > readback_artifact_u64(previous, "content_revision")
+        || readback_artifact_sha256(next) != readback_artifact_sha256(previous)
+}
+
+fn readback_artifact_u64(artifact: &serde_json::Value, key: &str) -> u64 {
+    artifact
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn readback_artifact_sha256(artifact: &serde_json::Value) -> Option<&str> {
+    artifact.get("sha256").and_then(serde_json::Value::as_str)
+}
+
+fn annotate_operator_host_input_readback_evidence(
+    response: &mut serde_json::Value,
+    before_readback: Option<serde_json::Value>,
+    after_readback: Option<serde_json::Value>,
+) {
+    let before_sha = before_readback.as_ref().and_then(readback_artifact_sha256);
+    let after_sha = after_readback.as_ref().and_then(readback_artifact_sha256);
+    let status = if before_sha.is_some() && after_sha.is_some() {
+        "captured"
+    } else {
+        "missing-or-timeout"
+    };
+    let delta_observed = before_sha.is_some() && after_sha.is_some() && before_sha != after_sha;
+    let visual_capture_method = after_readback
+        .as_ref()
+        .and_then(|artifact| artifact.get("capture_method"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(outputs) = response
+        .get_mut("outputs")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for output in outputs {
+            let Some(evidence) = output
+                .get_mut("framebuffer_delta_evidence")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            evidence.insert(
+                "app_owned_framebuffer_readback_status".to_owned(),
+                json!(status),
+            );
+            evidence.insert(
+                "before_framebuffer_sha256".to_owned(),
+                before_sha
+                    .map(|sha| serde_json::Value::String(sha.to_owned()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            evidence.insert(
+                "after_framebuffer_sha256".to_owned(),
+                after_sha
+                    .map(|sha| serde_json::Value::String(sha.to_owned()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            evidence.insert(
+                "before_readback_artifact".to_owned(),
+                before_readback.clone().unwrap_or(serde_json::Value::Null),
+            );
+            evidence.insert(
+                "after_readback_artifact".to_owned(),
+                after_readback.clone().unwrap_or(serde_json::Value::Null),
+            );
+            evidence.insert(
+                "app_owned_framebuffer_readback_artifact".to_owned(),
+                after_readback.clone().unwrap_or(serde_json::Value::Null),
+            );
+            evidence.insert("readback_delta_observed".to_owned(), json!(delta_observed));
+            evidence.insert(
+                "visual_capture_method".to_owned(),
+                visual_capture_method.clone(),
+            );
+        }
+    }
 }
 
 fn ipc_exchange_bytes(response: &serde_json::Value) -> u64 {
@@ -57888,6 +59231,20 @@ fn operator_host_input_smoke_probe_requests_with_limit(
     code: &str,
     source_event_limit: usize,
 ) -> Option<Vec<serde_json::Value>> {
+    operator_host_input_smoke_probe_requests_with_limit_and_batch_size(
+        path,
+        code,
+        source_event_limit,
+        OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST,
+    )
+}
+
+fn operator_host_input_smoke_probe_requests_with_limit_and_batch_size(
+    path: &Path,
+    code: &str,
+    source_event_limit: usize,
+    batch_size: usize,
+) -> Option<Vec<serde_json::Value>> {
     let source_events = operator_host_input_source_events(path)?;
     let original_source_event_count = source_events.len();
     let sampled_source_events =
@@ -57895,7 +59252,7 @@ fn operator_host_input_smoke_probe_requests_with_limit(
     let sampled_source_event_count = sampled_source_events.len();
     let full_coverage =
         source_event_limit == 0 || sampled_source_event_count == original_source_event_count;
-    operator_host_input_probe_requests_from_events(
+    operator_host_input_probe_requests_from_events_with_batch_size(
         path,
         code,
         sampled_source_events,
@@ -57914,6 +59271,7 @@ fn operator_host_input_smoke_probe_requests_with_limit(
                 "evenly-spaced-first-last"
             }
         })),
+        batch_size,
     )
 }
 
@@ -58019,18 +59377,33 @@ fn operator_host_input_probe_requests_from_events(
     source_events: Vec<serde_json::Value>,
     source_event_selection: Option<serde_json::Value>,
 ) -> Option<Vec<serde_json::Value>> {
+    operator_host_input_probe_requests_from_events_with_batch_size(
+        path,
+        code,
+        source_events,
+        source_event_selection,
+        OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST,
+    )
+}
+
+fn operator_host_input_probe_requests_from_events_with_batch_size(
+    path: &Path,
+    code: &str,
+    source_events: Vec<serde_json::Value>,
+    source_event_selection: Option<serde_json::Value>,
+    batch_size: usize,
+) -> Option<Vec<serde_json::Value>> {
     if source_events.is_empty() {
         return None;
     }
+    let batch_size = batch_size.max(1);
     let source_hash = boon_runtime::sha256_bytes(code.as_bytes());
     let source_path = path.display().to_string();
     let layout_proof_hash = json!(null);
-    let batch_count = source_events
-        .len()
-        .div_ceil(OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST);
+    let batch_count = source_events.len().div_ceil(batch_size);
     Some(
         source_events
-            .chunks(OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST)
+            .chunks(batch_size)
             .enumerate()
             .map(|(batch_index, batch)| {
                 let mut request = json!({
@@ -59852,6 +61225,172 @@ mod tests {
                         == boon_document::render_scene::RenderVisualPrimitiveKind::TextInputCaret
             }),
             "input overlay sidecar should carry the focused caret primitive"
+        );
+    }
+
+    #[test]
+    fn cells_input_overlay_render_scene_patch_updates_stale_selected_cell_primitives() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-input-overlay-stale-selected-primitives",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (_, _, a0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("A0"))
+                .unwrap();
+        let (b0_x, b0_y, b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let overlay_lookup = PreviewRenderOverlayLookup::from_layout_proof(&initial_layout);
+        assert_eq!(overlay_lookup.address_for_node(&a0_node), Some("A0"));
+        assert_eq!(overlay_lookup.address_for_node(&b0_node), Some("B0"));
+
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame.clone())),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let input = real_window_shaped_click_input_from_index(0, b0_x, b0_y);
+        preview_apply_real_window_input(
+            &input,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        let post_frame = latest_preview_frame(&shared_render_state);
+        let focus_overlay = input_state.focus_render_overlay.clone();
+        assert_eq!(focus_overlay.selected_address.as_deref(), Some("B0"));
+        assert_eq!(
+            focus_overlay.previous_selected_address.as_deref(),
+            Some("A0")
+        );
+        assert_eq!(
+            post_frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == a0_node)
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+        assert_eq!(
+            post_frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == b0_node)
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+
+        let hover_overlay = PreviewHoverOverlayState::default();
+        let touched_nodes = preview_input_overlay_render_scene_touched_nodes(
+            &post_frame,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+        );
+        let a0_doc_node = boon_document_model::DocumentNodeId(a0_node.clone());
+        let b0_doc_node = boon_document_model::DocumentNodeId(b0_node.clone());
+        assert!(
+            touched_nodes.contains(&a0_doc_node),
+            "render-scene sidecar must replace the previously selected A0 node"
+        );
+        assert!(
+            touched_nodes.contains(&b0_doc_node),
+            "render-scene sidecar must replace the newly selected B0 node"
+        );
+
+        let mut patch_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let sidecar = preview_input_overlay_render_scene_patch_from_base(
+            &post_frame,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+            &touched_nodes,
+            920,
+            720,
+            &mut patch_columns,
+        )
+        .expect("cell selection overlay should produce a render-scene sidecar");
+        let replaced_nodes = sidecar
+            .patch
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                boon_document::RenderScenePatchOperation::ReplaceNodeEntries { nodes, .. } => {
+                    Some(nodes)
+                }
+                _ => None,
+            })
+            .expect("input overlay sidecar should replace touched node entries");
+        assert!(replaced_nodes.contains(&a0_doc_node));
+        assert!(replaced_nodes.contains(&b0_doc_node));
+
+        let initial_base_frame =
+            preview_frame_with_viewport_background(&initial_frame, 920.0, 720.0);
+        let mut base_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let mut patched_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &initial_base_frame,
+            920,
+            720,
+            &mut base_columns,
+        );
+        patched_scene.apply_patch(&sidecar.patch).unwrap();
+
+        let mut full_overlay_frame = post_frame.clone();
+        preview_apply_hover_overlay_to_render_frame(&mut full_overlay_frame, &hover_overlay);
+        preview_apply_focus_overlay_lookup_to_render_frame(
+            &mut full_overlay_frame,
+            &overlay_lookup,
+            &focus_overlay,
+        );
+        let full_overlay_frame =
+            preview_frame_with_viewport_background(&full_overlay_frame, 920.0, 720.0);
+        let mut full_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let full_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &full_overlay_frame,
+            920,
+            720,
+            &mut full_columns,
+        );
+
+        let primitives_for = |scene: &boon_document::RenderScene, node: &str| {
+            scene
+                .visual_primitives
+                .iter()
+                .filter(|primitive| primitive.node.0 == node)
+                .map(|primitive| {
+                    (
+                        primitive.primitive,
+                        primitive.color,
+                        primitive.stroke_width.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            primitives_for(&patched_scene, &a0_node),
+            primitives_for(&full_scene, &a0_node),
+            "patched stale scene must clear A0 selected visual primitives"
+        );
+        assert_eq!(
+            primitives_for(&patched_scene, &b0_node),
+            primitives_for(&full_scene, &b0_node),
+            "patched stale scene must apply B0 selected visual primitives"
         );
     }
 
@@ -78858,7 +80397,7 @@ document:
             "{response}"
         );
         assert_eq!(
-            response["outputs"][0]["framebuffer_delta_evidence"]["before_state_hash"],
+            response["outputs"][0]["framebuffer_delta_evidence"]["state_summary_delta_evidence"]["before_state_summary_hash"],
             json!("omitted-for-compact-response"),
             "{response}"
         );
@@ -83064,10 +84603,58 @@ document:
         );
         assert_eq!(input_state.focused_node.as_deref(), Some(b0_node.as_str()));
         let frame = latest_preview_frame(&shared_render_state);
+        let formula_address_text = frame
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.is_some()
+                    && f64::from(item.bounds.y) < 50.0
+                    && f64::from(item.bounds.x) < 60.0
+            })
+            .and_then(|item| item.text.clone());
+        assert_eq!(
+            formula_address_text.as_deref(),
+            Some("B0"),
+            "clicking B0 should patch the retained formula-bar address label, not leave the initial A0 label"
+        );
+        let formula_address_node = frame
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.as_deref() == Some("B0")
+                    && f64::from(item.bounds.y) < 50.0
+                    && f64::from(item.bounds.x) < 50.0
+            })
+            .map(|item| item.node.clone())
+            .expect("formula-bar address label node should be present after B0 selection");
+        assert!(
+            preview_retained_bound_sync_text_update_nodes().contains(&formula_address_node),
+            "formula-bar address label must be part of retained text update nodes so direct WGPU render-scene patches replace its old glyphs"
+        );
+        let formula_fx_text = frame
+            .display_list
+            .iter()
+            .find(|item| {
+                item.text.is_some()
+                    && f64::from(item.bounds.y) < 50.0
+                    && f64::from(item.bounds.x) >= 50.0
+                    && f64::from(item.bounds.x) < 80.0
+            })
+            .and_then(|item| item.text.clone());
+        assert_eq!(
+            formula_fx_text.as_deref(),
+            Some("fx"),
+            "clicking B0 must not rewrite the formula-bar fx label while patching the address label"
+        );
         assert_eq!(
             frame_text_for_node(&frame, &formula_node).as_deref(),
             Some("=add(A0,A1)"),
             "clicking B0 should patch the retained formula-bar text input, not only runtime state or a fresh relower"
+        );
+        assert!(
+            preview_retained_bound_sync_text_update_nodes()
+                .contains(&boon_document_model::DocumentNodeId(formula_node.clone())),
+            "formula-bar text input must be part of retained text update nodes so direct WGPU render-scene patches replace its old glyphs"
         );
         let shared = shared_render_state.lock().unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
@@ -83140,6 +84727,72 @@ document:
             selected_cells,
             vec![b0_node],
             "clicking B0 should visually select only that cell display item"
+        );
+    }
+
+    #[test]
+    fn cells_focus_only_route_syncs_formula_bar_text() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-focus-only-formula-bar-sync",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (_, _, b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let (_, _, formula_node) = formula_bar_input_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let event = boon_runtime::LiveSourceEvent {
+            source: "cell.sources.editor.select".to_owned(),
+            address: Some("B0".to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        };
+        let output = live_runtime
+            .lock()
+            .unwrap()
+            .apply_source_event_for_document_window(event.clone(), 0, 16, 0, 16)
+            .unwrap();
+        assert_eq!(output.state_summary["store"]["selected_address"], "B0");
+        assert_eq!(
+            output.state_summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+
+        let changed = preview_update_shared_focus_node_from_runtime_state(
+            &shared_render_state,
+            &json!({
+                "target_node": b0_node,
+                "source_intent": {"intent": "focus"}
+            }),
+            &event,
+            &output.state_summary,
+        )
+        .unwrap();
+
+        assert!(
+            changed,
+            "focus-only retained patch should update selection-dependent formula bar bindings"
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &formula_node).as_deref(),
+            Some("=add(A0,A1)"),
+            "focus-only cell selection must patch the main formula input above the grid"
         );
     }
 
@@ -84041,6 +85694,77 @@ document:
         assert_eq!(
             artifact_key, "cells-retained-frame",
             "artifact-backed layouts without a retained override keep the stable layout hash key"
+        );
+    }
+
+    #[test]
+    fn direct_input_overlay_base_scene_lookup_uses_retained_content_revision() {
+        let render_scene = boon_document::RenderScene {
+            viewport: boon_document::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 200.0,
+            },
+            items: Vec::new(),
+            visual_primitives: Vec::new(),
+            quad_batches: Vec::new(),
+            text_runs: Vec::new(),
+            metrics: boon_document::RenderSceneMetrics::default(),
+        };
+        let mut cache = PreviewRenderSceneCache::new();
+        let stale_key = (
+            "stale-render-frame-hash".to_owned(),
+            320,
+            200,
+            "cached-derived-retained-keys".to_owned(),
+            "none".to_owned(),
+        );
+        let current_key = (
+            "current-render-frame-hash".to_owned(),
+            320,
+            200,
+            "cached-derived-retained-keys".to_owned(),
+            "none".to_owned(),
+        );
+        cache.insert(
+            stale_key.clone(),
+            (
+                "cells-retained-frame".to_owned(),
+                "stale-scene-hash".to_owned(),
+                render_scene.clone(),
+            ),
+        );
+        cache.insert(
+            current_key.clone(),
+            (
+                "cells-retained-frame:retained-content-revision:5".to_owned(),
+                "current-scene-hash".to_owned(),
+                render_scene,
+            ),
+        );
+
+        assert_eq!(
+            preview_cached_render_scene_key_for_layout_hash(
+                &cache,
+                "cells-retained-frame:retained-content-revision:5",
+                320,
+                200,
+                "cached-derived-retained-keys",
+            ),
+            Some(current_key),
+            "direct input-overlay rendering must not reuse a pre-sync base scene after retained formula-bar text changes"
+        );
+        assert!(
+            preview_cached_render_scene_key_for_layout_hash(
+                &cache,
+                "cells-retained-frame",
+                320,
+                200,
+                "cached-derived-retained-keys",
+            )
+            .is_some(),
+            "plain layout-hash lookups are still allowed for artifact-backed frames without retained content"
         );
     }
 

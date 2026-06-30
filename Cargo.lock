@@ -561,6 +561,11 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_plan",
+ "boon_typecheck",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -714,12 +719,20 @@ dependencies = [
 name = "boon_plan"
 version = "0.1.0"
 dependencies = [
- "boon_ir",
- "boon_parser",
- "boon_typecheck",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "boon_plan_executor"
+version = "0.1.0"
+dependencies = [
+ "boon_plan",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -759,12 +772,11 @@ dependencies = [
  "boon_bridge",
  "boon_compiler",
  "boon_ir",
- "boon_parser",
  "boon_plan",
+ "boon_plan_executor",
  "boon_report_schema",
  "boon_scene_model",
  "boon_solid_model",
- "boon_typecheck",
  "bytes",
  "serde",
  "serde_json",

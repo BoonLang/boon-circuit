@@ -4,26 +4,137 @@
 
 use bitvec::prelude::*;
 use boon_bridge::{BridgeBlobRef, BridgePageRef, BridgeTaskCompletion, BridgeValue};
-use boon_compiler::compile_typed_program;
-#[cfg(test)]
-use boon_ir::lower;
-use boon_ir::{
-    BytesScalarArg, DerivedValueKind, FieldId, FunctionDefinition, InitialValue,
-    ListAppendFieldValue, ListId, ListInitialRecord, ListInitializer, ListOperationKind,
-    ListPredicate, ListProjectionKind, ScopeId, SourceId, SourcePayloadField, StateId,
-    TypedProgram, UpdateExpression, UpdateGuard, UpdateMatchArm, UpdateValueExpression,
-    UpdateValueMatchArm, ViewBindingKind, debug_tables, lower_profiled, lower_runtime_profiled,
-    verify_hidden_identity, verify_static_schedule,
-};
-use boon_parser::{
+use boon_compiler::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
-    BytesSizeSyntax, DocumentAst, ParsedProgram, parse_project, parse_source,
+    BytesSizeSyntax, CompiledSourceReportContext, CompilerBytesScalarArg as BytesScalarArg,
+    CompilerDerivedEquationPlan, CompilerDerivedTextExpression, CompilerDerivedTextTransform,
+    CompilerDerivedValueKind as DerivedValueKind, CompilerDocumentRenderSlots,
+    CompilerFieldSlotCollisionDiagnostic, CompilerFieldValue, CompilerGenericDerivedPlan,
+    CompilerInitialValue, CompilerListAppendFieldValue, CompilerListOperation,
+    CompilerListOperationKind, CompilerListPredicate, CompilerListProjection,
+    CompilerListProjectionKind, CompilerListSourceBindingSlot, CompilerListSummaryFields,
+    CompilerRuntimeGenericArg, CompilerRuntimeGenericDerivedPlan, CompilerRuntimeGenericExpr,
+    CompilerRuntimeGenericFunction, CompilerRuntimeGenericIndexedField,
+    CompilerRuntimeGenericOutputRoot, CompilerRuntimeGenericRecordExprField,
+    CompilerRuntimeGenericRecordField, CompilerRuntimeGenericRootField,
+    CompilerRuntimeGenericStatement, CompilerRuntimeProfileMetadata, CompilerRuntimeProgram,
+    CompilerRuntimeSymbols, CompilerScalarEquationPlan, CompilerScalarUpdateExpression,
+    CompilerSourcePayloadCounts, CompilerSourcePayloadField, CompilerSourceRouteBoolFacts,
+    CompilerSourceRouteRootTextTransform, CompilerSourceRouteRouterRoute,
+    CompilerSourceRouteSource, CompilerSourceUnit, CompilerStaticProgramAnalysis,
+    CompilerStorageIndexedDerivedFields, CompilerStorageIndexedRowInitialReset,
+    CompilerStorageInitialRow, CompilerStorageInitialRows, CompilerStorageListInitializerKind,
+    CompilerStorageListSlot, CompilerStorageRootSlot, CompilerStorageRowTemplate,
+    CompilerTypecheckReportMetadata, CompilerTypedProgramInventoryCounts,
+    CompilerTypedProgramReportMetadata, CompilerTypedStorageLayoutCounts,
+    CompilerUnsupportedRuntimeDiagnostics, CompilerUpdateGuard as UpdateGuard,
+    CompilerUpdateMatchArm as UpdateMatchArm,
+    CompilerUpdateValueExpression as UpdateValueExpression,
+    CompilerUpdateValueMatchArm as UpdateValueMatchArm, DocumentAst, ParsedProgram,
+    compile_source_path_to_full_ir, compile_source_path_to_machine_plan,
+    compile_source_text_to_full_ir, compile_source_text_to_runtime_ir,
+    compile_source_units_to_full_ir, compile_source_units_to_runtime_ir,
+    compiler_ir_debug_report_from_path, compiler_parsed_document,
+    compiler_source_files_for_manifest_source, compiler_source_text_for_manifest_source,
+    compiler_source_text_for_path, compiler_source_units_for_manifest_source,
+    compiler_source_units_for_path, parse_scenario_file as compiler_parse_scenario_file,
 };
+#[cfg(test)]
+use boon_compiler::{
+    compile_parsed_program_to_runtime_ir, compiler_derived_equation_plan_from_ir,
+    compiler_generic_derived_plan_from_ir, compiler_list_projections_from_ir,
+    compiler_runtime_program_from_ir, compiler_source_route_root_text_transform_targets_from_ir,
+    compiler_source_route_router_targets_from_ir, compiler_source_route_sources_from_ir,
+    compiler_storage_indexed_derived_fields_from_ir,
+    compiler_storage_indexed_row_initial_resets_from_ir, compiler_storage_initial_rows_from_ir,
+    compiler_storage_list_slots_from_ir, compiler_storage_root_slots_from_ir,
+    compiler_storage_row_templates_from_ir, compiler_typed_program_inventory_counts_from_ir,
+    compiler_typed_program_report_metadata_from_ir, parse_project, parse_source,
+};
+#[cfg(test)]
+use boon_ir::TypedProgram;
+#[cfg(test)]
+use boon_ir::{lower, lower_profiled};
 use boon_plan::{
-    InitialValueKind as PlanInitialValueKind, MachinePlan, PlanConstantId, PlanConstantValue,
-    PlanDerivedExpression, PlanExpressionKind, PlanListProjection, PlanOpKind, PlanRowExpression,
-    PlanRowSelectPattern, PlanSourceGuard, PlanValueType, RegionKind, TargetProfile, ValueRef,
-    plan_sha256, verify_plan,
+    FieldId, InitialValueKind as PlanInitialValueKind, ListId, MachinePlan, PlanConstantId,
+    PlanConstantValue, PlanDerivedExpression, PlanExpressionKind, PlanOpKind, PlanRowExpression,
+    PlanRowSelectPattern, PlanValueType, RegionKind, SourceId, SourcePayloadField, StateId,
+    TargetProfile, ValueRef, plan_sha256, verify_plan,
+};
+use boon_plan_executor::{
+    IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
+    IndexedUpdateBranchExecution, IndexedUpdateTargetEvent, IndexedUpdateTargetOverride,
+    ListProjectionExecution, ListRetainExecution, ListRowDefaultFields, PlanExecutorBytes,
+    PlanExecutorListRowState, PlanExecutorLiveSourceEvent, PlanExecutorLiveSourceEventExpectedToml,
+    PlanExecutorRootState, PlanExecutorScenarioCheckpointCellExpectation,
+    PlanExecutorScenarioCheckpointErrorExpectation, PlanExecutorScenarioCheckpointInput,
+    PlanExecutorScenarioStepMeta, RootBytesEnvironment, RootBytesFixedMutation,
+    RootBytesUpdateDispatchKind, RootExecutedUpdate, RootJsonSourceEvent,
+    RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput,
+    RootScenarioLegacyStepComparisonInput, RootUpdateCandidateTracker,
+    ScenarioEventsCommandOutputInput, SourceRouteCommandOutputInput, SourceRouteExecutionContext,
+    SourceRouteExecutionSurface, SourceRouteFullExecution, SourceRouteRuntimeBranchExecutionInput,
+    SourceRouteSourceEventReportInput,
+    append_list_rows_for_derived_values_with as append_plan_list_rows_for_derived_values_with,
+    assemble_initial_state_report as assemble_plan_initial_state_report,
+    assemble_root_runtime_branch_update as assemble_plan_root_runtime_branch_update,
+    assemble_root_scenario_command_output as assemble_plan_root_scenario_command_output,
+    assemble_root_scenario_coverage_report as assemble_plan_root_scenario_coverage_report,
+    assemble_root_scenario_legacy_comparison as assemble_plan_root_scenario_legacy_comparison,
+    assemble_root_scenario_report as assemble_plan_root_scenario_report,
+    assemble_root_scenario_step_report as assemble_plan_root_scenario_step_report,
+    assemble_scenario_events_command_output as assemble_plan_scenario_events_command_output,
+    assemble_source_derived_step_deltas as assemble_plan_source_derived_step_deltas,
+    assemble_source_route_command_output as assemble_plan_source_route_command_output,
+    assemble_source_route_legacy_comparison as assemble_plan_source_route_legacy_comparison,
+    assemble_source_route_runtime_branch_execution as assemble_plan_source_route_runtime_branch_execution,
+    assert_live_source_event_matches_expected as assert_plan_live_source_event_matches_expected,
+    assert_scenario_checkpoint as assert_plan_scenario_checkpoint,
+    build_live_source_event_expected_toml as build_plan_live_source_event_expected_toml,
+    coalesce_field_set_deltas as coalesce_plan_field_set_deltas,
+    collect_root_update_candidate_for_step as collect_plan_root_update_candidate_for_step,
+    commit_ordered_root_update_candidates as commit_plan_ordered_root_update_candidates,
+    decode_expected_source_event as decode_plan_expected_source_event,
+    demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
+    evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
+    evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
+    evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
+    evaluate_root_bytes_write_update,
+    evaluate_root_pure_number_compare_values as evaluate_root_pure_number_compare_values_core,
+    execute_indexed_update_batch_with as execute_plan_indexed_update_batch_with,
+    execute_initial_state as execute_plan_initial_state_core,
+    execute_source_route_with_runtime_callbacks as execute_plan_source_route_with_runtime_callbacks,
+    field_label as plan_field_label,
+    indexed_field_has_fixed_byte_bank as plan_indexed_field_has_fixed_byte_bank,
+    indexed_fixed_byte_bank_len as plan_indexed_fixed_byte_bank_len,
+    indexed_state_has_fixed_byte_bank as plan_indexed_state_has_fixed_byte_bank,
+    initial_list_next_keys as initial_plan_list_next_keys,
+    initialize_root_state as initialize_plan_root_state, list_label as plan_list_label,
+    list_row_default_fields as plan_list_row_default_fields,
+    list_row_state_public_rows as plan_list_row_state_public_rows,
+    list_row_state_report_fields as plan_list_row_state_report_fields, local_field_name,
+    materialize_list_projections as materialize_plan_list_projections_core,
+    materialize_list_retains as materialize_plan_list_retains_core,
+    plan_constant_bytes_for_storage_slot as plan_executor_constant_bytes_for_storage_slot,
+    plan_constant_json_value as plan_executor_constant_json_value,
+    plan_constant_value_bytes as plan_executor_constant_value_bytes,
+    plan_constant_value_json_value as plan_executor_constant_value_json_value,
+    prepare_root_scenario_step as prepare_plan_root_scenario_step,
+    refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
+    refresh_list_row_expression_fields_best_effort_with as refresh_plan_list_row_expression_fields_best_effort_with,
+    refresh_list_row_expression_fields_with as refresh_plan_list_row_expression_fields_with,
+    refresh_list_row_initial_state_fields as refresh_plan_list_row_initial_state_fields,
+    remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
+    root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
+    row_expression_applies_to_list as plan_row_expression_applies_to_list,
+    row_source_binding_id as plan_row_source_binding_id_core,
+    select_explicit_root_scenario_steps as select_plan_explicit_root_scenario_steps,
+    select_scenario_event_steps as select_plan_scenario_event_steps,
+    semantic_delta_signature as plan_json_delta_signature,
+    semantic_field_label as plan_semantic_field_label,
+    source_guard_matches as plan_executor_source_guard_matches,
+    state_label_by_id as plan_state_label, summarize_plan_lists as summarize_plan_lists_core,
+    validate_source_payload_bytes_field_name as validate_plan_source_payload_bytes_field_name,
 };
 use boon_scene_model::{
     AppearanceMaterial, AppearanceMaterialId, Bounds3D, Camera, CameraId, CameraProjection,
@@ -50,6 +161,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub use boon_compiler::{
+    CompilerRowScope as RuntimeRowScope,
+    CompilerStaticProgramAnalysis as RuntimeStaticProgramAnalysis,
+    CompilerViewBinding as RuntimeViewBinding, CompilerViewBindingKind as RuntimeViewBindingKind,
+};
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
 type RootReadKeys = SmallVec<[GenericReadKey; 3]>;
@@ -236,6 +353,42 @@ fn record_runtime_bytes_zero_fill(byte_len: usize) {
     }
 }
 
+fn record_runtime_bytes_executor_copy_cost(executor_report: &JsonValue) {
+    let Some(cost) = executor_report.get("bytes_copy_cost") else {
+        return;
+    };
+    if let Some(count) = cost
+        .get("copy_from_slice_count")
+        .and_then(JsonValue::as_u64)
+    {
+        BYTES_COPY_FROM_SLICE_COUNT.fetch_add(count, Ordering::Relaxed);
+    }
+    if let Some(bytes) = cost
+        .get("copy_from_slice_bytes")
+        .and_then(JsonValue::as_u64)
+    {
+        BYTES_COPY_FROM_SLICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+    if let Some(count) = cost.get("vec_alloc_count").and_then(JsonValue::as_u64) {
+        BYTES_VEC_ALLOC_COUNT.fetch_add(count, Ordering::Relaxed);
+    }
+    if let Some(bytes) = cost.get("vec_alloc_bytes").and_then(JsonValue::as_u64) {
+        BYTES_VEC_ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+    if let Some(count) = cost.get("vec_clone_count").and_then(JsonValue::as_u64) {
+        BYTES_VEC_CLONE_COUNT.fetch_add(count, Ordering::Relaxed);
+    }
+    if let Some(bytes) = cost.get("vec_clone_bytes").and_then(JsonValue::as_u64) {
+        BYTES_VEC_CLONE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+    if let Some(count) = cost.get("zero_fill_count").and_then(JsonValue::as_u64) {
+        BYTES_ZERO_FILL_COUNT.fetch_add(count, Ordering::Relaxed);
+    }
+    if let Some(bytes) = cost.get("zero_fill_bytes").and_then(JsonValue::as_u64) {
+        BYTES_ZERO_FILL_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 fn allocation_snapshot() -> AllocationSnapshot {
     AllocationSnapshot {
         count: ALLOC_COUNT.load(Ordering::Relaxed),
@@ -331,70 +484,25 @@ impl<'a> GenericSourceEvent<'a> {
         let Some(expected) = &step.expected_source_event else {
             return Ok(None);
         };
-        let source = toml_string_ref(expected, "source")
-            .ok_or_else(|| format!("{} expected_source_event missing source", step.id))?;
-        let mut payload = BTreeMap::new();
-        let mut payload_bytes = BTreeMap::new();
-        for (key, value) in expected {
-            if matches!(
-                key.as_str(),
-                "source"
-                    | "text"
-                    | "key"
-                    | "target_text"
-                    | "address"
-                    | "target_occurrence"
-                    | "target_key"
-                    | "target_generation"
-                    | "bind_epoch"
-                    | "source_id"
-                    | "source_epoch"
-                    | "list_id"
-            ) {
-                continue;
-            }
-            if let Some(field) = source_payload_bytes_field_from_toml_key(key)? {
-                let value = value.as_str().ok_or_else(|| {
-                    format!(
-                        "{} expected_source_event `{key}` BYTES payload must be hex text",
-                        step.id
-                    )
-                })?;
-                let bytes = bytes_decode_hex(value).map_err(|error| match error {
-                    BoonValue::Error(code) => format!(
-                        "{} expected_source_event `{key}` has invalid hex BYTES payload: {code}",
-                        step.id
-                    ),
-                    _ => format!(
-                        "{} expected_source_event `{key}` has invalid hex BYTES payload",
-                        step.id
-                    ),
-                })?;
-                payload_bytes.insert(field, bytes);
-                continue;
-            }
-            if let Some(value) = value.as_str() {
-                payload.insert(key.clone(), value);
-            }
-        }
+        let decoded = decode_plan_expected_source_event(&step.id, expected)?;
         Ok(Some(Self {
-            source,
-            text: toml_string_ref(expected, "text"),
-            key: toml_string_ref(expected, "key"),
-            list_id: toml_string_ref(expected, "list_id"),
-            target_text: toml_string_ref(expected, "target_text"),
-            target_occurrence: toml_usize_ref(expected, "target_occurrence"),
-            target_key: toml_u64_ref(expected, "target_key"),
-            target_generation: toml_u64_ref(expected, "target_generation"),
-            bind_epoch: toml_u64_ref(expected, "bind_epoch"),
-            address: toml_string_ref(expected, "address"),
-            source_epoch: toml_u64_ref(expected, "source_epoch"),
-            payload,
-            payload_bytes,
-            pointer_x: toml_string_ref(expected, "pointer_x"),
-            pointer_y: toml_string_ref(expected, "pointer_y"),
-            pointer_width: toml_string_ref(expected, "pointer_width"),
-            pointer_height: toml_string_ref(expected, "pointer_height"),
+            source: decoded.source,
+            text: decoded.text,
+            key: decoded.key,
+            list_id: decoded.list_id,
+            target_text: decoded.target_text,
+            target_occurrence: decoded.target_occurrence,
+            target_key: decoded.target_key,
+            target_generation: decoded.target_generation,
+            bind_epoch: decoded.bind_epoch,
+            address: decoded.address,
+            source_epoch: decoded.source_epoch,
+            payload: decoded.payload,
+            payload_bytes: decoded.payload_bytes,
+            pointer_x: decoded.pointer_x,
+            pointer_y: decoded.pointer_y,
+            pointer_width: decoded.pointer_width,
+            pointer_height: decoded.pointer_height,
         }))
     }
 
@@ -409,35 +517,14 @@ impl<'a> GenericSourceEvent<'a> {
     }
 }
 
-fn source_payload_bytes_field_from_toml_key(key: &str) -> RuntimeResult<Option<String>> {
-    if key == "bytes_hex" {
-        return Ok(Some("bytes".to_owned()));
-    }
-    if key.ends_with("_bytes_hex") {
-        return Err(format!(
-            "named BYTES source payload key `{key}` is not supported in v1; use the reserved `bytes_hex` key"
-        )
-        .into());
-    }
-    Ok(None)
-}
-
-fn source_payload_bytes_toml_key(field: &str) -> String {
-    if field == "bytes" {
-        "bytes_hex".to_owned()
-    } else {
-        format!("{field}_bytes_hex")
-    }
-}
-
-fn validate_source_payload_bytes_field_name(field: &str) -> RuntimeResult<()> {
-    if field == "bytes" {
-        return Ok(());
-    }
-    Err(format!(
-        "named BYTES source payload key `{field}` is not supported in v1; use the reserved `bytes` key"
-    )
-    .into())
+fn plan_executor_scenario_step_meta(steps: &[ScenarioStep]) -> Vec<PlanExecutorScenarioStepMeta> {
+    steps
+        .iter()
+        .map(|step| PlanExecutorScenarioStepMeta {
+            id: step.id.clone(),
+            has_expected_source_event: step.expected_source_event.is_some(),
+        })
+        .collect()
 }
 
 fn validate_live_source_event_payload_bytes_fields(
@@ -445,7 +532,7 @@ fn validate_live_source_event_payload_bytes_fields(
     context: &str,
 ) -> RuntimeResult<()> {
     for field in event.payload_bytes.keys() {
-        validate_source_payload_bytes_field_name(field)
+        validate_plan_source_payload_bytes_field_name(field)
             .map_err(|error| format!("{context}: {error}"))?;
     }
     Ok(())
@@ -3134,49 +3221,12 @@ impl Serialize for RenderTarget<'_> {
     }
 }
 
-pub fn load_and_lower(source_path: &Path) -> RuntimeResult<(ParsedProgram, TypedProgram)> {
-    let (parsed, ir, _) = load_and_lower_profiled(source_path)?;
-    Ok((parsed, ir))
-}
-
-pub fn load_and_lower_profiled(
-    source_path: &Path,
-) -> RuntimeResult<(ParsedProgram, TypedProgram, JsonValue)> {
-    let total_started = Instant::now();
-    let parse_started = Instant::now();
-    let parsed = parse_source_path_or_manifest_project(source_path)?;
-    let parse_ms = runtime_elapsed_ms(parse_started);
-    let lower_started = Instant::now();
-    let (ir, lower_profile) = lower_profiled(&parsed)?;
-    let lower_ms = runtime_elapsed_ms(lower_started);
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = runtime_elapsed_ms(verify_started);
-    let source_unit_count = parsed.files.len();
-    let expression_count = ir.expression_count;
-    let graph_node_count = ir.graph_node_count;
-    Ok((
-        parsed,
-        ir,
-        json!({
-            "cache_hit": false,
-            "source_unit_count": source_unit_count,
-            "parse_ms": parse_ms,
-            "lower_ms": lower_ms,
-            "lower_profile": lower_profile,
-            "verify_ms": verify_ms,
-            "expression_count": expression_count,
-            "graph_node_count": graph_node_count,
-            "total_ms": runtime_elapsed_ms(total_started)
-        }),
-    ))
-}
-
+#[cfg(test)]
 fn lower_for_runtime(program: &ParsedProgram) -> RuntimeResult<TypedProgram> {
-    Ok(lower_runtime_profiled(program)?.0)
+    Ok(compile_parsed_program_to_runtime_ir(program.clone())?.ir)
 }
 
+#[cfg(test)]
 fn parse_source_path_or_manifest_project(source_path: &Path) -> RuntimeResult<ParsedProgram> {
     let units = source_units_for_path(source_path)?;
     if units.len() <= 1 {
@@ -3193,19 +3243,7 @@ fn parse_source_path_or_manifest_project(source_path: &Path) -> RuntimeResult<Pa
 }
 
 pub fn ir_debug_report(source_path: &Path) -> RuntimeResult<JsonValue> {
-    let (_parsed, ir) = load_and_lower(source_path)?;
-    Ok(json!({
-        "status": "pass",
-        "measurement_mode": "diagnostic",
-        "program_kind": "generic",
-        "expression_count": ir.expression_count,
-        "graph_node_count": ir.graph_node_count,
-        "semantic_index": ir.semantic_index.report(),
-        "hidden_identity_verified": ir.hidden_identity_verified,
-        "static_schedule_verified": ir.static_schedule_verified,
-        "nodes": ir.nodes,
-        "debug_tables": debug_tables(&ir),
-    }))
+    Ok(compiler_ir_debug_report_from_path(source_path)?)
 }
 
 pub fn emit_compiled_artifact(
@@ -3213,14 +3251,16 @@ pub fn emit_compiled_artifact(
     out_path: &Path,
     report_path: Option<&Path>,
 ) -> RuntimeResult<JsonValue> {
-    let (parsed, ir) = load_and_lower(source_path)?;
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiler_output = compile_source_path_to_full_ir(source_path)?;
+    let parsed = compiler_output.parsed;
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let program_hash = report_source_hash_for_parsed(&parsed);
-    let typecheck_hash = typecheck_report_hash(&ir);
-    let render_slot_hash = render_slot_table_hash(&ir);
+    let program_metadata = compiled.source_program_metadata("compiled artifact emission");
+    let typecheck_metadata = compiled.source_typecheck_metadata("compiled artifact emission");
+    let typecheck_hash = typecheck_metadata.typecheck_report_hash.clone();
+    let render_slot_hash = typecheck_metadata.render_slot_table_hash.clone();
     let artifact = CompiledArtifact::from_parts(
         &parsed,
-        &ir,
         &compiled,
         &program_hash,
         &typecheck_hash,
@@ -3253,8 +3293,8 @@ pub fn emit_compiled_artifact(
         "program_kind": parsed.kind.as_str(),
         "program_file_count": parsed.files.len(),
         "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-        "graph_node_count": ir.graph_node_count,
-        "semantic_index": ir.semantic_index.report(),
+        "graph_node_count": program_metadata.graph_node_count,
+        "semantic_index": program_metadata.semantic_index,
         "compiled_schedule": compiled.report(),
         "compiled_artifact": {
             "path": out_path.display().to_string(),
@@ -3417,13 +3457,15 @@ pub fn verify_expression_bytecode_report(
     scenario_path: &Path,
     report_path: Option<&Path>,
 ) -> RuntimeResult<JsonValue> {
-    let (parsed, ir) = load_and_lower(source_path)?;
+    let compiler_output = compile_source_path_to_full_ir(source_path)?;
+    let parsed = compiler_output.parsed;
     let scenario = parse_scenario(scenario_path)?;
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let program_hash = report_source_hash_for_parsed(&parsed);
     let source_hash = report_source_hash_for_parsed(&parsed);
     let scenario_hash = sha256_file(scenario_path)?;
-    let expression_bytecode = scalar_expression_bytecode_report(&ir, &compiled, &scenario)?;
+    let expression_bytecode = scalar_expression_bytecode_report(&compiled, &scenario)?;
+    let program_metadata = compiled.source_program_metadata("verify bytecode report");
     let parity_passed = expression_bytecode
         .get("parity_passed")
         .and_then(JsonValue::as_bool)
@@ -3453,11 +3495,11 @@ pub fn verify_expression_bytecode_report(
         "program_file_count": parsed.files.len(),
         "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
         "budget_hash": "n/a",
-        "graph_node_count": ir.graph_node_count,
-        "semantic_index": ir.semantic_index.report(),
+        "graph_node_count": program_metadata.graph_node_count,
+        "semantic_index": program_metadata.semantic_index,
         "compiled_schedule": compiled.report(),
-        "expression_count": ir.expression_count,
-        "expression_coverage": &ir.expression_coverage,
+        "expression_count": program_metadata.expression_count,
+        "expression_coverage": program_metadata.expression_coverage,
         "total_ticks": scenario.step.len(),
         "per_step_pass_fail": [{
             "id": "expression-bytecode-interpreter-parity",
@@ -3473,8 +3515,7 @@ pub fn verify_expression_bytecode_report(
 }
 
 pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
-    let text = fs::read_to_string(path)?;
-    Ok(toml::from_str(&text)?)
+    compiler_parse_scenario_file::<Scenario>(path)
 }
 
 pub fn run_scenario(
@@ -3483,23 +3524,39 @@ pub fn run_scenario(
     layer: VerificationLayer,
     report_path: Option<&Path>,
 ) -> RuntimeResult<RunOutput> {
-    let (parsed, ir, load_pipeline_profile) = load_and_lower_profiled(source_path)?;
+    let compiler_output = compile_source_path_to_full_ir(source_path)?;
+    let report_context = compiler_output.report_context();
+    let parsed = compiler_output.parsed;
     let scenario = parse_scenario(scenario_path)?;
     let started = Instant::now();
-    let output = run_loaded_scenario(&parsed, &ir, &scenario, layer)?;
+    let compile_started = Instant::now();
+    let compiled_program =
+        CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let output = run_loaded_scenario_with_compiled(
+        &parsed,
+        &compiled_program,
+        Some(&report_context),
+        compile_ms,
+        &scenario,
+        layer,
+    )?;
     let elapsed = started.elapsed();
     let mut report = output.report;
     if let Some(object) = report.as_object_mut() {
-        object.insert("load_pipeline_profile".to_owned(), load_pipeline_profile);
+        object.insert(
+            "load_pipeline_profile".to_owned(),
+            report_context.load_pipeline_profile.clone(),
+        );
     }
     enrich_report(
         &mut report,
         &source_path.display().to_string(),
-        &report_source_hash_for_parsed(&parsed),
+        &report_context,
         scenario_path,
         report_path,
         &parsed,
-        &ir,
+        &compiled_program,
         layer,
         elapsed.as_secs_f64() * 1000.0,
     )?;
@@ -3508,7 +3565,7 @@ pub fn run_scenario(
     }
     Ok(RunOutput {
         report,
-        document: boon_parser::parsed_document(&parsed),
+        document: compiler_parsed_document(&parsed),
         ..output
     })
 }
@@ -3536,10 +3593,10 @@ pub fn run_plan_initial_state(
     target_profile: TargetProfile,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanInitialStateOutput> {
-    let (parsed, ir) = load_and_lower(source_path)?;
-    let plan = compile_typed_program(&ir, target_profile)?;
+    let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
+    let report_context = compiled.report_context();
+    let plan = compiled.plan;
     let output = execute_machine_plan_initial_state_inner(&plan)?;
-    let source_hash = report_source_hash_for_parsed(&parsed);
     let report = json!({
         "status": "pass",
         "report_version": 1,
@@ -3552,14 +3609,15 @@ pub fn run_plan_initial_state(
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source_path.display().to_string(),
-        "source_hash": source_hash,
-        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+        "source_hash": report_context.source_hash,
+        "source_files": report_context.source_files,
         "scenario_hash": "n/a",
-        "program_hash": report_source_hash_for_parsed(&parsed),
-        "program_kind": parsed.kind.as_str(),
-        "program_file_count": parsed.files.len(),
+        "program_hash": report_context.program_hash,
+        "program_kind": report_context.program_kind,
+        "program_file_count": report_context.program_file_count,
         "budget_hash": "n/a",
-        "graph_node_count": ir.graph_node_count,
+        "graph_node_count": report_context.graph_node_count,
+        "load_pipeline_profile": report_context.load_pipeline_profile,
         "target_profile": target_profile.as_str(),
         "plan_hash": output.plan_hash,
         "plan_version": plan.version,
@@ -3605,33 +3663,88 @@ pub fn run_plan_source_route(
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRouteOutput> {
     validate_live_source_event_payload_bytes_fields(&event, "run-plan-route source event")?;
-    let (parsed, ir) = load_and_lower(source_path)?;
-    let plan = compile_typed_program(&ir, target_profile)?;
-    let output = execute_machine_plan_source_route_inner(
+    let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
+    let report_context = compiled.report_context();
+    let plan = compiled.plan;
+    let root_json_event = root_json_source_event_from_live(&event);
+    let host_file_root = source_path.parent();
+    let output = execute_plan_source_route_with_runtime_callbacks(
         &plan,
         source_route,
         target_state,
-        &event,
-        source_path.parent(),
+        &root_json_event,
+        |route_context: &SourceRouteExecutionContext,
+         _execution_surface: &SourceRouteExecutionSurface,
+         source_route_json_execution_report: &JsonValue| {
+            let (root_state, _, _) = plan_root_scalar_initial_state(&plan)?;
+            let executed = execute_root_scalar_update_branch(
+                &plan,
+                &route_context.update_op,
+                route_context.selection.source_id,
+                &route_context.source_route_slot,
+                &event,
+                &root_state.root_state,
+                &root_state.private_bytes,
+                &root_state.fixed_byte_banks,
+                host_file_root,
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "selected update branch {} source guard did not match the supplied event",
+                    route_context.update_op.id.0
+                )
+            })?;
+            Ok(assemble_plan_source_route_runtime_branch_execution(
+                SourceRouteRuntimeBranchExecutionInput {
+                    value: executed.value,
+                    expression_kind: executed.expression_kind.to_owned(),
+                    source_payload_field: executed.source_payload_field,
+                    update_constant_id: executed.update_constant_id,
+                    update_constant_value: executed.update_constant_value,
+                    host_effect: executed.host_effect,
+                    state_write_core: executed.state_write_core,
+                    bytes_state_core: executed.bytes_state_core,
+                    runtime_branch_core: executed.executor_core,
+                },
+                source_route_json_execution_report,
+            ))
+        },
+        || {
+            let step = event.clone().into_step(0);
+            let full_execution =
+                execute_machine_plan_root_scenario_inner(&plan, &[&step], host_file_root)?;
+            Ok(SourceRouteFullExecution {
+                state_summary: full_execution.state_summary,
+                semantic_delta_signatures: full_execution.semantic_delta_signatures,
+                semantic_deltas: full_execution.semantic_deltas,
+                per_step: full_execution.per_step,
+                executor_report: full_execution.executor_report,
+            })
+        },
     )?;
-    let source_hash = report_source_hash_for_parsed(&parsed);
-    let units = parsed
-        .files
-        .iter()
-        .map(|file| RuntimeSourceUnit {
-            path: file.path.clone(),
-            source: file.source.clone(),
-        })
-        .collect::<Vec<_>>();
+    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
     let legacy_comparison = if compare_legacy {
         let mut legacy_runtime =
             LiveRuntime::from_project(&source_path.display().to_string(), &units)?;
         let legacy_output = legacy_runtime.apply_source_event(event.clone())?;
-        let legacy_value = json_value_at_dotted_path(&legacy_output.state_summary, target_state)
-            .cloned()
-            .ok_or_else(|| {
-                format!("legacy runtime state summary does not contain `{target_state}`")
-            })?;
+        let route_is_indexed = output
+            .route_surface
+            .get("selected_op_indexed")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let legacy_value = if route_is_indexed {
+            legacy_indexed_route_value_from_deltas(
+                &legacy_output.semantic_deltas,
+                target_state,
+                &event,
+            )?
+        } else {
+            json_value_at_dotted_path(&legacy_output.state_summary, target_state)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("legacy runtime state summary does not contain `{target_state}`")
+                })?
+        };
         let legacy_delta_signatures = legacy_output
             .semantic_deltas
             .iter()
@@ -3645,25 +3758,19 @@ pub fn run_plan_source_route(
             .iter()
             .map(|patch| patch.kind.to_owned())
             .collect::<Vec<_>>();
-        let state_match = legacy_value == output.value;
-        let semantic_delta_match =
-            legacy_delta_signatures == plan_delta_signatures && legacy_deltas == plan_deltas;
-        json!({
-            "enabled": true,
-            "passed": state_match && semantic_delta_match,
-            "state_match": state_match,
-            "semantic_delta_match": semantic_delta_match,
-            "target_state": target_state,
-            "legacy_value": legacy_value,
-            "plan_value": output.value,
-            "legacy_semantic_delta_signatures": legacy_delta_signatures,
-            "legacy_semantic_deltas": legacy_deltas,
-            "plan_semantic_delta_signatures": plan_delta_signatures,
-            "plan_semantic_deltas": plan_deltas,
-            "legacy_render_patch_kinds": legacy_render_patch_kinds,
-            "legacy_semantic_delta_count": legacy_output.semantic_deltas.len(),
-            "legacy_render_patch_count": legacy_output.render_patches.len(),
-        })
+        assemble_plan_source_route_legacy_comparison(
+            target_state,
+            legacy_value,
+            output.value.clone(),
+            legacy_delta_signatures,
+            legacy_deltas,
+            plan_delta_signatures,
+            plan_deltas,
+            legacy_render_patch_kinds,
+            legacy_output.semantic_deltas.len(),
+            legacy_output.render_patches.len(),
+        )
+        .comparison
     } else {
         json!({
             "enabled": false,
@@ -3671,89 +3778,59 @@ pub fn run_plan_source_route(
             "reason": "legacy comparison was not requested"
         })
     };
-    let legacy_passed = legacy_comparison
-        .get("passed")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    let report_status = if legacy_passed { "pass" } else { "fail" };
-    let (source_event, source_event_artifacts) =
-        source_event_report(&event, source_route, output.source_id.0 as u64, report_path)?;
-    let command_argv = run_plan_source_route_command_argv(
-        source_path,
-        target_profile,
-        source_route,
-        target_state,
-        &event,
-        &source_event,
-        compare_legacy,
-        report_path,
-    );
-    let report = json!({
-        "status": report_status,
-        "report_version": 1,
-        "command": "run-plan-route",
-        "command_argv": command_argv,
-        "measurement_mode": "proof",
-        "exit_status": if legacy_passed { 0 } else { 1 },
-        "generated_at_utc": now_string(),
-        "git_commit": git_commit(),
-        "binary_hash": current_binary_hash(),
-        "binary_path": current_binary_path(),
-        "source_path": source_path.display().to_string(),
-        "source_hash": source_hash,
-        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-        "scenario_hash": "n/a",
-        "program_hash": report_source_hash_for_parsed(&parsed),
-        "program_kind": parsed.kind.as_str(),
-        "program_file_count": parsed.files.len(),
-        "budget_hash": "n/a",
-        "graph_node_count": ir.graph_node_count,
-        "target_profile": target_profile.as_str(),
-        "plan_hash": output.plan_hash,
-        "plan_version": plan.version,
-        "capability_summary": plan.capability_summary,
-        "route_surface": output.route_surface,
-        "source_event": source_event,
-        "state_summary": output.state_summary,
-        "semantic_delta_signatures": output.semantic_delta_signatures,
-        "semantic_deltas": output.semantic_deltas,
-        "legacy_comparison": legacy_comparison,
-        "per_step_pass_fail": [
-            {
-                "id": "machine-plan-verified",
-                "pass": true,
-                "detail": "MachinePlan verifier passed before CPU source-route execution"
+    let command_output =
+        assemble_plan_source_route_command_output(SourceRouteCommandOutputInput {
+            current_args: std::env::args().collect::<Vec<_>>(),
+            generated_at_utc: now_string(),
+            git_commit: git_commit(),
+            binary_hash: current_binary_hash(),
+            binary_path: current_binary_path(),
+            source_path: source_path.display().to_string(),
+            source_hash: report_context.source_hash.clone(),
+            source_files: report_context.source_files,
+            program_hash: report_context.program_hash,
+            program_kind: report_context.program_kind,
+            program_file_count: report_context.program_file_count,
+            graph_node_count: report_context.graph_node_count,
+            load_pipeline_profile: report_context.load_pipeline_profile,
+            target_profile: target_profile.as_str().to_owned(),
+            source_route: source_route.to_owned(),
+            target_state: target_state.to_owned(),
+            event: SourceRouteSourceEventReportInput {
+                source: source_route.to_owned(),
+                source_id: output.source_id.0 as u64,
+                text: event.text.clone(),
+                key: event.key.clone(),
+                list_id: event.list_id.clone(),
+                address: event.address.clone(),
+                target_text: event.target_text.clone(),
+                target_occurrence: event.target_occurrence,
+                target_key: event.target_key,
+                target_generation: event.target_generation,
+                bind_epoch: event.bind_epoch,
+                source_epoch: event.source_epoch,
+                payload: event.payload.clone(),
+                payload_bytes_report: JsonValue::Null,
+                pointer_x: event.pointer_x.clone(),
+                pointer_y: event.pointer_y.clone(),
+                pointer_width: event.pointer_width.clone(),
+                pointer_height: event.pointer_height.clone(),
             },
-            {
-                "id": "cpu-plan-route-surface-executable",
-                "pass": true,
-                "detail": "selected source route has zero unresolved/fallback counters"
-            },
-            {
-                "id": "cpu-plan-source-route-executed",
-                "pass": true,
-                "detail": format!(
-                    "CPU PlanExecutor executed the full source event and selected one typed {} target branch",
-                    output
-                        .route_surface
-                        .get("expression_kind")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or("unknown")
-                )
-            },
-            {
-                "id": "legacy-route-parity",
-                "pass": legacy_passed,
-                "detail": if compare_legacy {
-                    "legacy runtime produced matching target state and full semantic delta batch"
-                } else {
-                    "legacy runtime comparison was not requested"
-                }
-            }
-        ],
-        "artifact_sha256s": source_event_artifacts,
-        "plan_executor": output.executor_report,
-    });
+            payload_bytes: event.payload_bytes.clone(),
+            compare_legacy,
+            report_path: report_path.map(Path::to_path_buf),
+            plan_hash: output.plan_hash.clone(),
+            plan_version: serde_json::to_value(plan.version)?,
+            capability_summary: serde_json::to_value(&plan.capability_summary)?,
+            route_surface: output.route_surface.clone(),
+            state_summary: output.state_summary.clone(),
+            semantic_delta_signatures: output.semantic_delta_signatures.clone(),
+            semantic_deltas: output.semantic_deltas.clone(),
+            legacy_comparison,
+            plan_executor: output.executor_report.clone(),
+            inline_byte_limit: SOURCE_EVENT_INLINE_BYTES_LIMIT,
+        })?;
+    let report = command_output.report;
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -3764,6 +3841,38 @@ pub fn run_plan_source_route(
     })
 }
 
+fn legacy_indexed_route_value_from_deltas(
+    semantic_deltas: &[SemanticDelta<'_>],
+    target_state: &str,
+    event: &LiveSourceEvent,
+) -> RuntimeResult<JsonValue> {
+    let target_field = target_state
+        .rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(target_state);
+    let matches = semantic_deltas
+        .iter()
+        .filter(|delta| {
+            delta.kind == "FieldSet"
+                && delta.field_path.as_deref() == Some(target_field)
+                && event
+                    .target_key
+                    .is_none_or(|target_key| delta.key == Some(target_key))
+                && event
+                    .target_generation
+                    .is_none_or(|generation| delta.generation == Some(generation))
+        })
+        .collect::<Vec<_>>();
+    let [delta] = matches.as_slice() else {
+        return Err(format!(
+            "legacy runtime semantic deltas for indexed route `{target_state}` expected exactly one row field match, found {}",
+            matches.len()
+        )
+        .into());
+    };
+    Ok(serde_json::to_value(&delta.value)?)
+}
+
 pub fn run_plan_root_scalar_scenario(
     source_path: &Path,
     scenario_path: &Path,
@@ -3772,41 +3881,25 @@ pub fn run_plan_root_scalar_scenario(
     compare_legacy: bool,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRootScalarScenarioOutput> {
-    if selected_step_ids.is_empty() {
-        return Err(
-            "run-plan-root-scalar-scenario requires --steps with explicit scenario step ids".into(),
-        );
-    }
-    let (parsed, ir) = load_and_lower(source_path)?;
+    let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
+    let report_context = compiled.report_context();
+    let plan = compiled.plan;
     let scenario = parse_scenario(scenario_path)?;
-    let mut selected_steps = Vec::new();
-    for step_id in selected_step_ids {
-        let step = scenario
-            .step
-            .iter()
-            .find(|step| step.id == *step_id)
-            .ok_or_else(|| format!("scenario `{}` has no step `{step_id}`", scenario.name))?;
-        if step.expected_source_event.is_none() {
-            return Err(format!(
-                "selected step `{step_id}` has no expected_source_event and cannot be replayed by PlanExecutor"
-            )
-            .into());
-        }
-        selected_steps.push(step);
-    }
+    let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+    let step_selection = select_plan_explicit_root_scenario_steps(
+        &scenario.name,
+        &scenario_step_meta,
+        selected_step_ids,
+    )?;
+    let selected_steps = step_selection
+        .selected_indices
+        .iter()
+        .map(|index| &scenario.step[*index])
+        .collect::<Vec<_>>();
 
-    let plan = compile_typed_program(&ir, target_profile)?;
     let output =
         execute_machine_plan_root_scenario_inner(&plan, &selected_steps, source_path.parent())?;
-    let source_hash = report_source_hash_for_parsed(&parsed);
-    let units = parsed
-        .files
-        .iter()
-        .map(|file| RuntimeSourceUnit {
-            path: file.path.clone(),
-            source: file.source.clone(),
-        })
-        .collect::<Vec<_>>();
+    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
     let legacy_comparison = if compare_legacy {
         compare_plan_root_scenario_with_legacy(
             source_path,
@@ -3822,62 +3915,36 @@ pub fn run_plan_root_scalar_scenario(
             "reason": "legacy comparison is required for accepted root-scenario proof reports"
         })
     };
-    let legacy_passed = legacy_comparison.get("passed").and_then(JsonValue::as_bool) == Some(true);
-    let report_status = if legacy_passed { "pass" } else { "fail" };
-    let report = json!({
-        "status": report_status,
-        "report_version": 1,
-                "command": "run-plan-root-scalar-scenario",
-        "command_argv": std::env::args().collect::<Vec<_>>(),
-        "measurement_mode": "proof",
-        "exit_status": if legacy_passed { 0 } else { 1 },
-        "generated_at_utc": now_string(),
-        "git_commit": git_commit(),
-        "binary_hash": current_binary_hash(),
-        "binary_path": current_binary_path(),
-        "source_path": source_path.display().to_string(),
-        "source_hash": source_hash,
-        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-        "scenario_path": scenario_path.display().to_string(),
-        "scenario_hash": sha256_file(scenario_path)?,
-        "program_hash": report_source_hash_for_parsed(&parsed),
-        "program_kind": parsed.kind.as_str(),
-        "program_file_count": parsed.files.len(),
-        "budget_hash": "n/a",
-        "graph_node_count": ir.graph_node_count,
-        "target_profile": target_profile.as_str(),
-        "plan_hash": output.plan_hash,
-        "plan_version": plan.version,
-        "capability_summary": plan.capability_summary,
-        "selected_step_ids": selected_step_ids,
-        "state_summary": output.state_summary,
-        "semantic_delta_signatures": output.semantic_delta_signatures,
-        "semantic_deltas": output.semantic_deltas,
-        "legacy_comparison": legacy_comparison,
-        "per_step_pass_fail": [
-            {
-                "id": "machine-plan-verified",
-                "pass": true,
-                "detail": "MachinePlan verifier passed before CPU root-scenario execution"
-            },
-            {
-                "id": "cpu-plan-root-list-scenario-executed",
-                "pass": true,
-                "detail": "CPU PlanExecutor replayed selected unscoped root/list source events"
-            },
-            {
-                "id": "legacy-root-scenario-parity",
-                "pass": legacy_passed,
-                "detail": if compare_legacy {
-                    "legacy runtime produced matching touched root states and semantic deltas"
-                } else {
-                    "legacy runtime comparison was not requested"
-                }
-            }
-        ],
-        "artifact_sha256s": [],
-        "plan_executor": output.executor_report,
-    });
+    let command_output =
+        assemble_plan_root_scenario_command_output(RootScenarioCommandOutputInput {
+            command_argv: std::env::args().collect::<Vec<_>>(),
+            generated_at_utc: now_string(),
+            git_commit: git_commit(),
+            binary_hash: current_binary_hash(),
+            binary_path: current_binary_path(),
+            source_path: source_path.display().to_string(),
+            source_hash: report_context.source_hash.clone(),
+            source_files: report_context.source_files,
+            scenario_path: scenario_path.display().to_string(),
+            scenario_hash: sha256_file(scenario_path)?,
+            program_hash: report_context.program_hash,
+            program_kind: report_context.program_kind,
+            program_file_count: report_context.program_file_count,
+            graph_node_count: report_context.graph_node_count,
+            load_pipeline_profile: report_context.load_pipeline_profile,
+            target_profile: target_profile.as_str().to_owned(),
+            plan_hash: output.plan_hash.clone(),
+            plan_version: serde_json::to_value(plan.version)?,
+            capability_summary: serde_json::to_value(&plan.capability_summary)?,
+            selected_step_ids: selected_step_ids.to_vec(),
+            state_summary: output.state_summary.clone(),
+            semantic_delta_signatures: output.semantic_delta_signatures.clone(),
+            semantic_deltas: output.semantic_deltas.clone(),
+            legacy_comparison,
+            compare_legacy,
+            plan_executor: output.executor_report.clone(),
+        });
+    let report = command_output.report;
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -3895,43 +3962,24 @@ pub fn run_plan_scenario_events(
     compare_legacy: bool,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRootScalarScenarioOutput> {
-    let (parsed, ir) = load_and_lower(source_path)?;
+    let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
+    let report_context = compiled.report_context();
+    let plan = compiled.plan;
     let scenario = parse_scenario(scenario_path)?;
-    let selected_steps = scenario
-        .step
+    let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+    let step_selection = select_plan_scenario_event_steps(&scenario.name, &scenario_step_meta)?;
+    let selected_steps = step_selection
+        .selected_indices
         .iter()
-        .filter(|step| step.expected_source_event.is_some())
+        .map(|index| &scenario.step[*index])
         .collect::<Vec<_>>();
-    if selected_steps.is_empty() {
-        return Err(format!(
-            "scenario `{}` has no expected_source_event steps for PlanExecutor replay",
-            scenario.name
-        )
-        .into());
-    }
-    let selected_step_ids = selected_steps
+    let all_steps = step_selection
+        .all_indices
         .iter()
-        .map(|step| step.id.clone())
+        .map(|index| &scenario.step[*index])
         .collect::<Vec<_>>();
-    let assertion_only_step_ids = scenario
-        .step
-        .iter()
-        .filter(|step| step.expected_source_event.is_none())
-        .map(|step| step.id.clone())
-        .collect::<Vec<_>>();
-
-    let plan = compile_typed_program(&ir, target_profile)?;
-    let all_steps = scenario.step.iter().collect::<Vec<_>>();
     let output = execute_machine_plan_root_scenario_inner(&plan, &all_steps, source_path.parent())?;
-    let source_hash = report_source_hash_for_parsed(&parsed);
-    let units = parsed
-        .files
-        .iter()
-        .map(|file| RuntimeSourceUnit {
-            path: file.path.clone(),
-            source: file.source.clone(),
-        })
-        .collect::<Vec<_>>();
+    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
     let legacy_comparison = if compare_legacy {
         compare_plan_root_scenario_with_legacy(
             source_path,
@@ -3947,103 +3995,49 @@ pub fn run_plan_scenario_events(
             "reason": "legacy comparison was not requested"
         })
     };
-    let legacy_passed = legacy_comparison.get("passed").and_then(JsonValue::as_bool) == Some(true);
     let legacy_comparison_acceptance =
-        demand_current_semantic_delta_acceptance_policy(&legacy_comparison);
-    let legacy_accepted = legacy_passed
-        || legacy_comparison_acceptance
-            .get("accepted")
-            .and_then(JsonValue::as_bool)
-            == Some(true);
-    let assertion_only_covered = output.assertion_checkpoints.len()
-        == assertion_only_step_ids.len()
-        && output
-            .assertion_checkpoints
-            .iter()
-            .all(plan_assertion_checkpoint_report_is_covered);
-    let report_status = if legacy_accepted && assertion_only_covered {
-        "pass"
-    } else {
-        "fail"
-    };
-    let report_command = "run-plan-scenario-events";
-    let plan_executor_coverage = json!({
-        "surface": "scenario-expected-source-event-replay",
-        "scenario_step_count": scenario.step.len(),
-        "event_step_count": selected_steps.len(),
-        "selected_step_ids": selected_step_ids,
-        "assertion_only_step_ids": assertion_only_step_ids,
-        "covers_all_source_events": true,
-        "covers_assertion_only_steps": assertion_only_covered,
-        "full_scenario_parity": assertion_only_covered,
-        "full_scenario_parity_blocker": if assertion_only_covered {
-            JsonValue::Null
-        } else {
-            JsonValue::String("PlanExecutor did not check every assertion-only scenario checkpoint".to_owned())
-        },
-        "assertion_checkpoint_count": output.assertion_checkpoints.len(),
-    });
-    let report = json!({
-        "status": report_status,
-        "report_version": 1,
-        "command": report_command,
-        "command_argv": std::env::args().collect::<Vec<_>>(),
-        "measurement_mode": "proof",
-        "exit_status": if legacy_accepted && assertion_only_covered { 0 } else { 1 },
-        "generated_at_utc": now_string(),
-        "git_commit": git_commit(),
-        "binary_hash": current_binary_hash(),
-        "binary_path": current_binary_path(),
-        "source_path": source_path.display().to_string(),
-        "source_hash": source_hash,
-        "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-        "scenario_path": scenario_path.display().to_string(),
-        "scenario_hash": sha256_file(scenario_path)?,
-        "program_hash": report_source_hash_for_parsed(&parsed),
-        "program_kind": parsed.kind.as_str(),
-        "program_file_count": parsed.files.len(),
-        "budget_hash": "n/a",
-        "graph_node_count": ir.graph_node_count,
-        "target_profile": target_profile.as_str(),
-        "plan_hash": output.plan_hash,
-        "plan_version": plan.version,
-        "capability_summary": plan.capability_summary,
-        "selected_step_ids": plan_executor_coverage["selected_step_ids"].clone(),
-        "state_summary": output.state_summary,
-        "semantic_delta_signatures": output.semantic_delta_signatures,
-        "semantic_deltas": output.semantic_deltas,
-        "legacy_comparison": legacy_comparison,
-        "legacy_comparison_acceptance": legacy_comparison_acceptance,
-        "plan_executor_coverage": plan_executor_coverage,
-        "per_step_pass_fail": [
-            {
-                "id": "machine-plan-verified",
-                "pass": true,
-                "detail": "MachinePlan verifier passed before CPU scenario event replay"
-            },
-            {
-                "id": "cpu-plan-scenario-events-executed",
-                "pass": true,
-                "detail": "CPU PlanExecutor replayed all scenario steps carrying expected_source_event"
-            },
-            {
-                "id": "legacy-scenario-event-parity-or-demand-current-coalescing",
-                "pass": legacy_accepted,
-                "detail": if compare_legacy {
-                    "legacy runtime produced matching touched root states and either exact semantic deltas or schema-checked demand-current coalesced deltas"
-                } else {
-                    "legacy runtime comparison was not requested"
-                }
-            },
-            {
-                "id": "assertion-only-coverage-recorded",
-                "pass": assertion_only_covered,
-                "detail": "CPU PlanExecutor checked assertion-only scenario checkpoints in scenario order"
-            }
-        ],
-        "artifact_sha256s": [],
-        "plan_executor": output.executor_report,
-    });
+        plan_demand_current_semantic_delta_acceptance_policy(&legacy_comparison);
+    let coverage_report = assemble_plan_root_scenario_coverage_report(
+        scenario.step.len(),
+        selected_steps.len(),
+        &step_selection.selected_step_ids,
+        &step_selection.assertion_only_step_ids,
+        &output.assertion_checkpoints,
+    );
+    let assertion_only_covered = coverage_report.assertion_only_covered;
+    let plan_executor_coverage = coverage_report.coverage;
+    let command_output =
+        assemble_plan_scenario_events_command_output(ScenarioEventsCommandOutputInput {
+            command_argv: std::env::args().collect::<Vec<_>>(),
+            generated_at_utc: now_string(),
+            git_commit: git_commit(),
+            binary_hash: current_binary_hash(),
+            binary_path: current_binary_path(),
+            source_path: source_path.display().to_string(),
+            source_hash: report_context.source_hash.clone(),
+            source_files: report_context.source_files,
+            scenario_path: scenario_path.display().to_string(),
+            scenario_hash: sha256_file(scenario_path)?,
+            program_hash: report_context.program_hash,
+            program_kind: report_context.program_kind,
+            program_file_count: report_context.program_file_count,
+            graph_node_count: report_context.graph_node_count,
+            load_pipeline_profile: report_context.load_pipeline_profile,
+            target_profile: target_profile.as_str().to_owned(),
+            plan_hash: output.plan_hash.clone(),
+            plan_version: serde_json::to_value(plan.version)?,
+            capability_summary: serde_json::to_value(&plan.capability_summary)?,
+            state_summary: output.state_summary.clone(),
+            semantic_delta_signatures: output.semantic_delta_signatures.clone(),
+            semantic_deltas: output.semantic_deltas.clone(),
+            legacy_comparison,
+            legacy_comparison_acceptance,
+            compare_legacy,
+            plan_executor_coverage,
+            assertion_only_covered,
+            plan_executor: output.executor_report.clone(),
+        });
+    let report = command_output.report;
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -4054,152 +4048,9 @@ pub fn run_plan_scenario_events(
     })
 }
 
-fn demand_current_semantic_delta_acceptance_policy(legacy_comparison: &JsonValue) -> JsonValue {
-    if legacy_comparison
-        .get("enabled")
-        .and_then(JsonValue::as_bool)
-        != Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "not-applicable",
-            "reason": "legacy comparison disabled"
-        });
-    }
-    if legacy_comparison
-        .get("semantic_delta_match")
-        .and_then(JsonValue::as_bool)
-        == Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "not-needed",
-            "reason": "legacy semantic deltas already match"
-        });
-    }
-    if legacy_comparison
-        .get("state_match")
-        .and_then(JsonValue::as_bool)
-        != Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "demand-current-coalesced-semantic-deltas",
-            "reason": "legacy state parity failed"
-        });
-    }
-
-    let Some(steps) = legacy_comparison
-        .get("step_comparisons")
-        .and_then(JsonValue::as_array)
-    else {
-        return json!({
-            "accepted": false,
-            "kind": "demand-current-coalesced-semantic-deltas",
-            "reason": "legacy step comparisons missing"
-        });
-    };
-
-    let mut mismatched_step_ids = Vec::new();
-    let mut missing_delta_field_paths = BTreeSet::new();
-    let mut missing_delta_count = 0_u64;
-    let mut extra_plan_delta_count = 0_u64;
-    let mut rejected_missing_deltas = Vec::new();
-    for step in steps {
-        if step
-            .get("semantic_delta_match")
-            .and_then(JsonValue::as_bool)
-            == Some(true)
-        {
-            continue;
-        }
-        let step_id = step
-            .get("step_id")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("missing")
-            .to_owned();
-        mismatched_step_ids.push(step_id.clone());
-        if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
-            return json!({
-                "accepted": false,
-                "kind": "demand-current-coalesced-semantic-deltas",
-                "reason": format!("step `{step_id}` did not preserve touched state"),
-                "mismatched_step_ids": mismatched_step_ids
-            });
-        }
-        let legacy_deltas = step
-            .get("legacy_semantic_deltas")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let plan_deltas = step
-            .get("plan_semantic_deltas")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut remaining_legacy = legacy_deltas;
-        for plan_delta in plan_deltas {
-            if let Some(index) = remaining_legacy
-                .iter()
-                .position(|legacy| legacy == &plan_delta)
-            {
-                remaining_legacy.remove(index);
-            } else {
-                extra_plan_delta_count += 1;
-            }
-        }
-        for missing_delta in remaining_legacy {
-            missing_delta_count += 1;
-            let field_path = missing_delta
-                .get("field_path")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("missing")
-                .to_owned();
-            missing_delta_field_paths.insert(field_path.clone());
-            let kind_ok = missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
-            let field_ok = matches!(field_path.as_str(), "display_text" | "value" | "error");
-            if !(kind_ok && field_ok) {
-                rejected_missing_deltas.push(json!({
-                    "step_id": step_id,
-                    "delta": missing_delta,
-                }));
-            }
-        }
-    }
-
-    let accepted = !mismatched_step_ids.is_empty()
-        && extra_plan_delta_count == 0
-        && rejected_missing_deltas.is_empty();
-    json!({
-        "accepted": accepted,
-        "kind": "demand-current-coalesced-semantic-deltas",
-        "reason": if accepted {
-            "PlanExecutor preserved state/assertion parity and emitted a subset of legacy deltas; omitted deltas are transient demand-current FieldSet values"
-        } else {
-            "legacy semantic delta mismatch did not match the demand-current coalescing policy"
-        },
-        "mismatched_step_ids": mismatched_step_ids,
-        "missing_delta_field_paths": missing_delta_field_paths.into_iter().collect::<Vec<_>>(),
-        "missing_delta_count": missing_delta_count,
-        "extra_plan_delta_count": extra_plan_delta_count,
-        "rejected_missing_deltas": rejected_missing_deltas,
-    })
-}
-
 struct InitialStateExecution {
     plan_hash: String,
     state_summary: JsonValue,
-    executor_report: JsonValue,
-}
-
-struct SourceRouteExecution {
-    plan_hash: String,
-    source_id: SourceId,
-    value: JsonValue,
-    state_summary: JsonValue,
-    semantic_delta_signatures: Vec<String>,
-    semantic_deltas: JsonValue,
-    route_surface: JsonValue,
     executor_report: JsonValue,
 }
 
@@ -4213,7 +4064,7 @@ struct RootScenarioExecution {
     executor_report: JsonValue,
 }
 
-type RootBytesState = BTreeMap<usize, RuntimeBytes>;
+type RootBytesState = BTreeMap<usize, PlanExecutorBytes>;
 type RootFixedBytesBanks = BTreeMap<usize, Vec<u8>>;
 
 pub fn execute_machine_plan_initial_state(
@@ -4230,357 +4081,42 @@ pub fn execute_machine_plan_initial_state(
 fn execute_machine_plan_initial_state_inner(
     plan: &MachinePlan,
 ) -> RuntimeResult<InitialStateExecution> {
-    let verification = verify_plan(plan)?;
-    if verification.status != "pass" {
-        return Err(format!(
-            "MachinePlan verification failed with {} error(s)",
-            verification.error_count
-        )
-        .into());
-    }
-    if !plan.capability_summary.cpu_plan_executor_complete {
-        return Err(
-            "CPU PlanExecutor initial-state slice requires cpu_plan_executor_complete=true".into(),
-        );
-    }
-
-    let mut state_summary = serde_json::Map::new();
-    let mut initialized_state_count = 0usize;
-    let mut source_route_metadata_count = 0usize;
+    let core_execution = execute_plan_initial_state_core(plan)?;
+    let initialized_state_count = core_execution.initialized_state_count;
+    let source_route_metadata_count = core_execution.source_route_metadata_count;
     let list_state = plan_initial_list_state(plan)?;
-    for region in &plan.regions {
-        match region.kind {
-            RegionKind::SourceRouting => {
-                for op in &region.ops {
-                    if !matches!(op.kind, PlanOpKind::SourceRoute)
-                        || !matches!(op.output, Some(ValueRef::Source(_)))
-                    {
-                        return Err("CPU PlanExecutor initial-state slice only accepts source-route metadata ops in the source-routing region".into());
-                    }
-                    source_route_metadata_count += 1;
-                }
-            }
-            RegionKind::StateInitialization => {
-                for op in &region.ops {
-                    let PlanOpKind::StateInitialize {
-                        initial_value_kind,
-                        initial_constant_id,
-                    } = op.kind
-                    else {
-                        return Err("CPU PlanExecutor initial-state slice only accepts StateInitialize ops in the state-initialization region".into());
-                    };
-                    let Some(ValueRef::State(state_id)) = op.output else {
-                        return Err("StateInitialize op is missing a typed state output".into());
-                    };
-                    let slot = plan
-                        .storage_layout
-                        .scalar_slots
-                        .iter()
-                        .find(|slot| slot.state_id == state_id)
-                        .ok_or_else(|| {
-                            format!("StateInitialize op targets missing state {}", state_id.0)
-                        })?;
-                    if slot.initial_value_kind != initial_value_kind
-                        || slot.initial_constant_id != initial_constant_id
-                    {
-                        return Err(format!(
-                            "StateInitialize op and scalar storage slot disagree for state {}",
-                            state_id.0
-                        )
-                        .into());
-                    }
-                    if !slot.indexed {
-                        let value = plan_executor_initial_value(
-                            plan,
-                            slot.initial_constant_id,
-                            &slot.value_type,
-                            slot.initial_value_kind,
-                        )?;
-                        state_summary.insert(plan_state_label(plan, state_id.0), value);
-                    }
-                    initialized_state_count += 1;
-                }
-            }
-            RegionKind::DerivedEvaluation
-            | RegionKind::ListProjections
-            | RegionKind::DependencyEdges => {
-                for op in &region.ops {
-                    match (&region.kind, &op.kind) {
-                        (RegionKind::DerivedEvaluation, PlanOpKind::DerivedValue { .. })
-                            if op.unresolved_executable_ref_count == 0 => {}
-                        (RegionKind::ListProjections, PlanOpKind::ListProjection { .. })
-                        | (RegionKind::DependencyEdges, PlanOpKind::DependencyEdge) => {}
-                        _ => {
-                            return Err(format!(
-                                "CPU PlanExecutor initial-state slice does not support {:?} op {}",
-                                region.kind, op.id.0
-                            )
-                            .into());
-                        }
-                    }
-                }
-            }
-            RegionKind::UpdateBranches => {}
-            RegionKind::ListOperations => {
-                for op in &region.ops {
-                    match &op.kind {
-                        PlanOpKind::ListOperation { .. }
-                            if op.unresolved_executable_ref_count == 0 => {}
-                        _ => {
-                            return Err(format!(
-                                "CPU PlanExecutor initial-state slice does not support {:?} op {}",
-                                region.kind, op.id.0
-                            )
-                            .into());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if initialized_state_count != plan.storage_layout.scalar_slots.len() {
-        return Err(format!(
-            "CPU PlanExecutor initialized {initialized_state_count} scalar state(s), expected {}",
-            plan.storage_layout.scalar_slots.len()
-        )
-        .into());
-    }
-    if source_route_metadata_count != plan.source_routes.len() {
-        return Err(format!(
-            "CPU PlanExecutor observed {source_route_metadata_count} source route metadata op(s), expected {}",
-            plan.source_routes.len()
-        )
-        .into());
-    }
-    let plan_hash = plan_sha256(plan)?;
-    let state_summary = JsonValue::Object(state_summary);
+    let plan_hash = core_execution.plan_hash;
+    let state_summary = core_execution.state_summary;
     let list_summary = plan_list_summary(plan, &list_state);
     let projection_execution =
         materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_state)?;
     let retain_execution =
         materialize_plan_list_retains(plan, state_summary.as_object().unwrap(), &list_state)?;
+    let list_projection_summary = JsonValue::Object(projection_execution.summary);
+    let list_view_summary = JsonValue::Object(retain_execution.summary);
+    let report_assembly = assemble_plan_initial_state_report(
+        plan,
+        initialized_state_count,
+        source_route_metadata_count,
+        projection_execution.executed_count,
+        projection_execution.find_count,
+        projection_execution.chunk_count,
+        projection_execution.projected_row_count,
+        retain_execution.executed_count,
+        retain_execution.view_count,
+        retain_execution.retained_row_count,
+        &state_summary,
+        &core_execution.executor_report,
+        &list_summary,
+        &list_projection_summary,
+        &projection_execution.reports,
+        &list_view_summary,
+        &retain_execution.reports,
+    );
     Ok(InitialStateExecution {
         plan_hash,
         state_summary: state_summary.clone(),
-        executor_report: json!({
-            "executor": "cpu-plan-initial-state-v1",
-            "initialized_state_count": initialized_state_count,
-            "source_route_metadata_count": source_route_metadata_count,
-            "executed_list_projection_count": projection_execution.executed_count,
-            "executed_list_projection_find_count": projection_execution.find_count,
-            "executed_list_projection_chunk_count": projection_execution.chunk_count,
-            "projected_list_row_count": projection_execution.projected_row_count,
-            "executed_list_retain_count": retain_execution.executed_count,
-            "executed_list_view_count": retain_execution.view_count,
-            "retained_list_row_count": retain_execution.retained_row_count,
-            "list_slot_count": plan.storage_layout.list_slots.len(),
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": plan.capability_summary.executable_string_path_count,
-            "unknown_plan_op_count": plan.capability_summary.unknown_plan_op_count,
-            "graph_rebuild_count": plan.capability_summary.graph_rebuild_count,
-            "graph_clones_per_item": plan.capability_summary.graph_clones_per_item,
-            "state_summary": state_summary,
-            "list_summary": list_summary,
-            "list_projection_summary": JsonValue::Object(projection_execution.summary),
-            "list_projections": projection_execution.reports,
-            "list_view_summary": JsonValue::Object(retain_execution.summary),
-            "list_retains": retain_execution.reports,
-        }),
-    })
-}
-
-fn execute_machine_plan_source_route_inner(
-    plan: &MachinePlan,
-    source_route: &str,
-    target_state: &str,
-    event: &LiveSourceEvent,
-    host_file_root: Option<&Path>,
-) -> RuntimeResult<SourceRouteExecution> {
-    let verification = verify_plan(plan)?;
-    if verification.status != "pass" {
-        return Err(format!(
-            "MachinePlan verification failed with {} error(s)",
-            verification.error_count
-        )
-        .into());
-    }
-    if !plan.capability_summary.typed_lowering_executable {
-        return Err("CPU source-route PlanExecutor requires typed_lowering_executable=true".into());
-    }
-    let source_id = plan_source_id_for_label(plan, source_route)
-        .ok_or_else(|| format!("MachinePlan has no source route `{source_route}`"))?;
-    let target_state_id = plan_state_id_for_label(plan, target_state)
-        .ok_or_else(|| format!("MachinePlan has no state slot `{target_state}`"))?;
-    let source_route_slot = plan
-        .source_routes
-        .iter()
-        .find(|route| route.source_id == source_id)
-        .ok_or_else(|| format!("MachinePlan source route `{source_route}` has no route slot"))?;
-    if source_route_slot.scoped {
-        return Err(
-            "CPU PlanExecutor source-route slice currently supports only unscoped root routes"
-                .into(),
-        );
-    }
-
-    let route_ops = plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::UpdateBranches)
-        .flat_map(|region| region.ops.iter())
-        .filter(|op| {
-            op.inputs
-                .iter()
-                .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
-                && matches!(&op.output, Some(ValueRef::State(id)) if *id == target_state_id)
-        })
-        .collect::<Vec<_>>();
-    let [op] = route_ops.as_slice() else {
-        return Err(format!(
-            "expected exactly one typed update branch for `{source_route}` -> `{target_state}`, found {}",
-            route_ops.len()
-        )
-        .into());
-    };
-    if op.indexed {
-        return Err(
-            "CPU PlanExecutor source-route slice does not support indexed update branches".into(),
-        );
-    }
-    if op.unresolved_executable_ref_count != 0 {
-        return Err(format!(
-            "selected update branch {} has {} unresolved executable refs",
-            op.id.0, op.unresolved_executable_ref_count
-        )
-        .into());
-    }
-    let (root_state, root_bytes_state, root_fixed_bytes_banks, _) =
-        plan_root_scalar_initial_state(plan)?;
-    let selected_executed = execute_root_scalar_update_branch(
-        plan,
-        op,
-        source_id,
-        source_route_slot,
-        event,
-        &root_state,
-        &root_bytes_state,
-        &root_fixed_bytes_banks,
-        host_file_root,
-    )?
-    .ok_or_else(|| {
-        format!(
-            "selected update branch {} source guard did not match the supplied event",
-            op.id.0
-        )
-    })?;
-
-    let step = event.clone().into_step(0);
-    let full_execution = execute_machine_plan_root_scenario_inner(plan, &[&step], host_file_root)?;
-    let target_label = plan_state_label(plan, target_state_id.0);
-    let value = json_value_at_dotted_path(&full_execution.state_summary, &target_label)
-        .cloned()
-        .ok_or_else(|| {
-            format!("full source-route execution did not produce target state `{target_label}`")
-        })?;
-    if value != selected_executed.value {
-        return Err(format!(
-            "selected route op {} produced {:?}, but full source-route execution produced {:?} for `{target_label}`",
-            op.id.0, selected_executed.value, value
-        )
-        .into());
-    }
-    let mut state_summary = serde_json::Map::new();
-    state_summary.insert(target_label.clone(), value.clone());
-    let state_summary = JsonValue::Object(state_summary);
-    let plan_hash = plan_sha256(plan)?;
-    let route_surface = json!({
-        "source": source_route,
-        "source_id": source_id.0,
-        "target_state": target_state,
-        "target_state_id": target_state_id.0,
-        "update_op_id": op.id.0,
-        "expression_kind": selected_executed.expression_kind,
-        "source_payload_field": selected_executed.source_payload_field,
-        "update_constant_id": selected_executed.update_constant_id,
-        "update_constant_value": selected_executed.update_constant_value,
-        "host_effect": selected_executed.host_effect,
-        "payload_schema": source_route_slot.payload_schema,
-        "global_plan_executable": plan.capability_summary.executable,
-        "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
-        "global_cpu_plan_executor_complete": plan.capability_summary.cpu_plan_executor_complete,
-        "global_unresolved_executable_ref_count": plan.capability_summary.unresolved_executable_ref_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-        "selected_op_unresolved_executable_ref_count": op.unresolved_executable_ref_count,
-        "selected_op_indexed": op.indexed,
-    });
-    let full_executor = full_execution
-        .executor_report
-        .as_object()
-        .ok_or("root-scenario executor report is not an object")?;
-    let executor_report = json!({
-        "executor": "cpu-plan-source-route-v1",
-        "source": source_route,
-        "source_id": source_id.0,
-        "target_state": target_state,
-        "target_state_id": target_state_id.0,
-        "update_op_id": op.id.0,
-        "expression_kind": selected_executed.expression_kind,
-        "source_payload_field": selected_executed.source_payload_field,
-        "update_constant_id": selected_executed.update_constant_id,
-        "update_constant_value": selected_executed.update_constant_value,
-        "host_effect": selected_executed.host_effect,
-        "executed_update_branch_count": full_executor
-            .get("executed_update_branch_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "executed_derived_value_count": full_executor
-            .get("executed_derived_value_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "executed_list_append_count": full_executor
-            .get("executed_list_append_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "executed_list_remove_count": full_executor
-            .get("executed_list_remove_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "executed_indexed_update_count": full_executor
-            .get("executed_indexed_update_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "emitted_source_bind_count": full_executor
-            .get("emitted_source_bind_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "emitted_source_unbind_count": full_executor
-            .get("emitted_source_unbind_count")
-            .cloned()
-            .unwrap_or_else(|| json!(0)),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-        "state_summary": state_summary,
-        "full_state_summary": full_execution.state_summary,
-        "semantic_delta_signatures": full_execution.semantic_delta_signatures,
-        "semantic_deltas": full_execution.semantic_deltas,
-        "per_step": full_execution.per_step,
-    });
-    Ok(SourceRouteExecution {
-        plan_hash,
-        source_id,
-        value,
-        state_summary,
-        semantic_delta_signatures: full_execution.semantic_delta_signatures,
-        semantic_deltas: full_execution.semantic_deltas,
-        route_surface,
-        executor_report,
+        executor_report: report_assembly.executor_report,
     })
 }
 
@@ -4603,10 +4139,11 @@ fn execute_machine_plan_root_scenario_inner(
         );
     }
 
-    let (mut root_state, mut root_bytes_state, mut root_fixed_bytes_banks, initialized_state_count) =
+    let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
         plan_root_scalar_initial_state(plan)?;
     let mut list_state = plan_initial_list_state(plan)?;
-    let mut list_next_keys = plan_initial_list_next_keys(&list_state);
+    let mut list_next_keys =
+        initial_plan_list_next_keys(&plan_executor_list_state_for_materialization(&list_state));
     let bytes_counter_baseline = runtime_bytes_storage_counters_snapshot();
     let mut list_append_row_bool_delta_lists = BTreeSet::new();
     let mut per_step = Vec::new();
@@ -4628,7 +4165,7 @@ fn execute_machine_plan_root_scenario_inner(
         if step.expected_source_event.is_none() {
             assertion_checkpoints.push(assert_plan_executor_scenario_checkpoint(
                 plan,
-                &root_state,
+                &root_state.root_state,
                 &list_state,
                 step,
             )?);
@@ -4637,67 +4174,24 @@ fn execute_machine_plan_root_scenario_inner(
         let step_bytes_counter_start = runtime_bytes_storage_counters_snapshot();
         let generic_event = GenericSourceEvent::require(step)?;
         let event = live_source_event_from_generic(&generic_event);
-        let source_id = plan_source_id_for_label(plan, generic_event.source)
-            .ok_or_else(|| format!("MachinePlan has no source route `{}`", generic_event.source))?;
-        let source_route_slot = plan
-            .source_routes
-            .iter()
-            .find(|route| route.source_id == source_id)
-            .ok_or_else(|| {
-                format!(
-                    "MachinePlan source route `{}` has no route slot",
-                    generic_event.source
-                )
-            })?;
-        let derived_values =
-            execute_supported_derived_values_for_source(plan, source_id, &event, &root_state)?;
-        let root_update_key_gate = source_key_gate_for_root_updates(plan, source_id);
-        let root_update_key_matches = root_update_key_gate
-            .as_ref()
-            .is_none_or(|required| event.key.as_deref() == Some(required.as_str()));
-
-        let mut route_ops = plan
-            .regions
-            .iter()
-            .filter(|region| region.kind == RegionKind::UpdateBranches)
-            .flat_map(|region| region.ops.iter())
-            .filter(|op| {
-                op.inputs
-                    .iter()
-                    .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
-            })
-            .collect::<Vec<_>>();
-        sort_plan_ops_for_same_event_root_reads(&mut route_ops);
-        let route_has_list_remove = plan
-            .regions
-            .iter()
-            .filter(|region| region.kind == RegionKind::ListOperations)
-            .flat_map(|region| region.ops.iter())
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    PlanOpKind::ListOperation {
-                        operation_kind: boon_plan::PlanListOperationKind::Remove,
-                        remove: Some(remove),
-                        ..
-                    } if remove.source == ValueRef::Source(source_id)
-                )
-            });
-        if route_ops.is_empty() && derived_values.is_empty() && !route_has_list_remove {
-            return Err(format!(
-                "CPU root-scenario PlanExecutor found no executable selected-surface work for source route `{}`",
-                generic_event.source
-            )
-            .into());
-        }
+        let root_json_event = root_json_source_event_from_live(&event);
+        let step_preparation = prepare_plan_root_scenario_step(
+            plan,
+            generic_event.source,
+            &root_json_event,
+            &root_state.root_state,
+        )?;
+        let source_id = step_preparation.source_id;
+        let source_route_slot = &step_preparation.source_route_slot;
+        let derived_values = step_preparation.derived_values;
+        let route_ops = step_preparation.route_ops;
+        let root_update_key_matches = step_preparation.root_update_key_matches;
+        let root_dispatch_report = step_preparation.root_dispatch_report;
 
         let mut touched_states = serde_json::Map::new();
-        let mut touched_updates: BTreeMap<usize, (ExecutedRootUpdate, Vec<usize>)> =
-            BTreeMap::new();
-        let mut touched_update_order = Vec::new();
+        let mut touched_updates: BTreeMap<usize, RootExecutedUpdate> = BTreeMap::new();
+        let mut touched_update_candidates = RootUpdateCandidateTracker::default();
         let mut staged_root_state = root_state.clone();
-        let mut staged_root_bytes_state = root_bytes_state.clone();
-        let mut staged_root_fixed_bytes_banks = root_fixed_bytes_banks.clone();
         let mut step_signatures = Vec::new();
         let mut step_deltas = Vec::new();
         let mut updates = Vec::new();
@@ -4707,37 +4201,28 @@ fn execute_machine_plan_root_scenario_inner(
         let mut list_removes = Vec::new();
         let root_derived_values_before_updates =
             root_pure_number_compare_values(plan, &list_state)?;
-        for (field_id, value) in &derived_values {
-            let field_label = plan_derived_field_label(plan, field_id.0);
-            let signature = format!("FieldSet:{field_label}");
+        let source_derived_step = assemble_plan_source_derived_step_deltas(plan, &derived_values);
+        for (signature, delta) in source_derived_step
+            .semantic_delta_signatures
+            .iter()
+            .cloned()
+            .zip(source_derived_step.semantic_deltas.iter().cloned())
+        {
             step_signatures.push(signature.clone());
             semantic_delta_signatures.push(signature);
-            let delta = json!({
-                "kind": "FieldSet",
-                "list_id": null,
-                "key": null,
-                "generation": null,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": field_label,
-                "value": value,
-            });
             semantic_deltas.push(delta.clone());
             step_deltas.push(delta);
-            derived.push(json!({
-                "field_id": field_id.0,
-                "field_path": plan_derived_field_label(plan, field_id.0),
-                "value": value,
-            }));
             executed_derived_value_count += 1;
         }
+        derived.extend(source_derived_step.reports);
 
-        let append_result = append_list_rows_for_derived_values(
+        let append_result = append_plan_list_rows_for_derived_values_with(
             plan,
             &mut list_state,
             &mut list_next_keys,
             &mut list_append_row_bool_delta_lists,
             &derived_values,
+            eval_plan_row_expression,
         )?;
         for delta in &append_result.semantic_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -4749,11 +4234,25 @@ fn execute_machine_plan_root_scenario_inner(
         executed_list_append_count += append_result.appended_row_count;
         emitted_source_bind_count += append_result.source_bind_count;
 
-        let remove_result = remove_list_rows_for_source(
+        let remove_event = PlanExecutorLiveSourceEvent {
+            source: generic_event.source,
+            text: generic_event.text,
+            key: generic_event.key,
+            list_id: generic_event.list_id,
+            address: generic_event.address,
+            target_text: generic_event.target_text,
+            target_occurrence: generic_event.target_occurrence.map(|value| value as u64),
+            target_key: generic_event.target_key,
+            target_generation: generic_event.target_generation,
+            bind_epoch: generic_event.bind_epoch,
+            source_epoch: generic_event.source_epoch,
+            source_id: None,
+        };
+        let remove_result = remove_plan_list_rows_for_source_event(
             plan,
             source_id,
             source_route_slot,
-            &generic_event,
+            &remove_event,
             &mut list_state,
         )?;
         for delta in &remove_result.semantic_deltas {
@@ -4770,211 +4269,110 @@ fn execute_machine_plan_root_scenario_inner(
         list_removes.extend(remove_result.report_rows);
 
         let mut row_resolution_cache = BTreeMap::new();
-        let mut touched_indexed_updates = BTreeMap::new();
-        for op in route_ops {
+        for op in &route_ops {
             if !root_update_key_matches {
                 continue;
             }
             if op.indexed {
-                let mut indexed_executions = Vec::new();
-                let mut bulk_indexed_update = false;
-                if let Some((list_label, targets)) = unscoped_indexed_update_targets(
+                let indexed_target_rows = plan_executor_list_state_for_materialization(&list_state);
+                let indexed_batch = execute_plan_indexed_update_batch_with(
                     plan,
                     op,
                     source_route_slot,
-                    &generic_event,
-                    &list_state,
-                )? {
-                    bulk_indexed_update = true;
-                    for (key, generation) in targets {
-                        let mut row_event = generic_event.clone();
-                        row_event.list_id = Some(list_label.as_str());
-                        row_event.target_key = Some(key);
-                        row_event.target_generation = Some(generation);
-                        let mut per_row_resolution_cache = BTreeMap::new();
-                        indexed_executions.push(execute_indexed_update_branch(
-                            plan,
-                            op,
-                            source_id,
-                            source_route_slot,
-                            &row_event,
-                            &mut list_state,
-                            &mut per_row_resolution_cache,
-                            &root_derived_values_before_updates,
-                            host_file_root,
-                        )?);
-                    }
-                } else {
-                    indexed_executions.push(execute_indexed_update_branch(
-                        plan,
-                        op,
-                        source_id,
-                        source_route_slot,
-                        &generic_event,
-                        &mut list_state,
-                        &mut row_resolution_cache,
-                        &root_derived_values_before_updates,
-                        host_file_root,
-                    )?);
-                }
-                track_indexed_update_write_conflicts(
-                    &mut touched_indexed_updates,
-                    &indexed_executions,
-                )?;
-                let ordered_indexed_deltas = if bulk_indexed_update {
-                    let mut primary = Vec::new();
-                    let mut derived = Vec::new();
-                    for indexed in &indexed_executions {
-                        let output_field = indexed
-                            .report_rows
-                            .first()
-                            .and_then(|row| row.get("field_path"))
-                            .and_then(JsonValue::as_str);
-                        for delta in &indexed.semantic_deltas {
-                            if delta.get("field_path").and_then(JsonValue::as_str) == output_field {
-                                primary.push(delta.clone());
-                            } else {
-                                derived.push(delta.clone());
-                            }
+                    &IndexedUpdateTargetEvent {
+                        source: generic_event.source.to_owned(),
+                        list_id: generic_event.list_id.map(str::to_owned),
+                        target_key: generic_event.target_key,
+                        target_text: generic_event.target_text.map(str::to_owned),
+                        address: generic_event.address.map(str::to_owned),
+                    },
+                    &indexed_target_rows,
+                    |target: Option<IndexedUpdateTargetOverride>| {
+                        if let Some(target) = target {
+                            let mut row_event = generic_event.clone();
+                            row_event.list_id = Some(target.list_label.as_str());
+                            row_event.target_key = Some(target.key);
+                            row_event.target_generation = Some(target.generation);
+                            let mut per_row_resolution_cache = BTreeMap::new();
+                            execute_indexed_update_branch(
+                                plan,
+                                op,
+                                source_id,
+                                source_route_slot,
+                                &row_event,
+                                &mut list_state,
+                                &mut per_row_resolution_cache,
+                                &root_derived_values_before_updates,
+                                host_file_root,
+                            )
+                        } else {
+                            execute_indexed_update_branch(
+                                plan,
+                                op,
+                                source_id,
+                                source_route_slot,
+                                &generic_event,
+                                &mut list_state,
+                                &mut row_resolution_cache,
+                                &root_derived_values_before_updates,
+                                host_file_root,
+                            )
                         }
-                    }
-                    primary.extend(derived);
-                    primary
-                } else {
-                    indexed_executions
-                        .iter()
-                        .flat_map(|indexed| indexed.semantic_deltas.iter().cloned())
-                        .collect()
-                };
-                pending_indexed_deltas.extend(ordered_indexed_deltas);
-                for indexed in indexed_executions {
-                    executed_update_branch_count += indexed.updated_row_count;
-                    executed_indexed_update_count += indexed.updated_row_count;
-                    indexed_updates.extend(indexed.report_rows);
-                }
+                    },
+                )?;
+                pending_indexed_deltas.extend(indexed_batch.semantic_deltas);
+                executed_update_branch_count += indexed_batch.updated_row_count;
+                executed_indexed_update_count += indexed_batch.updated_row_count;
+                indexed_updates.extend(indexed_batch.report_rows);
                 continue;
             }
-            let Some(ValueRef::State(state_id)) = op.output else {
-                return Err(format!(
-                    "CPU root-scenario PlanExecutor update branch {} does not target a state slot",
-                    op.id.0
+            let mut runtime_branch = |op: &boon_plan::PlanOp,
+                                      staged_state: &PlanExecutorRootState|
+             -> RuntimeResult<Option<RootExecutedUpdate>> {
+                execute_root_scalar_update_branch(
+                    plan,
+                    op,
+                    source_id,
+                    source_route_slot,
+                    &event,
+                    &staged_state.root_state,
+                    &staged_state.private_bytes,
+                    &staged_state.fixed_byte_banks,
+                    host_file_root,
                 )
-                .into());
             };
-            if !plan_state_is_root_scalar(plan, state_id) {
-                return Err(format!(
-                    "CPU root-scenario PlanExecutor update branch {} targets non-root state {}",
-                    op.id.0, state_id.0
-                )
-                .into());
-            }
-            if op.unresolved_executable_ref_count != 0 {
-                return Err(format!(
-                    "selected update branch {} has {} unresolved executable refs",
-                    op.id.0, op.unresolved_executable_ref_count
-                )
-                .into());
-            }
-
-            let Some(executed) = execute_root_scalar_update_branch(
+            collect_plan_root_update_candidate_for_step(
                 plan,
                 op,
                 source_id,
+                generic_event.source,
                 source_route_slot,
-                &event,
-                &staged_root_state,
-                &staged_root_bytes_state,
-                &staged_root_fixed_bytes_banks,
-                host_file_root,
-            )?
-            else {
-                continue;
-            };
-            match touched_updates.get_mut(&state_id.0) {
-                Some((existing, op_ids))
-                    if existing.value == executed.value
-                        && existing.bytes_value == executed.bytes_value
-                        && existing.fixed_bytes_mutation == executed.fixed_bytes_mutation =>
-                {
-                    op_ids.push(op.id.0);
-                    continue;
-                }
-                Some((existing, _)) => {
-                    return Err(format!(
-                        "CPU root-scenario PlanExecutor found conflicting branches for state {} from `{}`: {:?} vs {:?}",
-                        state_id.0, generic_event.source, existing.value, executed.value
-                    )
-                    .into());
-                }
-                None => {
-                    apply_executed_root_update_to_state(
-                        &mut staged_root_state,
-                        &mut staged_root_bytes_state,
-                        &mut staged_root_fixed_bytes_banks,
-                        plan,
-                        state_id.0,
-                        &executed,
-                        op.id.0,
-                    )?;
-                    touched_update_order.push(state_id.0);
-                    touched_updates.insert(state_id.0, (executed, vec![op.id.0]));
-                }
-            }
+                &root_json_event,
+                &mut staged_root_state,
+                &mut touched_update_candidates,
+                &mut touched_updates,
+                &mut runtime_branch,
+            )?;
         }
 
-        for state_id in touched_update_order {
-            let Some((executed, op_ids)) = touched_updates.remove(&state_id) else {
-                continue;
-            };
-            let target_label = plan_state_label(plan, state_id);
-            let changed = root_state.get(&target_label) != Some(&executed.value);
-            apply_executed_root_update_to_state(
-                &mut root_state,
-                &mut root_bytes_state,
-                &mut root_fixed_bytes_banks,
-                plan,
-                state_id,
-                &executed,
-                op_ids[0],
-            )?;
-            if changed {
-                touched_states.insert(target_label.clone(), executed.value.clone());
-                let signature = format!("FieldSet:{target_label}");
-                step_signatures.push(signature.clone());
-                semantic_delta_signatures.push(signature);
-                let delta_value = root_plan_semantic_delta_value(&executed.value);
-                let delta = json!({
-                    "kind": "FieldSet",
-                    "list_id": null,
-                    "key": null,
-                    "generation": null,
-                    "source_id": null,
-                    "bind_epoch": null,
-                    "field_path": target_label.clone(),
-                    "value": delta_value,
-                });
-                semantic_deltas.push(delta.clone());
-                step_deltas.push(delta);
-            }
-            updates.push(json!({
-                "source_id": source_id.0,
-                "target_state": target_label,
-                "target_state_id": state_id,
-                "update_op_id": op_ids[0],
-                "candidate_update_op_ids": op_ids,
-                "expression_kind": executed.expression_kind,
-                "source_payload_field": executed.source_payload_field,
-                "update_constant_id": executed.update_constant_id,
-                "update_constant_value": executed.update_constant_value,
-                "bytes_access": executed.bytes_access,
-                "host_effect": executed.host_effect,
-                "selected_op_indexed": false,
-                "selected_op_unresolved_executable_ref_count": 0,
-                "value": executed.value,
-                "changed": changed,
-            }));
-            executed_update_branch_count += 1;
+        let root_update_commit_batch = commit_plan_ordered_root_update_candidates(
+            &mut root_state,
+            plan,
+            source_id,
+            &touched_update_candidates,
+            touched_updates,
+        )?;
+        touched_states.extend(root_update_commit_batch.touched_states);
+        for signature in root_update_commit_batch.semantic_delta_signatures {
+            step_signatures.push(signature.clone());
+            semantic_delta_signatures.push(signature);
         }
+        for delta in root_update_commit_batch.semantic_deltas {
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+        }
+        updates.extend(root_update_commit_batch.update_reports);
+        executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
         pending_indexed_deltas.extend(refresh_all_indexed_derived_fields(plan, &mut list_state)?);
         let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
         for delta in &pending_indexed_deltas {
@@ -4984,88 +4382,90 @@ fn execute_machine_plan_root_scenario_inner(
             semantic_deltas.push(delta.clone());
             step_deltas.push(delta.clone());
         }
-        let step_retain_execution = materialize_plan_list_retains(plan, &root_state, &list_state)?;
+        let step_retain_execution =
+            materialize_plan_list_retains(plan, &root_state.root_state, &list_state)?;
         executed_list_retain_count += step_retain_execution.executed_count;
         executed_list_view_count += step_retain_execution.view_count;
         retained_list_row_count += step_retain_execution.retained_row_count;
         let step_bytes_counters = runtime_bytes_storage_counters_snapshot()
             .saturating_delta_since(step_bytes_counter_start);
-        per_step.push(json!({
-            "step_id": step.id,
-            "source": generic_event.source,
-            "source_id": source_id.0,
-            "executed_update_branch_count": touched_states.len() + indexed_updates.len(),
-            "executed_derived_value_count": derived.len(),
-            "executed_list_append_count": append_result.appended_row_count,
-            "executed_list_remove_count": list_removes.len(),
-            "executed_indexed_update_count": indexed_updates.len(),
-            "executed_list_retain_count": step_retain_execution.executed_count,
-            "executed_list_view_count": step_retain_execution.view_count,
-            "retained_list_row_count": step_retain_execution.retained_row_count,
-            "emitted_source_bind_count": append_result.source_bind_count,
-            "emitted_source_unbind_count": remove_result.source_unbind_count,
-            "derived": derived,
-            "list_appends": append_result.report_rows,
-            "list_removes": list_removes,
-            "list_retains": step_retain_execution.reports,
-            "list_view_summary": JsonValue::Object(step_retain_execution.summary),
-            "indexed_updates": indexed_updates,
-            "updates": updates,
-            "touched_state_summary": JsonValue::Object(touched_states),
-            "semantic_delta_signatures": step_signatures,
-            "semantic_deltas": step_deltas,
-            "bytes_storage_counters": step_bytes_counters.report_json(),
-            "bytes_storage_no_copy": step_bytes_counters.no_runtime_byte_copies(),
-        }));
+        let step_report = assemble_plan_root_scenario_step_report(
+            &step.id,
+            generic_event.source,
+            source_id,
+            &root_dispatch_report,
+            touched_states.len() + indexed_updates.len(),
+            derived.len(),
+            append_result.appended_row_count,
+            list_removes.len(),
+            indexed_updates.len(),
+            step_retain_execution.executed_count,
+            step_retain_execution.view_count,
+            step_retain_execution.retained_row_count,
+            append_result.source_bind_count,
+            remove_result.source_unbind_count,
+            derived,
+            append_result.report_rows,
+            list_removes,
+            step_retain_execution.reports,
+            JsonValue::Object(step_retain_execution.summary),
+            indexed_updates,
+            updates,
+            JsonValue::Object(touched_states),
+            step_signatures,
+            step_deltas,
+            step_bytes_counters.report_json(),
+            step_bytes_counters.no_runtime_byte_copies(),
+        );
+        per_step.push(step_report.step_report);
     }
 
     let plan_hash = plan_sha256(plan)?;
     let bytes_storage_counters =
         runtime_bytes_storage_counters_snapshot().saturating_delta_since(bytes_counter_baseline);
-    let state_summary = JsonValue::Object(root_state);
+    let state_summary = JsonValue::Object(root_state.root_state);
     let list_summary = plan_list_summary(plan, &list_state);
     let projection_execution =
         materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_state)?;
     let retain_execution =
         materialize_plan_list_retains(plan, state_summary.as_object().unwrap(), &list_state)?;
     let semantic_deltas = JsonValue::Array(semantic_deltas);
-    let executor_report = json!({
-        "executor": "cpu-plan-root-list-scenario-v1",
-        "selected_step_count": per_step.len(),
-        "initialized_root_state_count": initialized_state_count,
-        "executed_update_branch_count": executed_update_branch_count,
-        "executed_derived_value_count": executed_derived_value_count,
-        "executed_list_append_count": executed_list_append_count,
-        "executed_list_remove_count": executed_list_remove_count,
-        "executed_indexed_update_count": executed_indexed_update_count,
-        "emitted_source_bind_count": emitted_source_bind_count,
-        "emitted_source_unbind_count": emitted_source_unbind_count,
-        "executed_list_retain_count": executed_list_retain_count,
-        "executed_list_view_count": executed_list_view_count,
-        "retained_list_row_count": retained_list_row_count,
-        "executed_list_projection_count": projection_execution.executed_count,
-        "executed_list_projection_find_count": projection_execution.find_count,
-        "executed_list_projection_chunk_count": projection_execution.chunk_count,
-        "projected_list_row_count": projection_execution.projected_row_count,
-        "list_slot_count": plan.storage_layout.list_slots.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-        "state_summary": state_summary,
-        "list_summary": list_summary,
-        "list_projection_summary": JsonValue::Object(projection_execution.summary),
-        "list_projections": projection_execution.reports,
-        "list_view_summary": JsonValue::Object(retain_execution.summary),
-        "list_retains": retain_execution.reports,
-        "semantic_delta_signatures": semantic_delta_signatures,
-        "semantic_deltas": semantic_deltas.clone(),
-        "per_step": per_step,
-        "assertion_checkpoints": assertion_checkpoints,
-        "bytes_storage_counters": bytes_storage_counters.report_json(),
-        "bytes_storage_no_copy": bytes_storage_counters.no_runtime_byte_copies(),
-    });
+    let list_projection_summary = JsonValue::Object(projection_execution.summary);
+    let list_view_summary = JsonValue::Object(retain_execution.summary);
+    let bytes_storage_counters_report = bytes_storage_counters.report_json();
+    let bytes_storage_no_copy = bytes_storage_counters.no_runtime_byte_copies();
+    let report_assembly = assemble_plan_root_scenario_report(
+        plan,
+        per_step.len(),
+        initialized_state_count,
+        &root_bytes_initialization_core,
+        executed_update_branch_count,
+        executed_derived_value_count,
+        executed_list_append_count,
+        executed_list_remove_count,
+        executed_indexed_update_count,
+        emitted_source_bind_count,
+        emitted_source_unbind_count,
+        executed_list_retain_count,
+        executed_list_view_count,
+        retained_list_row_count,
+        projection_execution.executed_count,
+        projection_execution.find_count,
+        projection_execution.chunk_count,
+        projection_execution.projected_row_count,
+        &state_summary,
+        &list_summary,
+        &list_projection_summary,
+        &projection_execution.reports,
+        &list_view_summary,
+        &retain_execution.reports,
+        &semantic_delta_signatures,
+        &semantic_deltas,
+        &per_step,
+        &assertion_checkpoints,
+        &bytes_storage_counters_report,
+        bytes_storage_no_copy,
+    )?;
     Ok(RootScenarioExecution {
         plan_hash,
         state_summary,
@@ -5073,7 +4473,7 @@ fn execute_machine_plan_root_scenario_inner(
         semantic_deltas,
         per_step,
         assertion_checkpoints,
-        executor_report,
+        executor_report: report_assembly.executor_report,
     })
 }
 
@@ -5083,378 +4483,52 @@ fn assert_plan_executor_scenario_checkpoint(
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
     step: &ScenarioStep,
 ) -> RuntimeResult<JsonValue> {
-    if !step.expect_semantic_delta_contains.is_empty()
-        || !step.expect_render_delta_contains.is_empty()
-    {
-        return Err(format!(
-            "{} assertion-only PlanExecutor checkpoint cannot validate delta expectations without a source event",
-            step.id
-        )
-        .into());
-    }
-
-    let mut checked = Vec::new();
-    let todos = plan_rows_with_field(list_state, "title");
-    if let Some(expected) = &step.expect_titles {
-        let actual = todos
-            .iter()
-            .filter_map(|row| row_textlike_field(row, "title"))
-            .collect::<Vec<_>>();
-        assert_eq_report(&step.id, "titles", expected, &actual)?;
-        checked.push("expect_titles");
-    }
-    if let Some(expected) = &step.expect_visible_titles {
-        let retain_execution = materialize_plan_list_retains(plan, root_state, list_state)?;
-        let actual = plan_visible_titles_from_retains(&retain_execution)?;
-        assert_eq_report(&step.id, "visible_titles", expected, &actual)?;
-        checked.push("expect_visible_titles");
-    }
-    if let Some(expected) = &step.expect_completed_titles {
-        let actual = todos
-            .iter()
-            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) == Some(true))
-            .filter_map(|row| row_textlike_field(row, "title"))
-            .collect::<Vec<_>>();
-        assert_eq_report(&step.id, "completed_titles", expected, &actual)?;
-        checked.push("expect_completed_titles");
-    }
-    if let Some(expected) = step.expect_active_count {
-        let actual = todos
-            .iter()
-            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) != Some(true))
-            .count();
-        assert_num(&step.id, "active_count", expected, actual)?;
-        checked.push("expect_active_count");
-    }
-    if let Some(expected) = step.expect_completed_count {
-        let actual = todos
-            .iter()
-            .filter(|row| row.fields.get("completed").and_then(JsonValue::as_bool) == Some(true))
-            .count();
-        assert_num(&step.id, "completed_count", expected, actual)?;
-        checked.push("expect_completed_count");
-    }
-    if let Some(expected) = &step.expect_filter {
-        let actual = plan_root_textlike_for_assertion(
-            root_state,
-            "store.selected_filter",
-            "selected_filter",
-        )?;
-        assert_eq_report(&step.id, "filter", expected, &actual)?;
-        checked.push("expect_filter");
-    }
-    if let Some(expected) = &step.expect_new_text {
-        let actual =
-            plan_root_textlike_for_assertion(root_state, "store.new_todo_text", "new_todo_text")?;
-        assert_eq_report(&step.id, "new_text", expected, &actual)?;
-        checked.push("expect_new_text");
-    }
-    if let Some(expected) = &step.expect_editing_title {
-        let row = plan_single_editing_row(&todos, &step.id)?;
-        let actual = row_textlike_field(row, "title")
-            .ok_or_else(|| format!("{} editing row is missing textlike title", step.id))?;
-        assert_eq_report(&step.id, "editing_title", expected, &actual)?;
-        checked.push("expect_editing_title");
-    }
-    if let Some(expected) = &step.expect_edit_text {
-        let row = plan_single_editing_row(&todos, &step.id)?;
-        let actual = row_textlike_field(row, "edit_text")
-            .ok_or_else(|| format!("{} editing row is missing textlike edit_text", step.id))?;
-        assert_eq_report(&step.id, "edit_text", expected, &actual)?;
-        checked.push("expect_edit_text");
-    }
-    if let Some(expected) = step.expect_no_editing {
-        let actual = !todos
-            .iter()
-            .any(|row| row.fields.get("editing").and_then(JsonValue::as_bool) == Some(true));
-        assert_eq_report(&step.id, "no_editing", &expected, &actual)?;
-        checked.push("expect_no_editing");
-    }
-    if let Some(expect) = &step.expect_cell {
-        let mut required_fields = Vec::new();
-        if expect.value.is_some() {
-            required_fields.push("value");
-        }
-        if expect.formula.is_some() {
-            required_fields.push("formula_text");
-        }
-        if expect.editing_text.is_some() {
-            required_fields.push("editing_text");
-        }
-        if expect.editing.is_some() {
-            required_fields.push("editing");
-        }
-        let row = plan_cell_row(list_state, &expect.address, &required_fields, &step.id)?;
-        if let Some(expected) = &expect.value {
-            let actual = row_textlike_field(row, "value").unwrap_or_default();
-            assert_eq_report(&step.id, "cell.value", expected, &actual)?;
-            checked.push("expect_cell.value");
-        }
-        if let Some(expected) = &expect.formula {
-            let actual = row_textlike_field(row, "formula_text").unwrap_or_default();
-            assert_eq_report(&step.id, "cell.formula", expected, &actual)?;
-            checked.push("expect_cell.formula");
-        }
-        if let Some(expected) = &expect.editing_text {
-            let actual = row_textlike_field(row, "editing_text").unwrap_or_default();
-            assert_eq_report(&step.id, "cell.editing_text", expected, &actual)?;
-            checked.push("expect_cell.editing_text");
-        }
-        if let Some(expected) = expect.editing {
-            let actual = row
-                .fields
-                .get("editing")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false);
-            assert_eq_report(&step.id, "cell.editing", &expected, &actual)?;
-            checked.push("expect_cell.editing");
-        }
-    }
-    if let Some(expect) = &step.expect_error {
-        let row = plan_cell_row(list_state, &expect.address, &["error"], &step.id)?;
-        let actual = row_textlike_field(row, "error").filter(|error| !error.is_empty());
-        assert_eq_report(
-            &step.id,
-            "cell.error",
-            &Some(expect.error.as_str()),
-            &actual.as_deref(),
-        )?;
-        checked.push("expect_error");
-    }
-    if step.expect_recomputed.is_some() {
-        return Err(format!(
-            "{} assertion-only PlanExecutor checkpoint cannot validate expect_recomputed without a source event recompute set",
-            step.id
-        )
-        .into());
-    }
-    for (path, expected) in &step.expect_root_text {
-        let actual = plan_root_textlike_for_assertion(root_state, path, path)?;
-        assert_eq_report(&step.id, path, expected, &actual)?;
-        checked.push("expect_root_text");
-    }
-
-    Ok(json!({
-        "step_id": step.id,
-        "source_intent_exemption": step.source_intent_exemption,
-        "checked_expectations": checked,
-        "checked_expectation_count": checked.len(),
-        "passed": true,
-    }))
-}
-
-fn plan_rows_with_field<'a>(
-    list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
-    field: &str,
-) -> Vec<&'a PlanListRowState> {
-    list_state
-        .values()
-        .find(|rows| rows.iter().any(|row| row.fields.contains_key(field)))
-        .map(|rows| rows.iter().collect())
-        .unwrap_or_default()
-}
-
-fn row_textlike_field(row: &PlanListRowState, field: &str) -> Option<String> {
-    row.fields.get(field).and_then(json_scalar_text)
-}
-
-fn plan_visible_titles_from_retains(
-    retain_execution: &ListRetainExecution,
-) -> RuntimeResult<Vec<String>> {
-    retain_execution
-        .summary
-        .iter()
-        .find(|(target, _)| target.ends_with("visible_todos") || target.as_str() == "visible_todos")
-        .or_else(|| retain_execution.summary.iter().next())
-        .map(|(_, summary)| {
-            summary
-                .get("titles")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| "PlanExecutor retain summary is missing visible titles".into())
-                .and_then(|titles| {
-                    titles
-                        .iter()
-                        .map(|title| {
-                            json_scalar_text(title)
-                                .ok_or_else(|| "PlanExecutor visible title is not textlike".into())
-                        })
-                        .collect::<RuntimeResult<Vec<_>>>()
-                })
-        })
-        .unwrap_or_else(|| Ok(Vec::new()))
-}
-
-fn plan_single_editing_row<'a>(
-    rows: &[&'a PlanListRowState],
-    step_id: &str,
-) -> RuntimeResult<&'a PlanListRowState> {
-    let editing = rows
-        .iter()
-        .copied()
-        .filter(|row| row.fields.get("editing").and_then(JsonValue::as_bool) == Some(true))
-        .collect::<Vec<_>>();
-    match editing.as_slice() {
-        [row] => Ok(*row),
-        [] => Err(format!("{step_id}: expected one editing row, found none").into()),
-        rows => Err(format!("{step_id}: expected one editing row, found {}", rows.len()).into()),
-    }
-}
-
-fn plan_cell_row<'a>(
-    list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
-    address: &str,
-    required_fields: &[&str],
-    step_id: &str,
-) -> RuntimeResult<&'a PlanListRowState> {
-    for rows in list_state.values() {
-        for row in rows {
-            if row_textlike_field(row, "address").as_deref() == Some(address)
-                && required_fields
-                    .iter()
-                    .all(|field| row.fields.contains_key(*field))
-            {
-                return Ok(row);
-            }
-        }
-    }
-    Err(format!(
-        "{step_id}: PlanExecutor cell address `{address}` with fields {:?} not found",
-        required_fields
-    )
-    .into())
-}
-
-fn plan_root_textlike_for_assertion(
-    root_state: &serde_json::Map<String, JsonValue>,
-    path: &str,
-    fallback_path: &str,
-) -> RuntimeResult<String> {
-    let root = JsonValue::Object(root_state.clone());
-    for candidate in [
-        path.to_owned(),
-        format!("store.{fallback_path}"),
-        fallback_path.to_owned(),
-    ] {
-        if let Some(value) = json_value_at_dotted_path(&root, &candidate)
-            && let Some(text) = json_scalar_text(value)
-        {
-            return Ok(text);
-        }
-    }
-    Err(format!("PlanExecutor root text assertion path `{path}` not found").into())
-}
-
-fn plan_assertion_checkpoint_report_is_covered(checkpoint: &JsonValue) -> bool {
-    let checked = checkpoint
-        .get("checked_expectations")
-        .and_then(JsonValue::as_array);
-    checkpoint.get("passed").and_then(JsonValue::as_bool) == Some(true)
-        && checked.is_some_and(|checked| {
-            checkpoint
-                .get("checked_expectation_count")
-                .and_then(JsonValue::as_u64)
-                == Some(checked.len() as u64)
-        })
-}
-
-fn root_plan_semantic_delta_value(value: &JsonValue) -> JsonValue {
-    value.clone()
-}
-
-fn apply_executed_root_update_to_state(
-    root_state: &mut serde_json::Map<String, JsonValue>,
-    root_bytes_state: &mut RootBytesState,
-    root_fixed_bytes_banks: &mut RootFixedBytesBanks,
-    plan: &MachinePlan,
-    state_id: usize,
-    executed: &ExecutedRootUpdate,
-    op_id: usize,
-) -> RuntimeResult<()> {
-    let target_label = plan_state_label(plan, state_id);
-    root_state.insert(target_label, executed.value.clone());
-    if let Some(mutation) = &executed.fixed_bytes_mutation {
-        apply_root_fixed_bytes_mutation(root_bytes_state, root_fixed_bytes_banks, mutation, op_id)?;
-        root_bytes_state.remove(&state_id);
-    } else if let Some(bytes) = executed.bytes_value.clone() {
-        root_bytes_state.insert(state_id, bytes);
-        root_fixed_bytes_banks.remove(&state_id);
-    } else {
-        root_bytes_state.remove(&state_id);
-        root_fixed_bytes_banks.remove(&state_id);
-    }
-    Ok(())
-}
-
-struct ExecutedRootUpdate {
-    value: JsonValue,
-    bytes_value: Option<RuntimeBytes>,
-    fixed_bytes_mutation: Option<RootFixedBytesMutation>,
-    bytes_access: JsonValue,
-    expression_kind: &'static str,
-    source_payload_field: JsonValue,
-    update_constant_id: JsonValue,
-    update_constant_value: JsonValue,
-    host_effect: JsonValue,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RootFixedBytesMutation {
-    input_state_id: StateId,
-    output_state_id: StateId,
-    patches: Vec<(usize, u8)>,
+    let list_state = plan_executor_list_state_for_materialization(list_state);
+    let report = assert_plan_scenario_checkpoint(
+        plan,
+        root_state,
+        &list_state,
+        PlanExecutorScenarioCheckpointInput {
+            step_id: step.id.clone(),
+            source_intent_exemption: step.source_intent_exemption.clone(),
+            semantic_delta_expectation_count: step.expect_semantic_delta_contains.len(),
+            render_delta_expectation_count: step.expect_render_delta_contains.len(),
+            expect_titles: step.expect_titles.clone(),
+            expect_visible_titles: step.expect_visible_titles.clone(),
+            expect_completed_titles: step.expect_completed_titles.clone(),
+            expect_active_count: step.expect_active_count,
+            expect_completed_count: step.expect_completed_count,
+            expect_filter: step.expect_filter.clone(),
+            expect_new_text: step.expect_new_text.clone(),
+            expect_editing_title: step.expect_editing_title.clone(),
+            expect_edit_text: step.expect_edit_text.clone(),
+            expect_no_editing: step.expect_no_editing,
+            expect_cell: step.expect_cell.as_ref().map(|expect| {
+                PlanExecutorScenarioCheckpointCellExpectation {
+                    address: expect.address.clone(),
+                    value: expect.value.clone(),
+                    formula: expect.formula.clone(),
+                    editing_text: expect.editing_text.clone(),
+                    editing: expect.editing,
+                }
+            }),
+            expect_error: step.expect_error.as_ref().map(|expect| {
+                PlanExecutorScenarioCheckpointErrorExpectation {
+                    address: expect.address.clone(),
+                    error: expect.error.clone(),
+                }
+            }),
+            expect_recomputed_present: step.expect_recomputed.is_some(),
+            expect_root_text: step.expect_root_text.clone(),
+        },
+    )?;
+    Ok(report.report)
 }
 
 struct RootBytesView<'a> {
     bytes: Cow<'a, [u8]>,
     access_source: &'static str,
     cow_kind: &'static str,
-}
-
-fn root_update_output_state_id(op: &boon_plan::PlanOp) -> Option<StateId> {
-    if op.indexed {
-        return None;
-    }
-    match op.output.as_ref()? {
-        ValueRef::State(state_id) => Some(*state_id),
-        _ => None,
-    }
-}
-
-fn root_update_state_inputs(op: &boon_plan::PlanOp) -> Vec<StateId> {
-    let output = root_update_output_state_id(op);
-    let mut inputs = Vec::new();
-    for input in &op.inputs {
-        if let ValueRef::State(state_id) = input
-            && Some(*state_id) != output
-            && !inputs.contains(state_id)
-        {
-            inputs.push(*state_id);
-        }
-    }
-    inputs
-}
-
-fn sort_plan_ops_for_same_event_root_reads(ops: &mut Vec<&boon_plan::PlanOp>) {
-    let target_state_ids = ops
-        .iter()
-        .filter_map(|op| root_update_output_state_id(op))
-        .collect::<Vec<_>>();
-    let mut pending = std::mem::take(ops);
-    let mut sorted = Vec::with_capacity(pending.len());
-    let mut settled = BTreeSet::new();
-    while !pending.is_empty() {
-        let ready_position = pending.iter().position(|candidate| {
-            root_update_state_inputs(candidate)
-                .iter()
-                .all(|input| !target_state_ids.contains(input) || settled.contains(&input.0))
-        });
-        let next = pending.remove(ready_position.unwrap_or(0));
-        if let Some(state_id) = root_update_output_state_id(next) {
-            settled.insert(state_id.0);
-        }
-        sorted.push(next);
-    }
-    *ops = sorted;
 }
 
 fn root_bytes_view_access_json(
@@ -5470,21 +4544,12 @@ fn root_bytes_view_access_json(
     })
 }
 
-#[derive(Clone, Debug)]
-struct PlanListRowState {
-    key: u64,
-    generation: u64,
-    fields: BTreeMap<String, JsonValue>,
-    private_bytes: BTreeMap<String, RuntimeBytes>,
-    fixed_bytes_banks: BTreeMap<String, Vec<u8>>,
-}
+type PlanListRowState = PlanExecutorListRowState;
 
-fn report_row_fields(row: &PlanListRowState) -> BTreeMap<String, JsonValue> {
-    let mut fields = row.fields.clone();
-    for (field, bytes) in &row.private_bytes {
-        fields.insert(field.clone(), bytes.report_json());
-    }
-    fields
+fn plan_executor_list_row_report_fields(
+    row: &PlanListRowState,
+) -> RuntimeResult<BTreeMap<String, JsonValue>> {
+    Ok(plan_list_row_state_report_fields(row))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -5494,167 +4559,13 @@ struct PlanRowEvalKey {
     field_id: usize,
 }
 
-struct ListAppendExecution {
-    semantic_deltas: Vec<JsonValue>,
-    report_rows: Vec<JsonValue>,
-    appended_row_count: usize,
-    source_bind_count: usize,
-}
-
-struct ListRemoveExecution {
-    semantic_deltas: Vec<JsonValue>,
-    report_rows: Vec<JsonValue>,
-    report_derived: Vec<JsonValue>,
-    removed_row_count: usize,
-    source_unbind_count: usize,
-    derived_count: usize,
-}
-
-struct ListRemoveTarget {
-    row_index: usize,
-    row: PlanListRowState,
-    row_resolution: JsonValue,
-    source_binding_id: Option<u64>,
-    bind_epoch: Option<u64>,
-}
-
-struct IndexedUpdateExecution {
-    semantic_deltas: Vec<JsonValue>,
-    report_rows: Vec<JsonValue>,
-    updated_row_count: usize,
-}
-
-#[derive(Default)]
-struct ListProjectionExecution {
-    summary: serde_json::Map<String, JsonValue>,
-    reports: Vec<JsonValue>,
-    executed_count: usize,
-    find_count: usize,
-    chunk_count: usize,
-    projected_row_count: usize,
-}
-
-#[derive(Default)]
-struct ListRetainExecution {
-    summary: serde_json::Map<String, JsonValue>,
-    reports: Vec<JsonValue>,
-    executed_count: usize,
-    view_count: usize,
-    retained_row_count: usize,
-}
-
 fn materialize_plan_list_projections(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> RuntimeResult<ListProjectionExecution> {
-    let mut execution = ListProjectionExecution::default();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::ListProjections)
-        .flat_map(|region| region.ops.iter())
-    {
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            return Err(format!("list projection op {} has no field output", op.id.0).into());
-        };
-        let PlanOpKind::ListProjection { projection } = &op.kind else {
-            return Err(format!(
-                "list projection region op {} is not a ListProjection",
-                op.id.0
-            )
-            .into());
-        };
-        let target_label = plan_semantic_field_label(plan, output_id.0);
-        match projection {
-            PlanListProjection::Find {
-                source_list,
-                field,
-                value,
-            } => {
-                let selector = plan_projection_selector_value(plan, root_state, value)?;
-                let rows = list_state.get(&source_list.0).ok_or_else(|| {
-                    format!(
-                        "list projection op {} source list {} is not materialized",
-                        op.id.0, source_list.0
-                    )
-                })?;
-                let projected = rows
-                    .iter()
-                    .find(|row| row_json_values_equal(row.fields.get(field), &selector))
-                    .map(|row| JsonValue::Object(row.fields.clone().into_iter().collect()))
-                    .unwrap_or(JsonValue::Null);
-                let projected_row_count = usize::from(!projected.is_null());
-                execution
-                    .summary
-                    .insert(target_label.clone(), projected.clone());
-                execution.reports.push(json!({
-                    "op_id": op.id.0,
-                    "kind": "find",
-                    "target": target_label,
-                    "source_list_id": source_list.0,
-                    "source_list": plan_list_label(plan, source_list.0),
-                    "field": field,
-                    "selector": selector,
-                    "projected_row_count": projected_row_count,
-                }));
-                execution.executed_count += 1;
-                execution.find_count += 1;
-                execution.projected_row_count += projected_row_count;
-            }
-            PlanListProjection::Chunk {
-                source_list,
-                size,
-                item_field,
-                label_field,
-            } => {
-                let rows = list_state.get(&source_list.0).ok_or_else(|| {
-                    format!(
-                        "list projection op {} source list {} is not materialized",
-                        op.id.0, source_list.0
-                    )
-                })?;
-                let mut chunks = Vec::new();
-                for (index, chunk) in rows.chunks(*size).enumerate() {
-                    let mut chunk_object = serde_json::Map::new();
-                    chunk_object.insert(label_field.clone(), JsonValue::String(index.to_string()));
-                    chunk_object.insert(
-                        item_field.clone(),
-                        JsonValue::Array(
-                            chunk
-                                .iter()
-                                .map(|row| {
-                                    JsonValue::Object(row.fields.clone().into_iter().collect())
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                    );
-                    chunks.push(JsonValue::Object(chunk_object));
-                }
-                execution
-                    .summary
-                    .insert(target_label.clone(), JsonValue::Array(chunks.clone()));
-                execution.reports.push(json!({
-                    "op_id": op.id.0,
-                    "kind": "chunk",
-                    "target": target_label,
-                    "source_list_id": source_list.0,
-                    "source_list": plan_list_label(plan, source_list.0),
-                    "size": size,
-                    "item_field": item_field,
-                    "label_field": label_field,
-                    "projected_row_count": chunks.len(),
-                }));
-                execution.executed_count += 1;
-                execution.chunk_count += 1;
-                execution.projected_row_count += chunks.len();
-            }
-            PlanListProjection::Unknown { summary } => {
-                return Err(format!("list projection op {} is unknown: {summary}", op.id.0).into());
-            }
-        }
-    }
-    Ok(execution)
+    let executor_rows = plan_executor_list_state_for_materialization(list_state);
+    materialize_plan_list_projections_core(plan, root_state, &executor_rows)
 }
 
 fn materialize_plan_list_retains(
@@ -5662,1211 +4573,25 @@ fn materialize_plan_list_retains(
     root_state: &serde_json::Map<String, JsonValue>,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> RuntimeResult<ListRetainExecution> {
-    let mut execution = ListRetainExecution::default();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::ListOperations)
-        .flat_map(|region| region.ops.iter())
-    {
-        let PlanOpKind::ListOperation {
-            operation_kind: boon_plan::PlanListOperationKind::Retain,
-            retain: Some(retain),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        let Some(ValueRef::List(source_list_id)) = op.output else {
-            return Err(format!("list retain op {} has no source list output", op.id.0).into());
-        };
-        let ValueRef::Field(target_field_id) = retain.target else {
-            return Err(format!("list retain op {} target is not a field", op.id.0).into());
-        };
-        if !op.inputs.contains(&retain.target) {
-            return Err(format!(
-                "list retain op {} target field is not present in typed inputs",
-                op.id.0
-            )
-            .into());
-        }
-
-        let source_label = plan_list_label(plan, source_list_id.0);
-        let target_label = plan_derived_field_label(plan, target_field_id.0);
-        let rows = list_state.get(&source_list_id.0).ok_or_else(|| {
-            format!(
-                "list retain op {} source list {} is not materialized",
-                op.id.0, source_list_id.0
-            )
-        })?;
-        let mut retained_rows = Vec::new();
-        let mut titles = Vec::new();
-        let mut active_count = 0usize;
-        let mut completed_count = 0usize;
-        let mut predicate_report = None;
-        for (row_index, row) in rows.iter().enumerate() {
-            let resolution =
-                list_retain_predicate_resolution(plan, root_state, &retain.predicate, row)?;
-            predicate_report = Some(resolution.report.clone());
-            if !resolution.retained {
-                continue;
-            }
-            if let Some(title) = row.fields.get("title") {
-                titles.push(title.clone());
-            }
-            if row
-                .fields
-                .get("completed")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false)
-            {
-                completed_count += 1;
-            } else {
-                active_count += 1;
-            }
-            retained_rows.push(json!({
-                "source_row_index": row_index,
-                "key": row.key,
-                "generation": row.generation,
-                "fields": row.fields,
-            }));
-        }
-        let predicate = match predicate_report {
-            Some(report) => report,
-            None => list_retain_empty_predicate_report(plan, root_state, &retain.predicate)?,
-        };
-        let row_count = retained_rows.len();
-        let summary = json!({
-            "retain_op_id": op.id.0,
-            "target_field_id": target_field_id.0,
-            "target": target_label,
-            "source_list_id": source_list_id.0,
-            "source_list": source_label,
-            "source_row_count": rows.len(),
-            "row_count": row_count,
-            "titles": titles,
-            "active_count": active_count,
-            "completed_count": completed_count,
-            "rows": retained_rows,
-        });
-        execution
-            .summary
-            .insert(target_label.clone(), summary.clone());
-        execution.reports.push(json!({
-            "op_id": op.id.0,
-            "kind": "retain",
-            "target_field_id": target_field_id.0,
-            "target": target_label,
-            "source_list_id": source_list_id.0,
-            "source_list": source_label,
-            "predicate": predicate,
-            "source_row_count": rows.len(),
-            "retained_row_count": row_count,
-            "rows": summary["rows"],
-        }));
-        execution.executed_count += 1;
-        execution.view_count += 1;
-        execution.retained_row_count += row_count;
-    }
-    Ok(execution)
+    let executor_rows = plan_executor_list_state_for_materialization(list_state);
+    materialize_plan_list_retains_core(plan, root_state, &executor_rows)
 }
 
-struct ListRetainPredicateResolution {
-    retained: bool,
-    report: JsonValue,
-}
-
-fn list_retain_predicate_resolution(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    predicate: &boon_plan::PlanListRemovePredicate,
-    row: &PlanListRowState,
-) -> RuntimeResult<ListRetainPredicateResolution> {
-    match predicate {
-        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        } => {
-            let ValueRef::State(selector_id) = selector else {
-                return Err("selected-filter retain selector is not a state ref".into());
-            };
-            let ValueRef::State(row_field_id) = row_field else {
-                return Err("selected-filter retain row field is not a state ref".into());
-            };
-            let selector_label = plan_state_label(plan, selector_id.0);
-            let selector_value = root_state
-                .get(&selector_label)
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    format!("selected-filter retain selector `{selector_label}` is not text")
-                })?;
-            let row_field_label = plan_state_label(plan, row_field_id.0);
-            let row_field_name = local_field_name(&row_field_label);
-            let row_value = row
-                .fields
-                .get(&row_field_name)
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| {
-                    format!(
-                        "selected-filter retain row field `{row_field_name}` is not bool on row key {} generation {}",
-                        row.key, row.generation
-                    )
-                })?;
-            let retained = match selector_value {
-                "All" => true,
-                "Active" => !row_value,
-                "Completed" => row_value,
-                other => {
-                    return Err(format!(
-                        "selected-filter retain selector `{selector_label}` has unsupported value `{other}`"
-                    )
-                    .into())
-                }
-            };
-            Ok(ListRetainPredicateResolution {
-                retained,
-                report: json!({
-                    "kind": "selected_filter_visibility",
-                    "selector_state_id": selector_id.0,
-                    "selector": selector_label,
-                    "selector_value": selector_value,
-                    "row_field_state_id": row_field_id.0,
-                    "row_field": row_field_name,
-                }),
-            })
-        }
-        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(ListRetainPredicateResolution {
-            retained: true,
-            report: json!({ "kind": "always_true" }),
-        }),
-        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
-            let (field_name, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(ListRetainPredicateResolution {
-                retained: value,
-                report: json!({
-                    "kind": "row_field_bool",
-                    "row_field": field_name,
-                }),
-            })
-        }
-        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
-            let (field_name, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(ListRetainPredicateResolution {
-                retained: !value,
-                report: json!({
-                    "kind": "row_field_bool_not",
-                    "row_field": field_name,
-                }),
-            })
-        }
-        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
-            "CPU root-scenario PlanExecutor does not support unknown list retain predicate `{summary}`"
-        )
-        .into()),
-    }
-}
-
-fn list_retain_empty_predicate_report(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    predicate: &boon_plan::PlanListRemovePredicate,
-) -> RuntimeResult<JsonValue> {
-    match predicate {
-        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        } => {
-            let ValueRef::State(selector_id) = selector else {
-                return Err("selected-filter retain selector is not a state ref".into());
-            };
-            let ValueRef::State(row_field_id) = row_field else {
-                return Err("selected-filter retain row field is not a state ref".into());
-            };
-            let selector_label = plan_state_label(plan, selector_id.0);
-            let selector_value = root_state
-                .get(&selector_label)
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    format!("selected-filter retain selector `{selector_label}` is not text")
-                })?;
-            Ok(json!({
-                "kind": "selected_filter_visibility",
-                "selector_state_id": selector_id.0,
-                "selector": selector_label,
-                "selector_value": selector_value,
-                "row_field_state_id": row_field_id.0,
-                "row_field": local_field_name(&plan_state_label(plan, row_field_id.0)),
-            }))
-        }
-        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({ "kind": "always_true" })),
-        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => Ok(json!({
-            "kind": "row_field_bool",
-            "row_field": local_field_name(&plan_state_label_from_ref(plan, input)?),
-        })),
-        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => Ok(json!({
-            "kind": "row_field_bool_not",
-            "row_field": local_field_name(&plan_state_label_from_ref(plan, input)?),
-        })),
-        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
-            "CPU root-scenario PlanExecutor does not support unknown list retain predicate `{summary}`"
-        )
-        .into()),
-    }
-}
-
-fn plan_state_label_from_ref(plan: &MachinePlan, value_ref: &ValueRef) -> RuntimeResult<String> {
-    let ValueRef::State(state_id) = value_ref else {
-        return Err(format!("expected state ref, got {value_ref:?}").into());
-    };
-    Ok(plan_state_label(plan, state_id.0))
-}
-
-fn plan_projection_selector_value(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    value: &ValueRef,
-) -> RuntimeResult<JsonValue> {
-    match value {
-        ValueRef::State(state_id) => {
-            let label = plan_state_label(plan, state_id.0);
-            root_state.get(&label).cloned().ok_or_else(|| {
-                format!("list projection selector state `{label}` is not materialized").into()
-            })
-        }
-        _ => Err(
-            "CPU PlanExecutor list projection selector currently requires a root state ref".into(),
-        ),
-    }
-}
-
-fn execute_supported_derived_values_for_source(
-    plan: &MachinePlan,
-    source_id: SourceId,
-    event: &LiveSourceEvent,
-    root_state: &serde_json::Map<String, JsonValue>,
-) -> RuntimeResult<BTreeMap<FieldId, JsonValue>> {
-    let mut values = BTreeMap::new();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-        .filter(|op| {
-            op.inputs
-                .iter()
-                .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
-        })
-    {
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            return Err(format!("derived op {} does not output a field", op.id.0).into());
-        };
-        match &op.kind {
-            PlanOpKind::DerivedValue {
-                expression:
-                    Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                        source_id: expression_source_id,
-                        key_field,
-                        required_key,
-                        state,
-                        skip_empty,
-                    }),
-                ..
-            } if *expression_source_id == source_id => {
-                let key = source_payload_json_value(event, key_field)?;
-                if key.as_str() != Some(required_key) {
-                    continue;
-                }
-                let text = match state {
-                    ValueRef::State(state_id) => {
-                        let state_label = plan_state_label(plan, state_id.0);
-                        root_state
-                            .get(&state_label)
-                            .and_then(JsonValue::as_str)
-                            .ok_or_else(|| {
-                                format!(
-                                    "derived op {} root state `{state_label}` is not text",
-                                    op.id.0
-                                )
-                            })?
-                            .to_owned()
-                    }
-                    ValueRef::SourcePayload {
-                        source_id: payload_source_id,
-                        field: SourcePayloadField::Text,
-                    } if *payload_source_id == source_id => {
-                        let payload = source_payload_json_value(event, &SourcePayloadField::Text)?;
-                        payload
-                            .as_str()
-                            .ok_or_else(|| {
-                                format!("derived op {} source text payload is not text", op.id.0)
-                            })?
-                            .to_owned()
-                    }
-                    other => {
-                        return Err(format!(
-                            "derived op {} trim input is not supported: {other:?}",
-                            op.id.0
-                        )
-                        .into());
-                    }
-                };
-                let trimmed = text.trim().to_owned();
-                if *skip_empty && trimmed.is_empty() {
-                    continue;
-                }
-                values.insert(output_id, JsonValue::String(trimmed));
-            }
-            _ => {
-                return Err(format!(
-                    "CPU root-scenario PlanExecutor does not support derived op {} for source {}",
-                    op.id.0, source_id.0
-                )
-                .into());
-            }
-        }
-    }
-    Ok(values)
-}
-
-fn source_key_gate_for_root_updates(plan: &MachinePlan, source_id: SourceId) -> Option<String> {
-    plan.regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-        .find_map(|op| match &op.kind {
-            PlanOpKind::DerivedValue {
-                expression:
-                    Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                        source_id: expression_source_id,
-                        required_key,
-                        ..
-                    }),
-                ..
-            } if *expression_source_id == source_id => Some(required_key.clone()),
-            _ => None,
-        })
-}
-
-fn append_list_rows_for_derived_values(
-    plan: &MachinePlan,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
-    list_next_keys: &mut BTreeMap<usize, u64>,
-    list_append_row_bool_delta_lists: &mut BTreeSet<usize>,
-    derived_values: &BTreeMap<FieldId, JsonValue>,
-) -> RuntimeResult<ListAppendExecution> {
-    let mut semantic_deltas = Vec::new();
-    let mut report_rows = Vec::new();
-    let mut appended_row_count = 0usize;
-    let mut source_bind_count = 0usize;
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::ListOperations)
-        .flat_map(|region| region.ops.iter())
-    {
-        let PlanOpKind::ListOperation {
-            operation_kind: boon_plan::PlanListOperationKind::Append,
-            append: Some(append),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        let Some(trigger_value) = value_for_plan_ref(plan, &append.trigger, derived_values, None)?
-        else {
-            continue;
-        };
-        if trigger_value.is_null() {
-            continue;
-        }
-        let Some(ValueRef::List(list_id)) = op.output else {
-            return Err(format!("append op {} does not output a list", op.id.0).into());
-        };
-        let list_slot = plan
-            .storage_layout
-            .list_slots
-            .iter()
-            .find(|slot| slot.list_id == list_id)
-            .ok_or_else(|| {
-                format!(
-                    "append op {} references missing list {}",
-                    op.id.0, list_id.0
-                )
-            })?;
-        let list_label = plan_list_label(plan, list_id.0);
-        let existing_rows = list_state
-            .get(&list_id.0)
-            .ok_or_else(|| format!("list state missing list {}", list_id.0))?;
-        let next_key = list_next_keys
-            .entry(list_id.0)
-            .or_insert_with(|| existing_rows.iter().map(|row| row.key).max().unwrap_or(0) + 1);
-        let key = *next_key;
-        *next_key = next_key.saturating_add(1);
-        let generation = 1u64;
-        let (mut fields, mut private_bytes, mut fixed_bytes_banks) =
-            plan_row_default_fields(plan, list_slot)?;
-        for field in &append.fields {
-            let field_id = field.field_id.ok_or_else(|| {
-                format!(
-                    "append op {} field `{}` has no typed field id",
-                    op.id.0, field.name
-                )
-            })?;
-            let field_label = plan_semantic_field_label(plan, field_id.0);
-            let field_name = local_field_name(&field_label);
-            let (value, bytes_value) = match (&field.value_ref, field.constant_id) {
-                (Some(value_ref), None) => {
-                    let value = value_for_plan_ref(plan, value_ref, derived_values, Some(&fields))?
-                        .ok_or_else(|| {
-                            format!(
-                                "append op {} field `{}` value ref was not produced",
-                                op.id.0, field.name
-                            )
-                        })?;
-                    (value, None)
-                }
-                (None, Some(constant_id)) => {
-                    let constant = plan
-                        .constants
-                        .iter()
-                        .find(|constant| constant.id == constant_id)
-                        .ok_or_else(|| {
-                            format!("append op {} missing constant {}", op.id.0, constant_id.0)
-                        })?;
-                    (
-                        plan_constant_json_value(constant)?,
-                        runtime_bytes_from_plan_constant_value(
-                            &constant.value,
-                            &format!("append op {} field `{}`", op.id.0, field.name),
-                        )?,
-                    )
-                }
-                _ => {
-                    return Err(format!(
-                        "append op {} field `{}` has invalid value source",
-                        op.id.0, field.name
-                    )
-                    .into());
-                }
-            };
-            fields.insert(field_name.clone(), value);
-            if let Some(bytes) = bytes_value {
-                if indexed_field_has_fixed_byte_bank(plan, list_slot.scope_id, &field_name) {
-                    fixed_bytes_banks.insert(field_name.clone(), bytes.inline_bytes()?.to_vec());
-                }
-                private_bytes.insert(field_name.clone(), bytes);
-            } else {
-                private_bytes.remove(&field_name);
-                fixed_bytes_banks.remove(&field_name);
-            }
-        }
-        let mut source_bind_deltas = Vec::new();
-        for (route_index, route) in row_scoped_source_routes(plan, list_slot).iter().enumerate() {
-            let source_binding_id = (key - 1)
-                * row_scoped_source_routes(plan, list_slot).len() as u64
-                + route_index as u64
-                + 1;
-            source_bind_deltas.push(json!({
-                "kind": "SourceBind",
-                "list_id": list_label,
-                "key": key,
-                "generation": generation,
-                "source_id": source_binding_id,
-                "bind_epoch": source_binding_id,
-                "field_path": route.path,
-                "value": route.path,
-            }));
-            source_bind_count += 1;
-        }
-
-        let mut row = PlanListRowState {
-            key,
-            generation,
-            fields,
-            private_bytes,
-            fixed_bytes_banks,
-        };
-        let fields_before_refresh = row.fields.clone();
-        let mut refresh_state = list_state.clone();
-        let mut projected_rows = existing_rows.clone();
-        projected_rows.push(row.clone());
-        refresh_state.insert(list_id.0, projected_rows);
-        refresh_row_expression_fields_best_effort(plan, list_slot, &refresh_state, &mut row);
-        refresh_row_initial_state_fields(plan, list_slot, &mut row);
-        let mut refresh_state = list_state.clone();
-        let mut projected_rows = existing_rows.clone();
-        projected_rows.push(row.clone());
-        refresh_state.insert(list_id.0, projected_rows);
-        refresh_row_expression_fields(plan, list_slot, &refresh_state, &mut row)?;
-        refresh_row_initial_state_fields(plan, list_slot, &mut row);
-
-        semantic_deltas.push(json!({
-            "kind": "ListInsert",
-            "list_id": list_label,
-            "key": key,
-            "generation": generation,
-            "source_id": null,
-            "bind_epoch": null,
-            "field_path": null,
-            "value": trigger_value,
-        }));
-        semantic_deltas.extend(source_bind_deltas);
-        semantic_deltas.extend(row_refresh_field_deltas(
-            plan,
-            list_slot,
-            &list_label,
-            key,
-            generation,
-            &fields_before_refresh,
-            &row.fields,
-        ));
-
-        let mut row_bool_deltas = row_bool_not_deltas(
-            plan,
-            list_slot,
-            &list_label,
-            key,
-            generation,
-            &mut row.fields,
-        )?;
-        if !list_append_row_bool_delta_lists.insert(list_id.0) {
-            row_bool_deltas.clear();
-        }
-        semantic_deltas.extend(row_bool_deltas);
-        let fields = row.fields.clone();
-        list_state
-            .get_mut(&list_id.0)
-            .ok_or_else(|| format!("list state missing list {}", list_id.0))?
-            .push(row);
-        report_rows.push(json!({
-            "list_id": list_id.0,
-            "list": list_label,
-            "append_op_id": op.id.0,
-            "key": key,
-            "generation": generation,
-            "trigger": trigger_value,
-            "fields": fields,
-        }));
-        appended_row_count += 1;
-    }
-    Ok(ListAppendExecution {
-        semantic_deltas,
-        report_rows,
-        appended_row_count,
-        source_bind_count,
-    })
-}
-
-fn remove_list_rows_for_source(
-    plan: &MachinePlan,
-    source_id: SourceId,
-    source_route_slot: &boon_plan::SourceRoute,
-    event: &GenericSourceEvent<'_>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
-) -> RuntimeResult<ListRemoveExecution> {
-    let mut semantic_deltas = Vec::new();
-    let mut report_rows = Vec::new();
-    let mut report_derived = Vec::new();
-    let mut removed_row_count = 0usize;
-    let mut source_unbind_count = 0usize;
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::ListOperations)
-        .flat_map(|region| region.ops.iter())
-    {
-        let PlanOpKind::ListOperation {
-            operation_kind: boon_plan::PlanListOperationKind::Remove,
-            remove: Some(remove),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        if remove.source != ValueRef::Source(source_id) {
-            continue;
-        }
-        if op.unresolved_executable_ref_count != 0 {
-            return Err(format!(
-                "selected list remove op {} has {} unresolved executable refs",
-                op.id.0, op.unresolved_executable_ref_count
-            )
-            .into());
-        }
-        let Some(ValueRef::List(list_id)) = op.output else {
-            return Err(format!("list remove op {} does not output a list", op.id.0).into());
-        };
-        let list_slot = plan
-            .storage_layout
-            .list_slots
-            .iter()
-            .find(|slot| slot.list_id == list_id)
-            .ok_or_else(|| {
-                format!(
-                    "list remove op {} references missing list {}",
-                    op.id.0, list_id.0
-                )
-            })?;
-        if source_route_slot.scoped && source_route_slot.scope_id != list_slot.scope_id {
-            return Err(format!(
-                "list remove op {} source scope {:?} does not match list scope {:?}",
-                op.id.0, source_route_slot.scope_id, list_slot.scope_id
-            )
-            .into());
-        }
-        let list_label = plan_list_label(plan, list_id.0);
-        if let Some(event_list) = event.list_id
-            && event_list != list_label
-        {
-            return Err(format!(
-                "scoped source `{}` targeted list `{event_list}`, expected `{list_label}`",
-                event.source
-            )
-            .into());
-        }
-        let before_derived = root_pure_number_compare_values(plan, list_state)?;
-        let rows_snapshot = list_state
-            .get(&list_id.0)
-            .ok_or_else(|| format!("list state missing list {}", list_id.0))?;
-        let target_rows = if source_route_slot.scoped {
-            let row_index =
-                resolve_plan_row_index(plan, source_route_slot, event, list_slot, list_state)?;
-            let row = rows_snapshot
-                .get(row_index)
-                .cloned()
-                .ok_or_else(|| format!("row index {row_index} missing in `{list_label}`"))?;
-            if !list_remove_predicate_matches(plan, &remove.predicate, &row)? {
-                Vec::new()
-            } else {
-                let source_binding_id =
-                    plan_row_source_binding_id(plan, list_slot, row.key, source_id);
-                let row_resolution =
-                    row_resolution_report(event, row_index, &row, source_binding_id);
-                vec![ListRemoveTarget {
-                    row_index,
-                    row,
-                    row_resolution,
-                    source_binding_id,
-                    bind_epoch: source_binding_id,
-                }]
-            }
-        } else {
-            let mut targets = Vec::new();
-            for (row_index, row) in rows_snapshot.iter().cloned().enumerate() {
-                if list_remove_predicate_matches(plan, &remove.predicate, &row)? {
-                    targets.push(ListRemoveTarget {
-                        row_index,
-                        row: row.clone(),
-                        row_resolution: predicate_row_resolution_report(
-                            plan,
-                            &remove.predicate,
-                            row_index,
-                            &row,
-                        )?,
-                        source_binding_id: None,
-                        bind_epoch: None,
-                    });
-                }
-            }
-            targets
-        };
-        let scoped_routes = row_scoped_source_routes(plan, list_slot);
-        for target in &target_rows {
-            let mut source_unbinds = Vec::new();
-            for (route_index, route) in scoped_routes.iter().enumerate() {
-                let source_unbind_id =
-                    (target.row.key - 1) * scoped_routes.len() as u64 + route_index as u64 + 1;
-                let delta = json!({
-                    "kind": "SourceUnbind",
-                    "list_id": list_label,
-                    "key": target.row.key,
-                    "generation": target.row.generation,
-                    "source_id": source_unbind_id,
-                    "bind_epoch": source_unbind_id,
-                    "field_path": route.path,
-                    "value": null,
-                });
-                semantic_deltas.push(delta.clone());
-                source_unbinds.push(delta);
-                source_unbind_count += 1;
-            }
-            let remove_delta = json!({
-                "kind": "ListRemove",
-                "list_id": list_label,
-                "key": target.row.key,
-                "generation": target.row.generation,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": null,
-                "value": null,
-            });
-            semantic_deltas.push(remove_delta.clone());
-            report_rows.push(json!({
-                "list_id": list_id.0,
-                "list": list_label,
-                "remove_op_id": op.id.0,
-                "source_id": source_id.0,
-                "source": event.source,
-                "row_index": target.row_index,
-                "key": target.row.key,
-                "generation": target.row.generation,
-                "source_binding_id": target.source_binding_id,
-                "bind_epoch": target.bind_epoch,
-                "row_resolution": target.row_resolution,
-                "source_unbinds": source_unbinds,
-                "row_fields": target.row.fields.clone(),
-            }));
-            removed_row_count += 1;
-        }
-        let rows = list_state
-            .get_mut(&list_id.0)
-            .ok_or_else(|| format!("list state missing list {}", list_id.0))?;
-        for target in target_rows.iter().rev() {
-            rows.remove(target.row_index);
-        }
-        let after_derived = root_pure_number_compare_values(plan, list_state)?;
-        for (delta, report) in changed_root_derived_deltas(plan, &before_derived, &after_derived) {
-            semantic_deltas.push(delta);
-            report_derived.push(report);
-        }
-    }
-    let derived_count = report_derived.len();
-    Ok(ListRemoveExecution {
-        semantic_deltas,
-        report_rows,
-        report_derived,
-        removed_row_count,
-        source_unbind_count,
-        derived_count,
-    })
-}
-
-fn row_refresh_field_deltas(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    list_label: &str,
-    key: u64,
-    generation: u64,
-    before: &BTreeMap<String, JsonValue>,
-    after: &BTreeMap<String, JsonValue>,
-) -> Vec<JsonValue> {
-    let row_expression_fields = row_expression_output_field_names(plan, list_slot);
-    after
-        .iter()
-        .filter(|(field, _)| row_expression_fields.contains(*field))
-        .filter(|(field, value)| before.get(*field) != Some(*value))
-        .map(|(field, value)| {
-            json!({
-                "kind": "FieldSet",
-                "list_id": list_label,
-                "key": key,
-                "generation": generation,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": field,
-                "value": value,
-            })
-        })
-        .collect()
-}
-
-fn row_expression_output_field_names(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-) -> BTreeSet<String> {
-    plan.regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-        .filter_map(|op| {
-            if !op.indexed {
-                return None;
-            }
-            let Some(ValueRef::Field(output_id)) = op.output else {
-                return None;
-            };
-            let PlanOpKind::DerivedValue {
-                derived_kind: boon_plan::PlanDerivedKind::Pure,
-                expression: Some(PlanDerivedExpression::RowExpression { .. }),
-            } = &op.kind
-            else {
-                return None;
-            };
-            row_expression_applies_to_list(plan, list_slot, output_id)
-                .then(|| local_field_name(&plan_semantic_field_label(plan, output_id.0)))
-        })
-        .collect()
-}
-
-fn row_bool_not_deltas(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    list_label: &str,
-    key: u64,
-    generation: u64,
-    fields: &mut BTreeMap<String, JsonValue>,
-) -> RuntimeResult<Vec<JsonValue>> {
-    let mut deltas = Vec::new();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-    {
-        if !op.indexed {
-            continue;
-        }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(PlanDerivedExpression::BoolNot { input }),
-        } = &op.kind
-        else {
-            continue;
-        };
-        let Some(input_state_id) = (match input {
-            ValueRef::State(state_id) => Some(state_id),
-            _ => None,
-        }) else {
-            return Err(format!("indexed Bool/not op {} input is not a state ref", op.id.0).into());
-        };
-        let Some(input_slot) = plan
-            .storage_layout
-            .scalar_slots
-            .iter()
-            .find(|slot| slot.state_id == *input_state_id)
-        else {
-            return Err(format!("indexed Bool/not op {} input state is missing", op.id.0).into());
-        };
-        if input_slot.scope_id != list_slot.scope_id {
-            continue;
-        }
-        let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-        let input_value = fields
-            .get(&input_name)
-            .and_then(JsonValue::as_bool)
-            .ok_or_else(|| {
-                format!(
-                    "indexed Bool/not op {} input field `{input_name}` is not available as bool",
-                    op.id.0
-                )
-            })?;
-        let output_label = plan_semantic_field_label(plan, output_id.0);
-        let output_name = local_field_name(&output_label);
-        let value = JsonValue::Bool(!input_value);
-        fields.insert(output_name.clone(), value.clone());
-        deltas.push(json!({
-            "kind": "FieldSet",
-            "list_id": list_label,
-            "key": key,
-            "generation": generation,
-            "source_id": null,
-            "bind_epoch": null,
-            "field_path": output_name,
-            "value": value,
-        }));
-    }
-    Ok(deltas)
-}
-
-fn value_for_plan_ref(
-    plan: &MachinePlan,
-    value_ref: &ValueRef,
-    derived_values: &BTreeMap<FieldId, JsonValue>,
-    row_fields: Option<&BTreeMap<String, JsonValue>>,
-) -> RuntimeResult<Option<JsonValue>> {
-    match value_ref {
-        ValueRef::Field(field_id) => Ok(derived_values.get(field_id).cloned()),
-        ValueRef::State(state_id) => {
-            let field_name = local_field_name(&plan_state_label(plan, state_id.0));
-            Ok(row_fields.and_then(|fields| fields.get(&field_name).cloned()))
-        }
-        _ => Err(format!("unsupported append value ref `{value_ref:?}`").into()),
-    }
-}
-
-fn list_remove_predicate_matches(
-    plan: &MachinePlan,
-    predicate: &boon_plan::PlanListRemovePredicate,
-    row: &PlanListRowState,
-) -> RuntimeResult<bool> {
-    match predicate {
-        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(true),
-        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
-            let (_, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(value)
-        }
-        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
-            let (_, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(!value)
-        }
-        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility { .. } => Err(
-            "CPU root-scenario PlanExecutor does not support selected-filter visibility predicates in remove/count execution yet".into(),
-        ),
-        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
-            "CPU root-scenario PlanExecutor does not support unknown list remove predicate `{summary}`"
-        )
-        .into()),
-    }
-}
-
-fn list_remove_predicate_field_value(
-    plan: &MachinePlan,
-    input: &ValueRef,
-    row: &PlanListRowState,
-) -> RuntimeResult<(String, bool)> {
-    let ValueRef::State(state_id) = input else {
-        return Err(format!("list remove predicate input is not a state ref: {input:?}").into());
-    };
-    let field_name = local_field_name(&plan_state_label(plan, state_id.0));
-    let value = row.fields.get(&field_name).ok_or_else(|| {
-        format!(
-            "list remove predicate field `{field_name}` missing on row key {} generation {}",
-            row.key, row.generation
-        )
-    })?;
-    let bool_value = value.as_bool().ok_or_else(|| {
-        format!(
-            "list remove predicate field `{field_name}` is not bool on row key {} generation {}",
-            row.key, row.generation
-        )
-    })?;
-    Ok((field_name, bool_value))
-}
-
-fn predicate_row_resolution_report(
-    plan: &MachinePlan,
-    predicate: &boon_plan::PlanListRemovePredicate,
-    row_index: usize,
-    row: &PlanListRowState,
-) -> RuntimeResult<JsonValue> {
-    match predicate {
-        boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({
-            "method": "predicate",
-            "predicate": "always_true",
-            "predicate_field": null,
-            "predicate_value": true,
-            "row_index": row_index,
-            "key": row.key,
-            "generation": row.generation,
-            "source_binding_id": null,
-        })),
-        boon_plan::PlanListRemovePredicate::RowFieldBool { input } => {
-            let (field_name, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(json!({
-                "method": "predicate",
-                "predicate": "row_field_bool",
-                "predicate_field": field_name,
-                "predicate_value": value,
-                "row_index": row_index,
-                "key": row.key,
-                "generation": row.generation,
-                "source_binding_id": null,
-            }))
-        }
-        boon_plan::PlanListRemovePredicate::RowFieldBoolNot { input } => {
-            let (field_name, value) = list_remove_predicate_field_value(plan, input, row)?;
-            Ok(json!({
-                "method": "predicate",
-                "predicate": "row_field_bool_not",
-                "predicate_field": field_name,
-                "predicate_value": value,
-                "row_index": row_index,
-                "key": row.key,
-                "generation": row.generation,
-                "source_binding_id": null,
-            }))
-        }
-        boon_plan::PlanListRemovePredicate::SelectedFilterVisibility { .. } => Err(
-            "CPU root-scenario PlanExecutor does not report selected-filter visibility predicates in remove/count execution yet".into(),
-        ),
-        boon_plan::PlanListRemovePredicate::Unknown { summary } => Err(format!(
-            "CPU root-scenario PlanExecutor does not support unknown list remove predicate `{summary}`"
-        )
-        .into()),
-    }
+fn plan_executor_list_state_for_materialization(
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+) -> BTreeMap<usize, Vec<boon_plan_executor::PlanExecutorListRow>> {
+    plan_list_row_state_public_rows(list_state)
 }
 
 fn root_pure_number_compare_values(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
-    let aggregate_counts = aggregate_count_values(plan, list_state)?;
-    let mut values = BTreeMap::new();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-    {
-        if op.indexed {
-            continue;
-        }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(expression),
-        } = &op.kind
-        else {
-            continue;
-        };
-        if let Some(value) =
-            eval_root_bool_derived_expression(op.id.0, expression, &aggregate_counts)?
-        {
-            values.insert(output_id.0, json!(value));
-        }
-    }
-    Ok(values)
-}
-
-fn eval_root_bool_derived_expression(
-    op_id: usize,
-    expression: &PlanDerivedExpression,
-    aggregate_counts: &BTreeMap<usize, i64>,
-) -> RuntimeResult<Option<bool>> {
-    match expression {
-        PlanDerivedExpression::NumberCompareConst {
-            left,
-            op: compare_op,
-            right,
-        } => {
-            let ValueRef::Field(left_id) = left else {
-                return Err(format!(
-                    "number-compare derived op {op_id} left input is not a field ref"
-                )
-                .into());
-            };
-            let Some(left_value) = aggregate_counts.get(&left_id.0) else {
-                return Ok(None);
-            };
-            let value = match compare_op.as_str() {
-                ">" => *left_value > *right,
-                ">=" => *left_value >= *right,
-                "<" => *left_value < *right,
-                "<=" => *left_value <= *right,
-                "==" => *left_value == *right,
-                "!=" => *left_value != *right,
-                other => {
-                    return Err(format!(
-                        "number-compare derived op {op_id} has unsupported operator `{other}`"
-                    )
-                    .into());
-                }
-            };
-            Ok(Some(value))
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            let Some(left) = eval_root_bool_derived_expression(op_id, left, aggregate_counts)?
-            else {
-                return Ok(None);
-            };
-            let Some(right) = eval_root_bool_derived_expression(op_id, right, aggregate_counts)?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(left && right))
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            let Some(value) = eval_root_bool_derived_expression(op_id, input, aggregate_counts)?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(!value))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn aggregate_count_values(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-) -> RuntimeResult<BTreeMap<usize, i64>> {
-    let mut values = BTreeMap::new();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::ListOperations)
-        .flat_map(|region| region.ops.iter())
-    {
-        let PlanOpKind::ListOperation {
-            operation_kind: boon_plan::PlanListOperationKind::Count,
-            count: Some(count),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        let Some(ValueRef::List(list_id)) = op.output else {
-            return Err(format!("list count op {} does not output a list", op.id.0).into());
-        };
-        let rows = list_state
-            .get(&list_id.0)
-            .ok_or_else(|| format!("list state missing list {}", list_id.0))?;
-        let ValueRef::Field(target_id) = count.target else {
-            return Err(format!("list count op {} target is not a field ref", op.id.0).into());
-        };
-        let mut count_value = 0i64;
-        for row in rows {
-            if list_remove_predicate_matches(plan, &count.predicate, row)? {
-                count_value += 1;
-            }
-        }
-        values.insert(target_id.0, count_value);
-    }
-    Ok(values)
-}
-
-fn changed_root_derived_deltas(
-    plan: &MachinePlan,
-    before: &BTreeMap<usize, JsonValue>,
-    after: &BTreeMap<usize, JsonValue>,
-) -> Vec<(JsonValue, JsonValue)> {
-    let mut changes = Vec::new();
-    let mut emptied_scopes = BTreeSet::new();
-    for (field_id, value) in after {
-        if before.get(field_id) == Some(value) || value.as_bool() != Some(false) {
-            continue;
-        }
-        let field_path = plan_derived_field_label(plan, *field_id);
-        if let Some(scope) = field_path.strip_suffix(".has_todos") {
-            emptied_scopes.insert(scope.to_owned());
-        }
-    }
-    for (field_id, value) in after {
-        if before.get(field_id) == Some(value) {
-            continue;
-        }
-        let field_path = plan_derived_field_label(plan, *field_id);
-        if emptied_scopes.iter().any(|scope| {
-            field_path == format!("{scope}.has_completed")
-                || field_path == format!("{scope}.all_completed")
-        }) {
-            continue;
-        }
-        changes.push((
-            json!({
-                "kind": "FieldSet",
-                "list_id": null,
-                "key": null,
-                "generation": null,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": field_path,
-                "value": value,
-            }),
-            json!({
-                "field_id": field_id,
-                "field_path": field_path,
-                "expression_kind": "number_compare_const",
-                "value": value,
-            }),
-        ));
-    }
-    changes
+    let executor_rows = plan_executor_list_state_for_materialization(list_state);
+    Ok(evaluate_root_pure_number_compare_values_core(
+        plan,
+        &executor_rows,
+    )?)
 }
 
 fn execute_indexed_update_branch(
@@ -6879,7 +4604,7 @@ fn execute_indexed_update_branch(
     row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
     host_file_root: Option<&Path>,
-) -> RuntimeResult<IndexedUpdateExecution> {
+) -> RuntimeResult<IndexedUpdateBranchExecution> {
     if op.unresolved_executable_ref_count != 0 {
         return Err(format!(
             "selected indexed update branch {} has {} unresolved executable refs",
@@ -6897,8 +4622,9 @@ fn execute_indexed_update_branch(
             .into());
         }
     };
-    if !plan_source_guard_matches(source_guard, source_id, event)? {
-        return Ok(IndexedUpdateExecution {
+    let root_json_event = root_json_source_event_from_generic(event);
+    if !plan_executor_source_guard_matches(source_guard, source_id, &root_json_event)? {
+        return Ok(IndexedUpdateBranchExecution {
             semantic_deltas: Vec::new(),
             report_rows: Vec::new(),
             updated_row_count: 0,
@@ -6984,502 +4710,252 @@ fn execute_indexed_update_branch(
     let mut bytes_access = JsonValue::Null;
     let mut bytes_storage = JsonValue::Null;
     let mut host_effect = JsonValue::Null;
-    let mut update_constant_id = JsonValue::Null;
-    let mut update_constant_value = JsonValue::Null;
-    let (value, bytes_value, expression_kind) = match &op.kind {
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::SourcePayload,
-            source_payload_field: Some(source_payload_field),
-            update_constant_id: None,
-            ..
-        } => {
-            if !source_route_slot
-                .payload_schema
-                .fields
-                .contains(source_payload_field)
-            {
-                return Err(format!(
+    let mut executor_core = JsonValue::Null;
+    let root_json_event = root_json_source_event_from_generic(event);
+    let json_evaluation = evaluate_plan_indexed_json_update_branch(
+        plan,
+        op,
+        source_id,
+        source_route_slot,
+        &root_json_event,
+        row,
+        root_derived_values,
+    )?;
+    let (value, bytes_value, expression_kind, update_constant_id, update_constant_value) =
+        if json_evaluation.supported {
+            (
+                json_evaluation.value.ok_or_else(|| {
+                    format!(
+                        "indexed JSON update branch {} reported supported without a value",
+                        op.id.0
+                    )
+                })?,
+                None,
+                json_evaluation.expression_kind.ok_or_else(|| {
+                    format!(
+                        "indexed JSON update branch {} reported supported without expression kind",
+                        op.id.0
+                    )
+                })?,
+                json_evaluation.update_constant_id,
+                json_evaluation.update_constant_value,
+            )
+        } else {
+            match &op.kind {
+                PlanOpKind::UpdateBranch {
+                    expression_kind: PlanExpressionKind::SourcePayload,
+                    source_payload_field: Some(source_payload_field),
+                    update_constant_id: None,
+                    ..
+                } => {
+                    if !source_route_slot
+                        .payload_schema
+                        .fields
+                        .contains(source_payload_field)
+                    {
+                        return Err(format!(
                     "indexed SourcePayload update branch {} reads payload field {:?}, but route schema is {:?}",
                     op.id.0, source_payload_field, source_route_slot.payload_schema.fields
                 )
                 .into());
-            }
-            let typed_payload_ref_present = op.inputs.iter().any(|input| {
-                matches!(
-                    input,
-                    ValueRef::SourcePayload {
-                        source_id: input_source_id,
-                        field
-                    } if *input_source_id == source_id && field == source_payload_field
-                )
-            });
-            if !typed_payload_ref_present {
-                return Err(format!(
+                    }
+                    let typed_payload_ref_present = op.inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            ValueRef::SourcePayload {
+                                source_id: input_source_id,
+                                field
+                            } if *input_source_id == source_id && field == source_payload_field
+                        )
+                    });
+                    if !typed_payload_ref_present {
+                        return Err(format!(
                     "indexed SourcePayload update branch {} is missing typed SourcePayload input",
                     op.id.0
                 )
                 .into());
-            }
-            let (value, bytes_value) = generic_source_payload_value_for_output(
-                plan,
-                output_state_id,
-                event,
-                source_payload_field,
-                op.id.0,
-            )?;
-            (value, bytes_value, "source_payload")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::Const,
-            source_payload_field: None,
-            update_constant_id: Some(update_constant_id),
-            ..
-        } => {
-            let constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == *update_constant_id)
-                .ok_or_else(|| format!("missing update constant {}", update_constant_id.0))?;
-            let value = plan_constant_json_value(constant)?;
-            let bytes_value =
-                plan_constant_runtime_bytes_for_output(plan, output_state_id, constant, op.id.0)?;
-            (value, bytes_value, "const")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BoolNot,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_value = indexed_bool_not_input_value(plan, op, row, root_derived_values)?;
-            (JsonValue::Bool(!input_value), None, "bool_not")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesLength,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = indexed_single_state_input(op, output_state_id)?;
-            let bytes_view = indexed_row_state_bytes_view(plan, row, input_state_id, op.id.0)?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-                "byte_len": bytes_view.bytes.as_ref().len(),
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, input_state_id),
-                "byte_bank_used": bytes_view.access_source == "indexed_fixed_byte_bank",
-            });
-            let byte_len = i64::try_from(bytes_view.bytes.as_ref().len() as u64).map_err(|_| {
-                format!(
-                    "indexed Bytes/length update branch {} byte_len exceeds Boon NUMBER",
-                    op.id.0
-                )
-            })?;
-            (json!(byte_len), None, "bytes_length")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesGet,
-            source_payload_field: None,
-            update_constant_id: Some(update_constant_id),
-            ..
-        } => {
-            let input_state_id = indexed_single_state_input(op, output_state_id)?;
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            let index_constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == *update_constant_id)
-                .ok_or_else(|| {
-                    format!(
-                        "indexed Bytes/get update branch {} references missing index constant {}",
-                        op.id.0, update_constant_id.0
+                    }
+                    let (value, runtime_bytes_value) = generic_source_payload_value_for_output(
+                        plan,
+                        output_state_id,
+                        event,
+                        source_payload_field,
+                        op.id.0,
+                    )?;
+                    if let Some(bytes) = runtime_bytes_value.as_ref() {
+                        bytes_storage = json!({
+                            "storage": if plan_indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                                "indexed_fixed_byte_bank"
+                            } else {
+                                "indexed_row_private_bytes"
+                            },
+                            "output_state_id": output_state_id.0,
+                            "byte_bank_declared": plan_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                            "byte_bank_used": plan_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                            "byte_len": bytes.byte_len,
+                        });
+                    }
+                    let bytes_value = runtime_bytes_value
+                        .map(runtime_source_payload_bytes_to_plan_executor_bytes)
+                        .transpose()?;
+                    (
+                        value,
+                        bytes_value,
+                        "source_payload",
+                        JsonValue::Null,
+                        JsonValue::Null,
                     )
-                })?;
-            let PlanConstantValue::Number { value: index } = &index_constant.value else {
-                return Err(format!(
-                    "indexed Bytes/get update branch {} index constant {} is not a number",
-                    op.id.0, update_constant_id.0
-                )
-                .into());
-            };
-            let index = usize::try_from(*index).map_err(|_| {
-                format!(
-                    "indexed Bytes/get update branch {} index constant {} is negative or too large",
-                    op.id.0, update_constant_id.0
-                )
-            })?;
-            let bytes_view = indexed_row_state_bytes_view(plan, row, input_state_id, op.id.0)?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-                "byte_len": bytes_view.bytes.as_ref().len(),
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, input_state_id),
-                "byte_bank_used": bytes_view.access_source == "indexed_fixed_byte_bank",
-                "index": index,
-            });
-            let byte = bytes_view.bytes.as_ref().get(index).ok_or_else(|| {
-                format!(
-                    "indexed Bytes/get update branch {} index {index} is out of bounds for `{input_name}`",
-                    op.id.0
-                )
-            })?;
-            (json!(i64::from(*byte)), None, "bytes_get")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesSet,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, index, byte_value, index_constant_id, value_constant_id) =
-                indexed_bytes_set_operands(plan, op)?;
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            let bytes_view = indexed_row_state_bytes_view(plan, row, input_state_id, op.id.0)?;
-            if let boon_plan::PlanValueType::Bytes {
-                fixed_len: Some(fixed_len),
-            } = &output_slot.value_type
-                && *fixed_len != bytes_view.bytes.as_ref().len() as u64
-            {
-                return Err(format!(
-                    "indexed Bytes/set update branch {} output fixed length {} does not match input length {}",
-                    op.id.0,
-                    fixed_len,
-                    bytes_view.bytes.as_ref().len()
-                )
-                .into());
-            }
-            let value = root_fixed_bytes_report_json_with_patches(
-                bytes_view.bytes.as_ref(),
-                &[(index, byte_value)],
-                "Bytes/set",
-                op.id.0,
-                &input_name,
-            )?;
-            let mut output = bytes_view.bytes.as_ref().to_vec();
-            let Some(slot) = output.get_mut(index) else {
-                return Err(format!(
-                    "indexed Bytes/set update branch {} index {index} is out of bounds for `{input_name}`",
-                    op.id.0
-                )
-                .into());
-            };
-            *slot = byte_value;
-            let bytes = RuntimeBytes::inline(Bytes::from(output));
-            bytes_access = json!({
-                "read_only": false,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-                "byte_len": bytes_view.bytes.as_ref().len(),
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, input_state_id),
-                "byte_bank_used": bytes_view.access_source == "indexed_fixed_byte_bank",
-                "index": index,
-                "value": byte_value,
-            });
-            bytes_storage = json!({
-                "storage": if indexed_state_has_fixed_byte_bank(plan, output_state_id) {
-                    "indexed_fixed_byte_bank"
-                } else {
-                    "indexed_row_private_bytes"
-                },
-                "output_state_id": output_state_id.0,
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, output_state_id),
-                "byte_bank_used": indexed_state_has_fixed_byte_bank(plan, output_state_id),
-                "byte_len": bytes.byte_len,
-            });
-            update_constant_id = json!([index_constant_id.0, value_constant_id.0]);
-            update_constant_value = json!({
-                "index": index,
-                "value": byte_value,
-            });
-            (value, Some(bytes), "bytes_set")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::FileReadBytes,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let path_operand = file_read_bytes_path_operand(plan, op, "indexed")?;
-            let (path, path_update_constant_id, path_update_constant_value, path_source) =
-                match path_operand {
-                    FileReadBytesPathOperand::StaticConstant { path, constant_id } => (
-                        path.clone(),
-                        json!(constant_id.0),
-                        json!({
-                            "path": path,
-                            "path_source": "static_constant",
-                        }),
-                        "static_constant",
-                    ),
-                    FileReadBytesPathOperand::StatePath { state_id } => {
-                        let label = plan_state_label(plan, state_id.0);
-                        let path = indexed_row_state_text(plan, row, state_id, op.id.0, "path")?;
-                        (
-                            path.clone(),
-                            JsonValue::Null,
-                            json!({
-                                "path": path,
-                                "path_source": "state",
-                                "path_state": label,
-                                "path_state_id": state_id.0,
-                            }),
-                            "state",
-                        )
-                    }
-                    FileReadBytesPathOperand::RowFieldPath { field_id } => {
-                        let label = plan_field_label(plan, field_id.0);
-                        let path = indexed_row_field_text(plan, row, field_id, op.id.0, "path")?;
-                        (
-                            path.clone(),
-                            JsonValue::Null,
-                            json!({
-                                "path": path,
-                                "path_source": "row_field",
-                                "path_field": label,
-                                "path_field_id": field_id.0,
-                            }),
-                            "row_field",
-                        )
-                    }
-                };
-            let host_file_root = host_file_root.ok_or_else(|| {
-                format!(
-                    "indexed File/read_bytes update branch {} has no host file root",
-                    op.id.0
-                )
-            })?;
-            let bytes = read_plan_host_file_bytes(host_file_root, &path).map_err(|error| {
-                format!(
-                    "indexed File/read_bytes update branch {} cannot read `{path}`: {error}",
-                    op.id.0
-                )
-            })?;
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                bytes.len(),
-                "File/read_bytes",
-                op.id.0,
-            )?;
-            let bytes = RuntimeBytes::dynamic(Bytes::from(bytes));
-            bytes_access = json!({
-                "read_only": true,
-                "output_state_id": output_state_id.0,
-                "host_boundary": "file_read_bytes",
-                "byte_len": bytes.byte_len,
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, output_state_id),
-                "path_source": path_source,
-            });
-            update_constant_id = path_update_constant_id;
-            update_constant_value = path_update_constant_value;
-            (bytes.report_json(), Some(bytes), "file_read_bytes")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::FileWriteBytes,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, path_operand) = file_write_bytes_operands(plan, op, "indexed")?;
-            let (path, path_update_constant_id, path_update_constant_value, path_source) =
-                match path_operand {
-                    FileWriteBytesPathOperand::StaticConstant { path, constant_id } => (
-                        path.clone(),
-                        json!(constant_id.0),
-                        json!({ "path": path, "path_source": "static_constant" }),
-                        "static_constant",
-                    ),
-                    FileWriteBytesPathOperand::StatePath { state_id } => {
-                        let label = plan_state_label(plan, state_id.0);
-                        let path = indexed_row_state_text(plan, row, state_id, op.id.0, "path")?;
-                        (
-                            path.clone(),
-                            JsonValue::Null,
-                            json!({
-                                "path": path,
-                                "path_source": "state",
-                                "path_state": label,
-                                "path_state_id": state_id.0,
-                            }),
-                            "state",
-                        )
-                    }
-                    FileWriteBytesPathOperand::RowFieldPath { field_id } => {
-                        let label = plan_field_label(plan, field_id.0);
-                        let path = indexed_row_field_text(plan, row, field_id, op.id.0, "path")?;
-                        (
-                            path.clone(),
-                            JsonValue::Null,
-                            json!({
-                                "path": path,
-                                "path_source": "row_field",
-                                "path_field": label,
-                                "path_field_id": field_id.0,
-                            }),
-                            "row_field",
-                        )
-                    }
-                };
-            let host_file_root = host_file_root.ok_or_else(|| {
-                format!(
-                    "indexed File/write_bytes update branch {} has no host file root",
-                    op.id.0
-                )
-            })?;
-            let bytes_view = indexed_row_state_bytes_view(plan, row, input_state_id, op.id.0)?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-                "host_boundary": "file_write_bytes",
-                "byte_len": bytes_view.bytes.as_ref().len(),
-                "byte_bank_declared": indexed_state_has_fixed_byte_bank(plan, input_state_id),
-                "byte_bank_used": bytes_view.access_source == "indexed_fixed_byte_bank",
-                "path_source": path_source,
-            });
-            let write_result = write_plan_host_file_bytes(
-                host_file_root,
-                &path,
-                bytes_view.bytes.as_ref(),
-            )
-            .map_err(|error| {
-                format!(
-                    "indexed File/write_bytes update branch {} cannot write `{path}`: {error}",
-                    op.id.0
-                )
-            })?;
-            host_effect = write_result.report_json();
-            update_constant_id = path_update_constant_id;
-            update_constant_value = path_update_constant_value;
-            (JsonValue::String(path), None, "file_write_bytes")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::ReadPath,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = indexed_single_state_input(op, output_state_id)?;
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
-                format!(
-                    "indexed ReadPath update branch {} input field `{input_name}` is missing",
-                    op.id.0
-                )
-            })?;
-            (value, None, "read_path")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::PreviousValue,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = indexed_single_state_input(op, output_state_id)?;
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
-                format!(
-                    "indexed PreviousValue update branch {} input field `{input_name}` is missing",
-                    op.id.0
-                )
-            })?;
-            (value, None, "previous_value")
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::TextTrimOrPrevious,
-            source_payload_field,
-            update_constant_id: None,
-            ..
-        } => {
-            let output_name = local_field_name(&plan_state_label(plan, output_state_id.0));
-            let raw = if let Some(payload_field) = source_payload_field {
-                let typed_payload_ref_present = op.inputs.iter().any(|input| {
-                    matches!(
-                        input,
-                        ValueRef::SourcePayload {
-                            source_id: input_source_id,
-                            field
-                        } if *input_source_id == source_id && field == payload_field
-                    )
-                });
-                if !typed_payload_ref_present {
-                    return Err(format!(
-                        "indexed TextTrimOrPrevious update branch {} is missing typed SourcePayload input",
-                        op.id.0
-                    )
-                    .into());
                 }
-                generic_source_payload_json_value(event, payload_field)?
-                    .as_str()
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed TextTrimOrPrevious update branch {} payload is not text",
-                            op.id.0
-                        )
-                    })?
-                    .to_owned()
-            } else {
-                let input_state_id = op
-                    .inputs
-                    .iter()
-                    .filter_map(|input| match input {
-                        ValueRef::State(state_id) if *state_id != output_state_id => {
-                            Some(*state_id)
-                        }
-                        _ => None,
-                    })
-                    .next()
-                    .unwrap_or(output_state_id);
-                let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-                row.fields
-                    .get(&input_name)
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed TextTrimOrPrevious update branch {} input field `{input_name}` is not text",
-                            op.id.0
-                        )
-                    })?
-                    .to_owned()
-            };
-            let current = row
-                .fields
-                .get(&output_name)
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "indexed TextTrimOrPrevious update branch {} output field `{output_name}` is not text",
-                        op.id.0
+                PlanOpKind::UpdateBranch {
+                    expression_kind: PlanExpressionKind::Const,
+                    source_payload_field: None,
+                    update_constant_id: Some(update_constant_id),
+                    ..
+                } => {
+                    let constant = plan
+                        .constants
+                        .iter()
+                        .find(|constant| constant.id == *update_constant_id)
+                        .ok_or_else(|| {
+                            format!("missing update constant {}", update_constant_id.0)
+                        })?;
+                    let value = plan_executor_constant_json_value(constant)?;
+                    let bytes_value = plan_constant_executor_bytes_for_output(
+                        plan,
+                        output_state_id,
+                        constant,
+                        op.id.0,
+                    )?;
+                    (
+                        value,
+                        bytes_value,
+                        "const",
+                        json!(update_constant_id.0),
+                        plan_executor_constant_json_value(constant)?,
                     )
-                })?;
-            let trimmed = raw.trim();
-            let value = if trimmed.is_empty() {
-                current.to_owned()
-            } else {
-                trimmed.to_owned()
-            };
-            (JsonValue::String(value), None, "text_trim_or_previous")
-        }
-        _ => {
-            return Err(format!(
-                "CPU root-scenario PlanExecutor does not support indexed update branch {} kind {:?}",
-                op.id.0, op.kind
+                }
+                PlanOpKind::UpdateBranch {
+                    expression_kind:
+                        PlanExpressionKind::BytesSet
+                        | PlanExpressionKind::BytesSlice
+                        | PlanExpressionKind::BytesTake
+                        | PlanExpressionKind::BytesDrop
+                        | PlanExpressionKind::BytesZeros
+                        | PlanExpressionKind::BytesConcat
+                        | PlanExpressionKind::BytesWriteUnsigned
+                        | PlanExpressionKind::BytesWriteSigned
+                        | PlanExpressionKind::TextToBytes
+                        | PlanExpressionKind::BytesFromHex
+                        | PlanExpressionKind::BytesFromBase64
+                        | PlanExpressionKind::FileWriteBytes,
+                    source_payload_field: None,
+                    update_constant_id: None,
+                    ..
+                } => {
+                    let evaluation = evaluate_indexed_bytes_write_update_for_runtime(
+                        plan,
+                        op,
+                        row,
+                        host_file_root,
+                    )?;
+                    bytes_access = evaluation.bytes_access;
+                    bytes_storage = evaluation.bytes_storage;
+                    host_effect = evaluation.host_effect;
+                    executor_core = evaluation.executor_report;
+                    (
+                        evaluation.value.ok_or_else(|| {
+                            format!(
+                                "indexed BYTES write branch {} reported supported without a value",
+                                op.id.0
+                            )
+                        })?,
+                        evaluation.bytes,
+                        evaluation.expression_kind.ok_or_else(|| {
+                            format!(
+                                "indexed BYTES write branch {} reported supported without expression kind",
+                                op.id.0
+                            )
+                        })?,
+                        evaluation.update_constant_id,
+                        evaluation.update_constant_value,
+                    )
+                }
+                PlanOpKind::UpdateBranch {
+                    expression_kind:
+                        PlanExpressionKind::BytesLength
+                        | PlanExpressionKind::BytesIsEmpty
+                        | PlanExpressionKind::BytesGet
+                        | PlanExpressionKind::BytesToHex
+                        | PlanExpressionKind::BytesToBase64
+                        | PlanExpressionKind::BytesToText
+                        | PlanExpressionKind::BytesReadUnsigned
+                        | PlanExpressionKind::BytesReadSigned
+                        | PlanExpressionKind::BytesEqual
+                        | PlanExpressionKind::BytesFind
+                        | PlanExpressionKind::BytesStartsWith
+                        | PlanExpressionKind::BytesEndsWith
+                        | PlanExpressionKind::FileReadBytes,
+                    source_payload_field: None,
+                    ..
+                } => {
+                    let evaluation = evaluate_indexed_bytes_read_update_for_runtime(
+                        plan,
+                        op,
+                        row,
+                        host_file_root,
+                    )?;
+                    bytes_access = evaluation.bytes_access;
+                    executor_core = evaluation.executor_report;
+                    if let Some(bytes) = evaluation.bytes.as_ref() {
+                        bytes_storage = json!({
+                            "storage": if plan_indexed_state_has_fixed_byte_bank(plan, output_state_id) {
+                                "indexed_fixed_byte_bank"
+                            } else {
+                                "indexed_row_private_bytes"
+                            },
+                            "output_state_id": output_state_id.0,
+                            "byte_bank_declared": plan_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                            "byte_bank_used": plan_indexed_state_has_fixed_byte_bank(plan, output_state_id),
+                            "byte_len": bytes.byte_len(),
+                        });
+                    }
+                    (
+                        evaluation.value.ok_or_else(|| {
+                            format!(
+                                "indexed BYTES read branch {} reported supported without a value",
+                                op.id.0
+                            )
+                        })?,
+                        evaluation.bytes,
+                        evaluation.expression_kind.ok_or_else(|| {
+                            format!(
+                                "indexed BYTES read branch {} reported supported without expression kind",
+                                op.id.0
+                            )
+                        })?,
+                        evaluation.update_constant_id,
+                        evaluation.update_constant_value,
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "CPU root-scenario PlanExecutor does not support indexed update branch {} kind {:?}: {}",
+                        op.id.0,
+                        op.kind,
+                        json_evaluation
+                            .unsupported_reason
+                            .unwrap_or_else(|| "unsupported indexed JSON update branch".to_owned())
             )
             .into());
-        }
-    };
+                }
+            }
+        };
     let output_name = local_field_name(&plan_state_label(plan, output_state_id.0));
     let changed = row.fields.get(&output_name) != Some(&value);
     row.fields.insert(output_name.clone(), value.clone());
     if let Some(bytes) = bytes_value {
-        if let Some(expected_len) = indexed_fixed_byte_bank_len(plan, output_state_id)? {
-            let inline_bytes = bytes.inline_bytes()?;
+        if let Some(expected_len) = plan_indexed_fixed_byte_bank_len(plan, output_state_id)? {
+            let inline_bytes = bytes.inline_bytes();
             if inline_bytes.len() != expected_len {
                 return Err(format!(
                     "indexed update branch {} fixed byte bank `{output_name}` expected {expected_len} byte(s), got {}",
@@ -7553,7 +5029,7 @@ fn execute_indexed_update_branch(
         }));
     }
     semantic_deltas.extend(derived_deltas);
-    Ok(IndexedUpdateExecution {
+    Ok(IndexedUpdateBranchExecution {
         semantic_deltas,
         report_rows: vec![json!({
             "source_id": source_id.0,
@@ -7569,6 +5045,7 @@ fn execute_indexed_update_branch(
             "bytes_access": bytes_access,
             "bytes_storage": bytes_storage,
             "host_effect": host_effect,
+            "executor_core": executor_core,
             "selected_op_indexed": true,
             "selected_op_unresolved_executable_ref_count": 0,
             "list_id": list_slot.list_id.0,
@@ -7582,184 +5059,10 @@ fn execute_indexed_update_branch(
             "field_path": output_name,
             "value": value,
             "changed": changed,
-            "row_fields": report_row_fields(row),
+            "row_fields": plan_executor_list_row_report_fields(row)?,
         })],
         updated_row_count: 1,
     })
-}
-
-fn unscoped_indexed_update_targets<'a>(
-    plan: &'a MachinePlan,
-    op: &boon_plan::PlanOp,
-    source_route_slot: &boon_plan::SourceRoute,
-    event: &GenericSourceEvent<'_>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-) -> RuntimeResult<Option<(String, Vec<(u64, u64)>)>> {
-    if source_route_slot.scoped
-        || event.target_key.is_some()
-        || event.target_text.is_some()
-        || event.address.is_some()
-    {
-        return Ok(None);
-    }
-    let Some(ValueRef::State(output_state_id)) = op.output else {
-        return Ok(None);
-    };
-    let Some(output_slot) = plan
-        .storage_layout
-        .scalar_slots
-        .iter()
-        .find(|slot| slot.state_id == output_state_id)
-    else {
-        return Ok(None);
-    };
-    if !output_slot.indexed {
-        return Ok(None);
-    }
-    let Some(scope_id) = output_slot.scope_id else {
-        return Ok(None);
-    };
-    let list_slot = plan
-        .storage_layout
-        .list_slots
-        .iter()
-        .find(|slot| slot.scope_id == Some(scope_id))
-        .ok_or_else(|| {
-            format!(
-                "indexed update branch {} has no list slot for scope",
-                op.id.0
-            )
-        })?;
-    let list_label = plan_list_label(plan, list_slot.list_id.0);
-    if let Some(event_list) = event.list_id
-        && event_list != list_label
-    {
-        return Err(format!(
-            "unscoped source `{}` targeted list `{event_list}`, expected `{list_label}`",
-            event.source
-        )
-        .into());
-    }
-    let rows = list_state
-        .get(&list_slot.list_id.0)
-        .ok_or_else(|| format!("list state missing list {}", list_slot.list_id.0))?;
-    Ok(Some((
-        list_label,
-        rows.iter()
-            .map(|row| (row.key, row.generation))
-            .collect::<Vec<_>>(),
-    )))
-}
-
-fn indexed_bool_not_input_value(
-    plan: &MachinePlan,
-    op: &boon_plan::PlanOp,
-    row: &PlanListRowState,
-    root_derived_values: &BTreeMap<usize, JsonValue>,
-) -> RuntimeResult<bool> {
-    let input = op
-        .inputs
-        .iter()
-        .find(|input| matches!(input, ValueRef::State(_) | ValueRef::Field(_)))
-        .ok_or_else(|| {
-            format!(
-                "indexed Bool/not update branch {} has no typed state or field input",
-                op.id.0
-            )
-        })?;
-    match input {
-        ValueRef::State(input_state_id) => {
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            row.fields
-                .get(&input_name)
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| {
-                    format!(
-                        "indexed Bool/not update branch {} input field `{input_name}` is not bool",
-                        op.id.0
-                    )
-                    .into()
-                })
-        }
-        ValueRef::Field(input_field_id) => {
-            let input_label = plan_derived_field_label(plan, input_field_id.0);
-            root_derived_values
-                .get(&input_field_id.0)
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| {
-                    format!(
-                        "indexed Bool/not update branch {} input derived field `{input_label}` is not bool",
-                        op.id.0
-                    )
-                    .into()
-                })
-        }
-        _ => unreachable!("filtered above"),
-    }
-}
-
-fn plan_source_guard_matches(
-    guard: &Option<PlanSourceGuard>,
-    active_source_id: SourceId,
-    event: &GenericSourceEvent<'_>,
-) -> RuntimeResult<bool> {
-    let Some(guard) = guard else {
-        return Ok(true);
-    };
-    match guard {
-        PlanSourceGuard::SourcePayloadOneOf {
-            source_id,
-            field,
-            values,
-        } => {
-            if matches!(field, SourcePayloadField::Bytes) {
-                return Err("BYTES source payload guards are not supported in v1".into());
-            }
-            if *source_id != active_source_id {
-                return Err(format!(
-                    "source guard targets source {}, but active source is {}",
-                    source_id.0, active_source_id.0
-                )
-                .into());
-            }
-            let value = generic_source_payload_json_value(event, field)?;
-            Ok(value
-                .as_str()
-                .is_some_and(|payload| values.iter().any(|expected| expected == payload)))
-        }
-    }
-}
-
-fn plan_source_guard_matches_live(
-    guard: &Option<PlanSourceGuard>,
-    active_source_id: SourceId,
-    event: &LiveSourceEvent,
-) -> RuntimeResult<bool> {
-    let Some(guard) = guard else {
-        return Ok(true);
-    };
-    match guard {
-        PlanSourceGuard::SourcePayloadOneOf {
-            source_id,
-            field,
-            values,
-        } => {
-            if matches!(field, SourcePayloadField::Bytes) {
-                return Err("BYTES source payload guards are not supported in v1".into());
-            }
-            if *source_id != active_source_id {
-                return Err(format!(
-                    "source guard targets source {}, but active source is {}",
-                    source_id.0, active_source_id.0
-                )
-                .into());
-            }
-            let value = source_payload_json_value(event, field)?;
-            Ok(value
-                .as_str()
-                .is_some_and(|payload| values.iter().any(|expected| expected == payload)))
-        }
-    }
 }
 
 fn generic_source_payload_json_value(
@@ -7845,29 +5148,6 @@ fn generic_source_payload_value_for_output(
     }
 }
 
-fn indexed_single_state_input(
-    op: &boon_plan::PlanOp,
-    output_state_id: StateId,
-) -> RuntimeResult<StateId> {
-    let inputs = op
-        .inputs
-        .iter()
-        .filter_map(|input| match input {
-            ValueRef::State(state_id) if *state_id != output_state_id => Some(*state_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let [input] = inputs.as_slice() else {
-        return Err(format!(
-            "indexed update branch {} expected one non-output state input, found {}",
-            op.id.0,
-            inputs.len()
-        )
-        .into());
-    };
-    Ok(*input)
-}
-
 fn indexed_row_state_text(
     plan: &MachinePlan,
     row: &PlanListRowState,
@@ -7925,58 +5205,18 @@ fn indexed_row_state_inline_bytes(
         )
         .into());
     }
-    let runtime_bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
+    let executor_bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
         format!(
             "indexed update branch {op_id} input row field `{field_name}` has no private BYTES state"
         )
     })?;
-    if &runtime_bytes.report_json() != public_value {
+    if &executor_bytes.report_json() != public_value {
         return Err(format!(
             "indexed update branch {op_id} bytes row field `{field_name}` public summary does not match private byte state"
         )
         .into());
     }
-    runtime_bytes.inline_bytes().cloned()
-}
-
-fn indexed_state_has_fixed_byte_bank(plan: &MachinePlan, state_id: StateId) -> bool {
-    plan.storage_layout
-        .byte_banks
-        .iter()
-        .any(|bank| bank.indexed && bank.state_id == state_id)
-}
-
-fn indexed_fixed_byte_bank_len(
-    plan: &MachinePlan,
-    state_id: StateId,
-) -> RuntimeResult<Option<usize>> {
-    plan.storage_layout
-        .byte_banks
-        .iter()
-        .find(|bank| bank.indexed && bank.state_id == state_id)
-        .map(|bank| {
-            usize::try_from(bank.fixed_len).map_err(|_| {
-                format!(
-                    "indexed fixed byte bank for state {} has unsupported length {}",
-                    state_id.0, bank.fixed_len
-                )
-                .into()
-            })
-        })
-        .transpose()
-}
-
-fn indexed_field_has_fixed_byte_bank(
-    plan: &MachinePlan,
-    scope_id: Option<ScopeId>,
-    field_name: &str,
-) -> bool {
-    plan.storage_layout.scalar_slots.iter().any(|slot| {
-        slot.indexed
-            && slot.scope_id == scope_id
-            && local_field_name(&plan_state_label(plan, slot.state_id.0)) == field_name
-            && indexed_state_has_fixed_byte_bank(plan, slot.state_id)
-    })
+    Ok(Bytes::copy_from_slice(executor_bytes.inline_bytes()))
 }
 
 fn indexed_row_state_bytes_view<'a>(
@@ -8009,19 +5249,19 @@ fn indexed_row_state_bytes_view<'a>(
             cow_kind: "borrowed",
         });
     }
-    let runtime_bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
+    let executor_bytes = row.private_bytes.get(&field_name).ok_or_else(|| {
         format!(
             "indexed update branch {op_id} input row field `{field_name}` has no private BYTES state"
         )
     })?;
-    if &runtime_bytes.report_json() != public_value {
+    if &executor_bytes.report_json() != public_value {
         return Err(format!(
             "indexed update branch {op_id} bytes row field `{field_name}` public summary does not match private byte state"
         )
         .into());
     }
     Ok(RootBytesView {
-        bytes: Cow::Borrowed(runtime_bytes.inline_bytes()?.as_ref()),
+        bytes: Cow::Borrowed(executor_bytes.inline_bytes()),
         access_source: "indexed_row_private_bytes",
         cow_kind: "borrowed",
     })
@@ -9184,6 +6424,10 @@ fn root_fixed_bytes_report_json(bytes: &[u8]) -> JsonValue {
     })
 }
 
+fn json_value_is_bytes_report(value: &JsonValue) -> bool {
+    value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES")
+}
+
 fn root_fixed_bytes_report_json_with_patches(
     bytes: &[u8],
     patches: &[(usize, u8)],
@@ -9257,102 +6501,6 @@ fn root_fixed_bytes_state_bytes<'a>(
     Ok(Some(bytes))
 }
 
-fn root_private_bytes_for_fixed_mutation<'a>(
-    root_bytes_state: &'a RootBytesState,
-    root_fixed_bytes_banks: &'a RootFixedBytesBanks,
-    state_id: StateId,
-    op_id: usize,
-) -> RuntimeResult<Cow<'a, [u8]>> {
-    if let Some(bytes) = root_fixed_bytes_banks.get(&state_id.0) {
-        return Ok(Cow::Borrowed(bytes.as_slice()));
-    }
-    if let Some(runtime_bytes) = root_bytes_state.get(&state_id.0) {
-        return Ok(Cow::Borrowed(runtime_bytes.inline_bytes()?.as_ref()));
-    }
-    Err(format!(
-        "root update branch {op_id} has no private byte state for state {}",
-        state_id.0
-    )
-    .into())
-}
-
-fn apply_root_fixed_bytes_mutation(
-    root_bytes_state: &RootBytesState,
-    root_fixed_bytes_banks: &mut RootFixedBytesBanks,
-    mutation: &RootFixedBytesMutation,
-    op_id: usize,
-) -> RuntimeResult<()> {
-    if mutation.input_state_id == mutation.output_state_id {
-        let output = root_fixed_bytes_banks
-            .get_mut(&mutation.output_state_id.0)
-            .ok_or_else(|| {
-                format!(
-                    "root update branch {op_id} output state {} has no fixed byte bank",
-                    mutation.output_state_id.0
-                )
-            })?;
-        for (index, byte_value) in &mutation.patches {
-            let Some(slot) = output.get_mut(*index) else {
-                return Err(format!(
-                    "root update branch {op_id} fixed byte bank index {index} is out of bounds"
-                )
-                .into());
-            };
-            *slot = *byte_value;
-        }
-        return Ok(());
-    }
-
-    let output_len = root_fixed_bytes_banks
-        .get(&mutation.output_state_id.0)
-        .map(Vec::len)
-        .ok_or_else(|| {
-            format!(
-                "root update branch {op_id} output state {} has no fixed byte bank",
-                mutation.output_state_id.0
-            )
-        })?;
-    for (index, _) in &mutation.patches {
-        if *index >= output_len {
-            return Err(format!(
-                "root update branch {op_id} fixed byte bank index {index} is out of bounds"
-            )
-            .into());
-        }
-    }
-    let input_len = root_private_bytes_for_fixed_mutation(
-        root_bytes_state,
-        root_fixed_bytes_banks,
-        mutation.input_state_id,
-        op_id,
-    )?
-    .len();
-    if output_len != input_len {
-        return Err(format!(
-            "root update branch {op_id} fixed byte bank output length {} does not match input length {}",
-            output_len,
-            input_len
-        )
-        .into());
-    }
-
-    let mut output = root_fixed_bytes_banks
-        .remove(&mutation.output_state_id.0)
-        .expect("output bank existence was checked above");
-    let input = root_private_bytes_for_fixed_mutation(
-        root_bytes_state,
-        root_fixed_bytes_banks,
-        mutation.input_state_id,
-        op_id,
-    )?;
-    output.copy_from_slice(input.as_ref());
-    for (index, byte_value) in &mutation.patches {
-        output[*index] = *byte_value;
-    }
-    root_fixed_bytes_banks.insert(mutation.output_state_id.0, output);
-    Ok(())
-}
-
 fn root_state_inline_bytes(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
@@ -9378,7 +6526,7 @@ fn root_state_inline_bytes(
             )
             .into());
         }
-        return runtime_bytes.inline_bytes().cloned();
+        return Ok(runtime_bytes_copy_from_slice(runtime_bytes.inline_bytes()));
     }
     if let Some(bytes) =
         root_fixed_bytes_state_bytes(plan, root_state, root_fixed_bytes_banks, state_id, op_id)?
@@ -9450,7 +6598,7 @@ fn root_state_bytes_view<'a>(
             .into());
         }
         return Ok(RootBytesView {
-            bytes: Cow::Borrowed(runtime_bytes.inline_bytes()?.as_ref()),
+            bytes: Cow::Borrowed(runtime_bytes.inline_bytes()),
             access_source: "root_bytes_state",
             cow_kind: "borrowed",
         });
@@ -9582,10 +6730,11 @@ fn plan_row_source_binding_id(
     source_id: SourceId,
 ) -> Option<u64> {
     let routes = row_scoped_source_routes(plan, list_slot);
-    routes
+    let route_source_ids = routes
         .iter()
-        .position(|route| route.source_id == source_id)
-        .map(|route_index| (key - 1) * routes.len() as u64 + route_index as u64 + 1)
+        .map(|route| route.source_id)
+        .collect::<Vec<_>>();
+    plan_row_source_binding_id_core(key, &route_source_ids, source_id)
 }
 
 fn row_resolution_report(
@@ -9612,75 +6761,6 @@ fn row_resolution_report(
         "generation": row.generation,
         "source_binding_id": source_binding_id,
     })
-}
-
-fn refresh_row_bool_not_fields(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    list_label: &str,
-    key: u64,
-    generation: u64,
-    fields: &mut BTreeMap<String, JsonValue>,
-) -> RuntimeResult<Vec<JsonValue>> {
-    let mut deltas = Vec::new();
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-    {
-        if !op.indexed {
-            continue;
-        }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(PlanDerivedExpression::BoolNot { input }),
-        } = &op.kind
-        else {
-            continue;
-        };
-        let Some(input_state_id) = (match input {
-            ValueRef::State(state_id) => Some(state_id),
-            _ => None,
-        }) else {
-            return Err(format!("indexed Bool/not op {} input is not a state ref", op.id.0).into());
-        };
-        let Some(input_slot) = plan
-            .storage_layout
-            .scalar_slots
-            .iter()
-            .find(|slot| slot.state_id == *input_state_id)
-        else {
-            return Err(format!("indexed Bool/not op {} input state is missing", op.id.0).into());
-        };
-        if input_slot.scope_id != list_slot.scope_id {
-            continue;
-        }
-        let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-        let Some(input_value) = fields.get(&input_name).and_then(JsonValue::as_bool) else {
-            continue;
-        };
-        let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
-        let value = JsonValue::Bool(!input_value);
-        let changed = fields.get(&output_name) != Some(&value);
-        fields.insert(output_name.clone(), value.clone());
-        if changed {
-            deltas.push(json!({
-                "kind": "FieldSet",
-                "list_id": list_label,
-                "key": key,
-                "generation": generation,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": output_name,
-                "value": value,
-            }));
-        }
-    }
-    Ok(deltas)
 }
 
 fn refresh_indexed_derived_fields_after_state_change(
@@ -9832,7 +6912,7 @@ fn stale_empty_text_indexed_derived_deltas(
         else {
             continue;
         };
-        if !row_expression_applies_to_list(plan, list_slot, output_id)
+        if !plan_row_expression_applies_to_list(plan, list_slot, output_id)
             || !later_states
                 .iter()
                 .any(|state_id| plan_row_expression_contains_state(expression, *state_id))
@@ -10247,7 +7327,7 @@ fn eval_indexed_derived_row_value(
             Ok(Some(JsonValue::Bool(!input_value)))
         }
         PlanDerivedExpression::RowExpression { expression } => {
-            if !row_expression_applies_to_list(plan, list_slot, output_id) {
+            if !plan_row_expression_applies_to_list(plan, list_slot, output_id) {
                 return Ok(None);
             }
             Ok(Some(eval_plan_row_expression(
@@ -10268,7 +7348,7 @@ fn execute_root_scalar_update_branch(
     root_bytes_state: &RootBytesState,
     root_fixed_bytes_banks: &RootFixedBytesBanks,
     host_file_root: Option<&Path>,
-) -> RuntimeResult<Option<ExecutedRootUpdate>> {
+) -> RuntimeResult<Option<RootExecutedUpdate>> {
     let source_guard = match &op.kind {
         PlanOpKind::UpdateBranch { source_guard, .. } => source_guard,
         _ => {
@@ -10279,7 +7359,8 @@ fn execute_root_scalar_update_branch(
             .into());
         }
     };
-    if !plan_source_guard_matches_live(source_guard, source_id, event)? {
+    let root_json_event = root_json_source_event_from_live(event);
+    if !plan_executor_source_guard_matches(source_guard, source_id, &root_json_event)? {
         return Ok(None);
     }
     let Some(ValueRef::State(output_state_id)) = op.output else {
@@ -10289,9 +7370,100 @@ fn execute_root_scalar_update_branch(
         )
         .into());
     };
-    let mut host_effect = JsonValue::Null;
+    if let Some(bytes_dispatch) = plan_root_bytes_update_dispatch_kind(op) {
+        let (
+            value,
+            bytes_value,
+            fixed_bytes_mutation,
+            bytes_access,
+            executor_core,
+            expression_kind,
+            update_constant_id,
+            update_constant_value,
+            host_effect,
+        ) = match bytes_dispatch {
+            RootBytesUpdateDispatchKind::Read => {
+                let bytes_environment = RootBytesRuntimeEnvironment::new(
+                    root_bytes_state,
+                    root_fixed_bytes_banks,
+                    host_file_root,
+                );
+                let evaluation = bytes_environment.evaluate_read(plan, op, root_state)?;
+                let value = evaluation.value.ok_or_else(|| {
+                    format!(
+                        "root BYTES read evaluator reported supported branch {} without a value",
+                        op.id.0
+                    )
+                })?;
+                let expression_kind = evaluation.expression_kind.ok_or_else(|| {
+                    format!(
+                        "root BYTES read evaluator reported supported branch {} without an expression kind",
+                        op.id.0
+                    )
+                })?;
+                (
+                    value,
+                    evaluation.bytes,
+                    None,
+                    evaluation.bytes_access,
+                    evaluation.executor_report,
+                    expression_kind,
+                    evaluation.update_constant_id,
+                    evaluation.update_constant_value,
+                    JsonValue::Null,
+                )
+            }
+            RootBytesUpdateDispatchKind::Write => {
+                let bytes_environment = RootBytesRuntimeEnvironment::new(
+                    root_bytes_state,
+                    root_fixed_bytes_banks,
+                    host_file_root,
+                );
+                let evaluation = bytes_environment.evaluate_write(plan, op, root_state)?;
+                let value = evaluation.value.ok_or_else(|| {
+                    format!(
+                        "root BYTES write evaluator reported supported branch {} without a value",
+                        op.id.0
+                    )
+                })?;
+                let expression_kind = evaluation.expression_kind.ok_or_else(|| {
+                    format!(
+                        "root BYTES write evaluator reported supported branch {} without an expression kind",
+                        op.id.0
+                    )
+                })?;
+                (
+                    value,
+                    evaluation.bytes,
+                    evaluation.fixed_mutation,
+                    evaluation.bytes_access,
+                    evaluation.executor_report,
+                    expression_kind,
+                    evaluation.update_constant_id,
+                    evaluation.update_constant_value,
+                    evaluation.host_effect,
+                )
+            }
+        };
+        return Ok(Some(assemble_plan_root_runtime_branch_update(
+            RootRuntimeBranchUpdateInput {
+                value,
+                bytes_value,
+                fixed_bytes_mutation,
+                bytes_access,
+                runtime_branch_core: executor_core,
+                state_write_core: JsonValue::Null,
+                bytes_state_core: JsonValue::Null,
+                expression_kind: expression_kind.to_owned(),
+                source_payload_field: JsonValue::Null,
+                update_constant_id,
+                update_constant_value,
+                host_effect,
+            },
+        )));
+    }
     let mut fixed_bytes_mutation = None;
-    let mut bytes_access = JsonValue::Null;
+    let mut executor_core = JsonValue::Null;
     let (
         value,
         bytes_value,
@@ -10333,13 +7505,27 @@ fn execute_root_scalar_update_branch(
                 )
                 .into());
             }
-            let (value, bytes_value) = source_payload_value_for_output(
-                plan,
-                output_state_id,
-                event,
-                source_payload_field,
-                op.id.0,
-            )?;
+            let (value, bytes_value) = if matches!(source_payload_field, SourcePayloadField::Bytes)
+            {
+                let root_json_event = root_json_source_event_from_live(event);
+                let commit = evaluate_root_bytes_source_payload_commit(
+                    plan,
+                    output_state_id,
+                    &root_json_event,
+                    source_payload_field,
+                    op.id,
+                )?;
+                executor_core = commit.executor_report;
+                (commit.value, Some(commit.bytes))
+            } else {
+                source_payload_value_for_output(
+                    plan,
+                    output_state_id,
+                    event,
+                    source_payload_field,
+                    op.id.0,
+                )?
+            };
             (
                 value,
                 bytes_value,
@@ -10360,9 +7546,9 @@ fn execute_root_scalar_update_branch(
                 .iter()
                 .find(|constant| constant.id == *update_constant_id)
                 .ok_or_else(|| format!("missing update constant {}", update_constant_id.0))?;
-            let value = plan_constant_json_value(constant)?;
+            let value = plan_executor_constant_json_value(constant)?;
             let bytes_value =
-                plan_constant_runtime_bytes_for_output(plan, output_state_id, constant, op.id.0)?;
+                plan_constant_executor_bytes_for_output(plan, output_state_id, constant, op.id.0)?;
             (
                 value.clone(),
                 bytes_value,
@@ -10392,1455 +7578,6 @@ fn execute_root_scalar_update_branch(
                 JsonValue::Bool(!input_value),
                 None,
                 "bool_not",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesLength,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            let byte_len = bytes_view.bytes.as_ref().len() as u64;
-            let byte_len = i64::try_from(byte_len).map_err(|_| {
-                format!(
-                    "root Bytes/length update branch {} byte_len exceeds Boon NUMBER",
-                    op.id.0
-                )
-            })?;
-            (
-                json!(byte_len),
-                None,
-                "bytes_length",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesIsEmpty,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            (
-                JsonValue::Bool(bytes_view.bytes.as_ref().is_empty()),
-                None,
-                "bytes_is_empty",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesGet,
-            source_payload_field: None,
-            update_constant_id: Some(update_constant_id),
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let index_constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == *update_constant_id)
-                .ok_or_else(|| {
-                    format!(
-                        "root Bytes/get update branch {} references missing index constant {}",
-                        op.id.0, update_constant_id.0
-                    )
-                })?;
-            let PlanConstantValue::Number { value: index } = &index_constant.value else {
-                return Err(format!(
-                    "root Bytes/get update branch {} index constant {} is not a number",
-                    op.id.0, update_constant_id.0
-                )
-                .into());
-            };
-            let index = usize::try_from(*index).map_err(|_| {
-                format!(
-                    "root Bytes/get update branch {} index constant {} is negative or too large",
-                    op.id.0, update_constant_id.0
-                )
-            })?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            let byte = bytes_view.bytes.as_ref().get(index).ok_or_else(|| {
-                    format!(
-                        "root Bytes/get update branch {} index {index} is out of bounds for `{input_label}`",
-                        op.id.0
-                    )
-                })?;
-            (
-                json!(i64::from(*byte)),
-                None,
-                "bytes_get",
-                JsonValue::Null,
-                json!(update_constant_id.0),
-                json!(index),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesSet,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, index, byte_value, index_constant_id, value_constant_id) =
-                root_bytes_set_operands(plan, op)?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let output_slot = plan
-                .storage_layout
-                .scalar_slots
-                .iter()
-                .find(|slot| slot.state_id == output_state_id)
-                .ok_or_else(|| {
-                    format!(
-                        "root Bytes/set update branch {} has no output storage slot",
-                        op.id.0
-                    )
-                })?;
-            if let Some(input_bytes) = root_fixed_bytes_state_bytes(
-                plan,
-                root_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )? && root_state_has_fixed_byte_bank(plan, output_state_id)
-            {
-                if let boon_plan::PlanValueType::Bytes {
-                    fixed_len: Some(fixed_len),
-                } = &output_slot.value_type
-                    && *fixed_len != input_bytes.len() as u64
-                {
-                    return Err(format!(
-                        "root Bytes/set update branch {} output fixed length {} does not match input length {}",
-                        op.id.0,
-                        fixed_len,
-                        input_bytes.len()
-                    )
-                    .into());
-                }
-                let value = root_fixed_bytes_report_json_with_patches(
-                    input_bytes,
-                    &[(index, byte_value)],
-                    "Bytes/set",
-                    op.id.0,
-                    &input_label,
-                )?;
-                fixed_bytes_mutation = Some(RootFixedBytesMutation {
-                    input_state_id,
-                    output_state_id,
-                    patches: vec![(index, byte_value)],
-                });
-                (
-                    value,
-                    None,
-                    "bytes_set",
-                    JsonValue::Null,
-                    json!([index_constant_id.0, value_constant_id.0]),
-                    json!({"index": index, "value": byte_value}),
-                )
-            } else {
-                let bytes = root_state_inline_bytes(
-                    plan,
-                    root_state,
-                    root_bytes_state,
-                    root_fixed_bytes_banks,
-                    input_state_id,
-                    op.id.0,
-                )?;
-                if let boon_plan::PlanValueType::Bytes {
-                    fixed_len: Some(fixed_len),
-                } = &output_slot.value_type
-                    && *fixed_len != bytes.len() as u64
-                {
-                    return Err(format!(
-                    "root Bytes/set update branch {} output fixed length {} does not match input length {}",
-                    op.id.0,
-                    fixed_len,
-                    bytes.len()
-                )
-                .into());
-                }
-                let mut output = runtime_bytes_vec_clone(&bytes);
-                let Some(slot) = output.get_mut(index) else {
-                    return Err(format!(
-                    "root Bytes/set update branch {} index {index} is out of bounds for `{input_label}`",
-                    op.id.0
-                )
-                .into());
-                };
-                *slot = byte_value;
-                let bytes = RuntimeBytes::inline(Bytes::from(output));
-                (
-                    bytes.report_json(),
-                    Some(bytes),
-                    "bytes_set",
-                    JsonValue::Null,
-                    json!([index_constant_id.0, value_constant_id.0]),
-                    json!({"index": index, "value": byte_value}),
-                )
-            }
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesSlice,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, offset, byte_count, offset_ref, byte_count_ref) =
-                root_bytes_slice_operands(plan, root_state, op)?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes = root_state_inline_bytes(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            let output = root_checked_bytes_slice(
-                &bytes,
-                offset,
-                byte_count,
-                "Bytes/slice",
-                op.id.0,
-                &input_label,
-            )?;
-            let output_len = output.len();
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output_len,
-                "Bytes/slice",
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": false,
-                "input_state_id": input_state_id.0,
-                "output_state_id": output_state_id.0,
-                "input_access_source": "root_state_inline_bytes",
-                "output_storage_kind": "bytes_slice_view",
-                "output_cow_kind": "borrowed_view",
-                "offset": offset,
-                "byte_count": byte_count,
-                "output_byte_len": output_len,
-            });
-            let bytes = RuntimeBytes::inline(output);
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_slice",
-                JsonValue::Null,
-                json!([offset_ref, byte_count_ref]),
-                json!({"offset": offset, "byte_count": byte_count}),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesTake,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, byte_count, byte_count_ref) =
-                root_bytes_count_operand(plan, root_state, op, "Bytes/take")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes = root_state_inline_bytes(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            let output = root_checked_bytes_slice(
-                &bytes,
-                0,
-                byte_count,
-                "Bytes/take",
-                op.id.0,
-                &input_label,
-            )?;
-            let output_len = output.len();
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output_len,
-                "Bytes/take",
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": false,
-                "input_state_id": input_state_id.0,
-                "output_state_id": output_state_id.0,
-                "input_access_source": "root_state_inline_bytes",
-                "output_storage_kind": "bytes_slice_view",
-                "output_cow_kind": "borrowed_view",
-                "offset": 0,
-                "byte_count": byte_count,
-                "output_byte_len": output_len,
-            });
-            let bytes = RuntimeBytes::inline(output);
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_take",
-                JsonValue::Null,
-                byte_count_ref,
-                json!(byte_count),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesDrop,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, byte_count, byte_count_ref) =
-                root_bytes_count_operand(plan, root_state, op, "Bytes/drop")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes = root_state_inline_bytes(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            let output =
-                root_checked_bytes_drop(&bytes, byte_count, "Bytes/drop", op.id.0, &input_label)?;
-            let output_len = output.len();
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output_len,
-                "Bytes/drop",
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": false,
-                "input_state_id": input_state_id.0,
-                "output_state_id": output_state_id.0,
-                "input_access_source": "root_state_inline_bytes",
-                "output_storage_kind": "bytes_slice_view",
-                "output_cow_kind": "borrowed_view",
-                "offset": byte_count,
-                "byte_count": output_len,
-                "dropped_byte_count": byte_count,
-                "output_byte_len": output_len,
-            });
-            let bytes = RuntimeBytes::inline(output);
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_drop",
-                JsonValue::Null,
-                byte_count_ref,
-                json!(byte_count),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesZeros,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (byte_count, byte_count_constant_id) = root_bytes_zeros_operand(plan, op)?;
-            let mut output = Vec::new();
-            output.try_reserve_exact(byte_count).map_err(|_| {
-                format!(
-                    "root Bytes/zeros update branch {} could not allocate {byte_count} bytes",
-                    op.id.0
-                )
-            })?;
-            record_runtime_bytes_vec_alloc(byte_count);
-            record_runtime_bytes_zero_fill(byte_count);
-            output.resize(byte_count, 0);
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output.len(),
-                "Bytes/zeros",
-                op.id.0,
-            )?;
-            let bytes = RuntimeBytes::inline(Bytes::from(output));
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_zeros",
-                JsonValue::Null,
-                json!(byte_count_constant_id.0),
-                json!(byte_count),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesToHex,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            (
-                JsonValue::String(bytes_encode_hex(bytes_view.bytes.as_ref())),
-                None,
-                "bytes_to_hex",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesFromHex,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let text = root_state_value(plan, root_state, input_state_id, op.id.0)?
-                .as_str()
-                .ok_or_else(|| {
-                    format!(
-                        "root Bytes/from_hex update branch {} input state `{input_label}` is not TEXT",
-                        op.id.0
-                    )
-                })?;
-            let output = bytes_decode_hex(text).map_err(|error| match error {
-                BoonValue::Error(code) => format!(
-                    "root Bytes/from_hex update branch {} failed for `{input_label}`: {code}",
-                    op.id.0
-                ),
-                _ => format!(
-                    "root Bytes/from_hex update branch {} failed for `{input_label}`",
-                    op.id.0
-                ),
-            })?;
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output.len(),
-                "Bytes/from_hex",
-                op.id.0,
-            )?;
-            let bytes = RuntimeBytes::inline(Bytes::from(output));
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_from_hex",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesToBase64,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            (
-                JsonValue::String(bytes_encode_base64(bytes_view.bytes.as_ref())),
-                None,
-                "bytes_to_base64",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesFromBase64,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let input_state_id = root_single_state_input(op)?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let text = root_state_value(plan, root_state, input_state_id, op.id.0)?
-                .as_str()
-                .ok_or_else(|| {
-                    format!(
-                        "root Bytes/from_base64 update branch {} input state `{input_label}` is not TEXT",
-                        op.id.0
-                    )
-                })?;
-            let output = bytes_decode_base64(text).map_err(|error| match error {
-                BoonValue::Error(code) => format!(
-                    "root Bytes/from_base64 update branch {} failed for `{input_label}`: {code}",
-                    op.id.0
-                ),
-                _ => format!(
-                    "root Bytes/from_base64 update branch {} failed for `{input_label}`",
-                    op.id.0
-                ),
-            })?;
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                output.len(),
-                "Bytes/from_base64",
-                op.id.0,
-            )?;
-            let bytes = RuntimeBytes::inline(Bytes::from(output));
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_from_base64",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesReadUnsigned,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (
-                input_state_id,
-                offset,
-                byte_count,
-                endian,
-                offset_constant_id,
-                byte_count_constant_id,
-                endian_constant_id,
-            ) = root_bytes_numeric_read_operands(plan, op, "Bytes/read_unsigned")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            let value = bytes_read_unsigned(bytes_view.bytes.as_ref(), offset, byte_count, endian)
-                .map_err(|error| {
-                    match error {
-                        BoonValue::Error(code) => format!(
-                            "root Bytes/read_unsigned update branch {} failed for `{input_label}`: {code}",
-                            op.id.0
-                        ),
-                        _ => format!(
-                            "root Bytes/read_unsigned update branch {} failed for `{input_label}`",
-                            op.id.0
-                        ),
-                    }
-                })?;
-            if value > i64::MAX as u64 {
-                return Err(format!(
-                    "root Bytes/read_unsigned update branch {} overflows Boon NUMBER",
-                    op.id.0
-                )
-                .into());
-            }
-            (
-                json!(value as i64),
-                None,
-                "bytes_read_unsigned",
-                JsonValue::Null,
-                json!([
-                    offset_constant_id.0,
-                    byte_count_constant_id.0,
-                    endian_constant_id.0
-                ]),
-                json!({
-                    "offset": offset,
-                    "byte_count": byte_count,
-                    "endian": runtime_bytes_endian_label(endian)
-                }),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesReadSigned,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (
-                input_state_id,
-                offset,
-                byte_count,
-                endian,
-                offset_constant_id,
-                byte_count_constant_id,
-                endian_constant_id,
-            ) = root_bytes_numeric_read_operands(plan, op, "Bytes/read_signed")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            let value =
-                bytes_read_signed(bytes_view.bytes.as_ref(), offset, byte_count, endian).map_err(
-                    |error| match error {
-                        BoonValue::Error(code) => format!(
-                        "root Bytes/read_signed update branch {} failed for `{input_label}`: {code}",
-                        op.id.0
-                    ),
-                        _ => format!(
-                        "root Bytes/read_signed update branch {} failed for `{input_label}`",
-                        op.id.0
-                    ),
-                    },
-                )?;
-            (
-                json!(value),
-                None,
-                "bytes_read_signed",
-                JsonValue::Null,
-                json!([
-                    offset_constant_id.0,
-                    byte_count_constant_id.0,
-                    endian_constant_id.0
-                ]),
-                json!({
-                    "offset": offset,
-                    "byte_count": byte_count,
-                    "endian": runtime_bytes_endian_label(endian)
-                }),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesWriteUnsigned,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (
-                input_state_id,
-                offset,
-                byte_count,
-                endian,
-                value,
-                offset_constant_id,
-                byte_count_constant_id,
-                endian_constant_id,
-                value_constant_id,
-            ) = root_bytes_numeric_write_operands(plan, op, "Bytes/write_unsigned")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            if let Some(input_bytes) = root_fixed_bytes_state_bytes(
-                plan,
-                root_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )? && root_state_has_fixed_byte_bank(plan, output_state_id)
-            {
-                root_validate_bytes_output_len(
-                    plan,
-                    output_state_id,
-                    input_bytes.len(),
-                    "Bytes/write_unsigned",
-                    op.id.0,
-                )?;
-                let patches =
-                    bytes_write_unsigned_patches(input_bytes.len(), offset, byte_count, endian, value)
-                        .map_err(|error| match error {
-                            BoonValue::Error(code) => format!(
-                                "root Bytes/write_unsigned update branch {} failed for `{input_label}`: {code}",
-                                op.id.0
-                            ),
-                            _ => format!(
-                                "root Bytes/write_unsigned update branch {} failed for `{input_label}`",
-                                op.id.0
-                            ),
-                        })?;
-                let value_json = root_fixed_bytes_report_json_with_patches(
-                    input_bytes,
-                    &patches,
-                    "Bytes/write_unsigned",
-                    op.id.0,
-                    &input_label,
-                )?;
-                bytes_access = json!({
-                    "read_only": false,
-                    "input_state_id": input_state_id.0,
-                    "output_state_id": output_state_id.0,
-                    "access_source": "root_fixed_byte_bank",
-                    "cow_kind": "borrowed",
-                    "mutation_kind": "fixed_byte_bank_patches",
-                    "patch_count": patches.len(),
-                });
-                fixed_bytes_mutation = Some(RootFixedBytesMutation {
-                    input_state_id,
-                    output_state_id,
-                    patches,
-                });
-                (
-                    value_json,
-                    None,
-                    "bytes_write_unsigned",
-                    JsonValue::Null,
-                    json!([
-                        offset_constant_id.0,
-                        byte_count_constant_id.0,
-                        endian_constant_id.0,
-                        value_constant_id.0
-                    ]),
-                    json!({
-                        "offset": offset,
-                        "byte_count": byte_count,
-                        "endian": runtime_bytes_endian_label(endian),
-                        "value": value
-                    }),
-                )
-            } else {
-                let bytes = root_state_inline_bytes(
-                    plan,
-                    root_state,
-                    root_bytes_state,
-                    root_fixed_bytes_banks,
-                    input_state_id,
-                    op.id.0,
-                )?;
-                let mut output = runtime_bytes_vec_clone(&bytes);
-                bytes_write_unsigned(&mut output, offset, byte_count, endian, value).map_err(
-                    |error| match error {
-                    BoonValue::Error(code) => format!(
-                        "root Bytes/write_unsigned update branch {} failed for `{input_label}`: {code}",
-                        op.id.0
-                    ),
-                    _ => format!(
-                        "root Bytes/write_unsigned update branch {} failed for `{input_label}`",
-                        op.id.0
-                    ),
-                    },
-                )?;
-                root_validate_bytes_output_len(
-                    plan,
-                    output_state_id,
-                    output.len(),
-                    "Bytes/write_unsigned",
-                    op.id.0,
-                )?;
-                let bytes = RuntimeBytes::inline(Bytes::from(output));
-                (
-                    bytes.report_json(),
-                    Some(bytes),
-                    "bytes_write_unsigned",
-                    JsonValue::Null,
-                    json!([
-                        offset_constant_id.0,
-                        byte_count_constant_id.0,
-                        endian_constant_id.0,
-                        value_constant_id.0
-                    ]),
-                    json!({
-                        "offset": offset,
-                        "byte_count": byte_count,
-                        "endian": runtime_bytes_endian_label(endian),
-                        "value": value
-                    }),
-                )
-            }
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesWriteSigned,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (
-                input_state_id,
-                offset,
-                byte_count,
-                endian,
-                value,
-                offset_constant_id,
-                byte_count_constant_id,
-                endian_constant_id,
-                value_constant_id,
-            ) = root_bytes_numeric_write_operands(plan, op, "Bytes/write_signed")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            if let Some(input_bytes) = root_fixed_bytes_state_bytes(
-                plan,
-                root_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )? && root_state_has_fixed_byte_bank(plan, output_state_id)
-            {
-                root_validate_bytes_output_len(
-                    plan,
-                    output_state_id,
-                    input_bytes.len(),
-                    "Bytes/write_signed",
-                    op.id.0,
-                )?;
-                let patches =
-                    bytes_write_signed_patches(input_bytes.len(), offset, byte_count, endian, value)
-                        .map_err(|error| match error {
-                            BoonValue::Error(code) => format!(
-                                "root Bytes/write_signed update branch {} failed for `{input_label}`: {code}",
-                                op.id.0
-                            ),
-                            _ => format!(
-                                "root Bytes/write_signed update branch {} failed for `{input_label}`",
-                                op.id.0
-                            ),
-                        })?;
-                let value_json = root_fixed_bytes_report_json_with_patches(
-                    input_bytes,
-                    &patches,
-                    "Bytes/write_signed",
-                    op.id.0,
-                    &input_label,
-                )?;
-                bytes_access = json!({
-                    "read_only": false,
-                    "input_state_id": input_state_id.0,
-                    "output_state_id": output_state_id.0,
-                    "access_source": "root_fixed_byte_bank",
-                    "cow_kind": "borrowed",
-                    "mutation_kind": "fixed_byte_bank_patches",
-                    "patch_count": patches.len(),
-                });
-                fixed_bytes_mutation = Some(RootFixedBytesMutation {
-                    input_state_id,
-                    output_state_id,
-                    patches,
-                });
-                (
-                    value_json,
-                    None,
-                    "bytes_write_signed",
-                    JsonValue::Null,
-                    json!([
-                        offset_constant_id.0,
-                        byte_count_constant_id.0,
-                        endian_constant_id.0,
-                        value_constant_id.0
-                    ]),
-                    json!({
-                        "offset": offset,
-                        "byte_count": byte_count,
-                        "endian": runtime_bytes_endian_label(endian),
-                        "value": value
-                    }),
-                )
-            } else {
-                let bytes = root_state_inline_bytes(
-                    plan,
-                    root_state,
-                    root_bytes_state,
-                    root_fixed_bytes_banks,
-                    input_state_id,
-                    op.id.0,
-                )?;
-                let mut output = runtime_bytes_vec_clone(&bytes);
-                bytes_write_signed(&mut output, offset, byte_count, endian, value).map_err(
-                    |error| match error {
-                    BoonValue::Error(code) => format!(
-                        "root Bytes/write_signed update branch {} failed for `{input_label}`: {code}",
-                        op.id.0
-                    ),
-                    _ => format!(
-                        "root Bytes/write_signed update branch {} failed for `{input_label}`",
-                        op.id.0
-                    ),
-                    },
-                )?;
-                root_validate_bytes_output_len(
-                    plan,
-                    output_state_id,
-                    output.len(),
-                    "Bytes/write_signed",
-                    op.id.0,
-                )?;
-                let bytes = RuntimeBytes::inline(Bytes::from(output));
-                (
-                    bytes.report_json(),
-                    Some(bytes),
-                    "bytes_write_signed",
-                    JsonValue::Null,
-                    json!([
-                        offset_constant_id.0,
-                        byte_count_constant_id.0,
-                        endian_constant_id.0,
-                        value_constant_id.0
-                    ]),
-                    json!({
-                        "offset": offset,
-                        "byte_count": byte_count,
-                        "endian": runtime_bytes_endian_label(endian),
-                        "value": value
-                    }),
-                )
-            }
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::FileReadBytes,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let path_operand = file_read_bytes_path_operand(plan, op, "root")?;
-            let (path, path_update_constant_id, path_update_constant_value) = match path_operand {
-                FileReadBytesPathOperand::StaticConstant { path, constant_id } => (
-                    path.clone(),
-                    json!(constant_id.0),
-                    json!({
-                        "path": path,
-                        "path_source": "static_constant",
-                    }),
-                ),
-                FileReadBytesPathOperand::StatePath { state_id } => {
-                    let label = plan_state_label(plan, state_id.0);
-                    let value = root_state_value(plan, root_state, state_id, op.id.0)?;
-                    let path = value.as_str().ok_or_else(|| {
-                        format!(
-                            "root File/read_bytes update branch {} path state `{label}` is not TEXT",
-                            op.id.0
-                        )
-                    })?;
-                    (
-                        path.to_owned(),
-                        JsonValue::Null,
-                        json!({
-                            "path": path,
-                            "path_source": "state",
-                            "path_state": label,
-                            "path_state_id": state_id.0,
-                        }),
-                    )
-                }
-                FileReadBytesPathOperand::RowFieldPath { .. } => {
-                    return Err(format!(
-                        "root File/read_bytes update branch {} cannot use an indexed row field path operand",
-                        op.id.0
-                    )
-                    .into())
-                }
-            };
-            let host_file_root = host_file_root.ok_or_else(|| {
-                format!(
-                    "root File/read_bytes update branch {} has no host file root",
-                    op.id.0
-                )
-            })?;
-            let bytes = read_plan_host_file_bytes(host_file_root, &path).map_err(|error| {
-                format!(
-                    "root File/read_bytes update branch {} cannot read `{path}`: {error}",
-                    op.id.0
-                )
-            })?;
-            root_validate_bytes_output_len(
-                plan,
-                output_state_id,
-                bytes.len(),
-                "File/read_bytes",
-                op.id.0,
-            )?;
-            let bytes = RuntimeBytes::dynamic(Bytes::from(bytes));
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "file_read_bytes",
-                JsonValue::Null,
-                path_update_constant_id,
-                path_update_constant_value,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::FileWriteBytes,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, path_operand) = file_write_bytes_operands(plan, op, "root")?;
-            let (path, path_update_constant_id, path_update_constant_value, path_source) =
-                match path_operand {
-                    FileWriteBytesPathOperand::StaticConstant { path, constant_id } => (
-                        path.clone(),
-                        json!(constant_id.0),
-                        json!({ "path": path }),
-                        "static_constant",
-                    ),
-                    FileWriteBytesPathOperand::StatePath { state_id } => {
-                        let label = plan_state_label(plan, state_id.0);
-                        let value = root_state_value(plan, root_state, state_id, op.id.0)?;
-                        let path = value.as_str().ok_or_else(|| {
-                            format!(
-                                "root File/write_bytes update branch {} path state `{label}` is not TEXT",
-                                op.id.0
-                            )
-                        })?;
-                        (
-                            path.to_owned(),
-                            JsonValue::Null,
-                            json!({
-                                "path": path,
-                                "path_state": label,
-                                "path_state_id": state_id.0,
-                            }),
-                            "state",
-                        )
-                    }
-                    FileWriteBytesPathOperand::RowFieldPath { .. } => {
-                        return Err(format!(
-                            "root File/write_bytes update branch {} cannot use an indexed row field path operand",
-                            op.id.0
-                        )
-                        .into());
-                    }
-                };
-            let host_file_root = host_file_root.ok_or_else(|| {
-                format!(
-                    "root File/write_bytes update branch {} has no host file root",
-                    op.id.0
-                )
-            })?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-                "host_boundary": "file_write_bytes",
-                "byte_len": bytes_view.bytes.as_ref().len(),
-                "path_source": path_source,
-            });
-            let write_result =
-                write_plan_host_file_bytes(host_file_root, &path, bytes_view.bytes.as_ref())
-                    .map_err(|error| {
-                        format!(
-                            "root File/write_bytes update branch {} cannot write `{path}`: {error}",
-                            op.id.0
-                        )
-                    })?;
-            host_effect = write_result.report_json();
-            (
-                JsonValue::String(path.clone()),
-                None,
-                "file_write_bytes",
-                JsonValue::Null,
-                path_update_constant_id,
-                path_update_constant_value,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::TextToBytes,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, encoding, encoding_constant_id) =
-                root_text_bytes_conversion_operands(plan, op, "Text/to_bytes")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let text = root_state_value(plan, root_state, input_state_id, op.id.0)?
-                .as_str()
-                .ok_or_else(|| {
-                    format!(
-                        "root Text/to_bytes update branch {} input state `{input_label}` is not TEXT",
-                        op.id.0
-                    )
-                })?;
-            let bytes = runtime_text_to_bytes(text, &encoding).map_err(|error| {
-                format!(
-                    "root Text/to_bytes update branch {} input state `{input_label}` {error}",
-                    op.id.0
-                )
-            })?;
-            let output_slot = plan
-                .storage_layout
-                .scalar_slots
-                .iter()
-                .find(|slot| slot.state_id == output_state_id)
-                .ok_or_else(|| {
-                    format!(
-                        "root Text/to_bytes update branch {} has no output storage slot",
-                        op.id.0
-                    )
-                })?;
-            if let boon_plan::PlanValueType::Bytes {
-                fixed_len: Some(fixed_len),
-            } = &output_slot.value_type
-                && *fixed_len != bytes.byte_len
-            {
-                return Err(format!(
-                    "root Text/to_bytes update branch {} output fixed length {} does not match encoded length {}",
-                    op.id.0,
-                    fixed_len,
-                    bytes.byte_len
-                )
-                .into());
-            }
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "text_to_bytes",
-                JsonValue::Null,
-                json!(encoding_constant_id.0),
-                json!(encoding),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesToText,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (input_state_id, encoding, encoding_constant_id) =
-                root_text_bytes_conversion_operands(plan, op, "Bytes/to_text")?;
-            let input_label = plan_state_label(plan, input_state_id.0);
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                input_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "input_state_id": input_state_id.0,
-                "access_source": bytes_view.access_source,
-                "cow_kind": bytes_view.cow_kind,
-            });
-            let text =
-                runtime_bytes_to_text(bytes_view.bytes.as_ref(), &encoding).map_err(|error| {
-                    format!(
-                        "root Bytes/to_text update branch {} input state `{input_label}` {error}",
-                        op.id.0
-                    )
-                })?;
-            (
-                JsonValue::String(text),
-                None,
-                "bytes_to_text",
-                JsonValue::Null,
-                json!(encoding_constant_id.0),
-                json!(encoding),
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesEqual,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (left_state_id, right_state_id) = root_bytes_equal_state_inputs(op)?;
-            let left_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                left_state_id,
-                op.id.0,
-            )?;
-            let right_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                right_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "inputs": [
-                    root_bytes_view_access_json("left", left_state_id, &left_view),
-                    root_bytes_view_access_json("right", right_state_id, &right_view)
-                ],
-            });
-            (
-                JsonValue::Bool(left_view.bytes.as_ref() == right_view.bytes.as_ref()),
-                None,
-                "bytes_equal",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesFind,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (haystack_state_id, needle_state_id) =
-                root_bytes_ordered_state_inputs(op, "Bytes/find")?;
-            let haystack_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                haystack_state_id,
-                op.id.0,
-            )?;
-            let needle_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                needle_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "inputs": [
-                    root_bytes_view_access_json("haystack", haystack_state_id, &haystack_view),
-                    root_bytes_view_access_json("needle", needle_state_id, &needle_view)
-                ],
-            });
-            let value = match bytes_find(haystack_view.bytes.as_ref(), needle_view.bytes.as_ref()) {
-                Some(index) => json!(i64::try_from(index).map_err(|_| {
-                    format!(
-                        "root Bytes/find update branch {} found index exceeds Boon NUMBER",
-                        op.id.0
-                    )
-                })?),
-                None => JsonValue::Null,
-            };
-            (
-                value,
-                None,
-                "bytes_find",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesStartsWith,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (bytes_state_id, prefix_state_id) =
-                root_bytes_ordered_state_inputs(op, "Bytes/starts_with")?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                bytes_state_id,
-                op.id.0,
-            )?;
-            let prefix_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                prefix_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "inputs": [
-                    root_bytes_view_access_json("input", bytes_state_id, &bytes_view),
-                    root_bytes_view_access_json("prefix", prefix_state_id, &prefix_view)
-                ],
-            });
-            (
-                JsonValue::Bool(
-                    bytes_view
-                        .bytes
-                        .as_ref()
-                        .starts_with(prefix_view.bytes.as_ref()),
-                ),
-                None,
-                "bytes_starts_with",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesEndsWith,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (bytes_state_id, suffix_state_id) =
-                root_bytes_ordered_state_inputs(op, "Bytes/ends_with")?;
-            let bytes_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                bytes_state_id,
-                op.id.0,
-            )?;
-            let suffix_view = root_state_bytes_view(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                suffix_state_id,
-                op.id.0,
-            )?;
-            bytes_access = json!({
-                "read_only": true,
-                "inputs": [
-                    root_bytes_view_access_json("input", bytes_state_id, &bytes_view),
-                    root_bytes_view_access_json("suffix", suffix_state_id, &suffix_view)
-                ],
-            });
-            (
-                JsonValue::Bool(
-                    bytes_view
-                        .bytes
-                        .as_ref()
-                        .ends_with(suffix_view.bytes.as_ref()),
-                ),
-                None,
-                "bytes_ends_with",
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
-            )
-        }
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::BytesConcat,
-            source_payload_field: None,
-            update_constant_id: None,
-            ..
-        } => {
-            let (left_state_id, right_state_id) = root_bytes_concat_state_inputs(op)?;
-            let left_bytes = root_state_inline_bytes(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                left_state_id,
-                op.id.0,
-            )?;
-            let right_bytes = root_state_inline_bytes(
-                plan,
-                root_state,
-                root_bytes_state,
-                root_fixed_bytes_banks,
-                right_state_id,
-                op.id.0,
-            )?;
-            let output_slot = plan
-                .storage_layout
-                .scalar_slots
-                .iter()
-                .find(|slot| slot.state_id == output_state_id)
-                .ok_or_else(|| {
-                    format!(
-                        "root Bytes/concat update branch {} has no output storage slot",
-                        op.id.0
-                    )
-                })?;
-            let output_len = left_bytes.len().saturating_add(right_bytes.len());
-            if let boon_plan::PlanValueType::Bytes {
-                fixed_len: Some(fixed_len),
-            } = &output_slot.value_type
-                && *fixed_len != output_len as u64
-            {
-                return Err(format!(
-                        "root Bytes/concat update branch {} output fixed length {} does not match concat length {}",
-                        op.id.0, fixed_len, output_len
-                    )
-                    .into());
-            }
-            record_runtime_bytes_vec_alloc(output_len);
-            let mut output = Vec::with_capacity(output_len);
-            output.extend_from_slice(&left_bytes);
-            output.extend_from_slice(&right_bytes);
-            let bytes = RuntimeBytes::inline(Bytes::from(output));
-            (
-                bytes.report_json(),
-                Some(bytes),
-                "bytes_concat",
                 JsonValue::Null,
                 JsonValue::Null,
                 JsonValue::Null,
@@ -11892,7 +7629,7 @@ fn execute_root_scalar_update_branch(
                             )?
                             .is_some()
                         {
-                            fixed_bytes_mutation = Some(RootFixedBytesMutation {
+                            fixed_bytes_mutation = Some(RootBytesFixedMutation {
                                 input_state_id,
                                 output_state_id,
                                 patches: Vec::new(),
@@ -11907,7 +7644,12 @@ fn execute_root_scalar_update_branch(
                             input_state_id,
                             op.id.0,
                         )? {
-                            Some(RuntimeBytes::inline(runtime_bytes_copy_from_slice(bytes)))
+                            Some(PlanExecutorBytes::from_inline(
+                                sha256_bytes(bytes),
+                                bytes.len() as u64,
+                                bytes.to_vec(),
+                                "root ReadPath fixed byte bank",
+                            )?)
                         } else {
                             None
                         }
@@ -11944,7 +7686,7 @@ fn execute_root_scalar_update_branch(
                         )?
                         .is_some()
                     {
-                        fixed_bytes_mutation = Some(RootFixedBytesMutation {
+                        fixed_bytes_mutation = Some(RootBytesFixedMutation {
                             input_state_id,
                             output_state_id,
                             patches: Vec::new(),
@@ -11959,7 +7701,12 @@ fn execute_root_scalar_update_branch(
                         input_state_id,
                         op.id.0,
                     )? {
-                        Some(RuntimeBytes::inline(runtime_bytes_copy_from_slice(bytes)))
+                        Some(PlanExecutorBytes::from_inline(
+                            sha256_bytes(bytes),
+                            bytes.len() as u64,
+                            bytes.to_vec(),
+                            "root PreviousValue fixed byte bank",
+                        )?)
                     } else {
                         None
                     }
@@ -12057,86 +7804,31 @@ fn execute_root_scalar_update_branch(
             .into());
         }
     };
-    Ok(Some(ExecutedRootUpdate {
-        value,
-        bytes_value,
-        fixed_bytes_mutation,
-        bytes_access,
-        expression_kind,
-        source_payload_field,
-        update_constant_id,
-        update_constant_value,
-        host_effect,
-    }))
+    Ok(Some(assemble_plan_root_runtime_branch_update(
+        RootRuntimeBranchUpdateInput {
+            value,
+            bytes_value,
+            fixed_bytes_mutation,
+            bytes_access: JsonValue::Null,
+            runtime_branch_core: executor_core,
+            state_write_core: JsonValue::Null,
+            bytes_state_core: JsonValue::Null,
+            expression_kind: expression_kind.to_owned(),
+            source_payload_field,
+            update_constant_id,
+            update_constant_value,
+            host_effect: JsonValue::Null,
+        },
+    )))
 }
 
 fn plan_root_scalar_initial_state(
     plan: &MachinePlan,
-) -> RuntimeResult<(
-    serde_json::Map<String, JsonValue>,
-    RootBytesState,
-    RootFixedBytesBanks,
-    usize,
-)> {
-    let mut state = serde_json::Map::new();
-    let mut bytes_state = RootBytesState::new();
-    let mut fixed_bytes_banks = RootFixedBytesBanks::new();
-    let mut initialized = 0usize;
-    for slot in &plan.storage_layout.scalar_slots {
-        if slot.indexed {
-            continue;
-        }
-        let value = plan_executor_initial_value(
-            plan,
-            slot.initial_constant_id,
-            &slot.value_type,
-            slot.initial_value_kind,
-        )?;
-        if matches!(slot.value_type, PlanValueType::Bytes { .. }) {
-            let constant_id = slot.initial_constant_id.ok_or_else(|| {
-                format!(
-                    "bytes state `{}` has no typed initial constant",
-                    plan_state_label(plan, slot.state_id.0)
-                )
-            })?;
-            let constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == constant_id)
-                .ok_or_else(|| format!("missing plan constant {}", constant_id.0))?;
-            let runtime_bytes =
-                plan_constant_runtime_bytes_for_slot(constant, slot, "initial state")?.ok_or_else(
-                    || {
-                        format!(
-                            "initial bytes state `{}` does not have private byte payload",
-                            plan_state_label(plan, slot.state_id.0)
-                        )
-                    },
-                )?;
-            if runtime_bytes.report_json() != value {
-                return Err(format!(
-                    "initial bytes state `{}` public summary does not match private byte payload",
-                    plan_state_label(plan, slot.state_id.0)
-                )
-                .into());
-            }
-            if root_state_has_fixed_byte_bank(plan, slot.state_id) {
-                let bank_bytes = runtime_bytes.inline_bytes()?.as_ref().to_vec();
-                if root_fixed_bytes_report_json(&bank_bytes) != value {
-                    return Err(format!(
-                        "initial fixed byte bank `{}` public summary does not match private bank state",
-                        plan_state_label(plan, slot.state_id.0)
-                    )
-                    .into());
-                }
-                fixed_bytes_banks.insert(slot.state_id.0, bank_bytes);
-            }
-            bytes_state.insert(slot.state_id.0, runtime_bytes);
-        }
-        state.insert(plan_state_label(plan, slot.state_id.0), value);
-        initialized += 1;
-    }
-    Ok((state, bytes_state, fixed_bytes_banks, initialized))
+) -> RuntimeResult<(PlanExecutorRootState, JsonValue, usize)> {
+    let root_state = initialize_plan_root_state(plan)?;
+    let executor_report = root_state.executor_report.clone();
+    let initialized_state_count = root_state.initialized_state_count;
+    Ok((root_state, executor_report, initialized_state_count))
 }
 
 fn plan_initial_list_state(
@@ -12157,27 +7849,26 @@ fn plan_initial_list_state(
                     )
                 })?;
                 let field_name = local_field_name(&plan_semantic_field_label(plan, field_id.0));
+                let field_context = format!(
+                    "initial row field `{}` for list {}",
+                    field.name, slot.list_id.0
+                );
                 fields.insert(
                     field_name.clone(),
-                    plan_constant_value_json_value(&field.value)?,
+                    plan_executor_constant_value_json_value(&field.value, &field_context)?,
                 );
-                if let Some(bytes) = runtime_bytes_from_plan_constant_value(
-                    &field.value,
-                    &format!(
-                        "initial row field `{}` for list {}",
-                        field.name, slot.list_id.0
-                    ),
-                )? {
-                    if indexed_field_has_fixed_byte_bank(plan, slot.scope_id, &field_name) {
-                        fixed_bytes_banks
-                            .insert(field_name.clone(), bytes.inline_bytes()?.to_vec());
+                if let Some(bytes) =
+                    plan_executor_constant_value_bytes(&field.value, &field_context)?
+                {
+                    if plan_indexed_field_has_fixed_byte_bank(plan, slot.scope_id, &field_name) {
+                        fixed_bytes_banks.insert(field_name.clone(), bytes.inline_bytes().to_vec());
                     }
                     private_bytes.insert(field_name, bytes);
                 }
             }
             let key = index as u64 + 1;
             let generation = 1;
-            let _ = refresh_row_bool_not_fields(
+            let _ = refresh_plan_list_row_bool_not_fields(
                 plan,
                 slot,
                 &plan_list_label(plan, slot.list_id.0),
@@ -12212,7 +7903,9 @@ fn plan_initial_list_state(
                 fields.insert("index".to_owned(), JsonValue::String(text.clone()));
                 fields.insert("value".to_owned(), JsonValue::String(text));
                 let (defaults, default_bytes, default_fixed_banks) =
-                    plan_row_default_fields(plan, slot)?;
+                    plan_executor_list_row_default_fields_to_runtime(plan_list_row_default_fields(
+                        plan, slot,
+                    )?);
                 for (field, value) in defaults {
                     fields.entry(field).or_insert(value);
                 }
@@ -12220,7 +7913,7 @@ fn plan_initial_list_state(
                 let fixed_bytes_banks = default_fixed_banks;
                 let key = offset as u64 + 1;
                 let generation = 1;
-                let _ = refresh_row_bool_not_fields(
+                let _ = refresh_plan_list_row_bool_not_fields(
                     plan,
                     slot,
                     &plan_list_label(plan, slot.list_id.0),
@@ -12248,8 +7941,14 @@ fn plan_initial_list_state(
         let mut row_expression_list_state = lists.clone();
         row_expression_list_state.insert(list_id, rows.clone());
         for row in &mut rows {
-            refresh_row_expression_fields_best_effort(plan, slot, &row_expression_list_state, row);
-            refresh_row_initial_state_fields(plan, slot, row);
+            refresh_plan_list_row_expression_fields_best_effort_with(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                eval_plan_row_expression,
+            );
+            refresh_plan_list_row_initial_state_fields(plan, slot, row);
             if let Some(current_rows) = row_expression_list_state.get_mut(&list_id) {
                 if let Some(current_row) = current_rows
                     .iter_mut()
@@ -12262,9 +7961,15 @@ fn plan_initial_list_state(
         let mut row_expression_list_state = lists.clone();
         row_expression_list_state.insert(list_id, rows.clone());
         for row in &mut rows {
-            refresh_row_expression_fields(plan, slot, &row_expression_list_state, row)?;
-            refresh_row_initial_state_fields(plan, slot, row);
-            let _ = refresh_row_bool_not_fields(
+            refresh_plan_list_row_expression_fields_with(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                eval_plan_row_expression,
+            )?;
+            refresh_plan_list_row_initial_state_fields(plan, slot, row);
+            let _ = refresh_plan_list_row_bool_not_fields(
                 plan,
                 slot,
                 &plan_list_label(plan, slot.list_id.0),
@@ -12276,179 +7981,6 @@ fn plan_initial_list_state(
         lists.insert(list_id, rows);
     }
     Ok(lists)
-}
-
-fn refresh_row_initial_state_fields(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    row: &mut PlanListRowState,
-) {
-    for slot in &plan.storage_layout.scalar_slots {
-        if slot.scope_id != list_slot.scope_id {
-            continue;
-        }
-        let Some(source_path) = slot.initial_row_field_path.as_deref() else {
-            continue;
-        };
-        let source_name = local_field_name(source_path);
-        let Some(value) = row.fields.get(&source_name).cloned() else {
-            continue;
-        };
-        let field_name = local_field_name(&plan_state_label(plan, slot.state_id.0));
-        let field_missing = !row.fields.contains_key(&field_name);
-        row.fields.entry(field_name.clone()).or_insert(value);
-        if !field_missing {
-            continue;
-        }
-        if let Some(bytes) = row.private_bytes.get(&source_name).cloned() {
-            if let Some(expected_len) = indexed_fixed_byte_bank_len(plan, slot.state_id)
-                .ok()
-                .flatten()
-                && let Ok(inline_bytes) = bytes.inline_bytes()
-                && inline_bytes.len() == expected_len
-            {
-                row.fixed_bytes_banks
-                    .insert(field_name.clone(), inline_bytes.to_vec());
-            }
-            row.private_bytes.insert(field_name.clone(), bytes);
-        } else if let Some(bank_bytes) = row.fixed_bytes_banks.get(&source_name).cloned() {
-            if indexed_state_has_fixed_byte_bank(plan, slot.state_id) {
-                row.fixed_bytes_banks.insert(field_name, bank_bytes);
-            }
-        }
-    }
-}
-
-fn plan_initial_list_next_keys(
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-) -> BTreeMap<usize, u64> {
-    list_state
-        .iter()
-        .map(|(list_id, rows)| {
-            let next_key = rows.iter().map(|row| row.key).max().unwrap_or(0) + 1;
-            (*list_id, next_key)
-        })
-        .collect()
-}
-
-fn refresh_row_expression_fields(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &mut PlanListRowState,
-) -> RuntimeResult<()> {
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-    {
-        if !op.indexed {
-            continue;
-        }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(PlanDerivedExpression::RowExpression { expression }),
-        } = &op.kind
-        else {
-            continue;
-        };
-        if !row_expression_applies_to_list(plan, list_slot, output_id) {
-            continue;
-        }
-        let value = eval_plan_row_expression(plan, list_state, row, expression)?;
-        let field_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
-        row.fields.insert(field_name, value);
-    }
-    Ok(())
-}
-
-fn refresh_row_expression_fields_best_effort(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &mut PlanListRowState,
-) {
-    for op in plan
-        .regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-    {
-        if !op.indexed {
-            continue;
-        }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(PlanDerivedExpression::RowExpression { expression }),
-        } = &op.kind
-        else {
-            continue;
-        };
-        if !row_expression_applies_to_list(plan, list_slot, output_id) {
-            continue;
-        }
-        let Ok(value) = eval_plan_row_expression(plan, list_state, row, expression) else {
-            continue;
-        };
-        let field_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
-        row.fields.insert(field_name, value);
-    }
-}
-
-fn row_expression_applies_to_list(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-    output_id: FieldId,
-) -> bool {
-    plan.debug_map
-        .fields
-        .iter()
-        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(output_id.0))
-        .and_then(|entry| {
-            entry
-                .label
-                .rsplit_once('.')
-                .map(|(scope_name, _)| scope_name.to_owned())
-        })
-        .is_some_and(|scope_name| {
-            let has_row_source_route = plan.source_routes.iter().any(|route| {
-                route.scope_id == list_slot.scope_id
-                    && route.path.starts_with(&format!("{scope_name}."))
-            });
-            let has_row_state_slot = plan.storage_layout.scalar_slots.iter().any(|slot| {
-                slot.scope_id == list_slot.scope_id
-                    && plan_state_label(plan, slot.state_id.0)
-                        .starts_with(&format!("{scope_name}."))
-            });
-            let has_append_row_field = plan
-                .regions
-                .iter()
-                .filter(|region| region.kind == RegionKind::ListOperations)
-                .flat_map(|region| region.ops.iter())
-                .any(|op| {
-                    op.output == Some(ValueRef::List(list_slot.list_id))
-                        && matches!(
-                            &op.kind,
-                            PlanOpKind::ListOperation {
-                                append: Some(append),
-                                ..
-                            } if append.fields.iter().any(|field| {
-                                field.field_id.is_some_and(|field_id| {
-                                    plan_semantic_field_label(plan, field_id.0)
-                                        .starts_with(&format!("{scope_name}."))
-                                })
-                            })
-                        )
-                });
-            has_row_source_route || has_row_state_slot || has_append_row_field
-        })
 }
 
 fn eval_plan_row_expression(
@@ -12475,7 +8007,7 @@ fn eval_plan_row_expression_with_stack(
                 .iter()
                 .find(|constant| constant.id == *constant_id)
                 .ok_or_else(|| format!("row expression constant {} is missing", constant_id.0))?;
-            plan_constant_json_value(constant)
+            plan_executor_constant_json_value(constant)
         }
         PlanRowExpression::TextTrim { input } => Ok(JsonValue::String(
             eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?
@@ -13005,16 +8537,16 @@ fn row_value_to_text(value: &JsonValue) -> RuntimeResult<String> {
     Err(format!("row expression value `{value}` is not text-convertible").into())
 }
 
-fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_ir::FieldId) -> String {
+fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -> String {
     local_field_name(&plan_semantic_field_label(plan, field_id.0))
 }
 
 fn eval_plan_row_lookup_field(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    list_id: boon_ir::ListId,
+    list_id: boon_plan::ListId,
     row: &PlanListRowState,
-    field: boon_ir::FieldId,
+    field: boon_plan::FieldId,
     stack: &[PlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
     let target_name = plan_row_field_local_name(plan, field);
@@ -13048,7 +8580,7 @@ fn eval_plan_row_lookup_field(
 
 fn plan_indexed_row_expression_for_field(
     plan: &MachinePlan,
-    field: boon_ir::FieldId,
+    field: boon_plan::FieldId,
 ) -> Option<&PlanRowExpression> {
     plan.regions
         .iter()
@@ -13071,7 +8603,7 @@ fn plan_indexed_row_expression_for_field(
 
 fn eval_plan_row_list_ref(
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    list_id: boon_ir::ListId,
+    list_id: boon_plan::ListId,
 ) -> RuntimeResult<JsonValue> {
     let rows = list_state
         .get(&list_id.0)
@@ -13341,7 +8873,7 @@ fn eval_plan_row_bytes_with_stack(
         }
         _ => {
             if let Some(bytes) = eval_plan_row_private_bytes_ref(plan, row, expression)? {
-                return Ok(bytes.inline_bytes()?.to_vec());
+                return Ok(bytes.inline_bytes().to_vec());
             }
             let value =
                 eval_plan_row_expression_with_stack(plan, list_state, row, expression, stack)?;
@@ -13365,7 +8897,7 @@ fn eval_plan_row_private_bytes_ref(
     plan: &MachinePlan,
     row: &PlanListRowState,
     expression: &PlanRowExpression,
-) -> RuntimeResult<Option<RuntimeBytes>> {
+) -> RuntimeResult<Option<PlanExecutorBytes>> {
     let PlanRowExpression::Field { input } = expression else {
         return Ok(None);
     };
@@ -13484,93 +9016,26 @@ fn eval_plan_row_text_with_stack(
     row_value_to_text(&value)
 }
 
-fn plan_row_default_fields(
-    plan: &MachinePlan,
-    list_slot: &boon_plan::ListStorageSlot,
-) -> RuntimeResult<(
+fn plan_executor_list_row_default_fields_to_runtime(
+    defaults: ListRowDefaultFields,
+) -> (
     BTreeMap<String, JsonValue>,
-    BTreeMap<String, RuntimeBytes>,
+    BTreeMap<String, PlanExecutorBytes>,
     BTreeMap<String, Vec<u8>>,
-)> {
-    let mut fields = BTreeMap::new();
-    let mut private_bytes = BTreeMap::new();
-    let mut fixed_bytes_banks = BTreeMap::new();
-    for slot in &plan.storage_layout.scalar_slots {
-        if slot.scope_id != list_slot.scope_id {
-            continue;
-        }
-        let Some(constant_id) = slot.initial_constant_id else {
-            continue;
-        };
-        let constant = plan
-            .constants
-            .iter()
-            .find(|constant| constant.id == constant_id)
-            .ok_or_else(|| format!("missing row default constant {}", constant_id.0))?;
-        let field_name = local_field_name(&plan_state_label(plan, slot.state_id.0));
-        fields.insert(field_name.clone(), plan_constant_json_value(constant)?);
-        if let Some(bytes) = plan_constant_runtime_bytes_for_slot(
-            constant,
-            slot,
-            &format!("row default field `{field_name}`"),
-        )? {
-            if indexed_state_has_fixed_byte_bank(plan, slot.state_id) {
-                fixed_bytes_banks.insert(field_name.clone(), bytes.inline_bytes()?.to_vec());
-            }
-            private_bytes.insert(field_name, bytes);
-        }
-    }
-    Ok((fields, private_bytes, fixed_bytes_banks))
+) {
+    (
+        defaults.fields,
+        defaults.private_bytes,
+        defaults.fixed_byte_banks,
+    )
 }
 
 fn plan_list_summary(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> JsonValue {
-    let mut lists = serde_json::Map::new();
-    for (list_id, rows) in list_state {
-        let list_label = plan_list_label(plan, *list_id);
-        let titles = rows
-            .iter()
-            .filter_map(|row| row.fields.get("title").cloned())
-            .collect::<Vec<_>>();
-        let active_count = rows
-            .iter()
-            .filter(|row| {
-                row.fields
-                    .get("completed")
-                    .and_then(JsonValue::as_bool)
-                    .map(|completed| !completed)
-                    .unwrap_or(false)
-            })
-            .count();
-        let completed_count = rows
-            .iter()
-            .filter(|row| {
-                row.fields
-                    .get("completed")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false)
-            })
-            .count();
-        lists.insert(
-            list_label,
-            json!({
-                "row_count": rows.len(),
-                "titles": titles,
-                "active_count": active_count,
-                "completed_count": completed_count,
-                "rows": rows.iter().map(|row| {
-                    json!({
-                        "key": row.key,
-                        "generation": row.generation,
-                        "fields": row.fields,
-                    })
-                }).collect::<Vec<_>>(),
-            }),
-        );
-    }
-    JsonValue::Object(lists)
+    let executor_rows = plan_executor_list_state_for_materialization(list_state);
+    summarize_plan_lists_core(plan, &executor_rows)
 }
 
 fn source_has_unsupported_root_scenario_ops(plan: &MachinePlan, source_id: SourceId) -> bool {
@@ -13590,13 +9055,6 @@ fn source_has_unsupported_root_scenario_ops(plan: &MachinePlan, source_id: Sourc
                 .iter()
                 .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
         })
-}
-
-fn plan_state_is_root_scalar(plan: &MachinePlan, state_id: boon_ir::StateId) -> bool {
-    plan.storage_layout
-        .scalar_slots
-        .iter()
-        .any(|slot| slot.state_id == state_id && !slot.indexed)
 }
 
 fn live_source_event_from_generic(event: &GenericSourceEvent<'_>) -> LiveSourceEvent {
@@ -13626,6 +9084,30 @@ fn live_source_event_from_generic(event: &GenericSourceEvent<'_>) -> LiveSourceE
     }
 }
 
+fn root_json_source_event_from_generic(event: &GenericSourceEvent<'_>) -> RootJsonSourceEvent {
+    RootJsonSourceEvent {
+        text: event.text.map(str::to_owned),
+        key: event.key.map(str::to_owned),
+        address: event.address.map(str::to_owned),
+        payload: event
+            .payload
+            .iter()
+            .map(|(key, value)| (key.clone(), (*value).to_owned()))
+            .collect(),
+        payload_bytes: event.payload_bytes.clone(),
+    }
+}
+
+fn root_json_source_event_from_live(event: &LiveSourceEvent) -> RootJsonSourceEvent {
+    RootJsonSourceEvent {
+        text: event.text.clone(),
+        key: event.key.clone(),
+        address: event.address.clone(),
+        payload: event.payload.clone(),
+        payload_bytes: event.payload_bytes.clone(),
+    }
+}
+
 fn compare_plan_root_scenario_with_legacy(
     source_path: &Path,
     units: &[RuntimeSourceUnit],
@@ -13634,10 +9116,8 @@ fn compare_plan_root_scenario_with_legacy(
     plan_per_step: &[JsonValue],
 ) -> RuntimeResult<JsonValue> {
     let mut legacy_runtime = LiveRuntime::from_project(&source_path.display().to_string(), units)?;
-    let mut step_comparisons = Vec::new();
-    let mut state_match = true;
-    let mut semantic_delta_match = true;
     let mut last_legacy_state_summary = legacy_runtime.state_summary();
+    let mut step_inputs = Vec::new();
 
     for (step, plan_step) in selected_steps.iter().zip(plan_per_step) {
         let generic_event = GenericSourceEvent::require(step)?;
@@ -13659,118 +9139,28 @@ fn compare_plan_root_scenario_with_legacy(
             .get("semantic_deltas")
             .cloned()
             .unwrap_or(JsonValue::Array(Vec::new()));
-        let plan_signature_strings = plan_signatures
-            .iter()
-            .map(|signature| {
-                signature
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "plan semantic delta signature is not a string".into())
-            })
-            .collect::<RuntimeResult<Vec<_>>>()?;
-        let step_delta_match =
-            plan_signature_strings == legacy_signatures && plan_deltas == legacy_deltas;
-        semantic_delta_match &= step_delta_match;
 
         let touched = plan_step
             .get("touched_state_summary")
             .and_then(JsonValue::as_object)
             .ok_or_else(|| format!("plan step `{}` is missing touched_state_summary", step.id))?;
-        let mut touched_state_match = true;
-        for (path, plan_value) in touched {
-            let legacy_value = json_value_at_dotted_path(&legacy_output.state_summary, path)
-                .ok_or_else(|| format!("legacy state summary is missing `{path}`"))?;
-            if legacy_value != plan_value {
-                touched_state_match = false;
-            }
-        }
-        state_match &= touched_state_match;
-        step_comparisons.push(json!({
-            "step_id": step.id,
-            "state_match": touched_state_match,
-            "semantic_delta_match": step_delta_match,
-            "legacy_semantic_delta_signatures": legacy_signatures,
-            "legacy_semantic_deltas": legacy_deltas,
-            "plan_semantic_delta_signatures": plan_signatures,
-            "plan_semantic_deltas": plan_deltas,
-            "touched_state_summary": touched,
-        }));
+        step_inputs.push(RootScenarioLegacyStepComparisonInput {
+            step_id: step.id.clone(),
+            legacy_state_summary: legacy_output.state_summary.clone(),
+            legacy_semantic_delta_signatures: legacy_signatures,
+            legacy_semantic_deltas: legacy_deltas,
+            plan_semantic_delta_signatures: plan_signatures,
+            plan_semantic_deltas: plan_deltas,
+            touched_state_summary: touched.clone(),
+        });
     }
 
-    let final_plan_state = plan_state_summary
-        .as_object()
-        .ok_or("plan state summary is not an object")?;
-    let mut legacy_final_projection = serde_json::Map::new();
-    for (path, plan_value) in final_plan_state {
-        let legacy_value = json_value_at_dotted_path(&last_legacy_state_summary, path)
-            .ok_or_else(|| format!("legacy final state summary is missing `{path}`"))?;
-        legacy_final_projection.insert(path.clone(), legacy_value.clone());
-        if legacy_value != plan_value {
-            state_match = false;
-        }
-    }
-
-    Ok(json!({
-        "enabled": true,
-        "passed": state_match && semantic_delta_match,
-        "state_match": state_match,
-        "semantic_delta_match": semantic_delta_match,
-        "plan_state_summary": plan_state_summary,
-        "legacy_state_summary": JsonValue::Object(legacy_final_projection),
-        "step_comparisons": step_comparisons,
-    }))
-}
-
-fn plan_source_id_for_label(plan: &MachinePlan, label: &str) -> Option<SourceId> {
-    plan.debug_map
-        .source_routes
-        .iter()
-        .find(|entry| entry.label == label)
-        .and_then(|entry| debug_entry_numeric_id(&entry.id, "source"))
-        .map(SourceId)
-}
-
-fn plan_state_id_for_label(plan: &MachinePlan, label: &str) -> Option<boon_ir::StateId> {
-    plan.debug_map
-        .state_slots
-        .iter()
-        .find(|entry| entry.label == label)
-        .and_then(|entry| debug_entry_numeric_id(&entry.id, "state"))
-        .map(boon_ir::StateId)
-}
-
-fn plan_list_label(plan: &MachinePlan, list_id: usize) -> String {
-    plan.debug_map
-        .list_slots
-        .iter()
-        .find(|entry| debug_entry_numeric_id(&entry.id, "list") == Some(list_id))
-        .map(|entry| entry.label.clone())
-        .unwrap_or_else(|| format!("list:{list_id}"))
-}
-
-fn plan_semantic_field_label(plan: &MachinePlan, field_id: usize) -> String {
-    plan.debug_map
-        .fields
-        .iter()
-        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(field_id))
-        .map(|entry| entry.label.clone())
-        .unwrap_or_else(|| format!("field:{field_id}"))
-}
-
-fn plan_derived_field_label(plan: &MachinePlan, field_id: usize) -> String {
-    plan.debug_map
-        .derived_values
-        .iter()
-        .find(|entry| debug_entry_numeric_id(&entry.id, "field") == Some(field_id))
-        .map(|entry| entry.label.clone())
-        .unwrap_or_else(|| format!("field:{field_id}"))
-}
-
-fn local_field_name(label: &str) -> String {
-    label
-        .rsplit_once('.')
-        .map(|(_, local)| local.to_owned())
-        .unwrap_or_else(|| label.to_owned())
+    Ok(assemble_plan_root_scenario_legacy_comparison(
+        plan_state_summary,
+        &last_legacy_state_summary,
+        step_inputs,
+    )?
+    .comparison)
 }
 
 fn row_scoped_source_routes<'a>(
@@ -13784,13 +9174,6 @@ fn row_scoped_source_routes<'a>(
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| route.source_id.0);
     routes
-}
-
-fn debug_entry_numeric_id(value: &str, prefix: &str) -> Option<usize> {
-    value
-        .strip_prefix(prefix)
-        .and_then(|suffix| suffix.strip_prefix(':'))
-        .and_then(|suffix| suffix.parse::<usize>().ok())
 }
 
 fn source_payload_json_value(
@@ -13849,6 +9232,23 @@ fn source_payload_runtime_bytes(
         .ok_or_else(|| format!("source event is missing `{field_name}` BYTES payload").into())
 }
 
+fn source_payload_executor_bytes(
+    event: &LiveSourceEvent,
+    field: &SourcePayloadField,
+) -> RuntimeResult<PlanExecutorBytes> {
+    let field_name = source_payload_bytes_field_name(field)?;
+    let bytes = event
+        .payload_bytes
+        .get(field_name)
+        .ok_or_else(|| format!("source event is missing `{field_name}` BYTES payload"))?;
+    PlanExecutorBytes::from_inline(
+        sha256_bytes(bytes),
+        bytes.len() as u64,
+        bytes.clone(),
+        "root source-payload BYTES",
+    )
+}
+
 fn source_payload_bytes_field_name(field: &SourcePayloadField) -> RuntimeResult<&str> {
     match field {
         SourcePayloadField::Bytes => Ok("bytes"),
@@ -13862,7 +9262,7 @@ fn source_payload_value_for_output(
     event: &LiveSourceEvent,
     field: &SourcePayloadField,
     op_id: usize,
-) -> RuntimeResult<(JsonValue, Option<RuntimeBytes>)> {
+) -> RuntimeResult<(JsonValue, Option<PlanExecutorBytes>)> {
     let slot = plan
         .storage_layout
         .scalar_slots
@@ -13876,7 +9276,7 @@ fn source_payload_value_for_output(
         })?;
     match field {
         SourcePayloadField::Bytes => {
-            let bytes = source_payload_runtime_bytes(event, field)?;
+            let bytes = source_payload_executor_bytes(event, field)?;
             let boon_plan::PlanValueType::Bytes { fixed_len } = &slot.value_type else {
                 return Err(format!(
                     "root source-payload update branch {op_id} reads BYTES payload but output state `{}` is not BYTES",
@@ -13885,11 +9285,11 @@ fn source_payload_value_for_output(
                 .into());
             };
             if let Some(expected_len) = *fixed_len
-                && expected_len != bytes.byte_len
+                && expected_len != bytes.byte_len()
             {
                 return Err(format!(
                     "root source-payload update branch {op_id} BYTES payload has byte_len {} but output fixed_len {expected_len}",
-                    bytes.byte_len
+                    bytes.byte_len()
                 )
                 .into());
             }
@@ -13911,36 +9311,6 @@ fn source_payload_value_for_output(
     }
 }
 
-fn plan_constant_json_value(constant: &boon_plan::PlanConstant) -> RuntimeResult<JsonValue> {
-    plan_constant_value_json_value(&constant.value).map_err(|error| {
-        format!("plan constant {} is not executable: {error}", constant.id.0).into()
-    })
-}
-
-fn runtime_bytes_from_plan_constant_value(
-    value: &PlanConstantValue,
-    context: &str,
-) -> RuntimeResult<Option<RuntimeBytes>> {
-    let PlanConstantValue::Bytes {
-        byte_len,
-        sha256,
-        inline_bytes: Some(bytes),
-    } = value
-    else {
-        return Ok(None);
-    };
-    if bytes.len() as u64 != *byte_len || sha256_bytes(bytes) != *sha256 {
-        return Err(
-            format!("{context} bytes constant payload does not match typed digest/length").into(),
-        );
-    }
-    Ok(Some(RuntimeBytes::inline_with_digest(
-        sha256.clone(),
-        *byte_len,
-        Bytes::copy_from_slice(bytes),
-    )?))
-}
-
 fn plan_constant_runtime_bytes_for_output(
     plan: &MachinePlan,
     output_state_id: StateId,
@@ -13958,368 +9328,163 @@ fn plan_constant_runtime_bytes_for_output(
                 output_state_id.0
             )
         })?;
-    plan_constant_runtime_bytes_for_slot(
+    plan_executor_constant_bytes_for_storage_slot(
+        constant,
+        slot,
+        &format!("root const update branch {op_id}"),
+    )
+    .and_then(|bytes| bytes.map(plan_executor_bytes_to_runtime_bytes).transpose())
+}
+
+fn plan_constant_executor_bytes_for_output(
+    plan: &MachinePlan,
+    output_state_id: StateId,
+    constant: &boon_plan::PlanConstant,
+    op_id: usize,
+) -> RuntimeResult<Option<PlanExecutorBytes>> {
+    let slot = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == output_state_id)
+        .ok_or_else(|| {
+            format!(
+                "root const update branch {op_id} targets missing state {}",
+                output_state_id.0
+            )
+        })?;
+    plan_executor_constant_bytes_for_storage_slot(
         constant,
         slot,
         &format!("root const update branch {op_id}"),
     )
 }
 
-fn plan_constant_runtime_bytes_for_slot(
-    constant: &boon_plan::PlanConstant,
-    slot: &boon_plan::ScalarStorageSlot,
-    context: &str,
-) -> RuntimeResult<Option<RuntimeBytes>> {
-    match (&constant.value, &slot.value_type, slot.initial_value_kind) {
-        (
-            PlanConstantValue::Bytes {
-                byte_len,
-                sha256,
-                inline_bytes: Some(bytes),
-            },
-            PlanValueType::Bytes { fixed_len },
-            PlanInitialValueKind::Bytes,
-        ) => {
-            if let Some(expected_len) = *fixed_len
-                && expected_len != *byte_len
-            {
-                return Err(format!(
-                    "{context} bytes constant {} has byte_len {byte_len} but storage fixed_len {expected_len}",
-                    constant.id.0
-                )
-                .into());
-            }
-            Ok(Some(RuntimeBytes::inline_with_digest(
-                sha256.clone(),
-                *byte_len,
-                Bytes::copy_from_slice(bytes),
-            )?))
-        }
-        (PlanConstantValue::Bytes { .. }, _, _) => Err(format!(
-            "{context} bytes constant {} does not match output BYTES storage",
-            constant.id.0
-        )
-        .into()),
-        _ => Ok(None),
-    }
+fn plan_executor_bytes_to_runtime_bytes(bytes: PlanExecutorBytes) -> RuntimeResult<RuntimeBytes> {
+    RuntimeBytes::inline_with_digest(
+        bytes.digest().to_owned(),
+        bytes.byte_len(),
+        Bytes::copy_from_slice(bytes.inline_bytes()),
+    )
 }
 
-fn plan_constant_value_json_value(value: &PlanConstantValue) -> RuntimeResult<JsonValue> {
-    match value {
-        PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => {
-            Ok(JsonValue::String(value.clone()))
-        }
-        PlanConstantValue::Number { value } => Ok(json!(value)),
-        PlanConstantValue::Byte { value } => Ok(json!(value)),
-        PlanConstantValue::Bool { value } => Ok(json!(value)),
-        PlanConstantValue::Bytes {
-            byte_len,
-            sha256,
-            inline_bytes: Some(bytes),
-        } => Ok(RuntimeBytes::inline_with_digest(
-            sha256.clone(),
-            *byte_len,
-            Bytes::copy_from_slice(bytes),
-        )?
-        .report_json()),
-        PlanConstantValue::Bytes {
-            inline_bytes: None, ..
-        } => Err("byte payload is missing".into()),
-    }
+fn runtime_source_payload_bytes_to_plan_executor_bytes(
+    bytes: RuntimeBytes,
+) -> RuntimeResult<PlanExecutorBytes> {
+    let inline = bytes.inline_bytes()?.as_ref().to_vec();
+    PlanExecutorBytes::from_inline(
+        bytes.digest,
+        bytes.byte_len,
+        inline,
+        "indexed source-payload BYTES state",
+    )
 }
 
-fn plan_json_delta_signature(delta: &JsonValue) -> RuntimeResult<String> {
-    let kind = delta
-        .get("kind")
-        .and_then(JsonValue::as_str)
-        .ok_or("semantic delta has no kind")?;
-    Ok(match delta.get("field_path").and_then(JsonValue::as_str) {
-        Some(field_path) => format!("{kind}:{field_path}"),
-        None => kind.to_owned(),
+fn indexed_row_view_for_plan_executor(row: &PlanListRowState) -> RuntimeResult<IndexedRowView> {
+    Ok(IndexedRowView {
+        fields: row.fields.clone(),
+        private_bytes: row.private_bytes.clone(),
+        fixed_byte_banks: row.fixed_bytes_banks.clone(),
     })
 }
 
-fn coalesce_plan_field_set_deltas(deltas: Vec<JsonValue>) -> RuntimeResult<Vec<JsonValue>> {
-    let mut last_by_target = BTreeMap::new();
-    for (index, delta) in deltas.iter().enumerate() {
-        if let Some(key) = plan_field_set_delta_target_key(delta)? {
-            last_by_target.insert(key, index);
+fn evaluate_indexed_bytes_read_update_for_runtime(
+    plan: &MachinePlan,
+    op: &boon_plan::PlanOp,
+    row: &PlanListRowState,
+    host_file_root: Option<&Path>,
+) -> RuntimeResult<IndexedBytesReadEvaluation> {
+    let row_view = indexed_row_view_for_plan_executor(row)?;
+    let evaluation = evaluate_indexed_bytes_read_update(plan, op, &row_view, host_file_root)?;
+    if !evaluation.supported {
+        return Err(evaluation
+            .unsupported_reason
+            .unwrap_or_else(|| "indexed BYTES read evaluator did not support branch".to_owned())
+            .into());
+    }
+    Ok(evaluation)
+}
+
+fn evaluate_indexed_bytes_write_update_for_runtime(
+    plan: &MachinePlan,
+    op: &boon_plan::PlanOp,
+    row: &PlanListRowState,
+    host_file_root: Option<&Path>,
+) -> RuntimeResult<IndexedBytesWriteEvaluation> {
+    let row_view = indexed_row_view_for_plan_executor(row)?;
+    let evaluation = evaluate_indexed_bytes_write_update(plan, op, &row_view, host_file_root)?;
+    if !evaluation.supported {
+        return Err(evaluation
+            .unsupported_reason
+            .unwrap_or_else(|| "indexed BYTES write evaluator did not support branch".to_owned())
+            .into());
+    }
+    Ok(evaluation)
+}
+
+struct RootBytesRuntimeEnvironment<'a> {
+    private_bytes: &'a RootBytesState,
+    fixed_byte_banks: &'a RootFixedBytesBanks,
+    host_file_root: Option<&'a Path>,
+}
+
+impl RootBytesEnvironment for RootBytesRuntimeEnvironment<'_> {
+    fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
+        self.private_bytes.get(&state_id.0)
+    }
+
+    fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
+        self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
+    }
+}
+
+impl<'a> RootBytesRuntimeEnvironment<'a> {
+    fn new(
+        private_bytes: &'a RootBytesState,
+        fixed_byte_banks: &'a RootFixedBytesBanks,
+        host_file_root: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            private_bytes,
+            fixed_byte_banks,
+            host_file_root,
         }
     }
 
-    let mut coalesced = Vec::new();
-    for (index, delta) in deltas.into_iter().enumerate() {
-        let Some(key) = plan_field_set_delta_target_key(&delta)? else {
-            coalesced.push(delta);
-            continue;
-        };
-        if last_by_target.get(&key).copied() == Some(index) {
-            coalesced.push(delta);
+    fn evaluate_read(
+        &self,
+        plan: &MachinePlan,
+        op: &boon_plan::PlanOp,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<boon_plan_executor::RootBytesReadEvaluation> {
+        let evaluation =
+            evaluate_root_bytes_read_update(plan, op, root_state, self, self.host_file_root)?;
+        if !evaluation.supported {
+            return Err(evaluation
+                .unsupported_reason
+                .unwrap_or_else(|| "root BYTES read evaluator did not support branch".to_owned())
+                .into());
         }
+        Ok(evaluation)
     }
-    Ok(coalesced)
-}
 
-fn track_indexed_update_write_conflicts(
-    touched: &mut BTreeMap<String, (JsonValue, Vec<usize>)>,
-    executions: &[IndexedUpdateExecution],
-) -> RuntimeResult<()> {
-    for execution in executions {
-        for row in &execution.report_rows {
-            let key = indexed_update_write_target_key(row)?;
-            let value = row.get("value").cloned().unwrap_or(JsonValue::Null);
-            let update_op_id = row
-                .get("update_op_id")
-                .and_then(JsonValue::as_u64)
-                .and_then(|id| usize::try_from(id).ok())
-                .unwrap_or(0);
-            match touched.get_mut(&key) {
-                Some((existing, op_ids)) => {
-                    let conflict_kind = if *existing == value {
-                        "duplicate"
-                    } else {
-                        "conflicting"
-                    };
-                    return Err(format!(
-                        "CPU root-scenario PlanExecutor found {conflict_kind} indexed update branches for target {key}: ops {:?} wrote {:?}, op {} wrote {:?}",
-                        op_ids, existing, update_op_id, value
-                    )
-                    .into());
-                }
-                None => {
-                    touched.insert(key, (value, vec![update_op_id]));
-                }
-            }
+    fn evaluate_write(
+        &self,
+        plan: &MachinePlan,
+        op: &boon_plan::PlanOp,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<boon_plan_executor::RootBytesWriteEvaluation> {
+        let evaluation =
+            evaluate_root_bytes_write_update(plan, op, root_state, self, self.host_file_root)?;
+        if !evaluation.supported {
+            return Err(evaluation
+                .unsupported_reason
+                .unwrap_or_else(|| "root BYTES write evaluator did not support branch".to_owned())
+                .into());
         }
+        record_runtime_bytes_executor_copy_cost(&evaluation.executor_report);
+        Ok(evaluation)
     }
-    Ok(())
-}
-
-fn indexed_update_write_target_key(row: &JsonValue) -> RuntimeResult<String> {
-    let target = json!({
-        "list_id": row.get("list_id").cloned().unwrap_or(JsonValue::Null),
-        "key": row.get("key").cloned().unwrap_or(JsonValue::Null),
-        "generation": row.get("generation").cloned().unwrap_or(JsonValue::Null),
-        "field_path": row.get("field_path").cloned().unwrap_or(JsonValue::Null),
-    });
-    Ok(serde_json::to_string(&target)?)
-}
-
-fn plan_field_set_delta_target_key(delta: &JsonValue) -> RuntimeResult<Option<String>> {
-    if delta.get("kind").and_then(JsonValue::as_str) != Some("FieldSet") {
-        return Ok(None);
-    }
-    let target = json!({
-        "kind": delta.get("kind").cloned().unwrap_or(JsonValue::Null),
-        "list_id": delta.get("list_id").cloned().unwrap_or(JsonValue::Null),
-        "key": delta.get("key").cloned().unwrap_or(JsonValue::Null),
-        "generation": delta.get("generation").cloned().unwrap_or(JsonValue::Null),
-        "source_id": delta.get("source_id").cloned().unwrap_or(JsonValue::Null),
-        "bind_epoch": delta.get("bind_epoch").cloned().unwrap_or(JsonValue::Null),
-        "field_path": delta.get("field_path").cloned().unwrap_or(JsonValue::Null),
-    });
-    Ok(Some(serde_json::to_string(&target)?))
-}
-
-fn source_event_report(
-    event: &LiveSourceEvent,
-    source: &str,
-    source_id: u64,
-    report_path: Option<&Path>,
-) -> RuntimeResult<(JsonValue, Vec<JsonValue>)> {
-    let (payload_bytes, artifacts) =
-        source_event_payload_bytes_report(&event.payload_bytes, report_path)?;
-    Ok((
-        json!({
-            "source": source,
-            "source_id": source_id,
-            "text": event.text,
-            "key": event.key,
-            "list_id": event.list_id,
-            "address": event.address,
-            "target_text": event.target_text,
-            "target_occurrence": event.target_occurrence,
-            "target_key": event.target_key,
-            "target_generation": event.target_generation,
-            "bind_epoch": event.bind_epoch,
-            "source_epoch": event.source_epoch,
-            "payload": event.payload,
-            "payload_bytes": payload_bytes,
-            "pointer_x": event.pointer_x,
-            "pointer_y": event.pointer_y,
-            "pointer_width": event.pointer_width,
-            "pointer_height": event.pointer_height,
-        }),
-        artifacts,
-    ))
-}
-
-fn run_plan_source_route_command_argv(
-    source_path: &Path,
-    target_profile: TargetProfile,
-    source_route: &str,
-    target_state: &str,
-    event: &LiveSourceEvent,
-    source_event: &JsonValue,
-    compare_legacy: bool,
-    report_path: Option<&Path>,
-) -> Vec<String> {
-    let current_args = std::env::args().collect::<Vec<_>>();
-    if current_args.iter().any(|arg| arg == "run-plan-route") {
-        return current_args;
-    }
-
-    let mut argv = vec![
-        "target/debug/boon_cli".to_owned(),
-        "run-plan-route".to_owned(),
-        source_path.display().to_string(),
-        "--source".to_owned(),
-        source_route.to_owned(),
-        "--target-state".to_owned(),
-        target_state.to_owned(),
-    ];
-    if let Some(text) = &event.text {
-        argv.push("--text".to_owned());
-        argv.push(text.clone());
-    }
-    if let Some(key) = &event.key {
-        argv.push("--key".to_owned());
-        argv.push(key.clone());
-    }
-    if let Some(address) = &event.address {
-        argv.push("--address".to_owned());
-        argv.push(address.clone());
-    }
-    for (name, value) in &event.payload {
-        argv.push("--payload".to_owned());
-        argv.push(format!("{name}={value}"));
-    }
-    for (name, bytes) in &event.payload_bytes {
-        let artifact_path = source_event
-            .get("payload_bytes")
-            .and_then(|payload| payload.get(name))
-            .and_then(|payload| payload.get("artifact_path"))
-            .and_then(JsonValue::as_str);
-        if let Some(path) = artifact_path {
-            argv.push("--payload-bytes-file".to_owned());
-            argv.push(format!("{name}={path}"));
-        } else {
-            argv.push("--payload-bytes-hex".to_owned());
-            argv.push(format!("{name}={}", bytes_hex_argument(bytes)));
-        }
-    }
-    if compare_legacy {
-        argv.push("--compare-legacy".to_owned());
-    }
-    if target_profile != TargetProfile::SoftwareDefault {
-        argv.push("--target".to_owned());
-        argv.push(target_profile.as_str().to_owned());
-    }
-    if let Some(report_path) = report_path {
-        argv.push("--report".to_owned());
-        argv.push(report_path.display().to_string());
-    }
-    argv
-}
-
-fn bytes_hex_argument(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn source_event_payload_bytes_report(
-    payload_bytes: &BTreeMap<String, Vec<u8>>,
-    report_path: Option<&Path>,
-) -> RuntimeResult<(JsonValue, Vec<JsonValue>)> {
-    let mut payload = serde_json::Map::new();
-    let mut artifacts = Vec::new();
-    for (field, bytes) in payload_bytes {
-        let runtime_bytes = RuntimeBytes::dynamic(Bytes::from(bytes.clone()));
-        if bytes.len() <= SOURCE_EVENT_INLINE_BYTES_LIMIT {
-            let mut artifact = runtime_bytes.artifact_json();
-            if let JsonValue::Object(object) = &mut artifact {
-                object.insert(
-                    "inline_byte_limit".to_owned(),
-                    json!(SOURCE_EVENT_INLINE_BYTES_LIMIT),
-                );
-            }
-            payload.insert(field.clone(), artifact);
-            continue;
-        }
-
-        let digest = runtime_bytes.digest.clone();
-        let artifact_path = source_event_bytes_artifact_path(report_path, field, &digest);
-        if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&artifact_path, bytes)?;
-        let artifact_path = artifact_path.display().to_string();
-        payload.insert(
-            field.clone(),
-            json!({
-                "$boon_type": "BYTES",
-                "storage": "artifact",
-                "digest": digest.clone(),
-                "byte_len": runtime_bytes.byte_len,
-                "artifact_path": artifact_path,
-                "artifact_sha256": digest.clone(),
-                "inline_byte_limit": SOURCE_EVENT_INLINE_BYTES_LIMIT
-            }),
-        );
-        artifacts.push(json!({
-            "path": artifact_path,
-            "sha256": digest
-        }));
-    }
-    Ok((JsonValue::Object(payload), artifacts))
-}
-
-fn source_event_bytes_artifact_path(
-    report_path: Option<&Path>,
-    field: &str,
-    digest: &str,
-) -> PathBuf {
-    let safe_field = sanitize_artifact_name(field);
-    match report_path {
-        Some(path) => {
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(sanitize_artifact_name)
-                .unwrap_or_else(|| "run-plan-route".to_owned());
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            parent
-                .join(format!("{stem}-artifacts"))
-                .join(format!("source-event-{safe_field}-{digest}.bytes"))
-        }
-        None => PathBuf::from("target")
-            .join("reports")
-            .join("bytes-plan")
-            .join("source-event-artifacts")
-            .join(format!("source-event-{safe_field}-{digest}.bytes")),
-    }
-}
-
-fn sanitize_artifact_name(value: &str) -> String {
-    let mut output = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if output.is_empty() {
-        output.push_str("payload");
-    }
-    output
 }
 
 fn json_value_at_dotted_path<'a>(root: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
@@ -14428,26 +9593,6 @@ fn plan_executor_initial_value(
     }
 }
 
-fn plan_state_label(plan: &MachinePlan, state_id: usize) -> String {
-    let expected = format!("state:{state_id}");
-    plan.debug_map
-        .state_slots
-        .iter()
-        .find(|entry| entry.id == expected)
-        .map(|entry| entry.label.clone())
-        .unwrap_or(expected)
-}
-
-fn plan_field_label(plan: &MachinePlan, field_id: usize) -> String {
-    let expected = format!("field:{field_id}");
-    plan.debug_map
-        .fields
-        .iter()
-        .find(|entry| entry.id == expected)
-        .map(|entry| entry.label.clone())
-        .unwrap_or(expected)
-}
-
 pub fn run_compiled_artifact_scenario(
     artifact_path: &Path,
     scenario_path: &Path,
@@ -14465,28 +9610,34 @@ pub fn run_scenario_project(
     layer: VerificationLayer,
     report_path: Option<&Path>,
 ) -> RuntimeResult<RunOutput> {
-    let parsed = parse_project(
-        source_label.to_owned(),
-        units
-            .iter()
-            .map(|unit| (unit.path.clone(), unit.source.clone())),
-    )?;
-    let ir = lower_for_runtime(&parsed)?;
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
+    let compiler_units = compiler_source_units_from_runtime_units(units);
+    let compiler_output = compile_source_units_to_runtime_ir(source_label, &compiler_units)?;
+    let report_context = compiler_output.report_context();
+    let parsed = compiler_output.parsed;
     let scenario = parse_scenario(scenario_path)?;
     let started = Instant::now();
-    let output = run_loaded_scenario(&parsed, &ir, &scenario, layer)?;
+    let compile_started = Instant::now();
+    let compiled_program =
+        CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let output = run_loaded_scenario_with_compiled(
+        &parsed,
+        &compiled_program,
+        Some(&report_context),
+        compile_ms,
+        &scenario,
+        layer,
+    )?;
     let elapsed = started.elapsed();
     let mut report = output.report;
     enrich_report(
         &mut report,
         source_label,
-        &report_source_hash_for_parsed(&parsed),
+        &report_context,
         scenario_path,
         report_path,
         &parsed,
-        &ir,
+        &compiled_program,
         layer,
         elapsed.as_secs_f64() * 1000.0,
     )?;
@@ -14495,7 +9646,7 @@ pub fn run_scenario_project(
     }
     Ok(RunOutput {
         report,
-        document: boon_parser::parsed_document(&parsed),
+        document: compiler_parsed_document(&parsed),
         ..output
     })
 }
@@ -14535,32 +9686,42 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     layer: VerificationLayer,
     step_limit: Option<usize>,
 ) -> RuntimeResult<RunOutput> {
-    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
-    let ir = lower_for_runtime(&parsed)?;
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
+    let compiler_output = compile_source_text_to_runtime_ir(source_label, source_text)?;
+    let report_context = compiler_output.report_context();
+    let parsed = compiler_output.parsed;
     let mut scenario = scenario.clone();
     if let Some(step_limit) = step_limit {
         scenario.step.truncate(step_limit.min(scenario.step.len()));
     }
     let started = Instant::now();
-    let output = run_loaded_scenario(&parsed, &ir, &scenario, layer)?;
+    let compile_started = Instant::now();
+    let compiled_program =
+        CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let output = run_loaded_scenario_with_compiled(
+        &parsed,
+        &compiled_program,
+        Some(&report_context),
+        compile_ms,
+        &scenario,
+        layer,
+    )?;
     let elapsed = started.elapsed();
     let mut report = output.report;
     enrich_report(
         &mut report,
         source_label,
-        &report_source_hash_for_parsed(&parsed),
+        &report_context,
         scenario_path,
         None,
         &parsed,
-        &ir,
+        &compiled_program,
         layer,
         elapsed.as_secs_f64() * 1000.0,
     )?;
     Ok(RunOutput {
         report,
-        document: boon_parser::parsed_document(&parsed),
+        document: compiler_parsed_document(&parsed),
         ..output
     })
 }
@@ -14571,33 +9732,44 @@ pub fn run_source_initial_state(
     scenario_path: &Path,
     scenario: &Scenario,
 ) -> RuntimeResult<RunOutput> {
-    let parse_started = Instant::now();
-    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
-    let parse_ms = parse_started.elapsed().as_secs_f64() * 1000.0;
-    let lower_started = Instant::now();
-    let ir = lower_for_runtime(&parsed)?;
-    let lower_ms = lower_started.elapsed().as_secs_f64() * 1000.0;
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = verify_started.elapsed().as_secs_f64() * 1000.0;
+    let compiler_output = compile_source_text_to_runtime_ir(source_label, source_text)?;
+    let parsed = compiler_output.parsed;
+    let parse_ms = compiler_output
+        .load_pipeline_profile
+        .get("parse_ms")
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(0.0);
+    let lower_ms = compiler_output
+        .load_pipeline_profile
+        .get("lower_ms")
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(0.0);
+    let verify_ms = compiler_output
+        .load_pipeline_profile
+        .get("verify_ms")
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(0.0);
     let compile_started = Instant::now();
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = compile_started.elapsed().as_secs_f64() * 1000.0;
     let runtime_started = Instant::now();
-    let mut runtime = LoadedRuntime::new(&ir, &compiled)?;
+    let mut runtime = LoadedRuntime::new(&compiled)?;
     runtime.prepare_for_scenario(scenario)?;
     let state_summary = runtime.state_summary();
     let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1000.0;
     let report_started = Instant::now();
-    let runtime_profile = RuntimeProfile::from_ir(&ir);
-    let runtime_profile_detail = runtime_profile.detail_report(&ir);
-    let capacity_report = runtime_profile.capacity_report(&ir);
-    let generic_runtime_slices = generic_runtime_slices_report(&ir, &compiled);
-    let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(&ir, &compiled);
-    let typecheck_report_hash = typecheck_report_hash(&ir);
-    let render_slot_table_hash = render_slot_table_hash(&ir);
-    let semantic_index_report = ir.semantic_index.report();
+    let runtime_profile_metadata =
+        compiled.source_runtime_profile_metadata("playground initial-state report");
+    let runtime_profile = RuntimeProfile::from_compiler_metadata(runtime_profile_metadata);
+    let runtime_profile_detail = runtime_profile.detail_report(runtime_profile_metadata);
+    let capacity_report = runtime_profile.capacity_report(runtime_profile_metadata);
+    let program_metadata = compiled.source_program_metadata("playground initial-state report");
+    let inventory_counts = compiled.source_inventory_counts("playground initial-state report");
+    let generic_runtime_slices =
+        generic_runtime_slices_report(&compiled, program_metadata, inventory_counts);
+    let generic_runtime_slice_evidence =
+        generic_runtime_slice_evidence_report(&compiled, inventory_counts);
+    let typecheck_metadata = compiled.source_typecheck_metadata("playground initial-state report");
     let report = json!({
         "status": "pass",
         "command": "playground-initial-state",
@@ -14608,16 +9780,16 @@ pub fn run_source_initial_state(
         "scenario_hash": sha256_file(scenario_path)?,
         "program_hash": sha256_bytes(source_text.as_bytes()),
         "program_kind": "generic",
-        "expression_count": ir.expression_count,
-        "expression_coverage": &ir.expression_coverage,
-        "semantic_index": semantic_index_report,
-        "typecheck_report_hash": typecheck_report_hash,
-        "render_slot_table_hash": render_slot_table_hash,
-        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
-        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
-        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
-        "typecheck_report": &ir.typecheck_report,
-        "graph_node_count": ir.graph_node_count,
+        "expression_count": program_metadata.expression_count,
+        "expression_coverage": program_metadata.expression_coverage.clone(),
+        "semantic_index": program_metadata.semantic_index.clone(),
+        "typecheck_report_hash": &typecheck_metadata.typecheck_report_hash,
+        "render_slot_table_hash": &typecheck_metadata.render_slot_table_hash,
+        "typed_render_metadata_used": typecheck_metadata.typed_render_metadata_used,
+        "unresolved_type_variable_count": typecheck_metadata.unresolved_type_variable_count,
+        "render_slot_failure_count": typecheck_metadata.render_slot_failure_count,
+        "typecheck_report": typecheck_metadata.report.clone(),
+        "graph_node_count": program_metadata.graph_node_count,
         "graph_rebuild_count": 0,
         "graph_clones_per_item": 0,
         "max_dirty_nodes": 0,
@@ -14642,18 +9814,18 @@ pub fn run_source_initial_state(
             "implementation": "typed static graph initialized for playground preview",
             "source_loaded_from_boon": true,
             "typed_ir_loaded": true,
-            "static_schedule_verified": ir.static_schedule_verified,
+            "static_schedule_verified": program_metadata.static_schedule_verified,
             "runtime_profile": runtime_profile.as_str(),
             "runtime_profile_detail": runtime_profile_detail,
             "capacities": capacity_report,
-            "expression_coverage": &ir.expression_coverage,
-            "semantic_index": semantic_index_report,
-            "typecheck_report_hash": typecheck_report_hash,
-            "render_slot_table_hash": render_slot_table_hash,
-            "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
-            "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
-            "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
-            "generic_interpreter_complete": derive_generic_interpreter_complete(&ir, &compiled, &generic_runtime_slices),
+            "expression_coverage": program_metadata.expression_coverage.clone(),
+            "semantic_index": program_metadata.semantic_index.clone(),
+            "typecheck_report_hash": &typecheck_metadata.typecheck_report_hash,
+            "render_slot_table_hash": &typecheck_metadata.render_slot_table_hash,
+            "typed_render_metadata_used": typecheck_metadata.typed_render_metadata_used,
+            "unresolved_type_variable_count": typecheck_metadata.unresolved_type_variable_count,
+            "render_slot_failure_count": typecheck_metadata.render_slot_failure_count,
+            "generic_interpreter_complete": derive_generic_interpreter_complete(&program_metadata, &compiled, &generic_runtime_slices),
             "example_behavior_adapter": derive_example_behavior_adapter(&compiled, &generic_runtime_slices),
             "adapter_kind": "generic",
             "remaining_example_specific_shell_policy": "scenario_assertion_report_glue_only",
@@ -14663,16 +9835,16 @@ pub fn run_source_initial_state(
             "generic_runtime_slice_evidence": generic_runtime_slice_evidence
         },
         "state_summary": state_summary,
-        "ir_debug_tables": debug_tables(&ir),
-        "hidden_identity_verified": ir.hidden_identity_verified,
-        "static_schedule_verified": ir.static_schedule_verified
+        "ir_debug_tables": compiled.source_ir_debug_tables("playground initial-state report"),
+        "hidden_identity_verified": program_metadata.hidden_identity_verified,
+        "static_schedule_verified": program_metadata.static_schedule_verified
     });
     Ok(RunOutput {
         report,
         semantic_deltas: Vec::new(),
         render_patches: Vec::new(),
         state_summary,
-        document: boon_parser::parsed_document(&parsed),
+        document: compiler_parsed_document(&parsed),
     })
 }
 
@@ -14706,7 +9878,6 @@ pub struct RuntimeSourceUnit {
 #[derive(Clone)]
 struct CachedRuntimePlan {
     parsed: Arc<ParsedProgram>,
-    ir: Arc<TypedProgram>,
     compiled: Arc<CompiledProgram>,
 }
 
@@ -14747,46 +9918,27 @@ fn cached_runtime_plan_from_source_profiled(
         ));
     }
 
-    let parse_started = Instant::now();
-    let parsed = Arc::new(parse_source(
-        source_label.to_owned(),
-        source_text.to_owned(),
-    )?);
-    let parse_ms = runtime_elapsed_ms(parse_started);
-    let lower_started = Instant::now();
-    let (ir, lower_profile) = lower_runtime_profiled(&parsed)?;
-    let lower_ms = runtime_elapsed_ms(lower_started);
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = runtime_elapsed_ms(verify_started);
+    let compiler_output = compile_source_text_to_runtime_ir(source_label, source_text)?;
     let compile_started = Instant::now();
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    let expression_count = ir.expression_count;
-    let graph_node_count = ir.graph_node_count;
+    let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
+    if let Some(profile) = load_pipeline_profile.as_object_mut() {
+        profile.insert("compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert(
+            "total_ms".to_owned(),
+            json!(runtime_elapsed_ms(total_started)),
+        );
+    }
     let plan = CachedRuntimePlan {
-        parsed,
-        ir: Arc::new(ir),
+        parsed: Arc::new(compiler_output.parsed),
         compiled: Arc::new(compiled),
     };
     if let Ok(mut cache) = runtime_plan_cache().lock() {
         cache.insert(key, plan.clone());
     }
-    Ok((
-        plan,
-        json!({
-            "cache_hit": false,
-            "parse_ms": parse_ms,
-            "lower_ms": lower_ms,
-            "lower_profile": lower_profile,
-            "verify_ms": verify_ms,
-            "compile_ms": compile_ms,
-            "expression_count": expression_count,
-            "graph_node_count": graph_node_count,
-            "total_ms": runtime_elapsed_ms(total_started)
-        }),
-    ))
+    Ok((plan, load_pipeline_profile))
 }
 
 fn cached_runtime_plan_from_project(
@@ -14800,6 +9952,14 @@ fn cached_full_runtime_plan_from_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<CachedRuntimePlan> {
+    Ok(cached_full_runtime_plan_from_project_profiled(source_label, units)?.0)
+}
+
+fn cached_full_runtime_plan_from_project_profiled(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<(CachedRuntimePlan, JsonValue)> {
+    let total_started = Instant::now();
     if units.len() == 1 {
         let unit = &units[0];
         let key = format!("full:{}", sha256_bytes(unit.source.as_bytes()));
@@ -14808,22 +9968,37 @@ fn cached_full_runtime_plan_from_project(
             .ok()
             .and_then(|cache| cache.get(&key).cloned())
         {
-            return Ok(plan);
+            return Ok((
+                plan,
+                json!({
+                    "cache_hit": true,
+                    "surface": "full-ir",
+                    "total_ms": runtime_elapsed_ms(total_started)
+                }),
+            ));
         }
-        let parsed = Arc::new(parse_source(unit.path.clone(), unit.source.clone())?);
-        let (ir, _) = lower_profiled(&parsed)?;
-        verify_hidden_identity(&ir)?;
-        verify_static_schedule(&ir)?;
-        let compiled = CompiledProgram::from_ir(&ir)?;
+        let compiler_output = compile_source_text_to_full_ir(&unit.path, &unit.source)?;
+        let compile_started = Instant::now();
+        let compiled =
+            CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
+        let compile_ms = runtime_elapsed_ms(compile_started);
+        let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
+        if let Some(profile) = load_pipeline_profile.as_object_mut() {
+            profile.insert("compile_ms".to_owned(), json!(compile_ms));
+            profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+            profile.insert(
+                "total_ms".to_owned(),
+                json!(runtime_elapsed_ms(total_started)),
+            );
+        }
         let plan = CachedRuntimePlan {
-            parsed,
-            ir: Arc::new(ir),
+            parsed: Arc::new(compiler_output.parsed),
             compiled: Arc::new(compiled),
         };
         if let Ok(mut cache) = runtime_plan_cache().lock() {
             cache.insert(key, plan.clone());
         }
-        return Ok(plan);
+        return Ok((plan, load_pipeline_profile));
     }
     let key = format!("full:{}", source_units_hash(units));
     if let Some(plan) = runtime_plan_cache()
@@ -14831,27 +10006,38 @@ fn cached_full_runtime_plan_from_project(
         .ok()
         .and_then(|cache| cache.get(&key).cloned())
     {
-        return Ok(plan);
+        return Ok((
+            plan,
+            json!({
+                "cache_hit": true,
+                "surface": "full-ir",
+                "source_unit_count": units.len(),
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ));
     }
-    let parsed = Arc::new(parse_project(
-        source_label.to_owned(),
-        units
-            .iter()
-            .map(|unit| (unit.path.clone(), unit.source.clone())),
-    )?);
-    let (ir, _) = lower_profiled(&parsed)?;
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiler_units = compiler_source_units_from_runtime_units(units);
+    let compiler_output = compile_source_units_to_full_ir(source_label, &compiler_units)?;
+    let compile_started = Instant::now();
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
+    let compile_ms = runtime_elapsed_ms(compile_started);
+    let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
+    if let Some(profile) = load_pipeline_profile.as_object_mut() {
+        profile.insert("compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert(
+            "total_ms".to_owned(),
+            json!(runtime_elapsed_ms(total_started)),
+        );
+    }
     let plan = CachedRuntimePlan {
-        parsed,
-        ir: Arc::new(ir),
+        parsed: Arc::new(compiler_output.parsed),
         compiled: Arc::new(compiled),
     };
     if let Ok(mut cache) = runtime_plan_cache().lock() {
         cache.insert(key, plan.clone());
     }
-    Ok(plan)
+    Ok((plan, load_pipeline_profile))
 }
 
 fn cached_runtime_plan_from_project_profiled(
@@ -14879,49 +10065,28 @@ fn cached_runtime_plan_from_project_profiled(
         ));
     }
 
-    let parse_started = Instant::now();
-    let parsed = Arc::new(parse_project(
-        source_label.to_owned(),
-        units
-            .iter()
-            .map(|unit| (unit.path.clone(), unit.source.clone())),
-    )?);
-    let parse_ms = runtime_elapsed_ms(parse_started);
-    let lower_started = Instant::now();
-    let (ir, lower_profile) = lower_runtime_profiled(&parsed)?;
-    let lower_ms = runtime_elapsed_ms(lower_started);
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = runtime_elapsed_ms(verify_started);
+    let compiler_units = compiler_source_units_from_runtime_units(units);
+    let compiler_output = compile_source_units_to_runtime_ir(source_label, &compiler_units)?;
     let compile_started = Instant::now();
-    let compiled = CompiledProgram::from_ir(&ir)?;
+    let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    let expression_count = ir.expression_count;
-    let graph_node_count = ir.graph_node_count;
+    let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
+    if let Some(profile) = load_pipeline_profile.as_object_mut() {
+        profile.insert("compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert(
+            "total_ms".to_owned(),
+            json!(runtime_elapsed_ms(total_started)),
+        );
+    }
     let plan = CachedRuntimePlan {
-        parsed,
-        ir: Arc::new(ir),
+        parsed: Arc::new(compiler_output.parsed),
         compiled: Arc::new(compiled),
     };
     if let Ok(mut cache) = runtime_plan_cache().lock() {
         cache.insert(key, plan.clone());
     }
-    Ok((
-        plan,
-        json!({
-            "cache_hit": false,
-            "source_unit_count": units.len(),
-            "parse_ms": parse_ms,
-            "lower_ms": lower_ms,
-            "lower_profile": lower_profile,
-            "verify_ms": verify_ms,
-            "compile_ms": compile_ms,
-            "expression_count": expression_count,
-            "graph_node_count": graph_node_count,
-            "total_ms": runtime_elapsed_ms(total_started)
-        }),
-    ))
+    Ok((plan, load_pipeline_profile))
 }
 
 fn runtime_elapsed_ms(start: Instant) -> f64 {
@@ -14965,13 +10130,16 @@ pub fn source_units_hash(units: &[RuntimeSourceUnit]) -> String {
     sha256_bytes(canonical.as_bytes())
 }
 
-#[derive(Clone, Debug)]
-pub struct RuntimeStaticProgramAnalysis {
-    pub typecheck_report: boon_typecheck::TypeCheckReport,
-    pub view_bindings: Vec<boon_ir::ViewBinding>,
-    pub row_scopes: Vec<boon_ir::RowScope>,
-    pub source_paths: Vec<String>,
-    pub source_address_lookup_fields: BTreeMap<String, String>,
+fn compiler_source_units_from_runtime_units(
+    units: &[RuntimeSourceUnit],
+) -> Vec<CompilerSourceUnit> {
+    units
+        .iter()
+        .map(|unit| CompilerSourceUnit {
+            path: unit.path.clone(),
+            source: unit.source.clone(),
+        })
+        .collect()
 }
 
 pub fn cached_static_analysis_from_project(
@@ -14979,21 +10147,10 @@ pub fn cached_static_analysis_from_project(
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<RuntimeStaticProgramAnalysis> {
     let plan = cached_full_runtime_plan_from_project(source_label, units)?;
-    Ok(RuntimeStaticProgramAnalysis {
-        typecheck_report: plan.ir.typecheck_report.clone(),
-        view_bindings: plan.ir.view_bindings.clone(),
-        row_scopes: plan.ir.row_scopes.clone(),
-        source_paths: plan
-            .compiled
-            .source_routes
-            .route_slots
-            .iter()
-            .map(|route| route.source.clone())
-            .collect(),
-        source_address_lookup_fields: source_address_lookup_fields_from_routes(
-            &plan.compiled.source_routes,
-        ),
-    })
+    plan.compiled
+        .static_analysis
+        .clone()
+        .ok_or_else(|| "compiled runtime plan has no compiler static analysis".into())
 }
 
 pub fn cached_runtime_static_analysis_from_project(
@@ -15001,24 +10158,13 @@ pub fn cached_runtime_static_analysis_from_project(
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<RuntimeStaticProgramAnalysis> {
     let plan = cached_runtime_plan_from_project(source_label, units)?;
-    Ok(RuntimeStaticProgramAnalysis {
-        typecheck_report: plan.ir.typecheck_report.clone(),
-        view_bindings: plan.ir.view_bindings.clone(),
-        row_scopes: plan.ir.row_scopes.clone(),
-        source_paths: plan
-            .compiled
-            .source_routes
-            .route_slots
-            .iter()
-            .map(|route| route.source.clone())
-            .collect(),
-        source_address_lookup_fields: source_address_lookup_fields_from_routes(
-            &plan.compiled.source_routes,
-        ),
-    })
+    plan.compiled
+        .static_analysis
+        .clone()
+        .ok_or_else(|| "compiled runtime plan has no compiler static analysis".into())
 }
 
-pub fn cached_runtime_parsed_project(
+fn cached_runtime_parsed_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<Arc<ParsedProgram>> {
@@ -15044,7 +10190,7 @@ impl LiveRuntime {
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let scenario = parse_scenario(scenario_path)?;
-        let mut runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
             runtime,
@@ -15060,7 +10206,7 @@ impl LiveRuntime {
     ) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let scenario = parse_scenario(scenario_path)?;
-        let mut runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
             runtime,
@@ -15071,7 +10217,7 @@ impl LiveRuntime {
 
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
-        let runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
             runtime,
             next_step: 1,
@@ -15081,7 +10227,7 @@ impl LiveRuntime {
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
-        let runtime = LoadedRuntime::new(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
             runtime,
             next_step: 1,
@@ -15120,8 +10266,7 @@ impl LiveRuntime {
         }
         let (plan, plan_profile) = cached_runtime_plan_from_project_profiled(source_label, units)?;
         let runtime_started = Instant::now();
-        let (runtime, runtime_profile) =
-            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref())?;
+        let (runtime, runtime_profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref())?;
         let runtime_ms = runtime_elapsed_ms(runtime_started);
         let live_runtime = Self {
             runtime,
@@ -15627,158 +10772,47 @@ impl LiveRuntime {
 
 impl LiveSourceEvent {
     fn assert_matches_step(&self, step: &ScenarioStep) -> RuntimeResult<()> {
-        let expected = GenericSourceEvent::require(step)?;
-        assert_live_source_event_field(
+        assert_plan_live_source_event_matches_expected(
             &step.id,
-            Some(expected.source),
-            "source",
-            Some(self.source.as_str()),
-        )?;
-        assert_live_source_event_field(&step.id, expected.text, "text", self.text.as_deref())?;
-        assert_live_source_event_field(&step.id, expected.key, "key", self.key.as_deref())?;
-        assert_live_source_event_field(
-            &step.id,
-            expected.list_id,
-            "list_id",
-            self.list_id.as_deref(),
-        )?;
-        assert_live_source_event_field(
-            &step.id,
-            expected.address,
-            "address",
-            self.address.as_deref(),
-        )?;
-        assert_live_source_event_field(
-            &step.id,
-            expected.target_text,
-            "target_text",
-            self.target_text.as_deref(),
-        )?;
-        if let Some(expected) = &step.expected_source_event {
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_usize_ref(expected, "target_occurrence").map(|value| value as u64),
-                "target_occurrence",
-                self.target_occurrence.map(|value| value as u64),
-            )?;
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_u64_ref(expected, "target_key"),
-                "target_key",
-                self.target_key,
-            )?;
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_u64_ref(expected, "target_generation"),
-                "target_generation",
-                self.target_generation,
-            )?;
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_u64_ref(expected, "bind_epoch"),
-                "bind_epoch",
-                self.bind_epoch,
-            )?;
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_u64_ref(expected, "source_epoch"),
-                "source_epoch",
-                self.source_epoch,
-            )?;
-            assert_live_source_event_numeric_field(
-                &step.id,
-                toml_u64_ref(expected, "source_id"),
-                "source_id",
-                self.source_id,
-            )?;
-        }
-        Ok(())
+            step.expected_source_event.as_ref(),
+            PlanExecutorLiveSourceEvent {
+                source: self.source.as_str(),
+                text: self.text.as_deref(),
+                key: self.key.as_deref(),
+                list_id: self.list_id.as_deref(),
+                address: self.address.as_deref(),
+                target_text: self.target_text.as_deref(),
+                target_occurrence: self.target_occurrence.map(|value| value as u64),
+                target_key: self.target_key,
+                target_generation: self.target_generation,
+                bind_epoch: self.bind_epoch,
+                source_epoch: self.source_epoch,
+                source_id: self.source_id,
+            },
+        )
     }
 
     fn into_expected_source_event(self) -> BTreeMap<String, toml::Value> {
-        let mut expected_source_event = BTreeMap::new();
-        expected_source_event.insert("source".to_owned(), toml::Value::String(self.source));
-        if let Some(text) = self.text {
-            expected_source_event.insert("text".to_owned(), toml::Value::String(text));
-        }
-        if let Some(key) = self.key {
-            expected_source_event.insert("key".to_owned(), toml::Value::String(key));
-        }
-        if let Some(list_id) = self.list_id {
-            expected_source_event.insert("list_id".to_owned(), toml::Value::String(list_id));
-        }
-        if let Some(address) = self.address {
-            expected_source_event.insert("address".to_owned(), toml::Value::String(address));
-        }
-        for (key, value) in self.payload {
-            expected_source_event
-                .entry(key)
-                .or_insert_with(|| toml::Value::String(value));
-        }
-        for (field, bytes) in self.payload_bytes {
-            expected_source_event
-                .entry(source_payload_bytes_toml_key(&field))
-                .or_insert_with(|| toml::Value::String(bytes_encode_hex(&bytes)));
-        }
-        if let Some(pointer_x) = self.pointer_x {
-            expected_source_event.insert("pointer_x".to_owned(), toml::Value::String(pointer_x));
-        }
-        if let Some(pointer_y) = self.pointer_y {
-            expected_source_event.insert("pointer_y".to_owned(), toml::Value::String(pointer_y));
-        }
-        if let Some(pointer_width) = self.pointer_width {
-            expected_source_event.insert(
-                "pointer_width".to_owned(),
-                toml::Value::String(pointer_width),
-            );
-        }
-        if let Some(pointer_height) = self.pointer_height {
-            expected_source_event.insert(
-                "pointer_height".to_owned(),
-                toml::Value::String(pointer_height),
-            );
-        }
-        if let Some(target_text) = self.target_text {
-            expected_source_event
-                .insert("target_text".to_owned(), toml::Value::String(target_text));
-        }
-        if let Some(target_occurrence) = self.target_occurrence {
-            expected_source_event.insert(
-                "target_occurrence".to_owned(),
-                toml::Value::Integer(target_occurrence as i64),
-            );
-        }
-        if let Some(target_key) = self.target_key {
-            expected_source_event.insert(
-                "target_key".to_owned(),
-                toml::Value::Integer(target_key as i64),
-            );
-        }
-        if let Some(target_generation) = self.target_generation {
-            expected_source_event.insert(
-                "target_generation".to_owned(),
-                toml::Value::Integer(target_generation as i64),
-            );
-        }
-        if let Some(bind_epoch) = self.bind_epoch {
-            expected_source_event.insert(
-                "bind_epoch".to_owned(),
-                toml::Value::Integer(bind_epoch as i64),
-            );
-        }
-        if let Some(source_epoch) = self.source_epoch {
-            expected_source_event.insert(
-                "source_epoch".to_owned(),
-                toml::Value::Integer(source_epoch as i64),
-            );
-        }
-        if let Some(source_id) = self.source_id {
-            expected_source_event.insert(
-                "source_id".to_owned(),
-                toml::Value::Integer(source_id as i64),
-            );
-        }
-        expected_source_event
+        build_plan_live_source_event_expected_toml(PlanExecutorLiveSourceEventExpectedToml {
+            source: self.source.as_str(),
+            text: self.text.as_deref(),
+            key: self.key.as_deref(),
+            list_id: self.list_id.as_deref(),
+            address: self.address.as_deref(),
+            payload: &self.payload,
+            payload_bytes: &self.payload_bytes,
+            pointer_x: self.pointer_x.as_deref(),
+            pointer_y: self.pointer_y.as_deref(),
+            pointer_width: self.pointer_width.as_deref(),
+            pointer_height: self.pointer_height.as_deref(),
+            target_text: self.target_text.as_deref(),
+            target_occurrence: self.target_occurrence,
+            target_key: self.target_key,
+            target_generation: self.target_generation,
+            bind_epoch: self.bind_epoch,
+            source_epoch: self.source_epoch,
+            source_id: self.source_id,
+        })
     }
 
     fn into_step(self, sequence: usize) -> ScenarioStep {
@@ -15839,38 +10873,6 @@ fn live_source_user_action() -> BTreeMap<String, toml::Value> {
     user_action
 }
 
-fn assert_live_source_event_field(
-    step_id: &str,
-    expected_value: Option<&str>,
-    key: &str,
-    actual_value: Option<&str>,
-) -> RuntimeResult<()> {
-    if expected_value.is_none() || expected_value == actual_value {
-        Ok(())
-    } else {
-        Err(format!(
-            "{step_id}: observed live source field `{key}` expected {expected_value:?}, got {actual_value:?}"
-        )
-        .into())
-    }
-}
-
-fn assert_live_source_event_numeric_field(
-    step_id: &str,
-    expected_value: Option<u64>,
-    key: &str,
-    actual_value: Option<u64>,
-) -> RuntimeResult<()> {
-    if expected_value.is_none() || expected_value == actual_value {
-        Ok(())
-    } else {
-        Err(format!(
-            "{step_id}: observed live source field `{key}` expected {expected_value:?}, got {actual_value:?}"
-        )
-        .into())
-    }
-}
-
 pub use boon_report_schema::{
     command_argv_value_after, command_argv_values_after, report_schema_hash,
     require_command_argv_f64, require_command_argv_value, require_generic_runtime_slice_flags,
@@ -15878,6 +10880,16 @@ pub use boon_report_schema::{
     verify_playground_surface_report, verify_report_schema, verify_report_schema_negative_probe,
     verify_runtime_execution_metadata, verify_semantic_delta_protocol_batches, write_json,
 };
+
+fn compiler_source_payload_field(value: &CompilerSourcePayloadField) -> SourcePayloadField {
+    match value {
+        CompilerSourcePayloadField::Address => SourcePayloadField::Address,
+        CompilerSourcePayloadField::Bytes => SourcePayloadField::Bytes,
+        CompilerSourcePayloadField::Key => SourcePayloadField::Key,
+        CompilerSourcePayloadField::Named(name) => SourcePayloadField::Named(name.clone()),
+        CompilerSourcePayloadField::Text => SourcePayloadField::Text,
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExampleManifest {
@@ -16074,7 +11086,10 @@ fn validate_example_manifest(path: &Path, manifest: &ExampleManifest) -> Runtime
 
 pub fn example_source_files(name: &str) -> RuntimeResult<Vec<PathBuf>> {
     let entry = example_manifest_entry(name)?;
-    Ok(source_files_for_entry(&entry))
+    Ok(compiler_source_files_for_manifest_source(
+        &entry.source,
+        &entry.source_files,
+    ))
 }
 
 pub fn example_source_units(name: &str) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
@@ -16088,47 +11103,43 @@ pub fn example_source_text(name: &str) -> RuntimeResult<String> {
 }
 
 pub fn source_units_for_path(path: &Path) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
-    source_files_for_path(path)?
+    Ok(compiler_source_units_for_path(path)?
         .into_iter()
-        .map(|path| {
-            let source = fs::read_to_string(&path)?;
-            Ok(RuntimeSourceUnit {
-                path: path.display().to_string(),
-                source,
-            })
-        })
-        .collect()
+        .map(runtime_source_unit_from_compiler)
+        .collect())
 }
 
 pub fn source_units_for_entry(
     entry: &ExampleManifestEntry,
 ) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
-    source_files_for_entry(entry)
-        .into_iter()
-        .map(|path| {
-            let source = fs::read_to_string(&path)?;
-            Ok(RuntimeSourceUnit {
-                path: path.display().to_string(),
-                source,
-            })
-        })
-        .collect()
+    Ok(
+        compiler_source_units_for_manifest_source(&entry.source, &entry.source_files)?
+            .into_iter()
+            .map(runtime_source_unit_from_compiler)
+            .collect(),
+    )
 }
 
 pub fn source_text_for_path(path: &Path) -> RuntimeResult<String> {
-    let source_path = resolve_repo_file(path);
-    let entries = example_manifest_entries().unwrap_or_default();
-    for entry in entries {
-        let entry_source = resolve_repo_file(&entry.source);
-        if paths_match(&entry_source, &source_path) {
-            return Ok(fs::read_to_string(entry_source)?);
-        }
-    }
-    Ok(fs::read_to_string(source_path)?)
+    Ok(compiler_source_text_for_path(path)?)
 }
 
 pub fn source_text_for_entry(entry: &ExampleManifestEntry) -> RuntimeResult<String> {
-    Ok(fs::read_to_string(resolve_repo_file(&entry.source))?)
+    Ok(compiler_source_text_for_manifest_source(&entry.source)?)
+}
+
+fn runtime_source_unit_from_compiler(unit: CompilerSourceUnit) -> RuntimeSourceUnit {
+    RuntimeSourceUnit {
+        path: unit.path,
+        source: unit.source,
+    }
+}
+
+fn runtime_source_units_from_compiler(units: Vec<CompilerSourceUnit>) -> Vec<RuntimeSourceUnit> {
+    units
+        .into_iter()
+        .map(runtime_source_unit_from_compiler)
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -16627,43 +11638,6 @@ fn build_url_encode(input: &str) -> String {
     output
 }
 
-fn source_files_for_path(source_path: &Path) -> RuntimeResult<Vec<PathBuf>> {
-    let source_path = resolve_repo_file(source_path);
-    let entries = example_manifest_entries().unwrap_or_default();
-    for entry in entries {
-        let entry_source = resolve_repo_file(&entry.source);
-        if paths_match(&entry_source, &source_path) {
-            return Ok(source_files_for_entry(&entry));
-        }
-    }
-    Ok(vec![source_path])
-}
-
-fn source_files_for_entry(entry: &ExampleManifestEntry) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if entry.source_files.is_empty() {
-        files.push(resolve_repo_file(&entry.source));
-    } else {
-        for relative in &entry.source_files {
-            files.push(resolve_repo_file(relative));
-        }
-        let source = resolve_repo_file(&entry.source);
-        if !files.iter().any(|path| paths_match(path, &source)) {
-            files.push(source);
-        }
-    }
-    files
-}
-
-fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .ok()
-            .zip(right.canonicalize().ok())
-            .is_some_and(|(left, right)| left == right)
-}
-
 pub fn example_paths(name: &str) -> RuntimeResult<(PathBuf, PathBuf, PathBuf)> {
     let requested = if name == "todo" { "todomvc" } else { name };
     if !requested
@@ -16704,6 +11678,7 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
     relative.to_path_buf()
 }
 
+#[cfg(test)]
 fn run_loaded_scenario(
     _parsed: &ParsedProgram,
     ir: &TypedProgram,
@@ -16713,10 +11688,23 @@ fn run_loaded_scenario(
     let compile_started = Instant::now();
     let compiled = CompiledProgram::from_ir(ir)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
+    run_loaded_scenario_with_compiled(_parsed, &compiled, None, compile_ms, scenario, layer)
+}
+
+fn run_loaded_scenario_with_compiled(
+    _parsed: &ParsedProgram,
+    compiled: &CompiledProgram,
+    report_context: Option<&CompiledSourceReportContext>,
+    compile_ms: f64,
+    scenario: &Scenario,
+    layer: VerificationLayer,
+) -> RuntimeResult<RunOutput> {
     let runtime_init_started = Instant::now();
-    let runtime = LoadedRuntime::new(ir, &compiled)?;
+    let runtime = LoadedRuntime::new(compiled)?;
     let runtime_init_ms = runtime_elapsed_ms(runtime_init_started);
-    let mut output = run_generic_scenario(runtime, _parsed, ir, &compiled, scenario, layer)?;
+    let mut output =
+        run_generic_scenario(runtime, _parsed, compiled, report_context, scenario, layer)?;
+    let program_metadata = compiled.source_program_metadata("loaded scenario compile profile");
     if let Some(object) = output.report.as_object_mut() {
         object.insert(
             "compile_pipeline_profile".to_owned(),
@@ -16724,8 +11712,8 @@ fn run_loaded_scenario(
                 "compile_ms": compile_ms,
                 "runtime_init_ms": runtime_init_ms,
                 "total_ms": compile_ms + runtime_init_ms,
-                "expression_count": ir.expression_count,
-                "graph_node_count": ir.graph_node_count,
+                "expression_count": program_metadata.expression_count,
+                "graph_node_count": program_metadata.graph_node_count,
             }),
         );
     }
@@ -16743,15 +11731,12 @@ struct CountedStepOutput {
 }
 
 impl LoadedRuntime {
-    fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
-        Ok(Self::new_profiled(ir, compiled)?.0)
+    fn new(compiled: &CompiledProgram) -> RuntimeResult<Self> {
+        Ok(Self::new_profiled(compiled)?.0)
     }
 
-    fn new_profiled(
-        ir: &TypedProgram,
-        compiled: &CompiledProgram,
-    ) -> RuntimeResult<(Self, JsonValue)> {
-        let (generic, generic_profile) = GenericScheduledRuntime::new_profiled(ir, compiled)?;
+    fn new_profiled(compiled: &CompiledProgram) -> RuntimeResult<(Self, JsonValue)> {
+        let (generic, generic_profile) = GenericScheduledRuntime::new_profiled(compiled)?;
         Ok(Self {
             generic: Some(generic),
         }
@@ -17405,6 +12390,13 @@ struct CompiledProgram {
     list_equations: ListEquationPlan,
     list_projections: ListProjectionPlan,
     source_routes: SourceRoutePlan,
+    static_analysis: Option<CompilerStaticProgramAnalysis>,
+    program_metadata: Option<CompilerTypedProgramReportMetadata>,
+    typecheck_metadata: Option<CompilerTypecheckReportMetadata>,
+    inventory_counts: Option<CompilerTypedProgramInventoryCounts>,
+    runtime_profile_metadata: Option<CompilerRuntimeProfileMetadata>,
+    ir_debug_tables: Option<JsonValue>,
+    source_route_bool_facts: Option<CompilerSourceRouteBoolFacts>,
     list_source_bindings: ListSourceBindingPlan,
     storage_initialization: RuntimeStorageInitializationPlan,
     document_lowering: RuntimeDocumentLoweringTables,
@@ -17457,6 +12449,16 @@ struct ListSummaryFields {
     list: String,
     row_scope: String,
     fields: Vec<String>,
+}
+
+impl ListSummaryFields {
+    fn from_compiler(summary: CompilerListSummaryFields) -> Self {
+        Self {
+            list: summary.list,
+            row_scope: summary.row_scope,
+            fields: summary.fields,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -17777,222 +12779,12 @@ struct FieldSlotCollisionDiagnostic {
 }
 
 impl RuntimeSymbols {
-    fn from_ir(ir: &TypedProgram) -> Self {
+    fn from_compiler(compiler_symbols: CompilerRuntimeSymbols) -> Self {
         let mut symbols = Self::default();
-        for source in &ir.sources {
-            symbols.intern(&source.path);
-        }
-        for cell in &ir.state_cells {
-            symbols.intern(&cell.path);
-        }
-        for list in &ir.lists {
-            symbols.intern(&list.name);
-        }
-        for value in &ir.derived_values {
-            symbols.intern(&value.path);
-            for source in &value.sources {
-                symbols.intern(source);
-            }
-        }
-        for branch in &ir.update_branches {
-            symbols.intern(&branch.target);
-            symbols.intern(&branch.source);
-            match &branch.expression {
-                UpdateExpression::SourcePayload { path }
-                | UpdateExpression::Const { value: path }
-                | UpdateExpression::PreviousValue { path }
-                | UpdateExpression::ReadPath { path }
-                | UpdateExpression::BoolNot { path }
-                | UpdateExpression::BytesLength { path }
-                | UpdateExpression::BytesIsEmpty { path }
-                | UpdateExpression::BytesGet { path, .. }
-                | UpdateExpression::BytesSet { path, .. }
-                | UpdateExpression::BytesSlice { path, .. }
-                | UpdateExpression::BytesTake { path, .. }
-                | UpdateExpression::BytesDrop { path, .. }
-                | UpdateExpression::BytesToHex { path }
-                | UpdateExpression::BytesFromHex { path }
-                | UpdateExpression::BytesToBase64 { path }
-                | UpdateExpression::BytesFromBase64 { path }
-                | UpdateExpression::BytesReadUnsigned { path, .. }
-                | UpdateExpression::BytesReadSigned { path, .. }
-                | UpdateExpression::BytesWriteUnsigned { path, .. }
-                | UpdateExpression::BytesWriteSigned { path, .. }
-                | UpdateExpression::TextToBytes { path, .. }
-                | UpdateExpression::BytesToText { path, .. } => {
-                    symbols.intern(path);
-                }
-                UpdateExpression::FileReadBytes { path } => match path {
-                    boon_ir::FileBytesPath::StaticText(path)
-                    | boon_ir::FileBytesPath::StatePath(path) => {
-                        symbols.intern(path);
-                    }
-                },
-                UpdateExpression::FileWriteBytes { bytes_path, path } => {
-                    symbols.intern(bytes_path);
-                    match path {
-                        boon_ir::FileBytesPath::StaticText(path)
-                        | boon_ir::FileBytesPath::StatePath(path) => {
-                            symbols.intern(path);
-                        }
-                    }
-                }
-                UpdateExpression::BytesZeros { .. } => {}
-                UpdateExpression::BytesConcat { left, right }
-                | UpdateExpression::BytesEqual { left, right } => {
-                    symbols.intern(left);
-                    symbols.intern(right);
-                }
-                UpdateExpression::BytesFind { haystack, needle } => {
-                    symbols.intern(haystack);
-                    symbols.intern(needle);
-                }
-                UpdateExpression::BytesStartsWith { path, prefix } => {
-                    symbols.intern(path);
-                    symbols.intern(prefix);
-                }
-                UpdateExpression::BytesEndsWith { path, suffix } => {
-                    symbols.intern(path);
-                    symbols.intern(suffix);
-                }
-                UpdateExpression::TextTrimOrPrevious { path, previous } => {
-                    symbols.intern(path);
-                    symbols.intern(previous);
-                }
-                UpdateExpression::PrefixPayloadConcat {
-                    prefix,
-                    payload_path,
-                    separator,
-                } => {
-                    symbols.intern(prefix);
-                    symbols.intern(payload_path);
-                    symbols.intern(separator);
-                }
-                UpdateExpression::PrefixRootConcat {
-                    prefix,
-                    path,
-                    separator,
-                } => {
-                    symbols.intern(prefix);
-                    symbols.intern(path);
-                    symbols.intern(separator);
-                }
-                UpdateExpression::NumberInfix { left, right, .. } => {
-                    symbols.intern(left);
-                    symbols.intern(right);
-                }
-                UpdateExpression::ProjectTime {
-                    pointer_x,
-                    pointer_width,
-                    viewport_start,
-                    viewport_end,
-                    fallback,
-                } => {
-                    symbols.intern(pointer_x);
-                    symbols.intern(pointer_width);
-                    symbols.intern(viewport_start);
-                    symbols.intern(viewport_end);
-                    symbols.intern(fallback);
-                }
-                UpdateExpression::MatchNumberInfixConst {
-                    left, right, arms, ..
-                } => {
-                    symbols.intern(left);
-                    symbols.intern(right);
-                    for arm in arms {
-                        symbols.intern(&arm.pattern);
-                        intern_update_value_expression_symbols(&mut symbols, &arm.output);
-                    }
-                }
-                UpdateExpression::MatchConst { input, arms } => {
-                    symbols.intern(input);
-                    for arm in arms {
-                        symbols.intern(&arm.pattern);
-                        symbols.intern(&arm.output);
-                    }
-                }
-                UpdateExpression::MatchValueConst { input, arms }
-                | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
-                    symbols.intern(input);
-                    for arm in arms {
-                        symbols.intern(&arm.pattern);
-                        intern_update_value_expression_symbols(&mut symbols, &arm.output);
-                    }
-                }
-                UpdateExpression::ListFindValue {
-                    list,
-                    field,
-                    expected,
-                    target,
-                    fallback,
-                } => {
-                    symbols.intern(list);
-                    symbols.intern(field);
-                    intern_update_value_expression_symbols(&mut symbols, expected);
-                    symbols.intern(target);
-                    if let Some(fallback) = fallback {
-                        intern_update_value_expression_symbols(&mut symbols, fallback);
-                    }
-                }
-                UpdateExpression::Unknown { summary } => {
-                    symbols.intern(summary);
-                }
-            }
-        }
-        for operation in &ir.list_operations {
-            symbols.intern(&operation.list);
-            match &operation.kind {
-                ListOperationKind::Append { trigger, fields } => {
-                    symbols.intern(trigger);
-                    for field in fields {
-                        symbols.intern(&field.name);
-                        match &field.value {
-                            ListAppendFieldValue::Source { path } => {
-                                symbols.intern(path);
-                            }
-                            ListAppendFieldValue::Const { value } => {
-                                symbols.intern(value);
-                            }
-                            ListAppendFieldValue::TypedConst { .. } => {}
-                        }
-                    }
-                }
-                ListOperationKind::Remove { source, predicate } => {
-                    symbols.intern(source);
-                    symbols.intern_list_predicate(predicate);
-                }
-                ListOperationKind::Retain { target, predicate }
-                | ListOperationKind::Count { target, predicate } => {
-                    symbols.intern(target);
-                    symbols.intern_list_predicate(predicate);
-                }
-            }
-        }
-        for projection in &ir.list_projections {
-            symbols.intern(&projection.target);
-            symbols.intern(&projection.list);
-            if let ListProjectionKind::Find { field, value } = &projection.kind {
-                symbols.intern(field);
-                symbols.intern(value);
-            }
+        for path in compiler_symbols.paths {
+            symbols.intern(&path);
         }
         symbols
-    }
-
-    fn intern_list_predicate(&mut self, predicate: &ListPredicate) {
-        match predicate {
-            ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
-                self.intern(path);
-            }
-            ListPredicate::SelectedFilterVisibility {
-                selector,
-                row_field,
-            } => {
-                self.intern(selector);
-                self.intern(row_field);
-            }
-            ListPredicate::AlwaysTrue | ListPredicate::Unknown { .. } => {}
-        }
     }
 
     fn intern(&mut self, path: &str) -> RuntimeSymbolId {
@@ -18025,6 +12817,13 @@ impl RuntimeSymbols {
 }
 
 impl FieldSlotCollisionDiagnostic {
+    fn from_compiler(diagnostic: CompilerFieldSlotCollisionDiagnostic) -> Self {
+        Self {
+            field_id: diagnostic.field_id,
+            labels: diagnostic.labels,
+        }
+    }
+
     fn vec_from_artifact(value: &JsonValue, context: &str) -> RuntimeResult<Vec<Self>> {
         artifact_array(value, context)?
             .iter()
@@ -18043,99 +12842,129 @@ impl FieldSlotCollisionDiagnostic {
     }
 }
 
-fn intern_update_value_expression_symbols(
-    symbols: &mut RuntimeSymbols,
-    value: &UpdateValueExpression,
-) {
-    match value {
-        UpdateValueExpression::Const { value } => {
-            symbols.intern(value);
-        }
-        UpdateValueExpression::ReadPath { path } => {
-            symbols.intern(path);
-        }
-        UpdateValueExpression::MatchConst { input, arms } => {
-            symbols.intern(input);
-            for arm in arms {
-                symbols.intern(&arm.pattern);
-                intern_update_value_expression_symbols(symbols, &arm.output);
-            }
-        }
-        UpdateValueExpression::NumberInfix { left, right, .. } => {
-            symbols.intern(left);
-            symbols.intern(right);
-        }
-        UpdateValueExpression::MatchNumberInfixConst {
-            left, right, arms, ..
-        } => {
-            symbols.intern(left);
-            symbols.intern(right);
-            for arm in arms {
-                symbols.intern(&arm.pattern);
-                intern_update_value_expression_symbols(symbols, &arm.output);
-            }
-        }
-    }
-}
-
 impl RuntimeStorageInitializationPlan {
-    fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
-        let mut root_slots = Vec::new();
-        let mut root_initial_field_copies = Vec::new();
-        let empty_initial_fields = ValueColumns::default();
-        for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
-            let initializer = RuntimeInitialValue::from_initial(&cell.initial_value)?;
-            let initial_value = initializer.to_field_value(&empty_initial_fields)?;
-            if let RuntimeInitialValue::RootInitialField { path } = &initializer {
-                root_initial_field_copies.push(RuntimeStorageRootInitialCopy {
-                    target: cell.path.clone(),
-                    source: path.clone(),
-                });
-            }
-            root_slots.push(RuntimeStorageRootSlot {
-                path: cell.path.clone(),
-                initializer,
-                initial_value,
-            });
-        }
+    fn from_ir(
+        compiler_root_slots: Vec<CompilerStorageRootSlot>,
+        compiler_indexed_row_initial_resets: Vec<CompilerStorageIndexedRowInitialReset>,
+        compiler_list_slots: Vec<CompilerStorageListSlot>,
+        compiler_row_templates: Vec<CompilerStorageRowTemplate>,
+        compiler_initial_rows: Vec<CompilerStorageInitialRows>,
+        compiler_indexed_derived_fields: Vec<CompilerStorageIndexedDerivedFields>,
+    ) -> RuntimeResult<Self> {
+        let root_slots = compiler_root_slots
+            .into_iter()
+            .map(RuntimeStorageRootSlot::from_compiler)
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        let root_initial_field_copies = root_slots
+            .iter()
+            .filter_map(RuntimeStorageRootInitialCopy::from_root_slot)
+            .collect::<Vec<_>>();
 
         let mut list_slots = Vec::new();
-        let mut list_names = BTreeSet::new();
-        for list in &ir.lists {
-            let row_scope = row_scope_name_for_ir_list(ir, list);
-            let indexed_cells = ir
-                .state_cells
-                .iter()
-                .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
-                .collect::<Vec<_>>();
-            let row_template =
-                RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;
-            let row_template_plan =
-                RuntimeStorageRowTemplate::from_runtime_template(&row_template)?;
-            let (initializer_kind, initial_rows) = match &list.initializer {
-                ListInitializer::RecordLiteral { rows }
-                    if ir_list_has_derived_list_view(ir, &list.name)
-                        && list_initial_records_have_dynamic_fields(rows) =>
-                {
-                    (
-                        RuntimeStorageListInitializerKind::DeferredDynamicListView,
-                        Vec::new(),
+        let mut row_templates_by_list = BTreeMap::new();
+        for template in compiler_row_templates {
+            if row_templates_by_list
+                .insert(template.list.clone(), template)
+                .is_some()
+            {
+                return Err("compiler storage row templates contain a duplicate list".into());
+            }
+        }
+        let mut initial_rows_by_list = BTreeMap::new();
+        for rows in compiler_initial_rows {
+            if initial_rows_by_list
+                .insert(rows.list.clone(), rows)
+                .is_some()
+            {
+                return Err("compiler storage initial rows contain a duplicate list".into());
+            }
+        }
+        let mut indexed_derived_fields_by_list = BTreeMap::new();
+        for fields in compiler_indexed_derived_fields {
+            if indexed_derived_fields_by_list
+                .insert(fields.list.clone(), fields)
+                .is_some()
+            {
+                return Err(
+                    "compiler storage indexed derived fields contain a duplicate list".into(),
+                );
+            }
+        }
+        for compiler_slot in compiler_list_slots {
+            if compiler_slot.synthetic_list_view_storage {
+                list_slots.push(RuntimeStorageListSlot::from_compiler_synthetic(
+                    compiler_slot,
+                )?);
+                continue;
+            }
+            let compiler_template = row_templates_by_list
+                .get(compiler_slot.name.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "compiler storage list slot `{}` has no row template",
+                        compiler_slot.name
                     )
-                }
-                ListInitializer::RecordLiteral { rows } => {
+                })?;
+            if compiler_template.row_scope != compiler_slot.row_scope {
+                return Err(format!(
+                    "compiler storage row template for list `{}` has row scope `{}` but list slot has `{}`",
+                    compiler_slot.name, compiler_template.row_scope, compiler_slot.row_scope
+                )
+                .into());
+            }
+            let row_scope = compiler_slot.row_scope.clone();
+            let row_template_plan =
+                RuntimeStorageRowTemplate::from_compiler(compiler_template.clone())?;
+            let row_template = row_template_plan.to_runtime_template();
+            let derived_fields = indexed_derived_fields_by_list
+                .get(compiler_slot.name.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "compiler storage list slot `{}` has no indexed derived field metadata",
+                        compiler_slot.name
+                    )
+                })?;
+            if derived_fields.row_scope != row_scope {
+                return Err(format!(
+                    "compiler storage indexed derived fields for list `{}` have row scope `{}` but list slot has `{}`",
+                    compiler_slot.name, derived_fields.row_scope, row_scope
+                )
+                .into());
+            }
+            let (initializer_kind, initial_rows) = match &compiler_slot.initializer_kind {
+                CompilerStorageListInitializerKind::DeferredDynamicListView => (
+                    RuntimeStorageListInitializerKind::DeferredDynamicListView,
+                    Vec::new(),
+                ),
+                CompilerStorageListInitializerKind::RecordLiteral => {
+                    let rows = initial_rows_by_list
+                        .get(compiler_slot.name.as_str())
+                        .ok_or_else(|| {
+                            format!(
+                                "compiler storage list slot `{}` has no initial row metadata",
+                                compiler_slot.name
+                            )
+                        })?;
                     let rows = rows
+                        .rows
                         .iter()
                         .map(|row| {
-                            let initial_fields = list_initial_fields(row)?;
+                            let initial_fields = list_initial_fields_from_compiler(row)?;
                             let mut row = row_template.materialize(initial_fields)?;
-                            initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
-                            initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
+                            initialize_indexed_derived_base_fields_from_compiler(
+                                derived_fields,
+                                &mut row,
+                            );
+                            initialize_indexed_derived_text_fields_from_compiler(
+                                derived_fields,
+                                &mut row,
+                            );
                             Ok(row)
                         })
                         .collect::<RuntimeResult<Vec<_>>>()?;
                     (RuntimeStorageListInitializerKind::RecordLiteral, rows)
                 }
-                ListInitializer::Range { from, to } => {
+                CompilerStorageListInitializerKind::Range { from, to } => {
                     let count = if from <= to {
                         usize::try_from(to.saturating_sub(*from).saturating_add(1))
                             .map_err(|_| "List/range row count is out of range")?
@@ -18151,8 +12980,14 @@ impl RuntimeStorageInitializationPlan {
                         initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
                         row_template.fill_missing_row_initial_fields(&mut initial_fields);
                         let mut row = row_template.materialize(initial_fields)?;
-                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
-                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
+                        initialize_indexed_derived_base_fields_from_compiler(
+                            derived_fields,
+                            &mut row,
+                        );
+                        initialize_indexed_derived_text_fields_from_compiler(
+                            derived_fields,
+                            &mut row,
+                        );
                         range_rows.push(row);
                     }
                     (
@@ -18163,37 +12998,38 @@ impl RuntimeStorageInitializationPlan {
                         range_rows,
                     )
                 }
-                ListInitializer::Empty => (RuntimeStorageListInitializerKind::Empty, Vec::new()),
-                ListInitializer::Unknown { summary } => {
-                    if ir_list_has_derived_list_view(ir, &list.name) {
-                        (
-                            RuntimeStorageListInitializerKind::DeferredDynamicListView,
-                            Vec::new(),
-                        )
-                    } else {
-                        return Err(format!(
-                            "list `{}` has unsupported initializer `{summary}`",
-                            list.name
-                        )
-                        .into());
-                    }
+                CompilerStorageListInitializerKind::Empty => {
+                    (RuntimeStorageListInitializerKind::Empty, Vec::new())
+                }
+                CompilerStorageListInitializerKind::SyntheticListViewStorage => {
+                    return Err(format!(
+                        "compiler storage list slot `{}` marked synthetic but did not set synthetic_list_view_storage",
+                        compiler_slot.name
+                    )
+                    .into());
+                }
+                CompilerStorageListInitializerKind::Unsupported { summary } => {
+                    return Err(format!(
+                        "list `{}` has unsupported initializer `{summary}`",
+                        compiler_slot.name
+                    )
+                    .into());
                 }
             };
-            if let Some(capacity) = list.capacity
+            if let Some(capacity) = compiler_slot.capacity
                 && initial_rows.len() > capacity
             {
                 return Err(format!(
                     "list `{}` initializes {} rows beyond declared capacity {capacity}",
-                    list.name,
+                    compiler_slot.name,
                     initial_rows.len()
                 )
                 .into());
             }
-            list_names.insert(list.name.clone());
             list_slots.push(RuntimeStorageListSlot {
-                id: list.id,
-                name: list.name.clone(),
-                capacity: list.capacity,
+                id: ListId(compiler_slot.id),
+                name: compiler_slot.name,
+                capacity: compiler_slot.capacity,
                 row_scope,
                 synthetic_list_view_storage: false,
                 initializer_kind,
@@ -18202,61 +13038,9 @@ impl RuntimeStorageInitializationPlan {
             });
         }
 
-        let mut synthetic_list_id = ir
-            .lists
-            .iter()
-            .map(|list| list.id.0)
-            .max()
-            .map_or(0, |id| id.saturating_add(1));
-        for value in ir.derived_values.iter().filter(|value| {
-            !value.indexed
-                && value.scope_id.is_none()
-                && matches!(value.kind, DerivedValueKind::ListView)
-        }) {
-            let name = derived_root_list_storage_name(&value.path);
-            if list_names.contains(&name) {
-                continue;
-            }
-            list_names.insert(name.clone());
-            list_slots.push(RuntimeStorageListSlot {
-                id: ListId(synthetic_list_id),
-                name,
-                capacity: None,
-                row_scope: String::new(),
-                synthetic_list_view_storage: true,
-                initializer_kind: RuntimeStorageListInitializerKind::SyntheticListViewStorage,
-                row_template: RuntimeStorageRowTemplate::default(),
-                initial_rows: Vec::new(),
-            });
-            synthetic_list_id = synthetic_list_id.saturating_add(1);
-        }
-
-        let indexed_row_initial_resets = ir
-            .state_cells
-            .iter()
-            .filter(|cell| cell.indexed)
-            .filter_map(|cell| {
-                let InitialValue::RowInitialField { path } = &cell.initial_value else {
-                    return None;
-                };
-                let scope_id = cell.scope_id?;
-                let row_scope = ir.row_scopes.iter().find(|scope| scope.id == scope_id)?;
-                let target_field = cell
-                    .path
-                    .strip_prefix(&format!("{}.", row_scope.row_scope))?
-                    .to_owned();
-                let source_field = if path == &target_field {
-                    base_row_field_name(&target_field)
-                } else {
-                    path.clone()
-                };
-                Some(RuntimeStorageIndexedRowInitialReset {
-                    list: row_scope.list.clone(),
-                    target_field,
-                    source_field,
-                    original_source_path: path.clone(),
-                })
-            })
+        let indexed_row_initial_resets = compiler_indexed_row_initial_resets
+            .into_iter()
+            .map(RuntimeStorageIndexedRowInitialReset::from_compiler)
             .collect();
 
         Ok(Self {
@@ -18287,7 +13071,87 @@ impl RuntimeStorageInitializationPlan {
     }
 }
 
+impl RuntimeStorageRootSlot {
+    fn from_compiler(slot: CompilerStorageRootSlot) -> RuntimeResult<Self> {
+        let initializer = RuntimeInitialValue::from_compiler(slot.initializer)?;
+        let initial_value = initializer.to_field_value(&ValueColumns::default())?;
+        Ok(Self {
+            path: slot.path,
+            initializer,
+            initial_value,
+        })
+    }
+}
+
+impl RuntimeStorageRootInitialCopy {
+    fn from_root_slot(slot: &RuntimeStorageRootSlot) -> Option<Self> {
+        let RuntimeInitialValue::RootInitialField { path } = &slot.initializer else {
+            return None;
+        };
+        Some(Self {
+            target: slot.path.clone(),
+            source: path.clone(),
+        })
+    }
+}
+
+impl RuntimeStorageListSlot {
+    fn from_compiler_synthetic(slot: CompilerStorageListSlot) -> RuntimeResult<Self> {
+        if !slot.synthetic_list_view_storage
+            || !matches!(
+                slot.initializer_kind,
+                CompilerStorageListInitializerKind::SyntheticListViewStorage
+            )
+        {
+            return Err(format!(
+                "compiler storage list slot `{}` is not a valid synthetic list-view slot",
+                slot.name
+            )
+            .into());
+        }
+        Ok(Self {
+            id: ListId(slot.id),
+            name: slot.name,
+            capacity: slot.capacity,
+            row_scope: slot.row_scope,
+            synthetic_list_view_storage: true,
+            initializer_kind: RuntimeStorageListInitializerKind::SyntheticListViewStorage,
+            row_template: RuntimeStorageRowTemplate::default(),
+            initial_rows: Vec::new(),
+        })
+    }
+}
+
+impl RuntimeStorageIndexedRowInitialReset {
+    fn from_compiler(reset: CompilerStorageIndexedRowInitialReset) -> Self {
+        Self {
+            list: reset.list,
+            target_field: reset.target_field,
+            source_field: reset.source_field,
+            original_source_path: reset.original_source_path,
+        }
+    }
+}
+
 impl RuntimeStorageRowTemplate {
+    fn from_compiler(template: CompilerStorageRowTemplate) -> RuntimeResult<Self> {
+        Ok(Self {
+            fields: template
+                .fields
+                .into_iter()
+                .map(|field| {
+                    Ok(RuntimeStorageRowFieldTemplate {
+                        field_name: field.field_name,
+                        initial_value: RuntimeInitialValue::from_compiler(field.initial_value)?,
+                        missing_row_initial_value: field
+                            .missing_row_initial_value
+                            .map(field_value_from_compiler),
+                    })
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        })
+    }
+
     fn from_runtime_template(template: &RuntimeRowSnapshotTemplate) -> RuntimeResult<Self> {
         Ok(Self {
             fields: template
@@ -18296,7 +13160,7 @@ impl RuntimeStorageRowTemplate {
                 .map(|field| {
                     Ok(RuntimeStorageRowFieldTemplate {
                         field_name: field.field_name.to_string(),
-                        initial_value: RuntimeInitialValue::from_initial(&field.initial_value)?,
+                        initial_value: field.initial_value.clone(),
                         missing_row_initial_value: field.missing_row_initial_value.clone(),
                     })
                 })
@@ -18312,7 +13176,7 @@ impl RuntimeStorageRowTemplate {
                 .map(|field| RuntimeRowSnapshotFieldTemplate {
                     field_name: field.field_name.clone().into_boxed_str(),
                     field_id: FieldSlotId::from_path(&field.field_name),
-                    initial_value: field.initial_value.to_initial_value(),
+                    initial_value: field.initial_value.clone(),
                     missing_row_initial_value: field.missing_row_initial_value.clone(),
                 })
                 .collect(),
@@ -18321,45 +13185,19 @@ impl RuntimeStorageRowTemplate {
 }
 
 impl RuntimeInitialValue {
-    fn from_initial(initial: &InitialValue) -> RuntimeResult<Self> {
+    fn from_compiler(initial: CompilerInitialValue) -> RuntimeResult<Self> {
         match initial {
-            InitialValue::Text { value } => Ok(Self::Text(value.clone())),
-            InitialValue::Number { value } => Ok(Self::Number(*value)),
-            InitialValue::Byte { value } => Ok(Self::Byte(*value)),
-            InitialValue::Bool { value } => Ok(Self::Bool(*value)),
-            InitialValue::Bytes { bytes, .. } => Ok(Self::Bytes(bytes.clone())),
-            InitialValue::Enum { value } => Ok(Self::Enum(value.clone())),
-            InitialValue::RootInitialField { path } => {
-                Ok(Self::RootInitialField { path: path.clone() })
-            }
-            InitialValue::RowInitialField { path } => {
-                Ok(Self::RowInitialField { path: path.clone() })
-            }
-            InitialValue::Unknown { summary } => {
+            CompilerInitialValue::Text(value) => Ok(Self::Text(value)),
+            CompilerInitialValue::Number(value) => Ok(Self::Number(value)),
+            CompilerInitialValue::Byte(value) => Ok(Self::Byte(value)),
+            CompilerInitialValue::Bool(value) => Ok(Self::Bool(value)),
+            CompilerInitialValue::Bytes(bytes) => Ok(Self::Bytes(bytes)),
+            CompilerInitialValue::Enum(value) => Ok(Self::Enum(value)),
+            CompilerInitialValue::RootInitialField { path } => Ok(Self::RootInitialField { path }),
+            CompilerInitialValue::RowInitialField { path } => Ok(Self::RowInitialField { path }),
+            CompilerInitialValue::Unknown { summary } => {
                 Err(format!("unsupported state initializer `{summary}`").into())
             }
-        }
-    }
-
-    fn to_initial_value(&self) -> InitialValue {
-        match self {
-            Self::Text(value) => InitialValue::Text {
-                value: value.clone(),
-            },
-            Self::Number(value) => InitialValue::Number { value: *value },
-            Self::Byte(value) => InitialValue::Byte { value: *value },
-            Self::Bool(value) => InitialValue::Bool { value: *value },
-            Self::Bytes(bytes) => InitialValue::Bytes {
-                bytes: bytes.clone(),
-                fixed_len: Some(bytes.len()),
-            },
-            Self::Enum(value) => InitialValue::Enum {
-                value: value.clone(),
-            },
-            Self::RootInitialField { path } => {
-                InitialValue::RootInitialField { path: path.clone() }
-            }
-            Self::RowInitialField { path } => InitialValue::RowInitialField { path: path.clone() },
         }
     }
 
@@ -18383,17 +13221,393 @@ impl RuntimeInitialValue {
 }
 
 impl RuntimeGenericDerivedPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
+    fn from_compiler(compiler_plan: CompilerGenericDerivedPlan) -> Self {
+        RuntimeGenericDerivedPlan::from_compiler_runtime_plan(compiler_plan.runtime_plan)
+    }
+
+    fn from_compiler_runtime_plan(compiler_plan: CompilerRuntimeGenericDerivedPlan) -> Self {
+        Self {
+            functions: compiler_plan
+                .functions
+                .into_iter()
+                .map(RuntimeGenericFunction::from_compiler)
+                .map(|function| (function.name.clone(), function))
+                .collect(),
+            output_roots: compiler_plan
+                .output_roots
+                .into_iter()
+                .map(RuntimeGenericOutputRoot::from_compiler)
+                .collect(),
+            root_fields: compiler_plan
+                .root_fields
+                .into_iter()
+                .map(RuntimeGenericDerivedRootField::from_compiler)
+                .collect(),
+            indexed_fields: compiler_plan
+                .indexed_fields
+                .into_iter()
+                .map(RuntimeGenericDerivedIndexedField::from_compiler)
+                .collect(),
+            unsupported_reasons: compiler_plan.unsupported_reasons,
+        }
+    }
+
+    fn root_field_plan(&self, path: &str) -> Option<&RuntimeGenericDerivedRootField> {
+        self.root_fields
+            .iter()
+            .find(|field| root_state_path_matches_runtime_path(&field.path, path))
+    }
+
+    fn output_root_plan(&self, root: &str) -> Option<&RuntimeGenericOutputRoot> {
+        self.output_roots.iter().find(|output| output.root == root)
+    }
+
+    fn indexed_field_plan(
+        &self,
+        key: &GenericDerivedKey,
+    ) -> Option<&RuntimeGenericDerivedIndexedField> {
+        self.indexed_fields
+            .iter()
+            .find(|field| field.list == key.list && field.field == key.field)
+    }
+
+    fn supported_root_count(&self) -> usize {
+        self.root_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .count()
+    }
+
+    fn supported_indexed_count(&self) -> usize {
+        self.indexed_fields
+            .iter()
+            .filter(|field| field.statement.is_some())
+            .count()
+    }
+
+    fn function(&self, function: &str) -> Option<&RuntimeGenericFunction> {
+        self.functions.get(function).or_else(|| {
+            function
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| self.functions.get(suffix))
+        })
+    }
+}
+
+impl RuntimeGenericFunction {
+    fn from_compiler(function: CompilerRuntimeGenericFunction) -> Self {
+        Self {
+            name: function.name,
+            args: function.args,
+            statement: RuntimeGenericStatement::from_compiler(function.statement),
+        }
+    }
+}
+
+impl RuntimeGenericOutputRoot {
+    fn from_compiler(output: CompilerRuntimeGenericOutputRoot) -> Self {
+        Self {
+            root: output.root,
+            output_kind: output.output_kind,
+            typed_contract_known: output.typed_contract_known,
+            generic_output_port: output.generic_output_port,
+            statement: output.statement.map(RuntimeGenericStatement::from_compiler),
+            unsupported_reason: output.unsupported_reason,
+        }
+    }
+}
+
+impl RuntimeGenericDerivedRootField {
+    fn from_compiler(field: CompilerRuntimeGenericRootField) -> Self {
+        Self {
+            path: field.path,
+            kind: field.kind,
+            has_sources: field.has_sources,
+            statement: field.statement.map(RuntimeGenericStatement::from_compiler),
+            unsupported_reason: field.unsupported_reason,
+        }
+    }
+}
+
+impl RuntimeGenericDerivedIndexedField {
+    fn from_compiler(field: CompilerRuntimeGenericIndexedField) -> Self {
+        Self {
+            list: field.list,
+            row_scope: field.row_scope,
+            field: field.field,
+            kind: field.kind,
+            startup_recompute: field.startup_recompute,
+            statement: field.statement.map(RuntimeGenericStatement::from_compiler),
+            unsupported_reason: field.unsupported_reason,
+        }
+    }
+}
+
+impl RuntimeGenericStatement {
+    fn from_compiler(statement: CompilerRuntimeGenericStatement) -> Self {
+        match statement {
+            CompilerRuntimeGenericStatement::Empty => Self::Empty,
+            CompilerRuntimeGenericStatement::Expr(expr) => {
+                Self::Expr(RuntimeGenericExpr::from_compiler(expr))
+            }
+            CompilerRuntimeGenericStatement::Binding { name, value } => Self::Binding {
+                name,
+                value: Box::new(Self::from_compiler(*value)),
+            },
+            CompilerRuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                Self::ExprWithChildren {
+                    expr: RuntimeGenericExpr::from_compiler(expr),
+                    children: children.into_iter().map(Self::from_compiler).collect(),
+                }
+            }
+            CompilerRuntimeGenericStatement::Block(statements) => {
+                Self::Block(statements.into_iter().map(Self::from_compiler).collect())
+            }
+            CompilerRuntimeGenericStatement::List(statements) => {
+                Self::List(statements.into_iter().map(Self::from_compiler).collect())
+            }
+            CompilerRuntimeGenericStatement::Record(fields) => Self::Record(
+                fields
+                    .into_iter()
+                    .map(RuntimeGenericRecordField::from_compiler)
+                    .collect(),
+            ),
+            CompilerRuntimeGenericStatement::Latest(statements) => {
+                Self::Latest(statements.into_iter().map(Self::from_compiler).collect())
+            }
+        }
+    }
+
+    fn collect_user_function_calls(
+        &self,
+        functions: &BTreeMap<String, RuntimeGenericFunction>,
+        unsupported_functions: &BTreeMap<String, String>,
+        output: &mut Vec<String>,
+    ) {
+        match self {
+            RuntimeGenericStatement::Empty => {}
+            RuntimeGenericStatement::Expr(expr) => {
+                expr.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericStatement::Binding { value, .. } => {
+                value.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                expr.collect_user_function_calls(functions, unsupported_functions, output);
+                for child in children {
+                    child.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericStatement::Block(statements)
+            | RuntimeGenericStatement::List(statements)
+            | RuntimeGenericStatement::Latest(statements) => {
+                for statement in statements {
+                    statement.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericStatement::Record(fields) => {
+                for field in fields {
+                    field.value.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl RuntimeGenericRecordField {
+    fn from_compiler(field: CompilerRuntimeGenericRecordField) -> Self {
+        Self {
+            name: field.name,
+            value: RuntimeGenericStatement::from_compiler(field.value),
+        }
+    }
+}
+
+impl RuntimeGenericExpr {
+    fn from_compiler(expr: CompilerRuntimeGenericExpr) -> Self {
+        match expr {
+            CompilerRuntimeGenericExpr::Identifier(name) => Self::Identifier(name),
+            CompilerRuntimeGenericExpr::Path(parts) => Self::Path(parts),
+            CompilerRuntimeGenericExpr::Text(value) => Self::Text(value),
+            CompilerRuntimeGenericExpr::Number(value) => Self::Number(value),
+            CompilerRuntimeGenericExpr::NaN => Self::NaN,
+            CompilerRuntimeGenericExpr::Bool(value) => Self::Bool(value),
+            CompilerRuntimeGenericExpr::Enum(value) => Self::Enum(value),
+            CompilerRuntimeGenericExpr::TaggedObject { tag, fields } => Self::TaggedObject {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(RuntimeGenericRecordExprField::from_compiler)
+                    .collect(),
+            },
+            CompilerRuntimeGenericExpr::Call { function, args } => Self::Call {
+                function,
+                args: args
+                    .into_iter()
+                    .map(RuntimeGenericArg::from_compiler)
+                    .collect(),
+            },
+            CompilerRuntimeGenericExpr::Pipe { input, op, args } => Self::Pipe {
+                input: Box::new(Self::from_compiler(*input)),
+                op,
+                args: args
+                    .into_iter()
+                    .map(RuntimeGenericArg::from_compiler)
+                    .collect(),
+            },
+            CompilerRuntimeGenericExpr::Infix { left, op, right } => Self::Infix {
+                left: Box::new(Self::from_compiler(*left)),
+                op,
+                right: Box::new(Self::from_compiler(*right)),
+            },
+            CompilerRuntimeGenericExpr::Record(fields) => Self::Record(
+                fields
+                    .into_iter()
+                    .map(RuntimeGenericRecordExprField::from_compiler)
+                    .collect(),
+            ),
+            CompilerRuntimeGenericExpr::List(items) => {
+                Self::List(items.into_iter().map(Self::from_compiler).collect())
+            }
+            CompilerRuntimeGenericExpr::Bytes { size, items } => Self::Bytes {
+                size,
+                items: items.into_iter().map(Self::from_compiler).collect(),
+            },
+            CompilerRuntimeGenericExpr::Then { input, output } => Self::Then {
+                input: Box::new(Self::from_compiler(*input)),
+                output: output.map(|output| Box::new(Self::from_compiler(*output))),
+            },
+            CompilerRuntimeGenericExpr::When { input } => Self::When {
+                input: Box::new(Self::from_compiler(*input)),
+            },
+            CompilerRuntimeGenericExpr::MatchArm { pattern, output } => Self::MatchArm {
+                pattern,
+                output: output.map(|output| Box::new(Self::from_compiler(*output))),
+            },
+            CompilerRuntimeGenericExpr::Delimiter => Self::Delimiter,
+        }
+    }
+
+    fn collect_user_function_calls(
+        &self,
+        functions: &BTreeMap<String, RuntimeGenericFunction>,
+        unsupported_functions: &BTreeMap<String, String>,
+        output: &mut Vec<String>,
+    ) {
+        match self {
+            RuntimeGenericExpr::Call { function, args } => {
+                collect_runtime_user_function_call(
+                    function,
+                    functions,
+                    unsupported_functions,
+                    output,
+                );
+                for arg in args {
+                    arg.value
+                        .collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Pipe { input, op, args } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+                collect_runtime_user_function_call(op, functions, unsupported_functions, output);
+                for arg in args {
+                    arg.value
+                        .collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Infix { left, right, .. } => {
+                left.collect_user_function_calls(functions, unsupported_functions, output);
+                right.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::TaggedObject { fields, .. }
+            | RuntimeGenericExpr::Record(fields) => {
+                for field in fields {
+                    field.value.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+            RuntimeGenericExpr::List(items) | RuntimeGenericExpr::Bytes { items, .. } => {
+                for item in items {
+                    item.collect_user_function_calls(functions, unsupported_functions, output);
+                }
+            }
+            RuntimeGenericExpr::Then {
+                input,
+                output: then_output,
+            } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+                if let Some(output_expr) = then_output {
+                    output_expr.collect_user_function_calls(
+                        functions,
+                        unsupported_functions,
+                        output,
+                    );
+                }
+            }
+            RuntimeGenericExpr::When { input } => {
+                input.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::MatchArm {
+                output: Some(output_expr),
+                ..
+            } => {
+                output_expr.collect_user_function_calls(functions, unsupported_functions, output);
+            }
+            RuntimeGenericExpr::Identifier(_)
+            | RuntimeGenericExpr::Path(_)
+            | RuntimeGenericExpr::Text(_)
+            | RuntimeGenericExpr::Number(_)
+            | RuntimeGenericExpr::NaN
+            | RuntimeGenericExpr::Bool(_)
+            | RuntimeGenericExpr::Enum(_)
+            | RuntimeGenericExpr::MatchArm { output: None, .. }
+            | RuntimeGenericExpr::Delimiter => {}
+        }
+    }
+}
+
+impl RuntimeGenericRecordExprField {
+    fn from_compiler(field: CompilerRuntimeGenericRecordExprField) -> Self {
+        Self {
+            name: field.name,
+            value: RuntimeGenericExpr::from_compiler(field.value),
+            spread: field.spread,
+        }
+    }
+}
+
+impl RuntimeGenericArg {
+    fn from_compiler(arg: CompilerRuntimeGenericArg) -> Self {
+        Self {
+            name: arg.name,
+            value: RuntimeGenericExpr::from_compiler(arg.value),
+        }
+    }
+}
+
+impl RuntimeGenericDerivedPlan {
+    fn legacy_from_compiler_ast(compiler_plan: CompilerGenericDerivedPlan) -> Self {
         let mut plan = Self::default();
-        let function_names = ir
+        let function_names = compiler_plan
             .functions
             .iter()
             .map(|function| function.name.clone())
             .collect::<BTreeSet<_>>();
         let mut compiled_functions = BTreeMap::new();
         let mut unsupported_functions = BTreeMap::new();
-        for function in &ir.functions {
-            match RuntimeGenericFunction::from_ir(function, &ir.expressions, &function_names) {
+        for function in &compiler_plan.functions {
+            match RuntimeGenericFunction::from_compiler_ast(
+                function,
+                &compiler_plan.expressions,
+                &function_names,
+            ) {
                 Ok(compiled) => {
                     compiled_functions.insert(function.name.clone(), compiled);
                 }
@@ -18402,10 +13616,10 @@ impl RuntimeGenericDerivedPlan {
                 }
             }
         }
-        for output in &ir.output_values {
+        for output in &compiler_plan.output_roots {
             let compiled = RuntimeGenericStatement::from_ast(
                 &output.statement,
-                &ir.expressions,
+                &compiler_plan.expressions,
                 &function_names,
             );
             let (statement, unsupported_reason) = match compiled {
@@ -18424,19 +13638,10 @@ impl RuntimeGenericDerivedPlan {
                 unsupported_reason,
             });
         }
-        for value in ir.derived_values.iter().filter(|value| {
-            !value.indexed
-                && value.scope_id.is_none()
-                && matches!(
-                    value.kind,
-                    DerivedValueKind::Pure
-                        | DerivedValueKind::SourceEventTransform
-                        | DerivedValueKind::ListView
-                )
-        }) {
+        for value in &compiler_plan.root_fields {
             let compiled = RuntimeGenericStatement::from_ast(
                 &value.statement,
-                &ir.expressions,
+                &compiler_plan.expressions,
                 &function_names,
             );
             let (statement, unsupported_reason) = match compiled {
@@ -18449,52 +13654,36 @@ impl RuntimeGenericDerivedPlan {
             plan.root_fields.push(RuntimeGenericDerivedRootField {
                 path: value.path.clone(),
                 kind: value.kind.clone(),
-                has_sources: !value.sources.is_empty(),
+                has_sources: value.has_sources,
                 statement,
                 unsupported_reason,
             });
         }
-        for value in ir.derived_values.iter().filter(|value| {
-            (value.indexed || value.scope_id.is_some())
-                && matches!(
-                    value.kind,
-                    DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
-                )
-        }) {
-            if let Some((row_scope, field)) = value.path.split_once('.') {
-                let list = ir
-                    .row_scopes
-                    .iter()
-                    .find(|scope| scope.row_scope == row_scope)
-                    .map(|scope| scope.list.clone());
-                let Some(list) = list else {
-                    continue;
-                };
-                let compiled = RuntimeGenericStatement::from_ast(
-                    &value.statement,
-                    &ir.expressions,
-                    &function_names,
-                );
-                let (statement, unsupported_reason) = match compiled {
-                    Ok(statement) => (Some(statement), None),
-                    Err(reason) => {
-                        *plan.unsupported_reasons.entry(reason.clone()).or_default() += 1;
-                        (None, Some(reason))
-                    }
-                };
-                plan.indexed_fields.push(RuntimeGenericDerivedIndexedField {
-                    list,
-                    row_scope: row_scope.to_owned(),
-                    field: field.to_owned(),
-                    kind: value.kind.clone(),
-                    startup_recompute: value.startup_recompute,
-                    statement,
-                    unsupported_reason,
-                });
-            }
+        for value in &compiler_plan.indexed_fields {
+            let compiled = RuntimeGenericStatement::from_ast(
+                &value.statement,
+                &compiler_plan.expressions,
+                &function_names,
+            );
+            let (statement, unsupported_reason) = match compiled {
+                Ok(statement) => (Some(statement), None),
+                Err(reason) => {
+                    *plan.unsupported_reasons.entry(reason.clone()).or_default() += 1;
+                    (None, Some(reason))
+                }
+            };
+            plan.indexed_fields.push(RuntimeGenericDerivedIndexedField {
+                list: value.list.clone(),
+                row_scope: value.row_scope.clone(),
+                field: value.field.clone(),
+                kind: value.kind.clone(),
+                startup_recompute: value.startup_recompute,
+                statement,
+                unsupported_reason,
+            });
         }
         let reachable_functions =
-            plan.reachable_function_names(&compiled_functions, &unsupported_functions);
+            plan.legacy_reachable_function_names(&compiled_functions, &unsupported_functions);
         for function in &reachable_functions.missing {
             let reason = unsupported_functions
                 .get(function)
@@ -18560,17 +13749,17 @@ impl RuntimeGenericDerivedPlan {
         plan
     }
 
-    fn root_field_plan(&self, path: &str) -> Option<&RuntimeGenericDerivedRootField> {
+    fn legacy_root_field_plan(&self, path: &str) -> Option<&RuntimeGenericDerivedRootField> {
         self.root_fields
             .iter()
             .find(|field| root_state_path_matches_runtime_path(&field.path, path))
     }
 
-    fn output_root_plan(&self, root: &str) -> Option<&RuntimeGenericOutputRoot> {
+    fn legacy_output_root_plan(&self, root: &str) -> Option<&RuntimeGenericOutputRoot> {
         self.output_roots.iter().find(|output| output.root == root)
     }
 
-    fn indexed_field_plan(
+    fn legacy_indexed_field_plan(
         &self,
         key: &GenericDerivedKey,
     ) -> Option<&RuntimeGenericDerivedIndexedField> {
@@ -18579,21 +13768,21 @@ impl RuntimeGenericDerivedPlan {
             .find(|field| field.list == key.list && field.field == key.field)
     }
 
-    fn supported_root_count(&self) -> usize {
+    fn legacy_supported_root_count(&self) -> usize {
         self.root_fields
             .iter()
             .filter(|field| field.statement.is_some())
             .count()
     }
 
-    fn supported_indexed_count(&self) -> usize {
+    fn legacy_supported_indexed_count(&self) -> usize {
         self.indexed_fields
             .iter()
             .filter(|field| field.statement.is_some())
             .count()
     }
 
-    fn function(&self, function: &str) -> Option<&RuntimeGenericFunction> {
+    fn legacy_function(&self, function: &str) -> Option<&RuntimeGenericFunction> {
         self.functions.get(function).or_else(|| {
             function
                 .rsplit_once('/')
@@ -18601,7 +13790,7 @@ impl RuntimeGenericDerivedPlan {
         })
     }
 
-    fn reachable_function_names(
+    fn legacy_reachable_function_names(
         &self,
         functions: &BTreeMap<String, RuntimeGenericFunction>,
         unsupported_functions: &BTreeMap<String, String>,
@@ -18653,8 +13842,8 @@ struct ReachableRuntimeFunctions {
 }
 
 impl RuntimeGenericFunction {
-    fn from_ir(
-        function: &FunctionDefinition,
+    fn from_compiler_ast(
+        function: &boon_compiler::CompilerGenericDerivedFunction,
         expressions: &[AstExpr],
         functions: &BTreeSet<String>,
     ) -> Result<Self, String> {
@@ -18793,7 +13982,7 @@ impl RuntimeGenericStatement {
         }
     }
 
-    fn collect_user_function_calls(
+    fn legacy_collect_user_function_calls(
         &self,
         functions: &BTreeMap<String, RuntimeGenericFunction>,
         unsupported_functions: &BTreeMap<String, String>,
@@ -18941,7 +14130,7 @@ impl RuntimeGenericExpr {
         }
     }
 
-    fn collect_user_function_calls(
+    fn legacy_collect_user_function_calls(
         &self,
         functions: &BTreeMap<String, RuntimeGenericFunction>,
         unsupported_functions: &BTreeMap<String, String>,
@@ -19077,6 +14266,7 @@ fn runtime_generic_call_supported(
     match function {
         "SOURCE"
         | "Text/empty"
+        | "Text/space"
         | "Text/concat"
         | "Text/trim"
         | "Text/to_number"
@@ -19226,38 +14416,30 @@ fn runtime_generic_expr_kind_label(kind: &AstExprKind) -> &'static str {
 
 impl RuntimeDocumentLoweringTables {
     fn from_ir(
-        ir: &TypedProgram,
         root_summary_paths: Vec<String>,
         list_summary_fields: Vec<ListSummaryFields>,
         dynamic_list_view_lists: BTreeSet<String>,
-        list_projections: &ListProjectionPlan,
-        storage_initialization: &RuntimeStorageInitializationPlan,
+        observed_root_paths: BTreeSet<String>,
+        projection_storage_resolutions: BTreeMap<String, String>,
+        unresolved_projection_storage_paths: BTreeSet<String>,
+        compiler_render_slots: CompilerDocumentRenderSlots,
     ) -> Self {
-        let (projection_storage_resolutions, unresolved_projection_storage_paths) =
-            runtime_document_projection_storage_resolutions(
-                ir,
-                list_projections,
-                storage_initialization,
-            );
-        let render_slots = ir
-            .typecheck_report
-            .render_slot_table
+        let render_slots = compiler_render_slots
             .slots
-            .iter()
+            .into_iter()
             .map(|slot| RuntimeDocumentRenderSlot {
                 slot_statement_id: slot.slot_statement_id,
-                slot_name: slot.slot_name.clone(),
-                expected_contract: slot.expected_contract.clone(),
+                slot_name: slot.slot_name,
+                expected_contract: slot.expected_contract,
                 value_expr_id: slot.value_expr_id,
-                actual_type: serde_json::to_value(&slot.actual_type)
-                    .unwrap_or_else(|_| json!({"serialization_error": "actual_type"})),
-                diagnostic_count: slot.diagnostics.len(),
+                actual_type: slot.actual_type,
+                diagnostic_count: slot.diagnostic_count,
                 optional_list_map_binding_id: slot.optional_list_map_binding_id,
                 item_scope_id: slot.item_scope_id,
-                template_function: slot.template_function.clone(),
-                template_arg_count: slot.template_args.len(),
-                materialization_policy: RuntimeDocumentMaterializationPolicy::from_typecheck(
-                    slot.materialization_policy,
+                template_function: slot.template_function,
+                template_arg_count: slot.template_arg_count,
+                materialization_policy: RuntimeDocumentMaterializationPolicy::from_compiler_label(
+                    &slot.materialization_policy,
                 ),
             })
             .collect();
@@ -19268,14 +14450,14 @@ impl RuntimeDocumentLoweringTables {
             dynamic_list_view_lists,
             projection_storage_resolutions,
             unresolved_projection_storage_paths,
-            render_slot_table_hash: render_slot_table_hash(ir),
-            render_slot_count: ir.typecheck_report.render_slot_count,
-            render_slot_failure_count: ir.typecheck_report.render_slot_failure_count,
-            full_document_typecheck_coverage: ir.typecheck_report.full_document_typecheck_coverage,
-            list_map_binding_count_render_slot_materialization: ir
-                .typecheck_report
+            render_slot_table_hash: compiler_render_slots.render_slot_table_hash,
+            render_slot_count: compiler_render_slots.render_slot_count,
+            render_slot_failure_count: compiler_render_slots.render_slot_failure_count,
+            full_document_typecheck_coverage: compiler_render_slots
+                .full_document_typecheck_coverage,
+            list_map_binding_count_render_slot_materialization: compiler_render_slots
                 .list_map_binding_count_render_slot_materialization,
-            observed_root_paths: observed_root_paths_from_view_bindings(ir),
+            observed_root_paths,
             render_slots,
             render_patch_lowering: RuntimeRenderPatchLoweringTables::generic(),
         }
@@ -19314,13 +14496,12 @@ impl RuntimeDocumentSummaryLimits {
 }
 
 impl RuntimeDocumentMaterializationPolicy {
-    fn from_typecheck(policy: boon_typecheck::MaterializationPolicy) -> Self {
+    fn from_compiler_label(policy: &str) -> Self {
         match policy {
-            boon_typecheck::MaterializationPolicy::RuntimeValue => Self::RuntimeValue,
-            boon_typecheck::MaterializationPolicy::RenderSlotMaterialization => {
-                Self::RenderSlotMaterialization
-            }
-            boon_typecheck::MaterializationPolicy::StaticChildren => Self::StaticChildren,
+            "RuntimeValue" => Self::RuntimeValue,
+            "RenderSlotMaterialization" => Self::RenderSlotMaterialization,
+            "StaticChildren" => Self::StaticChildren,
+            _ => Self::RuntimeValue,
         }
     }
 
@@ -19345,214 +14526,140 @@ impl RuntimeRenderPatchLoweringTables {
     }
 }
 
-fn runtime_document_projection_storage_resolutions(
-    ir: &TypedProgram,
-    list_projections: &ListProjectionPlan,
-    storage_initialization: &RuntimeStorageInitializationPlan,
-) -> (BTreeMap<String, String>, BTreeSet<String>) {
-    let storage_list_names = storage_initialization
-        .list_slots
-        .iter()
-        .map(|slot| slot.name.clone())
-        .collect::<BTreeSet<_>>();
-    let mut resolutions = BTreeMap::new();
-    let mut unresolved = BTreeSet::new();
-    for projection in &list_projections.projections {
-        if resolutions.contains_key(&projection.list) {
-            continue;
-        }
-        if let Some(list) =
-            runtime_document_storage_list_name_for_path(&projection.list, &storage_list_names)
-        {
-            resolutions.insert(projection.list.clone(), list);
-            continue;
-        }
-        if let Some((_, list)) = runtime_document_direct_root_list_ref_for_path(
-            ir,
-            &projection.list,
-            &storage_list_names,
-        ) {
-            resolutions.insert(projection.list.clone(), list);
-            continue;
-        }
-        unresolved.insert(projection.list.clone());
-    }
-    (resolutions, unresolved)
-}
-
-fn runtime_document_storage_list_name_for_path(
-    path: &str,
-    storage_list_names: &BTreeSet<String>,
-) -> Option<String> {
-    if storage_list_names.contains(path) {
-        return Some(path.to_owned());
-    }
-    if let Some(stripped) = path.strip_prefix("store.")
-        && storage_list_names.contains(stripped)
-    {
-        return Some(stripped.to_owned());
-    }
-    let local = row_field_name(path);
-    storage_list_names.contains(local).then(|| local.to_owned())
-}
-
-fn runtime_document_direct_root_list_ref_for_path(
-    ir: &TypedProgram,
-    path: &str,
-    storage_list_names: &BTreeSet<String>,
-) -> Option<(String, String)> {
-    let value = ir
-        .derived_values
-        .iter()
-        .find(|value| !value.indexed && root_state_path_matches_runtime_path(&value.path, path))?;
-    runtime_document_direct_root_list_ref_for_statement(ir, &value.statement, storage_list_names)
-}
-
-fn runtime_document_direct_root_list_ref_for_statement(
-    ir: &TypedProgram,
-    statement: &AstStatement,
-    storage_list_names: &BTreeSet<String>,
-) -> Option<(String, String)> {
-    if !statement.children.is_empty() {
-        return None;
-    }
-    let expr = ir.expressions.get(statement.expr?)?;
-    let referenced = match &expr.kind {
-        AstExprKind::Identifier(name) => name.clone(),
-        AstExprKind::Path(parts) if !parts.is_empty() => parts.join("."),
-        _ => return None,
-    };
-    let plan = ir.derived_values.iter().find(|value| {
-        !value.indexed
-            && value.scope_id.is_none()
-            && matches!(value.kind, DerivedValueKind::ListView)
-            && root_state_path_matches_runtime_path(&value.path, &referenced)
-    })?;
-    let list = runtime_document_storage_list_name_for_path(&plan.path, storage_list_names)?;
-    Some((plan.path.clone(), list))
-}
-
 impl CompiledProgram {
-    fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
-        let symbols = RuntimeSymbols::from_ir(ir);
-        for cell in &ir.state_cells {
-            if let InitialValue::Unknown { summary } = &cell.initial_value {
-                return Err(format!(
-                    "state cell `{}` has unsupported initializer `{summary}`",
-                    cell.path
-                )
-                .into());
-            }
-        }
-        for list in &ir.lists {
-            if let ListInitializer::Unknown { summary } = &list.initializer {
-                if !ir_list_has_derived_list_view(ir, &list.name) {
-                    return Err(format!(
-                        "list `{}` has unsupported initializer `{summary}`",
-                        list.name
-                    )
-                    .into());
-                }
-            }
-            if list.graph_clones_per_item != 0 {
-                return Err(format!(
-                    "list `{}` would clone {} graph nodes per item",
-                    list.name, list.graph_clones_per_item
-                )
-                .into());
-            }
-        }
-        let unsupported_update_branch_count = ir
-            .update_branches
-            .iter()
-            .filter(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
-            .count();
-        if let Some(branch) = ir
-            .update_branches
-            .iter()
-            .find(|branch| matches!(branch.expression, UpdateExpression::Unknown { .. }))
-        {
-            let UpdateExpression::Unknown { summary } = &branch.expression else {
-                unreachable!();
-            };
-            return Err(format!(
-                "update branch `{}` from `{}` has unsupported expression `{summary}`",
-                branch.target, branch.source
-            )
-            .into());
-        }
-        let unsupported_list_operation_count = ir
-            .list_operations
-            .iter()
-            .filter(|operation| list_operation_has_unknown_predicate(operation))
-            .count();
-        if let Some(operation) = ir
-            .list_operations
-            .iter()
-            .find(|operation| list_operation_has_unknown_predicate(operation))
-        {
-            return Err(format!(
-                "list operation for `{}` has unsupported predicate",
-                operation.list
-            )
-            .into());
-        }
-        let storage_initialization = RuntimeStorageInitializationPlan::from_ir(ir)?;
-        let scalar_equations = ScalarEquationPlan::from_ir(ir);
-        let derived_equations = DerivedEquationPlan::from_ir(ir);
-        let generic_derived = GenericDerivedPlan::from_ir(ir);
-        let generic_derived_runtime = RuntimeGenericDerivedPlan::from_ir(ir);
+    fn source_program_metadata(&self, context: &str) -> &CompilerTypedProgramReportMetadata {
+        self.program_metadata
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built typed program metadata"))
+    }
+
+    fn source_typecheck_metadata(&self, context: &str) -> &CompilerTypecheckReportMetadata {
+        self.typecheck_metadata
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built typecheck metadata"))
+    }
+
+    fn source_inventory_counts(&self, context: &str) -> &CompilerTypedProgramInventoryCounts {
+        self.inventory_counts
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built inventory counts"))
+    }
+
+    fn source_runtime_profile_metadata(&self, context: &str) -> &CompilerRuntimeProfileMetadata {
+        self.runtime_profile_metadata
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built runtime profile metadata"))
+    }
+
+    fn source_ir_debug_tables(&self, context: &str) -> &JsonValue {
+        self.ir_debug_tables
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built IR debug tables"))
+    }
+
+    fn source_route_bool_facts(&self, context: &str) -> &CompilerSourceRouteBoolFacts {
+        self.source_route_bool_facts
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context} requires source-built source-route bool facts"))
+    }
+
+    fn from_compiler_runtime_program(program: CompilerRuntimeProgram) -> RuntimeResult<Self> {
+        let CompilerRuntimeProgram {
+            symbols,
+            unsupported_diagnostics,
+            storage_root_slots,
+            storage_indexed_row_initial_resets,
+            storage_list_slots,
+            storage_row_templates,
+            storage_initial_rows,
+            storage_indexed_derived_fields,
+            scalar_equations,
+            derived_equations,
+            generic_derived_plan,
+            list_operations,
+            list_projections,
+            root_state_paths,
+            list_summary_fields,
+            dynamic_list_view_lists,
+            observed_root_paths,
+            projection_storage,
+            document_render_slots,
+            field_slot_collision_diagnostics,
+            source_route_root_targets,
+            source_route_sources,
+            source_route_bool_facts,
+            source_route_router_targets,
+            source_route_root_text_transform_targets,
+            mut static_analysis,
+            list_source_bindings,
+            source_payload_counts,
+            storage_layout_counts,
+            inventory_counts,
+            program_metadata,
+            typecheck_metadata,
+            runtime_profile_metadata,
+            ir_debug_tables,
+        } = program;
+
+        let symbols = RuntimeSymbols::from_compiler(symbols);
+        let (unsupported_update_branch_count, unsupported_list_operation_count) =
+            validate_compiler_unsupported_runtime_diagnostics(&unsupported_diagnostics)?;
+        let storage_initialization = RuntimeStorageInitializationPlan::from_ir(
+            storage_root_slots,
+            storage_indexed_row_initial_resets,
+            storage_list_slots,
+            storage_row_templates,
+            storage_initial_rows,
+            storage_indexed_derived_fields,
+        )?;
+        let scalar_equations = ScalarEquationPlan::from_compiler(scalar_equations);
+        let derived_equations = DerivedEquationPlan::from_compiler(derived_equations);
+        let generic_derived = GenericDerivedPlan::from_compiler(generic_derived_plan.clone());
+        let generic_derived_runtime =
+            RuntimeGenericDerivedPlan::from_compiler(generic_derived_plan);
         let derived_text_transform_count = derived_equations.text_transforms.len();
-        let list_equations = ListEquationPlan::from_ir(ir);
-        let list_projections = ListProjectionPlan::from_ir(ir);
-        let mut root_state_paths = ir
-            .state_cells
-            .iter()
-            .filter(|cell| !cell.indexed)
-            .map(|cell| cell.path.clone())
+        let list_equations = ListEquationPlan::from_compiler_operations(list_operations)?;
+        let list_projections = ListProjectionPlan::from_compiler_projections(list_projections);
+        let list_summary_fields = list_summary_fields
+            .into_iter()
+            .map(ListSummaryFields::from_compiler)
             .collect::<Vec<_>>();
-        root_state_paths.extend(
-            ir.derived_values
-                .iter()
-                .filter(|value| {
-                    !value.indexed
-                        && value.scope_id.is_none()
-                        && (value.kind == DerivedValueKind::SourceEventTransform
-                            || (value.kind == DerivedValueKind::Pure
-                                && statement_contains_latest(&value.statement, &ir.expressions)))
-                })
-                .map(|value| value.path.clone()),
-        );
-        root_state_paths.sort();
-        root_state_paths.dedup();
-        let list_summary_fields = list_summary_fields_from_ir(ir);
-        let dynamic_list_view_lists = dynamic_list_view_lists_from_ir(ir);
         let document_lowering = RuntimeDocumentLoweringTables::from_ir(
-            ir,
             root_state_paths.clone(),
             list_summary_fields.clone(),
             dynamic_list_view_lists.clone(),
-            &list_projections,
-            &storage_initialization,
+            observed_root_paths,
+            projection_storage.resolutions,
+            projection_storage.unresolved_paths,
+            document_render_slots,
         );
-        let field_slot_collision_diagnostics = field_slot_collision_diagnostics(ir);
-        let root_targets = ir
-            .state_cells
-            .iter()
-            .filter(|cell| !cell.indexed)
-            .map(|cell| cell.path.as_str())
-            .collect::<BTreeSet<_>>();
+        let field_slot_collision_diagnostics = field_slot_collision_diagnostics
+            .into_iter()
+            .map(FieldSlotCollisionDiagnostic::from_compiler)
+            .collect::<Vec<_>>();
         let source_routes = SourceRoutePlan::from_plans(
-            ir,
             &scalar_equations,
             &derived_equations,
             &list_equations,
-            &root_targets,
+            &source_route_root_targets,
+            &source_route_sources,
+            &source_route_bool_facts,
+            &source_route_router_targets,
+            &source_route_root_text_transform_targets,
         )?;
+        static_analysis.source_paths = source_routes
+            .route_slots
+            .iter()
+            .map(|route| route.source.clone())
+            .collect();
+        static_analysis.source_address_lookup_fields =
+            source_address_lookup_fields_from_routes(&source_routes);
         let source_route_count = source_routes.len();
-        let list_source_bindings = ListSourceBindingPlan::from_ir(ir);
-        let source_payload_counts = SourcePayloadCounts::from_ir(ir);
-        let storage_layout_counts = TypedStorageLayoutCounts::from_ir(ir);
+        let list_source_bindings = ListSourceBindingPlan::from_compiler_slots(list_source_bindings);
+        let source_payload_counts =
+            SourcePayloadCounts::from_compiler_counts(source_payload_counts);
+        let storage_layout_counts =
+            TypedStorageLayoutCounts::from_compiler_counts(storage_layout_counts);
         Ok(Self {
             compiled_from_typed_ir: true,
             symbols,
@@ -19563,21 +14670,28 @@ impl CompiledProgram {
             list_equations,
             list_projections,
             source_routes,
+            static_analysis: Some(static_analysis),
+            program_metadata: Some(program_metadata),
+            typecheck_metadata: Some(typecheck_metadata),
+            inventory_counts: Some(inventory_counts),
+            runtime_profile_metadata: Some(runtime_profile_metadata),
+            ir_debug_tables: Some(ir_debug_tables),
+            source_route_bool_facts: Some(source_route_bool_facts),
             list_source_bindings,
             storage_initialization,
             document_lowering,
             root_state_paths,
             list_summary_fields,
             dynamic_list_view_lists,
-            schedule_node_count: ir.nodes.len(),
-            state_initializer_count: ir.state_cells.len(),
-            list_initializer_count: ir.lists.len(),
-            derived_value_count: ir.derived_values.len(),
+            schedule_node_count: inventory_counts.schedule_node_count,
+            state_initializer_count: inventory_counts.state_initializer_count,
+            list_initializer_count: inventory_counts.list_initializer_count,
+            derived_value_count: inventory_counts.derived_value_count,
             derived_text_transform_count,
-            update_branch_count: ir.update_branches.len(),
-            list_operation_count: ir.list_operations.len(),
-            list_projection_count: ir.list_projections.len(),
-            view_binding_count: ir.view_bindings.len(),
+            update_branch_count: inventory_counts.update_branch_count,
+            list_operation_count: inventory_counts.list_operation_count,
+            list_projection_count: inventory_counts.list_projection_count,
+            view_binding_count: inventory_counts.view_binding_count,
             source_payload_schema_count: source_payload_counts.schema_count,
             source_payload_field_count: source_payload_counts.field_count,
             source_payload_text_field_count: source_payload_counts.text_field_count,
@@ -19601,6 +14715,11 @@ impl CompiledProgram {
             unsupported_list_operation_count,
             field_slot_collision_diagnostics,
         })
+    }
+
+    #[cfg(test)]
+    fn from_ir(ir: &TypedProgram) -> RuntimeResult<Self> {
+        Self::from_compiler_runtime_program(compiler_runtime_program_from_ir(ir))
     }
 
     fn from_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
@@ -19754,6 +14873,13 @@ impl CompiledProgram {
             list_equations: non_route_tables.list_equations,
             list_projections: non_route_tables.list_projections,
             source_routes,
+            static_analysis: None,
+            program_metadata: None,
+            typecheck_metadata: None,
+            inventory_counts: None,
+            runtime_profile_metadata: None,
+            ir_debug_tables: None,
+            source_route_bool_facts: None,
             list_source_bindings: non_route_tables.list_source_bindings,
             storage_initialization,
             document_lowering,
@@ -19952,6 +15078,50 @@ impl CompiledProgram {
             "document_lowering": runtime_document_lowering_tables_artifact(&self.document_lowering)
         })
     }
+}
+
+fn validate_compiler_unsupported_runtime_diagnostics(
+    diagnostics: &CompilerUnsupportedRuntimeDiagnostics,
+) -> RuntimeResult<(usize, usize)> {
+    if let Some(diagnostic) = &diagnostics.unsupported_state_initializer {
+        return Err(format!(
+            "state cell `{}` has unsupported initializer `{}`",
+            diagnostic.path, diagnostic.summary
+        )
+        .into());
+    }
+    if let Some(diagnostic) = &diagnostics.unsupported_list_initializer {
+        return Err(format!(
+            "list `{}` has unsupported initializer `{}`",
+            diagnostic.list, diagnostic.summary
+        )
+        .into());
+    }
+    if let Some(diagnostic) = &diagnostics.graph_clone_list {
+        return Err(format!(
+            "list `{}` would clone {} graph nodes per item",
+            diagnostic.list, diagnostic.graph_clones_per_item
+        )
+        .into());
+    }
+    if let Some(diagnostic) = &diagnostics.unsupported_update_branch {
+        return Err(format!(
+            "update branch `{}` from `{}` has unsupported expression `{}`",
+            diagnostic.target, diagnostic.source, diagnostic.summary
+        )
+        .into());
+    }
+    if let Some(diagnostic) = &diagnostics.unsupported_list_operation {
+        return Err(format!(
+            "list operation for `{}` has unsupported predicate",
+            diagnostic.list
+        )
+        .into());
+    }
+    Ok((
+        diagnostics.unsupported_update_branch_count,
+        diagnostics.unsupported_list_operation_count,
+    ))
 }
 
 fn list_summary_fields_artifact(summary: &ListSummaryFields) -> JsonValue {
@@ -20383,7 +15553,7 @@ fn runtime_generic_derived_plan_artifact(plan: &RuntimeGenericDerivedPlan) -> Js
         "excluded_parser_ast_sections": [
             "AstStatement",
             "AstExpr",
-            "FunctionDefinition"
+            "GenericDerivedFunction"
         ]
     })
 }
@@ -22748,6 +17918,7 @@ fn source_route_artifact(route_id: usize, route: &SourceRoute) -> JsonValue {
         "indexed_text_targets": route.indexed_text_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
         "indexed_bool_targets": route.indexed_bool_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
         "indexed_value_targets": route.indexed_value_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
+        "indexed_scalar_actions": route.indexed_scalar_actions.iter().map(source_action_artifact).collect::<Vec<_>>(),
         "derived_text_targets": route.derived_text_targets,
         "router_route_targets": route.router_route_targets.iter().map(source_route_router_route_artifact).collect::<Vec<_>>(),
         "root_text_transform_targets": route.root_text_transform_targets.iter().map(source_route_root_text_transform_artifact).collect::<Vec<_>>(),
@@ -23246,6 +18417,22 @@ impl SourceRoute {
                 })
                 .transpose()?
                 .unwrap_or_default(),
+            indexed_scalar_actions: object
+                .get("indexed_scalar_actions")
+                .map(|value| {
+                    artifact_array(value, &format!("{context}.indexed_scalar_actions"))?
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            SourceAction::from_artifact(
+                                value,
+                                &format!("{context}.indexed_scalar_actions[{index}]"),
+                            )
+                        })
+                        .collect::<RuntimeResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
             derived_text_targets: artifact_string_array_field(
                 object,
                 "derived_text_targets",
@@ -23402,6 +18589,23 @@ impl SourceRouteRouterRoute {
             target: artifact_string_field(object, "target", context)?,
             path: artifact_string_field(object, "path", context)?,
         })
+    }
+}
+
+impl SourceRouteRootTextTransform {
+    fn from_compiler(target: CompilerSourceRouteRootTextTransform) -> Self {
+        Self {
+            source: target.source,
+            target: target.target,
+            value: field_value_from_compiler(target.value),
+        }
+    }
+}
+
+fn field_value_from_compiler(value: CompilerFieldValue) -> FieldValue {
+    match value {
+        CompilerFieldValue::Text(value) => FieldValue::Text(value),
+        CompilerFieldValue::Bool(value) => FieldValue::Bool(value),
     }
 }
 
@@ -23943,15 +19147,15 @@ impl CompiledArtifact {
 
     fn from_parts(
         parsed: &ParsedProgram,
-        ir: &TypedProgram,
         compiled: &CompiledProgram,
         program_hash: &str,
         typecheck_report_hash: &str,
         render_slot_table_hash: &str,
     ) -> Self {
-        let semantic_index = ir.semantic_index.report();
+        let program_metadata = compiled.source_program_metadata("compiled artifact body");
         let compiled_schedule = compiled.report();
         let source_units = compiled_artifact_source_units(parsed);
+        let typecheck_metadata = compiled.source_typecheck_metadata("compiled artifact body");
         let body = json!({
             "artifact_kind": "boonc.compiled_program",
             "artifact_version": 1,
@@ -23963,7 +19167,7 @@ impl CompiledArtifact {
             "program_hash": program_hash,
             "source_unit_hashes": source_units,
             "report_schema_hash": compiled_artifact_report_schema_hash(),
-            "semantic_index": semantic_index,
+            "semantic_index": program_metadata.semantic_index,
             "symbol_table": compiled_schedule["runtime_symbol_table"].clone(),
             "runtime_symbol_count": compiled_schedule["runtime_symbol_count"].clone(),
             "runtime_symbol_ownership": compiled_schedule["runtime_symbol_ownership"].clone(),
@@ -23979,18 +19183,18 @@ impl CompiledArtifact {
             },
             "route_op_streams": compiled_schedule["source_route_op_streams"].clone(),
             "dependency_graph": {
-                "static_schedule_verified": ir.static_schedule_verified,
-                "hidden_identity_verified": ir.hidden_identity_verified,
-                "graph_node_count": ir.graph_node_count,
+                "static_schedule_verified": program_metadata.static_schedule_verified,
+                "hidden_identity_verified": program_metadata.hidden_identity_verified,
+                "graph_node_count": program_metadata.graph_node_count,
                 "schedule_node_count": compiled_schedule["schedule_node_count"].clone(),
                 "source_route_count": compiled_schedule["source_route_count"].clone(),
                 "list_source_binding_count": compiled_schedule["list_source_binding_count"].clone()
             },
             "document_lowering_tables": {
                 "render_slot_table_hash": render_slot_table_hash,
-                "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
-                "render_slot_count": ir.typecheck_report.render_slot_count,
-                "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count
+                "typed_render_metadata_used": typecheck_metadata.typed_render_metadata_used,
+                "render_slot_count": typecheck_metadata.render_slot_count,
+                "render_slot_failure_count": typecheck_metadata.render_slot_failure_count
             },
             "bridge_schemas": {
                 "status": "not_present_or_not_separate_from_source_payload_schemas",
@@ -24502,38 +19706,6 @@ fn compiled_artifact_report_schema_hash() -> String {
     report_schema_hash()
 }
 
-fn ir_list_has_derived_list_view(ir: &TypedProgram, list_name: &str) -> bool {
-    let store_path = format!("store.{list_name}");
-    ir.derived_values.iter().any(|value| {
-        matches!(value.kind, DerivedValueKind::ListView)
-            && (value.path == list_name
-                || value.path == store_path
-                || row_field_name(&value.path) == list_name)
-    })
-}
-
-fn list_initial_records_have_dynamic_fields(rows: &[ListInitialRecord]) -> bool {
-    rows.iter().any(|row| {
-        row.fields
-            .iter()
-            .any(|field| matches!(field.value, InitialValue::Unknown { .. }))
-    })
-}
-
-fn dynamic_list_view_lists_from_ir(ir: &TypedProgram) -> BTreeSet<String> {
-    ir.lists
-        .iter()
-        .filter(|list| ir_list_has_derived_list_view(ir, &list.name))
-        .map(|list| list.name.clone())
-        .collect()
-}
-
-fn derived_root_list_storage_name(path: &str) -> String {
-    path.strip_prefix("store.")
-        .map(str::to_owned)
-        .unwrap_or_else(|| row_field_name(path).to_owned())
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TypedStorageLayoutCounts {
     root_text_slot_count: usize,
@@ -24549,58 +19721,19 @@ struct TypedStorageLayoutCounts {
 }
 
 impl TypedStorageLayoutCounts {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let mut counts = Self {
-            list_memory_count: ir.lists.len(),
-            list_hidden_key_slot_count: ir.lists.len(),
-            list_hidden_generation_slot_count: ir.lists.len(),
-            ..Self::default()
-        };
-        for cell in &ir.state_cells {
-            match (cell.indexed, &cell.initial_value) {
-                (false, InitialValue::Bool { .. }) => counts.root_bool_slot_count += 1,
-                (false, InitialValue::Enum { .. }) => counts.root_enum_slot_count += 1,
-                (
-                    false,
-                    InitialValue::Text { .. }
-                    | InitialValue::Number { .. }
-                    | InitialValue::Byte { .. }
-                    | InitialValue::Bytes { .. }
-                    | InitialValue::RootInitialField { .. }
-                    | InitialValue::RowInitialField { .. },
-                ) => {
-                    counts.root_text_slot_count += 1;
-                }
-                (false, InitialValue::Unknown { .. }) => {}
-                (true, InitialValue::Bool { .. }) => {
-                    counts.list_row_template_field_count += 1;
-                    counts.list_row_bool_slot_count += 1;
-                }
-                (true, InitialValue::Enum { .. }) => {
-                    counts.list_row_template_field_count += 1;
-                    counts.list_row_enum_slot_count += 1;
-                }
-                (
-                    true,
-                    InitialValue::Text { .. }
-                    | InitialValue::Number { .. }
-                    | InitialValue::Byte { .. }
-                    | InitialValue::Bytes { .. }
-                    | InitialValue::RootInitialField { .. }
-                    | InitialValue::RowInitialField { .. },
-                ) => {
-                    counts.list_row_template_field_count += 1;
-                    counts.list_row_text_slot_count += 1;
-                }
-                (true, InitialValue::Unknown { .. }) => {}
-            }
+    fn from_compiler_counts(counts: CompilerTypedStorageLayoutCounts) -> Self {
+        Self {
+            root_text_slot_count: counts.root_text_slot_count,
+            root_bool_slot_count: counts.root_bool_slot_count,
+            root_enum_slot_count: counts.root_enum_slot_count,
+            list_memory_count: counts.list_memory_count,
+            list_row_template_field_count: counts.list_row_template_field_count,
+            list_row_text_slot_count: counts.list_row_text_slot_count,
+            list_row_bool_slot_count: counts.list_row_bool_slot_count,
+            list_row_enum_slot_count: counts.list_row_enum_slot_count,
+            list_hidden_key_slot_count: counts.list_hidden_key_slot_count,
+            list_hidden_generation_slot_count: counts.list_hidden_generation_slot_count,
         }
-        counts.list_row_text_slot_count += ir
-            .derived_values
-            .iter()
-            .filter(|value| value.indexed)
-            .count();
-        counts
     }
 
     fn from_artifact(
@@ -24658,24 +19791,16 @@ struct SourcePayloadCounts {
 }
 
 impl SourcePayloadCounts {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let mut counts = Self {
-            schema_count: ir.sources.len(),
-            ..Self::default()
-        };
-        for source in &ir.sources {
-            for field in &source.payload_schema.fields {
-                counts.field_count += 1;
-                match field {
-                    SourcePayloadField::Text => counts.text_field_count += 1,
-                    SourcePayloadField::Key => counts.key_field_count += 1,
-                    SourcePayloadField::Address => counts.address_field_count += 1,
-                    SourcePayloadField::Bytes => counts.bytes_field_count += 1,
-                    SourcePayloadField::Named(_) => counts.pointer_field_count += 1,
-                }
-            }
+    fn from_compiler_counts(counts: CompilerSourcePayloadCounts) -> Self {
+        Self {
+            schema_count: counts.schema_count,
+            field_count: counts.field_count,
+            text_field_count: counts.text_field_count,
+            key_field_count: counts.key_field_count,
+            address_field_count: counts.address_field_count,
+            bytes_field_count: counts.bytes_field_count,
+            pointer_field_count: counts.pointer_field_count,
         }
-        counts
     }
 
     fn from_source_routes(source_routes: &SourceRoutePlan) -> Self {
@@ -24696,83 +19821,6 @@ impl SourcePayloadCounts {
             }
         }
         counts
-    }
-}
-
-fn list_summary_fields_from_ir(ir: &TypedProgram) -> Vec<ListSummaryFields> {
-    let mut summaries = ir
-        .lists
-        .iter()
-        .map(|list| {
-            let row_scope = row_scope_name_for_ir_list(ir, list);
-            let prefix = format!("{row_scope}.");
-            let mut fields = ir
-                .state_cells
-                .iter()
-                .filter(|cell| cell.indexed && cell.path.starts_with(&prefix))
-                .filter_map(|cell| cell.path.strip_prefix(&prefix).map(str::to_owned))
-                .collect::<Vec<_>>();
-            for value in &ir.derived_values {
-                if value.indexed && value.path.starts_with(&prefix) {
-                    if let Some(field) = value.path.strip_prefix(&prefix) {
-                        fields.push(field.to_owned());
-                    }
-                }
-            }
-            if let boon_ir::ListInitializer::RecordLiteral { rows } = &list.initializer {
-                for row in rows {
-                    for field in &row.fields {
-                        fields.push(field.name.clone());
-                    }
-                }
-            }
-            for operation in &ir.list_operations {
-                let ListOperationKind::Append {
-                    fields: append_fields,
-                    ..
-                } = &operation.kind
-                else {
-                    continue;
-                };
-                if operation.list == list.name {
-                    fields.extend(append_fields.iter().map(|field| field.name.clone()));
-                }
-            }
-            fields.sort();
-            fields.dedup();
-            ListSummaryFields {
-                list: list.name.clone(),
-                row_scope,
-                fields,
-            }
-        })
-        .collect::<Vec<_>>();
-    for value in ir.derived_values.iter().filter(|value| {
-        !value.indexed
-            && value.scope_id.is_none()
-            && matches!(value.kind, DerivedValueKind::ListView)
-    }) {
-        let list = derived_root_list_storage_name(&value.path);
-        if summaries.iter().any(|summary| summary.list == list) {
-            continue;
-        }
-        summaries.push(ListSummaryFields {
-            row_scope: list.clone(),
-            list,
-            fields: Vec::new(),
-        });
-    }
-    summaries
-}
-
-fn list_operation_has_unknown_predicate(operation: &boon_ir::ListOperation) -> bool {
-    match &operation.kind {
-        ListOperationKind::Append { .. } => false,
-        ListOperationKind::Remove { predicate, .. }
-        | ListOperationKind::Retain { predicate, .. }
-        | ListOperationKind::Count { predicate, .. } => {
-            matches!(predicate, ListPredicate::Unknown { .. })
-        }
     }
 }
 
@@ -25438,7 +20486,7 @@ trait ScenarioExecutor {
 
     fn state_summary(&mut self) -> JsonValue;
 
-    fn stress_profiles(&mut self, _ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+    fn stress_profiles(&mut self) -> RuntimeResult<Option<JsonValue>> {
         Ok(None)
     }
 }
@@ -25446,8 +20494,8 @@ trait ScenarioExecutor {
 fn run_generic_scenario<R: ScenarioExecutor>(
     mut runtime: R,
     parsed: &ParsedProgram,
-    ir: &TypedProgram,
     compiled: &CompiledProgram,
+    report_context: Option<&CompiledSourceReportContext>,
     scenario: &Scenario,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
@@ -25661,7 +20709,6 @@ fn run_generic_scenario<R: ScenarioExecutor>(
     let state_summary = runtime.state_summary();
     let mut report = base_example_report(
         parsed,
-        ir,
         scenario,
         layer,
         &semantic_deltas,
@@ -25690,11 +20737,12 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         list_delta_oracle_mismatches,
         allocation_deltas,
         compiled,
+        report_context,
         state_summary.clone(),
         baseline_rss_mib,
     );
     if matches!(layer, VerificationLayer::Speed)
-        && let Some(stress_profiles) = runtime.stress_profiles(ir)?
+        && let Some(stress_profiles) = runtime.stress_profiles()?
     {
         report["stress_profiles"] = stress_profiles;
     }
@@ -25703,7 +20751,7 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         semantic_deltas,
         render_patches,
         state_summary,
-        document: boon_parser::parsed_document(parsed),
+        document: compiler_parsed_document(parsed),
     })
 }
 
@@ -25744,7 +20792,6 @@ fn run_artifact_runtime_scenario(
 
 fn base_example_report(
     parsed: &ParsedProgram,
-    ir: &TypedProgram,
     scenario: &Scenario,
     layer: VerificationLayer,
     semantic_deltas: &[SemanticDelta<'static>],
@@ -25773,6 +20820,7 @@ fn base_example_report(
     list_delta_oracle_mismatches: Vec<usize>,
     allocation_deltas: Vec<AllocationSnapshot>,
     compiled: &CompiledProgram,
+    report_context: Option<&CompiledSourceReportContext>,
     state_summary: JsonValue,
     baseline_rss_mib: f64,
 ) -> JsonValue {
@@ -25949,41 +20997,46 @@ fn base_example_report(
     let total_alloc_count: u64 = allocation_deltas.iter().map(|delta| delta.count).sum();
     let total_alloc_bytes: u64 = allocation_deltas.iter().map(|delta| delta.bytes).sum();
     let list_slot_count = report_list_slot_count(&state_summary);
-    let program_hash = report_source_hash_for_parsed(parsed);
+    let program_hash = report_context
+        .map(|context| context.program_hash.clone())
+        .unwrap_or_else(|| report_source_hash_for_parsed(parsed));
     let semantic_delta_protocol_batches =
         semantic_delta_protocol_batches(&program_hash, semantic_deltas, &per_step);
     let render_patch_protocol_batches =
         render_patch_protocol_batches(&program_hash, render_patches, &per_step);
     let implementation = "static_graph_interpreter";
     let adapter_blocker = "examples execute through the manifest/source/scenario-driven generic runtime path; remaining final handoff blockers are fresh human reports and aggregate all reports, not an example behavior adapter";
-    let generic_runtime_slices = generic_runtime_slices_report(ir, compiled);
-    let generic_runtime_slice_evidence = generic_runtime_slice_evidence_report(ir, compiled);
+    let program_metadata = compiled.source_program_metadata("base example report");
+    let inventory_counts = compiled.source_inventory_counts("base example report");
+    let generic_runtime_slices =
+        generic_runtime_slices_report(compiled, program_metadata, inventory_counts);
+    let generic_runtime_slice_evidence =
+        generic_runtime_slice_evidence_report(compiled, inventory_counts);
     let generic_interpreter_complete =
-        derive_generic_interpreter_complete(ir, compiled, &generic_runtime_slices);
+        derive_generic_interpreter_complete(program_metadata, compiled, &generic_runtime_slices);
     let example_behavior_adapter =
         derive_example_behavior_adapter(compiled, &generic_runtime_slices);
     let remaining_shells = remaining_example_specific_shells(compiled, &generic_runtime_slices);
-    let runtime_profile = RuntimeProfile::from_ir(ir);
-    let capacity_report = runtime_profile.capacity_report(ir);
-    let runtime_profile_detail = runtime_profile.detail_report(ir);
-    let typecheck_report_hash = typecheck_report_hash(ir);
-    let render_slot_table_hash = render_slot_table_hash(ir);
-    let semantic_index_report = ir.semantic_index.report();
+    let runtime_profile_metadata = compiled.source_runtime_profile_metadata("base example report");
+    let runtime_profile = RuntimeProfile::from_compiler_metadata(runtime_profile_metadata);
+    let capacity_report = runtime_profile.capacity_report(runtime_profile_metadata);
+    let runtime_profile_detail = runtime_profile.detail_report(runtime_profile_metadata);
+    let typecheck_metadata = compiled.source_typecheck_metadata("base example report");
     let runtime_execution = json!({
         "implementation": implementation,
         "source_loaded_from_boon": true,
         "typed_ir_loaded": true,
-        "static_schedule_verified": ir.static_schedule_verified,
+        "static_schedule_verified": program_metadata.static_schedule_verified,
         "runtime_profile": runtime_profile.as_str(),
         "runtime_profile_detail": runtime_profile_detail,
         "capacities": capacity_report,
-        "expression_coverage": &ir.expression_coverage,
-        "semantic_index": semantic_index_report,
-        "typecheck_report_hash": typecheck_report_hash,
-        "render_slot_table_hash": render_slot_table_hash,
-        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
-        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
-        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
+        "expression_coverage": program_metadata.expression_coverage.clone(),
+        "semantic_index": program_metadata.semantic_index.clone(),
+        "typecheck_report_hash": &typecheck_metadata.typecheck_report_hash,
+        "render_slot_table_hash": &typecheck_metadata.render_slot_table_hash,
+        "typed_render_metadata_used": typecheck_metadata.typed_render_metadata_used,
+        "unresolved_type_variable_count": typecheck_metadata.unresolved_type_variable_count,
+        "render_slot_failure_count": typecheck_metadata.render_slot_failure_count,
         "generic_interpreter_complete": generic_interpreter_complete,
         "example_behavior_adapter": example_behavior_adapter,
         "adapter_kind": "generic",
@@ -26062,20 +21115,20 @@ fn base_example_report(
         "framebuffer_size": runtime_framebuffer_size(layer),
         "program_kind": "generic",
         "program_hash": program_hash,
-        "expression_count": ir.expression_count,
-        "expression_coverage": &ir.expression_coverage,
-        "semantic_index": semantic_index_report,
-        "typecheck_report_hash": typecheck_report_hash,
-        "render_slot_table_hash": render_slot_table_hash,
-        "typed_render_metadata_used": ir.typecheck_report.render_slot_count > 0,
-        "unresolved_type_variable_count": ir.typecheck_report.unresolved_type_variable_count,
-        "render_slot_failure_count": ir.typecheck_report.render_slot_failure_count,
-        "typecheck_report": &ir.typecheck_report,
+        "expression_count": program_metadata.expression_count,
+        "expression_coverage": program_metadata.expression_coverage.clone(),
+        "semantic_index": program_metadata.semantic_index.clone(),
+        "typecheck_report_hash": &typecheck_metadata.typecheck_report_hash,
+        "render_slot_table_hash": &typecheck_metadata.render_slot_table_hash,
+        "typed_render_metadata_used": typecheck_metadata.typed_render_metadata_used,
+        "unresolved_type_variable_count": typecheck_metadata.unresolved_type_variable_count,
+        "render_slot_failure_count": typecheck_metadata.render_slot_failure_count,
+        "typecheck_report": typecheck_metadata.report,
         "total_ticks": scenario.step.len(),
         "total_source_events": scenario.step.iter().filter(|step| step.expected_source_event.is_some()).count(),
         "total_semantic_deltas": semantic_deltas.len(),
         "total_render_deltas": render_patches.len(),
-        "graph_node_count": ir.graph_node_count,
+        "graph_node_count": program_metadata.graph_node_count,
         "graph_rebuild_count": 0,
         "graph_clones_per_item": 0,
         "max_dirty_nodes": dirty_max,
@@ -26158,8 +21211,8 @@ fn base_example_report(
         "semantic_delta_protocol_batches": semantic_delta_protocol_batches,
         "render_patch_protocol_batches": render_patch_protocol_batches,
         "render_patches": render_patches,
-        "hidden_identity_verified": ir.hidden_identity_verified,
-        "static_schedule_verified": ir.static_schedule_verified,
+        "hidden_identity_verified": program_metadata.hidden_identity_verified,
+        "static_schedule_verified": program_metadata.static_schedule_verified,
         "artifact_sha256s": [],
         "failure_artifacts": [],
     });
@@ -26298,7 +21351,11 @@ fn remaining_example_specific_shells(
     shells
 }
 
-fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) -> JsonValue {
+fn generic_runtime_slices_report(
+    compiled: &CompiledProgram,
+    program_metadata: &CompilerTypedProgramReportMetadata,
+    inventory_counts: &CompilerTypedProgramInventoryCounts,
+) -> JsonValue {
     let route_action_count = compiled
         .source_routes
         .route_slots
@@ -26366,33 +21423,38 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
                 .for_source_id(route.source_id)
                 .is_some()
         });
-    let update_branches_loaded = compiled.update_branch_count == ir.update_branches.len()
+    let update_branches_loaded = compiled.update_branch_count
+        == inventory_counts.update_branch_count
         && compiled.unsupported_update_branch_count == 0
         && compiled.update_branch_count > 0;
-    let list_operations_loaded = compiled.list_operation_count == ir.list_operations.len()
+    let list_operations_loaded = compiled.list_operation_count
+        == inventory_counts.list_operation_count
         && compiled.unsupported_list_operation_count == 0;
-    let state_initializers_loaded =
-        compiled.state_initializer_count == ir.state_cells.len() && !ir.state_cells.is_empty();
-    let list_initializers_loaded =
-        compiled.list_initializer_count == ir.lists.len() && !ir.lists.is_empty();
-    let derived_values_loaded = compiled.derived_value_count == ir.derived_values.len();
+    let state_initializers_loaded = compiled.state_initializer_count
+        == inventory_counts.state_initializer_count
+        && inventory_counts.state_initializer_count > 0;
+    let list_initializers_loaded = compiled.list_initializer_count
+        == inventory_counts.list_initializer_count
+        && inventory_counts.list_initializer_count > 0;
+    let derived_values_loaded =
+        compiled.derived_value_count == inventory_counts.derived_value_count;
     let has_indexed_routes = indexed_text_route_count > 0 || indexed_bool_route_count > 0;
-    let has_render_bindings = !ir.view_bindings.is_empty();
+    let has_render_bindings = inventory_counts.view_binding_count > 0;
     let has_list_source_bindings = !compiled.list_source_bindings.list_slots.is_empty();
     json!({
         "generic_executable_surface_inferred_from_ir": true,
         "ir_update_branch_table_loaded": update_branches_loaded,
-        "update_branch_count": ir.update_branches.len(),
+        "update_branch_count": inventory_counts.update_branch_count,
         "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
         "generic_scenario_loop_executor": update_branches_loaded && list_initializers_loaded,
-        "generic_schedule_instantiated_before_adapter": ir.static_schedule_verified,
+        "generic_schedule_instantiated_before_adapter": program_metadata.static_schedule_verified,
         "loaded_runtime_owns_generic_schedule_storage": state_initializers_loaded && list_initializers_loaded,
         "surface_driver_borrows_generic_storage_for_tick": false,
         "generic_source_event_ingest": source_routes_dense,
         "generic_source_binding_store": has_list_source_bindings,
         "generic_indexed_branch_evaluator": has_indexed_routes,
         "generic_indexed_scalar_commit_executor": has_indexed_routes,
-        "generic_semantic_delta_emitter": route_action_count > 0 || !ir.list_operations.is_empty(),
+        "generic_semantic_delta_emitter": route_action_count > 0 || inventory_counts.list_operation_count > 0,
         "generic_source_mutation_semantic_delta_emitter": route_action_count > 0,
         "generic_derived_value_semantic_delta_emitter": compiled.derived_value_count > 0,
         "generic_source_bind_semantic_delta_emitter": has_list_source_bindings,
@@ -26412,7 +21474,7 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_indexed_bulk_bool_commit_executor": indexed_bool_route_count > 0,
         "generic_list_append_source_binding_executor": list_append_operation_count > 0 && list_append_route_count > 0 && has_list_source_bindings,
         "generic_list_remove_source_unbinding_executor": list_remove_operation_count > 0 && list_remove_route_count > 0,
-        "generic_list_move_semantic_delta_emitter": !ir.lists.is_empty(),
+        "generic_list_move_semantic_delta_emitter": inventory_counts.list_initializer_count > 0,
         "generic_list_count_retain_executor": list_count_retain_operation_count > 0,
         "generic_summary_reads_authoritative_storage": state_initializers_loaded || list_initializers_loaded,
         "generic_loaded_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
@@ -26454,15 +21516,15 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
         "generic_routed_indexed_bool_target_application": indexed_bool_route_count > 0,
         "generic_routed_indexed_text_target_application": indexed_text_route_count > 0,
         "ir_list_operation_table_loaded": list_operations_loaded,
-        "list_operation_count": ir.list_operations.len(),
+        "list_operation_count": inventory_counts.list_operation_count,
         "unsupported_list_operation_count": compiled.unsupported_list_operation_count,
         "ir_state_initializers_loaded": state_initializers_loaded,
-        "state_initializer_count": ir.state_cells.len(),
+        "state_initializer_count": inventory_counts.state_initializer_count,
         "ir_list_initializers_loaded": list_initializers_loaded,
-        "list_initializer_count": ir.lists.len(),
+        "list_initializer_count": inventory_counts.list_initializer_count,
         "generic_list_structural_commit_executor": list_initializers_loaded,
         "ir_derived_value_table_loaded": derived_values_loaded,
-        "derived_value_count": ir.derived_values.len(),
+        "derived_value_count": inventory_counts.derived_value_count,
         "generic_root_scalar_holds_from_ir": root_scalar_route_count > 0,
         "generic_hold_storage_authoritative": state_initializers_loaded || list_initializers_loaded,
         "generic_indexed_text_hold_from_ir": indexed_text_route_count > 0,
@@ -26474,8 +21536,8 @@ fn generic_runtime_slices_report(ir: &TypedProgram, compiled: &CompiledProgram) 
 }
 
 fn generic_runtime_slice_evidence_report(
-    ir: &TypedProgram,
     compiled: &CompiledProgram,
+    inventory_counts: &CompilerTypedProgramInventoryCounts,
 ) -> JsonValue {
     let route_action_count = compiled
         .source_routes
@@ -26536,7 +21598,6 @@ fn generic_runtime_slice_evidence_report(
             )
         })
         .count();
-    let source_payload_counts = SourcePayloadCounts::from_ir(ir);
     json!({
         "computed_from": "typed_ir_and_compiled_program",
         "source_route_count": compiled.source_route_count,
@@ -26565,13 +21626,13 @@ fn generic_runtime_slice_evidence_report(
         "list_count_retain_operation_count": list_count_retain_operation_count,
         "list_projection_count": compiled.list_projection_count,
         "view_binding_count": compiled.view_binding_count,
-        "source_payload_schema_count": source_payload_counts.schema_count,
-        "source_payload_field_count": source_payload_counts.field_count,
-        "source_payload_text_field_count": source_payload_counts.text_field_count,
-        "source_payload_key_field_count": source_payload_counts.key_field_count,
-        "source_payload_address_field_count": source_payload_counts.address_field_count,
-        "source_payload_bytes_field_count": source_payload_counts.bytes_field_count,
-        "source_payload_pointer_field_count": source_payload_counts.pointer_field_count,
+        "source_payload_schema_count": compiled.source_payload_schema_count,
+        "source_payload_field_count": compiled.source_payload_field_count,
+        "source_payload_text_field_count": compiled.source_payload_text_field_count,
+        "source_payload_key_field_count": compiled.source_payload_key_field_count,
+        "source_payload_address_field_count": compiled.source_payload_address_field_count,
+        "source_payload_bytes_field_count": compiled.source_payload_bytes_field_count,
+        "source_payload_pointer_field_count": compiled.source_payload_pointer_field_count,
         "typed_storage_layout": {
             "computed_from": "typed_ir_state_and_list_tables",
             "root_text_slot_count": compiled.root_text_slot_count,
@@ -26600,19 +21661,19 @@ fn generic_runtime_slice_evidence_report(
         "list_hidden_key_slot_count": compiled.list_hidden_key_slot_count,
         "list_hidden_generation_slot_count": compiled.list_hidden_generation_slot_count,
         "derived_text_transform_count": compiled.derived_text_transform_count,
-        "state_initializer_count": ir.state_cells.len(),
-        "list_initializer_count": ir.lists.len(),
-        "derived_value_count": ir.derived_values.len()
+        "state_initializer_count": inventory_counts.state_initializer_count,
+        "list_initializer_count": inventory_counts.list_initializer_count,
+        "derived_value_count": inventory_counts.derived_value_count
     })
 }
 
 fn derive_generic_interpreter_complete(
-    ir: &TypedProgram,
+    program_metadata: &CompilerTypedProgramReportMetadata,
     compiled: &CompiledProgram,
     generic_runtime_slices: &JsonValue,
 ) -> bool {
-    ir.static_schedule_verified
-        && ir.expression_coverage.unknown_total() == 0
+    program_metadata.static_schedule_verified
+        && program_metadata.expression_coverage_unknown_total == 0
         && compiled.unsupported_update_branch_count == 0
         && compiled.unsupported_list_operation_count == 0
         && compiled.source_route_count > 0
@@ -26653,18 +21714,13 @@ enum RuntimeProfile {
 }
 
 impl RuntimeProfile {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let all_lists_bounded = ir
-            .lists
-            .iter()
-            .all(|list| list_effective_capacity(list).is_some());
-        let all_bytes_bounded = all_bytes_state_bounded(ir);
-        if all_lists_bounded
-            && all_bytes_bounded
+    fn from_compiler_metadata(metadata: &CompilerRuntimeProfileMetadata) -> Self {
+        if metadata.all_lists_bounded
+            && metadata.all_bytes_bounded
             && std::env::var("BOON_RUNTIME_PROFILE").as_deref() == Ok("hardware_bounded")
         {
             Self::HardwareBounded
-        } else if all_lists_bounded {
+        } else if metadata.all_lists_bounded {
             Self::SoftwareBounded
         } else {
             Self::SoftwareDynamic
@@ -26679,22 +21735,18 @@ impl RuntimeProfile {
         }
     }
 
-    fn detail_report(self, ir: &TypedProgram) -> JsonValue {
-        let unbounded_lists = ir
+    fn detail_report(self, metadata: &CompilerRuntimeProfileMetadata) -> JsonValue {
+        let unbounded_lists = metadata
             .lists
             .iter()
-            .filter(|list| list_effective_capacity(list).is_none())
+            .filter(|list| list.effective_capacity.is_none())
             .map(|list| json!(list.name))
             .collect::<Vec<_>>();
-        let unbounded_bytes = ir
-            .state_cells
+        let unbounded_bytes = metadata
+            .bytes
             .iter()
-            .filter_map(|cell| match &cell.initial_value {
-                InitialValue::Bytes {
-                    fixed_len: None, ..
-                } => Some(json!(cell.path)),
-                _ => None,
-            })
+            .filter(|bytes| bytes.fixed_len.is_none())
+            .map(|bytes| json!(bytes.name))
             .collect::<Vec<_>>();
         json!({
             "name": self.as_str(),
@@ -26718,19 +21770,18 @@ impl RuntimeProfile {
         })
     }
 
-    fn capacity_report(self, ir: &TypedProgram) -> JsonValue {
-        let lists = ir
+    fn capacity_report(self, metadata: &CompilerRuntimeProfileMetadata) -> JsonValue {
+        let lists = metadata
             .lists
             .iter()
             .map(|list| {
-                let effective_capacity = list_effective_capacity(list);
                 json!({
                     "name": list.name,
-                    "declared_capacity": list.capacity,
-                    "effective_capacity": effective_capacity,
-                    "capacity_source": list_capacity_source(list),
-                    "dynamic_growth_allowed": matches!(self, Self::SoftwareDynamic) && effective_capacity.is_none(),
-                    "overflow_behavior": if effective_capacity.is_some() {
+                    "declared_capacity": list.declared_capacity,
+                    "effective_capacity": list.effective_capacity,
+                    "capacity_source": list.capacity_source,
+                    "dynamic_growth_allowed": matches!(self, Self::SoftwareDynamic) && list.effective_capacity.is_none(),
+                    "overflow_behavior": if list.effective_capacity.is_some() {
                         "hard_error"
                     } else {
                         "grow_until_external_budget"
@@ -26738,65 +21789,37 @@ impl RuntimeProfile {
                 })
             })
             .collect::<Vec<_>>();
-        let bytes = ir
-            .state_cells
+        let bytes = metadata
+            .bytes
             .iter()
-            .filter_map(|cell| match &cell.initial_value {
-                InitialValue::Bytes { fixed_len, .. } => Some(json!({
-                    "name": cell.path,
-                    "scope": if cell.indexed { "indexed" } else { "root" },
-                    "fixed_len": fixed_len,
-                    "effective_capacity": fixed_len,
-                    "capacity_source": if fixed_len.is_some() {
+            .map(|bytes| {
+                json!({
+                    "name": bytes.name,
+                    "scope": bytes.scope,
+                    "fixed_len": bytes.fixed_len,
+                    "effective_capacity": bytes.fixed_len,
+                    "capacity_source": if bytes.fixed_len.is_some() {
                         "BYTES[N] fixed length"
                     } else {
                         "dynamic BYTES"
                     },
-                    "dynamic_growth_allowed": matches!(self, Self::SoftwareDynamic) && fixed_len.is_none(),
-                    "overflow_behavior": if fixed_len.is_some() {
+                    "dynamic_growth_allowed": matches!(self, Self::SoftwareDynamic) && bytes.fixed_len.is_none(),
+                    "overflow_behavior": if bytes.fixed_len.is_some() {
                         "hard_error"
                     } else {
                         "grow_until_external_budget"
                     },
-                })),
-                _ => None,
+                })
             })
             .collect::<Vec<_>>();
         json!({
             "profile": self.as_str(),
-            "all_lists_bounded": ir.lists.iter().all(|list| list_effective_capacity(list).is_some()),
+            "all_lists_bounded": metadata.all_lists_bounded,
             "lists": lists,
-            "all_bytes_bounded": all_bytes_state_bounded(ir),
+            "all_bytes_bounded": metadata.all_bytes_bounded,
             "bytes": bytes,
         })
     }
-}
-
-fn list_effective_capacity(list: &boon_ir::ListMemory) -> Option<usize> {
-    list.capacity.or_else(|| match list.initializer {
-        ListInitializer::Range { from, to } if from <= to => {
-            usize::try_from(to.saturating_sub(from).saturating_add(1)).ok()
-        }
-        ListInitializer::Range { .. } => Some(0),
-        _ => None,
-    })
-}
-
-fn list_capacity_source(list: &boon_ir::ListMemory) -> &'static str {
-    if list.capacity.is_some() {
-        "list_capacity_syntax"
-    } else if matches!(list.initializer, ListInitializer::Range { .. }) {
-        "range_initializer"
-    } else {
-        "dynamic_list"
-    }
-}
-
-fn all_bytes_state_bounded(ir: &TypedProgram) -> bool {
-    ir.state_cells.iter().all(|cell| match &cell.initial_value {
-        InitialValue::Bytes { fixed_len, .. } => fixed_len.is_some(),
-        _ => true,
-    })
 }
 
 fn slice_bool(slices: &serde_json::Map<String, JsonValue>, key: &str) -> Option<bool> {
@@ -26822,11 +21845,11 @@ fn report_source_hash_for_parsed(parsed: &ParsedProgram) -> String {
 fn enrich_report(
     report: &mut JsonValue,
     source_path: &str,
-    source_hash: &str,
+    report_context: &CompiledSourceReportContext,
     scenario_path: &Path,
     report_path: Option<&Path>,
     parsed: &ParsedProgram,
-    ir: &TypedProgram,
+    compiled: &CompiledProgram,
     layer: VerificationLayer,
     elapsed_ms: f64,
 ) -> RuntimeResult<()> {
@@ -26846,19 +21869,26 @@ fn enrich_report(
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("binary_path".to_owned(), json!(current_binary_path()));
     object.insert("source_path".to_owned(), json!(source_path));
-    object.insert("source_hash".to_owned(), json!(source_hash));
-    object.insert("expected_source_hash".to_owned(), json!(source_hash));
-    object.insert("program_hash".to_owned(), json!(source_hash));
-    object.insert("program_file_count".to_owned(), json!(parsed.files.len()));
+    object.insert("source_hash".to_owned(), json!(report_context.source_hash));
+    object.insert(
+        "expected_source_hash".to_owned(),
+        json!(report_context.source_hash),
+    );
+    object.insert(
+        "program_hash".to_owned(),
+        json!(report_context.program_hash),
+    );
+    object.insert(
+        "program_kind".to_owned(),
+        json!(report_context.program_kind),
+    );
+    object.insert(
+        "program_file_count".to_owned(),
+        json!(report_context.program_file_count),
+    );
     object.insert(
         "source_files".to_owned(),
-        json!(
-            parsed
-                .files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>()
-        ),
+        json!(report_context.source_files),
     );
     object.insert(
         "program_files".to_owned(),
@@ -26892,9 +21922,23 @@ fn enrich_report(
     object.insert("layer".to_owned(), json!(layer.as_str()));
     object.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
     object.insert("source_count".to_owned(), json!(parsed.sources.len()));
-    object.insert("source_port_count".to_owned(), json!(ir.sources.len()));
-    object.insert("state_cell_count".to_owned(), json!(ir.state_cells.len()));
-    object.insert("list_count".to_owned(), json!(ir.lists.len()));
+    object.insert("source_port_count".to_owned(), json!(parsed.sources.len()));
+    let compiled_schedule = object
+        .get("compiled_schedule")
+        .and_then(JsonValue::as_object);
+    let state_initializer_count = compiled_schedule
+        .and_then(|schedule| schedule.get("state_initializer_count"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    let list_initializer_count = compiled_schedule
+        .and_then(|schedule| schedule.get("list_initializer_count"))
+        .and_then(JsonValue::as_u64)
+        .unwrap_or_default();
+    object.insert(
+        "state_cell_count".to_owned(),
+        json!(state_initializer_count),
+    );
+    object.insert("list_count".to_owned(), json!(list_initializer_count));
     object.insert(
         "example".to_owned(),
         json!(
@@ -26904,7 +21948,12 @@ fn enrich_report(
                 .unwrap_or("generic")
         ),
     );
-    object.insert("ir_debug_tables".to_owned(), debug_tables(ir));
+    object.insert(
+        "ir_debug_tables".to_owned(),
+        compiled
+            .source_ir_debug_tables("scenario report enrichment")
+            .clone(),
+    );
     if let Some(report_path) = report_path {
         object.insert(
             "report_path".to_owned(),
@@ -30000,40 +25049,6 @@ fn stable_runtime_field_id(name: &str) -> usize {
     OFFSET + (hash as usize & 0x000f_ffff)
 }
 
-fn field_slot_collision_diagnostics(ir: &TypedProgram) -> Vec<FieldSlotCollisionDiagnostic> {
-    let mut names = Vec::new();
-    for cell in &ir.state_cells {
-        names.push(row_field_name(&cell.path).to_owned());
-    }
-    for value in &ir.derived_values {
-        names.push(row_field_name(&value.path).to_owned());
-    }
-    for list in &ir.lists {
-        match &list.initializer {
-            ListInitializer::RecordLiteral { rows } => {
-                for row in rows {
-                    for field in &row.fields {
-                        names.push(row_field_name(&field.name).to_owned());
-                    }
-                }
-            }
-            ListInitializer::Range { .. } => {
-                names.push("index".to_owned());
-                names.push("value".to_owned());
-            }
-            ListInitializer::Empty | ListInitializer::Unknown { .. } => {}
-        }
-    }
-    for operation in &ir.list_operations {
-        if let ListOperationKind::Append { fields, .. } = &operation.kind {
-            for field in fields {
-                names.push(row_field_name(&field.name).to_owned());
-            }
-        }
-    }
-    field_slot_collision_diagnostics_from_names(names)
-}
-
 fn field_slot_collision_diagnostics_from_names(
     names: impl IntoIterator<Item = String>,
 ) -> Vec<FieldSlotCollisionDiagnostic> {
@@ -30064,7 +25079,7 @@ struct RuntimeRowSnapshotTemplate {
 struct RuntimeRowSnapshotFieldTemplate {
     field_name: Box<str>,
     field_id: FieldSlotId,
-    initial_value: InitialValue,
+    initial_value: RuntimeInitialValue,
     missing_row_initial_value: Option<FieldValue>,
 }
 
@@ -30502,14 +25517,11 @@ impl SummaryLimits {
 }
 
 impl GenericScheduledRuntime {
-    fn new(ir: &TypedProgram, compiled: &CompiledProgram) -> RuntimeResult<Self> {
-        Ok(Self::new_profiled(ir, compiled)?.0)
+    fn new(compiled: &CompiledProgram) -> RuntimeResult<Self> {
+        Ok(Self::new_profiled(compiled)?.0)
     }
 
-    fn new_profiled(
-        _ir: &TypedProgram,
-        compiled: &CompiledProgram,
-    ) -> RuntimeResult<(Self, JsonValue)> {
+    fn new_profiled(compiled: &CompiledProgram) -> RuntimeResult<(Self, JsonValue)> {
         Self::from_compiled_profiled(compiled)
     }
 
@@ -30584,20 +25596,6 @@ impl GenericScheduledRuntime {
                 "total_ms": runtime_elapsed_ms(total_started)
             }),
         ))
-    }
-
-    fn initialize_root_holds_from_root_initial_fields(
-        &mut self,
-        ir: &TypedProgram,
-    ) -> RuntimeResult<()> {
-        for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
-            let InitialValue::RootInitialField { path } = &cell.initial_value else {
-                continue;
-            };
-            let value = self.resolve_root_initial_field_value(path)?;
-            self.storage.root.insert_value(cell.path.clone(), value);
-        }
-        Ok(())
     }
 
     fn initialize_root_holds_from_storage_plan(
@@ -31133,56 +26131,6 @@ impl GenericScheduledRuntime {
 
     fn canonical_source_path(&self, source: &str) -> Option<String> {
         self.source_routes.canonical_source_path(source)
-    }
-
-    fn reset_indexed_holds_from_row_initial_fields(
-        &mut self,
-        ir: &TypedProgram,
-    ) -> RuntimeResult<()> {
-        for cell in ir.state_cells.iter().filter(|cell| cell.indexed) {
-            let InitialValue::RowInitialField { path } = &cell.initial_value else {
-                continue;
-            };
-            let Some(scope_id) = cell.scope_id else {
-                continue;
-            };
-            let Some(row_scope) = ir.row_scopes.iter().find(|scope| scope.id == scope_id) else {
-                continue;
-            };
-            let Some(target_field) = cell.path.strip_prefix(&format!("{}.", row_scope.row_scope))
-            else {
-                continue;
-            };
-            let len = self.storage.list_len(&row_scope.list)?;
-            for index in 0..len {
-                let base_path;
-                let source_path = if path == target_field {
-                    base_path = base_row_field_name(target_field);
-                    base_path.as_str()
-                } else {
-                    path
-                };
-                if let Some(value) =
-                    self.storage
-                        .list_row_value_opt(&row_scope.list, index, source_path)
-                {
-                    self.storage
-                        .set_list_row_value(&row_scope.list, index, target_field, value)?;
-                    continue;
-                }
-                let value =
-                    match self
-                        .storage
-                        .list_row_value_opt(&row_scope.list, index, target_field)
-                    {
-                        Some(_) => continue,
-                        None => FieldValue::Text(String::new()),
-                    };
-                self.storage
-                    .set_list_row_value(&row_scope.list, index, target_field, value)?;
-            }
-        }
-        Ok(())
     }
 
     fn reset_indexed_holds_from_storage_plan(
@@ -35600,13 +30548,15 @@ impl GenericScheduledRuntime {
     }
 
     fn root_list_view_function_record_children(
-        definition: &FunctionDefinition,
+        definition: &GenericDerivedFunction,
     ) -> Option<Vec<AstStatement>> {
         let children = Self::root_list_view_function_body_children(definition);
         record_statement_children(children).then(|| children.to_vec())
     }
 
-    fn root_list_view_function_body_children(definition: &FunctionDefinition) -> &[AstStatement] {
+    fn root_list_view_function_body_children(
+        definition: &GenericDerivedFunction,
+    ) -> &[AstStatement] {
         if definition.statement.children.len() == 1
             && matches!(
                 definition.statement.children[0].kind,
@@ -35631,7 +30581,7 @@ impl GenericScheduledRuntime {
         function: &str,
         call_args: &[AstCallArg],
         forwarded_binding: &str,
-    ) -> Option<(FunctionDefinition, String)> {
+    ) -> Option<(GenericDerivedFunction, String)> {
         let function = self.user_function_definition(function)?;
         if call_args.len() != 1 {
             return None;
@@ -35649,7 +30599,7 @@ impl GenericScheduledRuntime {
 
     fn root_list_view_field_only_record_projector(
         &mut self,
-        function: FunctionDefinition,
+        function: GenericDerivedFunction,
         row_arg: String,
     ) -> Option<RootListViewFieldOnlyRecordProjector> {
         let record_children = Self::root_list_view_function_record_children(&function)?;
@@ -35707,7 +30657,7 @@ impl GenericScheduledRuntime {
 
     fn root_list_view_field_only_branch_projector(
         &mut self,
-        function: FunctionDefinition,
+        function: GenericDerivedFunction,
         row_arg: String,
     ) -> Option<RootListViewFieldOnlyProjector> {
         let body = Self::root_list_view_function_body_children(&function);
@@ -39511,6 +34461,7 @@ impl GenericScheduledRuntime {
         match function {
             "SOURCE" => self.runtime_call_input_or_first(input, args, frame),
             "Text/empty" => Ok(BoonValue::Text(String::new())),
+            "Text/space" => Ok(BoonValue::Text(" ".to_owned())),
             "Text/concat" => {
                 let left = self.runtime_call_input_or_first(input, args, frame)?;
                 let right = self.runtime_named_or_positional_arg_value(args, "with", 0, frame)?;
@@ -45567,7 +40518,7 @@ impl GenericScheduledRuntime {
         }
     }
 
-    fn user_function_definition(&self, function: &str) -> Option<FunctionDefinition> {
+    fn user_function_definition(&self, function: &str) -> Option<GenericDerivedFunction> {
         self.generic_derived
             .functions
             .get(function)
@@ -45579,7 +40530,7 @@ impl GenericScheduledRuntime {
             })
     }
 
-    fn function_free_env_names(&mut self, definition: &FunctionDefinition) -> BTreeSet<String> {
+    fn function_free_env_names(&mut self, definition: &GenericDerivedFunction) -> BTreeSet<String> {
         if let Some(names) = self
             .generic_derived_state
             .function_free_names_cache
@@ -45597,7 +40548,7 @@ impl GenericScheduledRuntime {
 
     fn function_free_env_names_uncached(
         &self,
-        definition: &FunctionDefinition,
+        definition: &GenericDerivedFunction,
         visiting: &mut BTreeSet<String>,
     ) -> BTreeSet<String> {
         if !visiting.insert(definition.name.clone()) {
@@ -45651,7 +40602,7 @@ impl GenericScheduledRuntime {
 
     fn function_arg_accesses(
         &mut self,
-        definition: &FunctionDefinition,
+        definition: &GenericDerivedFunction,
     ) -> BTreeMap<String, FunctionArgAccess> {
         if let Some(accesses) = self
             .generic_derived_state
@@ -45669,7 +40620,7 @@ impl GenericScheduledRuntime {
 
     fn function_arg_accesses_uncached(
         &self,
-        definition: &FunctionDefinition,
+        definition: &GenericDerivedFunction,
     ) -> BTreeMap<String, FunctionArgAccess> {
         let args = definition.args.iter().cloned().collect::<BTreeSet<_>>();
         let mut shadowed = BTreeSet::new();
@@ -45976,7 +40927,7 @@ impl GenericScheduledRuntime {
         &self,
         input: Option<usize>,
         call_args: &[AstCallArg],
-        callee: &FunctionDefinition,
+        callee: &GenericDerivedFunction,
         callee_accesses: &BTreeMap<String, FunctionArgAccess>,
         args: &BTreeSet<String>,
         shadowed: &mut BTreeSet<String>,
@@ -46242,7 +41193,7 @@ impl GenericScheduledRuntime {
 
     fn generic_function_cache_key(
         &mut self,
-        definition: &FunctionDefinition,
+        definition: &GenericDerivedFunction,
         frame: &mut GenericEvalFrame,
         input: Option<&BoonValue>,
         args: &[(String, BoonValue)],
@@ -49511,17 +44462,6 @@ fn json_child_path<'a>(value: &'a JsonValue, path: &[&str]) -> Option<&'a JsonVa
     Some(current)
 }
 
-fn statement_contains_latest(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
-    statement
-        .expr
-        .and_then(|expr_id| expressions.get(expr_id))
-        .is_some_and(|expr| matches!(expr.kind, AstExprKind::Latest))
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_contains_latest(child, expressions))
-}
-
 fn record_statement_children(children: &[AstStatement]) -> bool {
     children
         .iter()
@@ -50124,118 +45064,17 @@ impl DerefMut for GenericScheduledRuntime {
 }
 
 impl GenericCircuitRuntime {
+    #[cfg(test)]
     fn new(ir: &TypedProgram) -> RuntimeResult<Self> {
-        let mut runtime = Self::default();
-        for cell in ir.state_cells.iter().filter(|cell| !cell.indexed) {
-            runtime.root.insert_value(
-                cell.path.clone(),
-                runtime_value_from_initial(&cell.initial_value, &ValueColumns::default())?,
-            );
-        }
-        for list in &ir.lists {
-            let row_scope = row_scope_name_for_ir_list(ir, list);
-            let indexed_cells = ir
-                .state_cells
-                .iter()
-                .filter(|cell| cell.indexed && cell.path.starts_with(&format!("{row_scope}.")))
-                .collect::<Vec<_>>();
-            let row_template =
-                RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;
-            let rows = match &list.initializer {
-                ListInitializer::RecordLiteral { rows }
-                    if ir_list_has_derived_list_view(ir, &list.name)
-                        && list_initial_records_have_dynamic_fields(rows) =>
-                {
-                    Vec::new()
-                }
-                ListInitializer::RecordLiteral { rows } => rows
-                    .iter()
-                    .map(|row| {
-                        let initial_fields = list_initial_fields(row)?;
-                        let mut row = row_template.materialize(initial_fields)?;
-                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
-                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
-                        Ok(row)
-                    })
-                    .collect::<RuntimeResult<Vec<_>>>()?,
-                ListInitializer::Range { from, to } => {
-                    let count = if from <= to {
-                        usize::try_from(to.saturating_sub(*from).saturating_add(1))
-                            .map_err(|_| "List/range row count is out of range")?
-                    } else {
-                        0
-                    };
-                    let mut range_rows = Vec::with_capacity(count);
-                    for value in *from..=*to {
-                        let mut initial_fields = ValueColumns::default();
-                        let text = value.to_string();
-                        initial_fields
-                            .insert_value("index".to_owned(), FieldValue::Text(text.clone()));
-                        initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
-                        row_template.fill_missing_row_initial_fields(&mut initial_fields);
-                        let mut row = row_template.materialize(initial_fields)?;
-                        initialize_indexed_derived_base_fields(ir, &row_scope, &mut row);
-                        initialize_indexed_derived_text_fields(ir, &row_scope, &mut row);
-                        range_rows.push(row);
-                    }
-                    range_rows
-                }
-                ListInitializer::Empty => Vec::new(),
-                ListInitializer::Unknown { summary } => {
-                    if ir_list_has_derived_list_view(ir, &list.name) {
-                        Vec::new()
-                    } else {
-                        return Err(format!(
-                            "list `{}` has unsupported initializer `{summary}`",
-                            list.name
-                        )
-                        .into());
-                    }
-                }
-            };
-            if let Some(capacity) = list.capacity
-                && rows.len() > capacity
-            {
-                return Err(format!(
-                    "list `{}` initializes {} rows beyond declared capacity {capacity}",
-                    list.name,
-                    rows.len()
-                )
-                .into());
-            }
-            runtime.lists.insert(
-                list.id,
-                list.name.clone(),
-                ListMemory::from_values(rows),
-                list.capacity,
-                row_template,
-            );
-        }
-        let mut synthetic_list_id = ir
-            .lists
-            .iter()
-            .map(|list| list.id.0)
-            .max()
-            .map_or(0, |id| id.saturating_add(1));
-        for value in ir.derived_values.iter().filter(|value| {
-            !value.indexed
-                && value.scope_id.is_none()
-                && matches!(value.kind, DerivedValueKind::ListView)
-        }) {
-            let name = derived_root_list_storage_name(&value.path);
-            if runtime.lists.memory(&name).is_some() {
-                continue;
-            }
-            runtime.lists.insert(
-                ListId(synthetic_list_id),
-                name,
-                ListMemory::from_values(Vec::<RuntimeRowSnapshot>::new()),
-                None,
-                RuntimeRowSnapshotTemplate::default(),
-            );
-            synthetic_list_id = synthetic_list_id.saturating_add(1);
-        }
-        Ok(runtime)
+        RuntimeStorageInitializationPlan::from_ir(
+            compiler_storage_root_slots_from_ir(ir),
+            compiler_storage_indexed_row_initial_resets_from_ir(ir),
+            compiler_storage_list_slots_from_ir(ir),
+            compiler_storage_row_templates_from_ir(ir),
+            compiler_storage_initial_rows_from_ir(ir),
+            compiler_storage_indexed_derived_fields_from_ir(ir),
+        )?
+        .instantiate_storage()
     }
 
     fn root_textlike(&self, path: &str) -> RuntimeResult<String> {
@@ -50910,6 +45749,18 @@ impl GenericCircuitRuntime {
         (leaf != path)
             .then(|| self.list_row_value_opt(list, index, leaf))
             .flatten()
+    }
+
+    fn list_row_bytes_path_opt(
+        &self,
+        list: &str,
+        index: usize,
+        path: &str,
+    ) -> Option<RuntimeBytes> {
+        match self.list_row_value_path_opt(list, index, path) {
+            Some(FieldValue::Bytes(value)) => Some(value),
+            _ => None,
+        }
     }
 
     fn list_row_initial_value_opt(
@@ -51739,6 +46590,66 @@ impl GenericCircuitRuntime {
                     value.into_owned(),
                 )))
             }
+            ScalarUpdateExpression::BytesToHex { path } => {
+                let bytes = self
+                    .root_bytes(path)
+                    .ok()
+                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
+                    .ok_or_else(|| {
+                        format!(
+                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
+                        )
+                    })?;
+                let data = bytes.inline_bytes().map_err(|error| {
+                    format!(
+                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
+                    )
+                })?;
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
+                    bytes_encode_hex(data),
+                )))
+            }
+            ScalarUpdateExpression::BytesToBase64 { path } => {
+                let bytes = self
+                    .root_bytes(path)
+                    .ok()
+                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
+                    .ok_or_else(|| {
+                        format!(
+                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
+                        )
+                    })?;
+                let data = bytes.inline_bytes().map_err(|error| {
+                    format!(
+                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
+                    )
+                })?;
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
+                    bytes_encode_base64(data),
+                )))
+            }
+            ScalarUpdateExpression::BytesToText { path, encoding } => {
+                let bytes = self
+                    .root_bytes(path)
+                    .ok()
+                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
+                    .ok_or_else(|| {
+                        format!(
+                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
+                        )
+                    })?;
+                let data = bytes.inline_bytes().map_err(|error| {
+                    format!(
+                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
+                    )
+                })?;
+                let text = runtime_bytes_to_text(data, encoding).map_err(|error| {
+                    format!(
+                        "indexed text update `{target}` from `{source}` bytes path `{path}` {error}"
+                    )
+                })?;
+                Ok(IndexedTextCandidate::SourceText(Cow::Owned(text)))
+            }
             ScalarUpdateExpression::NumberInfix { .. }
             | ScalarUpdateExpression::ProjectTime { .. }
             | ScalarUpdateExpression::BoolNot(_)
@@ -51750,9 +46661,7 @@ impl GenericCircuitRuntime {
             | ScalarUpdateExpression::BytesTake { .. }
             | ScalarUpdateExpression::BytesDrop { .. }
             | ScalarUpdateExpression::BytesZeros { .. }
-            | ScalarUpdateExpression::BytesToHex { .. }
             | ScalarUpdateExpression::BytesFromHex { .. }
-            | ScalarUpdateExpression::BytesToBase64 { .. }
             | ScalarUpdateExpression::BytesFromBase64 { .. }
             | ScalarUpdateExpression::BytesReadUnsigned { .. }
             | ScalarUpdateExpression::BytesReadSigned { .. }
@@ -51760,7 +46669,6 @@ impl GenericCircuitRuntime {
             | ScalarUpdateExpression::BytesWriteSigned { .. }
             | ScalarUpdateExpression::FileReadBytes { .. }
             | ScalarUpdateExpression::TextToBytes { .. }
-            | ScalarUpdateExpression::BytesToText { .. }
             | ScalarUpdateExpression::BytesConcat { .. }
             | ScalarUpdateExpression::BytesEqual { .. }
             | ScalarUpdateExpression::BytesFind { .. }
@@ -51823,7 +46731,10 @@ impl GenericCircuitRuntime {
                     })
                     .or_else(|| self.root_textlike(path).ok())
                 },
-                |_| None,
+                |path| match self.list_row_value_path_opt(list, index, path) {
+                    Some(FieldValue::Bytes(value)) => Some(value),
+                    _ => self.root_bytes(path).ok(),
+                },
             )?
             .ok_or_else(|| {
                 format!("no supported bool branch for `{target}` from `{source}`").into()
@@ -51884,7 +46795,7 @@ impl GenericCircuitRuntime {
                         Some(FieldValue::Text(value.clone()))
                     }
                     RuntimeListAppendFieldValue::TypedConst { value } => {
-                        runtime_value_from_initial(value, &ValueColumns::default()).ok()
+                        value.to_field_value(&ValueColumns::default()).ok()
                     }
                 })
         })?;
@@ -51901,7 +46812,7 @@ impl GenericCircuitRuntime {
                 RuntimeListAppendFieldValue::TypedConst { value } => {
                     row.columns.insert_value(
                         field.name.clone(),
-                        runtime_value_from_initial(value, &ValueColumns::default())?,
+                        value.to_field_value(&ValueColumns::default())?,
                     );
                 }
             }
@@ -53575,13 +48486,14 @@ impl ValueColumns {
     }
 }
 
-fn list_initial_fields(row: &boon_ir::ListInitialRecord) -> RuntimeResult<ValueColumns> {
+fn list_initial_fields_from_compiler(
+    row: &CompilerStorageInitialRow,
+) -> RuntimeResult<ValueColumns> {
     let mut columns = ValueColumns::default();
     for field in &row.fields {
-        columns.insert_value(
-            field.name.clone(),
-            runtime_value_from_initial(&field.value, &ValueColumns::default())?,
-        );
+        let value =
+            RuntimeInitialValue::from_compiler(field.value.clone())?.to_field_value(&columns)?;
+        columns.insert_value(field.name.clone(), value);
     }
     Ok(columns)
 }
@@ -53602,33 +48514,6 @@ fn boon_record_initial_fields(value: BoonValue) -> RuntimeResult<ValueColumns> {
 }
 
 impl RuntimeRowSnapshotTemplate {
-    fn from_cells(
-        row_scope: &str,
-        indexed_cells: &[&boon_ir::StateCell],
-        ir: &TypedProgram,
-    ) -> RuntimeResult<Self> {
-        let mut fields = Vec::with_capacity(indexed_cells.len());
-        for cell in indexed_cells {
-            let field = cell
-                .path
-                .strip_prefix(&format!("{row_scope}."))
-                .ok_or_else(|| {
-                    format!(
-                        "state cell `{}` is not in row scope `{row_scope}`",
-                        cell.path
-                    )
-                })?
-                .to_owned();
-            fields.push(RuntimeRowSnapshotFieldTemplate {
-                field_id: FieldSlotId::from_path(&field),
-                field_name: field.into_boxed_str(),
-                initial_value: cell.initial_value.clone(),
-                missing_row_initial_value: missing_row_initial_value(cell, ir),
-            });
-        }
-        Ok(Self { fields })
-    }
-
     fn materialize(&self, mut initial_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
         for field in &self.fields {
             if initial_fields.contains_key_id(field.field_id.clone()) {
@@ -53637,7 +48522,9 @@ impl RuntimeRowSnapshotTemplate {
                 }
                 continue;
             }
-            let value = runtime_value_from_initial(&field.initial_value, &initial_fields)
+            let value = field
+                .initial_value
+                .to_field_value(&initial_fields)
                 .or_else(|error| field.missing_row_initial_value.clone().ok_or(error))?;
             initial_fields.insert_value(field.field_name.to_string(), value);
         }
@@ -53649,7 +48536,7 @@ impl RuntimeRowSnapshotTemplate {
 
     fn restore_row_initial_fields_from_base(&self, fields: &mut ValueColumns) -> RuntimeResult<()> {
         for field in &self.fields {
-            let InitialValue::RowInitialField { path } = &field.initial_value else {
+            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
                 continue;
             };
             let current = fields.owned_value(&field.field_name);
@@ -53676,7 +48563,7 @@ impl RuntimeRowSnapshotTemplate {
 
     fn fill_missing_row_initial_fields(&self, initial_fields: &mut ValueColumns) {
         for field in &self.fields {
-            let InitialValue::RowInitialField { path } = &field.initial_value else {
+            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
                 continue;
             };
             let field_id = FieldSlotId::from_path(path);
@@ -53700,26 +48587,28 @@ impl RuntimeRowSnapshotTemplate {
                 return Err(format!("generic row missing field `{}`", field.field_name).into());
             }
             match &field.initial_value {
-                InitialValue::Text { value } => {
+                RuntimeInitialValue::Text(value) => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
-                InitialValue::Number { value } => row.columns.insert_value(
+                RuntimeInitialValue::Number(value) => row.columns.insert_value(
                     field.field_name.to_string(),
                     FieldValue::Json(json!(*value)),
                 ),
-                InitialValue::Byte { value } => row.columns.insert_value(
+                RuntimeInitialValue::Byte(value) => row.columns.insert_value(
                     field.field_name.to_string(),
                     FieldValue::Json(json!(*value)),
                 ),
-                InitialValue::Bool { value } => row.columns.set_bool(&field.field_name, *value)?,
-                InitialValue::Bytes { bytes, .. } => row.columns.set_value(
+                RuntimeInitialValue::Bool(value) => {
+                    row.columns.set_bool(&field.field_name, *value)?
+                }
+                RuntimeInitialValue::Bytes(bytes) => row.columns.set_value(
                     &field.field_name,
                     FieldValue::Bytes(RuntimeBytes::inline(Bytes::copy_from_slice(bytes))),
                 )?,
-                InitialValue::Enum { value } => {
+                RuntimeInitialValue::Enum(value) => {
                     row.columns.set_textlike(&field.field_name, value)?
                 }
-                InitialValue::RootInitialField { path } => {
+                RuntimeInitialValue::RootInitialField { path } => {
                     if let Some(value) = initial_value(path) {
                         row.columns.set_value(&field.field_name, value)?;
                     } else if let Some(value) = field.missing_row_initial_value.clone() {
@@ -53728,7 +48617,7 @@ impl RuntimeRowSnapshotTemplate {
                         return Err(format!("root initial field `{path}` is missing").into());
                     }
                 }
-                InitialValue::RowInitialField { path } => {
+                RuntimeInitialValue::RowInitialField { path } => {
                     if let Some(value) =
                         row_initial_field_value(&row.columns, path, &field.field_name)
                             .or_else(|| initial_value(path))
@@ -53739,9 +48628,6 @@ impl RuntimeRowSnapshotTemplate {
                     } else {
                         return Err(format!("row initial field `{path}` is missing").into());
                     }
-                }
-                InitialValue::Unknown { summary } => {
-                    return Err(format!("unsupported state initializer `{summary}`").into());
                 }
             }
         }
@@ -53778,61 +48664,14 @@ fn runtime_row_changed_field_names(
     changed
 }
 
-fn missing_row_initial_value(cell: &boon_ir::StateCell, ir: &TypedProgram) -> Option<FieldValue> {
-    let InitialValue::RowInitialField { .. } = &cell.initial_value else {
-        return None;
-    };
-    if ir.update_branches.iter().any(|branch| {
-        branch.target == cell.path && matches!(branch.expression, UpdateExpression::BoolNot { .. })
-    }) {
-        Some(FieldValue::Bool(false))
-    } else {
-        Some(FieldValue::Text(String::new()))
-    }
-}
-
-fn initialize_indexed_derived_base_fields(
-    ir: &TypedProgram,
-    row_scope: &str,
+fn initialize_indexed_derived_base_fields_from_compiler(
+    fields: &CompilerStorageIndexedDerivedFields,
     row: &mut RuntimeRowSnapshot,
 ) {
-    for value in ir.derived_values.iter().filter(|value| value.indexed) {
-        let Some(field) = value
-            .path
-            .strip_prefix(row_scope)
-            .and_then(|path| path.strip_prefix('.'))
-        else {
-            continue;
-        };
+    for field in &fields.fields {
         if let Some(base_value) = row.columns.owned_value(field) {
             row.columns
                 .insert_value(base_row_field_name(field), base_value);
-        }
-    }
-}
-
-fn runtime_value_from_initial(
-    initial: &InitialValue,
-    initial_fields: &ValueColumns,
-) -> RuntimeResult<FieldValue> {
-    match initial {
-        InitialValue::Text { value } => Ok(FieldValue::Text(value.clone())),
-        InitialValue::Number { value } => Ok(FieldValue::Json(json!(*value))),
-        InitialValue::Byte { value } => Ok(FieldValue::Json(json!(*value))),
-        InitialValue::Bool { value } => Ok(FieldValue::Bool(*value)),
-        InitialValue::Bytes { bytes, .. } => Ok(FieldValue::Bytes(RuntimeBytes::inline(
-            Bytes::copy_from_slice(bytes),
-        ))),
-        InitialValue::Enum { value } => Ok(FieldValue::Enum(value.clone())),
-        InitialValue::RootInitialField { path } => Ok(initial_fields
-            .owned_value(path)
-            .unwrap_or_else(|| FieldValue::Text(String::new()))),
-        InitialValue::RowInitialField { path } => {
-            row_initial_field_value(initial_fields, path, path)
-                .ok_or_else(|| format!("row initial field `{path}` is missing").into())
-        }
-        InitialValue::Unknown { summary } => {
-            Err(format!("unsupported state initializer `{summary}`").into())
         }
     }
 }
@@ -53875,19 +48714,11 @@ fn field_value_is_empty_text(value: &FieldValue) -> bool {
     matches!(value, FieldValue::Text(text) if text.is_empty())
 }
 
-fn initialize_indexed_derived_text_fields(
-    ir: &TypedProgram,
-    row_scope: &str,
+fn initialize_indexed_derived_text_fields_from_compiler(
+    fields: &CompilerStorageIndexedDerivedFields,
     row: &mut RuntimeRowSnapshot,
 ) {
-    for value in ir.derived_values.iter().filter(|value| value.indexed) {
-        let Some(field) = value
-            .path
-            .strip_prefix(row_scope)
-            .and_then(|path| path.strip_prefix('.'))
-        else {
-            continue;
-        };
+    for field in &fields.fields {
         if !row.columns.contains_key(field) {
             row.columns
                 .insert_value(field.to_owned(), FieldValue::Text(String::new()));
@@ -53895,33 +48726,8 @@ fn initialize_indexed_derived_text_fields(
     }
 }
 
-fn row_scope_name(list_name: &str) -> String {
-    list_name
-        .strip_suffix("ies")
-        .map(|prefix| format!("{prefix}y"))
-        .or_else(|| list_name.strip_suffix('s').map(str::to_owned))
-        .unwrap_or_else(|| format!("{list_name}_item"))
-}
-
-fn row_scope_name_for_ir_list(ir: &TypedProgram, list: &boon_ir::ListMemory) -> String {
-    list.row_scope_id
-        .and_then(|scope_id| ir.row_scopes.get(scope_id.as_usize()))
-        .map(|scope| scope.row_scope.clone())
-        .unwrap_or_else(|| row_scope_name(&list.name))
-}
-
 fn base_row_field_name(field: &str) -> String {
     format!("__base_{}", field.replace('.', "_"))
-}
-
-fn row_scope_matches_list(list_name: &str, scope: &str) -> bool {
-    if let Some(prefix) = list_name.strip_suffix("ies") {
-        return scope.strip_suffix('y') == Some(prefix);
-    }
-    if let Some(prefix) = list_name.strip_suffix('s') {
-        return scope == prefix;
-    }
-    scope.strip_suffix("_item") == Some(list_name)
 }
 
 fn todo_generic_row(title: &str) -> RuntimeRowSnapshot {
@@ -54186,6 +48992,192 @@ fn runtime_bytes_scalar_arg_usize(
 }
 
 impl ScalarUpdateExpression {
+    fn from_compiler(expression: CompilerScalarUpdateExpression) -> Self {
+        match expression {
+            CompilerScalarUpdateExpression::SourceText => Self::SourceText,
+            CompilerScalarUpdateExpression::SourceKey => Self::SourceKey,
+            CompilerScalarUpdateExpression::SourceAddress => Self::SourceAddress,
+            CompilerScalarUpdateExpression::SourcePayload(value) => Self::SourcePayload(value),
+            CompilerScalarUpdateExpression::Const(value) => Self::Const(value),
+            CompilerScalarUpdateExpression::NumberInfix { left, op, right } => {
+                Self::NumberInfix { left, op, right }
+            }
+            CompilerScalarUpdateExpression::ProjectTime {
+                pointer_x,
+                pointer_width,
+                viewport_start,
+                viewport_end,
+                fallback,
+            } => Self::ProjectTime {
+                pointer_x,
+                pointer_width,
+                viewport_start,
+                viewport_end,
+                fallback,
+            },
+            CompilerScalarUpdateExpression::MatchNumberInfixConst {
+                left,
+                op,
+                right,
+                arms,
+            } => Self::MatchNumberInfixConst {
+                left,
+                op,
+                right,
+                arms,
+            },
+            CompilerScalarUpdateExpression::ListFindValue {
+                list,
+                field,
+                expected,
+                target,
+                fallback,
+            } => Self::ListFindValue {
+                list,
+                field,
+                expected,
+                target,
+                fallback,
+            },
+            CompilerScalarUpdateExpression::PreviousValue(value) => Self::PreviousValue(value),
+            CompilerScalarUpdateExpression::ReadPath(value) => Self::ReadPath(value),
+            CompilerScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
+                Self::TextTrimOrPrevious { path, previous }
+            }
+            CompilerScalarUpdateExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => Self::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            },
+            CompilerScalarUpdateExpression::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            } => Self::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            },
+            CompilerScalarUpdateExpression::BoolNot(value) => Self::BoolNot(value),
+            CompilerScalarUpdateExpression::BytesLength(value) => Self::BytesLength(value),
+            CompilerScalarUpdateExpression::BytesIsEmpty(value) => Self::BytesIsEmpty(value),
+            CompilerScalarUpdateExpression::BytesGet { path, index } => {
+                Self::BytesGet { path, index }
+            }
+            CompilerScalarUpdateExpression::BytesSet { path, index, value } => {
+                Self::BytesSet { path, index, value }
+            }
+            CompilerScalarUpdateExpression::BytesSlice {
+                path,
+                offset,
+                byte_count,
+            } => Self::BytesSlice {
+                path,
+                offset,
+                byte_count,
+            },
+            CompilerScalarUpdateExpression::BytesTake { path, byte_count } => {
+                Self::BytesTake { path, byte_count }
+            }
+            CompilerScalarUpdateExpression::BytesDrop { path, byte_count } => {
+                Self::BytesDrop { path, byte_count }
+            }
+            CompilerScalarUpdateExpression::BytesZeros { byte_count } => {
+                Self::BytesZeros { byte_count }
+            }
+            CompilerScalarUpdateExpression::BytesToHex { path } => Self::BytesToHex { path },
+            CompilerScalarUpdateExpression::BytesFromHex { path } => Self::BytesFromHex { path },
+            CompilerScalarUpdateExpression::BytesToBase64 { path } => Self::BytesToBase64 { path },
+            CompilerScalarUpdateExpression::BytesFromBase64 { path } => {
+                Self::BytesFromBase64 { path }
+            }
+            CompilerScalarUpdateExpression::BytesReadUnsigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+            } => Self::BytesReadUnsigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+            },
+            CompilerScalarUpdateExpression::BytesReadSigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+            } => Self::BytesReadSigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+            },
+            CompilerScalarUpdateExpression::BytesWriteUnsigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+                value,
+            } => Self::BytesWriteUnsigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+                value,
+            },
+            CompilerScalarUpdateExpression::BytesWriteSigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+                value,
+            } => Self::BytesWriteSigned {
+                path,
+                offset,
+                byte_count,
+                endian,
+                value,
+            },
+            CompilerScalarUpdateExpression::FileReadBytes { path } => Self::FileReadBytes { path },
+            CompilerScalarUpdateExpression::TextToBytes { path, encoding } => {
+                Self::TextToBytes { path, encoding }
+            }
+            CompilerScalarUpdateExpression::BytesToText { path, encoding } => {
+                Self::BytesToText { path, encoding }
+            }
+            CompilerScalarUpdateExpression::BytesConcat { left, right } => {
+                Self::BytesConcat { left, right }
+            }
+            CompilerScalarUpdateExpression::BytesEqual { left, right } => {
+                Self::BytesEqual { left, right }
+            }
+            CompilerScalarUpdateExpression::BytesFind { haystack, needle } => {
+                Self::BytesFind { haystack, needle }
+            }
+            CompilerScalarUpdateExpression::BytesStartsWith { path, prefix } => {
+                Self::BytesStartsWith { path, prefix }
+            }
+            CompilerScalarUpdateExpression::BytesEndsWith { path, suffix } => {
+                Self::BytesEndsWith { path, suffix }
+            }
+            CompilerScalarUpdateExpression::MatchConst { input, arms } => {
+                Self::MatchConst { input, arms }
+            }
+            CompilerScalarUpdateExpression::MatchValueConst { input, arms } => {
+                Self::MatchValueConst { input, arms }
+            }
+            CompilerScalarUpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+                Self::MatchTextIsEmptyConst { input, arms }
+            }
+            CompilerScalarUpdateExpression::Unsupported => Self::Unsupported,
+        }
+    }
+
     fn is_root_text_expression(&self) -> bool {
         matches!(
             self,
@@ -54235,6 +49227,10 @@ impl ScalarUpdateExpression {
     fn is_indexed_bool_expression(&self) -> bool {
         matches!(self, Self::Const(value) if value == "True" || value == "False")
             || matches!(self, Self::BoolNot(_))
+            || matches!(self, Self::BytesIsEmpty(_))
+            || matches!(self, Self::BytesEqual { .. })
+            || matches!(self, Self::BytesStartsWith { .. })
+            || matches!(self, Self::BytesEndsWith { .. })
     }
 
     fn is_indexed_bool_match_expression(&self) -> bool {
@@ -54255,7 +49251,23 @@ impl ScalarUpdateExpression {
     fn is_indexed_value_expression(&self) -> bool {
         matches!(
             self,
-            Self::BytesLength(_) | Self::BytesGet { .. } | Self::BytesSet { .. }
+            Self::BytesLength(_)
+                | Self::BytesGet { .. }
+                | Self::BytesSet { .. }
+                | Self::BytesSlice { .. }
+                | Self::BytesTake { .. }
+                | Self::BytesDrop { .. }
+                | Self::BytesZeros { .. }
+                | Self::BytesFromHex { .. }
+                | Self::BytesFromBase64 { .. }
+                | Self::BytesReadUnsigned { .. }
+                | Self::BytesReadSigned { .. }
+                | Self::BytesWriteUnsigned { .. }
+                | Self::BytesWriteSigned { .. }
+                | Self::FileReadBytes { .. }
+                | Self::TextToBytes { .. }
+                | Self::BytesConcat { .. }
+                | Self::BytesFind { .. }
         )
     }
 
@@ -55208,11 +50220,10 @@ impl ScalarBytecodeSampleContext {
 }
 
 fn scalar_expression_bytecode_report(
-    ir: &TypedProgram,
     compiled: &CompiledProgram,
     scenario: &Scenario,
 ) -> RuntimeResult<JsonValue> {
-    let candidates = scalar_bytecode_candidates(ir, compiled);
+    let candidates = scalar_bytecode_candidates(compiled);
     let mut compiled_expression_count = 0usize;
     let mut fallback_reasons = Vec::new();
     let mut deopt_reasons = Vec::new();
@@ -55347,11 +50358,10 @@ fn scalar_expression_bytecode_report(
 }
 
 fn scalar_generated_kernel_report(
-    ir: &TypedProgram,
     compiled: &CompiledProgram,
     scenario: &Scenario,
 ) -> RuntimeResult<JsonValue> {
-    let candidates = scalar_bytecode_candidates(ir, compiled);
+    let candidates = scalar_bytecode_candidates(compiled);
     let mut generated_kernel_count = 0usize;
     let mut fallback_reasons = Vec::new();
     let mut deopt_reasons = Vec::new();
@@ -55516,11 +50526,9 @@ fn scalar_generated_kernel_report(
     }))
 }
 
-fn scalar_bytecode_candidates(
-    ir: &TypedProgram,
-    compiled: &CompiledProgram,
-) -> Vec<ScalarBytecodeCandidate> {
+fn scalar_bytecode_candidates(compiled: &CompiledProgram) -> Vec<ScalarBytecodeCandidate> {
     let mut candidates = Vec::new();
+    let bool_facts = compiled.source_route_bool_facts("scalar bytecode candidate report");
     for (route_id, route) in compiled.source_routes.route_slots.iter().enumerate() {
         for target in &route.root_scalar_targets {
             candidates.push(ScalarBytecodeCandidate {
@@ -55529,7 +50537,7 @@ fn scalar_bytecode_candidates(
                 source: route.source.clone(),
                 target: target.target.clone(),
                 target_kind: "root_scalar",
-                mode: if ir_scalar_target_is_bool(ir, &target.target) {
+                mode: if source_route_target_is_bool(&bool_facts, &target.target) {
                     ScalarBytecodeMode::Bool
                 } else {
                     ScalarBytecodeMode::Text
@@ -56251,11 +51259,19 @@ fn source_action_guard_matches(
     match guard {
         UpdateGuard::SourcePayloadOneOf { field, values } => {
             let payload_value = match field {
-                SourcePayloadField::Text => input.text,
-                SourcePayloadField::Key => input.key,
-                SourcePayloadField::Address => input.address,
-                SourcePayloadField::Bytes => None,
-                SourcePayloadField::Named(name) => input.payload.get(name).copied(),
+                CompilerSourcePayloadField::Text => input.text,
+                CompilerSourcePayloadField::Key => input.key,
+                CompilerSourcePayloadField::Address => input.address,
+                CompilerSourcePayloadField::Named(name) => input.payload.get(name).copied(),
+                CompilerSourcePayloadField::Bytes => {
+                    let Some(payload) = input.payload_bytes.get("bytes") else {
+                        return false;
+                    };
+                    return values.iter().any(|expected| {
+                        bytes_decode_hex(expected)
+                            .is_ok_and(|expected_bytes| expected_bytes == *payload)
+                    });
+                }
             };
             payload_value.is_some_and(|payload| values.iter().any(|expected| expected == payload))
         }
@@ -56361,7 +51377,7 @@ struct RootListViewFieldOnlyPlan {
 
 #[derive(Clone, Debug)]
 struct RootListViewFieldOnlyRecordProjector {
-    function: FunctionDefinition,
+    function: GenericDerivedFunction,
     row_arg: String,
     fields: Vec<RootListViewFieldOnlyRecordField>,
     record_field_names: BTreeSet<String>,
@@ -56379,7 +51395,7 @@ struct RootListViewFieldOnlyRecordField {
 enum RootListViewFieldOnlyProjector {
     Direct(RootListViewFieldOnlyRecordProjector),
     Branch {
-        function: FunctionDefinition,
+        function: GenericDerivedFunction,
         row_arg: String,
         selector_expr: usize,
         selector_row_arg_access: FunctionArgAccess,
@@ -57149,10 +52165,17 @@ struct DerivedEquationPlan {
 #[derive(Clone, Debug, Default)]
 struct GenericDerivedPlan {
     expressions: Vec<AstExpr>,
-    functions: BTreeMap<String, FunctionDefinition>,
+    functions: BTreeMap<String, GenericDerivedFunction>,
     root_fields: Vec<GenericDerivedRootField>,
     observed_root_paths: BTreeSet<String>,
     indexed_fields: Vec<GenericDerivedIndexedField>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericDerivedFunction {
+    name: String,
+    args: Vec<String>,
+    statement: AstStatement,
 }
 
 #[derive(Clone, Debug)]
@@ -57181,22 +52204,6 @@ struct GenericDerivedIndexedField {
     kind: DerivedValueKind,
     startup_recompute: bool,
     statement: AstStatement,
-}
-
-fn observed_root_paths_from_view_bindings(ir: &TypedProgram) -> BTreeSet<String> {
-    let mut paths = BTreeSet::new();
-    for binding in &ir.view_bindings {
-        if !matches!(
-            binding.kind,
-            ViewBindingKind::Data | ViewBindingKind::Target | ViewBindingKind::Source
-        ) {
-            continue;
-        }
-        for variant in root_path_observation_variants(&binding.path) {
-            paths.insert(variant);
-        }
-    }
-    paths
 }
 
 fn root_path_observation_variants(path: &str) -> Vec<String> {
@@ -60240,190 +55247,6 @@ enum RuntimeDerivedTextExpression {
     Unsupported,
 }
 
-fn source_event_transform_text_expression(
-    value: &boon_ir::DerivedValue,
-    source: &str,
-    expressions: &[AstExpr],
-    functions: &[FunctionDefinition],
-) -> RuntimeDerivedTextExpression {
-    let exprs = statement_ast_exprs(&value.statement, expressions);
-    let Some(path) = text_trim_input_path_from_exprs(&exprs) else {
-        if let Some(expression) = source_payload_when_match_const_expression(&exprs, source) {
-            return expression;
-        }
-        if let Some(expression) =
-            source_then_match_const_expression(&value.path, &exprs, source, expressions, functions)
-        {
-            return expression;
-        }
-        if let Some(expression) =
-            source_then_inline_match_const_expression(&value.path, &exprs, source)
-        {
-            return expression;
-        }
-        if let Some(expression) = source_then_prefix_payload_concat_expression(&exprs, source) {
-            return expression;
-        }
-        if let Some(expression) =
-            source_then_prefix_root_concat_expression(&value.path, &exprs, source)
-        {
-            return expression;
-        }
-        if let Some(expression) =
-            source_then_list_find_value_expression(&value.path, &exprs, source)
-        {
-            return expression;
-        }
-        if let Some(value) = source_then_const_text_value(&exprs, source) {
-            return RuntimeDerivedTextExpression::Const { value };
-        }
-        let Some(path) = source_then_text_value(&exprs, source)
-            .or_else(|| source_direct_text_value(&exprs, source))
-        else {
-            return RuntimeDerivedTextExpression::Unsupported;
-        };
-        return RuntimeDerivedTextExpression::SourceRootText {
-            path: canonical_transform_text_path(&value.path, &path),
-        };
-    };
-    if path == "text"
-        || path.ends_with(".text")
-        || value
-            .sources
-            .iter()
-            .any(|source| path == format!("{source}.text"))
-    {
-        return RuntimeDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty;
-    }
-    RuntimeDerivedTextExpression::EnterKeyRootTextTrimNonEmpty {
-        path: canonical_transform_text_path(&value.path, &path),
-    }
-}
-
-fn source_payload_when_match_const_expression(
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::When { input } = expr.kind else {
-            return None;
-        };
-        let input = ast_argument_value_in_exprs(exprs, input)
-            .filter(|input| !input.is_empty())
-            .or_else(|| source_payload_path_in_expr_subtree(exprs, input, source))
-            .or_else(|| source_payload_path_before_line(exprs, expr.line, source))?;
-        if source_payload_field_from_input(&input, source).is_none() {
-            return None;
-        }
-        let arms = runtime_match_const_arms_after_when(exprs, expr.line);
-        (!arms.is_empty()).then_some(RuntimeDerivedTextExpression::MatchConst { input, arms })
-    })
-}
-
-fn source_then_match_const_expression(
-    target: &str,
-    exprs: &[AstExpr],
-    source: &str,
-    all_expressions: &[AstExpr],
-    functions: &[FunctionDefinition],
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
-        if !input_matches {
-            return None;
-        }
-        let output = output?;
-        let output_expr = exprs.iter().find(|candidate| candidate.id == output)?;
-        let AstExprKind::Call { function, args } = &output_expr.kind else {
-            return None;
-        };
-        let function = runtime_function_definition_for_call(functions, function)?;
-        let function_exprs = statement_ast_exprs(&function.statement, all_expressions);
-        let when = function_exprs
-            .iter()
-            .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))?;
-        let AstExprKind::When { input } = when.kind else {
-            return None;
-        };
-        let input_name = ast_argument_value_in_exprs(&function_exprs, input)?;
-        let input =
-            runtime_function_call_arg_path(target, exprs, args, &function.args, &input_name)?;
-        let arms = runtime_match_const_arms_after_when(&function_exprs, when.line);
-        (!arms.is_empty()).then_some(RuntimeDerivedTextExpression::MatchConst { input, arms })
-    })
-}
-
-fn source_then_inline_match_const_expression(
-    target: &str,
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        if !source_then_input_matches(exprs, input, expr.line, source) {
-            return None;
-        }
-        let output = output?;
-        let when = exprs.iter().find(|candidate| candidate.id == output)?;
-        let AstExprKind::When { input } = when.kind else {
-            return None;
-        };
-        let input = ast_argument_value_in_exprs(exprs, input)
-            .map(|path| canonical_transform_text_path(target, &path))?;
-        let arms = runtime_match_const_arms_after_when(exprs, when.line);
-        (!arms.is_empty()).then_some(RuntimeDerivedTextExpression::MatchConst { input, arms })
-    })
-}
-
-fn source_then_prefix_payload_concat_expression(
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
-        if !input_matches {
-            return None;
-        }
-        output
-            .and_then(|output| prefix_payload_concat_expression(exprs, output, source))
-            .or_else(|| prefix_payload_concat_expression_after_line(exprs, expr.line, source))
-    })
-}
-
-fn source_then_prefix_root_concat_expression(
-    target: &str,
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        if !source_then_input_matches(exprs, input, expr.line, source) {
-            return None;
-        }
-        output
-            .and_then(|output| prefix_root_concat_expression(target, exprs, output))
-            .or_else(|| prefix_root_concat_expression_after_line(target, exprs, expr.line))
-    })
-}
-
-fn source_direct_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
-    exprs.iter().find_map(|expr| {
-        let path = ast_argument_value_in_exprs(exprs, expr.id)?;
-        source_payload_field_from_input(&path, source)?;
-        Some(path)
-    })
-}
-
 fn source_payload_path_in_expr_subtree(
     exprs: &[AstExpr],
     expr_id: usize,
@@ -60449,185 +55272,6 @@ fn source_payload_path_before_line(exprs: &[AstExpr], line: usize, source: &str)
             source_payload_field_from_input(&path, source)?;
             Some(path)
         })
-}
-
-fn prefix_root_concat_expression_after_line(
-    target: &str,
-    exprs: &[AstExpr],
-    line: usize,
-) -> Option<RuntimeDerivedTextExpression> {
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line >= line && expr.line < end_line)
-        .find_map(|expr| prefix_root_concat_expression(target, exprs, expr.id))
-}
-
-fn prefix_root_concat_expression(
-    target: &str,
-    exprs: &[AstExpr],
-    output: usize,
-) -> Option<RuntimeDerivedTextExpression> {
-    let expr = exprs.iter().find(|expr| expr.id == output)?;
-    let AstExprKind::Pipe { op, input, args } = &expr.kind else {
-        return None;
-    };
-    if op != "Text/concat" {
-        return None;
-    }
-    let prefix = ast_const_text_value_in_exprs(exprs, *input)?;
-    let path = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("with"))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-        .map(|path| canonical_transform_text_path(target, &path))?;
-    let separator = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("separator"))
-        .and_then(|arg| ast_const_text_value_in_exprs(exprs, arg.value))
-        .unwrap_or_default();
-    Some(RuntimeDerivedTextExpression::PrefixRootConcat {
-        prefix,
-        path,
-        separator,
-    })
-}
-
-fn prefix_payload_concat_expression_after_line(
-    exprs: &[AstExpr],
-    line: usize,
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line > line && expr.line < end_line)
-        .find_map(|expr| prefix_payload_concat_expression(exprs, expr.id, source))
-}
-
-fn prefix_payload_concat_expression(
-    exprs: &[AstExpr],
-    output: usize,
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    let expr = exprs.iter().find(|expr| expr.id == output)?;
-    let AstExprKind::Pipe { op, input, args } = &expr.kind else {
-        return None;
-    };
-    if op != "Text/concat" {
-        return None;
-    }
-    let prefix = ast_const_text_value_in_exprs(exprs, *input)?;
-    let payload_path = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("with"))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    source_payload_field_from_input(&payload_path, source)?;
-    let separator = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("separator"))
-        .and_then(|arg| ast_const_text_value_in_exprs(exprs, arg.value))
-        .unwrap_or_default();
-    Some(RuntimeDerivedTextExpression::PrefixPayloadConcat {
-        prefix,
-        payload_path,
-        separator,
-    })
-}
-
-fn runtime_function_definition_for_call<'a>(
-    functions: &'a [FunctionDefinition],
-    function: &str,
-) -> Option<&'a FunctionDefinition> {
-    functions
-        .iter()
-        .find(|definition| definition.name == function)
-        .or_else(|| {
-            let suffix = function.rsplit_once('/').map(|(_, name)| name)?;
-            functions
-                .iter()
-                .find(|definition| definition.name == suffix)
-        })
-}
-
-fn runtime_function_call_arg_path(
-    target: &str,
-    exprs: &[AstExpr],
-    args: &[AstCallArg],
-    formals: &[String],
-    input_name: &str,
-) -> Option<String> {
-    let named = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some(input_name))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value));
-    let positional = formals
-        .iter()
-        .position(|formal| formal == input_name)
-        .and_then(|index| {
-            args.iter()
-                .filter(|arg| arg.name.is_none())
-                .nth(index)
-                .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-        });
-    named
-        .or(positional)
-        .map(|path| canonical_transform_text_path(target, &path))
-}
-
-fn runtime_match_const_arms_after_when(exprs: &[AstExpr], when_line: usize) -> Vec<UpdateMatchArm> {
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line >= when_line && expr.line < end_line)
-        .filter_map(|expr| {
-            let AstExprKind::MatchArm {
-                pattern,
-                output: Some(output),
-            } = &expr.kind
-            else {
-                return None;
-            };
-            let pattern = runtime_match_const_pattern_label(pattern)?;
-            let output = ast_simple_text_value_in_exprs(exprs, *output)?;
-            Some(UpdateMatchArm { pattern, output })
-        })
-        .collect()
 }
 
 fn runtime_match_const_pattern_label(pattern: &[String]) -> Option<String> {
@@ -60769,15 +55413,6 @@ fn collect_expr_tree(
     }
 }
 
-fn text_trim_input_path_from_exprs(exprs: &[AstExpr]) -> Option<String> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
-            return None;
-        };
-        (op == "Text/trim").then(|| ast_argument_value_in_exprs(exprs, *input))?
-    })
-}
-
 fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
     let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
     Some(match &expr.kind {
@@ -60900,6 +55535,7 @@ struct SourceRoute {
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
     indexed_bool_targets: Vec<SourceRouteScalarTarget>,
     indexed_value_targets: Vec<SourceRouteScalarTarget>,
+    indexed_scalar_actions: Vec<SourceAction>,
     derived_text_targets: Vec<String>,
     router_route_targets: Vec<SourceRouteRouterRoute>,
     root_text_transform_targets: Vec<SourceRouteRootTextTransform>,
@@ -60933,6 +55569,16 @@ struct SourceRouteRouterRoute {
     source: String,
     target: String,
     path: String,
+}
+
+impl SourceRouteRouterRoute {
+    fn from_compiler(target: CompilerSourceRouteRouterRoute) -> Self {
+        Self {
+            source: target.source,
+            target: target.target,
+            path: target.path,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61042,6 +55688,126 @@ impl SourceRouteBoolAction {
     }
 }
 
+fn indexed_text_source_action_for_target(target: &SourceRouteScalarTarget) -> Option<SourceAction> {
+    let kind = match &target.expression {
+        ScalarUpdateExpression::Const(_) => SourceRouteTextAction::Const,
+        ScalarUpdateExpression::SourceText | ScalarUpdateExpression::SourcePayload(_) => {
+            SourceRouteTextAction::SourceText
+        }
+        ScalarUpdateExpression::PreviousValue(_) => SourceRouteTextAction::PreviousValue,
+        ScalarUpdateExpression::ReadPath(_) => SourceRouteTextAction::ReadPath,
+        ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
+            SourceRouteTextAction::TextTrimOrPrevious
+        }
+        ScalarUpdateExpression::PrefixPayloadConcat { .. }
+        | ScalarUpdateExpression::PrefixRootConcat { .. } => SourceRouteTextAction::ReadPath,
+        ScalarUpdateExpression::MatchConst { .. }
+        | ScalarUpdateExpression::MatchValueConst { .. }
+        | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
+        | ScalarUpdateExpression::MatchNumberInfixConst { .. }
+        | ScalarUpdateExpression::ListFindValue { .. }
+        | ScalarUpdateExpression::BytesToHex { .. }
+        | ScalarUpdateExpression::BytesToBase64 { .. }
+        | ScalarUpdateExpression::BytesToText { .. } => SourceRouteTextAction::Computed,
+        ScalarUpdateExpression::NumberInfix { .. }
+        | ScalarUpdateExpression::ProjectTime { .. }
+        | ScalarUpdateExpression::SourceKey
+        | ScalarUpdateExpression::SourceAddress
+        | ScalarUpdateExpression::BoolNot(_)
+        | ScalarUpdateExpression::BytesLength(_)
+        | ScalarUpdateExpression::BytesIsEmpty(_)
+        | ScalarUpdateExpression::BytesGet { .. }
+        | ScalarUpdateExpression::BytesSet { .. }
+        | ScalarUpdateExpression::BytesSlice { .. }
+        | ScalarUpdateExpression::BytesTake { .. }
+        | ScalarUpdateExpression::BytesDrop { .. }
+        | ScalarUpdateExpression::BytesZeros { .. }
+        | ScalarUpdateExpression::BytesFromHex { .. }
+        | ScalarUpdateExpression::BytesFromBase64 { .. }
+        | ScalarUpdateExpression::BytesReadUnsigned { .. }
+        | ScalarUpdateExpression::BytesReadSigned { .. }
+        | ScalarUpdateExpression::BytesWriteUnsigned { .. }
+        | ScalarUpdateExpression::BytesWriteSigned { .. }
+        | ScalarUpdateExpression::FileReadBytes { .. }
+        | ScalarUpdateExpression::TextToBytes { .. }
+        | ScalarUpdateExpression::BytesConcat { .. }
+        | ScalarUpdateExpression::BytesEqual { .. }
+        | ScalarUpdateExpression::BytesFind { .. }
+        | ScalarUpdateExpression::BytesStartsWith { .. }
+        | ScalarUpdateExpression::BytesEndsWith { .. }
+        | ScalarUpdateExpression::Unsupported => return None,
+    };
+    Some(SourceAction::IndexedText {
+        kind,
+        target: target.target.clone(),
+        guard: target.guard.clone(),
+    })
+}
+
+fn indexed_bool_source_action_for_target(target: &SourceRouteScalarTarget) -> Option<SourceAction> {
+    let kind = match &target.expression {
+        ScalarUpdateExpression::BoolNot(_) => SourceRouteBoolAction::BoolNot,
+        ScalarUpdateExpression::Const(value) if value == "True" => SourceRouteBoolAction::ConstTrue,
+        ScalarUpdateExpression::Const(value) if value == "False" => {
+            SourceRouteBoolAction::ConstFalse
+        }
+        ScalarUpdateExpression::ReadPath(_) => SourceRouteBoolAction::ReadPath,
+        ScalarUpdateExpression::SourcePayload(_) => SourceRouteBoolAction::SourcePulse,
+        ScalarUpdateExpression::MatchConst { .. }
+        | ScalarUpdateExpression::MatchValueConst { .. }
+        | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
+        | ScalarUpdateExpression::MatchNumberInfixConst { .. }
+        | ScalarUpdateExpression::BytesIsEmpty(_)
+        | ScalarUpdateExpression::BytesEqual { .. }
+        | ScalarUpdateExpression::BytesStartsWith { .. }
+        | ScalarUpdateExpression::BytesEndsWith { .. } => SourceRouteBoolAction::Match,
+        ScalarUpdateExpression::SourceText
+        | ScalarUpdateExpression::SourceKey
+        | ScalarUpdateExpression::SourceAddress
+        | ScalarUpdateExpression::Const(_)
+        | ScalarUpdateExpression::NumberInfix { .. }
+        | ScalarUpdateExpression::ProjectTime { .. }
+        | ScalarUpdateExpression::PreviousValue(_)
+        | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+        | ScalarUpdateExpression::PrefixPayloadConcat { .. }
+        | ScalarUpdateExpression::PrefixRootConcat { .. }
+        | ScalarUpdateExpression::ListFindValue { .. }
+        | ScalarUpdateExpression::BytesLength(_)
+        | ScalarUpdateExpression::BytesGet { .. }
+        | ScalarUpdateExpression::BytesSet { .. }
+        | ScalarUpdateExpression::BytesSlice { .. }
+        | ScalarUpdateExpression::BytesTake { .. }
+        | ScalarUpdateExpression::BytesDrop { .. }
+        | ScalarUpdateExpression::BytesZeros { .. }
+        | ScalarUpdateExpression::BytesToHex { .. }
+        | ScalarUpdateExpression::BytesFromHex { .. }
+        | ScalarUpdateExpression::BytesToBase64 { .. }
+        | ScalarUpdateExpression::BytesFromBase64 { .. }
+        | ScalarUpdateExpression::BytesReadUnsigned { .. }
+        | ScalarUpdateExpression::BytesReadSigned { .. }
+        | ScalarUpdateExpression::BytesWriteUnsigned { .. }
+        | ScalarUpdateExpression::BytesWriteSigned { .. }
+        | ScalarUpdateExpression::FileReadBytes { .. }
+        | ScalarUpdateExpression::TextToBytes { .. }
+        | ScalarUpdateExpression::BytesToText { .. }
+        | ScalarUpdateExpression::BytesConcat { .. }
+        | ScalarUpdateExpression::BytesFind { .. }
+        | ScalarUpdateExpression::Unsupported => return None,
+    };
+    Some(SourceAction::IndexedBool {
+        kind,
+        target: target.target.clone(),
+        guard: target.guard.clone(),
+    })
+}
+
+fn indexed_value_source_action_for_target(target: &SourceRouteScalarTarget) -> SourceAction {
+    SourceAction::IndexedValue {
+        target: target.target.clone(),
+        guard: target.guard.clone(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ListEquationPlan {
     operations: Vec<RuntimeListOperation>,
@@ -61083,21 +55849,7 @@ struct RuntimeListAppendField {
 enum RuntimeListAppendFieldValue {
     Source { path: String },
     Const { value: String },
-    TypedConst { value: InitialValue },
-}
-
-impl RuntimeListAppendFieldValue {
-    fn from_ir(value: &ListAppendFieldValue) -> Self {
-        match value {
-            ListAppendFieldValue::Source { path } => Self::Source { path: path.clone() },
-            ListAppendFieldValue::Const { value } => Self::Const {
-                value: value.clone(),
-            },
-            ListAppendFieldValue::TypedConst { value } => Self::TypedConst {
-                value: value.clone(),
-            },
-        }
-    }
+    TypedConst { value: RuntimeInitialValue },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61110,344 +55862,20 @@ enum RuntimeListPredicate {
 }
 
 impl ScalarEquationPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let source_paths = ir
-            .sources
-            .iter()
-            .map(|source| source.path.clone())
-            .collect::<Vec<_>>();
-        let branches = ir
-            .update_branches
-            .iter()
+    fn from_compiler(plan: CompilerScalarEquationPlan) -> Self {
+        let branches = plan
+            .branches
+            .into_iter()
             .map(|branch| ScalarUpdateBranch {
-                target: branch.target.clone(),
-                source: branch.source.clone(),
-                guard: branch.guard.clone(),
-                expression: match &branch.expression {
-                    UpdateExpression::SourcePayload { path } if path == "text" => {
-                        ScalarUpdateExpression::SourceText
-                    }
-                    UpdateExpression::SourcePayload { path } if path == "key" => {
-                        ScalarUpdateExpression::SourceKey
-                    }
-                    UpdateExpression::SourcePayload { path } if path == "address" => {
-                        ScalarUpdateExpression::SourceAddress
-                    }
-                    UpdateExpression::SourcePayload { path } => {
-                        ScalarUpdateExpression::SourcePayload(path.clone())
-                    }
-                    UpdateExpression::Const { value } => {
-                        ScalarUpdateExpression::Const(value.clone())
-                    }
-                    UpdateExpression::NumberInfix { left, op, right } => {
-                        ScalarUpdateExpression::NumberInfix {
-                            left: left.clone(),
-                            op: op.clone(),
-                            right: right.clone(),
-                        }
-                    }
-                    UpdateExpression::ProjectTime {
-                        pointer_x,
-                        pointer_width,
-                        viewport_start,
-                        viewport_end,
-                        fallback,
-                    } => ScalarUpdateExpression::ProjectTime {
-                        pointer_x: pointer_x.clone(),
-                        pointer_width: pointer_width.clone(),
-                        viewport_start: viewport_start.clone(),
-                        viewport_end: viewport_end.clone(),
-                        fallback: fallback.clone(),
-                    },
-                    UpdateExpression::MatchNumberInfixConst {
-                        left,
-                        op,
-                        right,
-                        arms,
-                    } => ScalarUpdateExpression::MatchNumberInfixConst {
-                        left: left.clone(),
-                        op: op.clone(),
-                        right: right.clone(),
-                        arms: arms.clone(),
-                    },
-                    UpdateExpression::ListFindValue {
-                        list,
-                        field,
-                        expected,
-                        target,
-                        fallback,
-                    } => ScalarUpdateExpression::ListFindValue {
-                        list: list.clone(),
-                        field: field.clone(),
-                        expected: expected.clone(),
-                        target: target.clone(),
-                        fallback: fallback.clone(),
-                    },
-                    UpdateExpression::PreviousValue { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("text") =>
-                    {
-                        ScalarUpdateExpression::SourceText
-                    }
-                    UpdateExpression::PreviousValue { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("key") =>
-                    {
-                        ScalarUpdateExpression::SourceKey
-                    }
-                    UpdateExpression::PreviousValue { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("address") =>
-                    {
-                        ScalarUpdateExpression::SourceAddress
-                    }
-                    UpdateExpression::PreviousValue { path }
-                        if source_payload_field_from_input(path, &branch.source).is_some() =>
-                    {
-                        ScalarUpdateExpression::SourcePayload(
-                            source_payload_field_from_input(path, &branch.source)
-                                .unwrap_or_default(),
-                        )
-                    }
-                    UpdateExpression::PreviousValue { path } => {
-                        ScalarUpdateExpression::PreviousValue(path.clone())
-                    }
-                    UpdateExpression::ReadPath { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("text") =>
-                    {
-                        ScalarUpdateExpression::SourceText
-                    }
-                    UpdateExpression::ReadPath { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("key") =>
-                    {
-                        ScalarUpdateExpression::SourceKey
-                    }
-                    UpdateExpression::ReadPath { path }
-                        if source_payload_field_from_input(path, &branch.source).as_deref()
-                            == Some("address") =>
-                    {
-                        ScalarUpdateExpression::SourceAddress
-                    }
-                    UpdateExpression::ReadPath { path }
-                        if source_payload_field_from_input(path, &branch.source).is_some() =>
-                    {
-                        ScalarUpdateExpression::SourcePayload(
-                            source_payload_field_from_input(path, &branch.source)
-                                .unwrap_or_default(),
-                        )
-                    }
-                    UpdateExpression::ReadPath { path } => {
-                        ScalarUpdateExpression::ReadPath(path.clone())
-                    }
-                    UpdateExpression::TextTrimOrPrevious { path, previous } => {
-                        ScalarUpdateExpression::TextTrimOrPrevious {
-                            path: path.clone(),
-                            previous: previous.clone(),
-                        }
-                    }
-                    UpdateExpression::PrefixPayloadConcat {
-                        prefix,
-                        payload_path,
-                        separator,
-                    } => ScalarUpdateExpression::PrefixPayloadConcat {
-                        prefix: prefix.clone(),
-                        payload_path: payload_path.clone(),
-                        separator: separator.clone(),
-                    },
-                    UpdateExpression::PrefixRootConcat {
-                        prefix,
-                        path,
-                        separator,
-                    } => ScalarUpdateExpression::PrefixRootConcat {
-                        prefix: prefix.clone(),
-                        path: path.clone(),
-                        separator: separator.clone(),
-                    },
-                    UpdateExpression::BoolNot { path } => {
-                        ScalarUpdateExpression::BoolNot(path.clone())
-                    }
-                    UpdateExpression::BytesLength { path } => {
-                        ScalarUpdateExpression::BytesLength(path.clone())
-                    }
-                    UpdateExpression::BytesIsEmpty { path } => {
-                        ScalarUpdateExpression::BytesIsEmpty(path.clone())
-                    }
-                    UpdateExpression::BytesGet { path, index } => {
-                        ScalarUpdateExpression::BytesGet {
-                            path: path.clone(),
-                            index: *index,
-                        }
-                    }
-                    UpdateExpression::BytesSet { path, index, value } => {
-                        ScalarUpdateExpression::BytesSet {
-                            path: path.clone(),
-                            index: *index,
-                            value: *value,
-                        }
-                    }
-                    UpdateExpression::BytesSlice {
-                        path,
-                        offset,
-                        byte_count,
-                    } => ScalarUpdateExpression::BytesSlice {
-                        path: path.clone(),
-                        offset: offset.clone(),
-                        byte_count: byte_count.clone(),
-                    },
-                    UpdateExpression::BytesTake { path, byte_count } => {
-                        ScalarUpdateExpression::BytesTake {
-                            path: path.clone(),
-                            byte_count: byte_count.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesDrop { path, byte_count } => {
-                        ScalarUpdateExpression::BytesDrop {
-                            path: path.clone(),
-                            byte_count: byte_count.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesZeros { byte_count } => {
-                        ScalarUpdateExpression::BytesZeros {
-                            byte_count: *byte_count,
-                        }
-                    }
-                    UpdateExpression::BytesToHex { path } => {
-                        ScalarUpdateExpression::BytesToHex { path: path.clone() }
-                    }
-                    UpdateExpression::BytesFromHex { path } => {
-                        ScalarUpdateExpression::BytesFromHex { path: path.clone() }
-                    }
-                    UpdateExpression::BytesToBase64 { path } => {
-                        ScalarUpdateExpression::BytesToBase64 { path: path.clone() }
-                    }
-                    UpdateExpression::BytesFromBase64 { path } => {
-                        ScalarUpdateExpression::BytesFromBase64 { path: path.clone() }
-                    }
-                    UpdateExpression::BytesReadUnsigned {
-                        path,
-                        offset,
-                        byte_count,
-                        endian,
-                    } => ScalarUpdateExpression::BytesReadUnsigned {
-                        path: path.clone(),
-                        offset: *offset,
-                        byte_count: *byte_count,
-                        endian: endian.clone(),
-                    },
-                    UpdateExpression::BytesReadSigned {
-                        path,
-                        offset,
-                        byte_count,
-                        endian,
-                    } => ScalarUpdateExpression::BytesReadSigned {
-                        path: path.clone(),
-                        offset: *offset,
-                        byte_count: *byte_count,
-                        endian: endian.clone(),
-                    },
-                    UpdateExpression::BytesWriteUnsigned {
-                        path,
-                        offset,
-                        byte_count,
-                        endian,
-                        value,
-                    } => ScalarUpdateExpression::BytesWriteUnsigned {
-                        path: path.clone(),
-                        offset: *offset,
-                        byte_count: *byte_count,
-                        endian: endian.clone(),
-                        value: *value,
-                    },
-                    UpdateExpression::BytesWriteSigned {
-                        path,
-                        offset,
-                        byte_count,
-                        endian,
-                        value,
-                    } => ScalarUpdateExpression::BytesWriteSigned {
-                        path: path.clone(),
-                        offset: *offset,
-                        byte_count: *byte_count,
-                        endian: endian.clone(),
-                        value: *value,
-                    },
-                    UpdateExpression::FileReadBytes { path } => {
-                        ScalarUpdateExpression::FileReadBytes {
-                            path: match path {
-                                boon_ir::FileBytesPath::StaticText(path)
-                                | boon_ir::FileBytesPath::StatePath(path) => path.clone(),
-                            },
-                        }
-                    }
-                    UpdateExpression::TextToBytes { path, encoding } => {
-                        ScalarUpdateExpression::TextToBytes {
-                            path: path.clone(),
-                            encoding: encoding.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesToText { path, encoding } => {
-                        ScalarUpdateExpression::BytesToText {
-                            path: path.clone(),
-                            encoding: encoding.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesConcat { left, right } => {
-                        ScalarUpdateExpression::BytesConcat {
-                            left: left.clone(),
-                            right: right.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesEqual { left, right } => {
-                        ScalarUpdateExpression::BytesEqual {
-                            left: left.clone(),
-                            right: right.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesFind { haystack, needle } => {
-                        ScalarUpdateExpression::BytesFind {
-                            haystack: haystack.clone(),
-                            needle: needle.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesStartsWith { path, prefix } => {
-                        ScalarUpdateExpression::BytesStartsWith {
-                            path: path.clone(),
-                            prefix: prefix.clone(),
-                        }
-                    }
-                    UpdateExpression::BytesEndsWith { path, suffix } => {
-                        ScalarUpdateExpression::BytesEndsWith {
-                            path: path.clone(),
-                            suffix: suffix.clone(),
-                        }
-                    }
-                    UpdateExpression::MatchConst { input, arms } => {
-                        ScalarUpdateExpression::MatchConst {
-                            input: input.clone(),
-                            arms: arms.clone(),
-                        }
-                    }
-                    UpdateExpression::MatchValueConst { input, arms } => {
-                        ScalarUpdateExpression::MatchValueConst {
-                            input: input.clone(),
-                            arms: arms.clone(),
-                        }
-                    }
-                    UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
-                        ScalarUpdateExpression::MatchTextIsEmptyConst {
-                            input: input.clone(),
-                            arms: arms.clone(),
-                        }
-                    }
-                    _ => ScalarUpdateExpression::Unsupported,
-                },
+                target: branch.target,
+                source: branch.source,
+                guard: branch.guard,
+                expression: ScalarUpdateExpression::from_compiler(branch.expression),
             })
             .collect();
         Self {
             branches,
-            source_paths,
+            source_paths: plan.source_paths,
         }
     }
 
@@ -62909,79 +57337,14 @@ fn bool_label(value: bool) -> String {
 }
 
 impl DerivedEquationPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let append_triggers = ir
-            .list_operations
-            .iter()
-            .filter_map(|operation| match &operation.kind {
-                ListOperationKind::Append { trigger, .. } => Some(trigger.as_str()),
-                ListOperationKind::Remove { .. }
-                | ListOperationKind::Retain { .. }
-                | ListOperationKind::Count { .. } => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let append_source_paths = ir
-            .list_operations
-            .iter()
-            .filter_map(|operation| match &operation.kind {
-                ListOperationKind::Append { trigger, fields } => Some(
-                    std::iter::once(trigger.as_str())
-                        .chain(fields.iter().filter_map(|field| match &field.value {
-                            ListAppendFieldValue::Source { path } => Some(path.as_str()),
-                            ListAppendFieldValue::Const { .. }
-                            | ListAppendFieldValue::TypedConst { .. } => None,
-                        }))
-                        .collect::<Vec<_>>(),
-                ),
-                ListOperationKind::Remove { .. }
-                | ListOperationKind::Retain { .. }
-                | ListOperationKind::Count { .. } => None,
-            })
-            .flatten()
-            .collect::<BTreeSet<_>>();
-        let text_transforms = ir
-            .derived_values
-            .iter()
-            .filter(|value| {
-                value.kind == DerivedValueKind::SourceEventTransform
-                    && (!value.indexed || append_triggers.contains(value.path.as_str()))
-            })
-            .filter_map(|value| {
-                let transforms = value
-                    .sources
-                    .iter()
-                    .filter_map(|source| {
-                        let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
-                        let expression = source_event_transform_text_expression(
-                            value,
-                            source,
-                            &ir.expressions,
-                            &ir.functions,
-                        );
-                        if !value.indexed
-                            && !append_source_paths.contains(value.path.as_str())
-                            && !source_is_scoped(ir, source)
-                            && matches!(expression, RuntimeDerivedTextExpression::Const { .. })
-                            && source_then_field_value(&exprs, source).is_some()
-                        {
-                            return None;
-                        }
-                        if !matches!(expression, RuntimeDerivedTextExpression::Unsupported) {
-                            Some(RuntimeDerivedTextTransform {
-                                target: value.path.clone(),
-                                source: source.clone(),
-                                expression,
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                (!transforms.is_empty()).then_some(transforms)
-            })
-            .flatten()
-            .collect();
-        Self { text_transforms }
+    fn from_compiler(plan: CompilerDerivedEquationPlan) -> Self {
+        Self {
+            text_transforms: plan
+                .text_transforms
+                .into_iter()
+                .map(RuntimeDerivedTextTransform::from_compiler)
+                .collect(),
+        }
     }
 
     fn eval_text_transform<'a>(
@@ -63118,66 +57481,110 @@ impl DerivedEquationPlan {
     }
 }
 
+impl RuntimeDerivedTextTransform {
+    fn from_compiler(transform: CompilerDerivedTextTransform) -> Self {
+        Self {
+            target: transform.target,
+            source: transform.source,
+            expression: RuntimeDerivedTextExpression::from_compiler(transform.expression),
+        }
+    }
+}
+
+impl RuntimeDerivedTextExpression {
+    fn from_compiler(expression: CompilerDerivedTextExpression) -> Self {
+        match expression {
+            CompilerDerivedTextExpression::Const { value } => Self::Const { value },
+            CompilerDerivedTextExpression::MatchConst { input, arms } => {
+                Self::MatchConst { input, arms }
+            }
+            CompilerDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
+                Self::EnterKeyPayloadTextTrimNonEmpty
+            }
+            CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
+                Self::EnterKeyRootTextTrimNonEmpty { path }
+            }
+            CompilerDerivedTextExpression::SourceRootText { path } => Self::SourceRootText { path },
+            CompilerDerivedTextExpression::ListFindValue {
+                list,
+                field,
+                expected,
+                target,
+                fallback,
+            } => Self::ListFindValue {
+                list,
+                field,
+                expected,
+                target,
+                fallback,
+            },
+            CompilerDerivedTextExpression::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            } => Self::PrefixRootConcat {
+                prefix,
+                path,
+                separator,
+            },
+            CompilerDerivedTextExpression::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            } => Self::PrefixPayloadConcat {
+                prefix,
+                payload_path,
+                separator,
+            },
+            CompilerDerivedTextExpression::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
 impl GenericDerivedPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let functions = ir
+    fn from_compiler(plan: CompilerGenericDerivedPlan) -> Self {
+        let functions = plan
             .functions
-            .iter()
-            .cloned()
-            .map(|function| (function.name.clone(), function))
-            .collect::<BTreeMap<_, _>>();
-        let root_fields = ir
-            .derived_values
-            .iter()
-            .filter(|value| {
-                !value.indexed
-                    && value.scope_id.is_none()
-                    && matches!(
-                        value.kind,
-                        DerivedValueKind::Pure
-                            | DerivedValueKind::SourceEventTransform
-                            | DerivedValueKind::ListView
-                    )
+            .into_iter()
+            .map(|function| {
+                let name = function.name.clone();
+                (
+                    name,
+                    GenericDerivedFunction {
+                        name: function.name,
+                        args: function.args,
+                        statement: function.statement,
+                    },
+                )
             })
-            .map(|value| GenericDerivedRootField {
-                path: value.path.clone(),
-                kind: value.kind.clone(),
-                has_sources: !value.sources.is_empty(),
-                statement: value.statement.clone(),
+            .collect::<BTreeMap<_, _>>();
+        let root_fields = plan
+            .root_fields
+            .into_iter()
+            .map(|field| GenericDerivedRootField {
+                path: field.path,
+                kind: field.kind,
+                has_sources: field.has_sources,
+                statement: field.statement,
             })
             .collect();
-        let indexed_fields = ir
-            .derived_values
-            .iter()
-            .filter(|value| {
-                (value.indexed || value.scope_id.is_some())
-                    && matches!(
-                        value.kind,
-                        DerivedValueKind::Pure | DerivedValueKind::SourceEventTransform
-                    )
-            })
-            .filter_map(|value| {
-                let (row_scope, field) = value.path.split_once('.')?;
-                let list = ir
-                    .row_scopes
-                    .iter()
-                    .find(|scope| scope.row_scope == row_scope)
-                    .map(|scope| scope.list.clone())?;
-                Some(GenericDerivedIndexedField {
-                    list,
-                    row_scope: row_scope.to_owned(),
-                    field: field.to_owned(),
-                    kind: value.kind.clone(),
-                    startup_recompute: value.startup_recompute,
-                    statement: value.statement.clone(),
-                })
+        let indexed_fields = plan
+            .indexed_fields
+            .into_iter()
+            .map(|field| GenericDerivedIndexedField {
+                list: field.list,
+                row_scope: field.row_scope,
+                field: field.field,
+                kind: field.kind,
+                startup_recompute: field.startup_recompute,
+                statement: field.statement,
             })
             .collect();
         Self {
-            expressions: ir.expressions.clone(),
+            expressions: plan.expressions,
             functions,
             root_fields,
-            observed_root_paths: observed_root_paths_from_view_bindings(ir),
+            observed_root_paths: plan.observed_root_paths,
             indexed_fields,
         }
     }
@@ -65617,40 +60024,26 @@ fn bytes_write_signed_patches(
 }
 
 impl ListProjectionPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let projections = ir
-            .list_projections
-            .iter()
-            .filter_map(|projection| {
-                let (columns, rows) = match &projection.kind {
-                    ListProjectionKind::Chunk { size, .. } => {
-                        let columns = (*size)?;
-                        (columns, 0)
-                    }
-                    ListProjectionKind::Find { .. } => (0, 0),
-                };
-                Some(RuntimeListProjection {
-                    target: projection.target.clone(),
-                    list: projection.list.clone(),
-                    columns,
-                    rows,
-                    kind: match &projection.kind {
-                        ListProjectionKind::Chunk {
-                            item_field,
-                            label_field,
-                            ..
-                        } => RuntimeListProjectionKind::Chunk {
-                            item_field: item_field.clone(),
-                            label_field: label_field.clone(),
-                        },
-                        ListProjectionKind::Find { field, value } => {
-                            RuntimeListProjectionKind::Find {
-                                field: field.clone(),
-                                value: value.clone(),
-                            }
-                        }
+    fn from_compiler_projections(projections: Vec<CompilerListProjection>) -> Self {
+        let projections = projections
+            .into_iter()
+            .map(|projection| RuntimeListProjection {
+                target: projection.target,
+                list: projection.list,
+                columns: projection.columns,
+                rows: projection.rows,
+                kind: match projection.kind {
+                    CompilerListProjectionKind::Chunk {
+                        item_field,
+                        label_field,
+                    } => RuntimeListProjectionKind::Chunk {
+                        item_field,
+                        label_field,
                     },
-                })
+                    CompilerListProjectionKind::Find { field, value } => {
+                        RuntimeListProjectionKind::Find { field, value }
+                    }
+                },
             })
             .collect();
         Self { projections }
@@ -65775,113 +60168,45 @@ fn source_suffix_after_variant<'a>(input: &'a str, variant: &str) -> Option<&'a 
     suffix.strip_prefix('.')
 }
 
-fn ir_read_path_is_bool_for_target(ir: &TypedProgram, target: &str, path: &str) -> bool {
-    if ir
-        .state_cells
+fn source_route_target_is_bool(facts: &CompilerSourceRouteBoolFacts, target: &str) -> bool {
+    facts.scalar_targets.contains(target)
+}
+
+fn source_route_read_path_is_bool(
+    facts: &CompilerSourceRouteBoolFacts,
+    target: &str,
+    path: &str,
+) -> bool {
+    facts
+        .read_paths
         .iter()
-        .any(|cell| cell.path == path && matches!(cell.initial_value, InitialValue::Bool { .. }))
-    {
-        return true;
-    }
-    let field = row_field_name(path);
-    let path_scope = path.split_once('.').map(|(scope, _)| scope);
-    let target_scope = target.split_once('.').map(|(scope, _)| scope);
-    let list = path_scope
-        .and_then(|scope| ir.row_scopes.iter().find(|row| row.row_scope == scope))
-        .or_else(|| {
-            target_scope.and_then(|scope| ir.row_scopes.iter().find(|row| row.row_scope == scope))
-        })
-        .map(|scope| scope.list.as_str());
-    match list {
-        Some(list) => ir_list_literal_field_is_bool(ir, list, field),
-        None => false,
-    }
-}
-
-fn ir_scalar_target_is_bool(ir: &TypedProgram, target: &str) -> bool {
-    let Some(cell) = ir.state_cells.iter().find(|cell| cell.path == target) else {
-        return ir_row_literal_field_for_path_is_bool(ir, target);
-    };
-    match &cell.initial_value {
-        InitialValue::Bool { .. } => true,
-        InitialValue::RowInitialField { path } => {
-            let Some(scope_id) = cell.scope_id else {
-                return false;
-            };
-            let Some(scope) = ir.row_scopes.get(scope_id.as_usize()) else {
-                return false;
-            };
-            ir_list_literal_field_is_bool(ir, &scope.list, row_field_name(path))
-        }
-        InitialValue::RootInitialField { path } => ir.state_cells.iter().any(|root| {
-            root.path == *path && matches!(root.initial_value, InitialValue::Bool { .. })
-        }),
-        InitialValue::Text { .. }
-        | InitialValue::Number { .. }
-        | InitialValue::Byte { .. }
-        | InitialValue::Bytes { .. }
-        | InitialValue::Enum { .. }
-        | InitialValue::Unknown { .. } => false,
-    }
-}
-
-fn ir_row_literal_field_for_path_is_bool(ir: &TypedProgram, path: &str) -> bool {
-    let Some((scope, field)) = path.split_once('.') else {
-        return false;
-    };
-    let Some(scope) = ir
-        .row_scopes
-        .iter()
-        .find(|candidate| candidate.row_scope == scope)
-    else {
-        return false;
-    };
-    ir_list_literal_field_is_bool(ir, &scope.list, row_field_name(field))
-}
-
-fn ir_list_literal_field_is_bool(ir: &TypedProgram, list: &str, field_name: &str) -> bool {
-    let Some(list) = ir.lists.iter().find(|candidate| candidate.name == list) else {
-        return false;
-    };
-    let ListInitializer::RecordLiteral { rows } = &list.initializer else {
-        return false;
-    };
-    let mut matched = false;
-    for row in rows {
-        for field in &row.fields {
-            if field.name != field_name {
-                continue;
-            }
-            matched = true;
-            if !matches!(field.value, InitialValue::Bool { .. }) {
-                return false;
-            }
-        }
-    }
-    matched
+        .any(|candidate| candidate.target == target && candidate.path == path)
 }
 
 impl SourceRoutePlan {
     fn from_plans(
-        ir: &TypedProgram,
         scalar: &ScalarEquationPlan,
         derived: &DerivedEquationPlan,
         lists: &ListEquationPlan,
-        root_targets: &BTreeSet<&str>,
+        root_targets: &BTreeSet<String>,
+        source_metadata: &[CompilerSourceRouteSource],
+        bool_facts: &CompilerSourceRouteBoolFacts,
+        router_targets: &[CompilerSourceRouteRouterRoute],
+        root_text_transform_targets: &[CompilerSourceRouteRootTextTransform],
     ) -> RuntimeResult<Self> {
         let mut routes = Self::default();
         for branch in &scalar.branches {
-            let source_id = source_id_for_path(ir, &branch.source)?;
+            let source_id = source_id_for_path(source_metadata, &branch.source)?;
             let route = routes.route_mut(&branch.source, source_id);
             let scalar_target = SourceRouteScalarTarget {
                 target: branch.target.clone(),
                 expression: branch.expression.clone(),
                 guard: branch.guard.clone(),
             };
-            let target_is_bool = ir_scalar_target_is_bool(ir, &branch.target);
+            let target_is_bool = source_route_target_is_bool(bool_facts, &branch.target);
             let bool_read_path = match &branch.expression {
                 ScalarUpdateExpression::ReadPath(path) => {
-                    ir_read_path_is_bool_for_target(ir, &branch.target, path)
+                    source_route_read_path_is_bool(bool_facts, &branch.target, path)
                 }
                 _ => false,
             };
@@ -65894,33 +60219,42 @@ impl SourceRoutePlan {
                 || bool_read_path
                 || bool_pulse
             {
+                if let Some(action) = indexed_bool_source_action_for_target(&scalar_target) {
+                    route.indexed_scalar_actions.push(action);
+                }
                 route.indexed_bool_targets.push(scalar_target);
             } else if branch.expression.is_indexed_text_expression() {
+                if let Some(action) = indexed_text_source_action_for_target(&scalar_target) {
+                    route.indexed_scalar_actions.push(action);
+                }
                 route.indexed_text_targets.push(scalar_target);
             } else if branch.expression.is_indexed_value_expression() {
+                route
+                    .indexed_scalar_actions
+                    .push(indexed_value_source_action_for_target(&scalar_target));
                 route.indexed_value_targets.push(scalar_target);
             }
         }
         for transform in &derived.text_transforms {
-            let source_id = source_id_for_path(ir, &transform.source)?;
+            let source_id = source_id_for_path(source_metadata, &transform.source)?;
             routes
                 .route_mut(&transform.source, source_id)
                 .derived_text_targets
                 .push(transform.target.clone());
         }
-        for target in router_route_targets_from_ir(ir)? {
-            let source_id = source_id_for_path(ir, &target.source)?;
+        for target in router_targets {
+            let source_id = source_id_for_path(source_metadata, &target.source)?;
             routes
                 .route_mut(&target.source, source_id)
                 .router_route_targets
-                .push(target);
+                .push(SourceRouteRouterRoute::from_compiler(target.clone()));
         }
-        for target in root_text_transform_targets_from_ir(ir)? {
-            let source_id = source_id_for_path(ir, &target.source)?;
+        for target in root_text_transform_targets {
+            let source_id = source_id_for_path(source_metadata, &target.source)?;
             routes
                 .route_mut(&target.source, source_id)
                 .root_text_transform_targets
-                .push(target);
+                .push(SourceRouteRootTextTransform::from_compiler(target.clone()));
         }
         for (append_ordinal, operation) in lists.operations.iter().enumerate() {
             match &operation.kind {
@@ -65938,7 +60272,7 @@ impl SourceRoutePlan {
                     }
                 }
                 RuntimeListOperationKind::Remove { source, predicate } => {
-                    let source_id = source_id_for_path(ir, source)?;
+                    let source_id = source_id_for_path(source_metadata, source)?;
                     routes
                         .route_mut(source, source_id)
                         .list_remove_targets
@@ -65951,12 +60285,16 @@ impl SourceRoutePlan {
                 | RuntimeListOperationKind::Count { .. } => {}
             }
         }
-        for source in &ir.sources {
-            if let Some(route) = routes.for_source_id_mut(source.id) {
-                route.payload_fields = source.payload_schema.fields.clone();
+        for source in source_metadata {
+            if let Some(route) = routes.for_source_id_mut(SourceId(source.source_id)) {
+                route.payload_fields = source
+                    .payload_fields
+                    .iter()
+                    .map(compiler_source_payload_field)
+                    .collect();
             }
         }
-        routes.set_address_lookup_fields(ir);
+        routes.set_address_lookup_fields(source_metadata);
         for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
@@ -66197,6 +60535,7 @@ impl SourceRoutePlan {
             indexed_text_targets: Vec::new(),
             indexed_bool_targets: Vec::new(),
             indexed_value_targets: Vec::new(),
+            indexed_scalar_actions: Vec::new(),
             derived_text_targets: Vec::new(),
             router_route_targets: Vec::new(),
             root_text_transform_targets: Vec::new(),
@@ -66217,139 +60556,25 @@ impl SourceRoutePlan {
         }
     }
 
-    fn set_address_lookup_fields(&mut self, ir: &TypedProgram) {
+    fn set_address_lookup_fields(&mut self, source_metadata: &[CompilerSourceRouteSource]) {
         for route in &mut self.route_slots {
-            route.address_lookup_field = ir
-                .sources
-                .get(route.source_id.as_usize())
-                .and_then(|source| source.payload_schema.address_lookup_field.clone());
+            route.address_lookup_field = source_metadata
+                .iter()
+                .find(|source| source.source_id == route.source_id.as_usize())
+                .and_then(|source| source.address_lookup_field.clone());
         }
     }
 }
 
-fn source_id_for_path(ir: &TypedProgram, path: &str) -> RuntimeResult<SourceId> {
-    ir.sources
+fn source_id_for_path(
+    source_metadata: &[CompilerSourceRouteSource],
+    path: &str,
+) -> RuntimeResult<SourceId> {
+    source_metadata
         .iter()
         .find(|source| source.path == path)
-        .map(|source| source.id)
-        .ok_or_else(|| format!("source route `{path}` has no typed IR SourceId").into())
-}
-
-fn router_route_targets_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<SourceRouteRouterRoute>> {
-    let mut targets = Vec::new();
-    for value in &ir.derived_values {
-        if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
-            continue;
-        }
-        let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
-        if !statement_calls_router_go_to(&exprs) {
-            continue;
-        }
-        for source in &value.sources {
-            let Some(path) = source_then_text_value(&exprs, source) else {
-                continue;
-            };
-            targets.push(SourceRouteRouterRoute {
-                source: source.clone(),
-                target: value.path.clone(),
-                path,
-            });
-        }
-    }
-    Ok(targets)
-}
-
-fn root_text_transform_targets_from_ir(
-    ir: &TypedProgram,
-) -> RuntimeResult<Vec<SourceRouteRootTextTransform>> {
-    let mut targets = Vec::new();
-    let append_triggers = ir
-        .list_operations
-        .iter()
-        .filter_map(|operation| match &operation.kind {
-            ListOperationKind::Append { trigger, .. } => Some(trigger.as_str()),
-            ListOperationKind::Remove { .. }
-            | ListOperationKind::Retain { .. }
-            | ListOperationKind::Count { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let statically_scheduled_root_updates = ir
-        .update_branches
-        .iter()
-        .filter(|branch| !branch.indexed)
-        .map(|branch| (branch.target.as_str(), branch.source.as_str()))
-        .collect::<BTreeSet<_>>();
-    for value in &ir.derived_values {
-        if value.indexed || value.kind != DerivedValueKind::SourceEventTransform {
-            continue;
-        }
-        if append_triggers.contains(value.path.as_str()) {
-            continue;
-        }
-        let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
-        if statement_calls_router_go_to(&exprs) {
-            continue;
-        }
-        for source in &value.sources {
-            if source_is_scoped(ir, source) {
-                continue;
-            }
-            if statically_scheduled_root_updates.contains(&(value.path.as_str(), source.as_str())) {
-                continue;
-            }
-            let typed_output = source_then_field_value(&exprs, source);
-            let expression = source_event_transform_text_expression(
-                value,
-                source,
-                &ir.expressions,
-                &ir.functions,
-            );
-            if !matches!(
-                expression,
-                RuntimeDerivedTextExpression::Const { .. }
-                    | RuntimeDerivedTextExpression::Unsupported
-            ) {
-                continue;
-            }
-            if !matches!(expression, RuntimeDerivedTextExpression::Unsupported)
-                && typed_output.is_none()
-            {
-                continue;
-            }
-            if source_payload_when_match_const_expression(&exprs, source).is_some() {
-                continue;
-            }
-            if source_then_match_const_expression(
-                &value.path,
-                &exprs,
-                source,
-                &ir.expressions,
-                &ir.functions,
-            )
-            .is_some()
-            {
-                continue;
-            }
-            if source_then_inline_match_const_expression(&value.path, &exprs, source).is_some() {
-                continue;
-            }
-            if source_then_prefix_payload_concat_expression(&exprs, source).is_some() {
-                continue;
-            }
-            if source_then_prefix_root_concat_expression(&value.path, &exprs, source).is_some() {
-                continue;
-            }
-            let Some(output) = typed_output else {
-                continue;
-            };
-            targets.push(SourceRouteRootTextTransform {
-                source: source.clone(),
-                target: value.path.clone(),
-                value: output,
-            });
-        }
-    }
-    Ok(targets)
+        .map(|source| SourceId(source.source_id))
+        .ok_or_else(|| format!("source route `{path}` has no compiler SourceId").into())
 }
 
 fn statement_calls_router_go_to(exprs: &[AstExpr]) -> bool {
@@ -66613,135 +60838,6 @@ fn expr_output_is_skip(exprs: &[AstExpr], output: usize) -> bool {
     ast_simple_text_value_in_exprs(exprs, output).as_deref() == Some("SKIP")
 }
 
-fn source_then_list_find_value_expression(
-    target: &str,
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<RuntimeDerivedTextExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        if !source_then_input_matches(exprs, input, expr.line, source) {
-            return None;
-        }
-        let (list_input, args) = match output {
-            Some(output) => list_find_value_call_in_expr_subtree(exprs, output),
-            None => list_find_value_call_after_then(exprs, expr),
-        }?;
-        let list = ast_argument_value_in_exprs(exprs, list_input)
-            .map(|path| canonical_transform_text_path(target, &path))?;
-        let field = named_arg_value(exprs, args, "field")?;
-        let expected = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("value"))
-            .and_then(|arg| runtime_update_value_expression_from_expr(exprs, arg.value))?;
-        let value_target = named_arg_value(exprs, args, "target")?;
-        let fallback = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("fallback"))
-            .and_then(|arg| runtime_update_value_expression_from_expr(exprs, arg.value))
-            .map(Box::new);
-        Some(RuntimeDerivedTextExpression::ListFindValue {
-            list,
-            field,
-            expected: Box::new(expected),
-            target: value_target,
-            fallback,
-        })
-    })
-}
-
-fn named_arg_value(exprs: &[AstExpr], args: &[AstCallArg], name: &str) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.name.as_deref() == Some(name))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn list_find_value_call_in_expr_subtree(
-    exprs: &[AstExpr],
-    expr_id: usize,
-) -> Option<(usize, &[AstCallArg])> {
-    let mut ids = Vec::new();
-    let mut seen = BTreeSet::new();
-    collect_expr_tree(expr_id, exprs, &mut seen, &mut ids);
-    ids.into_iter()
-        .filter_map(|id| exprs.iter().find(|expr| expr.id == id))
-        .find_map(list_find_value_call_parts)
-}
-
-fn list_find_value_call_after_then<'a>(
-    exprs: &'a [AstExpr],
-    then_expr: &AstExpr,
-) -> Option<(usize, &'a [AstCallArg])> {
-    exprs
-        .iter()
-        .filter(|expr| expr.start > then_expr.end)
-        .take_while(|expr| {
-            !matches!(
-                expr.kind,
-                AstExprKind::Then { .. } | AstExprKind::MatchArm { .. }
-            )
-        })
-        .find_map(list_find_value_call_parts)
-}
-
-fn list_find_value_call_parts(expr: &AstExpr) -> Option<(usize, &[AstCallArg])> {
-    match &expr.kind {
-        AstExprKind::Call { function, args } if function == "List/find_value" => args
-            .iter()
-            .find(|arg| arg.name.is_none())
-            .map(|arg| (arg.value, args.as_slice())),
-        AstExprKind::Pipe { input, op, args } if op == "List/find_value" => {
-            Some((*input, args.as_slice()))
-        }
-        _ => None,
-    }
-}
-
-fn runtime_update_value_expression_from_expr(
-    exprs: &[AstExpr],
-    expr_id: usize,
-) -> Option<UpdateValueExpression> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Path(parts) if !parts.is_empty() => Some(UpdateValueExpression::ReadPath {
-            path: parts.join("."),
-        }),
-        AstExprKind::Identifier(value) => Some(UpdateValueExpression::ReadPath {
-            path: value.clone(),
-        }),
-        AstExprKind::Bool(value) => Some(UpdateValueExpression::Const {
-            value: bool_label(*value),
-        }),
-        AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Number(value)
-        | AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value) => Some(UpdateValueExpression::Const {
-            value: value.clone(),
-        }),
-        _ => None,
-    }
-}
-
-fn source_then_const_text_value(exprs: &[AstExpr], source: &str) -> Option<String> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        let input_matches = source_then_input_matches(exprs, input, expr.line, source);
-        if !input_matches {
-            return None;
-        }
-        match output {
-            Some(output) => ast_const_text_value_in_exprs(exprs, output)
-                .or_else(|| const_text_value_in_expr_subtree(exprs, output)),
-            None => const_text_value_after_line(exprs, expr.line),
-        }
-    })
-}
-
 fn source_path_before_line_matches(exprs: &[AstExpr], line: usize, source: &str) -> bool {
     exprs
         .iter()
@@ -66850,13 +60946,6 @@ fn ast_simple_field_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<
     }
 }
 
-fn source_is_scoped(ir: &TypedProgram, source: &str) -> bool {
-    ir.sources
-        .iter()
-        .find(|candidate| candidate.path == source)
-        .is_some_and(|candidate| candidate.scoped)
-}
-
 fn source_event_path_matches(path: &str, source: &str) -> bool {
     source_event_ref_variants(source)
         .iter()
@@ -66878,31 +60967,15 @@ fn source_event_ref_variants(source: &str) -> Vec<String> {
 }
 
 impl ListSourceBindingPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let mut list_slots = Vec::new();
-        for list in &ir.lists {
-            let Some(scope_id) = list.row_scope_id else {
-                continue;
-            };
-            let Some(row_scope) = ir.row_scopes.iter().find(|scope| scope.id == scope_id) else {
-                continue;
-            };
-            let row_scope = row_scope.row_scope.clone();
-            let prefix = format!("{row_scope}.");
-            let source_paths = ir
-                .sources
-                .iter()
-                .filter(|source| source.scoped && source.path.starts_with(&prefix))
-                .map(|source| source.path.clone())
-                .collect::<Vec<_>>();
-            if !source_paths.is_empty() {
-                list_slots.push(ListSourceBindingSlot {
-                    list: list.name.clone(),
-                    row_scope,
-                    source_paths,
-                });
-            }
-        }
+    fn from_compiler_slots(slots: Vec<CompilerListSourceBindingSlot>) -> Self {
+        let list_slots = slots
+            .into_iter()
+            .map(|slot| ListSourceBindingSlot {
+                list: slot.list,
+                row_scope: slot.row_scope,
+                source_paths: slot.source_paths,
+            })
+            .collect();
         Self { list_slots }
     }
 
@@ -67018,135 +61091,144 @@ impl SourceRoute {
         if !self.root_scalar_targets.is_empty() {
             self.actions.push(SourceAction::RootScalar);
         }
-        self.actions
-            .extend(self.indexed_text_targets.iter().filter_map(|target| {
-                let kind = match &target.expression {
-                    ScalarUpdateExpression::Const(_) => SourceRouteTextAction::Const,
-                    ScalarUpdateExpression::SourceText
-                    | ScalarUpdateExpression::SourcePayload(_) => SourceRouteTextAction::SourceText,
-                    ScalarUpdateExpression::PreviousValue(_) => {
-                        SourceRouteTextAction::PreviousValue
-                    }
-                    ScalarUpdateExpression::ReadPath(_) => SourceRouteTextAction::ReadPath,
-                    ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
-                        SourceRouteTextAction::TextTrimOrPrevious
-                    }
-                    ScalarUpdateExpression::PrefixPayloadConcat { .. }
-                    | ScalarUpdateExpression::PrefixRootConcat { .. } => {
-                        SourceRouteTextAction::ReadPath
-                    }
-                    ScalarUpdateExpression::MatchConst { .. }
-                    | ScalarUpdateExpression::MatchValueConst { .. }
-                    | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
-                    | ScalarUpdateExpression::MatchNumberInfixConst { .. }
-                    | ScalarUpdateExpression::ListFindValue { .. }
-                    | ScalarUpdateExpression::BytesToHex { .. }
-                    | ScalarUpdateExpression::BytesToBase64 { .. }
-                    | ScalarUpdateExpression::BytesToText { .. } => SourceRouteTextAction::Computed,
-                    ScalarUpdateExpression::NumberInfix { .. }
-                    | ScalarUpdateExpression::ProjectTime { .. }
-                    | ScalarUpdateExpression::SourceKey
-                    | ScalarUpdateExpression::SourceAddress
-                    | ScalarUpdateExpression::BoolNot(_)
-                    | ScalarUpdateExpression::BytesLength(_)
-                    | ScalarUpdateExpression::BytesIsEmpty(_)
-                    | ScalarUpdateExpression::BytesGet { .. }
-                    | ScalarUpdateExpression::BytesSet { .. }
-                    | ScalarUpdateExpression::BytesSlice { .. }
-                    | ScalarUpdateExpression::BytesTake { .. }
-                    | ScalarUpdateExpression::BytesDrop { .. }
-                    | ScalarUpdateExpression::BytesZeros { .. }
-                    | ScalarUpdateExpression::BytesFromHex { .. }
-                    | ScalarUpdateExpression::BytesFromBase64 { .. }
-                    | ScalarUpdateExpression::BytesReadUnsigned { .. }
-                    | ScalarUpdateExpression::BytesReadSigned { .. }
-                    | ScalarUpdateExpression::BytesWriteUnsigned { .. }
-                    | ScalarUpdateExpression::BytesWriteSigned { .. }
-                    | ScalarUpdateExpression::FileReadBytes { .. }
-                    | ScalarUpdateExpression::TextToBytes { .. }
-                    | ScalarUpdateExpression::BytesConcat { .. }
-                    | ScalarUpdateExpression::BytesEqual { .. }
-                    | ScalarUpdateExpression::BytesFind { .. }
-                    | ScalarUpdateExpression::BytesStartsWith { .. }
-                    | ScalarUpdateExpression::BytesEndsWith { .. }
-                    | ScalarUpdateExpression::Unsupported => return None,
-                };
-                Some(SourceAction::IndexedText {
-                    kind,
-                    target: target.target.clone(),
-                    guard: target.guard.clone(),
-                })
-            }));
-        self.actions
-            .extend(self.indexed_bool_targets.iter().filter_map(|target| {
-                let kind = match &target.expression {
-                    ScalarUpdateExpression::BoolNot(_) => SourceRouteBoolAction::BoolNot,
-                    ScalarUpdateExpression::Const(value) if value == "True" => {
-                        SourceRouteBoolAction::ConstTrue
-                    }
-                    ScalarUpdateExpression::Const(value) if value == "False" => {
-                        SourceRouteBoolAction::ConstFalse
-                    }
-                    ScalarUpdateExpression::ReadPath(_) => SourceRouteBoolAction::ReadPath,
-                    ScalarUpdateExpression::SourcePayload(_) => SourceRouteBoolAction::SourcePulse,
-                    ScalarUpdateExpression::MatchConst { .. }
-                    | ScalarUpdateExpression::MatchValueConst { .. }
-                    | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
-                    | ScalarUpdateExpression::MatchNumberInfixConst { .. } => {
-                        SourceRouteBoolAction::Match
-                    }
-                    ScalarUpdateExpression::SourceText
-                    | ScalarUpdateExpression::SourceKey
-                    | ScalarUpdateExpression::SourceAddress
-                    | ScalarUpdateExpression::Const(_)
-                    | ScalarUpdateExpression::NumberInfix { .. }
-                    | ScalarUpdateExpression::ProjectTime { .. }
-                    | ScalarUpdateExpression::PreviousValue(_)
-                    | ScalarUpdateExpression::TextTrimOrPrevious { .. }
-                    | ScalarUpdateExpression::PrefixPayloadConcat { .. }
-                    | ScalarUpdateExpression::PrefixRootConcat { .. }
-                    | ScalarUpdateExpression::ListFindValue { .. }
-                    | ScalarUpdateExpression::BytesLength(_)
-                    | ScalarUpdateExpression::BytesIsEmpty(_)
-                    | ScalarUpdateExpression::BytesGet { .. }
-                    | ScalarUpdateExpression::BytesSet { .. }
-                    | ScalarUpdateExpression::BytesSlice { .. }
-                    | ScalarUpdateExpression::BytesTake { .. }
-                    | ScalarUpdateExpression::BytesDrop { .. }
-                    | ScalarUpdateExpression::BytesZeros { .. }
-                    | ScalarUpdateExpression::BytesToHex { .. }
-                    | ScalarUpdateExpression::BytesFromHex { .. }
-                    | ScalarUpdateExpression::BytesToBase64 { .. }
-                    | ScalarUpdateExpression::BytesFromBase64 { .. }
-                    | ScalarUpdateExpression::BytesReadUnsigned { .. }
-                    | ScalarUpdateExpression::BytesReadSigned { .. }
-                    | ScalarUpdateExpression::BytesWriteUnsigned { .. }
-                    | ScalarUpdateExpression::BytesWriteSigned { .. }
-                    | ScalarUpdateExpression::FileReadBytes { .. }
-                    | ScalarUpdateExpression::TextToBytes { .. }
-                    | ScalarUpdateExpression::BytesToText { .. }
-                    | ScalarUpdateExpression::BytesConcat { .. }
-                    | ScalarUpdateExpression::BytesEqual { .. }
-                    | ScalarUpdateExpression::BytesFind { .. }
-                    | ScalarUpdateExpression::BytesStartsWith { .. }
-                    | ScalarUpdateExpression::BytesEndsWith { .. }
-                    | ScalarUpdateExpression::Unsupported => return None,
-                };
-                Some(SourceAction::IndexedBool {
-                    kind,
-                    target: target.target.clone(),
-                    guard: target.guard.clone(),
-                })
-            }));
-        self.actions
-            .extend(
-                self.indexed_value_targets
-                    .iter()
-                    .map(|target| SourceAction::IndexedValue {
+        if !self.indexed_scalar_actions.is_empty() {
+            self.actions
+                .extend(self.indexed_scalar_actions.iter().cloned());
+        } else {
+            self.actions
+                .extend(self.indexed_text_targets.iter().filter_map(|target| {
+                    let kind = match &target.expression {
+                        ScalarUpdateExpression::Const(_) => SourceRouteTextAction::Const,
+                        ScalarUpdateExpression::SourceText
+                        | ScalarUpdateExpression::SourcePayload(_) => {
+                            SourceRouteTextAction::SourceText
+                        }
+                        ScalarUpdateExpression::PreviousValue(_) => {
+                            SourceRouteTextAction::PreviousValue
+                        }
+                        ScalarUpdateExpression::ReadPath(_) => SourceRouteTextAction::ReadPath,
+                        ScalarUpdateExpression::TextTrimOrPrevious { .. } => {
+                            SourceRouteTextAction::TextTrimOrPrevious
+                        }
+                        ScalarUpdateExpression::PrefixPayloadConcat { .. }
+                        | ScalarUpdateExpression::PrefixRootConcat { .. } => {
+                            SourceRouteTextAction::ReadPath
+                        }
+                        ScalarUpdateExpression::MatchConst { .. }
+                        | ScalarUpdateExpression::MatchValueConst { .. }
+                        | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
+                        | ScalarUpdateExpression::MatchNumberInfixConst { .. }
+                        | ScalarUpdateExpression::ListFindValue { .. }
+                        | ScalarUpdateExpression::BytesToHex { .. }
+                        | ScalarUpdateExpression::BytesToBase64 { .. }
+                        | ScalarUpdateExpression::BytesToText { .. } => {
+                            SourceRouteTextAction::Computed
+                        }
+                        ScalarUpdateExpression::NumberInfix { .. }
+                        | ScalarUpdateExpression::ProjectTime { .. }
+                        | ScalarUpdateExpression::SourceKey
+                        | ScalarUpdateExpression::SourceAddress
+                        | ScalarUpdateExpression::BoolNot(_)
+                        | ScalarUpdateExpression::BytesLength(_)
+                        | ScalarUpdateExpression::BytesIsEmpty(_)
+                        | ScalarUpdateExpression::BytesGet { .. }
+                        | ScalarUpdateExpression::BytesSet { .. }
+                        | ScalarUpdateExpression::BytesSlice { .. }
+                        | ScalarUpdateExpression::BytesTake { .. }
+                        | ScalarUpdateExpression::BytesDrop { .. }
+                        | ScalarUpdateExpression::BytesZeros { .. }
+                        | ScalarUpdateExpression::BytesFromHex { .. }
+                        | ScalarUpdateExpression::BytesFromBase64 { .. }
+                        | ScalarUpdateExpression::BytesReadUnsigned { .. }
+                        | ScalarUpdateExpression::BytesReadSigned { .. }
+                        | ScalarUpdateExpression::BytesWriteUnsigned { .. }
+                        | ScalarUpdateExpression::BytesWriteSigned { .. }
+                        | ScalarUpdateExpression::FileReadBytes { .. }
+                        | ScalarUpdateExpression::TextToBytes { .. }
+                        | ScalarUpdateExpression::BytesConcat { .. }
+                        | ScalarUpdateExpression::BytesEqual { .. }
+                        | ScalarUpdateExpression::BytesFind { .. }
+                        | ScalarUpdateExpression::BytesStartsWith { .. }
+                        | ScalarUpdateExpression::BytesEndsWith { .. }
+                        | ScalarUpdateExpression::Unsupported => return None,
+                    };
+                    Some(SourceAction::IndexedText {
+                        kind,
                         target: target.target.clone(),
                         guard: target.guard.clone(),
-                    }),
-            );
+                    })
+                }));
+            self.actions
+                .extend(self.indexed_bool_targets.iter().filter_map(|target| {
+                    let kind = match &target.expression {
+                        ScalarUpdateExpression::BoolNot(_) => SourceRouteBoolAction::BoolNot,
+                        ScalarUpdateExpression::Const(value) if value == "True" => {
+                            SourceRouteBoolAction::ConstTrue
+                        }
+                        ScalarUpdateExpression::Const(value) if value == "False" => {
+                            SourceRouteBoolAction::ConstFalse
+                        }
+                        ScalarUpdateExpression::ReadPath(_) => SourceRouteBoolAction::ReadPath,
+                        ScalarUpdateExpression::SourcePayload(_) => {
+                            SourceRouteBoolAction::SourcePulse
+                        }
+                        ScalarUpdateExpression::MatchConst { .. }
+                        | ScalarUpdateExpression::MatchValueConst { .. }
+                        | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
+                        | ScalarUpdateExpression::MatchNumberInfixConst { .. }
+                        | ScalarUpdateExpression::BytesIsEmpty(_)
+                        | ScalarUpdateExpression::BytesEqual { .. }
+                        | ScalarUpdateExpression::BytesStartsWith { .. }
+                        | ScalarUpdateExpression::BytesEndsWith { .. } => {
+                            SourceRouteBoolAction::Match
+                        }
+                        ScalarUpdateExpression::SourceText
+                        | ScalarUpdateExpression::SourceKey
+                        | ScalarUpdateExpression::SourceAddress
+                        | ScalarUpdateExpression::Const(_)
+                        | ScalarUpdateExpression::NumberInfix { .. }
+                        | ScalarUpdateExpression::ProjectTime { .. }
+                        | ScalarUpdateExpression::PreviousValue(_)
+                        | ScalarUpdateExpression::TextTrimOrPrevious { .. }
+                        | ScalarUpdateExpression::PrefixPayloadConcat { .. }
+                        | ScalarUpdateExpression::PrefixRootConcat { .. }
+                        | ScalarUpdateExpression::ListFindValue { .. }
+                        | ScalarUpdateExpression::BytesLength(_)
+                        | ScalarUpdateExpression::BytesGet { .. }
+                        | ScalarUpdateExpression::BytesSet { .. }
+                        | ScalarUpdateExpression::BytesSlice { .. }
+                        | ScalarUpdateExpression::BytesTake { .. }
+                        | ScalarUpdateExpression::BytesDrop { .. }
+                        | ScalarUpdateExpression::BytesZeros { .. }
+                        | ScalarUpdateExpression::BytesToHex { .. }
+                        | ScalarUpdateExpression::BytesFromHex { .. }
+                        | ScalarUpdateExpression::BytesToBase64 { .. }
+                        | ScalarUpdateExpression::BytesFromBase64 { .. }
+                        | ScalarUpdateExpression::BytesReadUnsigned { .. }
+                        | ScalarUpdateExpression::BytesReadSigned { .. }
+                        | ScalarUpdateExpression::BytesWriteUnsigned { .. }
+                        | ScalarUpdateExpression::BytesWriteSigned { .. }
+                        | ScalarUpdateExpression::FileReadBytes { .. }
+                        | ScalarUpdateExpression::TextToBytes { .. }
+                        | ScalarUpdateExpression::BytesToText { .. }
+                        | ScalarUpdateExpression::BytesConcat { .. }
+                        | ScalarUpdateExpression::BytesFind { .. }
+                        | ScalarUpdateExpression::Unsupported => return None,
+                    };
+                    Some(SourceAction::IndexedBool {
+                        kind,
+                        target: target.target.clone(),
+                        guard: target.guard.clone(),
+                    })
+                }));
+            self.actions
+                .extend(self.indexed_value_targets.iter().map(|target| {
+                    SourceAction::IndexedValue {
+                        target: target.target.clone(),
+                        guard: target.guard.clone(),
+                    }
+                }));
+        }
     }
 
     #[cfg(test)]
@@ -67226,48 +61308,53 @@ impl SourceRoute {
 }
 
 impl ListEquationPlan {
-    fn from_ir(ir: &TypedProgram) -> Self {
-        let operations = ir
-            .list_operations
-            .iter()
+    fn from_compiler_operations(operations: Vec<CompilerListOperation>) -> RuntimeResult<Self> {
+        let operations = operations
+            .into_iter()
             .map(|operation| {
-                let list = operation.list.clone();
-                let kind = match &operation.kind {
-                    ListOperationKind::Append { trigger, fields } => {
+                let kind = match operation.kind {
+                    CompilerListOperationKind::Append { trigger, fields } => {
                         RuntimeListOperationKind::Append {
-                            trigger: trigger.clone(),
+                            trigger,
                             fields: fields
-                                .iter()
-                                .map(|field| RuntimeListAppendField {
-                                    name: field.name.clone(),
-                                    value: RuntimeListAppendFieldValue::from_ir(&field.value),
+                                .into_iter()
+                                .map(|field| {
+                                    Ok(RuntimeListAppendField {
+                                        name: field.name,
+                                        value: runtime_list_append_field_value_from_compiler(
+                                            field.value,
+                                        )?,
+                                    })
                                 })
-                                .collect(),
+                                .collect::<RuntimeResult<Vec<_>>>()?,
                         }
                     }
-                    ListOperationKind::Remove { source, predicate } => {
+                    CompilerListOperationKind::Remove { source, predicate } => {
                         RuntimeListOperationKind::Remove {
-                            source: source.clone(),
-                            predicate: runtime_list_predicate(predicate),
+                            source,
+                            predicate: runtime_list_predicate_from_compiler(predicate),
                         }
                     }
-                    ListOperationKind::Retain { target, predicate } => {
+                    CompilerListOperationKind::Retain { target, predicate } => {
                         RuntimeListOperationKind::Retain {
-                            target: target.clone(),
-                            predicate: runtime_list_predicate(predicate),
+                            target,
+                            predicate: runtime_list_predicate_from_compiler(predicate),
                         }
                     }
-                    ListOperationKind::Count { target, predicate } => {
+                    CompilerListOperationKind::Count { target, predicate } => {
                         RuntimeListOperationKind::Count {
-                            target: target.clone(),
-                            predicate: runtime_list_predicate(predicate),
+                            target,
+                            predicate: runtime_list_predicate_from_compiler(predicate),
                         }
                     }
                 };
-                RuntimeListOperation { list, kind }
+                Ok(RuntimeListOperation {
+                    list: operation.list,
+                    kind,
+                })
             })
-            .collect();
-        Self { operations }
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        Ok(Self { operations })
     }
 
     fn append_trigger(&self, list: &str) -> RuntimeResult<&str> {
@@ -67387,7 +61474,7 @@ impl ListEquationPlan {
                 RuntimeListAppendFieldValue::TypedConst { value } => {
                     initial_fields.insert_value(
                         field.name.to_owned(),
-                        runtime_value_from_initial(value, &ValueColumns::default())?,
+                        value.to_field_value(&ValueColumns::default())?,
                     );
                 }
             }
@@ -67559,23 +61646,37 @@ impl ListEquationPlan {
     }
 }
 
-fn runtime_list_predicate(predicate: &ListPredicate) -> RuntimeListPredicate {
+fn runtime_list_append_field_value_from_compiler(
+    value: CompilerListAppendFieldValue,
+) -> RuntimeResult<RuntimeListAppendFieldValue> {
+    match value {
+        CompilerListAppendFieldValue::Source { path } => {
+            Ok(RuntimeListAppendFieldValue::Source { path })
+        }
+        CompilerListAppendFieldValue::Const { value } => {
+            Ok(RuntimeListAppendFieldValue::Const { value })
+        }
+        CompilerListAppendFieldValue::TypedConst { value } => {
+            Ok(RuntimeListAppendFieldValue::TypedConst {
+                value: RuntimeInitialValue::from_compiler(value)?,
+            })
+        }
+    }
+}
+
+fn runtime_list_predicate_from_compiler(predicate: CompilerListPredicate) -> RuntimeListPredicate {
     match predicate {
-        ListPredicate::AlwaysTrue => RuntimeListPredicate::AlwaysTrue,
-        ListPredicate::RowFieldBool { path } => {
-            RuntimeListPredicate::FieldBool { path: path.clone() }
-        }
-        ListPredicate::RowFieldBoolNot { path } => {
-            RuntimeListPredicate::FieldBoolNot { path: path.clone() }
-        }
-        ListPredicate::SelectedFilterVisibility {
+        CompilerListPredicate::AlwaysTrue => RuntimeListPredicate::AlwaysTrue,
+        CompilerListPredicate::FieldBool { path } => RuntimeListPredicate::FieldBool { path },
+        CompilerListPredicate::FieldBoolNot { path } => RuntimeListPredicate::FieldBoolNot { path },
+        CompilerListPredicate::SelectorVisibility {
             selector,
             row_field,
         } => RuntimeListPredicate::SelectorVisibility {
-            selector: selector.clone(),
-            row_field: row_field.clone(),
+            selector,
+            row_field,
         },
-        _ => RuntimeListPredicate::Unsupported,
+        CompilerListPredicate::Unsupported => RuntimeListPredicate::Unsupported,
     }
 }
 
@@ -68632,22 +62733,22 @@ impl ScenarioExecutor for LoadedRuntime {
         self.generic_state_summary()
     }
 
-    fn stress_profiles(&mut self, _ir: &TypedProgram) -> RuntimeResult<Option<JsonValue>> {
+    fn stress_profiles(&mut self) -> RuntimeResult<Option<JsonValue>> {
         Ok(None)
     }
 }
 
 #[cfg(test)]
 fn todomvc_initial_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String>> {
-    let list = ir
-        .lists
+    let rows = compiler_storage_initial_rows_from_ir(ir)
+        .into_iter()
+        .find(|rows| rows.list == "todos")
+        .ok_or("TodoMVC compiler storage plan has no `todos` list memory")?;
+    if rows.rows.is_empty() {
+        return Err("TodoMVC `todos` compiler storage initializer has no rows".into());
+    }
+    rows.rows
         .iter()
-        .find(|list| list.name == "todos")
-        .ok_or("TodoMVC IR has no `todos` list memory")?;
-    let ListInitializer::RecordLiteral { rows } = &list.initializer else {
-        return Err("TodoMVC `todos` list initializer is not a record literal".into());
-    };
-    rows.iter()
         .map(|row| {
             let field = row
                 .fields
@@ -68655,7 +62756,7 @@ fn todomvc_initial_titles_from_ir(ir: &TypedProgram) -> RuntimeResult<Vec<String
                 .find(|field| field.name == "title")
                 .ok_or("TodoMVC initial row has no `title` field")?;
             match &field.value {
-                InitialValue::Text { value } => Ok(value.clone()),
+                CompilerInitialValue::Text(value) => Ok(value.clone()),
                 other => Err(format!("TodoMVC initial title is not text: {other:?}").into()),
             }
         })
@@ -68711,14 +62812,16 @@ fn cells_project_source_for_test() -> String {
 
 #[cfg(test)]
 fn cells_range_from_ir(ir: &TypedProgram) -> Option<(i64, i64)> {
-    ir.lists
-        .iter()
-        .find(|list| list.name == "cells")
-        .and_then(|list| match list.initializer {
-            ListInitializer::Range { from, to } => Some((from, to)),
-            ListInitializer::RecordLiteral { .. }
-            | ListInitializer::Empty
-            | ListInitializer::Unknown { .. } => None,
+    compiler_storage_list_slots_from_ir(ir)
+        .into_iter()
+        .find(|slot| slot.name == "cells")
+        .and_then(|slot| match slot.initializer_kind {
+            CompilerStorageListInitializerKind::Range { from, to } => Some((from, to)),
+            CompilerStorageListInitializerKind::RecordLiteral
+            | CompilerStorageListInitializerKind::Empty
+            | CompilerStorageListInitializerKind::DeferredDynamicListView
+            | CompilerStorageListInitializerKind::SyntheticListViewStorage
+            | CompilerStorageListInitializerKind::Unsupported { .. } => None,
         })
 }
 
@@ -69087,18 +63190,6 @@ fn git_commit() -> String {
         .clone()
 }
 
-fn typecheck_report_hash(ir: &TypedProgram) -> String {
-    serde_json::to_vec(&ir.typecheck_report)
-        .map(|bytes| sha256_bytes(&bytes))
-        .unwrap_or_else(|_| "unserializable-typecheck-report".to_owned())
-}
-
-fn render_slot_table_hash(ir: &TypedProgram) -> String {
-    serde_json::to_vec(&ir.typecheck_report.render_slot_table)
-        .map(|bytes| sha256_bytes(&bytes))
-        .unwrap_or_else(|_| "unserializable-render-slot-table".to_owned())
-}
-
 fn current_binary_hash() -> String {
     static BINARY_HASH: OnceLock<String> = OnceLock::new();
     BINARY_HASH
@@ -69311,7 +63402,7 @@ FUNCTION app() {
     fn list_scenario_harness_from_parsed(parsed: &ParsedProgram) -> ListScenarioHarness {
         let ir = lower_for_runtime(parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        let generic = GenericScheduledRuntime::new(&compiled).unwrap();
         ListScenarioHarness::from_generic(generic).unwrap()
     }
 
@@ -69560,20 +63651,21 @@ FUNCTION icon_code(item) {
     fn physical_todomvc_root_source_event_default_materializes() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
+        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
         assert!(
-            ir.derived_values.iter().any(|value| {
+            generic_derived_plan.root_fields.iter().any(|value| {
                 value.path == "theme_options.name"
                     && value.kind == DerivedValueKind::SourceEventTransform
-                    && !value.indexed
             }),
             "{:#?}",
-            ir.derived_values
+            generic_derived_plan
+                .root_fields
                 .iter()
-                .map(|value| format!("{} {:?} indexed={}", value.path, value.kind, value.indexed))
+                .map(|value| format!("{} {:?}", value.path, value.kind))
                 .collect::<Vec<_>>()
         );
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let generic = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        let generic = GenericScheduledRuntime::new(&compiled).unwrap();
         assert_eq!(
             generic.root_textlike_ref("theme_options.name").unwrap(),
             "Classic"
@@ -69584,27 +63676,19 @@ FUNCTION icon_code(item) {
     fn physical_todomvc_theme_source_event_updates_latest_root_text() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
-        let theme_targets = root_text_transform_targets_from_ir(&ir).unwrap();
-        let theme_debug = ir
-            .derived_values
+        let theme_targets = compiler_source_route_root_text_transform_targets_from_ir(&ir);
+        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
+        let theme_debug = generic_derived_plan
+            .root_fields
             .iter()
             .filter(|value| value.path == "theme_options.name")
-            .map(|value| {
-                let exprs = statement_ast_exprs(&value.statement, &ir.expressions);
-                (
-                    value.sources.clone(),
-                    exprs
-                        .iter()
-                        .map(|expr| (expr.id, expr.line, format!("{:?}", expr.kind)))
-                        .collect::<Vec<_>>(),
-                )
-            })
+            .map(|value| (value.kind.clone(), value.statement.children.len()))
             .collect::<Vec<_>>();
         assert!(
             theme_targets.iter().any(|target| {
                 target.source == "store.elements.theme_switcher.classic"
                     && target.target == "theme_options.name"
-                    && target.value == FieldValue::Text("Classic".to_owned())
+                    && target.value == CompilerFieldValue::Text("Classic".to_owned())
             }),
             "{theme_targets:#?}\n{theme_debug:#?}"
         );
@@ -69612,7 +63696,7 @@ FUNCTION icon_code(item) {
             theme_targets.iter().any(|target| {
                 target.source == "store.elements.theme_switcher.glassmorphism"
                     && target.target == "theme_options.name"
-                    && target.value == FieldValue::Text("Glassmorphism".to_owned())
+                    && target.value == CompilerFieldValue::Text("Glassmorphism".to_owned())
             }),
             "{theme_targets:#?}\n{theme_debug:#?}"
         );
@@ -69816,7 +63900,7 @@ FUNCTION icon_code(item) {
     fn physical_todomvc_router_filter_source_updates_selected_filter() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
-        let router_targets = router_route_targets_from_ir(&ir).unwrap();
+        let router_targets = compiler_source_route_router_targets_from_ir(&ir);
         assert!(
             router_targets.iter().any(|target| {
                 target.source == "store.elements.filter_buttons.completed"
@@ -70306,7 +64390,7 @@ FUNCTION icon_code(item) {
             }
         }
 
-        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
         let summary = runtime.generic_state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "A0");
         assert_eq!(summary["store"]["sheet_rows"].as_array().unwrap().len(), 24);
@@ -70489,7 +64573,7 @@ FUNCTION icon_code(item) {
             compiled.root_state_paths.clear();
             compiled.list_summary_fields.clear();
             compiled.dynamic_list_view_lists.clear();
-            let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+            let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
             assert_eq!(
                 runtime.root_state_paths, expected_root_state_paths,
                 "runtime did not use decoded document root paths for {example}"
@@ -70602,7 +64686,7 @@ FUNCTION icon_code(item) {
             artifact_compiled.list_projections = decoded.list_projections;
             artifact_compiled.list_source_bindings = decoded.list_source_bindings;
 
-            let mut runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+            let mut runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
             let summary = runtime.generic_state_summary();
             assert!(
                 summary.is_object(),
@@ -70618,12 +64702,12 @@ FUNCTION icon_code(item) {
             }
             if example == "todomvc" {
                 let scenario = parse_scenario(&scenario).unwrap();
-                let runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+                let runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
                 let output = run_generic_scenario(
                     runtime,
                     &parsed,
-                    &ir,
                     &artifact_compiled,
+                    None,
                     &scenario,
                     VerificationLayer::Semantic,
                 )
@@ -70699,19 +64783,19 @@ FUNCTION icon_code(item) {
 
             let mut artifact_compiled = compiled.clone();
             artifact_compiled.source_routes = decoded;
-            let mut runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+            let mut runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
             assert!(
                 runtime.generic_state_summary().is_object(),
                 "decoded source routes should instantiate runtime for {example}"
             );
             if example == "todomvc" {
                 let scenario = parse_scenario(&scenario).unwrap();
-                let runtime = LoadedRuntime::new(&ir, &artifact_compiled).unwrap();
+                let runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
                 let output = run_generic_scenario(
                     runtime,
                     &parsed,
-                    &ir,
                     &artifact_compiled,
+                    None,
                     &scenario,
                     VerificationLayer::Semantic,
                 )
@@ -71075,7 +65159,7 @@ FUNCTION icon_code(item) {
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
         let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
-        let report = scalar_generated_kernel_report(&ir, &compiled, &scenario).unwrap();
+        let report = scalar_generated_kernel_report(&compiled, &scenario).unwrap();
 
         assert_eq!(report["kernel_kind"], json!("generated_rust_enum_kernel"));
         assert_eq!(report["candidate_expression_count"], json!(3));
@@ -71168,7 +65252,7 @@ FUNCTION icon_code(item) {
             }
         }
 
-        let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
         assert_eq!(
             runtime.storage.root_bool_opt("store.has_completed"),
             Some(true)
@@ -71255,7 +65339,7 @@ FUNCTION decorate(value) {
             function.statement = poison.clone();
         }
 
-        let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+        let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
         assert_eq!(
             runtime.storage.root_textlike("store.decorated").unwrap(),
             "raw-ok"
@@ -71337,7 +65421,7 @@ FUNCTION decorate(value) {
             }
         }
 
-        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
         let summary = runtime.generic_state_summary();
         assert_eq!(
             summary["store"]["selected_input"]["address"], "A0",
@@ -71583,7 +65667,7 @@ FUNCTION decorate(value) {
             compiled.root_state_paths.clear();
             compiled.list_summary_fields.clear();
             compiled.dynamic_list_view_lists.clear();
-            let runtime = GenericScheduledRuntime::new(&ir, &compiled).unwrap();
+            let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
             assert_eq!(
                 runtime.root_state_paths, expected_root_state_paths,
                 "runtime did not use document lowering root paths for {example}"
@@ -71655,10 +65739,12 @@ FUNCTION decorate(value) {
         .unwrap();
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let slices = generic_runtime_slices_report(&ir, &compiled);
+        let program_metadata = compiler_typed_program_report_metadata_from_ir(&ir);
+        let inventory_counts = compiler_typed_program_inventory_counts_from_ir(&ir);
+        let slices = generic_runtime_slices_report(&compiled, &program_metadata, &inventory_counts);
 
         assert!(
-            derive_generic_interpreter_complete(&ir, &compiled, &slices),
+            derive_generic_interpreter_complete(&program_metadata, &compiled, &slices),
             "baseline TodoMVC slices should satisfy the generic interpreter contract"
         );
         assert!(
@@ -71669,7 +65755,7 @@ FUNCTION decorate(value) {
         let mut incomplete_slices = slices.clone();
         incomplete_slices["generic_loaded_runtime_shell"] = json!(false);
         assert!(
-            !derive_generic_interpreter_complete(&ir, &compiled, &incomplete_slices),
+            !derive_generic_interpreter_complete(&program_metadata, &compiled, &incomplete_slices),
             "generic_interpreter_complete must fail when a required current-example slice fails"
         );
 
@@ -72079,7 +66165,7 @@ FUNCTION decorate(value) {
         .unwrap();
         let todo_ir = lower(&todo_parsed).unwrap();
         let todo_compiled = CompiledProgram::from_ir(&todo_ir).unwrap();
-        let todo_runtime = GenericScheduledRuntime::new(&todo_ir, &todo_compiled).unwrap();
+        let todo_runtime = GenericScheduledRuntime::new(&todo_compiled).unwrap();
         let todo_input = todo_runtime
             .source_action_input_for_event(
                 "todo-append",
@@ -72115,7 +66201,7 @@ FUNCTION decorate(value) {
         let cells_parsed = parse_cells_project_for_test();
         let cells_ir = lower(&cells_parsed).unwrap();
         let cells_compiled = CompiledProgram::from_ir(&cells_ir).unwrap();
-        let cells_runtime = GenericScheduledRuntime::new(&cells_ir, &cells_compiled).unwrap();
+        let cells_runtime = GenericScheduledRuntime::new(&cells_compiled).unwrap();
         let commit_source = cells_ir
             .sources
             .iter()
@@ -72124,7 +66210,7 @@ FUNCTION decorate(value) {
         assert_eq!(
             cells_compiled
                 .source_routes
-                .address_lookup_field_for_source_id(commit_source.id),
+                .address_lookup_field_for_source_id(SourceId(commit_source.id.0)),
             Some("address")
         );
         let cells_event = GenericSourceEvent {
@@ -72170,7 +66256,7 @@ FUNCTION decorate(value) {
         .unwrap();
         let todo_ir = lower(&todo_parsed).unwrap();
         let todo_compiled = CompiledProgram::from_ir(&todo_ir).unwrap();
-        let todo_runtime = GenericScheduledRuntime::new(&todo_ir, &todo_compiled).unwrap();
+        let todo_runtime = GenericScheduledRuntime::new(&todo_compiled).unwrap();
         let todo_rows = todo_runtime
             .list_rows_json("todos", &["title", "completed", "editing"])
             .unwrap();
@@ -72184,7 +66270,7 @@ FUNCTION decorate(value) {
         let cells_parsed = parse_cells_project_for_test();
         let cells_ir = lower(&cells_parsed).unwrap();
         let cells_compiled = CompiledProgram::from_ir(&cells_ir).unwrap();
-        let cells_runtime = GenericScheduledRuntime::new(&cells_ir, &cells_compiled).unwrap();
+        let cells_runtime = GenericScheduledRuntime::new(&cells_compiled).unwrap();
         let a1 = cells_runtime
             .list_row_fields_json("cells", 0, &["address", "formula_text", "editing"])
             .unwrap();
@@ -74211,23 +68297,26 @@ FUNCTION new_todo(title) {
     ]
 }
 "#;
-        let parsed =
-            boon_parser::parse_source("runtime-row-alias-inline-key-match.bn", source).unwrap();
+        let parsed = parse_source("runtime-row-alias-inline-key-match.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         let selected = ir
             .derived_values
             .iter()
             .find(|value| value.path == "store.selected_todo_id")
             .expect("selected_todo_id should lower as a derived value");
-        let exprs = statement_ast_exprs(&selected.statement, &ir.expressions);
-        let expression = source_event_transform_text_expression(
-            selected,
-            "todo.todo_elements.editing_todo_title_element",
-            &ir.expressions,
-            &ir.functions,
-        );
+        let derived_equations =
+            DerivedEquationPlan::from_compiler(compiler_derived_equation_plan_from_ir(&ir));
+        let expression = derived_equations
+            .text_transforms
+            .iter()
+            .find(|transform| {
+                transform.target == selected.path
+                    && transform.source == "todo.todo_elements.editing_todo_title_element"
+            })
+            .map(|transform| &transform.expression)
+            .expect("compiler-derived transform should include row-alias inline key match");
         assert_eq!(
-            expression,
+            *expression,
             RuntimeDerivedTextExpression::MatchConst {
                 input: "old.todo_elements.editing_todo_title_element.event.key_down.key".to_owned(),
                 arms: vec![
@@ -74241,7 +68330,7 @@ FUNCTION new_todo(title) {
                     },
                 ],
             },
-            "runtime transform should compile the row-alias inline key match, exprs={exprs:?}, statement={:?}",
+            "compiler-derived transform should compile the row-alias inline key match, statement={:?}",
             selected.statement
         );
     }
@@ -74625,13 +68714,68 @@ FUNCTION new_todo(title) {
     }
 
     #[test]
+    fn runtime_live_cache_source_compile_uses_compiler_runtime_ir_facade() {
+        let source = format!("{}\n", include_str!("../../../examples/counter.bn"));
+        let (_plan, profile) = cached_runtime_plan_from_source_profiled(
+            "runtime-live-cache-compiler-facade.bn",
+            &source,
+        )
+        .unwrap();
+
+        assert_eq!(profile["owner"], "boon_compiler");
+        assert_eq!(profile["surface"], "runtime-ir");
+        assert!(
+            profile["legacy_runtime_compile_ms"].as_f64().is_some(),
+            "runtime should report only the remaining local legacy schedule build after compiler-owned parse/lower/verify: {profile}"
+        );
+    }
+
+    #[test]
+    fn runtime_full_static_cache_source_compile_uses_compiler_full_ir_facade() {
+        let source = format!("{}\n", include_str!("../../../examples/counter.bn"));
+        let units = vec![RuntimeSourceUnit {
+            path: "runtime-full-cache-compiler-facade.bn".to_owned(),
+            source,
+        }];
+        let (_plan, profile) =
+            cached_full_runtime_plan_from_project_profiled("runtime-full-cache", &units).unwrap();
+
+        assert_eq!(profile["owner"], "boon_compiler");
+        assert_eq!(profile["surface"], "full-ir");
+        assert!(
+            profile["legacy_runtime_compile_ms"].as_f64().is_some(),
+            "runtime full/static cache should report only the remaining local legacy schedule build after compiler-owned full parse/lower/verify: {profile}"
+        );
+    }
+
+    #[test]
+    fn runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade() {
+        let source = include_str!("../../../examples/counter.bn");
+        let parsed = parse_source(
+            "runtime-parsed-program-compiler-facade.bn".to_owned(),
+            source.to_owned(),
+        )
+        .unwrap();
+        let ir = lower_for_runtime(&parsed).unwrap();
+        let program_metadata = compiler_typed_program_report_metadata_from_ir(&ir);
+
+        assert!(
+            program_metadata.expression_count > 0,
+            "runtime parsed-program lowering should still produce usable runtime IR"
+        );
+        assert!(
+            program_metadata.static_schedule_verified,
+            "compiler-owned parsed-program lowering should preserve verification"
+        );
+    }
+
+    #[test]
     fn cells_value_and_error_are_demand_current_at_startup() {
         let source = cells_project_source_for_test();
         let (plan, _) =
             cached_runtime_plan_from_source_profiled("cells-demand-current-startup", &source)
                 .unwrap();
-        let (runtime, profile) =
-            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref()).unwrap();
+        let (runtime, profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref()).unwrap();
         let generic = runtime
             .generic
             .as_ref()
@@ -74664,8 +68808,7 @@ FUNCTION new_todo(title) {
         let (plan, _) =
             cached_runtime_plan_from_source_profiled("cells-reset-source-batch-fast-path", &source)
                 .unwrap();
-        let (runtime, profile) =
-            LoadedRuntime::new_profiled(plan.ir.as_ref(), plan.compiled.as_ref()).unwrap();
+        let (runtime, profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref()).unwrap();
         let generic = runtime
             .generic
             .as_ref()
@@ -74800,7 +68943,10 @@ FUNCTION new_todo(title) {
                 "examples/cells.bn".to_owned()
             ]
         );
-        let (parsed, ir) = load_and_lower(Path::new("../../examples/cells.bn")).unwrap();
+        let compiled =
+            compile_source_path_to_full_ir(Path::new("../../examples/cells.bn")).unwrap();
+        let parsed = compiled.parsed;
+        let ir = compiled.ir;
         assert_eq!(parsed.files.len(), 8);
         assert!(
             parsed
@@ -74832,13 +68978,18 @@ FUNCTION new_todo(title) {
                 .iter()
                 .any(|function| function == "cells_app")
         );
-        assert!(ir.derived_values.iter().any(|value| {
-            value.path == "cell.value" && value.kind == DerivedValueKind::Pure && value.indexed
+        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
+        assert!(generic_derived_plan.indexed_fields.iter().any(|value| {
+            value.list == "cells" && value.field == "value" && value.kind == DerivedValueKind::Pure
         }));
-        assert!(ir.sources.iter().any(|source| {
+        let source_routes = compiler_source_route_sources_from_ir(&ir);
+        assert!(source_routes.iter().any(|source| {
             source.path == "cell.sources.editor.commit"
-                && source.payload_schema.fields
-                    == vec![SourcePayloadField::Address, SourcePayloadField::Text]
+                && source.payload_fields
+                    == vec![
+                        CompilerSourcePayloadField::Address,
+                        CompilerSourcePayloadField::Text,
+                    ]
         }));
     }
 
@@ -74935,22 +69086,18 @@ FUNCTION new_todo(title) {
         );
         let parsed = parse_source("examples/cells.bn", &cells_source).unwrap();
         let ir = lower(&parsed).unwrap();
-        let cells_list = ir
-            .lists
-            .iter()
-            .find(|list| list.name == "cells_default_values")
+        let defaults = compiler_storage_initial_rows_from_ir(&ir)
+            .into_iter()
+            .find(|rows| rows.list == "cells_default_values")
             .expect("Cells source should lower generic default values");
-        let defaults = match &cells_list.initializer {
-            ListInitializer::RecordLiteral { rows } => rows,
-            initializer => panic!("unexpected Cells default initializer: {initializer:?}"),
-        };
-        assert!(defaults.iter().any(|row| {
+        assert!(!defaults.rows.is_empty());
+        assert!(defaults.rows.iter().any(|row| {
             row.fields.iter().any(|field| {
                 field.name == "address"
-                    && matches!(&field.value, InitialValue::Text { value } if value == "A0")
+                    && matches!(&field.value, CompilerInitialValue::Text(value) if value == "A0")
             }) && row.fields.iter().any(|field| {
                 field.name == "value"
-                    && matches!(&field.value, InitialValue::Text { value } if value == "9")
+                    && matches!(&field.value, CompilerInitialValue::Text(value) if value == "9")
             })
         }));
         let mut runtime =
@@ -74999,14 +69146,13 @@ FUNCTION new_number(number) {
 "#;
         let parsed = parse_source("range-list.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
-        let numbers = ir
-            .lists
-            .iter()
-            .find(|list| list.name == "numbers")
+        let numbers = compiler_storage_list_slots_from_ir(&ir)
+            .into_iter()
+            .find(|slot| slot.name == "numbers")
             .expect("range source should lower numbers list");
         assert_eq!(
-            numbers.initializer,
-            ListInitializer::Range { from: 0, to: 2 }
+            numbers.initializer_kind,
+            CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
         );
 
         let mut runtime = LiveRuntime::from_source("range-list", source).unwrap();
@@ -75336,24 +69482,25 @@ FUNCTION new_entry(entry) {
 "#;
         let parsed = parse_source("generic-list-projections.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
-        assert!(ir.list_projections.iter().any(|projection| {
+        let projections = compiler_list_projections_from_ir(&ir);
+        assert!(projections.iter().any(|projection| {
             projection.target == "store.selected_input"
                 && projection.list == "sheet"
                 && projection.kind
-                    == ListProjectionKind::Find {
+                    == CompilerListProjectionKind::Find {
                         field: "address".to_owned(),
                         value: "store.selected".to_owned(),
                     }
         }));
-        assert!(ir.list_projections.iter().any(|projection| {
+        assert!(projections.iter().any(|projection| {
             projection.target == "store.visible_rows"
                 && projection.list == "sheet"
                 && projection.kind
-                    == ListProjectionKind::Chunk {
-                        size: Some(2),
+                    == CompilerListProjectionKind::Chunk {
                         item_field: "entries".to_owned(),
                         label_field: "row_number".to_owned(),
                     }
+                && projection.columns == 2
         }));
 
         let mut runtime = LiveRuntime::from_source("generic-list-projections", source).unwrap();
@@ -77472,6 +71619,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             compiled.source_routes.len() > 0,
             "TodoMVC must compile source routes from typed IR"
         );
+        let source_metadata = compiler_source_route_sources_from_ir(&ir);
         for route in &compiled.source_routes.route_slots {
             let source_id = route.source_id;
             let by_id = compiled
@@ -77479,25 +71627,27 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 .for_source_id(source_id)
                 .expect("dense SourceId slot must resolve to a route");
             assert_eq!(by_id.source, route.source);
+            let source = source_metadata
+                .iter()
+                .find(|source| source.source_id == source_id.as_usize())
+                .expect("compiler source metadata must include dense SourceId");
             assert_eq!(
-                ir.sources[source_id.as_usize()].path,
-                route.source,
-                "dense route slot must match the typed IR source table"
+                source.path, route.source,
+                "dense route slot must match the compiler source metadata table"
             );
         }
 
-        let input_source = ir
-            .sources
+        let input_source = source_metadata
             .iter()
             .find(|source| source.path == "store.sources.new_todo_input.key_down")
-            .expect("TodoMVC input key source must be present in typed IR");
+            .expect("TodoMVC input key source must be present in compiler source metadata");
         let input_route = compiled
             .source_routes
-            .for_source_id(input_source.id)
+            .for_source_id(SourceId(input_source.source_id))
             .expect("TodoMVC input source id must resolve through dense route slots");
         let input_actions = compiled
             .source_routes
-            .actions_for_source_id(input_source.id)
+            .actions_for_source_id(SourceId(input_source.source_id))
             .expect("TodoMVC input source id must resolve through SourceActionTable");
         assert!(
             input_route.has_list_append_target("todos"),
@@ -77511,7 +71661,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
         assert_eq!(
             compiled.source_routes.source_id(&input_source.path),
-            Some(input_source.id),
+            Some(SourceId(input_source.source_id)),
             "source label fallback must resolve through the sorted compiled label index"
         );
         assert!(
@@ -77580,7 +71730,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .as_array()
             .expect("compiled report must include per-route op streams");
         assert!(op_streams.iter().any(|route| {
-            route["source_id"].as_u64() == Some(input_source.id.as_usize() as u64)
+            route["source_id"].as_u64() == Some(input_source.source_id as u64)
                 && route["action_op_count"].as_u64().unwrap_or_default() > 0
                 && route["fallback_reasons"]
                     .as_array()
@@ -77663,19 +71813,19 @@ FUNCTION fake_todomvc_app() {
     #[test]
     fn list_predicates_preserve_ir_paths_without_todo_aliases() {
         assert!(matches!(
-            runtime_list_predicate(&ListPredicate::RowFieldBool {
+            runtime_list_predicate_from_compiler(CompilerListPredicate::FieldBool {
                 path: "task.done".to_owned()
             }),
             RuntimeListPredicate::FieldBool { path } if path == "task.done"
         ));
         assert!(matches!(
-            runtime_list_predicate(&ListPredicate::RowFieldBoolNot {
+            runtime_list_predicate_from_compiler(CompilerListPredicate::FieldBoolNot {
                 path: "task.done".to_owned()
             }),
             RuntimeListPredicate::FieldBoolNot { path } if path == "task.done"
         ));
         assert!(matches!(
-            runtime_list_predicate(&ListPredicate::SelectedFilterVisibility {
+            runtime_list_predicate_from_compiler(CompilerListPredicate::SelectorVisibility {
                 selector: "store.filter".to_owned(),
                 row_field: "task.done".to_owned(),
             }),
@@ -83695,12 +77845,30 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             key: Option<&str>,
             expected: &[(&str, &str)],
         ) -> ScenarioStep {
-            let mut expected_source_event = BTreeMap::new();
-            expected_source_event
-                .insert("source".to_owned(), toml::Value::String(source.to_owned()));
-            if let Some(key) = key {
-                expected_source_event.insert("key".to_owned(), toml::Value::String(key.to_owned()));
-            }
+            let payload = BTreeMap::new();
+            let payload_bytes = BTreeMap::new();
+            let expected_source_event = build_plan_live_source_event_expected_toml(
+                PlanExecutorLiveSourceEventExpectedToml {
+                    source,
+                    text: None,
+                    key,
+                    list_id: None,
+                    address: None,
+                    payload: &payload,
+                    payload_bytes: &payload_bytes,
+                    pointer_x: None,
+                    pointer_y: None,
+                    pointer_width: None,
+                    pointer_height: None,
+                    target_text: None,
+                    target_occurrence: None,
+                    target_key: None,
+                    target_generation: None,
+                    bind_epoch: None,
+                    source_epoch: None,
+                    source_id: None,
+                },
+            );
             ScenarioStep {
                 id: id.to_owned(),
                 expected_source_event: Some(expected_source_event),
@@ -85059,7 +79227,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let parsed = parse_source("examples/todomvc.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let step = LiveSourceEvent {
@@ -85158,7 +79326,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let parsed = parse_source("large-todomvc-count-delta.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
         let mut deltas = Vec::new();
         let mut patches = Vec::new();
         let step = LiveSourceEvent {
@@ -85224,7 +79392,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let parsed = parse_source("large-todomvc-dataflow-count.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
         let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let mut runtime = LoadedRuntime::new(&ir, &compiled).unwrap();
+        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
         let generic = runtime.generic.as_ref().unwrap();
         let mut active_kernel = LargeListCountDataflowKernel::build(
             &generic.storage,
@@ -88307,7 +82475,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 unresolved_executable_refs: Vec::new(),
             },
         };
-        let payload = RuntimeBytes::inline(Bytes::from_static(&[1, 2, 3]));
+        let payload = PlanExecutorBytes::from_inline(
+            sha256_bytes(&[1, 2, 3]),
+            3,
+            vec![1, 2, 3],
+            "typed row bytes concat test payload",
+        )
+        .expect("valid row payload bytes");
         let row = PlanListRowState {
             key: 7,
             generation: 1,
@@ -88452,7 +82626,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 unresolved_executable_refs: Vec::new(),
             },
         };
-        let payload = RuntimeBytes::inline(Bytes::from_static(b"ABC"));
+        let payload = PlanExecutorBytes::from_inline(
+            sha256_bytes(b"ABC"),
+            3,
+            b"ABC".to_vec(),
+            "typed row bytes to text test payload",
+        )
+        .expect("valid row payload bytes");
         let row = PlanListRowState {
             key: 7,
             generation: 1,
@@ -89212,6 +83392,10 @@ payload:
             output.report["plan_executor"]["executor"],
             "cpu-plan-initial-state-v1"
         );
+        assert_eq!(
+            output.report["plan_executor"]["report_assembly_core"]["executor"],
+            "cpu-plan-initial-state-report-assembly-v1"
+        );
         assert_eq!(output.report["plan_executor"]["initialized_state_count"], 1);
         assert_eq!(output.report["plan_executor"]["runtime_ast_eval_count"], 0);
         assert_eq!(
@@ -89247,10 +83431,22 @@ payload:
             output.report["plan_executor"]["executor"],
             "cpu-plan-root-list-scenario-v1"
         );
+        assert_eq!(
+            output.report["plan_executor"]["report_assembly_core"]["executor"],
+            "cpu-plan-root-scenario-report-assembly-v1"
+        );
         assert_eq!(output.state_summary["store.new_todo_text"], "Test todo");
         assert_eq!(output.state_summary["store.selected_filter"], "All");
         assert_eq!(output.state_summary["store.new_todo_focused"], true);
         assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(
+            output.report["legacy_comparison"]["executor"],
+            "cpu-plan-root-scenario-legacy-comparison-assembly-v1"
+        );
+        assert_eq!(
+            output.report["command_report_assembly_core"]["executor"],
+            "cpu-plan-root-scenario-command-report-assembly-v1"
+        );
         assert_eq!(output.report["legacy_comparison"]["state_match"], true);
         assert_eq!(
             output.report["legacy_comparison"]["semantic_delta_match"],
@@ -89263,6 +83459,10 @@ payload:
         assert_eq!(
             output.report["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"],
             "source_payload"
+        );
+        assert_eq!(
+            output.report["plan_executor"]["per_step"][0]["report_assembly_core"]["executor"],
+            "cpu-plan-root-scenario-step-report-assembly-v1"
         );
         assert_eq!(
             output.report["plan_executor"]["per_step"][1]["updates"][0]["expression_kind"],
@@ -89432,6 +83632,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             true
         );
         assert_eq!(
+            output.report["legacy_comparison"]["executor"],
+            "cpu-plan-source-route-legacy-comparison-assembly-v1"
+        );
+        assert_eq!(
+            output.report["command_report_assembly_core"]["executor"],
+            "cpu-plan-source-route-command-report-assembly-v1"
+        );
+        assert_eq!(
             output.report["semantic_delta_signatures"],
             json!(["FieldSet:store.flag", "FieldSet:store.mirrored"])
         );
@@ -89450,6 +83658,30 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(
             output.report["plan_executor"]["semantic_deltas"],
             output.report["semantic_deltas"]
+        );
+        assert_eq!(
+            output.report["plan_executor"]["full_execution_validation_core"]["executor"],
+            "cpu-plan-source-route-full-execution-validation-v1"
+        );
+        assert_eq!(
+            output.report["route_surface"]["full_execution_validation_core"]["matched"],
+            true
+        );
+        assert_eq!(
+            output.report["route_surface"]["executor_core"]["executor"],
+            "cpu-plan-source-route-execution-context-v1"
+        );
+        assert_eq!(
+            output.report["route_surface"]["executor_core"]["selection_core"]["executor"],
+            "cpu-plan-source-route-selection-v1"
+        );
+        assert_eq!(
+            output.report["plan_executor"]["report_assembly_core"]["executor"],
+            "cpu-plan-source-route-report-assembly-v1"
+        );
+        assert_eq!(
+            output.report["route_surface"]["report_assembly_core"]["executor"],
+            "cpu-plan-source-route-report-assembly-v1"
         );
 
         let _ = fs::remove_file(source_path);
@@ -89476,6 +83708,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     "PlanExecutor should preserve Cells state even when legacy emits extra transient cycle deltas"
                 );
                 assert_eq!(
+                    output.report["legacy_comparison"]["executor"],
+                    "cpu-plan-root-scenario-legacy-comparison-assembly-v1"
+                );
+                assert_eq!(
                     output.report["status"], "pass",
                     "Cells event replay report should pass through the explicit demand-current semantic-delta coalescing policy"
                 );
@@ -89492,6 +83728,22 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     "demand-current-coalesced-semantic-deltas"
                 );
                 assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["executor"],
+                    "cpu-plan-root-scenario-demand-current-acceptance-v1"
+                );
+                assert_eq!(
+                    output.report["command_report_assembly_core"]["executor"],
+                    "cpu-plan-scenario-events-command-report-assembly-v1"
+                );
+                assert_eq!(
+                    output.report["plan_executor"]["command_output_core"]["executor"],
+                    "cpu-plan-scenario-events-command-output-v1"
+                );
+                assert_eq!(
+                    output.report["plan_executor_coverage"]["executor"],
+                    "cpu-plan-root-scenario-coverage-report-v1"
+                );
+                assert_eq!(
                     output.report["plan_executor_coverage"]["covers_assertion_only_steps"],
                     true
                 );
@@ -89502,6 +83754,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 assert_eq!(
                     output.report["plan_executor_coverage"]["assertion_checkpoint_count"],
                     6
+                );
+                assert_eq!(
+                    output.report["plan_executor"]["list_projections"][0]["executor"],
+                    "cpu-plan-list-projection-materializer-v1"
                 );
                 assert_eq!(
                     output.report["plan_executor"]["assertion_checkpoints"]
@@ -89624,109 +83880,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(coalesced[1]["value"], "separate row");
         assert_eq!(coalesced[2]["key"], 4);
         assert_eq!(coalesced[2]["value"], 12);
-    }
-
-    #[test]
-    fn indexed_update_conflict_guard_rejects_real_same_target_writes() {
-        let report_row = |op_id: u64, key: u64, field: &str, value: JsonValue| {
-            json!({
-                "list_id": 7,
-                "list": "items",
-                "key": key,
-                "generation": 1,
-                "field_path": field,
-                "update_op_id": op_id,
-                "value": value,
-            })
-        };
-        let execution = |row: JsonValue| IndexedUpdateExecution {
-            semantic_deltas: Vec::new(),
-            report_rows: vec![row],
-            updated_row_count: 1,
-        };
-
-        let mut touched = BTreeMap::new();
-        track_indexed_update_write_conflicts(
-            &mut touched,
-            &[
-                execution(report_row(10, 4, "value", json!("old"))),
-                execution(report_row(11, 5, "value", json!("separate row"))),
-                execution(report_row(12, 4, "error", json!("separate field"))),
-            ],
-        )
-        .expect("different indexed targets should be accepted");
-
-        let error = track_indexed_update_write_conflicts(
-            &mut touched,
-            &[execution(report_row(14, 4, "value", json!("new")))],
-        )
-        .expect_err("different values for the same indexed target must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting indexed update branches"),
-            "unexpected error: {error}"
-        );
-
-        let mut touched = BTreeMap::new();
-        track_indexed_update_write_conflicts(
-            &mut touched,
-            &[execution(report_row(20, 4, "value", json!("same")))],
-        )
-        .expect("first indexed write should be accepted");
-        let error = track_indexed_update_write_conflicts(
-            &mut touched,
-            &[execution(report_row(21, 4, "value", json!("same")))],
-        )
-        .expect_err("same-value duplicate indexed target ownership must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate indexed update branches"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn indexed_update_conflict_guard_ignores_derived_semantic_deltas() {
-        let mut touched = BTreeMap::new();
-        let execution = IndexedUpdateExecution {
-            semantic_deltas: vec![
-                json!({
-                    "kind": "FieldSet",
-                    "list_id": "cells",
-                    "key": 4,
-                    "generation": 1,
-                    "source_id": null,
-                    "bind_epoch": null,
-                    "field_path": "value",
-                    "value": "",
-                }),
-                json!({
-                    "kind": "FieldSet",
-                    "list_id": "cells",
-                    "key": 4,
-                    "generation": 1,
-                    "source_id": null,
-                    "bind_epoch": null,
-                    "field_path": "value",
-                    "value": 12,
-                }),
-            ],
-            report_rows: vec![json!({
-                "list_id": 7,
-                "list": "cells",
-                "key": 4,
-                "generation": 1,
-                "field_path": "formula_text",
-                "update_op_id": 30,
-                "value": "=A1+A2",
-            })],
-            updated_row_count: 1,
-        };
-
-        track_indexed_update_write_conflicts(&mut touched, &[execution])
-            .expect("derived semantic-delta churn must not count as duplicate real writes");
     }
 
     #[test]
@@ -89884,7 +84037,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         );
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
-            5
+            3
         );
         let indexed_update = &output.report["plan_executor"]["per_step"][0]["indexed_updates"][0];
         assert_eq!(indexed_update["expression_kind"], "source_payload");
@@ -89895,6 +84048,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             indexed_update["value"]["digest"],
             "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
         );
+        assert_eq!(
+            indexed_update["bytes_storage"]["storage"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(indexed_update["bytes_storage"]["byte_bank_used"], true);
+        assert_eq!(indexed_update["bytes_storage"]["byte_len"], 3);
         assert_eq!(
             output.report["semantic_delta_signatures"],
             json!([
@@ -89911,11 +84070,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             update["expression_kind"] == "bytes_length"
                 && update["field_path"] == "payload_len"
                 && update["value"] == json!(3)
+                && update["executor_core"]["executor"] == "cpu-plan-indexed-bytes-read-evaluator-v1"
         }));
         assert!(inspect_updates.iter().any(|update| {
             update["expression_kind"] == "bytes_get"
                 && update["field_path"] == "payload_second"
                 && update["value"] == json!(254)
+                && update["executor_core"]["executor"] == "cpu-plan-indexed-bytes-read-evaluator-v1"
         }));
         let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
             .as_array()
@@ -89926,6 +84087,518 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             .expect("beta row should be present in PlanExecutor list summary");
         assert_eq!(beta["fields"]["payload_len"], json!(3));
         assert_eq!(beta["fields"]["payload_second"], json!(254));
+        for key in [
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"][key], 0,
+                "fallback counter {key} must stay zero"
+            );
+        }
+    }
+
+    #[test]
+    fn root_scalar_plan_executor_replays_indexed_bytes_equal_update() {
+        let steps = vec![
+            "receive-beta-bytes".to_owned(),
+            "inspect-beta-equal".to_owned(),
+        ];
+        let output = run_plan_root_scalar_scenario(
+            Path::new("../../examples/bytes_indexed_equal_plan_ops.bn"),
+            Path::new("../../examples/bytes_indexed_equal_plan_ops.scn"),
+            TargetProfile::SoftwareDefault,
+            &steps,
+            true,
+            None,
+        )
+        .expect("indexed Bytes/equal fixture should execute through PlanExecutor");
+
+        assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
+        assert_eq!(
+            output.report["legacy_comparison"]["semantic_delta_match"],
+            true
+        );
+        assert_eq!(
+            output.report["plan_executor"]["executed_indexed_update_count"],
+            3
+        );
+
+        let inspect_updates = output.report["plan_executor"]["per_step"][1]["indexed_updates"]
+            .as_array()
+            .expect("inspect step should expose indexed Bytes/equal updates");
+        assert_eq!(inspect_updates.len(), 2);
+        let same_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "payload_matches")
+            .expect("payload_matches update should execute");
+        assert_eq!(same_update["expression_kind"], "bytes_equal");
+        assert_eq!(same_update["value"], true);
+        assert_eq!(
+            same_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-read-evaluator-v1"
+        );
+        assert_eq!(same_update["bytes_access"]["read_only"], true);
+        assert_eq!(
+            same_update["bytes_access"]["inputs"][0]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(
+            same_update["bytes_access"]["inputs"][1]["access_source"],
+            "indexed_row_private_bytes"
+        );
+        assert_eq!(
+            same_update["bytes_access"]["inputs"][0]["byte_bank_used"],
+            true
+        );
+        assert_eq!(
+            same_update["bytes_access"]["inputs"][1]["byte_bank_used"],
+            false
+        );
+
+        let different_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "payload_differs")
+            .expect("payload_differs update should execute");
+        assert_eq!(different_update["expression_kind"], "bytes_equal");
+        assert_eq!(different_update["value"], false);
+        assert_eq!(
+            different_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-read-evaluator-v1"
+        );
+
+        let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
+            .as_array()
+            .expect("indexed Bytes/equal fixture should report rows");
+        let beta = rows
+            .iter()
+            .find(|row| row["key"] == json!(2))
+            .expect("beta row should be present in PlanExecutor list summary");
+        assert_eq!(beta["fields"]["payload_matches"], true);
+        assert_eq!(beta["fields"]["payload_differs"], false);
+        for key in [
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+        ] {
+            assert_eq!(
+                output.report["plan_executor"][key], 0,
+                "fallback counter {key} must stay zero"
+            );
+        }
+    }
+
+    #[test]
+    fn root_scalar_plan_executor_replays_indexed_bytes_search_updates() {
+        let steps = vec![
+            "receive-beta-bytes".to_owned(),
+            "inspect-beta-search".to_owned(),
+        ];
+        let output = run_plan_root_scalar_scenario(
+            Path::new("../../examples/bytes_indexed_search_plan_ops.bn"),
+            Path::new("../../examples/bytes_indexed_search_plan_ops.scn"),
+            TargetProfile::SoftwareDefault,
+            &steps,
+            true,
+            None,
+        )
+        .expect("indexed Bytes search fixture should execute through PlanExecutor");
+
+        assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
+        assert_eq!(
+            output.report["legacy_comparison"]["semantic_delta_match"],
+            true
+        );
+        assert_eq!(
+            output.report["plan_executor"]["executed_indexed_update_count"],
+            22
+        );
+
+        let inspect_updates = output.report["plan_executor"]["per_step"][1]["indexed_updates"]
+            .as_array()
+            .expect("inspect step should expose indexed Bytes search updates");
+        assert_eq!(inspect_updates.len(), 21);
+        let expected_text = [
+            ("payload_hex", "bytes_to_hex", json!("01fe0405ff")),
+            ("payload_base64", "bytes_to_base64", json!("Af4EBf8=")),
+            ("decoded_text", "bytes_to_text", json!("ABC")),
+        ];
+        for (field_path, expression_kind, value) in expected_text {
+            let update = inspect_updates
+                .iter()
+                .find(|update| update["field_path"] == field_path)
+                .unwrap_or_else(|| panic!("{field_path} update should execute"));
+            assert_eq!(update["expression_kind"], expression_kind);
+            assert_eq!(update["value"], value);
+            assert_eq!(
+                update["executor_core"]["executor"],
+                "cpu-plan-indexed-bytes-read-evaluator-v1"
+            );
+            assert_eq!(update["bytes_access"]["read_only"], true);
+        }
+
+        let expected_bytes_digest =
+            "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78";
+        let expected_bytes = [
+            ("encoded_text_bytes", "text_to_bytes", "row.text_source"),
+            ("decoded_hex_bytes", "bytes_from_hex", "row.hex_source"),
+            (
+                "decoded_base64_bytes",
+                "bytes_from_base64",
+                "row.base64_source",
+            ),
+        ];
+        for (field_path, expression_kind, input_field) in expected_bytes {
+            let update = inspect_updates
+                .iter()
+                .find(|update| update["field_path"] == field_path)
+                .unwrap_or_else(|| panic!("{field_path} update should execute"));
+            assert_eq!(update["expression_kind"], expression_kind);
+            assert_eq!(update["value"]["byte_len"], json!(3));
+            assert_eq!(update["value"]["digest"], expected_bytes_digest);
+            assert_eq!(
+                update["executor_core"]["executor"],
+                "cpu-plan-indexed-bytes-write-evaluator-v1"
+            );
+            assert_eq!(update["bytes_access"]["read_only"], true);
+            assert_eq!(update["bytes_access"]["input"]["input_field"], input_field);
+            assert_eq!(
+                update["bytes_storage"]["storage"],
+                "indexed_fixed_byte_bank"
+            );
+            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
+            assert_eq!(update["bytes_storage"]["byte_len"], json!(3));
+        }
+
+        let expected_slices = [
+            (
+                "payload_mid",
+                "bytes_slice",
+                2,
+                "9df02aeff60f85979be4737edbcd69757628a81b9b1201a48c64ab6b2eb18126",
+                json!({"offset": 1, "byte_count": 2}),
+            ),
+            (
+                "payload_take",
+                "bytes_take",
+                2,
+                "6077f477043ae8cefee8bd0f88b7db444863c754a0fb128ecec260de45f50b4e",
+                json!(2),
+            ),
+            (
+                "payload_drop",
+                "bytes_drop",
+                3,
+                "99c24dfd75d0145b9fe75fa80f6e4fcae7066f24a3f91195c675a849db264541",
+                json!(2),
+            ),
+        ];
+        for (field_path, expression_kind, byte_len, digest, update_constant_value) in
+            expected_slices
+        {
+            let update = inspect_updates
+                .iter()
+                .find(|update| update["field_path"] == field_path)
+                .unwrap_or_else(|| panic!("{field_path} update should execute"));
+            assert_eq!(update["expression_kind"], expression_kind);
+            assert_eq!(update["value"]["byte_len"], json!(byte_len));
+            assert_eq!(update["value"]["digest"], digest);
+            assert_eq!(update["update_constant_value"], update_constant_value);
+            assert_eq!(
+                update["executor_core"]["executor"],
+                "cpu-plan-indexed-bytes-write-evaluator-v1"
+            );
+            assert_eq!(update["bytes_access"]["read_only"], false);
+            assert_eq!(
+                update["bytes_access"]["input_access_source"],
+                "indexed_fixed_byte_bank"
+            );
+            assert_eq!(
+                update["bytes_access"]["output_storage_kind"],
+                "bytes_slice_view"
+            );
+            assert_eq!(
+                update["bytes_storage"]["storage"],
+                "indexed_fixed_byte_bank"
+            );
+            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
+            assert_eq!(update["bytes_storage"]["byte_len"], json!(byte_len));
+        }
+
+        let zeros_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "zero_fill")
+            .expect("zero_fill update should execute");
+        assert_eq!(zeros_update["expression_kind"], "bytes_zeros");
+        assert_eq!(zeros_update["value"]["byte_len"], json!(3));
+        assert_eq!(
+            zeros_update["value"]["digest"],
+            "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c"
+        );
+        assert!(zeros_update["update_constant_id"].is_number());
+        assert_eq!(zeros_update["update_constant_value"], json!(3));
+        assert_eq!(
+            zeros_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-write-evaluator-v1"
+        );
+        assert_eq!(
+            zeros_update["bytes_storage"]["storage"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(zeros_update["bytes_storage"]["byte_bank_used"], true);
+        assert_eq!(zeros_update["bytes_storage"]["byte_len"], json!(3));
+
+        let concat_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "payload_joined")
+            .expect("payload_joined update should execute");
+        assert_eq!(concat_update["expression_kind"], "bytes_concat");
+        assert_eq!(concat_update["value"]["byte_len"], json!(7));
+        assert_eq!(
+            concat_update["value"]["digest"],
+            "4825013d9d795bb73ad5e21ce6963c7c858ed984a8fa720a1d393554a04f43ee"
+        );
+        assert_eq!(
+            concat_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-write-evaluator-v1"
+        );
+        assert_eq!(
+            concat_update["executor_core"]["bytes_copy_cost"]["reason"],
+            "bytes_concat_output_vec"
+        );
+        assert_eq!(concat_update["bytes_access"]["read_only"], false);
+        assert_eq!(concat_update["bytes_access"]["inputs"][0]["role"], "left");
+        assert_eq!(concat_update["bytes_access"]["inputs"][1]["role"], "right");
+        assert_eq!(
+            concat_update["bytes_storage"]["storage"],
+            "indexed_fixed_byte_bank"
+        );
+        assert_eq!(concat_update["bytes_storage"]["byte_bank_used"], true);
+        assert_eq!(concat_update["bytes_storage"]["byte_len"], json!(7));
+
+        let read_u16_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "read_u16_be")
+            .expect("read_u16_be update should execute");
+        assert_eq!(read_u16_update["expression_kind"], "bytes_read_unsigned");
+        assert_eq!(read_u16_update["value"], json!(65028));
+        assert_eq!(
+            read_u16_update["update_constant_value"],
+            json!({"offset": 1, "byte_count": 2, "endian": "Big"})
+        );
+        assert_eq!(
+            read_u16_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-read-evaluator-v1"
+        );
+        assert_eq!(read_u16_update["bytes_access"]["read_only"], true);
+        assert_eq!(
+            read_u16_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+
+        let read_i8_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "read_i8_last")
+            .expect("read_i8_last update should execute");
+        assert_eq!(read_i8_update["expression_kind"], "bytes_read_signed");
+        assert_eq!(read_i8_update["value"], json!(-1));
+        assert_eq!(
+            read_i8_update["update_constant_value"],
+            json!({"offset": 4, "byte_count": 1, "endian": "Little"})
+        );
+        assert_eq!(
+            read_i8_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-read-evaluator-v1"
+        );
+        assert_eq!(read_i8_update["bytes_access"]["read_only"], true);
+        assert_eq!(
+            read_i8_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+
+        let expected_numeric_writes = [
+            (
+                "write_u16_le",
+                "bytes_write_unsigned",
+                5,
+                "8d220d82abb00ef958463bc77f36fcc1879cf87225bb513b2946fedfdb5d4300",
+                json!({"offset": 2, "byte_count": 2, "endian": "Little", "value": 4660}),
+                2,
+            ),
+            (
+                "write_i8_first",
+                "bytes_write_signed",
+                5,
+                "b22348517e4e632ac2a247feaa534cb664204a3b5eeb77acb1b0fc306ae63b29",
+                json!({"offset": 0, "byte_count": 1, "endian": "Little", "value": -1}),
+                1,
+            ),
+        ];
+        for (field_path, expression_kind, byte_len, digest, update_constant_value, patch_count) in
+            expected_numeric_writes
+        {
+            let update = inspect_updates
+                .iter()
+                .find(|update| update["field_path"] == field_path)
+                .unwrap_or_else(|| panic!("{field_path} update should execute"));
+            assert_eq!(update["expression_kind"], expression_kind);
+            assert_eq!(update["value"]["byte_len"], json!(byte_len));
+            assert_eq!(update["value"]["digest"], digest);
+            assert_eq!(update["update_constant_value"], update_constant_value);
+            assert_eq!(
+                update["executor_core"]["executor"],
+                "cpu-plan-indexed-bytes-write-evaluator-v1"
+            );
+            assert_eq!(update["bytes_access"]["read_only"], false);
+            assert_eq!(
+                update["bytes_access"]["access_source"],
+                "indexed_fixed_byte_bank"
+            );
+            assert_eq!(update["bytes_access"]["byte_bank_used"], true);
+            assert_eq!(update["bytes_access"]["mutation_kind"], "inline_bytes_copy");
+            assert_eq!(update["bytes_access"]["patch_count"], json!(patch_count));
+            assert_eq!(
+                update["bytes_storage"]["storage"],
+                "indexed_fixed_byte_bank"
+            );
+            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
+            assert_eq!(update["bytes_storage"]["byte_len"], json!(byte_len));
+        }
+
+        let is_empty_update = inspect_updates
+            .iter()
+            .find(|update| update["field_path"] == "payload_empty")
+            .expect("payload_empty update should execute");
+        assert_eq!(is_empty_update["expression_kind"], "bytes_is_empty");
+        assert_eq!(is_empty_update["value"], false);
+        assert_eq!(
+            is_empty_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-read-evaluator-v1"
+        );
+        assert_eq!(is_empty_update["bytes_access"]["read_only"], true);
+        assert_eq!(
+            is_empty_update["bytes_access"]["access_source"],
+            "indexed_fixed_byte_bank"
+        );
+
+        let expected = [
+            ("found_index", "bytes_find", json!(1), "haystack", "needle"),
+            (
+                "missing_index",
+                "bytes_find",
+                JsonValue::Null,
+                "haystack",
+                "needle",
+            ),
+            (
+                "starts",
+                "bytes_starts_with",
+                json!(true),
+                "input",
+                "prefix",
+            ),
+            ("ends", "bytes_ends_with", json!(true), "input", "suffix"),
+            (
+                "not_ends",
+                "bytes_ends_with",
+                json!(false),
+                "input",
+                "suffix",
+            ),
+        ];
+        for (field_path, expression_kind, value, left_role, right_role) in expected {
+            let update = inspect_updates
+                .iter()
+                .find(|update| update["field_path"] == field_path)
+                .unwrap_or_else(|| panic!("{field_path} update should execute"));
+            assert_eq!(update["expression_kind"], expression_kind);
+            assert_eq!(update["value"], value);
+            assert_eq!(
+                update["executor_core"]["executor"],
+                "cpu-plan-indexed-bytes-read-evaluator-v1"
+            );
+            assert_eq!(update["bytes_access"]["read_only"], true);
+            assert_eq!(update["bytes_access"]["inputs"][0]["role"], left_role);
+            assert_eq!(update["bytes_access"]["inputs"][1]["role"], right_role);
+        }
+
+        let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
+            .as_array()
+            .expect("indexed Bytes search fixture should report rows");
+        let beta = rows
+            .iter()
+            .find(|row| row["key"] == json!(2))
+            .expect("beta row should be present in PlanExecutor list summary");
+        assert_eq!(beta["fields"]["payload_hex"], json!("01fe0405ff"));
+        assert_eq!(beta["fields"]["payload_base64"], json!("Af4EBf8="));
+        assert_eq!(beta["fields"]["decoded_text"], json!("ABC"));
+        assert_eq!(beta["fields"]["encoded_text_bytes"]["byte_len"], json!(3));
+        assert_eq!(
+            beta["fields"]["encoded_text_bytes"]["digest"],
+            expected_bytes_digest
+        );
+        assert_eq!(beta["fields"]["decoded_hex_bytes"]["byte_len"], json!(3));
+        assert_eq!(
+            beta["fields"]["decoded_hex_bytes"]["digest"],
+            expected_bytes_digest
+        );
+        assert_eq!(beta["fields"]["decoded_base64_bytes"]["byte_len"], json!(3));
+        assert_eq!(
+            beta["fields"]["decoded_base64_bytes"]["digest"],
+            expected_bytes_digest
+        );
+        assert_eq!(beta["fields"]["payload_mid"]["byte_len"], json!(2));
+        assert_eq!(
+            beta["fields"]["payload_mid"]["digest"],
+            "9df02aeff60f85979be4737edbcd69757628a81b9b1201a48c64ab6b2eb18126"
+        );
+        assert_eq!(beta["fields"]["payload_take"]["byte_len"], json!(2));
+        assert_eq!(
+            beta["fields"]["payload_take"]["digest"],
+            "6077f477043ae8cefee8bd0f88b7db444863c754a0fb128ecec260de45f50b4e"
+        );
+        assert_eq!(beta["fields"]["payload_drop"]["byte_len"], json!(3));
+        assert_eq!(
+            beta["fields"]["payload_drop"]["digest"],
+            "99c24dfd75d0145b9fe75fa80f6e4fcae7066f24a3f91195c675a849db264541"
+        );
+        assert_eq!(beta["fields"]["zero_fill"]["byte_len"], json!(3));
+        assert_eq!(
+            beta["fields"]["zero_fill"]["digest"],
+            "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c"
+        );
+        assert_eq!(beta["fields"]["payload_joined"]["byte_len"], json!(7));
+        assert_eq!(
+            beta["fields"]["payload_joined"]["digest"],
+            "4825013d9d795bb73ad5e21ce6963c7c858ed984a8fa720a1d393554a04f43ee"
+        );
+        assert_eq!(beta["fields"]["read_u16_be"], json!(65028));
+        assert_eq!(beta["fields"]["read_i8_last"], json!(-1));
+        assert_eq!(beta["fields"]["write_u16_le"]["byte_len"], json!(5));
+        assert_eq!(
+            beta["fields"]["write_u16_le"]["digest"],
+            "8d220d82abb00ef958463bc77f36fcc1879cf87225bb513b2946fedfdb5d4300"
+        );
+        assert_eq!(beta["fields"]["write_i8_first"]["byte_len"], json!(5));
+        assert_eq!(
+            beta["fields"]["write_i8_first"]["digest"],
+            "b22348517e4e632ac2a247feaa534cb664204a3b5eeb77acb1b0fc306ae63b29"
+        );
+        assert_eq!(beta["fields"]["payload_empty"], false);
+        assert_eq!(beta["fields"]["found_index"], json!(1));
+        assert_eq!(beta["fields"]["missing_index"], JsonValue::Null);
+        assert_eq!(beta["fields"]["starts"], true);
+        assert_eq!(beta["fields"]["ends"], true);
+        assert_eq!(beta["fields"]["not_ends"], false);
         for key in [
             "runtime_ast_eval_count",
             "executable_string_path_count",
@@ -90001,6 +84674,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             "indexed_fixed_byte_bank"
         );
         assert_eq!(set_update["bytes_storage"]["byte_bank_used"], true);
+        assert_eq!(
+            set_update["executor_core"]["executor"],
+            "cpu-plan-indexed-bytes-write-evaluator-v1"
+        );
 
         let length_update = updates
             .iter()
@@ -90333,6 +85010,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         };
         let same_update = update_for("store.same");
         assert_eq!(same_update["expression_kind"], "bytes_equal");
+        assert_eq!(
+            same_update["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
         assert_eq!(same_update["value"], true);
         assert_eq!(same_update["source_payload_field"], JsonValue::Null);
         assert_eq!(same_update["update_constant_id"], JsonValue::Null);
@@ -90439,6 +85120,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         };
         let found_update = update_for("store.found_index");
         assert_eq!(found_update["expression_kind"], "bytes_find");
+        assert_eq!(
+            found_update["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
         assert_eq!(found_update["value"], 2);
         assert_eq!(found_update["source_payload_field"], JsonValue::Null);
         assert_eq!(found_update["update_constant_id"], JsonValue::Null);
@@ -90456,6 +85141,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             update_for("store.starts")["expression_kind"],
             "bytes_starts_with"
         );
+        assert_eq!(
+            update_for("store.starts")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
         assert_eq!(update_for("store.starts")["value"], true);
         assert_eq!(
             update_for("store.not_starts")["expression_kind"],
@@ -90465,6 +85154,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(
             update_for("store.ends")["expression_kind"],
             "bytes_ends_with"
+        );
+        assert_eq!(
+            update_for("store.ends")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
         );
         assert_eq!(update_for("store.ends")["value"], true);
         assert_eq!(
@@ -90552,8 +85245,16 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             "bytes_from_hex"
         );
         assert_eq!(
+            update_for("store.decoded_hex")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-write-evaluator-v1"
+        );
+        assert_eq!(
             update_for("store.decoded_base64")["expression_kind"],
             "bytes_from_base64"
+        );
+        assert_eq!(
+            update_for("store.decoded_base64")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-write-evaluator-v1"
         );
         for update in decode_updates {
             assert!(
@@ -90654,6 +85355,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             measure_update_for("store.read_u16_le")["expression_kind"],
             "bytes_read_unsigned"
         );
+        assert_eq!(
+            measure_update_for("store.read_u16_le")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
         assert_eq!(measure_update_for("store.read_u16_le")["value"], 513);
         assert_eq!(
             measure_update_for("store.read_u16_le")["update_constant_value"],
@@ -90666,6 +85371,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(
             measure_update_for("store.read_i16_be")["expression_kind"],
             "bytes_read_signed"
+        );
+        assert_eq!(
+            measure_update_for("store.read_i16_be")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
         );
         assert_eq!(measure_update_for("store.read_i16_be")["value"], -2);
         assert_eq!(
@@ -90687,6 +85396,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             "bytes_write_unsigned"
         );
         assert_eq!(
+            write_update_for("store.written_unsigned")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-write-evaluator-v1"
+        );
+        assert_eq!(
             write_update_for("store.written_unsigned")["value"],
             written_unsigned_summary
         );
@@ -90697,6 +85410,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(
             write_update_for("store.written_signed")["expression_kind"],
             "bytes_write_signed"
+        );
+        assert_eq!(
+            write_update_for("store.written_signed")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-write-evaluator-v1"
         );
         assert_eq!(
             write_update_for("store.written_signed")["value"],
@@ -90737,12 +85454,20 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             "bytes_read_unsigned"
         );
         assert_eq!(
+            inspect_update_for("store.written_unsigned_read")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
+        assert_eq!(
             inspect_update_for("store.written_unsigned_read")["value"],
             4660
         );
         assert_eq!(
             inspect_update_for("store.written_signed_read")["expression_kind"],
             "bytes_read_signed"
+        );
+        assert_eq!(
+            inspect_update_for("store.written_signed_read")["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
         );
         assert_eq!(
             inspect_update_for("store.written_signed_read")["value"],
@@ -90994,6 +85719,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         let encode_update = &first_step_updates[0];
         assert_eq!(encode_update["target_state"], "store.encoded");
         assert_eq!(encode_update["expression_kind"], "text_to_bytes");
+        assert_eq!(
+            encode_update["executor_core"]["executor"],
+            "cpu-plan-root-bytes-write-evaluator-v1"
+        );
         assert_eq!(encode_update["value"], encoded_summary);
         assert!(encode_update["update_constant_id"].is_number());
         assert_eq!(encode_update["update_constant_value"], "utf8");
@@ -91017,6 +85746,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(len_update["value"], 2);
         let decode_update = update_for("store.decoded");
         assert_eq!(decode_update["expression_kind"], "bytes_to_text");
+        assert_eq!(
+            decode_update["executor_core"]["executor"],
+            "cpu-plan-root-bytes-read-evaluator-v1"
+        );
         assert_eq!(decode_update["value"], "hi");
         assert!(decode_update["update_constant_id"].is_number());
         assert_eq!(decode_update["update_constant_value"], "utf8");
@@ -91107,9 +85840,22 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             );
         }
         assert_eq!(
-            output.report["plan_executor"]["bytes_storage_no_copy"], false,
-            "overall two-step fixture still includes the concat allocation in inspect-splits"
+            output.report["plan_executor"]["per_step"][1]["bytes_storage_no_copy"], false,
+            "concat step should report measured byte-buffer copy cost"
         );
+        assert_eq!(
+            output.report["plan_executor"]["bytes_storage_no_copy"], false,
+            "overall two-step fixture should report the measured concat copy cost"
+        );
+        for key in ["copy_from_slice_bytes", "vec_alloc_bytes"] {
+            assert!(
+                output.report["plan_executor"]["bytes_storage_counters"][key]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0,
+                "overall counter {key} should include executor-owned concat copy cost"
+            );
+        }
 
         let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
             .as_array()
@@ -91700,6 +86446,10 @@ expected_source_event = {{ source = "store.decode" }}
         assert_eq!(
             report["plan_executor"]["list_retains"][0]["predicate"]["selector_value"],
             "Active"
+        );
+        assert_eq!(
+            report["plan_executor"]["list_retains"][0]["executor"],
+            "cpu-plan-list-retain-materializer-v1"
         );
         assert_eq!(
             toggle_step["list_view_summary"]["store.visible_todos"]["row_count"],

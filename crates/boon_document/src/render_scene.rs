@@ -346,12 +346,33 @@ fn replace_render_scene_entries_for_nodes<T: Clone>(
         return Ok(false);
     }
     let insert_at = first.unwrap_or(entries.len());
-    entries.retain(|entry| {
-        let remove = entry_belongs_to_nodes(node_for_entry(entry), node_set);
+    let original = std::mem::take(entries);
+    let mut inserted_nodes = BTreeSet::new();
+    for entry in original {
+        let node = node_for_entry(&entry).clone();
+        let remove = entry_belongs_to_nodes(&node, node_set);
         saw_existing |= remove;
-        !remove
-    });
-    entries.splice(insert_at..insert_at, replacements.iter().cloned());
+        if remove {
+            if inserted_nodes.insert(node.clone()) {
+                entries.extend(
+                    replacements
+                        .iter()
+                        .filter(|replacement| node_for_entry(replacement) == &node)
+                        .cloned(),
+                );
+            }
+        } else {
+            entries.push(entry);
+        }
+    }
+    let remaining = replacements
+        .iter()
+        .filter(|replacement| !inserted_nodes.contains(node_for_entry(replacement)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        entries.splice(insert_at..insert_at, remaining);
+    }
     Ok(saw_existing || replacements.is_empty())
 }
 

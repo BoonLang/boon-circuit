@@ -1,0 +1,38 @@
+store: [
+    rows:
+        LIST {
+            [name: TEXT { alpha }, payload: BYTES[3] {}, same_expected: BYTES[3] { 16u01, 16uFE, 16u04 }, different_expected: BYTES[3] { 16u01, 16u02, 16u04 }]
+            [name: TEXT { beta }, payload: BYTES[3] {}, same_expected: BYTES[3] { 16u01, 16uFE, 16u04 }, different_expected: BYTES[3] { 16u01, 16u02, 16u04 }]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        receive: SOURCE
+        inspect: SOURCE
+        name: row.name
+        payload:
+            row.payload |> HOLD payload {
+                LATEST {
+                    receive.bytes |> THEN { receive.bytes }
+                }
+            }
+        same_expected: row.same_expected
+        different_expected: row.different_expected
+        payload_matches:
+            False |> HOLD payload_matches {
+                LATEST {
+                    inspect |> THEN { payload |> Bytes/equal(with: same_expected) }
+                }
+            }
+        payload_differs:
+            False |> HOLD payload_differs {
+                LATEST {
+                    inspect |> THEN { Bytes/equal(left: payload, right: different_expected) }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Indexed BYTES equal }))

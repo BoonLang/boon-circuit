@@ -1,0 +1,10 @@
+name = "bytes indexed search plan ops"
+source = "examples/bytes_indexed_search_plan_ops.bn"
+
+[[step]]
+id = "receive-beta-bytes"
+expected_source_event = { source = "row.receive", target_key = 2, target_generation = 1, bytes_hex = "01fe0405ff" }
+
+[[step]]
+id = "inspect-beta-search"
+expected_source_event = { source = "row.inspect", target_key = 2, target_generation = 1 }

@@ -1,0 +1,10 @@
+name = "bytes indexed equal plan ops"
+source = "examples/bytes_indexed_equal_plan_ops.bn"
+
+[[step]]
+id = "receive-beta-bytes"
+expected_source_event = { source = "row.receive", target_key = 2, target_generation = 1, bytes_hex = "01fe04" }
+
+[[step]]
+id = "inspect-beta-equal"
+expected_source_event = { source = "row.inspect", target_key = 2, target_generation = 1 }

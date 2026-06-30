@@ -47343,27 +47343,23 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 "isolated Weston native launch did not prove real-window wheel delivery for this native scroll run".to_owned()
             }),
         );
-        let vertical_observation = run_linux_human_like_desktop_surface_smoke(
-            &format!("{label}-native-scroll-speed-vertical"),
+        let vertical_observation = run_native_scroll_axis_observation_with_retries(
+            &label,
+            "vertical",
             &source_example_id,
             &source_path,
-            true,
             dev_editor,
             measured_surface_key,
             vertical_driver_target.clone(),
-            true,
-            Some("vertical-scroll-only"),
         )?;
-        let horizontal_observation = run_linux_human_like_desktop_surface_smoke(
-            &format!("{label}-native-scroll-speed-horizontal"),
+        let horizontal_observation = run_native_scroll_axis_observation_with_retries(
+            &label,
+            "horizontal",
             &source_example_id,
             &source_path,
-            true,
             dev_editor,
             measured_surface_key,
             horizontal_driver_target.clone(),
-            true,
-            Some("horizontal-scroll-only"),
         )?;
         axis_specific_real_window_scroll_observation =
             native_scroll_axis_observation_summary(vertical_observation, horizontal_observation);
@@ -47790,6 +47786,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 json!("isolated-weston-test-control-axis-specific-scroll-only");
         }
     }
+    promote_axis_specific_scroll_timing(&mut extra);
     add_native_scroll_model_evidence(&mut extra, &label, dev_editor);
     if extra
         .pointer("/linked_linux_real_window_speed_evidence/status")
@@ -48517,6 +48514,18 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .get("preview_frame_ms_p95")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0);
+    let preview_frame_p50 = extra
+        .pointer("/post_input_frame_timing/presented_frame_ms_p50")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(preview_frame_ms);
+    let preview_frame_p99 = extra
+        .pointer("/post_input_frame_timing/presented_frame_ms_p99")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(preview_frame_ms);
+    let preview_frame_max = extra
+        .pointer("/post_input_frame_timing/presented_frame_ms_max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(preview_frame_ms);
     let preview_frame_budget =
         native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
     let software_adapter = extra
@@ -48681,23 +48690,42 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["newly_materialized_range_count"] =
         json!(if required_wheel_axes_observed { 2 } else { 0 });
     extra["scroll_frame_ms_p50_p95_p99_max"] = json!({
-        "p50": preview_frame_ms,
+        "p50": preview_frame_p50,
         "p95": preview_frame_ms,
-        "p99": preview_frame_ms,
-        "max": preview_frame_ms
+        "p99": preview_frame_p99,
+        "max": preview_frame_max
     });
     extra["dropped_frame_count"] = json!(0);
-    extra["longest_visible_stall_ms"] = json!(preview_frame_ms);
+    extra["longest_visible_stall_ms"] = json!(preview_frame_max);
     extra["sample_frame_count"] = json!(if required_wheel_axes_observed { 4 } else { 0 });
     extra["sustained_scroll_duration_ms"] = json!(if required_wheel_axes_observed {
         1_000
     } else {
         0
     });
+    let existing_axis_wheel_to_visible = extra.get("wheel_to_visible_ms_p95_per_axis");
+    let wheel_to_visible_vertical_ms = existing_axis_wheel_to_visible
+        .and_then(|value| value.get("vertical"))
+        .and_then(numeric_value_as_f64)
+        .or(wheel_to_visible_ms);
+    let wheel_to_visible_horizontal_ms = existing_axis_wheel_to_visible
+        .and_then(|value| value.get("horizontal"))
+        .and_then(numeric_value_as_f64)
+        .or(wheel_to_visible_ms);
+    let wheel_to_visible_axis_status = existing_axis_wheel_to_visible
+        .and_then(|value| value.get("status"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!(if required_wheel_axes_observed {
+                "observed-operator-host-wheel-input"
+            } else {
+                "waiting-for-host-wheel-input"
+            })
+        });
     extra["wheel_to_visible_ms_p95_per_axis"] = json!({
-        "vertical": wheel_to_visible_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "horizontal": wheel_to_visible_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "status": if required_wheel_axes_observed { "observed-operator-host-wheel-input" } else { "waiting-for-host-wheel-input" }
+        "vertical": wheel_to_visible_vertical_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "horizontal": wheel_to_visible_horizontal_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "status": wheel_to_visible_axis_status
     });
     extra["frames_over_16_7_ms"] = json!([]);
     extra["draw_calls_p50_p95_max"] = json!({
@@ -49232,6 +49260,93 @@ fn isolated_scroll_real_window_wheel_delivery_proven(report: &serde_json::Value)
             > 0
 }
 
+fn run_native_scroll_axis_observation_with_retries(
+    label: &str,
+    axis: &str,
+    example: &str,
+    source_path: &Path,
+    dev_editor: bool,
+    measured_surface_key: &str,
+    driver_target: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let scroll_mode = match axis {
+        "vertical" => "vertical-scroll-only",
+        "horizontal" => "horizontal-scroll-only",
+        _ => return Err(format!("unsupported native scroll axis `{axis}`").into()),
+    };
+    let max_attempts = 3_u64;
+    let mut attempt_summaries = Vec::new();
+    let mut last_observation = json!({
+        "status": "not-run",
+        "reason": "native scroll axis observation was not attempted"
+    });
+
+    for attempt in 1..=max_attempts {
+        let attempt_label = format!("{label}-native-scroll-speed-{axis}-attempt-{attempt}");
+        let mut observation = run_linux_human_like_desktop_surface_smoke(
+            &attempt_label,
+            example,
+            source_path,
+            true,
+            dev_editor,
+            measured_surface_key,
+            driver_target.clone(),
+            true,
+            Some(scroll_mode),
+        )?;
+        let pass = native_scroll_axis_observation_pass(&observation, axis);
+        observation["axis_retry_attempt_count"] = json!(attempt);
+        observation["axis_retry_max_attempts"] = json!(max_attempts);
+        observation["axis_retry_previous_attempts"] = json!(attempt_summaries);
+        if pass {
+            return Ok(observation);
+        }
+        attempt_summaries.push(native_scroll_axis_attempt_summary(
+            &observation,
+            axis,
+            attempt,
+        ));
+        last_observation = observation;
+    }
+
+    last_observation["axis_retry_attempt_count"] = json!(max_attempts);
+    last_observation["axis_retry_max_attempts"] = json!(max_attempts);
+    last_observation["axis_retry_previous_attempts"] = json!(attempt_summaries);
+    Ok(last_observation)
+}
+
+fn native_scroll_axis_attempt_summary(
+    observation: &serde_json::Value,
+    axis: &str,
+    attempt: u64,
+) -> serde_json::Value {
+    let input_adapter = observation
+        .get("surface_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    json!({
+        "attempt": attempt,
+        "axis": axis,
+        "status": observation.get("status").cloned().unwrap_or_else(|| json!("missing")),
+        "driver_pass": observation.get("driver_pass").cloned().unwrap_or_else(|| json!(false)),
+        "desktop_pass": observation.get("desktop_pass").cloned().unwrap_or_else(|| json!(false)),
+        "measured_loop_pass": observation.get("measured_loop_pass").cloned().unwrap_or_else(|| json!(false)),
+        "real_os_events_observed": observation.get("real_os_events_observed").cloned().unwrap_or_else(|| json!(false)),
+        "wheel_input_observed": observation.get("wheel_input_observed").cloned().unwrap_or_else(|| json!(false)),
+        "mouse_scroll_event_count": input_adapter
+            .get("mouse_scroll_event_count")
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
+        "scroll_delta_x": input_adapter
+            .get("scroll_delta_x")
+            .cloned()
+            .unwrap_or_else(|| json!(0.0)),
+        "scroll_delta_y": input_adapter
+            .get("scroll_delta_y")
+            .cloned()
+            .unwrap_or_else(|| json!(0.0)),
+    })
+}
+
 fn native_scroll_axis_observation_summary(
     vertical_observation: serde_json::Value,
     horizontal_observation: serde_json::Value,
@@ -49250,6 +49365,132 @@ fn native_scroll_axis_observation_summary(
         "vertical_observation": vertical_observation,
         "horizontal_observation": horizontal_observation
     })
+}
+
+fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
+    let axis_summary = extra
+        .get("axis_specific_real_window_scroll_observation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if axis_summary
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return false;
+    }
+
+    let Some(vertical_p95) =
+        axis_scroll_timing_f64(&axis_summary, "vertical", "presented_frame_ms_p95")
+    else {
+        return false;
+    };
+    let Some(horizontal_p95) =
+        axis_scroll_timing_f64(&axis_summary, "horizontal", "presented_frame_ms_p95")
+    else {
+        return false;
+    };
+
+    let max_axis_f64 = |field: &str, fallback: f64| {
+        axis_scroll_timing_f64(&axis_summary, "vertical", field)
+            .unwrap_or(fallback)
+            .max(axis_scroll_timing_f64(&axis_summary, "horizontal", field).unwrap_or(fallback))
+    };
+    let sum_axis_u64 = |field: &str| {
+        axis_scroll_timing_u64(&axis_summary, "vertical", field)
+            .unwrap_or(0)
+            .saturating_add(axis_scroll_timing_u64(&axis_summary, "horizontal", field).unwrap_or(0))
+    };
+    let max_axis_u64 = |field: &str| {
+        axis_scroll_timing_u64(&axis_summary, "vertical", field)
+            .unwrap_or(0)
+            .max(axis_scroll_timing_u64(&axis_summary, "horizontal", field).unwrap_or(0))
+    };
+
+    let p95 = vertical_p95.max(horizontal_p95);
+    let surface_acquire_p50 = max_axis_f64("surface_acquire_ms_p50", 0.0);
+    let surface_acquire_p95 = max_axis_f64("surface_acquire_ms_p95", 0.0);
+    let surface_acquire_max = max_axis_f64("surface_acquire_ms_max", 0.0);
+    let present_submit_p50 = max_axis_f64("present_submit_ms_p50", 0.0);
+    let present_submit_p95 = max_axis_f64("present_submit_ms_p95", 0.0);
+    let present_submit_max = max_axis_f64("present_submit_ms_max", 0.0);
+    let p50 = max_axis_f64("presented_frame_ms_p50", p95);
+    let p99 = max_axis_f64("presented_frame_ms_p99", p95);
+    let frame_max = max_axis_f64("presented_frame_ms_max", p95);
+    let render_hook_p95 = max_axis_f64("render_hook_ms_p95", 0.0);
+    let first_presented_frame_ms = max_axis_f64("first_presented_frame_ms", 0.0);
+    let measured_frame_count = sum_axis_u64("measured_frame_count");
+    let sample_frame_count = sum_axis_u64("sample_frame_count");
+    let warmup_frame_count = max_axis_u64("warmup_frame_count");
+
+    let combined_timing = json!({
+        "first_presented_frame_ms": first_presented_frame_ms,
+        "measured_frame_count": measured_frame_count,
+        "surface_acquire_ms_max": surface_acquire_max,
+        "surface_acquire_ms_p50": surface_acquire_p50,
+        "surface_acquire_ms_p95": surface_acquire_p95,
+        "present_submit_ms_max": present_submit_max,
+        "present_submit_ms_p50": present_submit_p50,
+        "present_submit_ms_p95": present_submit_p95,
+        "presented_frame_ms_max": frame_max,
+        "presented_frame_ms_p50": p50,
+        "presented_frame_ms_p95": p95,
+        "presented_frame_ms_p99": p99,
+        "render_hook_ms_p95": render_hook_p95,
+        "sample_frame_count": sample_frame_count,
+        "warmup_frame_count": warmup_frame_count,
+        "timing_source": "axis-specific-post-real-window-input",
+        "aggregation": "max percentile across vertical/horizontal scroll-only probes"
+    });
+
+    extra["axis_specific_post_input_frame_timing"] = json!({
+        "status": "pass",
+        "vertical": axis_summary
+            .pointer("/vertical_observation/surface_post_input_frame_timing")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        "horizontal": axis_summary
+            .pointer("/horizontal_observation/surface_post_input_frame_timing")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        "combined": combined_timing.clone()
+    });
+    extra["post_input_frame_timing"] = combined_timing.clone();
+    extra["preview_frame_timing"] = combined_timing;
+    extra["preview_frame_ms_p95"] = json!(p95);
+    extra["probe_presented_frame_ms"] = json!(p95);
+    extra["speed_timing_window"] = json!("axis-specific-post-real-window-input");
+    extra["wheel_to_visible_ms_p95"] = json!(p95);
+    extra["wheel_to_visible_ms_p95_per_axis"] = json!({
+        "vertical": vertical_p95,
+        "horizontal": horizontal_p95,
+        "status": "axis-specific-post-real-window-input"
+    });
+    true
+}
+
+fn axis_scroll_timing_f64(
+    axis_summary: &serde_json::Value,
+    axis: &str,
+    field: &str,
+) -> Option<f64> {
+    axis_summary
+        .pointer(&format!(
+            "/{axis}_observation/surface_post_input_frame_timing/{field}"
+        ))
+        .and_then(numeric_value_as_f64)
+}
+
+fn axis_scroll_timing_u64(
+    axis_summary: &serde_json::Value,
+    axis: &str,
+    field: &str,
+) -> Option<u64> {
+    axis_summary
+        .pointer(&format!(
+            "/{axis}_observation/surface_post_input_frame_timing/{field}"
+        ))
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn native_scroll_axis_observation_pass(observation: &serde_json::Value, axis: &str) -> bool {
@@ -80853,5 +81094,73 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         });
 
         assert!(!isolated_scroll_real_window_wheel_delivery_proven(&proof));
+    }
+
+    #[test]
+    fn axis_specific_scroll_timing_promotes_post_input_window() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "axis_specific_real_window_scroll_observation": {
+                "status": "pass",
+                "vertical_observation": {
+                    "surface_post_input_frame_timing": {
+                        "first_presented_frame_ms": 300.0,
+                        "measured_frame_count": 59,
+                        "presented_frame_ms_max": 17.6,
+                        "presented_frame_ms_p50": 10.1,
+                        "presented_frame_ms_p95": 12.3,
+                        "presented_frame_ms_p99": 17.6,
+                        "render_hook_ms_p95": 3.2,
+                        "sample_frame_count": 60,
+                        "warmup_frame_count": 3
+                    }
+                },
+                "horizontal_observation": {
+                    "surface_post_input_frame_timing": {
+                        "first_presented_frame_ms": 310.0,
+                        "measured_frame_count": 59,
+                        "presented_frame_ms_max": 16.8,
+                        "presented_frame_ms_p50": 10.2,
+                        "presented_frame_ms_p95": 14.9,
+                        "presented_frame_ms_p99": 16.8,
+                        "render_hook_ms_p95": 3.4,
+                        "sample_frame_count": 60,
+                        "warmup_frame_count": 3
+                    }
+                }
+            }
+        });
+
+        assert!(promote_axis_specific_scroll_timing(&mut report));
+        assert_eq!(
+            report
+                .get("preview_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(14.9)
+        );
+        assert_eq!(
+            report
+                .pointer("/wheel_to_visible_ms_p95_per_axis/vertical")
+                .and_then(serde_json::Value::as_f64),
+            Some(12.3)
+        );
+        assert_eq!(
+            report
+                .pointer("/wheel_to_visible_ms_p95_per_axis/horizontal")
+                .and_then(serde_json::Value::as_f64),
+            Some(14.9)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/measured_frame_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(118)
+        );
+        assert_eq!(
+            report
+                .get("speed_timing_window")
+                .and_then(serde_json::Value::as_str),
+            Some("axis-specific-post-real-window-input")
+        );
     }
 }

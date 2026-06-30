@@ -1583,6 +1583,12 @@ pub struct NativeFrameTimingProof {
     pub sample_frame_count: u32,
     pub measured_frame_count: u32,
     pub first_presented_frame_ms: f64,
+    pub surface_acquire_ms_p50: f64,
+    pub surface_acquire_ms_p95: f64,
+    pub surface_acquire_ms_max: f64,
+    pub present_submit_ms_p50: f64,
+    pub present_submit_ms_p95: f64,
+    pub present_submit_ms_max: f64,
     pub presented_frame_ms_p50: f64,
     pub presented_frame_ms_p95: f64,
     pub presented_frame_ms_p99: f64,
@@ -2156,6 +2162,8 @@ async fn run_surface_probe_inner(
     let mut surface_acquire_ms = 0.0;
     let mut present_submit_ms = 0.0;
     let mut first_presented_frame_ms = 0.0;
+    let mut surface_acquire_samples = Vec::new();
+    let mut present_submit_samples = Vec::new();
     let mut presented_frame_samples = Vec::new();
     let mut render_hook_samples = Vec::new();
     let mut pending_readback = None;
@@ -2365,6 +2373,8 @@ async fn run_surface_probe_inner(
         let include_timing_sample =
             frame_index >= warmup_frame_count && !(readback_sample_frame && sample_frame_count > 1);
         if include_timing_sample {
+            surface_acquire_samples.push(current_surface_acquire_ms);
+            present_submit_samples.push(current_present_submit_ms);
             presented_frame_samples.push(current_surface_acquire_ms + current_present_submit_ms);
             if let Some(render_hook_ms) = render_hook_ms {
                 render_hook_samples.push(render_hook_ms);
@@ -2376,6 +2386,18 @@ async fn run_surface_probe_inner(
         sample_frame_count,
         measured_frame_count: presented_frame_samples.len() as u32,
         first_presented_frame_ms,
+        surface_acquire_ms_p50: percentile(&surface_acquire_samples, 0.50),
+        surface_acquire_ms_p95: percentile(&surface_acquire_samples, 0.95),
+        surface_acquire_ms_max: surface_acquire_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        present_submit_ms_p50: percentile(&present_submit_samples, 0.50),
+        present_submit_ms_p95: percentile(&present_submit_samples, 0.95),
+        present_submit_ms_max: present_submit_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
         presented_frame_ms_p50: percentile(&presented_frame_samples, 0.50),
         presented_frame_ms_p95: percentile(&presented_frame_samples, 0.95),
         presented_frame_ms_p99: percentile(&presented_frame_samples, 0.99),
@@ -2416,6 +2438,8 @@ async fn run_surface_probe_inner(
         let post_input_total_frame_count = post_input_warmup_frame_count
             .saturating_add(post_input_sample_count)
             .max(1);
+        let mut post_input_surface_acquire_samples = Vec::new();
+        let mut post_input_present_submit_samples = Vec::new();
         let mut post_input_presented_frame_samples = Vec::new();
         let mut post_input_render_hook_samples = Vec::new();
         let mut post_input_first_frame_ms = 0.0;
@@ -2580,6 +2604,8 @@ async fn run_surface_probe_inner(
             let include_timing_sample = frame_index >= post_input_warmup_frame_count
                 && !(readback_sample_frame && post_input_sample_count > 1);
             if include_timing_sample {
+                post_input_surface_acquire_samples.push(current_surface_acquire_ms);
+                post_input_present_submit_samples.push(current_present_submit_ms);
                 post_input_presented_frame_samples.push(frame_ms);
                 if let Some(render_hook_ms) = post_input_render_hook_ms {
                     post_input_render_hook_samples.push(render_hook_ms);
@@ -2591,6 +2617,18 @@ async fn run_surface_probe_inner(
             sample_frame_count: post_input_sample_count,
             measured_frame_count: post_input_presented_frame_samples.len() as u32,
             first_presented_frame_ms: post_input_first_frame_ms,
+            surface_acquire_ms_p50: percentile(&post_input_surface_acquire_samples, 0.50),
+            surface_acquire_ms_p95: percentile(&post_input_surface_acquire_samples, 0.95),
+            surface_acquire_ms_max: post_input_surface_acquire_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            present_submit_ms_p50: percentile(&post_input_present_submit_samples, 0.50),
+            present_submit_ms_p95: percentile(&post_input_present_submit_samples, 0.95),
+            present_submit_ms_max: post_input_present_submit_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
             presented_frame_ms_p50: percentile(&post_input_presented_frame_samples, 0.50),
             presented_frame_ms_p95: percentile(&post_input_presented_frame_samples, 0.95),
             presented_frame_ms_p99: percentile(&post_input_presented_frame_samples, 0.99),

@@ -4248,7 +4248,37 @@ fn external_render_proof_has_app_owned_readback(proof: Option<&serde_json::Value
         .pointer("/proof/artifact/artifact_sha256")
         .and_then(serde_json::Value::as_str)
         .is_some_and(is_sha256_hex_string);
-    app_owned_reused && artifact_hash
+    (app_owned_reused && artifact_hash)
+        || contains_visible_surface_wgpu_readback_proof(proof, false)
+}
+
+fn contains_visible_surface_wgpu_readback_proof(
+    value: &serde_json::Value,
+    ancestor_failed: bool,
+) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let current_failed = ancestor_failed
+                || object
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status != "pass");
+            let visible_surface_readback = object
+                .get("capture_method")
+                .and_then(serde_json::Value::as_str)
+                == Some("wgpu-visible-surface-copy-src-readback");
+            if !current_failed && visible_surface_readback {
+                return true;
+            }
+            object
+                .values()
+                .any(|child| contains_visible_surface_wgpu_readback_proof(child, current_failed))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|child| contains_visible_surface_wgpu_readback_proof(child, ancestor_failed)),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6097,6 +6127,44 @@ mod tests {
                 .pointer("/proof/artifact/frame_evidence_key")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn external_visible_readback_proof_replaces_duplicate_interactive_readback() {
+        let proof = serde_json::json!({
+            "status": "pass",
+            "renderer": "boon_native_gpu",
+            "proof": {
+                "status": "pass",
+                "capture_method": "wgpu-visible-surface-copy-src-readback",
+                "replacement_proof": "render-loop visible surface readback artifact"
+            }
+        });
+
+        assert!(external_render_proof_replaces_interactive_readback(Some(
+            &proof
+        )));
+
+        let failing_proof = serde_json::json!({
+            "status": "fail",
+            "proof": {
+                "status": "fail",
+                "capture_method": "wgpu-visible-surface-copy-src-readback"
+            }
+        });
+        assert!(!external_render_proof_replaces_interactive_readback(Some(
+            &failing_proof
+        )));
+
+        let desktop_capture = serde_json::json!({
+            "status": "pass",
+            "proof": {
+                "capture_method": "desktop-screenshot"
+            }
+        });
+        assert!(!external_render_proof_replaces_interactive_readback(Some(
+            &desktop_capture
+        )));
     }
 
     #[test]

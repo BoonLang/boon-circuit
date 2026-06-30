@@ -3213,6 +3213,39 @@ async fn run_surface_probe_inner(
             last_wake_generation = completed_generation;
             continue;
         }
+        if should_defer_render_for_interactive_readback(
+            options.readback_artifact_dir.is_some(),
+            interactive_readback_job.is_some(),
+            input.real_os_events_observed,
+            render_loop_state.current_scheduler_reason,
+        ) {
+            let bookkeeping_elapsed = bookkeeping_started.elapsed();
+            render_loop_state.note_idle_poll_substeps(
+                size_scale_elapsed,
+                input_sample_elapsed,
+                accessibility_elapsed,
+                hook_elapsed,
+                bookkeeping_elapsed,
+            );
+            render_loop_state.note_idle_poll();
+            let wait_started = Instant::now();
+            let completed_generation =
+                wake_handle.wait_for_wake_after(last_wake_generation, PASSIVE_INPUT_POLL_INTERVAL);
+            render_loop_state.note_idle_wait(
+                PASSIVE_INPUT_POLL_INTERVAL,
+                wait_started.elapsed(),
+                last_wake_generation,
+                completed_generation,
+            );
+            if completed_generation != last_wake_generation {
+                render_loop_state.note_external_wake_observed(
+                    completed_generation,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            last_wake_generation = completed_generation;
+            continue;
+        }
         if hooks.as_ref().is_none_or(|hooks| hooks.poll.is_none()) {
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         }
@@ -3822,6 +3855,31 @@ async fn run_surface_probe_inner(
             std::thread::sleep(Duration::from_millis(16));
         }
     }
+    if let Some(result) = finish_interactive_readback_job_before_report(
+        &mut interactive_readback_job,
+        VISIBLE_SURFACE_READBACK_TIMEOUT,
+    ) {
+        match result {
+            Ok(result) => {
+                last_interactive_readback_finish_ms = Some(result.finish_ms);
+                last_interactive_readback_completed_elapsed_ms = Some(result.completed_elapsed_ms);
+                last_interactive_readback_artifact = Some(result.artifact);
+                last_interactive_surface_readback_pending = false;
+                last_interactive_readback_error = None;
+            }
+            Err(error) => {
+                last_interactive_readback_finish_ms = None;
+                last_interactive_readback_completed_elapsed_ms =
+                    Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+                last_interactive_surface_readback_pending = false;
+                last_interactive_readback_error = Some(error);
+                render_loop_state.telemetry_drop_count =
+                    render_loop_state.telemetry_drop_count.saturating_add(1);
+                render_loop_state.last_missed_frame_cause =
+                    Some("interactive_readback_error".to_owned());
+            }
+        }
+    }
     let final_report_writer_stats = async_render_loop_report_writer.map(|writer| {
         let mut stats = writer.shutdown();
         if stats.last_enqueue_ms.is_none() {
@@ -4295,7 +4353,7 @@ fn interactive_surface_readback_decision(
     external_proof_replaces_readback: bool,
     readback_job_in_flight: bool,
 ) -> InteractiveSurfaceReadbackDecision {
-    if role != NativeWindowRole::Preview || !readback_enabled {
+    if !matches!(role, NativeWindowRole::Preview | NativeWindowRole::Dev) || !readback_enabled {
         return InteractiveSurfaceReadbackDecision::Off;
     }
     if external_proof_replaces_readback {
@@ -4305,6 +4363,18 @@ fn interactive_surface_readback_decision(
         return InteractiveSurfaceReadbackDecision::SkipBackpressure;
     }
     InteractiveSurfaceReadbackDecision::Queue
+}
+
+fn should_defer_render_for_interactive_readback(
+    readback_enabled: bool,
+    readback_job_in_flight: bool,
+    real_os_input_observed: bool,
+    scheduler_reason: Option<NativeSchedulerReason>,
+) -> bool {
+    readback_enabled
+        && readback_job_in_flight
+        && !real_os_input_observed
+        && scheduler_reason != Some(NativeSchedulerReason::HostInput)
 }
 
 fn should_use_offscreen_copy_to_present(
@@ -5295,6 +5365,23 @@ fn poll_interactive_readback_job(
     }
 }
 
+fn finish_interactive_readback_job_before_report(
+    job: &mut Option<AsyncInteractiveReadbackJob>,
+    timeout: Duration,
+) -> Option<Result<AsyncInteractiveReadbackResult, String>> {
+    let pending = job.take()?;
+    match pending.receiver.recv_timeout(timeout) {
+        Ok(result) => Some(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            *job = Some(pending);
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Some(Err("interactive readback worker disconnected".to_owned()))
+        }
+    }
+}
+
 fn visible_readback_failure_message(
     phase: &str,
     pending: &PendingSurfaceReadback,
@@ -6183,12 +6270,120 @@ mod tests {
         );
         assert_eq!(
             interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, false),
-            InteractiveSurfaceReadbackDecision::Off
+            InteractiveSurfaceReadbackDecision::Queue
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true),
+            InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
         assert_eq!(
             interactive_surface_readback_decision(NativeWindowRole::Preview, false, false, false),
             InteractiveSurfaceReadbackDecision::Off
         );
+    }
+
+    #[test]
+    fn final_report_drain_completes_pending_interactive_readback() {
+        let frame_evidence_key = FrameEvidenceKey {
+            frame_seq: 42,
+            content_revision: 7,
+            layout_revision: 5,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("surface-test".to_owned()),
+            surface_epoch: 1,
+            input_event_seq: Some(3),
+            present_id: 42,
+            proof_request_id: None,
+        };
+        let artifact = AppWindowReadbackArtifact {
+            path: "target/artifacts/native-gpu/frames/test.png".to_owned(),
+            sha256: "0".repeat(64),
+            width: 4,
+            height: 4,
+            presented_revision: Some(7),
+            content_revision: Some(7),
+            rendered_frame_count: Some(42),
+            frame_evidence_key: Some(frame_evidence_key.clone()),
+            capture_method: "wgpu-visible-surface-copy-src-readback".to_owned(),
+            texture_format: "Bgra8UnormSrgb".to_owned(),
+            nonblank_samples: 16,
+            unique_rgba_values: 2,
+            readback_deadline_ms: 5_000,
+            readback_poll_status: "completed_before_deadline".to_owned(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(AsyncInteractiveReadbackResult {
+                artifact,
+                finish_ms: 1.0,
+                completed_elapsed_ms: 2.0,
+            }))
+            .unwrap();
+        let mut job = Some(AsyncInteractiveReadbackJob { receiver });
+
+        let result =
+            finish_interactive_readback_job_before_report(&mut job, Duration::from_millis(1))
+                .expect("pending readback should complete before final report")
+                .expect("readback result should be ok");
+
+        assert!(job.is_none());
+        assert_eq!(
+            result.artifact.frame_evidence_key.as_ref(),
+            Some(&frame_evidence_key)
+        );
+        assert_eq!(result.completed_elapsed_ms, 2.0);
+    }
+
+    #[test]
+    fn final_report_drain_preserves_pending_interactive_readback_on_timeout() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut job = Some(AsyncInteractiveReadbackJob { receiver });
+
+        let result =
+            finish_interactive_readback_job_before_report(&mut job, Duration::from_millis(0));
+
+        assert!(result.is_none());
+        assert!(job.is_some());
+    }
+
+    #[test]
+    fn verifier_readback_backpressure_defers_non_input_frames_only() {
+        assert!(should_defer_render_for_interactive_readback(
+            true,
+            true,
+            false,
+            Some(NativeSchedulerReason::Timer)
+        ));
+        assert!(should_defer_render_for_interactive_readback(
+            true,
+            true,
+            false,
+            Some(NativeSchedulerReason::RequestedAnimation)
+        ));
+        assert!(!should_defer_render_for_interactive_readback(
+            true,
+            true,
+            true,
+            Some(NativeSchedulerReason::HostInput)
+        ));
+        assert!(!should_defer_render_for_interactive_readback(
+            true,
+            true,
+            false,
+            Some(NativeSchedulerReason::HostInput)
+        ));
+        assert!(!should_defer_render_for_interactive_readback(
+            false,
+            true,
+            false,
+            Some(NativeSchedulerReason::Timer)
+        ));
+        assert!(!should_defer_render_for_interactive_readback(
+            true,
+            false,
+            false,
+            Some(NativeSchedulerReason::Timer)
+        ));
     }
 
     #[test]

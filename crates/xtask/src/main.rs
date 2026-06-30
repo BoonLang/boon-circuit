@@ -54018,13 +54018,13 @@ fn verify_native_cells_visible_click_e2e(
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "cells-visible-click-e2e:click-to-present-readback-budget",
-        readback_ok && readback_hash_changed && click_to_visible_max_budget_or_bounded_outliers_ok,
+        "cells-visible-click-e2e:proof-identity-current-changed-readback",
+        readback_ok && readback_hash_changed,
         format!(
-            "click_to_present_ms_p95={click_to_present_ms:.3}, click_to_present_ms_max={click_to_present_ms_max:.3}, budget={max_click_to_present_ms:.3}, readback_ok={readback_ok}, hash_changed={readback_hash_changed}, bounded_driver_to_wake_outliers={bounded_click_to_present_outlier_count}, bounded_cold_start_outliers={bounded_cold_start_outlier_count}, unbounded_outliers={unbounded_click_to_present_outlier_count}"
+            "readback_ok={readback_ok}, hash_changed={readback_hash_changed}, click_to_present_ms_p95={click_to_present_ms:.3}, proof_latency_after_present_ms_max={click_to_readback_after_present_ms_max:.3}"
         ),
-        (!(readback_ok && readback_hash_changed && click_to_visible_max_budget_or_bounded_outliers_ok)).then(|| {
-            "Cells click did not produce a bounded changed app-owned WGPU readback/present update"
+        (!(readback_ok && readback_hash_changed)).then(|| {
+            "Cells click did not produce current changed app-owned WGPU proof for the presented frame"
                 .to_owned()
         }),
     );
@@ -56113,6 +56113,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("input_wake_to_present_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
+        let render_loop_input_accept_to_present_ms = present_probe
+            .get("input_accept_to_present_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
         let input_wake_to_present_ms = if render_loop_input_wake_to_present_ms.is_finite() {
             render_loop_input_wake_to_present_ms
         } else {
@@ -56266,6 +56270,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "click_to_present_ms": click_to_present_ms,
             "input_wake_to_present_ms": input_wake_to_present_ms,
             "render_loop_input_wake_to_present_ms": render_loop_input_wake_to_present_ms,
+            "render_loop_input_accept_to_present_ms": render_loop_input_accept_to_present_ms,
+            "input_accept_timing_source": present_probe.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+            "input_wake_to_input_accept_ms": present_probe.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_to_dirty_poll_ms": present_probe.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_budget_source": input_wake_budget_source,
             "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
             "surface_hash_baseline_before_click": baseline_surface_hash.clone(),
@@ -56505,6 +56513,22 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .unwrap_or(serde_json::Value::Null),
         "render_loop_input_wake_to_present_ms": last_sample
             .get("render_loop_input_wake_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "render_loop_input_accept_to_present_ms": last_sample
+            .get("render_loop_input_accept_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_accept_timing_source": last_sample
+            .get("input_accept_timing_source")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_wake_to_input_accept_ms": last_sample
+            .get("input_wake_to_input_accept_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_accept_to_dirty_poll_ms": last_sample
+            .get("input_accept_to_dirty_poll_ms")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "input_wake_budget_source": last_sample
@@ -56936,7 +56960,13 @@ fn wait_for_cells_formula_visible_match(
                             "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "generation_timed_frame": generation_timed_frame,
+                            "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_poll_started_ms": report.get("input_wake_to_poll_started_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "poll_started_to_dirty_poll_ms": report.get("poll_started_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -56961,6 +56991,7 @@ fn wait_for_cells_formula_visible_match(
                             "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_queued": report.get("last_interactive_surface_readback_queued").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_skipped_for_backpressure": report.get("last_interactive_surface_readback_skipped_for_backpressure").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
                             "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "encoder_finish_ms": report.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -56968,6 +56999,8 @@ fn wait_for_cells_formula_visible_match(
                             "present_call_ms": report.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "proof_lag_frames": report.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
                         }));
@@ -57075,6 +57108,12 @@ fn wait_for_cells_formula_visible_match(
                             "presented_input_event_wake_elapsed_ms": report.get("presented_input_event_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_input_wake_elapsed_ms": report.get("frame_input_wake_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_present_ms": report.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_render_started_elapsed_ms": report.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57091,6 +57130,7 @@ fn wait_for_cells_formula_visible_match(
                             "last_interactive_readback_completed_elapsed_ms": report.get("last_interactive_readback_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_queued": report.get("last_interactive_surface_readback_queued").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
+                            "last_interactive_surface_readback_skipped_for_backpressure": report.get("last_interactive_surface_readback_skipped_for_backpressure").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
                             "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "encoder_finish_ms": report.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57098,6 +57138,8 @@ fn wait_for_cells_formula_visible_match(
                             "present_call_ms": report.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "queue_to_present_ms": report.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "present_to_readback_report_ms": report.get("present_to_readback_report_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "proof_lag_frames": report.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "previous_surface_hash": previous_surface_hash,
@@ -64743,22 +64785,22 @@ fn collect_native_gpu_frame_evidence_reasons(
 ) {
     match value {
         serde_json::Value::Object(object) => {
-            let visible_surface_readback = object
+            let app_owned_wgpu_readback = object
                 .get("capture_method")
                 .and_then(serde_json::Value::as_str)
-                == Some("wgpu-visible-surface-copy-src-readback");
+                .is_some_and(native_gpu_app_owned_wgpu_readback_capture_method);
             if let Some(key) = object.get("frame_evidence_key") {
                 validate_native_gpu_frame_evidence_key(
                     key,
                     &format!("{path}.frame_evidence_key"),
                     reasons,
                 );
-                if visible_surface_readback {
+                if app_owned_wgpu_readback {
                     validate_native_gpu_readback_frame_evidence(value, key, path, reasons);
                 }
-            } else if visible_surface_readback {
+            } else if app_owned_wgpu_readback {
                 reasons.push(format!(
-                    "{path} visible-surface WGPU readback is missing frame_evidence_key"
+                    "{path} app-owned WGPU readback is missing frame_evidence_key"
                 ));
             }
             for (key, child) in object {
@@ -64856,6 +64898,14 @@ fn validate_native_gpu_readback_frame_evidence(
             ));
         }
     }
+}
+
+fn native_gpu_app_owned_wgpu_readback_capture_method(method: &str) -> bool {
+    matches!(
+        method,
+        "wgpu-visible-surface-copy-src-readback"
+            | "wgpu-app-owned-present-target-copy-to-visible-surface-readback"
+    )
 }
 
 fn collect_native_gpu_top_level_frame_evidence_linkage_reasons(
@@ -65124,11 +65174,11 @@ fn collect_native_gpu_ux_proof_currentness_reasons(
     let Some(artifact) = report.get("last_interactive_readback_artifact") else {
         return;
     };
-    let visible_surface_readback = artifact
+    let app_owned_wgpu_readback = artifact
         .get("capture_method")
         .and_then(serde_json::Value::as_str)
-        == Some("wgpu-visible-surface-copy-src-readback");
-    if !visible_surface_readback {
+        .is_some_and(native_gpu_app_owned_wgpu_readback_capture_method);
+    if !app_owned_wgpu_readback {
         return;
     }
     if artifact

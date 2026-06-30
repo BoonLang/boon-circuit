@@ -26363,9 +26363,11 @@ fn collect_native_ux_proof_currentness_reasons(report: &JsonValue, reasons: &mut
     let Some(artifact) = report.get("last_interactive_readback_artifact") else {
         return;
     };
-    let visible_surface_readback = artifact.get("capture_method").and_then(JsonValue::as_str)
-        == Some("wgpu-visible-surface-copy-src-readback");
-    if !visible_surface_readback {
+    let app_owned_wgpu_readback = artifact
+        .get("capture_method")
+        .and_then(JsonValue::as_str)
+        .is_some_and(native_app_owned_wgpu_readback_capture_method);
+    if !app_owned_wgpu_readback {
         return;
     }
     if artifact
@@ -26607,20 +26609,22 @@ fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut
 fn collect_native_frame_evidence_reasons(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
     match value {
         JsonValue::Object(object) => {
-            let visible_surface_readback = object.get("capture_method").and_then(JsonValue::as_str)
-                == Some("wgpu-visible-surface-copy-src-readback");
+            let app_owned_wgpu_readback = object
+                .get("capture_method")
+                .and_then(JsonValue::as_str)
+                .is_some_and(native_app_owned_wgpu_readback_capture_method);
             if let Some(key) = object.get("frame_evidence_key") {
                 validate_native_frame_evidence_key(
                     key,
                     &format!("{path}.frame_evidence_key"),
                     reasons,
                 );
-                if visible_surface_readback {
+                if app_owned_wgpu_readback {
                     validate_native_readback_frame_evidence(value, key, path, reasons);
                 }
-            } else if visible_surface_readback {
+            } else if app_owned_wgpu_readback {
                 reasons.push(format!(
-                    "{path} visible-surface WGPU readback is missing frame_evidence_key"
+                    "{path} app-owned WGPU readback is missing frame_evidence_key"
                 ));
             }
             for (key, child) in object {
@@ -26707,6 +26711,14 @@ fn validate_native_readback_frame_evidence(
             ));
         }
     }
+}
+
+fn native_app_owned_wgpu_readback_capture_method(method: &str) -> bool {
+    matches!(
+        method,
+        "wgpu-visible-surface-copy-src-readback"
+            | "wgpu-app-owned-present-target-copy-to-visible-surface-readback"
+    )
 }
 
 fn collect_native_top_level_frame_evidence_linkage_reasons(
@@ -31521,6 +31533,21 @@ mod tests {
             .unwrap()
             .remove("frame_evidence_key");
         assert!(!schema_accepts(report, "native-frame-evidence-missing-key"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_app_owned_present_target_proof_without_frame_evidence() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["last_interactive_readback_artifact"]["capture_method"] =
+            json!("wgpu-app-owned-present-target-copy-to-visible-surface-readback");
+        report["last_interactive_readback_artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frame_evidence_key");
+        assert!(!schema_accepts(
+            report,
+            "native-app-owned-target-frame-evidence-missing-key"
+        ));
     }
 
     #[test]

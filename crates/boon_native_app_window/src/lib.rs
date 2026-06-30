@@ -1769,6 +1769,7 @@ struct PendingSurfaceReadback {
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
     format: wgpu::TextureFormat,
+    capture_method: &'static str,
 }
 
 struct AsyncInteractiveReadbackResult {
@@ -3211,10 +3212,12 @@ async fn run_surface_probe_inner(
         let mut rendered_content_revision = rendered_revision;
         let mut rendered_layout_revision = rendered_revision;
         let mut rendered_render_scene_revision = rendered_revision;
+        let readback_enabled = options.readback_artifact_dir.is_some();
         let use_offscreen_copy_to_present = should_use_offscreen_copy_to_present(
             hooks.is_some(),
             surface_copy_to_present_supported,
             std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some(),
+            readback_enabled,
         );
         let render_target_kind = if use_offscreen_copy_to_present {
             "app-owned-offscreen-copy-to-present"
@@ -3222,6 +3225,7 @@ async fn run_surface_probe_inner(
             "visible-surface-direct"
         };
         render_loop_state.note_render_target_kind(render_target_kind);
+        let mut deferred_app_owned_readback_texture: Option<wgpu::Texture> = None;
 
         let frame = if use_offscreen_copy_to_present {
             let offscreen_texture = cached_offscreen_present_target(
@@ -3231,6 +3235,7 @@ async fn run_surface_probe_inner(
                 height,
                 config.format,
             );
+            deferred_app_owned_readback_texture = Some(offscreen_texture.clone());
             let offscreen_view =
                 offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
             if let Some(hooks) = hooks.as_mut() {
@@ -3492,7 +3497,7 @@ async fn run_surface_probe_inner(
         let readback_job_in_flight = interactive_readback_job.is_some();
         let interactive_readback_decision = interactive_surface_readback_decision(
             options.role,
-            options.readback_artifact_dir.is_some(),
+            readback_enabled,
             skip_interactive_surface_readback,
             readback_job_in_flight,
         );
@@ -3502,8 +3507,10 @@ async fn run_surface_probe_inner(
             render_loop_state.last_missed_frame_cause =
                 Some("interactive_readback_backpressure".to_owned());
         }
+        let interactive_readback_requested =
+            interactive_readback_decision == InteractiveSurfaceReadbackDecision::Queue;
         let interactive_readback =
-            if interactive_readback_decision == InteractiveSurfaceReadbackDecision::Queue {
+            if interactive_readback_requested && !use_offscreen_copy_to_present {
                 let artifact_dir = options
                     .readback_artifact_dir
                     .as_deref()
@@ -3546,7 +3553,7 @@ async fn run_surface_probe_inner(
                 consecutive_unsampled_input_resamples = 0;
             }
         }
-        last_interactive_surface_readback_queued = interactive_readback.is_some();
+        last_interactive_surface_readback_queued = interactive_readback_requested;
         last_interactive_surface_readback_skipped_for_external_proof =
             interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipExternalProof;
         last_interactive_surface_readback_skipped_for_backpressure =
@@ -3579,7 +3586,7 @@ async fn run_surface_probe_inner(
             hold_started.elapsed().as_secs_f64() * 1000.0,
         );
         let post_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
-        let skip_interactive_surface_readback_for_stale_input = interactive_readback.is_some()
+        let skip_interactive_surface_readback_for_stale_input = interactive_readback_requested
             && post_present_input_event_wake_count > sampled_input_event_wake_count;
         if skip_interactive_surface_readback_for_stale_input {
             render_loop_state.note_input_post_present_stale_readback_skip(
@@ -3591,7 +3598,7 @@ async fn run_surface_probe_inner(
         }
         last_interactive_surface_readback_skipped_for_stale_input =
             skip_interactive_surface_readback_for_stale_input;
-        last_interactive_surface_readback_pending = (interactive_readback.is_some()
+        last_interactive_surface_readback_pending = (interactive_readback_requested
             && !skip_interactive_surface_readback_for_stale_input)
             || (last_interactive_surface_readback_skipped_for_backpressure
                 && interactive_readback_job.is_some());
@@ -3604,8 +3611,43 @@ async fn run_surface_probe_inner(
             None,
         );
         last_frame_evidence_key = Some(current_frame_evidence_key.clone());
+        let deferred_interactive_readback = if !skip_interactive_surface_readback_for_stale_input
+            && interactive_readback_requested
+            && use_offscreen_copy_to_present
+        {
+            let artifact_dir = options
+                .readback_artifact_dir
+                .as_deref()
+                .expect("queue readback decision requires artifact dir");
+            let Some(readback_texture) = deferred_app_owned_readback_texture.as_ref() else {
+                return Err(NativeWindowError::Failed(
+                    "offscreen readback requested without an app-owned present target".to_owned(),
+                ));
+            };
+            let mut proof_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("boon-native-app-window-post-present-proof-encoder"),
+                });
+            let pending = queue_app_owned_present_target_readback(
+                &device,
+                &mut proof_encoder,
+                readback_texture,
+                options.role,
+                width,
+                height,
+                config.format,
+                &options.title,
+                surface_id.clone(),
+                surface_lifecycle.epoch(),
+            )?;
+            queue.submit(Some(proof_encoder.finish()));
+            Some((artifact_dir.to_owned(), pending))
+        } else {
+            None
+        };
         if !skip_interactive_surface_readback_for_stale_input
-            && let Some((artifact_dir, pending)) = interactive_readback
+            && let Some((artifact_dir, pending)) =
+                interactive_readback.or(deferred_interactive_readback)
         {
             if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
                 match result {
@@ -3822,7 +3864,7 @@ async fn run_surface_probe_inner(
     Ok(())
 }
 
-fn queue_visible_surface_readback(
+fn queue_texture_readback(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
@@ -3833,6 +3875,7 @@ fn queue_visible_surface_readback(
     title: &str,
     surface_id: SurfaceId,
     surface_epoch: u64,
+    capture_method: &'static str,
 ) -> Result<PendingSurfaceReadback, NativeWindowError> {
     let width = width.clamp(1, 1920);
     let height = height.clamp(1, 1080);
@@ -3877,7 +3920,62 @@ fn queue_visible_surface_readback(
         unpadded_bytes_per_row,
         padded_bytes_per_row,
         format,
+        capture_method,
     })
+}
+
+fn queue_visible_surface_readback(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    role: NativeWindowRole,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    title: &str,
+    surface_id: SurfaceId,
+    surface_epoch: u64,
+) -> Result<PendingSurfaceReadback, NativeWindowError> {
+    queue_texture_readback(
+        device,
+        encoder,
+        texture,
+        role,
+        width,
+        height,
+        format,
+        title,
+        surface_id,
+        surface_epoch,
+        "wgpu-visible-surface-copy-src-readback",
+    )
+}
+
+fn queue_app_owned_present_target_readback(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    role: NativeWindowRole,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    title: &str,
+    surface_id: SurfaceId,
+    surface_epoch: u64,
+) -> Result<PendingSurfaceReadback, NativeWindowError> {
+    queue_texture_readback(
+        device,
+        encoder,
+        texture,
+        role,
+        width,
+        height,
+        format,
+        title,
+        surface_id,
+        surface_epoch,
+        "wgpu-app-owned-present-target-copy-to-visible-surface-readback",
+    )
 }
 
 fn acquire_surface_texture_for_present(
@@ -4140,8 +4238,11 @@ fn should_use_offscreen_copy_to_present(
     hooks_present: bool,
     surface_copy_to_present_supported: bool,
     explicit_offscreen_copy_requested: bool,
+    readback_enabled: bool,
 ) -> bool {
-    hooks_present && surface_copy_to_present_supported && explicit_offscreen_copy_requested
+    hooks_present
+        && surface_copy_to_present_supported
+        && (explicit_offscreen_copy_requested || readback_enabled)
 }
 
 fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
@@ -4784,7 +4885,7 @@ fn finish_visible_surface_readback(
         content_revision: None,
         rendered_frame_count: None,
         frame_evidence_key: None,
-        capture_method: "wgpu-visible-surface-copy-src-readback".to_owned(),
+        capture_method: pending.capture_method.to_owned(),
         texture_format: format!("{:?}", pending.format),
         nonblank_samples,
         unique_rgba_values,
@@ -5590,12 +5691,21 @@ mod tests {
     #[test]
     fn offscreen_copy_to_present_is_explicit_diagnostic_path() {
         assert!(
-            !should_use_offscreen_copy_to_present(true, true, false),
-            "normal demand-driven preview frames should render directly to the visible surface"
+            !should_use_offscreen_copy_to_present(true, true, false, false),
+            "normal demand-driven preview frames without proof readback should render directly to the visible surface"
         );
-        assert!(!should_use_offscreen_copy_to_present(false, true, true));
-        assert!(!should_use_offscreen_copy_to_present(true, false, true));
-        assert!(should_use_offscreen_copy_to_present(true, true, true));
+        assert!(!should_use_offscreen_copy_to_present(
+            false, true, true, false
+        ));
+        assert!(!should_use_offscreen_copy_to_present(
+            true, false, true, false
+        ));
+        assert!(should_use_offscreen_copy_to_present(
+            true, true, true, false
+        ));
+        assert!(should_use_offscreen_copy_to_present(
+            true, true, false, true
+        ));
     }
 
     #[test]

@@ -1518,6 +1518,8 @@ pub struct AppWindowSurfaceProof {
     pub window_id: WindowId,
     pub surface_id: SurfaceId,
     pub surface_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_evidence_key: Option<FrameEvidenceKey>,
     pub wgpu_strategy: String,
     pub wgpu_surface_strategy: String,
     pub adapter_name: String,
@@ -2611,6 +2613,23 @@ async fn run_surface_probe_inner(
         }
     }
 
+    let proof_frame_evidence_key = (render_loop_state.rendered_frame_count > 0).then(|| {
+        frame_evidence_key_for_presented_frame(
+            &render_loop_state,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            (render_loop_state.last_accepted_host_input_event_wake_count > 0)
+                .then_some(render_loop_state.last_accepted_host_input_event_wake_count),
+            None,
+        )
+    });
+    if let Some(artifact) = readback_artifact.as_mut() {
+        artifact.presented_revision = Some(render_loop_state.presented_revision);
+        artifact.content_revision = Some(render_loop_state.last_render_content_revision);
+        artifact.rendered_frame_count = Some(render_loop_state.rendered_frame_count);
+        artifact.frame_evidence_key = proof_frame_evidence_key.clone();
+    }
+
     let mut observed_input_adapter = input_adapter.clone();
     let proof = AppWindowSurfaceProof {
         role: options.role.as_str().to_owned(),
@@ -2624,6 +2643,7 @@ async fn run_surface_probe_inner(
         window_id: window_id.clone(),
         surface_id: surface_id.clone(),
         surface_epoch: surface_lifecycle.epoch(),
+        frame_evidence_key: proof_frame_evidence_key,
         wgpu_strategy: format!("{:?}", app_window::WGPU_STRATEGY),
         wgpu_surface_strategy: format!("{:?}", app_window::WGPU_SURFACE_STRATEGY),
         adapter_name: adapter_info.name,

@@ -6964,6 +6964,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 &connect,
                                 ipc_stress_messages,
                                 ipc_queue_capacity,
+                                selected_example_id.as_deref(),
                                 replace_code_file.as_deref(),
                                 replace_code_expected_hash.as_deref(),
                                 skip_operator_host_input_probe,
@@ -59566,6 +59567,7 @@ fn run_dev_ipc_probe(
     connect: &str,
     message_count: u64,
     queue_capacity: u64,
+    selected_example_id: Option<&str>,
     replace_code_file: Option<&Path>,
     replace_code_expected_hash: Option<&str>,
     skip_operator_host_input_probe: bool,
@@ -59576,25 +59578,56 @@ fn run_dev_ipc_probe(
     let start = Instant::now();
     let replace_code_response = if let Some(path) = replace_code_file {
         let code = boon_runtime::source_text_for_path(path)?;
-        let expected_hash = replace_code_expected_hash
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| boon_runtime::sha256_bytes(code.as_bytes()));
-        let response = send_preview_ipc_request_with_timeouts(
-            connect,
-            json!({
-                "kind": "replace-code",
-                "code": code,
-                "expected_hash": expected_hash,
-                "source_path": path.display().to_string(),
-                "dev_pid": std::process::id()
-            }),
-            Duration::from_secs(5),
-            request_timeout,
-            Duration::from_secs(10),
-        )
-        .map_err(|error| -> Box<dyn std::error::Error> {
-            format!("replace-code request failed: {error}").into()
-        })?;
+        let code_hash = boon_runtime::sha256_bytes(code.as_bytes());
+        let expected_hash = replace_code_expected_hash.unwrap_or(code_hash.as_str());
+        if code_hash != expected_hash {
+            return Err(format!(
+                "replace-code hash mismatch before preview request: expected {expected_hash}, actual {code_hash}"
+            )
+            .into());
+        }
+        let response = if let Some(payload) =
+            source_project_payload_for_manifest_replace_probe(path, &code, selected_example_id)?
+        {
+            send_preview_source_project_ipc_request_with_json_fallback(
+                connect,
+                "replace-source",
+                &payload,
+                request_timeout,
+            )
+            .map(|mut response| {
+                response["replace_source_protocol"] = json!(true);
+                response["source_path"] = json!(payload.entrypoint_unit.clone());
+                response["active_file"] = json!(payload.active_file());
+                response["source_hash"] = json!(payload.project_hash.clone());
+                response["source_hash_kind"] = json!("source-project-payload");
+                response["source_unit_count"] = json!(payload.units.len());
+                response["runtime_source_unit_count"] = json!(payload.runtime_units().len());
+                response["multi_unit_execution_mode"] = json!("manifest-source-project");
+                response["preview_receives_example_name"] = json!(false);
+                response
+            })
+            .map_err(|error| -> Box<dyn std::error::Error> {
+                format!("replace-source project request failed: {error}").into()
+            })?
+        } else {
+            send_preview_ipc_request_with_timeouts(
+                connect,
+                json!({
+                    "kind": "replace-code",
+                    "code": code,
+                    "expected_hash": expected_hash,
+                    "source_path": path.display().to_string(),
+                    "dev_pid": std::process::id()
+                }),
+                Duration::from_secs(5),
+                request_timeout,
+                Duration::from_secs(10),
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> {
+                format!("replace-code request failed: {error}").into()
+            })?
+        };
         Some(response)
     } else {
         None
@@ -60485,6 +60518,78 @@ fn send_preview_ipc_request(
     )
 }
 
+fn source_project_payload_for_manifest_replace_probe(
+    path: &Path,
+    code: &str,
+    selected_example_id: Option<&str>,
+) -> Result<Option<SourceProjectPayload>, Box<dyn std::error::Error>> {
+    let catalog = ExampleCatalog::load();
+    let entry_id = selected_example_id
+        .and_then(|id| {
+            catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.id.clone())
+        })
+        .or_else(|| {
+            catalog
+                .entries
+                .iter()
+                .find(|entry| paths_match_for_preview_units(Path::new(&entry.source), path))
+                .map(|entry| entry.id.clone())
+        });
+    let Some(entry_id) = entry_id else {
+        return Ok(None);
+    };
+    let source_path_label = path.display().to_string();
+    let workspace = ExampleWorkspace::new(&catalog, &source_path_label, code, Some(&entry_id));
+    let project_units = workspace.selected_project_payload_units(&catalog)?;
+    let source_identity = opaque_source_identity(&workspace.entry_file, code, 0);
+    Ok(Some(SourceProjectPayload::from_project_units(
+        0,
+        0,
+        &source_identity,
+        &workspace.entry_file,
+        &workspace.current_file,
+        project_units,
+    )?))
+}
+
+fn send_preview_source_project_ipc_request_with_json_fallback(
+    connect: &str,
+    kind: &str,
+    payload: &SourceProjectPayload,
+    request_timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ack = send_preview_source_project_ipc_request_with_timeouts(
+        connect,
+        kind,
+        payload,
+        Duration::from_secs(5),
+        request_timeout,
+        Duration::from_secs(10),
+    )?;
+    if !source_project_binary_ack_needs_json_fallback(&ack) {
+        return Ok(ack);
+    }
+    let mut fallback_ack = send_preview_ipc_request_with_timeouts(
+        connect,
+        json!({
+            "kind": kind,
+            "payload": payload,
+            "dev_pid": std::process::id()
+        }),
+        Duration::from_secs(5),
+        request_timeout,
+        Duration::from_secs(10),
+    )?;
+    fallback_ack["source_project_ipc_binary_fallback"] = json!(true);
+    fallback_ack["source_project_ipc_binary_fallback_reason"] =
+        json!("preview did not understand source_project_frame");
+    Ok(fallback_ack)
+}
+
 fn send_preview_source_project_ipc_request(
     connect: &str,
     kind: &str,
@@ -61049,19 +61154,22 @@ fn wait_for_report_or_child_exit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if path.exists() {
-            if boon_runtime::verify_report_schema(path).is_ok() {
-                return Ok(());
-            }
-            if let Ok(report) = read_json(path)
-                && report.get("report_version").is_some()
-                && report.get("status").and_then(serde_json::Value::as_str) == Some("fail")
-                && report.get("blockers").is_some()
-            {
-                return Ok(());
-            }
+        if role_report_ready(path) {
+            return Ok(());
         }
         if let Some(status) = child.try_wait()? {
+            let grace = if status.success() {
+                Duration::from_millis(750)
+            } else {
+                Duration::from_millis(150)
+            };
+            let grace_start = Instant::now();
+            while grace_start.elapsed() < grace {
+                if role_report_ready(path) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             return Err(format!(
                 "{role} role exited before writing report `{}`: {status}",
                 path.display()
@@ -61071,6 +61179,23 @@ fn wait_for_report_or_child_exit(
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!("timed out waiting for role report `{}`", path.display()).into())
+}
+
+fn role_report_ready(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if boon_runtime::verify_report_schema(path).is_ok() {
+        return true;
+    }
+    if let Ok(report) = read_json(path)
+        && report.get("report_version").is_some()
+        && report.get("status").and_then(serde_json::Value::as_str) == Some("fail")
+        && report.get("blockers").is_some()
+    {
+        return true;
+    }
+    false
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
@@ -75405,6 +75530,77 @@ label:
             "tab selection should be a UI-buffer swap, not a project parse/typecheck: {selected_file}"
         );
         assert_eq!(shell.workspace.current_file, formula_file);
+    }
+
+    #[test]
+    fn manifest_replace_probe_uses_source_project_payload() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = std::fs::read_to_string(&cells_path).unwrap();
+        let payload = source_project_payload_for_manifest_replace_probe(
+            &cells_path,
+            &cells_source,
+            Some("cells"),
+        )
+        .unwrap()
+        .expect("manifest-backed examples should build a source project payload");
+
+        assert!(paths_match_for_preview_units(
+            Path::new(&payload.entrypoint_unit),
+            &cells_path
+        ));
+        assert_eq!(payload.units.len(), 8);
+        assert_eq!(payload.runtime_units().len(), 8);
+        assert!(
+            payload
+                .units
+                .iter()
+                .any(|unit| unit.virtual_uri.ends_with("examples/cells/formula.bn"))
+        );
+        assert!(
+            payload
+                .units
+                .iter()
+                .any(|unit| unit.virtual_uri.ends_with("examples/cells/view.bn"))
+        );
+
+        let scratch_path = Path::new("target/artifacts/native-gpu/tests/scratch-buffer.bn");
+        let scratch_payload = source_project_payload_for_manifest_replace_probe(
+            scratch_path,
+            "document: Document/new(root: [])",
+            None,
+        )
+        .unwrap();
+        assert!(
+            scratch_payload.is_none(),
+            "non-manifest buffers should keep the legacy single-file fallback"
+        );
+    }
+
+    #[test]
+    fn report_wait_accepts_report_that_lands_after_clean_child_exit() {
+        let report_path = format!(
+            "target/artifacts/native-gpu/tests/late-role-report-{}.json",
+            std::process::id()
+        );
+        let path = repo_path(&report_path);
+        let _ = std::fs::remove_file(&path);
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let script = format!(
+            "(sleep 0.1; printf '%s' '{}' > '{}') & exit 0",
+            r#"{"status":"fail","report_version":1,"blockers":["late report race probe"]}"#,
+            path.display()
+        );
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+            .unwrap();
+
+        wait_for_report_or_child_exit(&path, &mut child, "test", Duration::from_secs(3))
+            .expect("clean child exit should allow a short report-write grace window");
+        assert!(role_report_ready(&path));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

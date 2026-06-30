@@ -28,16 +28,38 @@ separately from UX latency.
 
 ## Architecture Direction
 
-- Keep frame policy small and explicit:
-  - `DemandDriven`: idle-efficient mode for idle-wake proof.
-  - `RequestedAnimation`: vsync-paced bursts while input, scroll, caret,
-    animation, or replay is active, then settle back to demand-driven idle.
+- Keep long-lived render-loop mode small and explicit:
+  - `DemandDriven`: product mode and idle-wake proof mode.
   - `ContinuousProbe`: diagnostics/verifier mode only.
-- Keep proof as instrumentation, not a frame policy:
-  - `Off`, `Counters`, `Trace`, `Proof`.
-  - Normal UX budgets exclude WGPU readback completion, JSON report writes,
+- `RequestedAnimation` is not a long-lived process mode unless
+  `docs/plans/NATIVE_DEMAND_DRIVEN_RENDER_LOOP_PLAN.md` and
+  `docs/architecture/NATIVE_GPU_PIPELINE.md` are updated at the same time.
+  Preferred implementation:
+
+```rust
+pub enum NativeRenderLoopMode {
+    DemandDriven,
+    ContinuousProbe,
+}
+
+pub enum NativeFramePacing {
+    Idle,
+    RequestedAnimationBurst {
+        reason: RequestedAnimationReason,
+        started_at: MonotonicNanos,
+        quiet_after: MonotonicNanos,
+        hard_stop_after: MonotonicNanos,
+    },
+}
+```
+
+- Keep proof as instrumentation, not frame scheduling:
+  - hot-path product counters are always on and included in UX latency;
+  - `Counters` means no optional instrumentation beyond product counters;
+  - `Trace` and `Proof` are optional and must report their own overhead;
+  - normal UX budgets exclude WGPU readback completion, JSON report writes,
     verbose trace emission, and proof serialization.
-  - Reports split `ux_latency`, `proof_latency`, and
+  - reports split `ux_latency`, `proof_latency`, and
     `instrumentation_overhead`.
 - Define frame phases as a scheduler contract:
   - drain host input;
@@ -46,10 +68,39 @@ separately from UX latency.
   - extract narrow render input;
   - prepare/upload/queue/encode/present;
   - run proof/readback only when instrumentation asks for it.
+- Use the burst transition table below:
+
+| Current state | Event | Next state |
+| --- | --- | --- |
+| `Idle` | visible-changing input, scroll, caret, replay, animation request | `RequestedAnimationBurst` |
+| `Idle` | source/runtime/layout wake | render one frame, then `Idle` unless more work remains |
+| `RequestedAnimationBurst` | continued input/animation | extend `quiet_after`, bounded by `hard_stop_after` |
+| `RequestedAnimationBurst` | no dirty work and no animation request | `Idle` after quiet interval or quiet frames |
+| any | verifier forced sample | render/proof sample without changing product mode |
+| any | surface lost, resize, or scale change | mark `SurfaceChanged`, invalidate epoch caches, render when valid |
+| any | `ContinuousProbe` CLI/verifier | `ContinuousProbe` until verifier stops it |
+
+- Use these initial pacing defaults unless fresh measurements justify changing
+  them:
+  - `requested_animation_burst_min_frames = 2`;
+  - `requested_animation_quiet_ms = 100`;
+  - `requested_animation_hard_cap_ms = 1000`;
+  - `requested_animation_max_pending_snapshots = 1`.
 - Use active/pending frames:
   - the active frame keeps scrolling and selection overlays responsive;
   - pending runtime/layout/render snapshots swap only when complete and current;
   - stale pending snapshots are dropped by epoch and frame sequence.
+- Apply active/pending backpressure:
+  - at most one pending runtime/layout/render snapshot per role;
+  - newer source/layout/surface epochs supersede older pending snapshots;
+  - stale pending work is cancelled or dropped before expensive build work when
+    possible;
+  - a pending snapshot may commit only if source revision, layout revision,
+    render scene revision, surface epoch, and frame sequence are still current;
+  - while pending work is incomplete, scroll and selection may update the active
+    retained frame through transform, clip, and overlay state only;
+  - hit testing uses the active layout snapshot until the pending snapshot
+    commits.
 - Keep the visual pipeline staged:
   - source/runtime state;
   - document model;
@@ -100,13 +151,20 @@ These are implementation inspirations, not dependency decisions.
 The first UI implementation is one compact dev-footer row, not a new panel:
 
 ```text
-Preview perf  fps 59.8, render 1.3ms, latency 8.4ms, proof off, age 0.9s
+Preview perf  mode idle, last 8.4ms, render 1.3ms, age 0.9s, proof off, drops 0
+Preview perf  mode burst, fps 59.8, p95 14.2ms, proof counters, drops 0
+Preview perf  mode probe, fps 60.0, proof readback, proof p95 6.1ms, drops 0
 ```
+
+In `DemandDriven` idle, FPS may legitimately be zero. The HUD must show mode,
+last frame latency, sample age, proof mode, and drops so a healthy idle preview
+does not look like a failed 0 FPS renderer.
 
 Add a tiny `PreviewPerfStats` snapshot with fixed scalar fields:
 
 - frame sequence;
 - sample time;
+- pacing state: idle, burst, or probe;
 - FPS or renders per second;
 - render-hook milliseconds;
 - present-call milliseconds;
@@ -142,12 +200,57 @@ Reports and HUD should expose the same key terms:
 The dev window must consume cached shell state while rendering. It must not
 perform a transport call from `footer_lines()` or any render hook.
 
-## Runtime And Compiler Guardrails
+## Timing Definitions
+
+Latency reports must define start/end timestamps, minimum sample count, warmup
+policy, adapter identity, present mode, outlier policy, and whether each metric
+is CPU-submit, compositor-present, GPU-completion, or proof-completion time.
+
+- `input_to_present_ms`:
+  - starts when the role poll hook accepts a host input delta that can affect
+    visible state;
+  - ends when the frame containing that accepted delta is submitted and
+    `present()` returns;
+  - excludes async proof/readback completion.
+- `render_hook_ms`:
+  - CPU wall time inside the role render hook only;
+  - excludes scheduler polling, IPC, report serialization, and proof
+    serialization;
+  - layout work is included only when the current implementation still performs
+    layout inside the render hook, and must then be reported separately too.
+- `layout_ms`:
+  - CPU wall time spent producing or updating `LayoutFrame`, layout fragments,
+    or retained layout state.
+- `present_call_ms`:
+  - CPU wall time for the present path through surface acquisition, command
+    submission, and `frame.present()`;
+  - does not claim GPU completion.
+- `proof_overhead_ms`:
+  - CPU/GPU/readback/reporting cost attributable to proof mode;
+  - reported separately from `input_to_present_ms`.
+- `instrumentation_overhead`:
+  - measured delta or fixed-accounted cost of counters, trace, proof, and report
+    emission.
+
+Preview-local UX latencies must use the preview process monotonic clock. Do not
+compare serialized `Instant` values across preview and dev processes. Cross-
+process command latency must be reported as explicitly owned send/ack timings.
+
+## Genericity And No-Hacks Guardrails
 
 Performance fixes must stay generic. Cells is a large fixture and useful stress
-case, not a compiler/runtime special case.
+case, not a compiler/runtime/document/renderer/verifier special case.
 
-- No production branches in `crates/boon_ir` or `crates/boon_runtime` on:
+- No production branches in these crates on example-specific names, source
+  paths, labels, or fixture strings:
+  - `crates/boon_ir`;
+  - `crates/boon_runtime`;
+  - `crates/boon_document`;
+  - `crates/boon_native_gpu`;
+  - `crates/boon_native_playground`;
+  - `crates/boon_native_app_window`;
+  - `crates/xtask` verifier shortcuts.
+- The banned strings include:
   - example name;
   - source path;
   - `cells`;
@@ -171,41 +274,48 @@ case, not a compiler/runtime special case.
 
 ## Implementation Slices
 
-1. Documentation and options:
-   - add this plan;
-   - document `DemandDriven`, `RequestedAnimation`, and `ContinuousProbe`;
-   - document instrumentation modes separately from frame policy.
-2. Telemetry model:
+1. Terminology and schema:
+   - define `NativeRenderLoopMode`, `NativeFramePacing`, and instrumentation
+     profile;
+   - keep `RequestedAnimation` as a bounded burst pacing substate unless the
+     native GPU architecture docs are updated too;
+   - document product counters separately from optional trace/proof work.
+2. Low-cost stats backbone:
    - add `PreviewPerfStats`;
    - record fixed-bucket or rolling-window timings without allocation-heavy hot
      path work;
    - add `preview-perf-snapshot` IPC;
    - report telemetry overhead and dropped updates.
-3. Dev footer row:
+3. Proof identity:
+   - add `FrameEvidenceKey`;
+   - thread evidence keys through presented frames and proof artifacts;
+   - add stale-proof and mismatched-epoch negative tests.
+4. Scheduler:
+   - keep `DemandDriven` idle behavior;
+   - implement requested-animation burst pacing and exit rules;
+   - sample host input at frame start;
+   - keep proof/readback outside normal UX latency.
+5. Dev footer row:
    - render exactly one compact preview performance row from cached state;
    - prove it wraps within the existing footer limits;
    - prove it does not query runtime or block on IPC in render/hot paths.
-4. Scheduler:
-   - keep `DemandDriven` idle behavior;
-   - add requested-animation bursts for active input/scroll/caret/replay;
-   - sample host input at frame start;
-   - keep proof/readback outside normal UX latency.
-5. Active/pending frame state:
+6. Active/pending frame state:
    - keep active retained render state available for cheap scroll/selection
      updates;
    - apply pending snapshots only when complete and current;
    - reject stale pending snapshots by epoch/frame sequence.
-6. Retained extraction and upload:
+7. Retained extraction and upload:
    - narrow the extraction from layout/document state to render input;
    - update only dirty render chunks, text runs, transforms, clips, and buffers;
    - report upload bytes, draw calls, cache hits, and materialized visible
      ranges.
-7. Generic runtime/compiler audit:
+8. Generic runtime/compiler/document/renderer/verifier audit:
    - add non-Cells fixtures for sparse startup, indexed lookup, exact
      invalidation, currentness barriers, move/remove/reinsert safety, and
      bounded fanout;
-   - add an audit test rejecting production compiler/runtime example-specific
-     branches.
+   - add audit tests rejecting production example-specific branches across
+     runtime, compiler, document, renderer, playground, app-window, and verifier
+     code.
 
 ## Verification
 
@@ -234,6 +344,42 @@ Proof gates:
 - proof latency and proof serialization are reported separately;
 - no desktop screenshots, Xvfb, legacy Ply, browser screenshots, COSMIC
   scraping, or human observation as native GPU proof.
+- every proof artifact must carry a structured frame evidence key:
+
+```rust
+pub struct FrameEvidenceKey {
+    pub frame_seq: u64,
+    pub content_revision: u64,
+    pub layout_revision: u64,
+    pub render_scene_revision: u64,
+    pub surface_id: SurfaceId,
+    pub surface_epoch: u64,
+    pub input_event_seq: Option<u64>,
+    pub present_id: u64,
+    pub proof_request_id: Option<u64>,
+}
+```
+
+- proof `frame_seq` must equal or explicitly reference the measured presented
+  frame;
+- proof `surface_epoch` must match the presented surface epoch;
+- proof `content_revision`, `layout_revision`, and `render_scene_revision` must
+  match the rendered content revisions;
+- `proof_lag_frames` must be reported when proof completes after presentation;
+- stale first-frame proof reuse fails;
+- proof cache hit without matching `FrameEvidenceKey` fails;
+- hash-only proof without structured artifact metadata fails.
+
+Native UX gates fail if:
+
+- `render_loop_mode == ContinuousProbe`;
+- proof mode is required to make the visible update happen;
+- input is injected below `HostEvent` / `HostInputEvent`;
+- `preview_blocked_on_ipc_count > 0`;
+- passive scroll causes runtime dispatch or graph rebuild;
+- the dev perf row performs IPC or runtime queries from render hooks;
+- visual proof comes from desktop screenshot, human observation, browser
+  screenshot, Xvfb, legacy Ply, or COSMIC scraping.
 
 Performance HUD gates:
 
@@ -260,13 +406,13 @@ Use this later as:
 ```text
 /goal Follow docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md until the entire plan is implemented and honestly verified.
 
-Performance is the main goal. Implement the native preview architecture so normal visible interaction uses fast scheduled realtime bursts, retained/hot renderer state, sparse runtime/layout work, and proof/debug modes that are toggleable and separately measured. Do not treat idle-wake as the main UX benchmark; keep it as a demand-driven smoke gate only.
+Performance is the main goal. Implement the native preview architecture so normal visible interaction uses bounded requested-animation bursts inside DemandDriven mode, retained/hot renderer state, sparse runtime/layout work, and proof/debug modes that are toggleable and separately measured. Do not treat idle-wake as the main UX benchmark; keep it as a demand-driven smoke gate only. Do not turn RequestedAnimation into a third long-lived product mode unless the native GPU architecture docs are updated too.
 
 Use subagents whenever useful for independent architecture, runtime/compiler, WGPU/rendering, testing, or external-library research. If the path starts becoming too complex, too hacky, or circular, stop micro-tuning and choose a simpler generic architecture that matches the source-of-truth docs.
 
-Do not add Cells/example-specific compiler or runtime hacks. No production branches on example names, source paths, cells/address/value/error/A0, or fixture-specific strings. Fix engine/runtime/compiler architecture instead.
+Do not add Cells/example-specific hacks in compiler, runtime, document, renderer, app-window, playground, or verifier code. No production branches on example names, source paths, cells/address/value/error/A0, or fixture-specific strings. Fix engine/runtime/document/rendering architecture instead.
 
-Implement the dev-window preview performance row and bounded preview-perf snapshot. Prove visually and functionally with deterministic native tests, app-owned WGPU readbacks, release-mode latency reports, runtime counters, and schema-valid reports. Fix broken/flaky verification infrastructure too when it blocks reliable progress.
+Implement the dev-window preview performance row and bounded preview-perf snapshot. Add exact timing definitions, product counters, burst exit criteria, active/pending snapshot backpressure, and FrameEvidenceKey proof identity. Prove visually and functionally with deterministic native tests, app-owned WGPU readbacks tied to the measured presented frame, release-mode latency reports, runtime counters, and schema-valid reports. Fix broken/flaky verification infrastructure too when it blocks reliable progress.
 
-Do not claim completion until all required native UX, proof, perf-HUD, generic runtime, and audit gates pass on fresh reports for the current worktree/binary. If blocked, leave the repo coherent and report the exact blocker, evidence, and next implementation step.
+Do not claim completion until all required native UX, proof identity, perf-HUD, generic runtime, no-hacks audit, and stale-proof negative gates pass on fresh reports for the current worktree/binary. If blocked, leave the repo coherent and report the exact blocker, evidence, and next implementation step.
 ```

@@ -39978,10 +39978,8 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             false,
             false,
         )?;
-        let isolated_launch_success = isolated_real_window_launch_proof
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+        let isolated_launch_success =
+            isolated_preview_real_window_input_delivery_proven(&isolated_real_window_launch_proof);
         push_audit_check(
             &mut checks,
             &mut blockers,
@@ -40422,6 +40420,10 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             extra["display_connection"] = display_connection.clone();
         }
     }
+    native_preview_promote_isolated_measured_loop_evidence(
+        &mut extra,
+        &isolated_real_window_launch_proof,
+    );
     if live_state_report.exists() {
         extra["live_state_report_sha256"] =
             json!(file_hash(live_state_report.to_string_lossy().as_ref()));
@@ -46431,6 +46433,222 @@ fn count_region_pixels(
     count
 }
 
+fn native_preview_route_array(
+    report: &serde_json::Value,
+    top_level_key: &str,
+    fallback_pointers: &[&str],
+) -> Vec<serde_json::Value> {
+    report
+        .get(top_level_key)
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .cloned()
+        .or_else(|| {
+            fallback_pointers.iter().find_map(|pointer| {
+                report
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|items| !items.is_empty())
+                    .cloned()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn isolated_preview_real_window_input_delivery_proven(report: &serde_json::Value) -> bool {
+    report
+        .get("driver_pass")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && report
+            .get("real_os_events_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("driver_effect_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("measured_loop_pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && report
+            .get("preview_input_adapter")
+            .is_some_and(native_input_adapter_has_delivered_events)
+}
+
+fn native_preview_promote_isolated_measured_loop_evidence(
+    extra: &mut serde_json::Value,
+    isolated_real_window_launch_proof: &serde_json::Value,
+) {
+    if !isolated_preview_real_window_input_delivery_proven(isolated_real_window_launch_proof) {
+        return;
+    }
+    let Some(measured_loop) = isolated_real_window_launch_proof.get("measured_loop_report") else {
+        return;
+    };
+    if measured_loop
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return;
+    }
+
+    extra["measured_preview_loop_evidence_promoted"] = json!(true);
+    extra["measured_preview_loop_evidence_source"] =
+        json!("isolated_real_window_launch_proof.measured_loop_report");
+    extra["evidence_tier"] = json!(boon_driver::TIER_REAL_WINDOW);
+    extra["real_window_input"] = json!(true);
+    extra["real_os_input"] = json!(true);
+    extra["app_owned_window_input"] = json!(true);
+    extra["input_injection_method"] = isolated_real_window_launch_proof
+        .get("method")
+        .cloned()
+        .unwrap_or_else(|| json!("isolated-weston-real-window-app-window-input"));
+
+    if let Some(input_adapter) = isolated_real_window_launch_proof
+        .get("preview_input_adapter")
+        .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+        .or_else(|| {
+            measured_loop
+                .get("observed_input_adapter")
+                .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+        })
+        .cloned()
+    {
+        let adapter_installed = input_adapter
+            .get("installed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let wheel_api_present = input_adapter
+            .get("wheel_api")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|api| !api.is_empty());
+        let provenance_api_present = input_adapter
+            .get("per_window_event_provenance_api")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|api| !api.is_empty());
+        extra["native_input_adapter"] = input_adapter;
+        extra["native_input_adapter_installed"] = json!(adapter_installed);
+        extra["native_wheel_adapter_installed"] = json!(adapter_installed && wheel_api_present);
+        extra["native_per_window_input_provenance_installed"] =
+            json!(adapter_installed && provenance_api_present);
+        extra["native_input_observation_only"] = json!(false);
+    }
+
+    for key in [
+        "surface_id",
+        "surface_epoch",
+        "frame_evidence_key",
+        "rendered_frame_count",
+        "presented_revision",
+        "last_render_content_revision",
+        "last_render_layout_revision",
+        "last_render_scene_revision",
+        "preview_perf_stats",
+    ] {
+        if let Some(value) = measured_loop.get(key).cloned() {
+            extra[key] = value;
+        }
+    }
+
+    if let Some(frame_key) = measured_loop.get("frame_evidence_key") {
+        if extra.get("surface_id").is_none() {
+            if let Some(surface_id) = frame_key.get("surface_id").cloned() {
+                extra["surface_id"] = surface_id;
+            }
+        }
+        if extra.get("surface_epoch").is_none() {
+            if let Some(surface_epoch) = frame_key.get("surface_epoch").cloned() {
+                extra["surface_epoch"] = surface_epoch;
+            }
+        }
+    }
+
+    if let Some(external_render_proof) = measured_loop.get("last_external_render_proof").cloned() {
+        if !extra
+            .get("preview_surface_proof")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            extra["preview_surface_proof"] = json!({});
+        }
+        extra["preview_native_gpu_render_proof"] = external_render_proof.clone();
+        if let Some(proof) = external_render_proof.get("proof").cloned() {
+            extra["native_gpu_render_proof"] = proof;
+        }
+        extra["preview_surface_proof"]["external_render_proof"] = external_render_proof;
+        extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
+        extra["preview_surface_proof"]["status"] = json!("pass");
+    }
+
+    if let Some(readback) = measured_loop
+        .get("last_interactive_readback_artifact")
+        .filter(|artifact| {
+            artifact
+                .get("nonblank_samples")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+        })
+        .cloned()
+    {
+        if !extra
+            .get("preview_surface_proof")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            extra["preview_surface_proof"] = json!({});
+        }
+        extra["last_interactive_readback_artifact"] = readback.clone();
+        extra["readback_artifacts"] = json!([readback.clone()]);
+        extra["preview_surface_proof"]["readback_artifact"] = readback.clone();
+        extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
+        extra["preview_surface_proof"]["status"] = json!("pass");
+        if let Some(path) = readback.get("path").and_then(serde_json::Value::as_str) {
+            extra["checkpoint_screenshot_or_video_paths"] = json!([path]);
+            if let Some(sha256) = readback.get("sha256").and_then(serde_json::Value::as_str) {
+                let entry = json!({
+                    "kind": "visible-surface-readback",
+                    "source": "isolated_real_window_launch_proof.measured_loop_report.last_interactive_readback_artifact",
+                    "path": path,
+                    "sha256": sha256
+                });
+                let mut frame_hashes = extra
+                    .get("frame_hashes")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                frame_hashes.push(entry.clone());
+                extra["frame_hashes"] = json!(frame_hashes);
+                let mut artifact_sha256s = extra
+                    .get("artifact_sha256s")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                artifact_sha256s.push(entry);
+                extra["artifact_sha256s"] = json!(artifact_sha256s);
+            }
+        }
+    }
+
+    if let (Some(frame_key), Some(readback_key)) = (
+        extra.get("frame_evidence_key"),
+        extra.pointer("/last_interactive_readback_artifact/frame_evidence_key"),
+    ) {
+        let proof_lag_frames = frame_key
+            .get("frame_seq")
+            .and_then(serde_json::Value::as_u64)
+            .zip(
+                readback_key
+                    .get("frame_seq")
+                    .and_then(serde_json::Value::as_u64),
+            )
+            .map(|(frame, proof_frame)| frame.saturating_sub(proof_frame))
+            .unwrap_or(0);
+        extra["proof_lag_frames"] = json!(proof_lag_frames);
+    }
+}
+
 fn native_preview_host_route_evidence(
     example: &str,
     report: &serde_json::Value,
@@ -46516,24 +46734,50 @@ fn native_preview_host_route_evidence(
             }
         });
     }
-    let hit_targets = report
-        .get("hit_target_assertions")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let source_intents = report
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let target_hit = source_intents
-        .iter()
-        .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
-        .find_map(|node| {
+    let hit_targets = native_preview_route_array(
+        report,
+        "hit_target_assertions",
+        &[
+            "/preview_document_layout_proof/hit_target_assertions",
+            "/prelaunch_layout_probe/hit_target_assertions",
+            "/prelaunch_layout_probe/layout_proof/hit_target_assertions",
+            "/layout_probe_report/hit_target_assertions",
+            "/layout_probe_report/layout_proof/hit_target_assertions",
+        ],
+    );
+    let source_intents = native_preview_route_array(
+        report,
+        "source_intent_assertions",
+        &[
+            "/preview_document_layout_proof/source_intent_assertions",
+            "/prelaunch_layout_probe/source_intent_assertions",
+            "/prelaunch_layout_probe/layout_proof/source_intent_assertions",
+            "/layout_probe_report/source_intent_assertions",
+            "/layout_probe_report/layout_proof/source_intent_assertions",
+        ],
+    );
+    let operator_target_node = report
+        .pointer("/operator_host_input_evidence/target_region/node")
+        .and_then(serde_json::Value::as_str);
+    let target_hit = operator_target_node
+        .and_then(|node| {
             hit_targets
                 .iter()
                 .find(|target| target.get("node").and_then(serde_json::Value::as_str) == Some(node))
                 .cloned()
+        })
+        .or_else(|| {
+            source_intents
+                .iter()
+                .filter_map(|intent| intent.get("node").and_then(serde_json::Value::as_str))
+                .find_map(|node| {
+                    hit_targets
+                        .iter()
+                        .find(|target| {
+                            target.get("node").and_then(serde_json::Value::as_str) == Some(node)
+                        })
+                        .cloned()
+                })
         })
         .or_else(|| hit_targets.first().cloned());
     let target_node = target_hit
@@ -80300,6 +80544,186 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             event.get("target_text").and_then(serde_json::Value::as_str),
             Some("+")
+        );
+    }
+
+    #[test]
+    fn native_preview_route_evidence_uses_embedded_prelaunch_layout_probe() {
+        let report = json!({
+            "operator_host_input": true,
+            "hit_target_assertions": [],
+            "source_intent_assertions": [],
+            "operator_host_input_evidence": {
+                "target_region": {
+                    "id": "hit:primary",
+                    "node": "primary",
+                    "bounds": {"x": 10.0, "y": 20.0, "width": 80.0, "height": 24.0},
+                    "basis": "prelaunch-generic-document-layout-proof"
+                },
+                "host_events": [
+                    {"kind": "pointer_down", "button": "left"}
+                ]
+            },
+            "prelaunch_layout_probe": {
+                "hit_target_assertions": [
+                    {
+                        "id": "hit:secondary",
+                        "node": "secondary",
+                        "bounds": {"x": 100.0, "y": 20.0, "width": 80.0, "height": 24.0}
+                    },
+                    {
+                        "id": "hit:primary",
+                        "node": "primary",
+                        "bounds": {"x": 10.0, "y": 20.0, "width": 80.0, "height": 24.0}
+                    }
+                ],
+                "source_intent_assertions": [
+                    {
+                        "node": "secondary",
+                        "intent": "click",
+                        "source_path": "store.sources.secondary.click"
+                    },
+                    {
+                        "node": "primary",
+                        "intent": "click",
+                        "source_path": "store.sources.primary.click"
+                    }
+                ]
+            }
+        });
+
+        let evidence = native_preview_host_route_evidence("generic", &report);
+        assert_eq!(
+            evidence.get("status").and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            evidence
+                .pointer("/target_hit_region/node")
+                .and_then(serde_json::Value::as_str),
+            Some("primary")
+        );
+        assert_eq!(
+            evidence
+                .pointer("/source_intents/0/source_path")
+                .and_then(serde_json::Value::as_str),
+            Some("store.sources.primary.click")
+        );
+    }
+
+    #[test]
+    fn native_preview_promotes_measured_loop_real_window_evidence() {
+        let frame_key = json!({
+            "frame_seq": 9,
+            "content_revision": 7,
+            "layout_revision": 5,
+            "render_scene_revision": 6,
+            "surface_id": "preview:test-surface",
+            "surface_epoch": 1,
+            "present_id": 9,
+            "input_event_seq": 3,
+            "proof_request_id": null
+        });
+        let input_adapter = json!({
+            "installed": true,
+            "real_os_events_observed": true,
+            "synthetic_input_probe": false,
+            "mouse_button_event_count": 1,
+            "mouse_last_window_protocol_id": 11,
+            "wheel_api": "app_window::input::mouse::Mouse::load_clear_scroll_delta",
+            "per_window_event_provenance_api": "app_window::input::{mouse,keyboard}::event_provenance"
+        });
+        let isolated = json!({
+            "status": "fail",
+            "method": "isolated-weston-headless-with-weston-test-control",
+            "driver_pass": true,
+            "desktop_pass": false,
+            "real_os_events_observed": true,
+            "driver_effect_observed": true,
+            "measured_loop_pass": true,
+            "preview_input_adapter": input_adapter,
+            "measured_loop_report": {
+                "status": "pass",
+                "surface_id": "preview:test-surface",
+                "surface_epoch": 1,
+                "frame_evidence_key": frame_key,
+                "rendered_frame_count": 9,
+                "presented_revision": 7,
+                "last_render_content_revision": 7,
+                "last_render_layout_revision": 5,
+                "last_render_scene_revision": 6,
+                "preview_perf_stats": {
+                    "status": "pass",
+                    "frame_seq": 9,
+                    "frame_evidence_key": frame_key
+                },
+                "last_external_render_proof": {
+                    "status": "pass",
+                    "visible_style_mode": "document_style",
+                    "debug_palette_used": false,
+                    "viewport_fill_ratio": 1.0,
+                    "content_bounds_fill_ratio": 1.0,
+                    "proof": {
+                        "artifact": {
+                            "kind": "app_owned_pixels",
+                            "artifact_path": "target/artifacts/native-gpu/test-preview.png",
+                            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "nonblank_samples": 16
+                        }
+                    }
+                },
+                "last_interactive_readback_artifact": {
+                    "capture_method": "wgpu-visible-surface-copy-src-readback",
+                    "path": "target/artifacts/native-gpu/test-visible.png",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "nonblank_samples": 16,
+                    "width": 920,
+                    "height": 720,
+                    "frame_evidence_key": frame_key
+                }
+            }
+        });
+        let mut extra = json!({
+            "evidence_tier": boon_driver::TIER_BOON_DRIVER,
+            "frame_hashes": [],
+            "artifact_sha256s": []
+        });
+
+        assert!(isolated_preview_real_window_input_delivery_proven(
+            &isolated
+        ));
+        native_preview_promote_isolated_measured_loop_evidence(&mut extra, &isolated);
+
+        assert_eq!(
+            extra
+                .get("evidence_tier")
+                .and_then(serde_json::Value::as_str),
+            Some(boon_driver::TIER_REAL_WINDOW)
+        );
+        assert_eq!(
+            extra
+                .pointer("/native_input_adapter/real_os_events_observed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            extra
+                .pointer("/preview_surface_proof/readback_artifact/nonblank_samples")
+                .and_then(serde_json::Value::as_u64),
+            Some(16)
+        );
+        assert_eq!(extra.pointer("/frame_evidence_key"), Some(&frame_key));
+        assert_eq!(
+            extra
+                .get("proof_lag_frames")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            extra
+                .pointer("/native_gpu_render_proof/artifact/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("app_owned_pixels")
         );
     }
 

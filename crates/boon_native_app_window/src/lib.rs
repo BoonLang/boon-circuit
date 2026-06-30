@@ -806,6 +806,9 @@ pub struct NativeRenderLoopState {
     pub last_render_target_kind: Option<String>,
     pub last_poll_started_elapsed_ms: Option<f64>,
     pub last_dirty_poll_elapsed_ms: Option<f64>,
+    pub last_accepted_host_input_event_wake_count: u64,
+    pub last_accepted_host_input_elapsed_ms: Option<f64>,
+    pub last_accepted_host_input_press_only: bool,
     pub last_external_wake_generation: u64,
     pub last_external_wake_observed_elapsed_ms: Option<f64>,
     pub last_render_started_elapsed_ms: Option<f64>,
@@ -872,6 +875,9 @@ impl NativeRenderLoopState {
             last_render_target_kind: None,
             last_poll_started_elapsed_ms: None,
             last_dirty_poll_elapsed_ms: None,
+            last_accepted_host_input_event_wake_count: 0,
+            last_accepted_host_input_elapsed_ms: None,
+            last_accepted_host_input_press_only: false,
             last_external_wake_generation: 0,
             last_external_wake_observed_elapsed_ms: None,
             last_render_started_elapsed_ms: None,
@@ -1023,6 +1029,17 @@ impl NativeRenderLoopState {
 
     pub fn note_dirty_poll(&mut self, elapsed_ms: f64) {
         self.last_dirty_poll_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_accepted_host_input(
+        &mut self,
+        input_event_wake_count: u64,
+        elapsed_ms: f64,
+        press_only: bool,
+    ) {
+        self.last_accepted_host_input_event_wake_count = input_event_wake_count;
+        self.last_accepted_host_input_elapsed_ms = Some(elapsed_ms);
+        self.last_accepted_host_input_press_only = press_only;
     }
 
     pub fn note_external_wake_observed(&mut self, generation: u64, elapsed_ms: f64) {
@@ -2651,7 +2668,8 @@ async fn run_surface_probe_inner(
             render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
         }
         let poll_started_at = Instant::now();
-        render_loop_state.note_poll_started(hold_started.elapsed().as_secs_f64() * 1000.0);
+        let poll_started_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
+        render_loop_state.note_poll_started(poll_started_elapsed_ms);
         render_loop_state.consume_due_wake(poll_started_at);
         render_loop_state.clear_requested_animation_burst_if_quiet(
             hold_started.elapsed().as_secs_f64() * 1000.0,
@@ -2727,6 +2745,13 @@ async fn run_surface_probe_inner(
             if poll_result.dirty {
                 render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
+            if input.real_os_events_observed && poll_result.dirty {
+                render_loop_state.note_accepted_host_input(
+                    sampled_input_event_wake_count,
+                    poll_started_elapsed_ms,
+                    native_input_delta_is_button_press_only(&input),
+                );
+            }
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         } else if input.real_os_events_observed && !native_input_delta_is_button_press_only(&input)
         {
@@ -2737,6 +2762,11 @@ async fn run_surface_probe_inner(
                 NativeSchedulerReason::HostInput,
             );
             render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
+            render_loop_state.note_accepted_host_input(
+                sampled_input_event_wake_count,
+                poll_started_elapsed_ms,
+                false,
+            );
         }
         let wake_generation = wake_handle.generation();
         let wake_generation_changed = wake_generation != last_wake_generation;
@@ -3162,9 +3192,15 @@ async fn run_surface_probe_inner(
             hold_started,
         );
         let stats_input_to_present_ms = elapsed_delta_ms(
-            stats_presented_input_wake_elapsed_ms,
+            render_loop_state.last_accepted_host_input_elapsed_ms,
             render_loop_state.last_present_completed_elapsed_ms,
-        );
+        )
+        .or_else(|| {
+            elapsed_delta_ms(
+                stats_presented_input_wake_elapsed_ms,
+                render_loop_state.last_present_completed_elapsed_ms,
+            )
+        });
         let stats_proof_mode = if last_interactive_surface_readback_queued {
             if last_interactive_surface_readback_pending {
                 "readback_pending"
@@ -3839,6 +3875,18 @@ fn write_render_loop_state_report(
         presented_input_wake_elapsed_ms,
         state.last_poll_started_elapsed_ms,
     );
+    let input_wake_to_input_accept_ms = elapsed_delta_ms(
+        presented_input_wake_elapsed_ms,
+        state.last_accepted_host_input_elapsed_ms,
+    );
+    let input_accept_to_dirty_poll_ms = elapsed_delta_ms(
+        state.last_accepted_host_input_elapsed_ms,
+        state.last_dirty_poll_elapsed_ms,
+    );
+    let input_accept_to_present_ms = elapsed_delta_ms(
+        state.last_accepted_host_input_elapsed_ms,
+        state.last_present_completed_elapsed_ms,
+    );
     let poll_started_to_dirty_poll_ms = elapsed_delta_ms(
         state.last_poll_started_elapsed_ms,
         state.last_dirty_poll_elapsed_ms,
@@ -3916,7 +3964,7 @@ fn write_render_loop_state_report(
         state,
         elapsed,
         renders_per_second,
-        input_wake_to_present_ms,
+        input_accept_to_present_ms.or(input_wake_to_present_ms),
         proof_mode,
         present_to_readback_report_ms,
         extras.frame_evidence_key.clone(),
@@ -4011,6 +4059,17 @@ fn write_render_loop_state_report(
         } else {
             "missing_generation_timestamp"
         },
+        "accepted_host_input_event_wake_count": state.last_accepted_host_input_event_wake_count,
+        "accepted_host_input_elapsed_ms": state.last_accepted_host_input_elapsed_ms,
+        "accepted_host_input_press_only": state.last_accepted_host_input_press_only,
+        "input_accept_timing_source": if state.last_accepted_host_input_elapsed_ms.is_some() {
+            "role_poll_hook_accepted_visible_host_input"
+        } else {
+            "missing_accepted_host_input"
+        },
+        "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
+        "input_accept_to_dirty_poll_ms": input_accept_to_dirty_poll_ms,
+        "input_accept_to_present_ms": input_accept_to_present_ms,
         "input_wake_to_dirty_poll_ms": input_wake_to_dirty_poll_ms,
         "input_wake_to_poll_started_ms": input_wake_to_poll_started_ms,
         "poll_started_to_dirty_poll_ms": poll_started_to_dirty_poll_ms,
@@ -4936,6 +4995,42 @@ mod tests {
         assert_eq!(stats.render_hook_ms, Some(2.5));
         assert_eq!(stats.present_call_ms, Some(1.4));
         assert_eq!(stats.frame_evidence_key, Some(key));
+    }
+
+    #[test]
+    fn accepted_host_input_timing_defines_product_input_to_present_latency() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_accepted_host_input(3, 20.0, false);
+        state.note_dirty_poll(20.4);
+        state.note_present_completed(27.5);
+
+        let raw_wake_elapsed_ms = Some(8.0);
+        let raw_wake_to_present_ms =
+            elapsed_delta_ms(raw_wake_elapsed_ms, state.last_present_completed_elapsed_ms);
+        let accepted_input_to_present_ms = elapsed_delta_ms(
+            state.last_accepted_host_input_elapsed_ms,
+            state.last_present_completed_elapsed_ms,
+        );
+        let stats = native_preview_perf_stats_snapshot(
+            NativeWindowRole::Preview,
+            &state,
+            Duration::from_millis(64),
+            60.0,
+            accepted_input_to_present_ms.or(raw_wake_to_present_ms),
+            "off",
+            None,
+            None,
+        );
+
+        assert_eq!(raw_wake_to_present_ms, Some(19.5));
+        assert_eq!(accepted_input_to_present_ms, Some(7.5));
+        assert_eq!(
+            stats.input_to_present_ms,
+            Some(7.5),
+            "product UX latency starts when the role poll hook accepts visible-changing host input, not at an earlier raw input wake"
+        );
+        assert_eq!(state.last_accepted_host_input_event_wake_count, 3);
+        assert!(!state.last_accepted_host_input_press_only);
     }
 
     #[test]

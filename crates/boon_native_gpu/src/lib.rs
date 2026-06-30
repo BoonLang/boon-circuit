@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod generated {
     pub mod shader_bindings;
@@ -117,6 +117,22 @@ pub struct FrameMetrics {
     pub quad_cache_eviction_count: u32,
     pub quad_cache_hit: bool,
     pub quad_cache_entry_count: u32,
+    #[serde(default)]
+    pub scene_key_ms: f64,
+    #[serde(default)]
+    pub rect_vertices_ms: f64,
+    #[serde(default)]
+    pub asset_prepare_ms: f64,
+    #[serde(default)]
+    pub quad_batch_key_ms: f64,
+    #[serde(default)]
+    pub quad_upload_ms: f64,
+    #[serde(default)]
+    pub draw_pass_ms: f64,
+    #[serde(default)]
+    pub retained_metrics_ms: f64,
+    #[serde(default)]
+    pub text_render_ms: f64,
     pub visible_display_item_count: u32,
     pub rendered_rect_count: u32,
     pub rect_cap_hit: bool,
@@ -649,6 +665,14 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 quad_cache_eviction_count: 0,
                 quad_cache_hit: false,
                 quad_cache_entry_count: 0,
+                scene_key_ms: 0.0,
+                rect_vertices_ms: 0.0,
+                asset_prepare_ms: 0.0,
+                quad_batch_key_ms: 0.0,
+                quad_upload_ms: 0.0,
+                draw_pass_ms: 0.0,
+                retained_metrics_ms: 0.0,
+                text_render_ms: 0.0,
                 visible_display_item_count: 0,
                 rendered_rect_count: 0,
                 rect_cap_hit: false,
@@ -2140,7 +2164,9 @@ fn encode_internal_scene_to_surface(
     let width = request.width;
     let height = request.height;
     let text_runs_shaped = scene.text_runs.len() as u32;
+    let scene_key_started = Instant::now();
     let scene_key = render_scene_cache_key(&scene);
+    let scene_key_ms = scene_key_started.elapsed().as_secs_f64() * 1000.0;
     let mut upload_bytes = 0u64;
     let mut allocated_gpu_bytes = 0u64;
     let mut dirty_upload_ranges = Vec::new();
@@ -2148,6 +2174,10 @@ fn encode_internal_scene_to_surface(
     let mut staging_wrap_count = 0u32;
     let mut queue_write_count = 0u32;
     let mut quad_cache_eviction_count = 0u32;
+    let mut rect_vertices_ms = 0.0_f64;
+    let mut asset_prepare_ms = 0.0_f64;
+    let mut quad_batch_key_ms = 0.0_f64;
+    let mut quad_upload_ms = 0.0_f64;
     let mut fallback_upload_ring = QuadUploadRing::default();
     let upload_ring = quad_upload_ring
         .as_deref_mut()
@@ -2168,8 +2198,10 @@ fn encode_internal_scene_to_surface(
                 && upload_ring.prepared_cache_is_valid(cache)
         })
         .and_then(|cache| {
+            let asset_prepare_started = Instant::now();
             let asset_metrics =
                 textures.cached_asset_metrics(cache.gpu_batches.iter().map(|batch| &batch.texture));
+            asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
             asset_metrics
                 .failure_diagnostics
                 .is_empty()
@@ -2181,10 +2213,14 @@ fn encode_internal_scene_to_surface(
             buffer_reuse_count = gpu_batches.len() as u32;
             (gpu_batches, rect_metrics, asset_metrics)
         } else {
+            let rect_vertices_started = Instant::now();
             let (quad_batches, rect_metrics) =
                 rect_vertices_from_scene(&scene, width as f32, height as f32);
+            rect_vertices_ms += rect_vertices_started.elapsed().as_secs_f64() * 1000.0;
+            let asset_prepare_started = Instant::now();
             let asset_metrics =
                 textures.prepare_assets(request.device, request.queue, &quad_batches)?;
+            asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
             struct QuadUploadCandidate {
                 batch: QuadBatch,
                 vertex_count: u32,
@@ -2194,6 +2230,7 @@ fn encode_internal_scene_to_surface(
             let mut candidates = Vec::new();
             let mut frame_reservation_size = 0u64;
             let mut dirty_reservation_size = 0u64;
+            let quad_batch_key_started = Instant::now();
             for batch in quad_batches {
                 let vertex_count = batch.vertices.len() as u32;
                 if vertex_count == 0 {
@@ -2223,6 +2260,8 @@ fn encode_internal_scene_to_surface(
                     reservation_size,
                 });
             }
+            quad_batch_key_ms += quad_batch_key_started.elapsed().as_secs_f64() * 1000.0;
+            let quad_upload_started = Instant::now();
             let begin_stats = upload_ring.begin_frame(
                 request.device,
                 frame_reservation_size,
@@ -2320,6 +2359,7 @@ fn encode_internal_scene_to_surface(
                 };
                 gpu_batches.push(gpu_batch);
             }
+            quad_upload_ms += quad_upload_started.elapsed().as_secs_f64() * 1000.0;
             if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
                 *prepared_quads = Some(PreparedQuadCache {
                     scene_key,
@@ -2333,6 +2373,7 @@ fn encode_internal_scene_to_surface(
             (gpu_batches, rect_metrics, asset_metrics)
         };
     let draw_ranges = coalesced_gpu_quad_draw_ranges(&gpu_batches);
+    let draw_pass_started = Instant::now();
     {
         let mut pass = request
             .encoder
@@ -2371,7 +2412,9 @@ fn encode_internal_scene_to_surface(
             pass.draw(0..range.vertex_count, 0..1);
         }
     }
+    let draw_pass_ms = draw_pass_started.elapsed().as_secs_f64() * 1000.0;
     let draw_range_count = draw_ranges.len() as u32;
+    let retained_metrics_started = Instant::now();
     let retained_chunk_metrics = sampled_retained_render_chunks(
         &scene,
         frame_seq,
@@ -2396,6 +2439,8 @@ fn encode_internal_scene_to_surface(
         }
     }
     let dirty_upload_chunk_count = dirty_upload_chunk_ids.len() as u32;
+    let retained_metrics_ms = retained_metrics_started.elapsed().as_secs_f64() * 1000.0;
+    let text_render_started = Instant::now();
     let (rendered_text_runs, text_cache_metrics) = match text.as_mut() {
         Some(text) => {
             let glyphon_text_runs = scene
@@ -2415,6 +2460,7 @@ fn encode_internal_scene_to_surface(
         }
         None => (0, TextFrameCacheMetrics::default()),
     };
+    let text_render_ms = text_render_started.elapsed().as_secs_f64() * 1000.0;
     Ok(FrameMetrics {
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
@@ -2433,6 +2479,14 @@ fn encode_internal_scene_to_surface(
         quad_cache_entry_count: quad_buffers
             .as_deref()
             .map_or(0, |cache| cache.len() as u32),
+        scene_key_ms,
+        rect_vertices_ms,
+        asset_prepare_ms,
+        quad_batch_key_ms,
+        quad_upload_ms,
+        draw_pass_ms,
+        retained_metrics_ms,
+        text_render_ms,
         visible_display_item_count: rect_metrics.visible_display_item_count,
         rendered_rect_count: rect_metrics.rendered_rect_count,
         rect_cap_hit: rect_metrics.cap_hit,

@@ -2892,6 +2892,7 @@ async fn run_surface_probe_inner(
     let mut last_interactive_surface_readback_queued = false;
     let mut last_interactive_surface_readback_skipped_for_external_proof = false;
     let mut last_interactive_surface_readback_skipped_for_stale_input = false;
+    let mut last_interactive_surface_readback_skipped_for_backpressure = false;
     let mut last_interactive_surface_readback_pending = false;
     let mut interactive_readback_job: Option<AsyncInteractiveReadbackJob> = None;
     let mut last_render_loop_report_write_ms: Option<f64> = None;
@@ -2967,6 +2968,7 @@ async fn run_surface_probe_inner(
                         last_interactive_surface_readback_queued,
                         last_interactive_surface_readback_skipped_for_external_proof,
                         last_interactive_surface_readback_skipped_for_stale_input,
+                        last_interactive_surface_readback_skipped_for_backpressure,
                         last_interactive_surface_readback_pending,
                         last_interactive_readback_error.clone(),
                     )
@@ -3464,27 +3466,63 @@ async fn run_surface_probe_inner(
             && options.role == NativeWindowRole::Preview
             && options.readback_artifact_dir.is_some()
             && external_render_proof_replaces_interactive_readback(external_render_proof.as_ref());
-        let interactive_readback =
-            if options.role == NativeWindowRole::Preview && !skip_interactive_surface_readback {
-                if let Some(artifact_dir) = options.readback_artifact_dir.as_deref() {
-                    Some((
-                        artifact_dir.to_owned(),
-                        queue_visible_surface_readback(
-                            &device,
-                            &mut encoder,
-                            &frame.texture,
-                            options.role,
-                            width,
-                            height,
-                            config.format,
-                            &options.title,
-                            surface_id.clone(),
-                            surface_lifecycle.epoch(),
-                        )?,
-                    ))
-                } else {
-                    None
+        if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
+            match result {
+                Ok(result) => {
+                    last_interactive_readback_finish_ms = Some(result.finish_ms);
+                    last_interactive_readback_completed_elapsed_ms =
+                        Some(result.completed_elapsed_ms);
+                    last_interactive_readback_artifact = Some(result.artifact);
+                    last_interactive_surface_readback_pending = false;
+                    last_interactive_readback_error = None;
                 }
+                Err(error) => {
+                    last_interactive_readback_finish_ms = None;
+                    last_interactive_readback_completed_elapsed_ms =
+                        Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+                    last_interactive_surface_readback_pending = false;
+                    last_interactive_readback_error = Some(error);
+                    render_loop_state.telemetry_drop_count =
+                        render_loop_state.telemetry_drop_count.saturating_add(1);
+                    render_loop_state.last_missed_frame_cause =
+                        Some("interactive_readback_error".to_owned());
+                }
+            }
+        }
+        let readback_job_in_flight = interactive_readback_job.is_some();
+        let interactive_readback_decision = interactive_surface_readback_decision(
+            options.role,
+            options.readback_artifact_dir.is_some(),
+            skip_interactive_surface_readback,
+            readback_job_in_flight,
+        );
+        if interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure {
+            render_loop_state.telemetry_drop_count =
+                render_loop_state.telemetry_drop_count.saturating_add(1);
+            render_loop_state.last_missed_frame_cause =
+                Some("interactive_readback_backpressure".to_owned());
+        }
+        let interactive_readback =
+            if interactive_readback_decision == InteractiveSurfaceReadbackDecision::Queue {
+                let artifact_dir = options
+                    .readback_artifact_dir
+                    .as_deref()
+                    .expect("queue readback decision requires artifact dir");
+                Some((
+                    artifact_dir.to_owned(),
+                    queue_visible_surface_readback(
+                        &device,
+                        &mut encoder,
+                        &frame.texture,
+                        options.role,
+                        width,
+                        height,
+                        config.format,
+                        &options.title,
+                        surface_id.clone(),
+                        surface_lifecycle.epoch(),
+                    )?,
+                ))
             } else {
                 None
             };
@@ -3510,7 +3548,9 @@ async fn run_surface_probe_inner(
         }
         last_interactive_surface_readback_queued = interactive_readback.is_some();
         last_interactive_surface_readback_skipped_for_external_proof =
-            skip_interactive_surface_readback;
+            interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipExternalProof;
+        last_interactive_surface_readback_skipped_for_backpressure =
+            interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure;
         let encoder_finish_started = Instant::now();
         let command_buffer = encoder.finish();
         let encoder_finish_ms = elapsed_ms(encoder_finish_started);
@@ -3551,8 +3591,10 @@ async fn run_surface_probe_inner(
         }
         last_interactive_surface_readback_skipped_for_stale_input =
             skip_interactive_surface_readback_for_stale_input;
-        last_interactive_surface_readback_pending =
-            interactive_readback.is_some() && !skip_interactive_surface_readback_for_stale_input;
+        last_interactive_surface_readback_pending = (interactive_readback.is_some()
+            && !skip_interactive_surface_readback_for_stale_input)
+            || (last_interactive_surface_readback_skipped_for_backpressure
+                && interactive_readback_job.is_some());
         let current_frame_evidence_key = frame_evidence_key_for_presented_frame(
             &render_loop_state,
             &surface_id,
@@ -3640,6 +3682,8 @@ async fn run_surface_probe_inner(
             "external_app_owned_readback"
         } else if last_interactive_surface_readback_skipped_for_stale_input {
             "skipped_stale_input"
+        } else if last_interactive_surface_readback_skipped_for_backpressure {
+            "readback_pending_backpressure"
         } else {
             "off"
         };
@@ -3700,6 +3744,7 @@ async fn run_surface_probe_inner(
                     last_interactive_surface_readback_queued,
                     last_interactive_surface_readback_skipped_for_external_proof,
                     last_interactive_surface_readback_skipped_for_stale_input,
+                    last_interactive_surface_readback_skipped_for_backpressure,
                     last_interactive_surface_readback_pending,
                     last_interactive_readback_error.clone(),
                 )
@@ -3759,6 +3804,7 @@ async fn run_surface_probe_inner(
                 last_interactive_surface_readback_queued,
                 last_interactive_surface_readback_skipped_for_external_proof,
                 last_interactive_surface_readback_skipped_for_stale_input,
+                last_interactive_surface_readback_skipped_for_backpressure,
                 last_interactive_surface_readback_pending,
                 last_interactive_readback_error.clone(),
             )
@@ -3895,6 +3941,7 @@ struct NativeRenderLoopReportExtras {
     last_interactive_surface_readback_queued: bool,
     last_interactive_surface_readback_skipped_for_external_proof: bool,
     last_interactive_surface_readback_skipped_for_stale_input: bool,
+    last_interactive_surface_readback_skipped_for_backpressure: bool,
     last_interactive_surface_readback_pending: bool,
     last_interactive_readback_error: Option<String>,
     app_window_surface_content_report: Option<serde_json::Value>,
@@ -3926,6 +3973,7 @@ impl NativeRenderLoopReportExtras {
         surface_readback_queued: bool,
         surface_readback_skipped_for_external_proof: bool,
         surface_readback_skipped_for_stale_input: bool,
+        surface_readback_skipped_for_backpressure: bool,
         surface_readback_pending: bool,
         readback_error: Option<String>,
     ) -> Self {
@@ -3937,6 +3985,8 @@ impl NativeRenderLoopReportExtras {
             surface_readback_skipped_for_external_proof;
         self.last_interactive_surface_readback_skipped_for_stale_input =
             surface_readback_skipped_for_stale_input;
+        self.last_interactive_surface_readback_skipped_for_backpressure =
+            surface_readback_skipped_for_backpressure;
         self.last_interactive_surface_readback_pending = surface_readback_pending;
         self.last_interactive_readback_error = readback_error;
         self
@@ -3980,6 +4030,7 @@ fn render_loop_report_extras(
         last_interactive_surface_readback_queued: false,
         last_interactive_surface_readback_skipped_for_external_proof: false,
         last_interactive_surface_readback_skipped_for_stale_input: false,
+        last_interactive_surface_readback_skipped_for_backpressure: false,
         last_interactive_surface_readback_pending: false,
         last_interactive_readback_error: None,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
@@ -4057,6 +4108,32 @@ fn external_render_proof_has_app_owned_readback(proof: Option<&serde_json::Value
         .and_then(serde_json::Value::as_str)
         .is_some_and(is_sha256_hex_string);
     app_owned_reused && artifact_hash
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveSurfaceReadbackDecision {
+    Queue,
+    SkipExternalProof,
+    SkipBackpressure,
+    Off,
+}
+
+fn interactive_surface_readback_decision(
+    role: NativeWindowRole,
+    readback_enabled: bool,
+    external_proof_replaces_readback: bool,
+    readback_job_in_flight: bool,
+) -> InteractiveSurfaceReadbackDecision {
+    if role != NativeWindowRole::Preview || !readback_enabled {
+        return InteractiveSurfaceReadbackDecision::Off;
+    }
+    if external_proof_replaces_readback {
+        return InteractiveSurfaceReadbackDecision::SkipExternalProof;
+    }
+    if readback_job_in_flight {
+        return InteractiveSurfaceReadbackDecision::SkipBackpressure;
+    }
+    InteractiveSurfaceReadbackDecision::Queue
 }
 
 fn should_use_offscreen_copy_to_present(
@@ -4377,6 +4454,8 @@ fn write_render_loop_state_report(
         "external_app_owned_readback"
     } else if extras.last_interactive_surface_readback_skipped_for_stale_input {
         "skipped_stale_input"
+    } else if extras.last_interactive_surface_readback_skipped_for_backpressure {
+        "readback_pending_backpressure"
     } else {
         "off"
     };
@@ -4517,6 +4596,7 @@ fn write_render_loop_state_report(
         "last_interactive_surface_readback_queued": extras.last_interactive_surface_readback_queued,
         "last_interactive_surface_readback_skipped_for_external_proof": extras.last_interactive_surface_readback_skipped_for_external_proof,
         "last_interactive_surface_readback_skipped_for_stale_input": extras.last_interactive_surface_readback_skipped_for_stale_input,
+        "last_interactive_surface_readback_skipped_for_backpressure": extras.last_interactive_surface_readback_skipped_for_backpressure,
         "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
         "last_interactive_readback_error": extras.last_interactive_readback_error,
         "app_window_surface_content_report": extras.app_window_surface_content_report,
@@ -5480,6 +5560,30 @@ mod tests {
             enriched
                 .pointer("/proof/artifact/frame_evidence_key")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn interactive_surface_readback_is_coalesced_while_previous_proof_is_pending() {
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Preview, true, false, false),
+            InteractiveSurfaceReadbackDecision::Queue
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Preview, true, true, false),
+            InteractiveSurfaceReadbackDecision::SkipExternalProof
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Preview, true, false, true),
+            InteractiveSurfaceReadbackDecision::SkipBackpressure
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, false),
+            InteractiveSurfaceReadbackDecision::Off
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Preview, false, false, false),
+            InteractiveSurfaceReadbackDecision::Off
         );
     }
 

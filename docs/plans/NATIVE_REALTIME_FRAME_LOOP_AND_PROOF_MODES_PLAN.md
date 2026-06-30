@@ -565,6 +565,36 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - production diff no-hacks scan for `cells`, `address`, `A0`, source path,
     fixture-specific, example-specific, and hardcode strings
 
+2026-06-30 scroll real-window evidence currentness slice:
+
+- Scroll-speed report assembly now treats isolated Weston measured-loop input as
+  usable scroll evidence only when it is packaged with same-frame native proof:
+  - app-window input adapter shows delivered real OS wheel events;
+  - measured loop report status is pass;
+  - `last_external_render_proof` used the visible-surface render path and
+    skipped render-hook offscreen app-owned proof;
+  - `last_interactive_readback_artifact` is an app-owned WGPU visible-surface
+    readback completed before deadline;
+  - readback `FrameEvidenceKey` matches the measured frame evidence key.
+- The scroll model now separates observed real-window wheel input from proven
+  real-window speed. Real-window speed proof additionally requires a real
+  post-input timing window (`post-real-window-input` or
+  `axis-specific-post-real-window-input`) with measured post-input frames.
+- This prevents the previous bad shape where an isolated input adapter could
+  turn an operator-host plan into apparent real-window speed proof without
+  current timing/proof linkage.
+- A fresh Cells scroll-speed verifier attempt was stopped after it entered the
+  long axis-retry path. The stale report still failed on missing real-window
+  wheel proof; the interrupted fresh run confirmed the broad isolated measured
+  loop had real app-window wheel events and same-frame WGPU proof, but no
+  complete axis-specific post-input timing report yet.
+- Focused verification passed:
+  - `cargo test -q -p xtask isolated_scroll`
+  - `cargo test -q -p xtask axis_specific_real_window_input_overrides_planned_operator_wheel_input`
+  - `cargo test -q -p xtask scroll_hot_path_rejects_render_hook_offscreen_proof`
+  - `cargo check -q -p xtask`
+  - `git diff --check`
+
 ## Implementation Slices
 
 1. Terminology and schema:

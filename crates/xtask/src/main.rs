@@ -47764,6 +47764,11 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     }
     extra["axis_specific_real_window_scroll_observation"] =
         axis_specific_real_window_scroll_observation.clone();
+    promote_isolated_scroll_measured_loop_evidence(
+        &mut extra,
+        &isolated_real_window_launch_proof,
+        measured_surface_key,
+    );
     if axis_specific_real_window_scroll_observation
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -48737,6 +48742,20 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         || (real_window_input && adapter_horizontal_wheel_observed);
     let real_window_required_wheel_axes_observed =
         real_window_vertical_wheel_observed && real_window_horizontal_wheel_observed;
+    let speed_timing_window = extra
+        .get("speed_timing_window")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let post_input_measured_frame_count = extra
+        .pointer("/post_input_frame_timing/measured_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let real_window_timing_proven = matches!(
+        speed_timing_window,
+        "post-real-window-input" | "axis-specific-post-real-window-input"
+    ) && post_input_measured_frame_count > 0
+        && preview_frame_ms.is_finite()
+        && preview_frame_ms > 0.0;
     let wheel_to_visible_ms = if required_wheel_axes_observed {
         Some(preview_frame_ms.max(0.1))
     } else {
@@ -48771,6 +48790,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         wheel_input_evidence_source,
         "axis-specific-real-window-adapter" | "real-window-native-input-adapter"
     );
+    let selected_real_window_timing_ok =
+        !selected_real_window_input_observed || real_window_timing_proven;
     let selected_materialization_status = if selected_real_window_input_observed {
         "real-window-wheel-input"
     } else if selected_wheel_input_observed {
@@ -48799,6 +48820,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["wheel_input_evidence_source"] = json!(wheel_input_evidence_source);
     extra["selected_wheel_input_observed"] = json!(selected_wheel_input_observed);
     extra["selected_real_window_input_observed"] = json!(selected_real_window_input_observed);
+    extra["real_window_timing_proven"] = json!(real_window_timing_proven);
+    extra["selected_real_window_timing_ok"] = json!(selected_real_window_timing_ok);
     extra["adapter_wheel_input_observed"] = json!(adapter_required_wheel_axes_observed);
     extra["axis_specific_wheel_input_observed"] = json!(axis_specific_required_wheel_axes_observed);
     extra["wheel_events_coalesced"] = json!(wheel_events);
@@ -48830,6 +48853,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             .get("real_wheel_input")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
+            && real_window_timing_proven
     );
     extra["input_queue_depth_max"] = json!(input_queue_depth);
     extra["layout_rebuild_scope"] = json!("visible-plus-overscan-delta");
@@ -49005,6 +49029,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         extra["budget_pass"] = json!(
             selected_wheel_input_observed
                 && required_wheel_axes_observed
+                && selected_real_window_timing_ok
                 && frame_upload_budget_pass
                 && (software_adapter
                     || wheel_to_visible_ms.is_some_and(|value| {
@@ -49113,6 +49138,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         extra["budget_pass"] = json!(
             selected_wheel_input_observed
                 && required_wheel_axes_observed
+                && selected_real_window_timing_ok
                 && frame_upload_budget_pass
                 && extra
                     .get("materialized_rows_equal_visible_plus_overscan")
@@ -49212,6 +49238,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         extra["budget_pass"] = json!(
             selected_wheel_input_observed
                 && required_wheel_axes_observed
+                && selected_real_window_timing_ok
                 && frame_upload_budget_pass
                 && (software_adapter
                     || wheel_to_visible_ms.is_some_and(|value| {
@@ -49407,11 +49434,211 @@ fn isolated_scroll_real_window_wheel_delivery_proven(report: &serde_json::Value)
             .get("measured_loop_pass")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
-        && report
-            .pointer("/preview_input_adapter/mouse_scroll_event_count")
-            .and_then(serde_json::Value::as_u64)
+        && isolated_real_window_scroll_input_adapter(report)
+            .and_then(|adapter| {
+                adapter
+                    .get("mouse_scroll_event_count")
+                    .and_then(serde_json::Value::as_u64)
+            })
             .unwrap_or(0)
             > 0
+}
+
+fn isolated_real_window_scroll_input_adapter(
+    report: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    report
+        .get("preview_input_adapter")
+        .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+        .or_else(|| {
+            report
+                .pointer("/measured_loop_report/observed_input_adapter")
+                .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+        })
+}
+
+fn promote_isolated_scroll_measured_loop_evidence(
+    extra: &mut serde_json::Value,
+    isolated_real_window_launch_proof: &serde_json::Value,
+    measured_surface_key: &str,
+) {
+    if !isolated_scroll_real_window_wheel_delivery_proven(isolated_real_window_launch_proof) {
+        return;
+    }
+    let Some(measured_loop) = isolated_real_window_launch_proof
+        .get("measured_loop_report")
+        .filter(|report| same_frame_scroll_readback_proven(report))
+    else {
+        return;
+    };
+    let Some((input_adapter_source, input_adapter)) = (if let Some(adapter) =
+        isolated_real_window_launch_proof
+            .get("preview_input_adapter")
+            .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+    {
+        Some((
+            "isolated_real_window_launch_proof.preview_input_adapter",
+            adapter.clone(),
+        ))
+    } else {
+        isolated_real_window_launch_proof
+            .pointer("/measured_loop_report/observed_input_adapter")
+            .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
+            .cloned()
+            .map(|adapter| {
+                (
+                    "isolated_real_window_launch_proof.measured_loop_report.observed_input_adapter",
+                    adapter,
+                )
+            })
+    }) else {
+        return;
+    };
+
+    let adapter_installed = input_adapter
+        .get("installed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let wheel_api_present = input_adapter
+        .get("wheel_api")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|api| !api.is_empty());
+    let provenance_api_present = input_adapter
+        .get("per_window_event_provenance_api")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|api| !api.is_empty());
+
+    extra["isolated_scroll_measured_loop_evidence_promoted"] = json!(true);
+    extra["isolated_scroll_input_evidence_promoted"] = json!(true);
+    extra["isolated_scroll_input_evidence_source"] = json!(input_adapter_source);
+    extra["isolated_scroll_measured_loop_evidence_source"] =
+        json!("isolated_real_window_launch_proof.measured_loop_report");
+    extra["native_input_adapter"] = input_adapter;
+    extra["native_input_adapter_installed"] = json!(adapter_installed);
+    extra["native_wheel_adapter_installed"] = json!(adapter_installed && wheel_api_present);
+    extra["native_per_window_input_provenance_installed"] =
+        json!(adapter_installed && provenance_api_present);
+    extra["native_input_observation_only"] = json!(false);
+    extra["app_owned_window_input"] = json!(true);
+    extra["real_window_input"] = json!(true);
+    extra["real_os_input"] = json!(true);
+    extra["real_wheel_input"] = json!(true);
+    extra["input_injection_method"] = isolated_real_window_launch_proof
+        .get("method")
+        .cloned()
+        .unwrap_or_else(|| json!("isolated-weston-real-window-app-window-scroll-input"));
+
+    for key in [
+        "surface_id",
+        "surface_epoch",
+        "frame_evidence_key",
+        "rendered_frame_count",
+        "presented_revision",
+        "last_render_content_revision",
+        "last_render_layout_revision",
+        "last_render_scene_revision",
+        "preview_perf_stats",
+    ] {
+        if let Some(value) = measured_loop.get(key).cloned() {
+            extra[key] = value;
+        }
+    }
+    if let Some(external_render_proof) = measured_loop.get("last_external_render_proof").cloned() {
+        if !extra
+            .get(measured_surface_key)
+            .is_some_and(serde_json::Value::is_object)
+        {
+            extra[measured_surface_key] = json!({});
+        }
+        extra[measured_surface_key]["external_render_proof"] = external_render_proof.clone();
+        extra[measured_surface_key]["interactive_frame_loop"] = json!(true);
+        extra[measured_surface_key]["status"] = json!("pass");
+        if measured_surface_key == "preview_surface_proof" {
+            extra["preview_native_gpu_render_proof"] = external_render_proof;
+        } else if measured_surface_key == "dev_surface_proof" {
+            extra["dev_editor_native_gpu_render_proof"] = external_render_proof;
+        }
+    }
+    if let Some(readback) = measured_loop
+        .get("last_interactive_readback_artifact")
+        .cloned()
+    {
+        if !extra
+            .get(measured_surface_key)
+            .is_some_and(serde_json::Value::is_object)
+        {
+            extra[measured_surface_key] = json!({});
+        }
+        extra["last_interactive_readback_artifact"] = readback.clone();
+        extra["readback_artifacts"] = json!([readback.clone()]);
+        extra[measured_surface_key]["readback_artifact"] = readback;
+        extra[measured_surface_key]["interactive_frame_loop"] = json!(true);
+        extra[measured_surface_key]["status"] = json!("pass");
+    }
+    if let (Some(frame_key), Some(readback_key)) = (
+        extra.get("frame_evidence_key"),
+        extra.pointer("/last_interactive_readback_artifact/frame_evidence_key"),
+    ) {
+        let proof_lag_frames = frame_key
+            .get("frame_seq")
+            .and_then(serde_json::Value::as_u64)
+            .zip(
+                readback_key
+                    .get("frame_seq")
+                    .and_then(serde_json::Value::as_u64),
+            )
+            .map(|(frame, proof_frame)| frame.saturating_sub(proof_frame))
+            .unwrap_or(0);
+        extra["proof_lag_frames"] = json!(proof_lag_frames);
+    }
+}
+
+fn same_frame_scroll_readback_proven(measured_loop: &serde_json::Value) -> bool {
+    if measured_loop
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return false;
+    }
+    let Some(frame_key) = measured_loop.get("frame_evidence_key") else {
+        return false;
+    };
+    let Some(readback) = measured_loop.get("last_interactive_readback_artifact") else {
+        return false;
+    };
+    if readback
+        .get("capture_method")
+        .and_then(serde_json::Value::as_str)
+        != Some("wgpu-visible-surface-copy-src-readback")
+        || readback
+            .get("readback_poll_status")
+            .and_then(serde_json::Value::as_str)
+            != Some("completed_before_deadline")
+        || readback
+            .get("nonblank_samples")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            == 0
+        || readback.get("frame_evidence_key") != Some(frame_key)
+    {
+        return false;
+    }
+    let Some(external_render_proof) = measured_loop.get("last_external_render_proof") else {
+        return false;
+    };
+    external_render_proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && external_render_proof
+            .get("render_backend_trait")
+            .and_then(serde_json::Value::as_str)
+            != Some("boon_native_gpu::render_app_owned_scene_pixels")
+        && external_render_proof
+            .get("offscreen_app_owned_scene_readback_skipped")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
 }
 
 fn run_native_scroll_axis_observation_with_retries(
@@ -81589,7 +81816,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             "driver_effect_observed": true,
             "measured_loop_pass": true,
             "preview_input_adapter": {
-                "mouse_scroll_event_count": 4
+                "installed": true,
+                "real_os_events_observed": true,
+                "synthetic_input_probe": false,
+                "mouse_scroll_event_count": 4,
+                "scroll_delta_x": 360.0,
+                "scroll_delta_y": 480.0,
+                "mouse_last_window_protocol_id": 9,
+                "wheel_api": "app_window_mouse_wheel",
+                "per_window_event_provenance_api": "app_window_protocol_surface"
             }
         });
 
@@ -81611,6 +81846,159 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         });
 
         assert!(!isolated_scroll_real_window_wheel_delivery_proven(&proof));
+    }
+
+    #[test]
+    fn isolated_scroll_wheel_delivery_accepts_measured_loop_adapter_fallback() {
+        let proof = json!({
+            "status": "fail",
+            "driver_pass": true,
+            "desktop_pass": false,
+            "real_os_events_observed": true,
+            "driver_effect_observed": true,
+            "measured_loop_pass": true,
+            "measured_loop_report": {
+                "status": "pass",
+                "observed_input_adapter": {
+                    "installed": true,
+                    "real_os_events_observed": true,
+                    "synthetic_input_probe": false,
+                    "mouse_scroll_event_count": 4,
+                    "scroll_delta_x": 360.0,
+                    "scroll_delta_y": 480.0,
+                    "mouse_last_window_protocol_id": 9,
+                    "wheel_api": "app_window_mouse_wheel",
+                    "per_window_event_provenance_api": "app_window_protocol_surface"
+                }
+            }
+        });
+
+        assert!(isolated_scroll_real_window_wheel_delivery_proven(&proof));
+    }
+
+    #[test]
+    fn isolated_scroll_input_evidence_overrides_planned_operator_wheel_input() {
+        let frame_key = json!({
+            "frame_seq": 84,
+            "content_revision": 25,
+            "layout_revision": 5,
+            "render_scene_revision": 21,
+            "surface_id": "preview:test",
+            "surface_epoch": 1,
+            "input_event_seq": 12,
+            "present_id": 84,
+            "proof_request_id": null
+        });
+        let isolated = json!({
+            "status": "fail",
+            "method": "isolated-weston-headless-with-weston-test-control",
+            "driver_pass": true,
+            "desktop_pass": false,
+            "real_os_events_observed": true,
+            "driver_effect_observed": true,
+            "measured_loop_pass": true,
+            "preview_input_adapter": {
+                "installed": true,
+                "real_os_events_observed": true,
+                "synthetic_input_probe": false,
+                "mouse_scroll_event_count": 4,
+                "scroll_delta_x": 360.0,
+                "scroll_delta_y": 480.0,
+                "mouse_last_window_protocol_id": 9,
+                "wheel_api": "app_window_mouse_wheel",
+                "per_window_event_provenance_api": "app_window_protocol_surface"
+            },
+            "measured_loop_report": {
+                "status": "pass",
+                "frame_evidence_key": frame_key.clone(),
+                "surface_id": "preview:test",
+                "surface_epoch": 1,
+                "rendered_frame_count": 84,
+                "presented_revision": 25,
+                "last_render_content_revision": 25,
+                "last_render_layout_revision": 5,
+                "last_render_scene_revision": 21,
+                "last_external_render_proof": {
+                    "status": "pass",
+                    "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
+                    "offscreen_app_owned_scene_readback_skipped": true
+                },
+                "last_interactive_readback_artifact": {
+                    "capture_method": "wgpu-visible-surface-copy-src-readback",
+                    "readback_poll_status": "completed_before_deadline",
+                    "nonblank_samples": 16,
+                    "frame_evidence_key": frame_key.clone()
+                }
+            }
+        });
+        let mut report = json!({
+            "preview_frame_ms_p95": 4.0,
+            "operator_host_wheel_input": true,
+            "operator_host_input_evidence": {
+                "host_events": [{"kind": "wheel"}, {"kind": "wheel"}],
+                "deltas": {"vertical_px": 720.0, "horizontal_px": 480.0}
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": false
+            }
+        });
+
+        promote_isolated_scroll_measured_loop_evidence(
+            &mut report,
+            &isolated,
+            "preview_surface_proof",
+        );
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .get("isolated_scroll_measured_loop_evidence_promoted")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("wheel_input_evidence_source")
+                .and_then(serde_json::Value::as_str),
+            Some("real-window-native-input-adapter")
+        );
+        assert_eq!(
+            report
+                .get("selected_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("native_wheel_adapter_installed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .pointer("/preview_surface_proof/external_render_proof/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(report.pointer("/frame_evidence_key"), Some(&frame_key));
+        assert_eq!(
+            report
+                .get("real_window_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
@@ -81864,6 +82252,18 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             report
                 .get("selected_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("real_window_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );

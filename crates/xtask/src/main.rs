@@ -47819,7 +47819,15 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         .and_then(serde_json::Value::as_str)
         == Some(boon_driver::TIER_BOON_DRIVER)
         && extra
-            .get("operator_host_wheel_input")
+            .get("selected_wheel_input_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && extra
+            .get("wheel_input_evidence_source")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|source| source != "operator-host-plan" && source != "missing")
+        && extra
+            .get("app_owned_window_input")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         && extra
@@ -47965,6 +47973,37 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             .and_then(serde_json::Value::as_bool)
             != Some(true))
         .then(|| "native scroll-speed gate lacks operator host wheel input evidence".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-scroll-{label}:observed-window-wheel-input"),
+        extra
+            .get("selected_wheel_input_observed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        format!(
+            "wheel_input_evidence_source={:?}, selected_wheel_input_observed={:?}, axis_specific={:?}, adapter={:?}",
+            extra
+                .get("wheel_input_evidence_source")
+                .and_then(serde_json::Value::as_str),
+            extra
+                .get("selected_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("axis_specific_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("adapter_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (extra
+            .get("selected_wheel_input_observed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true))
+        .then(|| {
+            "native scroll-speed gate has only planned wheel input; observed app-window wheel input is required".to_owned()
+        }),
     );
     push_audit_check(
         &mut checks,
@@ -48558,7 +48597,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     } else {
         shaped_run_cache_hits as f64 / shaped_cache_total as f64
     };
-    let operator_wheel_input = extra
+    let planned_operator_host_wheel_input = extra
         .get("operator_host_wheel_input")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
@@ -48582,43 +48621,105 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .pointer("/native_input_adapter/scroll_delta_y")
         .and_then(numeric_value_as_f64)
         .unwrap_or(0.0);
-    let wheel_events = if operator_wheel_input {
+    let axis_specific_adapter = extra
+        .pointer("/axis_specific_real_window_scroll_observation/combined_input_adapter")
+        .unwrap_or(&serde_json::Value::Null);
+    let axis_specific_pass = extra
+        .pointer("/axis_specific_real_window_scroll_observation/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let axis_specific_wheel_events = axis_specific_adapter
+        .get("mouse_scroll_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let axis_specific_scroll_delta_x = axis_specific_adapter
+        .get("scroll_delta_x")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let axis_specific_scroll_delta_y = axis_specific_adapter
+        .get("scroll_delta_y")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let axis_specific_vertical_wheel_observed = axis_specific_pass
+        && axis_specific_wheel_events > 0
+        && axis_specific_scroll_delta_y.abs() > f64::EPSILON;
+    let axis_specific_horizontal_wheel_observed = axis_specific_pass
+        && axis_specific_wheel_events > 0
+        && axis_specific_scroll_delta_x.abs() > f64::EPSILON;
+    let axis_specific_required_wheel_axes_observed =
+        axis_specific_vertical_wheel_observed && axis_specific_horizontal_wheel_observed;
+    let adapter_vertical_wheel_observed =
+        adapter_wheel_events > 0 && adapter_scroll_delta_y.abs() > f64::EPSILON;
+    let adapter_horizontal_wheel_observed =
+        adapter_wheel_events > 0 && adapter_scroll_delta_x.abs() > f64::EPSILON;
+    let adapter_required_wheel_axes_observed =
+        adapter_vertical_wheel_observed && adapter_horizontal_wheel_observed;
+    let observed_adapter_source = if real_window_input && adapter_required_wheel_axes_observed {
+        Some("real-window-native-input-adapter")
+    } else if app_owned_window_input && adapter_required_wheel_axes_observed {
+        Some("app-window-native-input-adapter")
+    } else if !planned_operator_host_wheel_input && adapter_required_wheel_axes_observed {
+        Some("native-input-adapter")
+    } else {
+        None
+    };
+    let wheel_input_evidence_source = if axis_specific_required_wheel_axes_observed {
+        "axis-specific-real-window-adapter"
+    } else if let Some(source) = observed_adapter_source {
+        source
+    } else if planned_operator_host_wheel_input {
+        "operator-host-plan"
+    } else {
+        "missing"
+    };
+    let operator_wheel_input = wheel_input_evidence_source == "operator-host-plan";
+    let wheel_events = if axis_specific_required_wheel_axes_observed {
+        axis_specific_wheel_events
+    } else if observed_adapter_source.is_some() {
+        adapter_wheel_events
+    } else if operator_wheel_input {
         extra
             .pointer("/operator_host_input_evidence/host_events")
             .and_then(serde_json::Value::as_array)
             .map_or(2, |events| events.len() as u64)
     } else {
-        adapter_wheel_events
+        0
     };
-    let scroll_delta_x = if operator_wheel_input {
+    let scroll_delta_x = if axis_specific_required_wheel_axes_observed {
+        axis_specific_scroll_delta_x
+    } else if observed_adapter_source.is_some() {
+        adapter_scroll_delta_x
+    } else if operator_wheel_input {
         extra
             .pointer("/operator_host_input_evidence/deltas/horizontal_px")
             .and_then(numeric_value_as_f64)
             .unwrap_or(480.0)
     } else {
-        adapter_scroll_delta_x
+        0.0
     };
-    let scroll_delta_y = if operator_wheel_input {
+    let scroll_delta_y = if axis_specific_required_wheel_axes_observed {
+        axis_specific_scroll_delta_y
+    } else if observed_adapter_source.is_some() {
+        adapter_scroll_delta_y
+    } else if operator_wheel_input {
         extra
             .pointer("/operator_host_input_evidence/deltas/vertical_px")
             .and_then(numeric_value_as_f64)
             .unwrap_or(720.0)
     } else {
-        adapter_scroll_delta_y
+        0.0
     };
     let vertical_wheel_observed = wheel_events > 0 && scroll_delta_y.abs() > f64::EPSILON;
     let horizontal_wheel_observed = wheel_events > 0 && scroll_delta_x.abs() > f64::EPSILON;
     let required_wheel_axes_observed = vertical_wheel_observed && horizontal_wheel_observed;
     let app_owned_window_vertical_wheel_observed = app_owned_window_input
-        && adapter_wheel_events > 0
-        && adapter_scroll_delta_y.abs() > f64::EPSILON;
+        && (adapter_vertical_wheel_observed || axis_specific_vertical_wheel_observed);
     let app_owned_window_horizontal_wheel_observed = app_owned_window_input
-        && adapter_wheel_events > 0
-        && adapter_scroll_delta_x.abs() > f64::EPSILON;
-    let real_window_vertical_wheel_observed =
-        real_window_input && app_owned_window_vertical_wheel_observed;
-    let real_window_horizontal_wheel_observed =
-        real_window_input && app_owned_window_horizontal_wheel_observed;
+        && (adapter_horizontal_wheel_observed || axis_specific_horizontal_wheel_observed);
+    let real_window_vertical_wheel_observed = axis_specific_vertical_wheel_observed
+        || (real_window_input && adapter_vertical_wheel_observed);
+    let real_window_horizontal_wheel_observed = axis_specific_horizontal_wheel_observed
+        || (real_window_input && adapter_horizontal_wheel_observed);
     let real_window_required_wheel_axes_observed =
         real_window_vertical_wheel_observed && real_window_horizontal_wheel_observed;
     let wheel_to_visible_ms = if required_wheel_axes_observed {
@@ -48647,6 +48748,30 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     } else {
         wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget
     };
+    let selected_wheel_input_observed = !matches!(
+        wheel_input_evidence_source,
+        "operator-host-plan" | "missing"
+    );
+    let selected_real_window_input_observed = matches!(
+        wheel_input_evidence_source,
+        "axis-specific-real-window-adapter" | "real-window-native-input-adapter"
+    );
+    let selected_materialization_status = if selected_real_window_input_observed {
+        "real-window-wheel-input"
+    } else if selected_wheel_input_observed {
+        "app-window-wheel-input"
+    } else if operator_wheel_input {
+        "operator-host-wheel-input"
+    } else {
+        "waiting-for-host-wheel-input"
+    };
+    let observed_wheel_status = if required_wheel_axes_observed {
+        format!("observed-{wheel_input_evidence_source}")
+    } else if operator_wheel_input {
+        "planned-operator-host-wheel-input-only".to_owned()
+    } else {
+        "waiting-for-host-wheel-input".to_owned()
+    };
     extra["software_adapter_wall_clock_budget_exempt"] = json!(software_adapter);
     extra["wall_clock_frame_budget_pass"] = json!(wall_clock_frame_budget_pass);
     extra["wall_clock_frame_budget_ms_p95"] = json!(preview_frame_ms);
@@ -48655,6 +48780,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     } else {
         "native surface used a non-software adapter; wall-clock frame timing is enforced"
     });
+    extra["operator_host_wheel_input_planned"] = json!(planned_operator_host_wheel_input);
+    extra["wheel_input_evidence_source"] = json!(wheel_input_evidence_source);
+    extra["selected_wheel_input_observed"] = json!(selected_wheel_input_observed);
+    extra["selected_real_window_input_observed"] = json!(selected_real_window_input_observed);
+    extra["adapter_wheel_input_observed"] = json!(adapter_required_wheel_axes_observed);
+    extra["axis_specific_wheel_input_observed"] = json!(axis_specific_required_wheel_axes_observed);
     extra["wheel_events_coalesced"] = json!(wheel_events);
     extra["operator_vertical_wheel_input"] = json!(operator_wheel_input && vertical_wheel_observed);
     extra["operator_horizontal_wheel_input"] =
@@ -48669,16 +48800,16 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["real_window_vertical_wheel_input"] = json!(real_window_vertical_wheel_observed);
     extra["real_window_horizontal_wheel_input"] = json!(real_window_horizontal_wheel_observed);
     extra["real_wheel_input"] = json!(
-        (!operator_wheel_input && required_wheel_axes_observed)
+        selected_wheel_input_observed
             || (real_window_input && real_window_required_wheel_axes_observed)
     );
-    extra["evidence_tier"] = json!(
-        if real_window_input && real_window_required_wheel_axes_observed {
-            "real-window"
-        } else {
-            boon_driver::TIER_BOON_DRIVER
-        }
-    );
+    extra["evidence_tier"] = json!(if selected_real_window_input_observed
+        || (real_window_input && real_window_required_wheel_axes_observed)
+    {
+        "real-window"
+    } else {
+        boon_driver::TIER_BOON_DRIVER
+    });
     extra["required_real_window_speed_proven"] = json!(
         extra
             .get("real_wheel_input")
@@ -48715,19 +48846,28 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let wheel_to_visible_axis_status = existing_axis_wheel_to_visible
         .and_then(|value| value.get("status"))
         .cloned()
-        .unwrap_or_else(|| {
-            json!(if required_wheel_axes_observed {
-                "observed-operator-host-wheel-input"
-            } else {
-                "waiting-for-host-wheel-input"
-            })
-        });
+        .unwrap_or_else(|| json!(observed_wheel_status));
     extra["wheel_to_visible_ms_p95_per_axis"] = json!({
         "vertical": wheel_to_visible_vertical_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
         "horizontal": wheel_to_visible_horizontal_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
         "status": wheel_to_visible_axis_status
     });
-    extra["frames_over_16_7_ms"] = json!([]);
+    let frames_over_16_7_ms = extra
+        .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_indices")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(serde_json::Value::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    extra["frames_over_16_7_ms"] = json!(frames_over_16_7_ms);
+    extra["frames_over_16_7_count"] = extra
+        .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_count")
+        .cloned()
+        .unwrap_or_else(|| json!(0));
     extra["draw_calls_p50_p95_max"] = json!({
         "p50": draw_calls,
         "p95": draw_calls,
@@ -48824,16 +48964,16 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "horizontal_px": if horizontal_wheel_observed { scroll_delta_x.abs() } else { 0.0 },
             "line_delta": if vertical_wheel_observed { 1 } else { 0 },
             "column_byte_delta": if horizontal_wheel_observed { 1 } else { 0 },
-            "status": if required_wheel_axes_observed { "observed-operator-host-wheel-input" } else { "waiting-for-host-wheel-input" }
+            "status": observed_wheel_status
         });
         extra["materialized_range_before_after"] = json!({
             "before": {"line_start": 0, "line_end": visible_line_count.saturating_sub(1), "column_start_byte": 0},
             "after": {"line_start": vertical_after, "line_end": (vertical_after + visible_line_count).min(line_count).saturating_sub(1), "column_start_byte": horizontal_after},
-            "status": "operator-host-wheel-input"
+            "status": selected_materialization_status
         });
         extra["non_os_scroll_model"] = json!({
             "status": "pass",
-            "input_kind": "operator_host_wheel_visible_range",
+            "input_kind": format!("{wheel_input_evidence_source}_visible_range"),
             "sample_count": 4,
             "vertical_samples": [
                 {"line_start": 0, "line_end": visible_line_count.saturating_sub(1)},
@@ -48848,7 +48988,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "upload_budget_bytes": upload_budget
         });
         extra["budget_pass"] = json!(
-            required_wheel_axes_observed
+            selected_wheel_input_observed
+                && required_wheel_axes_observed
                 && frame_upload_budget_pass
                 && (software_adapter
                     || wheel_to_visible_ms.is_some_and(|value| {
@@ -48920,27 +49061,27 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "horizontal_px": if horizontal_wheel_observed { scroll_delta_x.abs() } else { 0.0 },
             "row_delta": if vertical_wheel_observed { 1 } else { 0 },
             "column_delta": if horizontal_wheel_observed { 1 } else { 0 },
-            "status": if required_wheel_axes_observed { "observed-operator-host-wheel-input" } else { "waiting-for-host-wheel-input" }
+            "status": observed_wheel_status
         });
         extra["materialized_range_before_after"] = json!({
             "before": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
             "after_vertical": {"row_start": vertical_row_after, "row_end": (vertical_row_after + visible_rows).min(logical_rows).saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
             "after_horizontal": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": 0, "column_end": columns.saturating_sub(1)},
-            "status": "operator-host-wheel-input",
+            "status": selected_materialization_status,
             "collection": "selected_signal_lanes"
         });
         extra["visible_address_samples_before_after"] = json!({
             "before": extra["visible_address_samples_before"],
             "after_vertical": extra["visible_address_samples_after_vertical"],
             "after_horizontal": extra["visible_address_samples_after_horizontal"],
-            "status": "operator-host-wheel-input",
+            "status": selected_materialization_status,
             "sample_kind": "signal_lane_key"
         });
         extra["signal_lane_row_key_samples_before_after"] =
             extra["visible_address_samples_before_after"].clone();
         extra["non_os_scroll_model"] = json!({
             "status": "pass",
-            "input_kind": "operator_host_wheel_visible_signal_lane_range",
+            "input_kind": format!("{wheel_input_evidence_source}_visible_signal_lane_range"),
             "sample_count": 3,
             "collection": "selected_signal_lanes",
             "logical_signal_lane_row_count": logical_rows,
@@ -48955,7 +49096,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "upload_budget_bytes": upload_budget
         });
         extra["budget_pass"] = json!(
-            required_wheel_axes_observed
+            selected_wheel_input_observed
+                && required_wheel_axes_observed
                 && frame_upload_budget_pass
                 && extra
                     .get("materialized_rows_equal_visible_plus_overscan")
@@ -49027,23 +49169,23 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "horizontal_px": if horizontal_wheel_observed { scroll_delta_x.abs() } else { 0.0 },
             "row_delta": if vertical_wheel_observed { 1 } else { 0 },
             "column_delta": if horizontal_wheel_observed { 1 } else { 0 },
-            "status": if required_wheel_axes_observed { "observed-operator-host-wheel-input" } else { "waiting-for-host-wheel-input" }
+            "status": observed_wheel_status
         });
         extra["materialized_range_before_after"] = json!({
             "before": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": 0, "column_end": visible_columns.saturating_sub(1)},
             "after_vertical": {"row_start": vertical_row_after, "row_end": (vertical_row_after + visible_rows).min(rows).saturating_sub(1), "column_start": 0, "column_end": visible_columns.saturating_sub(1)},
             "after_horizontal": {"row_start": 0, "row_end": visible_rows.saturating_sub(1), "column_start": horizontal_col_after, "column_end": (horizontal_col_after + visible_columns).min(columns).saturating_sub(1)},
-            "status": "operator-host-wheel-input"
+            "status": selected_materialization_status
         });
         extra["visible_address_samples_before_after"] = json!({
             "before": extra["visible_address_samples_before"],
             "after_vertical": extra["visible_address_samples_after_vertical"],
             "after_horizontal": extra["visible_address_samples_after_horizontal"],
-            "status": "operator-host-wheel-input"
+            "status": selected_materialization_status
         });
         extra["non_os_scroll_model"] = json!({
             "status": "pass",
-            "input_kind": "operator_host_wheel_visible_range",
+            "input_kind": format!("{wheel_input_evidence_source}_visible_range"),
             "sample_count": 3,
             "logical_grid": {"columns": columns, "rows": rows, "cells": full_grid},
             "materialized_cell_count_max": materialized_cell_count_max,
@@ -49053,7 +49195,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "upload_budget_bytes": upload_budget
         });
         extra["budget_pass"] = json!(
-            required_wheel_axes_observed
+            selected_wheel_input_observed
+                && required_wheel_axes_observed
                 && frame_upload_budget_pass
                 && (software_adapter
                     || wheel_to_visible_ms.is_some_and(|value| {
@@ -49419,6 +49562,27 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
     let frame_max = max_axis_f64("presented_frame_ms_max", p95);
     let render_hook_p95 = max_axis_f64("render_hook_ms_p95", 0.0);
     let first_presented_frame_ms = max_axis_f64("first_presented_frame_ms", 0.0);
+    let vertical_measured_frame_count =
+        axis_scroll_timing_u64(&axis_summary, "vertical", "measured_frame_count").unwrap_or(0);
+    let horizontal_measured_frame_count =
+        axis_scroll_timing_u64(&axis_summary, "horizontal", "measured_frame_count").unwrap_or(0);
+    let vertical_over_16_7_indices = axis_scroll_timing_u64_array(
+        &axis_summary,
+        "vertical",
+        "presented_frame_ms_over_16_7_indices",
+    );
+    let horizontal_over_16_7_indices = axis_scroll_timing_u64_array(
+        &axis_summary,
+        "horizontal",
+        "presented_frame_ms_over_16_7_indices",
+    );
+    let mut combined_over_16_7_indices = vertical_over_16_7_indices.clone();
+    combined_over_16_7_indices.extend(
+        horizontal_over_16_7_indices
+            .iter()
+            .map(|index| index.saturating_add(vertical_measured_frame_count)),
+    );
+    let over_16_7_max = max_axis_f64("presented_frame_ms_over_16_7_max", 0.0);
     let measured_frame_count = sum_axis_u64("measured_frame_count");
     let sample_frame_count = sum_axis_u64("sample_frame_count");
     let warmup_frame_count = max_axis_u64("warmup_frame_count");
@@ -49436,6 +49600,9 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
         "presented_frame_ms_p50": p50,
         "presented_frame_ms_p95": p95,
         "presented_frame_ms_p99": p99,
+        "presented_frame_ms_over_16_7_count": combined_over_16_7_indices.len() as u64,
+        "presented_frame_ms_over_16_7_indices": combined_over_16_7_indices,
+        "presented_frame_ms_over_16_7_max": over_16_7_max,
         "render_hook_ms_p95": render_hook_p95,
         "sample_frame_count": sample_frame_count,
         "warmup_frame_count": warmup_frame_count,
@@ -49454,6 +49621,29 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
             .cloned()
             .unwrap_or_else(|| json!({})),
         "combined": combined_timing.clone()
+    });
+    extra["post_input_measured_frame_count_per_axis"] = json!({
+        "status": "pass",
+        "vertical": vertical_measured_frame_count,
+        "horizontal": horizontal_measured_frame_count
+    });
+    let vertical_skipped_render_hook_proof = axis_summary
+        .pointer("/vertical_observation/render_hook_app_owned_proof_skipped")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let horizontal_skipped_render_hook_proof = axis_summary
+        .pointer("/horizontal_observation/render_hook_app_owned_proof_skipped")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    extra["render_hook_app_owned_proof_skipped_for_axis_timing"] =
+        json!(vertical_skipped_render_hook_proof && horizontal_skipped_render_hook_proof);
+    extra["frames_over_16_7_ms_per_axis"] = json!({
+        "status": "pass",
+        "vertical": vertical_over_16_7_indices,
+        "horizontal": horizontal_over_16_7_indices,
+        "vertical_count": vertical_over_16_7_indices.len() as u64,
+        "horizontal_count": horizontal_over_16_7_indices.len() as u64,
+        "max_ms": over_16_7_max
     });
     extra["post_input_frame_timing"] = combined_timing.clone();
     extra["preview_frame_timing"] = combined_timing;
@@ -49491,6 +49681,25 @@ fn axis_scroll_timing_u64(
             "/{axis}_observation/surface_post_input_frame_timing/{field}"
         ))
         .and_then(serde_json::Value::as_u64)
+}
+
+fn axis_scroll_timing_u64_array(
+    axis_summary: &serde_json::Value,
+    axis: &str,
+    field: &str,
+) -> Vec<u64> {
+    axis_summary
+        .pointer(&format!(
+            "/{axis}_observation/surface_post_input_frame_timing/{field}"
+        ))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn native_scroll_axis_observation_pass(observation: &serde_json::Value, axis: &str) -> bool {
@@ -49667,37 +49876,65 @@ fn native_scroll_input_route_evidence(
         (!regions.is_empty()).then_some(regions)
     })
     .unwrap_or_default();
-    let operator_wheel_input = report
+    let planned_operator_host_wheel_input = report
         .get("operator_host_wheel_input")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
-    let wheel_count = if operator_wheel_input {
+    let wheel_input_evidence_source = report
+        .get("wheel_input_evidence_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(if planned_operator_host_wheel_input {
+            "operator-host-plan"
+        } else {
+            "missing"
+        });
+    let operator_wheel_input = wheel_input_evidence_source == "operator-host-plan";
+    let wheel_count = report
+        .get("wheel_events_coalesced")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            if operator_wheel_input {
+                report
+                    .get("wheel_events_coalesced")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            } else {
+                report
+                    .pointer("/native_input_adapter/mouse_scroll_event_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            }
+        });
+    let vertical_wheel_observed = if operator_wheel_input {
         report
-            .get("wheel_events_coalesced")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
+            .get("operator_vertical_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
     } else {
         report
-            .pointer("/native_input_adapter/mouse_scroll_event_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
+            .get("real_vertical_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || report
+                .get("app_owned_window_vertical_wheel_input")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
     };
-    let vertical_wheel_observed = report
-        .get(if operator_wheel_input {
-            "operator_vertical_wheel_input"
-        } else {
-            "real_vertical_wheel_input"
-        })
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let horizontal_wheel_observed = report
-        .get(if operator_wheel_input {
-            "operator_horizontal_wheel_input"
-        } else {
-            "real_horizontal_wheel_input"
-        })
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
+    let horizontal_wheel_observed = if operator_wheel_input {
+        report
+            .get("operator_horizontal_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    } else {
+        report
+            .get("real_horizontal_wheel_input")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || report
+                .get("app_owned_window_horizontal_wheel_input")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    };
     let has_vertical = scroll_regions.iter().any(|region| {
         region.get("axis").and_then(serde_json::Value::as_str) == Some("vertical")
             || region.get("axis").and_then(serde_json::Value::as_str) == Some("Vertical")
@@ -49731,6 +49968,7 @@ fn native_scroll_input_route_evidence(
         "has_vertical_scroll_region": has_vertical,
         "has_horizontal_scroll_region": has_horizontal,
         "wheel_event_count": wheel_count,
+        "wheel_input_evidence_source": wheel_input_evidence_source,
         "vertical_wheel_observed": vertical_wheel_observed,
         "horizontal_wheel_observed": horizontal_wheel_observed,
         "scroll_regions": scroll_regions,
@@ -49780,7 +50018,9 @@ fn passive_scroll_property_tree_proof(report: &serde_json::Value) -> serde_json:
         .and_then(serde_json::Value::as_str);
     let materialization_observed = matches!(
         materialized_status,
-        Some("operator-host-wheel-input") | Some("real-window-wheel-input")
+        Some("operator-host-wheel-input")
+            | Some("real-window-wheel-input")
+            | Some("app-window-wheel-input")
     );
     let invalidation_classes = report
         .get("invalidation_classes")
@@ -62454,13 +62694,30 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
     {
         blockers.push("passive_scroll_property_tree_proof.status must be pass".to_owned());
     }
-    if report
+    let materialized_status = report
         .pointer("/materialized_range_before_after/status")
+        .and_then(serde_json::Value::as_str);
+    if !matches!(
+        materialized_status,
+        Some("operator-host-wheel-input")
+            | Some("real-window-wheel-input")
+            | Some("app-window-wheel-input")
+    ) {
+        blockers.push(
+            "materialized_range_before_after.status must be operator-host-wheel-input, real-window-wheel-input, or app-window-wheel-input"
+                .to_owned(),
+        );
+    }
+    require_nonempty_str_field(blockers, report, "wheel_input_evidence_source");
+    require_bool_field(blockers, report, "selected_wheel_input_observed", true);
+    if report
+        .get("wheel_input_evidence_source")
         .and_then(serde_json::Value::as_str)
-        != Some("operator-host-wheel-input")
+        .is_some_and(|source| matches!(source, "operator-host-plan" | "missing"))
     {
         blockers.push(
-            "materialized_range_before_after.status must be operator-host-wheel-input".to_owned(),
+            "wheel_input_evidence_source must be observed app-window or real-window evidence, not only a planned host-wheel sequence"
+                .to_owned(),
         );
     }
     require_u64_at_least(blockers, report, "wheel_events_coalesced", 1);
@@ -62512,7 +62769,59 @@ fn require_common_scroll_hot_path_fields(blockers: &mut Vec<String>, report: &se
             native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0),
         );
     }
+    if report
+        .pointer("/axis_specific_post_input_frame_timing/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+    {
+        require_bool_field(
+            blockers,
+            report,
+            "render_hook_app_owned_proof_skipped_for_axis_timing",
+            true,
+        );
+        require_object_field(blockers, report, "post_input_measured_frame_count_per_axis");
+        for axis in ["vertical", "horizontal"] {
+            if report
+                .pointer(&format!("/post_input_measured_frame_count_per_axis/{axis}"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                < 30
+            {
+                blockers.push(format!(
+                    "post_input_measured_frame_count_per_axis.{axis} must be at least 30"
+                ));
+            }
+        }
+    }
     require_u64_array_field(blockers, report, "frames_over_16_7_ms");
+    if let Some(indices) = report
+        .get("frames_over_16_7_ms")
+        .and_then(serde_json::Value::as_array)
+    {
+        if let Some(count) = report
+            .get("frames_over_16_7_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            if count != indices.len() as u64 {
+                blockers.push(
+                    "frames_over_16_7_count must match frames_over_16_7_ms length".to_owned(),
+                );
+            }
+        }
+        if let Some(measured_frame_count) = report
+            .pointer("/preview_frame_timing/measured_frame_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            for index in indices.iter().filter_map(serde_json::Value::as_u64) {
+                if index >= measured_frame_count {
+                    blockers.push(format!(
+                        "frames_over_16_7_ms index {index} must be less than preview_frame_timing.measured_frame_count {measured_frame_count}"
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn require_active_pending_snapshot_backpressure(
@@ -66205,6 +66514,8 @@ fn run_isolated_weston_desktop_preview_e2e(
         "wayland_info_stderr_path": wayland_info_stderr_path,
         "desktop_stdout_path": desktop_stdout_path,
         "desktop_stderr_path": desktop_stderr_path,
+        "desktop_args": desktop_args,
+        "render_hook_app_owned_proof_skipped": true,
         "desktop_exit_status": desktop_status
             .as_ref()
             .map(std::process::ExitStatus::to_string)
@@ -66655,6 +66966,7 @@ fn run_linux_human_like_desktop_surface_smoke(
         "--probe".to_owned(),
         "--real-window-input-probe".to_owned(),
         "--demand-driven-loop".to_owned(),
+        "--skip-render-hook-app-owned-proof".to_owned(),
         "--child-hold-ms".to_owned(),
         "8000".to_owned(),
         "--dev-hold-ms".to_owned(),
@@ -81103,6 +81415,7 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             "axis_specific_real_window_scroll_observation": {
                 "status": "pass",
                 "vertical_observation": {
+                    "render_hook_app_owned_proof_skipped": true,
                     "surface_post_input_frame_timing": {
                         "first_presented_frame_ms": 300.0,
                         "measured_frame_count": 59,
@@ -81110,12 +81423,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                         "presented_frame_ms_p50": 10.1,
                         "presented_frame_ms_p95": 12.3,
                         "presented_frame_ms_p99": 17.6,
+                        "presented_frame_ms_over_16_7_indices": [12],
+                        "presented_frame_ms_over_16_7_max": 17.6,
                         "render_hook_ms_p95": 3.2,
                         "sample_frame_count": 60,
                         "warmup_frame_count": 3
                     }
                 },
                 "horizontal_observation": {
+                    "render_hook_app_owned_proof_skipped": true,
                     "surface_post_input_frame_timing": {
                         "first_presented_frame_ms": 310.0,
                         "measured_frame_count": 59,
@@ -81123,6 +81439,8 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                         "presented_frame_ms_p50": 10.2,
                         "presented_frame_ms_p95": 14.9,
                         "presented_frame_ms_p99": 16.8,
+                        "presented_frame_ms_over_16_7_indices": [20],
+                        "presented_frame_ms_over_16_7_max": 16.8,
                         "render_hook_ms_p95": 3.4,
                         "sample_frame_count": 60,
                         "warmup_frame_count": 3
@@ -81158,9 +81476,167 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         );
         assert_eq!(
             report
+                .pointer("/post_input_measured_frame_count_per_axis/vertical")
+                .and_then(serde_json::Value::as_u64),
+            Some(59)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_measured_frame_count_per_axis/horizontal")
+                .and_then(serde_json::Value::as_u64),
+            Some(59)
+        );
+        assert_eq!(
+            report
                 .get("speed_timing_window")
                 .and_then(serde_json::Value::as_str),
             Some("axis-specific-post-real-window-input")
+        );
+        assert_eq!(
+            report
+                .get("render_hook_app_owned_proof_skipped_for_axis_timing")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            report
+                .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_indices")
+                .and_then(serde_json::Value::as_array)
+                .cloned(),
+            Some(vec![json!(12), json!(79)])
+        );
+    }
+
+    #[test]
+    fn planned_operator_wheel_input_is_not_observed_scroll_speed_evidence() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 4.0,
+            "operator_host_wheel_input": true,
+            "operator_host_input_evidence": {
+                "host_events": [{"kind": "wheel"}, {"kind": "wheel"}],
+                "deltas": {"vertical_px": 720.0, "horizontal_px": 480.0}
+            },
+            "native_input_adapter": {
+                "mouse_scroll_event_count": 0,
+                "scroll_delta_x": 0.0,
+                "scroll_delta_y": 0.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": false
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "cells", false);
+
+        assert_eq!(
+            report
+                .get("wheel_input_evidence_source")
+                .and_then(serde_json::Value::as_str),
+            Some("operator-host-plan")
+        );
+        assert_eq!(
+            report
+                .get("selected_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn axis_specific_real_window_input_overrides_planned_operator_wheel_input() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "operator_host_wheel_input": true,
+            "operator_host_input_evidence": {
+                "host_events": [{"kind": "wheel"}, {"kind": "wheel"}],
+                "deltas": {"vertical_px": 720.0, "horizontal_px": 480.0}
+            },
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "mouse_scroll_event_count": 0,
+                "scroll_delta_x": 0.0,
+                "scroll_delta_y": 0.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": false
+            },
+            "axis_specific_real_window_scroll_observation": {
+                "status": "pass",
+                "combined_input_adapter": {
+                    "mouse_scroll_event_count": 4,
+                    "scroll_delta_x": 480.0,
+                    "scroll_delta_y": 720.0
+                },
+                "vertical_observation": {
+                    "surface_post_input_frame_timing": {
+                        "measured_frame_count": 59,
+                        "presented_frame_ms_p95": 11.0,
+                        "sample_frame_count": 60,
+                        "warmup_frame_count": 3
+                    }
+                },
+                "horizontal_observation": {
+                    "surface_post_input_frame_timing": {
+                        "measured_frame_count": 59,
+                        "presented_frame_ms_p95": 12.0,
+                        "sample_frame_count": 60,
+                        "warmup_frame_count": 3
+                    }
+                }
+            }
+        });
+
+        assert!(promote_axis_specific_scroll_timing(&mut report));
+        add_native_scroll_model_evidence(&mut report, "cells", false);
+
+        assert_eq!(
+            report
+                .get("wheel_input_evidence_source")
+                .and_then(serde_json::Value::as_str),
+            Some("axis-specific-real-window-adapter")
+        );
+        assert_eq!(
+            report
+                .get("selected_wheel_input_observed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("operator_vertical_wheel_input")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("real_vertical_wheel_input")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .pointer("/materialized_range_before_after/status")
+                .and_then(serde_json::Value::as_str),
+            Some("real-window-wheel-input")
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 }

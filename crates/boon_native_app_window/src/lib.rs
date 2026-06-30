@@ -1593,6 +1593,9 @@ pub struct NativeFrameTimingProof {
     pub presented_frame_ms_p95: f64,
     pub presented_frame_ms_p99: f64,
     pub presented_frame_ms_max: f64,
+    pub presented_frame_ms_over_16_7_count: u32,
+    pub presented_frame_ms_over_16_7_indices: Vec<u32>,
+    pub presented_frame_ms_over_16_7_max: f64,
     pub render_hook_ms_p95: Option<f64>,
 }
 
@@ -2165,6 +2168,8 @@ async fn run_surface_probe_inner(
     let mut surface_acquire_samples = Vec::new();
     let mut present_submit_samples = Vec::new();
     let mut presented_frame_samples = Vec::new();
+    let mut presented_frame_over_16_7_indices = Vec::new();
+    let mut presented_frame_over_16_7_max = 0.0_f64;
     let mut render_hook_samples = Vec::new();
     let mut pending_readback = None;
     let loop_mode = if options.hold_ms == 0 || options.demand_driven_loop {
@@ -2365,17 +2370,23 @@ async fn run_surface_probe_inner(
             )?;
         }
         let current_present_submit_ms = elapsed_ms(present_start);
+        let frame_ms = current_surface_acquire_ms + current_present_submit_ms;
         if frame_index == 0 {
             surface_acquire_ms = current_surface_acquire_ms;
             present_submit_ms = current_present_submit_ms;
-            first_presented_frame_ms = current_surface_acquire_ms + current_present_submit_ms;
+            first_presented_frame_ms = frame_ms;
         }
         let include_timing_sample =
             frame_index >= warmup_frame_count && !(readback_sample_frame && sample_frame_count > 1);
         if include_timing_sample {
             surface_acquire_samples.push(current_surface_acquire_ms);
             present_submit_samples.push(current_present_submit_ms);
-            presented_frame_samples.push(current_surface_acquire_ms + current_present_submit_ms);
+            let sample_index = presented_frame_samples.len() as u32;
+            presented_frame_samples.push(frame_ms);
+            if frame_ms > 16.7 {
+                presented_frame_over_16_7_indices.push(sample_index);
+                presented_frame_over_16_7_max = presented_frame_over_16_7_max.max(frame_ms);
+            }
             if let Some(render_hook_ms) = render_hook_ms {
                 render_hook_samples.push(render_hook_ms);
             }
@@ -2405,6 +2416,9 @@ async fn run_surface_probe_inner(
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
+        presented_frame_ms_over_16_7_count: presented_frame_over_16_7_indices.len() as u32,
+        presented_frame_ms_over_16_7_indices: presented_frame_over_16_7_indices,
+        presented_frame_ms_over_16_7_max: presented_frame_over_16_7_max,
         render_hook_ms_p95: (!render_hook_samples.is_empty())
             .then(|| percentile(&render_hook_samples, 0.95)),
     };
@@ -2441,6 +2455,8 @@ async fn run_surface_probe_inner(
         let mut post_input_surface_acquire_samples = Vec::new();
         let mut post_input_present_submit_samples = Vec::new();
         let mut post_input_presented_frame_samples = Vec::new();
+        let mut post_input_presented_frame_over_16_7_indices = Vec::new();
+        let mut post_input_presented_frame_over_16_7_max = 0.0_f64;
         let mut post_input_render_hook_samples = Vec::new();
         let mut post_input_first_frame_ms = 0.0;
         let mut post_input_readback = None;
@@ -2606,7 +2622,13 @@ async fn run_surface_probe_inner(
             if include_timing_sample {
                 post_input_surface_acquire_samples.push(current_surface_acquire_ms);
                 post_input_present_submit_samples.push(current_present_submit_ms);
+                let sample_index = post_input_presented_frame_samples.len() as u32;
                 post_input_presented_frame_samples.push(frame_ms);
+                if frame_ms > 16.7 {
+                    post_input_presented_frame_over_16_7_indices.push(sample_index);
+                    post_input_presented_frame_over_16_7_max =
+                        post_input_presented_frame_over_16_7_max.max(frame_ms);
+                }
                 if let Some(render_hook_ms) = post_input_render_hook_ms {
                     post_input_render_hook_samples.push(render_hook_ms);
                 }
@@ -2636,6 +2658,10 @@ async fn run_surface_probe_inner(
                 .iter()
                 .copied()
                 .fold(0.0_f64, f64::max),
+            presented_frame_ms_over_16_7_count: post_input_presented_frame_over_16_7_indices.len()
+                as u32,
+            presented_frame_ms_over_16_7_indices: post_input_presented_frame_over_16_7_indices,
+            presented_frame_ms_over_16_7_max: post_input_presented_frame_over_16_7_max,
             render_hook_ms_p95: (!post_input_render_hook_samples.is_empty())
                 .then(|| percentile(&post_input_render_hook_samples, 0.95)),
         });

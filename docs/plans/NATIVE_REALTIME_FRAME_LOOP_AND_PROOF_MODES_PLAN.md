@@ -1042,6 +1042,35 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   hardcoded field-name audits and aggregate release performance gates remain
   open.
 
+2026-07-01 legacy selection fallback reporting and aggregate gate slice:
+
+- Retained selection overlay sync stats now report
+  `selection_overlay_source`, `legacy_selection_fallback_count`, and
+  `legacy_selection_fallback_reason`.
+- The generic selected-node overlay helper records
+  `selection_overlay_source=generic-selected-node-set` and zero legacy fallback
+  count. The older address/source-intent compatibility helper records
+  `selection_overlay_source=legacy-address-source-intent` with a nonzero
+  fallback count, making the fallback visible instead of silently blending into
+  the product hot path.
+- `verify-native-cells-visible-click-e2e` retained-update contract now fails
+  measured samples that use the legacy selection fallback. The fallback remains
+  diagnostic compatibility code in the playground, but it is no longer accepted
+  for the release visible-click UX proof path.
+- `verify-native-gpu-all` now requires the release Cells visible-click E2E
+  report at `target/reports/native-gpu/cells-visible-click-e2e-release.json`,
+  and the architecture handoff command list includes the same gate.
+- Added focused unit coverage for:
+  - generic retained selected-node overlay reporting zero legacy fallback;
+  - legacy address overlay reporting fallback use;
+  - visible-click retained-update contract rejection for legacy fallback;
+  - native handoff aggregate requiring the visible-click release report;
+  - native label-contract rejection of legacy visible-click selection fallback.
+- This still does not complete the full plan. Remaining work includes removing
+  or further genericizing the address-shaped compatibility paths, strengthening
+  perf-HUD positive gates, broadening active/pending snapshot currentness proof,
+  and finishing the generic runtime/list/formula currentness work.
+
 ## Implementation Slices
 
 1. Terminology and schema:

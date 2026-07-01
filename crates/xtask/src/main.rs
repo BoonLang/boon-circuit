@@ -54607,6 +54607,10 @@ fn verify_native_cells_visible_click_e2e(
             "max_click_to_present_ms": max_click_to_present_ms,
             "operator_host_input": false,
             "real_os_input": real_os_input,
+            "readback_ok": readback_ok,
+            "readback_hash_changed": readback_hash_changed,
+            "structured_external_proof_changed": structured_external_proof_changed,
+            "proof_current_changed": proof_current_changed,
             "measurement_source": "isolated-weston-real-app-window-mouse-click-plus-app-owned-render-proof-or-wgpu-readback-then-sparse-runtime-value",
             "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
             "visual_capture_method": "app-owned-wgpu-readback",
@@ -55517,9 +55521,11 @@ fn cells_visible_click_retained_update_contract_summary(
     let mut document_patch_fast_path_rejected_count = 0_u64;
     let mut committed_render_patch_count = 0_u64;
     let mut committed_render_scene_patch_applied_count = 0_u64;
+    let mut legacy_selection_fallback_count = 0_u64;
     let mut layout_source_counts = BTreeMap::<String, u64>::new();
     let mut summary_source_counts = BTreeMap::<String, u64>::new();
     let mut render_scene_patch_source_counts = BTreeMap::<String, u64>::new();
+    let mut selection_overlay_source_counts = BTreeMap::<String, u64>::new();
     let mut sample_failures = Vec::new();
     let samples = live_probe
         .get("click_samples")
@@ -55596,6 +55602,28 @@ fn cells_visible_click_retained_update_contract_summary(
         *render_scene_patch_source_counts
             .entry(render_scene_patch_source.to_owned())
             .or_default() += 1;
+        let retained_bound_sync = sample
+            .pointer("/present_probe/last_external_render_proof/retained_bound_sync")
+            .filter(|value| value.is_object());
+        let selection_overlay_source = retained_bound_sync
+            .and_then(|value| {
+                value
+                    .get("selection_overlay_source")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("missing");
+        *selection_overlay_source_counts
+            .entry(selection_overlay_source.to_owned())
+            .or_default() += 1;
+        let sample_legacy_selection_fallback_count = retained_bound_sync
+            .and_then(|value| {
+                value
+                    .get("legacy_selection_fallback_count")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(0);
+        legacy_selection_fallback_count =
+            legacy_selection_fallback_count.saturating_add(sample_legacy_selection_fallback_count);
         if !retained_committed_update
             || layout_source == "full_document_lower"
             || render_patch_count == 0 && coalesced_render_patch_count == 0
@@ -55603,6 +55631,7 @@ fn cells_visible_click_retained_update_contract_summary(
                 .get("document_patch_fast_path_rejected")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
+            || sample_legacy_selection_fallback_count > 0
         {
             sample_failures.push(json!({
                 "index": sample_index,
@@ -55619,7 +55648,13 @@ fn cells_visible_click_retained_update_contract_summary(
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
                 "render_scene_patch_source": render_scene_patch_source,
-                "reason": "non_retained_or_unpatched_committed_update"
+                "selection_overlay_source": selection_overlay_source,
+                "legacy_selection_fallback_count": sample_legacy_selection_fallback_count,
+                "reason": if sample_legacy_selection_fallback_count > 0 {
+                    "legacy_selection_fallback_used"
+                } else {
+                    "non_retained_or_unpatched_committed_update"
+                }
             }));
         }
     }
@@ -55629,6 +55664,7 @@ fn cells_visible_click_retained_update_contract_summary(
         && committed_render_patch_count == click_sample_count
         && full_document_lower_count == 0
         && document_patch_fast_path_rejected_count == 0
+        && legacy_selection_fallback_count == 0
     {
         "pass"
     } else {
@@ -55643,9 +55679,11 @@ fn cells_visible_click_retained_update_contract_summary(
         "document_patch_fast_path_rejected_count": document_patch_fast_path_rejected_count,
         "committed_render_patch_count": committed_render_patch_count,
         "committed_render_scene_patch_applied_count": committed_render_scene_patch_applied_count,
+        "legacy_selection_fallback_count": legacy_selection_fallback_count,
         "layout_source_counts": layout_source_counts,
         "summary_source_counts": summary_source_counts,
         "render_scene_patch_source_counts": render_scene_patch_source_counts,
+        "selection_overlay_source_counts": selection_overlay_source_counts,
         "sample_failures": sample_failures,
     })
 }
@@ -61458,6 +61496,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "cells")],
         ),
         native_gpu_required_report(
+            "cells-visible-click-e2e-release",
+            "target/reports/native-gpu/cells-visible-click-e2e-release.json",
+            "verify-native-cells-visible-click-e2e",
+            &[("--profile", "release")],
+        ),
+        native_gpu_required_report(
             "scroll-speed-dev-code-editor",
             "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
             "verify-native-gpu-scroll-speed",
@@ -62039,6 +62083,85 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 blockers.push("workflow_coverage_pass must be true".to_owned());
             }
             require_u64_at_least(&mut blockers, report, "workflow_event_count", 6);
+        }
+        "cells-visible-click-e2e-release" => {
+            require_str_field(
+                &mut blockers,
+                report,
+                "command",
+                "verify-native-cells-visible-click-e2e",
+            );
+            require_str_field(&mut blockers, report, "profile", "release");
+            require_bool_field(&mut blockers, report, "operator_host_input", false);
+            require_bool_field(&mut blockers, report, "real_os_input", true);
+            require_u64_at_least(&mut blockers, report, "target_count", 2);
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "input_wake_to_formula_visible_ms_p95",
+                report
+                    .get("max_click_to_formula_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(16.7),
+            );
+            require_f64_at_most(
+                &mut blockers,
+                report,
+                "click_to_formula_visible_ms_p95",
+                report
+                    .get("max_click_to_present_ms")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(33.4),
+            );
+            if report
+                .get("click_to_visible_max_budget_or_bounded_outliers_pass")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                blockers.push(
+                    "cells-visible-click release must pass bounded visible-click outlier policy"
+                        .to_owned(),
+                );
+            }
+            for (path, label) in [
+                (
+                    "/retained_update_contract/status",
+                    "retained_update_contract",
+                ),
+                ("/runtime_work_contract/status", "runtime_work_contract"),
+                (
+                    "/formula_transition_contract/status",
+                    "formula_transition_contract",
+                ),
+                (
+                    "/selected_cell_transition_contract/status",
+                    "selected_cell_transition_contract",
+                ),
+            ] {
+                if report.pointer(path).and_then(serde_json::Value::as_str) != Some("pass") {
+                    blockers.push(format!("{label}.status must be pass"));
+                }
+            }
+            if report
+                .pointer("/retained_update_contract/legacy_selection_fallback_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+            {
+                blockers.push(
+                    "cells-visible-click release must not use legacy address selection fallback"
+                        .to_owned(),
+                );
+            }
+            if report
+                .get("proof_current_changed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                blockers.push(
+                    "cells-visible-click release must prove current changed app-owned WGPU pixels"
+                        .to_owned(),
+                );
+            }
         }
         "novywave-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
@@ -64809,6 +64932,10 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         "verify-native-cells-interaction-speed" => match value_arg(args, "--profile").as_deref() {
             Some("release") => "cells-interaction-speed-release",
             _ => "cells-interaction-speed-debug",
+        },
+        "verify-native-cells-visible-click-e2e" => match value_arg(args, "--profile").as_deref() {
+            Some("release") => "cells-visible-click-e2e-release",
+            _ => "cells-visible-click-e2e-debug",
         },
         "verify-native-gpu-idle-wake" => match value_arg(args, "--example").as_deref() {
             Some("counter") => "idle-wake-counter",
@@ -82131,6 +82258,138 @@ mod tests {
         assert!(
             !cells_plan_compare_semantic_delta_readiness_contract(&unsupported_missing).0,
             "demand-current readiness must only allow omitted demand-current fields"
+        );
+    }
+
+    #[test]
+    fn cells_visible_click_retained_update_contract_rejects_legacy_selection_fallback() {
+        let sample = json!({
+            "index": 0,
+            "interaction_timing": {
+                "layout_source": "visible_state_sync",
+                "summary_source": "retained_current",
+                "render_patch_count": 1,
+                "coalesced_render_patch_count": 0,
+                "document_patch_fast_path_rejected": false,
+                "layout_patch_profile": {
+                    "render_scene_patch_applied": true
+                }
+            },
+            "present_probe": {
+                "last_external_render_proof": {
+                    "render_scene_patch_source": "input-overlay-sidecar",
+                    "retained_bound_sync": {
+                        "status": "pass",
+                        "selection_overlay_source": "generic-selected-node-set",
+                        "legacy_selection_fallback_count": 0
+                    }
+                }
+            }
+        });
+        let pass_probe = json!({
+            "click_samples": [sample.clone()]
+        });
+        let pass_summary = cells_visible_click_retained_update_contract_summary(&pass_probe);
+        assert_eq!(
+            pass_summary
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            pass_summary
+                .get("legacy_selection_fallback_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+
+        let mut legacy_sample = sample;
+        legacy_sample["present_probe"]["last_external_render_proof"]["retained_bound_sync"]["selection_overlay_source"] =
+            json!("legacy-address-source-intent");
+        legacy_sample["present_probe"]["last_external_render_proof"]["retained_bound_sync"]["legacy_selection_fallback_count"] =
+            json!(1);
+        let fail_probe = json!({
+            "click_samples": [legacy_sample]
+        });
+        let fail_summary = cells_visible_click_retained_update_contract_summary(&fail_probe);
+        assert_eq!(
+            fail_summary
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(
+            fail_summary
+                .get("legacy_selection_fallback_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            fail_summary
+                .pointer("/sample_failures/0/reason")
+                .and_then(serde_json::Value::as_str),
+            Some("legacy_selection_fallback_used")
+        );
+    }
+
+    #[test]
+    fn native_gpu_handoff_requires_cells_visible_click_release_report() {
+        let reports = native_gpu_handoff_required_reports();
+        let report = reports
+            .iter()
+            .find(|report| report.label == "cells-visible-click-e2e-release")
+            .expect("native GPU handoff must require the Cells visible-click release gate");
+        assert_eq!(
+            report.path,
+            PathBuf::from("target/reports/native-gpu/cells-visible-click-e2e-release.json")
+        );
+        assert_eq!(report.command, "verify-native-cells-visible-click-e2e");
+        assert_eq!(report.required_argv, &[("--profile", "release")]);
+    }
+
+    #[test]
+    fn native_gpu_label_contract_rejects_cells_visible_click_legacy_selection_fallback() {
+        let report = json!({
+            "command": "verify-native-cells-visible-click-e2e",
+            "profile": "release",
+            "operator_host_input": false,
+            "real_os_input": true,
+            "target_count": 8,
+            "input_wake_to_formula_visible_ms_p95": 12.0,
+            "click_to_formula_visible_ms_p95": 24.0,
+            "max_click_to_formula_ms": 16.7,
+            "max_click_to_present_ms": 33.4,
+            "click_to_visible_max_budget_or_bounded_outliers_pass": true,
+            "proof_current_changed": true,
+            "retained_update_contract": {
+                "status": "pass",
+                "legacy_selection_fallback_count": 0
+            },
+            "runtime_work_contract": {
+                "status": "pass"
+            },
+            "formula_transition_contract": {
+                "status": "pass"
+            },
+            "selected_cell_transition_contract": {
+                "status": "pass"
+            }
+        });
+        assert!(
+            native_gpu_label_contract_blockers("cells-visible-click-e2e-release", &report)
+                .is_empty(),
+            "well-formed release visible-click report should satisfy the label contract"
+        );
+
+        let mut fallback_report = report;
+        fallback_report["retained_update_contract"]["legacy_selection_fallback_count"] = json!(1);
+        let blockers =
+            native_gpu_label_contract_blockers("cells-visible-click-e2e-release", &fallback_report);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("legacy address selection fallback")),
+            "label contract must reject legacy selection fallback: {blockers:?}"
         );
     }
 

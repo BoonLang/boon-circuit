@@ -36277,6 +36277,9 @@ fn unix_now_ms() -> u128 {
 struct PreviewRetainedBoundSyncStats {
     status: &'static str,
     reason: Option<String>,
+    selection_overlay_source: Option<&'static str>,
+    legacy_selection_fallback_count: usize,
+    legacy_selection_fallback_reason: Option<String>,
     target_node_count: usize,
     item_index_count: usize,
     source_intent_update_count: usize,
@@ -36320,6 +36323,15 @@ fn merge_preview_retained_bound_sync_stats(
         next.status
     };
     existing.reason = next.reason.or_else(|| existing.reason.take());
+    existing.selection_overlay_source = next
+        .selection_overlay_source
+        .or(existing.selection_overlay_source);
+    existing.legacy_selection_fallback_count = existing
+        .legacy_selection_fallback_count
+        .saturating_add(next.legacy_selection_fallback_count);
+    existing.legacy_selection_fallback_reason = next
+        .legacy_selection_fallback_reason
+        .or_else(|| existing.legacy_selection_fallback_reason.take());
     existing.target_node_count = existing.target_node_count.max(next.target_node_count);
     existing.item_index_count = existing.item_index_count.max(next.item_index_count);
     existing.source_intent_update_count = existing
@@ -36392,6 +36404,9 @@ fn preview_retained_bound_sync_stats_json_for(
         Some(stats) => json!({
             "status": stats.status,
             "reason": stats.reason,
+            "selection_overlay_source": stats.selection_overlay_source,
+            "legacy_selection_fallback_count": stats.legacy_selection_fallback_count,
+            "legacy_selection_fallback_reason": stats.legacy_selection_fallback_reason,
             "target_node_count": stats.target_node_count,
             "item_index_count": stats.item_index_count,
             "source_intent_update_count": stats.source_intent_update_count,
@@ -42191,6 +42206,9 @@ fn preview_patch_retained_selected_nodes_overlay(
     record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
         status: "pass",
         reason: None,
+        selection_overlay_source: Some("generic-selected-node-set"),
+        legacy_selection_fallback_count: 0,
+        legacy_selection_fallback_reason: None,
         target_node_count: target_nodes.len(),
         item_index_count: target_nodes.len(),
         source_intent_update_count: 0,
@@ -42357,6 +42375,11 @@ fn preview_patch_retained_selected_address_overlay(
     record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
         status: "pass",
         reason: None,
+        selection_overlay_source: Some("legacy-address-source-intent"),
+        legacy_selection_fallback_count: 1,
+        legacy_selection_fallback_reason: Some(
+            "generic selected-node binding evidence was unavailable".to_owned(),
+        ),
         target_node_count: target_nodes.len(),
         item_index_count: target_nodes.len(),
         source_intent_update_count: 0,
@@ -63314,6 +63337,7 @@ mod tests {
 
     #[test]
     fn retained_selected_node_overlay_patches_generic_node_sets() {
+        clear_preview_retained_bound_sync_stats();
         let mut document_frame = boon_document_model::DocumentFrame::empty("root");
         let root = boon_document_model::DocumentNodeId("root".to_owned());
         append_child(
@@ -63378,8 +63402,81 @@ mod tests {
         );
         let stats = preview_retained_bound_sync_stats_snapshot()
             .expect("generic selected-node patch should record retained sync stats");
+        assert_eq!(
+            stats.selection_overlay_source,
+            Some("generic-selected-node-set")
+        );
+        assert_eq!(stats.legacy_selection_fallback_count, 0);
+        assert_eq!(stats.legacy_selection_fallback_reason, None);
         assert_eq!(stats.style_update_count, 2);
         assert_eq!(stats.text_update_count, 0);
+    }
+
+    #[test]
+    fn retained_selected_address_overlay_reports_legacy_fallback_use() {
+        clear_preview_retained_bound_sync_stats();
+        let mut document_frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut document_frame,
+            root.clone(),
+            dev_node(
+                "legacy-alpha",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Alpha".to_owned()),
+                &[("width", "96"), ("height", "24"), ("selected", "false")],
+            ),
+        );
+        append_child(
+            &mut document_frame,
+            root,
+            dev_node(
+                "legacy-beta",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Beta".to_owned()),
+                &[("width", "96"), ("height", "24"), ("selected", "true")],
+            ),
+        );
+        let layout_frame = layout_frame_for_document_frame(&document_frame, (320.0, 120.0))
+            .expect("test frame should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({
+                "source_intent_assertions": [
+                    {"node": "legacy-alpha", "intent": "address", "source_path": "alpha"},
+                    {"node": "legacy-beta", "intent": "address", "source_path": "beta"}
+                ]
+            }),
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+
+        let changed = preview_patch_retained_selected_address_overlay(
+            &shared_render_state,
+            "alpha",
+            Some("beta"),
+            &BTreeSet::new(),
+        )
+        .expect("legacy selected-address patch should apply");
+
+        assert!(changed);
+        let stats = preview_retained_bound_sync_stats_snapshot()
+            .expect("legacy selected-address patch should record retained sync stats");
+        assert_eq!(
+            stats.selection_overlay_source,
+            Some("legacy-address-source-intent")
+        );
+        assert_eq!(stats.legacy_selection_fallback_count, 1);
+        assert_eq!(
+            stats.legacy_selection_fallback_reason.as_deref(),
+            Some("generic selected-node binding evidence was unavailable")
+        );
+        assert_eq!(stats.style_update_count, 2);
     }
 
     #[test]

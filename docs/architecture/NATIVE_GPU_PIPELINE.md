@@ -1010,6 +1010,7 @@ cargo xtask verify-native-gpu-preview-e2e --example cells --report target/report
 cargo xtask verify-native-gpu-preview-e2e --example todo_mvc_physical --report target/reports/native-gpu/preview-e2e-todo_mvc_physical.json
 cargo xtask verify-native-todomvc-physical-reference-parity --report target/reports/native-gpu/todomvc-physical-reference-parity.json
 cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
+cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json
 cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
 cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json

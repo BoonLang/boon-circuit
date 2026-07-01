@@ -3443,6 +3443,7 @@ async fn run_surface_probe_inner(
     let mut last_render_loop_report_write_ms: Option<f64> = None;
     let mut last_render_loop_report_enqueue_ms: Option<f64> = None;
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
+    let mut recent_frame_evidence: VecDeque<serde_json::Value> = VecDeque::new();
     let mut preview_perf_accumulator = NativePreviewPerfAccumulator::default();
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
     let requested_present_path_mode = requested_present_path_mode_from_env();
@@ -3532,6 +3533,7 @@ async fn run_surface_probe_inner(
                     )
                     .with_external_render_proof(external_render_proof.as_ref())
                     .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+                    .with_recent_frame_evidence(&recent_frame_evidence)
                     .with_report_writer_stats(Some(report_writer_stats)),
                     None,
                 );
@@ -4335,6 +4337,24 @@ async fn run_surface_probe_inner(
         } else {
             "off"
         };
+        push_recent_frame_evidence(
+            &mut recent_frame_evidence,
+            recent_frame_evidence_entry(
+                &render_loop_state,
+                &current_frame_evidence_key,
+                hold_started.elapsed().as_secs_f64() * 1000.0,
+                last_sampled_input_event_wake_count,
+                last_presented_input_event_wake_count,
+                input_event_wake_elapsed_ms_for_generation(
+                    &input_event_wake_timeline,
+                    last_presented_input_event_wake_count,
+                    hold_started,
+                ),
+                stats_input_to_present_ms,
+                stats_proof_mode,
+                external_render_proof.as_ref(),
+            ),
+        );
         preview_perf_accumulator.record(
             stats_render_hook_ms,
             render_loop_state.last_render_frame_metrics.as_ref(),
@@ -4416,6 +4436,7 @@ async fn run_surface_probe_inner(
                 )
                 .with_external_render_proof(external_render_proof.as_ref())
                 .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+                .with_recent_frame_evidence(&recent_frame_evidence)
                 .with_report_writer_stats(Some(report_writer_stats)),
                 None,
             );
@@ -4517,6 +4538,7 @@ async fn run_surface_probe_inner(
             )
             .with_external_render_proof(external_render_proof.as_ref())
             .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+            .with_recent_frame_evidence(&recent_frame_evidence)
             .with_report_writer_stats(final_report_writer_stats),
             None,
         )?;
@@ -4713,6 +4735,7 @@ struct NativeRenderLoopReportExtras {
     observed_input_adapter: Option<NativeInputAdapterProof>,
     external_render_proof: Option<serde_json::Value>,
     frame_evidence_key: Option<FrameEvidenceKey>,
+    recent_frame_evidence: Vec<serde_json::Value>,
     report_writer: Option<AsyncRenderLoopReportStats>,
 }
 
@@ -4773,6 +4796,11 @@ impl NativeRenderLoopReportExtras {
         self
     }
 
+    fn with_recent_frame_evidence(mut self, recent: &VecDeque<serde_json::Value>) -> Self {
+        self.recent_frame_evidence = recent.iter().cloned().collect();
+        self
+    }
+
     fn with_report_writer_stats(mut self, stats: Option<AsyncRenderLoopReportStats>) -> Self {
         if let Some(stats) = stats.as_ref() {
             self.last_render_loop_report_write_ms = stats.last_write_ms;
@@ -4817,6 +4845,7 @@ fn render_loop_report_extras(
         observed_input_adapter: observed_input_adapter.cloned(),
         external_render_proof: None,
         frame_evidence_key: None,
+        recent_frame_evidence: Vec::new(),
         report_writer: None,
     }
 }
@@ -5116,6 +5145,111 @@ fn frame_evidence_key_for_presented_frame(
         present_id: state.rendered_frame_count,
         proof_request_id,
     }
+}
+
+fn push_recent_frame_evidence(recent: &mut VecDeque<serde_json::Value>, entry: serde_json::Value) {
+    const RECENT_FRAME_EVIDENCE_LIMIT: usize = 32;
+    recent.push_back(entry);
+    while recent.len() > RECENT_FRAME_EVIDENCE_LIMIT {
+        recent.pop_front();
+    }
+}
+
+fn compact_external_render_proof_for_recent_history(
+    proof: Option<&serde_json::Value>,
+    key: &FrameEvidenceKey,
+) -> serde_json::Value {
+    let Some(proof) = proof else {
+        return serde_json::Value::Null;
+    };
+    let keyed_proof = external_render_proof_with_frame_evidence_key(Some(proof.clone()), Some(key));
+    let Some(keyed_proof) = keyed_proof else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "status": keyed_proof.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_surface_rendered": keyed_proof.get("visible_surface_rendered").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_present_path": keyed_proof.get("visible_present_path").cloned().unwrap_or(serde_json::Value::Null),
+        "render_target_kind": keyed_proof.get("render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
+        "layout_artifact": keyed_proof.get("layout_artifact").cloned().unwrap_or(serde_json::Value::Null),
+        "retained_bound_sync": keyed_proof.get("retained_bound_sync").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_focus_state": keyed_proof.get("input_overlay_focus_state").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_focused_node_probe": keyed_proof.get("input_overlay_focused_node_probe").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_applied": keyed_proof.get("input_overlay_render_scene_patch_applied").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_built_this_frame": keyed_proof.get("input_overlay_render_scene_patch_built_this_frame").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_direct_encode": keyed_proof.get("input_overlay_render_scene_patch_direct_encode").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_touched_node_count": keyed_proof.get("input_overlay_render_scene_patch_touched_node_count").cloned().unwrap_or(serde_json::Value::Null),
+        "proof": {
+            "status": keyed_proof.pointer("/proof/status").cloned().unwrap_or(serde_json::Value::Null),
+            "capture_method": keyed_proof.pointer("/proof/capture_method").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_evidence_key": keyed_proof.pointer("/proof/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key)),
+            "artifact": {
+                "path": keyed_proof.pointer("/proof/artifact/path").cloned().unwrap_or(serde_json::Value::Null),
+                "artifact_sha256": keyed_proof.pointer("/proof/artifact/artifact_sha256").cloned().unwrap_or(serde_json::Value::Null),
+                "frame_evidence_key": keyed_proof.pointer("/proof/artifact/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key))
+            },
+            "metrics": {
+                "preview_blocked_on_ipc_count": keyed_proof.pointer("/proof/metrics/preview_blocked_on_ipc_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+                "frame_seq": keyed_proof.pointer("/proof/metrics/frame_seq").cloned().unwrap_or_else(|| serde_json::json!(key.frame_seq)),
+                "render_scene_source": keyed_proof.pointer("/proof/metrics/render_scene_source").cloned().unwrap_or(serde_json::Value::Null),
+                "dirty_chunk_count": keyed_proof.pointer("/proof/metrics/dirty_chunk_count").cloned().unwrap_or(serde_json::Value::Null),
+                "retained_chunk_hit_count": keyed_proof.pointer("/proof/metrics/retained_chunk_hit_count").cloned().unwrap_or(serde_json::Value::Null),
+                "retained_chunk_miss_count": keyed_proof.pointer("/proof/metrics/retained_chunk_miss_count").cloned().unwrap_or(serde_json::Value::Null),
+                "queue_write_count": keyed_proof.pointer("/proof/metrics/queue_write_count").cloned().unwrap_or(serde_json::Value::Null),
+                "draw_calls": keyed_proof.pointer("/proof/metrics/draw_calls").cloned().unwrap_or(serde_json::Value::Null)
+            }
+        }
+    })
+}
+
+fn recent_frame_evidence_entry(
+    state: &NativeRenderLoopState,
+    key: &FrameEvidenceKey,
+    elapsed_ms: f64,
+    sampled_input_event_wake_count: u64,
+    presented_input_event_wake_count: u64,
+    presented_input_event_wake_elapsed_ms: Option<f64>,
+    input_to_present_ms: Option<f64>,
+    proof_mode: &str,
+    external_render_proof: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "pass",
+        "recorded_elapsed_ms": elapsed_ms,
+        "frame_evidence_key": key,
+        "frame_seq": key.frame_seq,
+        "present_id": key.present_id,
+        "content_revision": key.content_revision,
+        "layout_revision": key.layout_revision,
+        "render_scene_revision": key.render_scene_revision,
+        "surface_id": &key.surface_id,
+        "surface_epoch": key.surface_epoch,
+        "input_event_wake_count": presented_input_event_wake_count,
+        "input_event_seq": key.input_event_seq,
+        "sampled_input_event_wake_count": sampled_input_event_wake_count,
+        "presented_input_event_wake_count": presented_input_event_wake_count,
+        "presented_input_event_wake_elapsed_ms": presented_input_event_wake_elapsed_ms,
+        "presented_revision": state.presented_revision,
+        "rendered_frame_count": state.rendered_frame_count,
+        "input_wake_to_present_ms": input_to_present_ms,
+        "frame_input_to_present_ms": input_to_present_ms,
+        "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
+        "last_dirty_poll_elapsed_ms": state.last_dirty_poll_elapsed_ms,
+        "last_render_started_elapsed_ms": state.last_render_started_elapsed_ms,
+        "last_surface_acquired_elapsed_ms": state.last_surface_acquired_elapsed_ms,
+        "last_render_hook_completed_elapsed_ms": state.last_render_hook_completed_elapsed_ms,
+        "last_queue_submitted_elapsed_ms": state.last_queue_submitted_elapsed_ms,
+        "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
+        "last_present_call_ms": state.last_present_call_ms,
+        "last_queue_submit_call_ms": state.last_queue_submit_call_ms,
+        "last_surface_acquire_call_ms": state.last_surface_acquire_call_ms,
+        "last_render_target_kind": state.last_render_target_kind,
+        "proof_mode": proof_mode,
+        "last_external_render_proof": compact_external_render_proof_for_recent_history(
+            external_render_proof,
+            key,
+        )
+    })
 }
 
 fn native_preview_perf_stats_snapshot(
@@ -5797,6 +5931,7 @@ fn write_render_loop_state_report(
         "observed_input_adapter": extras.observed_input_adapter,
         "last_external_render_proof": external_render_proof,
         "frame_evidence_key": extras.frame_evidence_key,
+        "recent_frame_evidence": extras.recent_frame_evidence,
         "last_scheduler_reason": state.last_scheduler_reason,
         "last_role_dirty_reason": state.last_role_dirty_reason,
         "current_scheduler_reason": state.current_scheduler_reason,
@@ -6538,16 +6673,8 @@ fn merge_input_adapter_proof(base: &mut NativeInputAdapterProof, sample: &Native
     }
     base.scroll_delta_x += sample.scroll_delta_x;
     base.scroll_delta_y += sample.scroll_delta_y;
-    for button in &sample.mouse_buttons_down {
-        if !base.mouse_buttons_down.contains(button) {
-            base.mouse_buttons_down.push(button.clone());
-        }
-    }
-    for key in &sample.pressed_keys {
-        if !base.pressed_keys.contains(key) {
-            base.pressed_keys.push(key.clone());
-        }
-    }
+    base.mouse_buttons_down = sample.mouse_buttons_down.clone();
+    base.pressed_keys = sample.pressed_keys.clone();
     for event in &sample.mouse_button_events {
         if !base
             .mouse_button_events
@@ -6685,6 +6812,40 @@ fn stable_debug_hash<T: std::fmt::Debug>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
+        let mut base = empty_input_adapter_proof(false);
+
+        let mut pressed = empty_input_adapter_proof(false);
+        pressed.real_os_events_observed = true;
+        pressed.mouse_button_event_count = 2;
+        pressed.keyboard_key_event_count = 3;
+        pressed.mouse_buttons_down = vec!["left".to_owned()];
+        pressed.pressed_keys = vec!["KeyA".to_owned()];
+        merge_input_adapter_proof(&mut base, &pressed);
+
+        assert_eq!(base.mouse_button_event_count, 2);
+        assert_eq!(base.keyboard_key_event_count, 3);
+        assert_eq!(base.mouse_buttons_down, vec!["left".to_owned()]);
+        assert_eq!(base.pressed_keys, vec!["KeyA".to_owned()]);
+
+        let mut released = empty_input_adapter_proof(false);
+        released.mouse_button_event_count = 4;
+        released.keyboard_key_event_count = 5;
+        merge_input_adapter_proof(&mut base, &released);
+
+        assert_eq!(base.mouse_button_event_count, 4);
+        assert_eq!(base.keyboard_key_event_count, 5);
+        assert!(
+            base.mouse_buttons_down.is_empty(),
+            "current mouse button state must clear after a release/no-buttons sample"
+        );
+        assert!(
+            base.pressed_keys.is_empty(),
+            "current keyboard state must clear after a no-keys sample"
+        );
+    }
 
     #[test]
     fn render_loop_report_bytes_replace_existing_file_atomically() {

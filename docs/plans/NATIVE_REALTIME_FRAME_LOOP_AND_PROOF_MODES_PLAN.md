@@ -1936,6 +1936,59 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   native scroll evidence, Cells click/formula-bar responsiveness, runtime
   currentness/index/dependency work, and aggregate fresh-report alignment.
 
+2026-07-01 Cells click verifier evidence hardening slice:
+
+- Fixed the Cells visible-click verifier so `wait_for_native_mouse_window_position`
+  no longer accepts stale app-owned mouse coordinates. It now requires a fresh
+  input generation or mouse-motion count when previous counters are supplied,
+  and it checks the expected window-relative position with a bounded pixel
+  tolerance.
+- The verifier now fails/skips measured button-only clicks when prerequisite
+  preposition evidence is not fresh, instead of turning a setup failure into a
+  misleading 5-second click latency sample.
+- The app-window input proof merge now treats `mouse_buttons_down` and
+  `pressed_keys` as current-state snapshots while preserving cumulative event
+  counts/history. This prevents reports from showing a released button/key as
+  still down after later samples.
+- The Cells visible-click harness now drives measured targets with one
+  app-owned `click-only` native event, so each sample includes the target pointer
+  move plus the button event and no longer depends on fragile per-sample
+  move-only preposition. The verifier still records preposition probes as
+  skipped/pass diagnostics for this mode.
+- Focused verification passed:
+  - `cargo fmt`;
+  - `git diff --check`;
+  - `cargo test -q -p boon_native_app_window
+    merge_input_adapter_proof_keeps_current_button_and_key_state`;
+  - `cargo test -q -p xtask native_mouse_position_wait_`;
+  - `cargo check -q -p boon_native_app_window`;
+  - `cargo check -q -p xtask`;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/cells-visible-click-e2e-release-current.json`.
+- A 4-target release smoke passed with
+  `input_wake_to_present_ms_p95=15.256279 ms` and
+  `input_wake_to_formula_visible_ms_p95=15.256279 ms`, proving the corrected
+  evidence path can pass a short run.
+- The full 64-click release report still fails:
+  - command:
+    `timeout 480s cargo xtask verify-native-cells-visible-click-e2e --profile
+    release --report
+    target/reports/native-gpu/cells-visible-click-e2e-release-current.json`;
+  - report status: `fail`;
+  - target count: `64`;
+  - many later samples have runtime-selected address/formula-bar text current,
+    but missing current present/readback/visual proof, causing 5-second formula
+    visibility timeouts;
+  - passing-sample input-wake-to-present p95 remains above budget at about
+    `27.940383 ms`;
+  - present-call p95 for passing samples is about `10.219043 ms`.
+- Current blocker: the runtime/value side is not the observed failure in this
+  slice. The remaining Cells click gate is blocked by proof/present evidence
+  freshness after repeated native clicks plus a real scheduler/present tail above
+  16.7 ms. Next work should focus on recent-frame proof history keyed by
+  `FrameEvidenceKey`/input generation, avoiding single-latest report races, and
+  reducing requested-animation frame pacing/present latency.
+
 ## Implementation Slices
 
 1. Terminology and schema:

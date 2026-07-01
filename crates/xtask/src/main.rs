@@ -38210,6 +38210,10 @@ fn run_isolated_weston_idle_wake_observation(
                     loop_presented_revision_and_frame_count_from_report(&preposition_loop_before);
                 let preposition_previous_input_event_wake_count =
                     loop_input_event_wake_count_from_report(&preposition_loop_before);
+                let preposition_previous_mouse_motion_event_count = preposition_loop_before
+                    .get("observed_input_adapter")
+                    .map(native_input_adapter_mouse_motion_event_count)
+                    .unwrap_or(0);
                 let preposition_started = Instant::now();
                 write_idle_wake_parent_progress(
                     &artifact_dir,
@@ -38235,6 +38239,9 @@ fn run_isolated_weston_idle_wake_observation(
                     preview_loop_report,
                     target_x,
                     target_y,
+                    None,
+                    Some(preposition_previous_input_event_wake_count),
+                    Some(preposition_previous_mouse_motion_event_count),
                     Duration::from_secs(2),
                 );
                 let preposition_present_probe = wait_for_loop_presented_input_settle_since(
@@ -57572,6 +57579,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
         &preview_loop_report,
         calibration_x,
         calibration_y,
+        None,
+        None,
+        None,
         Duration::from_secs(2),
     );
     let calibration_present_probe = wait_for_loop_presented_change_since(
@@ -57698,6 +57708,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             loop_presented_revision_and_frame_count_from_report(&preposition_loop_before);
         let preposition_previous_input_event_wake_count =
             loop_input_event_wake_count_from_report(&preposition_loop_before);
+        let preposition_previous_mouse_motion_event_count = preposition_loop_before
+            .get("observed_input_adapter")
+            .map(native_input_adapter_mouse_motion_event_count)
+            .unwrap_or(0);
         let already_positioned = preposition_loop_before
             .get("observed_input_adapter")
             .and_then(native_input_adapter_mouse_window_xy)
@@ -57708,12 +57722,52 @@ fn run_isolated_weston_cells_visible_click_e2e(
                     && (observed_global_y - target_y as f64).abs() <= 1.5
             })
             .unwrap_or(false);
+        let measured_click_mode = "click-only";
+        let measured_click_includes_pointer_move = measured_click_mode == "click-only";
         let (
             preposition_driver_probe,
             preposition_probe,
             preposition_present_probe,
             preposition_quiet_probe,
-        ) = if already_positioned {
+        ) = if measured_click_includes_pointer_move {
+            (
+                json!({
+                    "status": "pass",
+                    "mode": "move-only",
+                    "skipped": true,
+                    "reason": "measured click sends the target pointer move and button event together"
+                }),
+                json!({
+                    "status": "pass",
+                    "skipped": true,
+                    "global_x": target_x,
+                    "global_y": target_y,
+                    "expected_mouse_window_x": target_x as f64 - origin_x,
+                    "expected_mouse_window_y": target_y as f64 - origin_y,
+                    "reason": "measured click sends the target pointer move and button event together",
+                    "observed_input_adapter": preposition_loop_before
+                        .get("observed_input_adapter")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                }),
+                json!({
+                    "status": "pass",
+                    "skipped": true,
+                    "reason": "measured click sends the target pointer move and button event together",
+                    "previous_presented_revision": preposition_previous_revision,
+                    "presented_revision": preposition_previous_revision,
+                    "previous_rendered_frame_count": preposition_previous_frame_count,
+                    "rendered_frame_count": preposition_previous_frame_count,
+                    "previous_input_event_wake_count": preposition_previous_input_event_wake_count,
+                    "input_event_wake_count": preposition_previous_input_event_wake_count
+                }),
+                json!({
+                    "status": "pass",
+                    "skipped": true,
+                    "reason": "measured click sends the target pointer move and button event together"
+                }),
+            )
+        } else if already_positioned {
             (
                 json!({
                     "status": "pass",
@@ -57763,6 +57817,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 &preview_loop_report,
                 target_x,
                 target_y,
+                Some((target_x as f64 - origin_x, target_y as f64 - origin_y)),
+                Some(preposition_previous_input_event_wake_count),
+                Some(preposition_previous_mouse_motion_event_count),
                 Duration::from_secs(2),
             );
             let preposition_present_probe = wait_for_loop_presented_input_settle_since(
@@ -57785,6 +57842,26 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 preposition_quiet_probe,
             )
         };
+        let preposition_driver_pass = preposition_driver_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_pass = preposition_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_present_pass = preposition_present_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_quiet_pass = preposition_quiet_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        let preposition_ready = preposition_driver_pass
+            && preposition_pass
+            && preposition_present_pass
+            && preposition_quiet_pass;
         let loop_before_click = read_json(&preview_loop_report).unwrap_or_else(|_| json!({}));
         let before_click_runtime_values = send_xtask_preview_ipc_request(
             ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
@@ -57834,50 +57911,75 @@ fn run_isolated_weston_cells_visible_click_e2e(
         let click_started = Instant::now();
         let formula_bar_text_before_click = previous_formula_bar_text.clone();
         let selected_address_before_click = previous_selected_address.clone();
-        let driver_run = spawn_weston_click_driver(
-            &driver_path,
-            &socket,
-            target_x,
-            target_y,
-            "button-only",
-            &driver_stdout_path,
-            &driver_stderr_path,
-        );
-        let (driver_probe, formula_visible_probe) = match driver_run {
-            Ok(run) => {
-                let formula_visible_probe = wait_for_cells_formula_visible_match(
-                    ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
-                    &preview_loop_report,
-                    &baseline_surface_hash,
-                    &baseline_external_render_proof_hash,
-                    baseline_surface_readback_path.as_deref(),
-                    previous_revision,
-                    previous_frame_count,
-                    previous_input_event_wake_count,
-                    &previous_selected_address,
-                    &target.address,
-                    &formula_bar_text_before_click,
-                    &target.expected_formula,
-                    click_started,
-                    Duration::from_secs(5),
-                );
-                (finish_weston_click_driver(run), formula_visible_probe)
+        let (driver_probe, formula_visible_probe) = if preposition_ready {
+            let driver_run = spawn_weston_click_driver(
+                &driver_path,
+                &socket,
+                target_x,
+                target_y,
+                measured_click_mode,
+                &driver_stdout_path,
+                &driver_stderr_path,
+            );
+            match driver_run {
+                Ok(run) => {
+                    let formula_visible_probe = wait_for_cells_formula_visible_match(
+                        ipc_path.to_str().ok_or("IPC path is not UTF-8")?,
+                        &preview_loop_report,
+                        &baseline_surface_hash,
+                        &baseline_external_render_proof_hash,
+                        baseline_surface_readback_path.as_deref(),
+                        previous_revision,
+                        previous_frame_count,
+                        previous_input_event_wake_count,
+                        &previous_selected_address,
+                        &target.address,
+                        &formula_bar_text_before_click,
+                        &target.expected_formula,
+                        click_started,
+                        Duration::from_secs(5),
+                    );
+                    (finish_weston_click_driver(run), formula_visible_probe)
+                }
+                Err(error) => {
+                    let diagnostic = format!("weston test driver failed to spawn: {error}");
+                    (
+                        json!({
+                            "status": "fail",
+                            "diagnostic": diagnostic.clone(),
+                            "mode": measured_click_mode
+                        }),
+                        json!({
+                            "status": "fail",
+                            "diagnostic": diagnostic,
+                            "elapsed_ms": click_started.elapsed().as_secs_f64() * 1000.0
+                        }),
+                    )
+                }
             }
-            Err(error) => {
-                let diagnostic = format!("weston test driver failed to spawn: {error}");
-                (
-                    json!({
-                        "status": "fail",
-                        "diagnostic": diagnostic.clone(),
-                        "mode": "button-only"
-                    }),
-                    json!({
-                        "status": "fail",
-                        "diagnostic": diagnostic,
-                        "elapsed_ms": click_started.elapsed().as_secs_f64() * 1000.0
-                    }),
-                )
-            }
+        } else {
+            let diagnostic = "measured click skipped because preposition did not produce fresh presented input evidence";
+            (
+                json!({
+                    "status": "fail",
+                    "skipped": true,
+                    "mode": measured_click_mode,
+                    "diagnostic": diagnostic,
+                    "preposition_driver_status": preposition_driver_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                    "preposition_position_status": preposition_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                    "preposition_present_status": preposition_present_probe.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                    "preposition_quiet_status": preposition_quiet_probe.get("status").cloned().unwrap_or(serde_json::Value::Null)
+                }),
+                json!({
+                    "status": "fail",
+                    "diagnostic": diagnostic,
+                    "failure_category": "preposition_not_presented",
+                    "present_probe": {"status": "missing"},
+                    "readback_probe": {"status": "missing"},
+                    "runtime_value_probe": {"status": "missing"},
+                    "visual_formula_probe": {"status": "missing"}
+                }),
+            )
         };
         let present_probe = formula_visible_probe
             .get("present_probe")
@@ -57912,22 +58014,6 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .unwrap_or("missing")
             .to_owned();
         let driver_pass = driver_probe
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-        let preposition_driver_pass = preposition_driver_probe
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-        let preposition_pass = preposition_probe
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-        let preposition_present_pass = preposition_present_probe
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-        let preposition_quiet_pass = preposition_quiet_probe
             .get("status")
             .and_then(serde_json::Value::as_str)
             == Some("pass");
@@ -58768,10 +58854,14 @@ fn wait_for_native_mouse_window_position(
     loop_report: &Path,
     global_x: i64,
     global_y: i64,
+    expected_window_pos: Option<(f64, f64)>,
+    previous_input_event_wake_count: Option<u64>,
+    previous_mouse_motion_event_count: Option<u64>,
     timeout: Duration,
 ) -> serde_json::Value {
     let started = Instant::now();
     let mut last_report = json!({"status": "missing"});
+    let tolerance_px = 1.5_f64;
     while started.elapsed() < timeout {
         if loop_report.exists() {
             match read_json(loop_report) {
@@ -58795,24 +58885,65 @@ fn wait_for_native_mouse_window_position(
                         if let Some((window_x, window_y)) =
                             native_input_adapter_mouse_window_xy(&input_adapter)
                         {
+                            let input_event_wake_count =
+                                loop_input_event_wake_count_from_report(&report);
+                            let mouse_motion_event_count =
+                                native_input_adapter_mouse_motion_event_count(&input_adapter);
+                            let fresh_input = previous_input_event_wake_count
+                                .is_none_or(|previous| input_event_wake_count > previous)
+                                || previous_mouse_motion_event_count
+                                    .is_none_or(|previous| mouse_motion_event_count > previous);
+                            let position_matches =
+                                expected_window_pos.is_none_or(|(expected_x, expected_y)| {
+                                    (window_x - expected_x).abs() <= tolerance_px
+                                        && (window_y - expected_y).abs() <= tolerance_px
+                                });
                             let origin_x = global_x as f64 - window_x;
                             let origin_y = global_y as f64 - window_y;
-                            return json!({
-                                "status": "pass",
-                                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                            let observation = json!({
                                 "global_x": global_x,
                                 "global_y": global_y,
                                 "mouse_window_x": window_x,
                                 "mouse_window_y": window_y,
+                                "expected_mouse_window_x": expected_window_pos.map(|(x, _)| x),
+                                "expected_mouse_window_y": expected_window_pos.map(|(_, y)| y),
+                                "position_tolerance_px": tolerance_px,
+                                "position_matches": position_matches,
+                                "input_event_wake_count": input_event_wake_count,
+                                "previous_input_event_wake_count": previous_input_event_wake_count,
+                                "mouse_motion_event_count": mouse_motion_event_count,
+                                "previous_mouse_motion_event_count": previous_mouse_motion_event_count,
+                                "fresh_input": fresh_input,
                                 "computed_window_origin_x": origin_x,
                                 "computed_window_origin_y": origin_y,
                                 "computed_window_origin": {
                                     "x": origin_x,
                                     "y": origin_y,
-                                    "source": "app_window observed mouse_window_pos after weston_test calibration click"
+                                    "source": "app_window observed mouse_window_pos after weston_test calibration/preposition input"
                                 },
                                 "observed_input_adapter": input_adapter
                             });
+                            if fresh_input && position_matches {
+                                let mut passed = observation;
+                                if let Some(object) = passed.as_object_mut() {
+                                    object.insert("status".to_owned(), json!("pass"));
+                                    object.insert(
+                                        "elapsed_ms".to_owned(),
+                                        json!(started.elapsed().as_secs_f64() * 1000.0),
+                                    );
+                                }
+                                return passed;
+                            }
+                            last_report = json!({
+                                "status": "observed-stale-or-wrong-position",
+                                "diagnostic": if !fresh_input {
+                                    "observed mouse position did not advance beyond the required input generation"
+                                } else {
+                                    "observed mouse position did not match requested target"
+                                },
+                                "observation": observation
+                            });
+                            continue;
                         }
                     }
                     last_report = report;
@@ -58839,6 +58970,158 @@ fn native_input_adapter_mouse_window_xy(input_adapter: &serde_json::Value) -> Op
     let x = pos.get("x").and_then(numeric_value_as_f64)?;
     let y = pos.get("y").and_then(numeric_value_as_f64)?;
     Some((x, y))
+}
+
+fn native_input_adapter_mouse_motion_event_count(input_adapter: &serde_json::Value) -> u64 {
+    input_adapter
+        .get("mouse_motion_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cells_recent_frame_visible_match_probe(
+    report: &serde_json::Value,
+    loop_report: &Path,
+    previous_revision: u64,
+    previous_frame_count: u64,
+    previous_input_event_wake_count: u64,
+    previous_external_render_proof_hash: &str,
+    previous_readback_path: Option<&str>,
+    previous_address: &str,
+    expected_address: &str,
+    previous_formula: &str,
+    expected_formula: &str,
+    started: Instant,
+) -> Option<(serde_json::Value, serde_json::Value, serde_json::Value)> {
+    let entries = report.get("recent_frame_evidence")?.as_array()?;
+    for entry in entries.iter().rev() {
+        let revision = entry
+            .get("presented_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let frame_count = entry
+            .get("rendered_frame_count")
+            .or_else(|| entry.get("frame_seq"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let input_event_wake_count = entry
+            .get("presented_input_event_wake_count")
+            .or_else(|| entry.get("input_event_wake_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let presented_changed = revision > previous_revision || frame_count > previous_frame_count;
+        if !presented_changed || input_event_wake_count <= previous_input_event_wake_count {
+            continue;
+        }
+        let external_render_proof = entry
+            .get("last_external_render_proof")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if external_render_proof.is_null() {
+            continue;
+        }
+        let frame_evidence_key = entry
+            .get("frame_evidence_key")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let external_render_proof_hash = external_render_proof
+            .pointer("/proof/artifact/artifact_sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|hash| is_sha256_hex(hash))
+            .unwrap_or("missing");
+        let mut readback_probe = json!({
+            "status": "pass",
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "loop_report": loop_report,
+            "presented_revision": revision,
+            "readback_presented_revision": revision,
+            "readback_content_revision": entry.get("content_revision").cloned().unwrap_or(serde_json::Value::Null),
+            "rendered_frame_count": frame_count,
+            "previous_presented_revision": previous_revision,
+            "previous_rendered_frame_count": previous_frame_count,
+            "previous_input_event_wake_count": previous_input_event_wake_count,
+            "input_event_wake_count": input_event_wake_count,
+            "sampled_input_event_wake_count": entry.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+            "presented_input_event_wake_count": entry.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+            "stale_for_latest_input": false,
+            "input_wake_timing_source": "recent_presented_input_generation",
+            "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
+            "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
+            "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
+            "last_render_started_elapsed_ms": entry.get("last_render_started_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_surface_acquired_elapsed_ms": entry.get("last_surface_acquired_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_render_hook_completed_elapsed_ms": entry.get("last_render_hook_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_queue_submitted_elapsed_ms": entry.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_present_completed_elapsed_ms": entry.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_queue_submit_call_ms": entry.get("last_queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_render_target_kind": entry.get("last_render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
+            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_evidence_key": frame_evidence_key,
+            "last_external_render_proof": external_render_proof,
+            "accepted_by_revision": true,
+            "accepted_by_hash_change": false,
+            "accepted_by_external_render_proof_hash_change": external_render_proof_hash != "missing"
+                && external_render_proof_hash != previous_external_render_proof_hash,
+            "accepted_by_structured_external_render_proof": true,
+            "structured_external_render_proof_is_current": true,
+            "accepted_by_retained_bound_text_sync": true,
+            "surface_readback_is_current": false,
+            "surface_readback_pending": false,
+            "recent_frame_evidence_match": true,
+            "external_render_proof_hash_after": external_render_proof_hash
+        });
+        let structured_current =
+            structured_external_visible_surface_proof_matches_report(&readback_probe);
+        readback_probe["accepted_by_structured_external_render_proof"] = json!(structured_current);
+        readback_probe["structured_external_render_proof_is_current"] = json!(structured_current);
+        if !structured_current {
+            continue;
+        }
+        let visual_probe = cells_visual_formula_probe_from_readback(
+            &readback_probe,
+            previous_readback_path,
+            previous_address,
+            expected_address,
+            previous_formula,
+            expected_formula,
+        );
+        if visual_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("pass")
+        {
+            continue;
+        }
+        let present_probe = json!({
+            "status": "pass",
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "loop_report": loop_report,
+            "previous_presented_revision": previous_revision,
+            "presented_revision": revision,
+            "previous_rendered_frame_count": previous_frame_count,
+            "rendered_frame_count": frame_count,
+            "previous_input_event_wake_count": previous_input_event_wake_count,
+            "input_event_wake_count": input_event_wake_count,
+            "sampled_input_event_wake_count": entry.get("sampled_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+            "presented_input_event_wake_count": entry.get("presented_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+            "stale_for_latest_input": false,
+            "input_wake_timing_source": "recent_presented_input_generation",
+            "generation_timed_frame": true,
+            "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_evidence_key": entry.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
+            "last_external_render_proof": entry.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
+            "recent_frame_evidence_match": true
+        });
+        return Some((present_probe, readback_probe, visual_probe));
+    }
+    None
 }
 
 fn structured_external_visible_surface_proof_matches_report(report: &serde_json::Value) -> bool {
@@ -59242,6 +59525,34 @@ fn wait_for_cells_formula_visible_match(
                         );
                         readback_probe = Some(probe);
                         visual_formula_probe = Some(visual_probe);
+                    }
+                    let visual_still_pending = visual_formula_probe
+                        .as_ref()
+                        .and_then(|probe| probe.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        != Some("pass");
+                    if visual_still_pending
+                        && let Some((recent_present, recent_readback, recent_visual)) =
+                            cells_recent_frame_visible_match_probe(
+                                &report,
+                                loop_report,
+                                previous_revision,
+                                previous_frame_count,
+                                previous_input_event_wake_count,
+                                previous_external_render_proof_hash,
+                                previous_readback_path,
+                                previous_address,
+                                expected_address,
+                                previous_formula,
+                                expected_formula,
+                                started,
+                            )
+                    {
+                        if present_probe.is_none() {
+                            present_probe = Some(recent_present);
+                        }
+                        readback_probe = Some(recent_readback);
+                        visual_formula_probe = Some(recent_visual);
                     }
                     last_report = report;
                 }
@@ -83748,6 +84059,112 @@ mod tests {
         assert_eq!(cells_visible_click_preview_hold_ms(0), 90_000);
         assert_eq!(cells_visible_click_preview_hold_ms(4), 90_000);
         assert_eq!(cells_visible_click_preview_hold_ms(64), 350_000);
+    }
+
+    fn write_mouse_position_loop_report(
+        path: &std::path::Path,
+        input_event_wake_count: u64,
+        mouse_motion_event_count: u64,
+        mouse_window_x: f64,
+        mouse_window_y: f64,
+    ) {
+        write_json(
+            path,
+            &json!({
+                "status": "pass",
+                "input_event_wake_count": input_event_wake_count,
+                "observed_input_adapter": {
+                    "real_os_events_observed": true,
+                    "synthetic_input_probe": false,
+                    "mouse_motion_event_count": mouse_motion_event_count,
+                    "mouse_window_pos": {
+                        "x": mouse_window_x,
+                        "y": mouse_window_y
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_mouse_position_wait_rejects_stale_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-xtask-mouse-position-stale-{}-{}",
+            std::process::id(),
+            monotonic_now_ns().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("loop.json");
+        write_mouse_position_loop_report(&report, 10, 20, 12.0, 34.0);
+
+        let probe = wait_for_native_mouse_window_position(
+            &report,
+            112,
+            234,
+            Some((12.0, 34.0)),
+            Some(10),
+            Some(20),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            probe.get("status").and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(
+            probe
+                .pointer("/last_report/status")
+                .and_then(serde_json::Value::as_str),
+            Some("observed-stale-or-wrong-position")
+        );
+        assert_eq!(
+            probe
+                .pointer("/last_report/observation/fresh_input")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn native_mouse_position_wait_accepts_fresh_matching_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-xtask-mouse-position-fresh-{}-{}",
+            std::process::id(),
+            monotonic_now_ns().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("loop.json");
+        write_mouse_position_loop_report(&report, 11, 20, 12.0, 34.0);
+
+        let probe = wait_for_native_mouse_window_position(
+            &report,
+            112,
+            234,
+            Some((12.0, 34.0)),
+            Some(10),
+            Some(20),
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(
+            probe.get("status").and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            probe
+                .get("fresh_input")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            probe
+                .get("position_matches")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

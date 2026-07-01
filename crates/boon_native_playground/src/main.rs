@@ -42812,8 +42812,21 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     );
     stats.source_intent_update_count = source_intent_updates.len();
     let mut changed = false;
+    let requested_source_intent_index_updates = source_intent_updates
+        .iter()
+        .map(|((node, selector), source_path)| {
+            source_intent_update_from_binding_update(node, selector, source_path)
+        })
+        .collect::<Vec<_>>();
     let mut source_intent_index_updates = Vec::<DocumentSourceIntentUpdate>::new();
-    if !source_intent_updates.is_empty()
+    let indexed_source_intent_update_count = patch_indexed_source_intent_updates(
+        &mut shared.layout_proof,
+        requested_source_intent_index_updates,
+    );
+    if let Some(update_count) = indexed_source_intent_update_count {
+        stats.source_intent_index_update_count = update_count;
+        changed |= update_count > 0;
+    } else if !source_intent_updates.is_empty()
         && let Some(assertions) = shared
             .layout_proof
             .get_mut("source_intent_assertions")
@@ -42847,16 +42860,18 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                 != Some(next_source_path.as_str())
             {
                 object.insert("source_path".to_owned(), json!(next_source_path));
-                source_intent_index_updates.push(DocumentSourceIntentUpdate {
-                    node,
-                    selector: selector.clone(),
-                    source_path: next_source_path.clone(),
-                });
+                source_intent_index_updates.push(source_intent_update_from_binding_update(
+                    &node,
+                    selector,
+                    next_source_path,
+                ));
                 changed = true;
             }
         }
     }
-    stats.source_intent_index_update_count = source_intent_index_updates.len();
+    if indexed_source_intent_update_count.is_none() {
+        stats.source_intent_index_update_count = source_intent_index_updates.len();
+    }
     if !source_intent_index_updates.is_empty() {
         if let Some((source_intent_index, source_intent_value_index)) =
             patched_source_intent_indexes(&shared.layout_proof, &source_intent_index_updates)
@@ -44055,6 +44070,54 @@ fn source_intent_binding_update_for_intent(
                 .then_with(|| left.cmp(right))
         })
         .map(|(_, source_path)| source_path.clone())
+}
+
+fn source_intent_update_from_binding_update(
+    node: &str,
+    selector: &DocumentSourceIntentBindingSelector,
+    source_path: &str,
+) -> DocumentSourceIntentUpdate {
+    DocumentSourceIntentUpdate {
+        node: node.to_owned(),
+        selector: selector.clone(),
+        source_path: source_path.to_owned(),
+    }
+}
+
+fn source_intent_indexed_path_matches(
+    layout_proof: &Value,
+    update: &DocumentSourceIntentUpdate,
+) -> bool {
+    layout_proof
+        .get("source_intent_index")
+        .and_then(|index| index.get(&update.node))
+        .and_then(|node_index| node_index.get(&update.selector.intent))
+        .and_then(Value::as_str)
+        == Some(update.source_path.as_str())
+}
+
+fn patch_indexed_source_intent_updates(
+    layout_proof: &mut Value,
+    updates: Vec<DocumentSourceIntentUpdate>,
+) -> Option<usize> {
+    if updates.is_empty()
+        || layout_proof.get("source_intent_index").is_none()
+        || layout_proof.get("source_intent_value_index").is_none()
+    {
+        return None;
+    }
+    let changed_updates = updates
+        .into_iter()
+        .filter(|update| !source_intent_indexed_path_matches(layout_proof, update))
+        .collect::<Vec<_>>();
+    if changed_updates.is_empty() {
+        return Some(0);
+    }
+    let (source_intent_index, source_intent_value_index) =
+        patched_source_intent_indexes(layout_proof, &changed_updates)?;
+    layout_proof["source_intent_index"] = source_intent_index;
+    layout_proof["source_intent_value_index"] = source_intent_value_index;
+    Some(changed_updates.len())
 }
 
 fn source_intent_assertion_matches_selector(
@@ -62881,6 +62944,14 @@ mod tests {
                 )
             })
             .collect();
+        cache_test_document_snapshot_with_targets(hash, structural_reads, data_binding_targets)
+    }
+
+    fn cache_test_document_snapshot_with_targets(
+        hash: &str,
+        structural_reads: &[&str],
+        data_binding_targets: DocumentDataBindingIndex,
+    ) -> Value {
         let document_frame = boon_document_model::DocumentFrame::empty("root");
         let derived_indexes = document_derived_indexes_for_frame(&document_frame).unwrap();
         let layout_frame = boon_document::LayoutFrame {
@@ -63101,6 +63172,95 @@ mod tests {
                 vec!["store.formula_bar.text".to_owned()]
             )]
         );
+        assert_eq!(stats.legacy_selection_fallback_count, 0);
+    }
+
+    #[test]
+    fn retained_bound_sync_patches_source_intent_indexes_without_assertion_scan() {
+        clear_preview_retained_bound_sync_stats();
+        let mut targets = DocumentDataBindingIndex::new();
+        targets.insert(
+            "store.next_source".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("test-node".to_owned()),
+                attr: document_source_intent_binding_attr("activate"),
+            }],
+        );
+        targets.insert(
+            "store.formula_bar.text".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("test-node".to_owned()),
+                attr: "text".to_owned(),
+            }],
+        );
+        let mut layout_proof = cache_test_document_snapshot_with_targets(
+            "retained-bound-source-intent-index-fast-path",
+            &[],
+            targets,
+        );
+        layout_proof["source_intent_assertions"] = json!([{
+            "node": "test-node",
+            "intent": "activate",
+            "source_path": "old.source"
+        }]);
+        layout_proof["source_intent_index"] = json!({
+            "test-node": {
+                "activate": "old.source"
+            }
+        });
+        layout_proof["source_intent_value_index"] = json!({
+            "activate": {
+                "old.source": ["test-node"]
+            }
+        });
+        let shared_render_state = test_shared_render_state(
+            layout_proof,
+            test_text_input_layout_frame("test-node", "stale retained text"),
+        );
+        let state_summary = json!({
+            "store": {
+                "next_source": "new.source",
+                "formula_bar": {
+                    "text": "fresh retained text"
+                }
+            }
+        });
+
+        assert!(
+            preview_sync_bound_text_inputs_for_nodes_from_state_summary(
+                &shared_render_state,
+                &state_summary,
+                &BTreeSet::from(["test-node".to_owned()])
+            )
+            .expect("indexed source-intent sync should update retained state")
+        );
+
+        let shared = shared_render_state.lock().unwrap();
+        assert_eq!(
+            live_source_for_node_intent(&shared.layout_proof, "test-node", "activate").as_deref(),
+            Some("new.source")
+        );
+        assert_eq!(
+            shared.layout_proof["source_intent_value_index"]["activate"]["new.source"],
+            json!(["test-node"])
+        );
+        assert_eq!(
+            shared.layout_proof["source_intent_assertions"][0]["source_path"],
+            json!("old.source"),
+            "indexed hot path should not scan and rewrite full assertion proof arrays"
+        );
+        drop(shared);
+
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, "test-node").as_deref(),
+            Some("fresh retained text")
+        );
+        let stats = preview_retained_bound_sync_stats_snapshot()
+            .expect("bound text sync should record retained sync stats");
+        assert_eq!(stats.source_intent_update_count, 1);
+        assert_eq!(stats.source_intent_index_update_count, 1);
+        assert_eq!(stats.text_update_count, 1);
         assert_eq!(stats.legacy_selection_fallback_count, 0);
     }
 

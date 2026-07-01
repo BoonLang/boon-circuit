@@ -11610,6 +11610,18 @@ fn native_gpu_app_owned_render_hook(
             .collect::<Vec<_>>(),
         "input_overlay_focus_state": {
             "focused_node": focus_overlay.focused_node.as_deref(),
+            "selected_node_count": focus_overlay.selected_nodes.len(),
+            "previous_selected_node_count": focus_overlay.previous_selected_nodes.len(),
+            "selected_node_samples": focus_overlay.selected_nodes
+                .iter()
+                .take(16)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "previous_selected_node_samples": focus_overlay.previous_selected_nodes
+                .iter()
+                .take(16)
+                .cloned()
+                .collect::<Vec<_>>(),
             "selected_address": focus_overlay.selected_address.as_deref(),
             "previous_selected_address": focus_overlay.previous_selected_address.as_deref(),
             "selection_proxy": focus_overlay.selection_proxy
@@ -11918,6 +11930,7 @@ fn preview_apply_focus_overlay_state_to_render_frame(
         return;
     }
     let selected_address = focus_overlay.selected_address.as_deref();
+    let selected_nodes = &focus_overlay.selected_nodes;
     for item in &mut frame.display_list {
         let next_focused = focus_overlay.focused_node.as_deref() == Some(item.node.0.as_str());
         if next_focused || item.focused || item.style.contains_key("__focused") {
@@ -11928,15 +11941,19 @@ fn preview_apply_focus_overlay_state_to_render_frame(
                 boon_document_model::StyleValue::Bool(next_focused),
             );
         }
-        if let Some(address) = selected_address
-            && item.style.contains_key("selected")
+        if item.style.contains_key("selected")
+            && (!selected_nodes.is_empty() || selected_address.is_some())
         {
-            let selected = {
-                next_focused
-                    || focused_raw_address(layout_proof, &item.node.0)
-                        .or_else(|| focused_address(layout_proof, &item.node.0))
-                        .map(|item_address| item_address == address)
-                        .unwrap_or(false)
+            let selected = if !selected_nodes.is_empty() {
+                next_focused || selected_nodes.contains(&item.node.0)
+            } else {
+                selected_address
+                    .and_then(|address| {
+                        focused_raw_address(layout_proof, &item.node.0)
+                            .or_else(|| focused_address(layout_proof, &item.node.0))
+                            .map(|item_address| item_address == address)
+                    })
+                    .unwrap_or(false)
             };
             set_display_style_value(
                 &mut item.style,
@@ -11982,6 +11999,7 @@ fn preview_apply_focus_overlay_lookup_to_render_frame(
         return;
     }
     let selected_address = focus_overlay.selected_address.as_deref();
+    let selected_nodes = &focus_overlay.selected_nodes;
     for item in &mut frame.display_list {
         let next_focused = focus_overlay.focused_node.as_deref() == Some(item.node.0.as_str());
         if next_focused || item.focused || item.style.contains_key("__focused") {
@@ -11992,15 +12010,19 @@ fn preview_apply_focus_overlay_lookup_to_render_frame(
                 boon_document_model::StyleValue::Bool(next_focused),
             );
         }
-        if let Some(address) = selected_address
-            && item.style.contains_key("selected")
+        if item.style.contains_key("selected")
+            && (!selected_nodes.is_empty() || selected_address.is_some())
         {
-            let selected = {
-                next_focused
-                    || lookup
-                        .address_for_node(&item.node.0)
-                        .map(|item_address| item_address == address)
-                        .unwrap_or(false)
+            let selected = if !selected_nodes.is_empty() {
+                next_focused || selected_nodes.contains(&item.node.0)
+            } else {
+                selected_address
+                    .and_then(|address| {
+                        lookup
+                            .address_for_node(&item.node.0)
+                            .map(|item_address| item_address == address)
+                    })
+                    .unwrap_or(false)
             };
             set_display_style_value(
                 &mut item.style,
@@ -12065,7 +12087,17 @@ fn preview_input_overlay_render_scene_touched_nodes(
             .into_iter()
             .map(boon_document_model::DocumentNodeId),
     );
-    if let Some(selected_address) = focus_overlay.selected_address.as_deref() {
+    nodes.extend(
+        focus_overlay
+            .previous_selected_nodes
+            .iter()
+            .chain(focus_overlay.selected_nodes.iter())
+            .cloned()
+            .map(boon_document_model::DocumentNodeId),
+    );
+    if focus_overlay.selected_nodes.is_empty()
+        && let Some(selected_address) = focus_overlay.selected_address.as_deref()
+    {
         nodes.extend(
             preview_selected_display_nodes_for_address(base_frame, lookup, selected_address)
                 .into_iter()
@@ -12083,24 +12115,41 @@ fn preview_input_overlay_render_scene_touched_nodes(
             );
         }
     }
-    for selected_address in [
-        focus_overlay.previous_selected_address.as_deref(),
-        focus_overlay.selected_address.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let mut selected_nodes = lookup.nodes_for_address(selected_address);
-        selected_nodes.extend(preview_selected_display_nodes_for_address(
-            base_frame,
-            lookup,
-            selected_address,
-        ));
-        nodes.extend(
-            selected_nodes
-                .into_iter()
-                .map(boon_document_model::DocumentNodeId),
-        );
+    if focus_overlay.previous_selected_nodes.is_empty() {
+        for selected_address in [focus_overlay.previous_selected_address.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let mut selected_nodes = lookup.nodes_for_address(selected_address);
+            selected_nodes.extend(preview_selected_display_nodes_for_address(
+                base_frame,
+                lookup,
+                selected_address,
+            ));
+            nodes.extend(
+                selected_nodes
+                    .into_iter()
+                    .map(boon_document_model::DocumentNodeId),
+            );
+        }
+    }
+    if focus_overlay.selected_nodes.is_empty() {
+        for selected_address in [focus_overlay.selected_address.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let mut selected_nodes = lookup.nodes_for_address(selected_address);
+            selected_nodes.extend(preview_selected_display_nodes_for_address(
+                base_frame,
+                lookup,
+                selected_address,
+            ));
+            nodes.extend(
+                selected_nodes
+                    .into_iter()
+                    .map(boon_document_model::DocumentNodeId),
+            );
+        }
     }
     nodes.retain(|node| {
         base_frame
@@ -35963,6 +36012,8 @@ fn json_value_to_document_text(value: &Value) -> String {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PreviewFocusOverlayState {
     focused_node: Option<String>,
+    previous_selected_nodes: BTreeSet<String>,
+    selected_nodes: BTreeSet<String>,
     previous_selected_address: Option<String>,
     selected_address: Option<String>,
     focused_text: String,
@@ -35981,6 +36032,8 @@ impl PreviewFocusOverlayState {
             .cloned();
         Self {
             focused_node: input_state.focused_node.clone(),
+            previous_selected_nodes: BTreeSet::new(),
+            selected_nodes: input_state.selected_overlay_nodes.clone(),
             previous_selected_address,
             selected_address: input_state.focused_address.clone(),
             focused_text: input_state.focused_text.clone(),
@@ -35996,6 +36049,12 @@ impl PreviewFocusOverlayState {
         caret_visible: bool,
     ) -> Self {
         let mut next = Self::from_input_state(input_state, caret_visible);
+        if next.previous_selected_nodes.is_empty()
+            && !input_state.focus_render_overlay.selected_nodes.is_empty()
+            && input_state.focus_render_overlay.selected_nodes != next.selected_nodes
+        {
+            next.previous_selected_nodes = input_state.focus_render_overlay.selected_nodes.clone();
+        }
         if next.previous_selected_address.is_none()
             && input_state
                 .focus_render_overlay
@@ -36013,6 +36072,8 @@ impl PreviewFocusOverlayState {
 
     fn is_empty(&self) -> bool {
         self.focused_node.is_none()
+            && self.previous_selected_nodes.is_empty()
+            && self.selected_nodes.is_empty()
             && self.previous_selected_address.is_none()
             && self.selected_address.is_none()
     }
@@ -39621,11 +39682,6 @@ fn preview_try_apply_simple_source_click_input(
     let remembered_candidate = input_state.hovered_click_candidate.clone();
     preview_remember_click_candidate(input_state, position_key, &remembered_candidate);
     clear_preview_retained_bound_sync_stats();
-    let previous_selected_address =
-        preview_selected_address_from_shared_layout_proof(shared_render_state)
-            .or_else(|| preview_selected_address_from_shared_layout(shared_render_state))
-            .or_else(|| selected_address_from_live_runtime(live_runtime))
-            .or_else(|| input_state.selected_overlay_address.clone());
     let previous_selected_nodes =
         preview_current_selected_nodes_from_shared_layout(shared_render_state)
             .unwrap_or_else(|| input_state.selected_overlay_nodes.clone());
@@ -39663,7 +39719,19 @@ fn preview_try_apply_simple_source_click_input(
         selected_overlay_sync_nodes.extend(selection_patch.current_nodes.iter().cloned());
         bound_sync_nodes.extend(selection_patch.sync_nodes.iter().cloned());
     }
-    if let Some(previous_selected_address) = previous_selected_address.as_deref()
+    let has_generic_selection_patch = retained_selection_patch
+        .as_ref()
+        .is_some_and(|patch| !patch.previous_nodes.is_empty() || !patch.current_nodes.is_empty());
+    let legacy_previous_selected_address = if has_generic_selection_patch {
+        None
+    } else {
+        preview_selected_address_from_shared_layout_proof(shared_render_state)
+            .or_else(|| preview_selected_address_from_shared_layout(shared_render_state))
+            .or_else(|| selected_address_from_live_runtime(live_runtime))
+            .or_else(|| input_state.selected_overlay_address.clone())
+    };
+    if !has_generic_selection_patch
+        && let Some(previous_selected_address) = legacy_previous_selected_address.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
         let nodes = source_intent_nodes_for_value(
@@ -39674,16 +39742,21 @@ fn preview_try_apply_simple_source_click_input(
         selected_overlay_sync_nodes.extend(nodes.iter().cloned());
         bound_sync_nodes.extend(nodes);
     }
-    let selected_address_for_style_patch = post_turn_state_summary
-        .as_ref()
-        .and_then(|summary| {
-            summary
-                .pointer("/store/selected_address")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .or_else(|| input_state.focused_address.clone());
-    if let Some(selected_address) = selected_address_for_style_patch.as_deref()
+    let legacy_selected_address_for_style_patch = if has_generic_selection_patch {
+        None
+    } else {
+        post_turn_state_summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .pointer("/store/selected_address")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| input_state.focused_address.clone())
+    };
+    if !has_generic_selection_patch
+        && let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
         let nodes =
@@ -39730,14 +39803,27 @@ fn preview_try_apply_simple_source_click_input(
     }
     let selection_proxy_text_refresh_ms = elapsed_ms(selection_proxy_text_refresh_started);
     let selected_overlay_patch_started = Instant::now();
-    if let Some(selected_address) = selected_address_for_style_patch.as_deref() {
+    if let Some(selection_patch) = retained_selection_patch.as_ref()
+        && (!selection_patch.current_nodes.is_empty() || !selection_patch.previous_nodes.is_empty())
+    {
+        if !preview_retained_bound_sync_already_changed_style_for_nodes(
+            &selected_overlay_sync_nodes,
+        ) {
+            preview_patch_retained_selected_nodes_overlay(
+                shared_render_state,
+                &selection_patch.current_nodes,
+                &selection_patch.previous_nodes,
+                &previous_selected_nodes,
+            )?;
+        }
+    } else if let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref() {
         if !preview_retained_bound_sync_already_changed_style_for_nodes(
             &selected_overlay_sync_nodes,
         ) {
             preview_patch_retained_selected_address_overlay(
                 shared_render_state,
                 selected_address,
-                previous_selected_address.as_deref(),
+                legacy_previous_selected_address.as_deref(),
                 &previous_selected_nodes,
             )?;
         }
@@ -39751,12 +39837,27 @@ fn preview_try_apply_simple_source_click_input(
     }
     let selected_overlay_patch_ms = elapsed_ms(selected_overlay_patch_started);
     let selection_focus_overlay_state_started = Instant::now();
-    if let Some(selected_address) = selected_address_for_style_patch.as_deref() {
+    if legacy_selected_address_for_style_patch.is_some() || retained_selection_patch.is_some() {
         let mut next_focus_overlay = PreviewFocusOverlayState::from_input_state_preserving_previous(
             input_state,
             input_state.focus_render_overlay.caret_visible,
         );
-        if let Some(previous_selected_address) = previous_selected_address.as_ref()
+        if let Some(selection_patch) = retained_selection_patch.as_ref() {
+            if !selection_patch.current_nodes.is_empty() {
+                next_focus_overlay.selected_nodes = selection_patch.current_nodes.clone();
+            }
+            if !selection_patch.previous_nodes.is_empty()
+                && selection_patch.previous_nodes != next_focus_overlay.selected_nodes
+            {
+                next_focus_overlay.previous_selected_nodes = selection_patch.previous_nodes.clone();
+            }
+        } else if !previous_selected_nodes.is_empty()
+            && previous_selected_nodes != next_focus_overlay.selected_nodes
+        {
+            next_focus_overlay.previous_selected_nodes = previous_selected_nodes.clone();
+        }
+        if let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref()
+            && let Some(previous_selected_address) = legacy_previous_selected_address.as_ref()
             && previous_selected_address != selected_address
         {
             next_focus_overlay.previous_selected_address = Some(previous_selected_address.clone());
@@ -41710,7 +41811,10 @@ fn preview_apply_selection_proxy_focus_overlay(
     if let Some(frame) = layout_frame_override.as_deref() {
         target_nodes.extend(preview_current_selected_display_nodes(frame));
     }
-    if let Some(address) = selected_address.as_deref() {
+    let selected_nodes = input_state.selected_overlay_nodes.clone();
+    if selected_nodes.is_empty()
+        && let Some(address) = selected_address.as_deref()
+    {
         target_nodes.extend(preview_selected_overlay_nodes_for_address(
             layout_proof,
             layout_frame_override.as_deref(),
@@ -41752,10 +41856,11 @@ fn preview_apply_selection_proxy_focus_overlay(
             "__focused",
             boon_document_model::StyleValue::Bool(next_focused),
         );
-        changed |= preview_apply_address_selected_overlay_to_item(
+        changed |= preview_apply_selected_overlay_to_item(
             item,
             layout_proof,
             None,
+            &selected_nodes,
             selected_address.as_deref(),
         );
         if matches!(
@@ -41862,10 +41967,11 @@ fn preview_apply_focus_overlay_to_item(
         "__focused",
         boon_document_model::StyleValue::Bool(next_focused),
     );
-    changed |= preview_apply_address_selected_overlay_to_item(
+    changed |= preview_apply_selected_overlay_to_item(
         item,
         layout_proof,
         None,
+        &input_state.selected_overlay_nodes,
         input_state.focused_address.as_deref(),
     );
     if item.style.remove("caret_column").is_some() {
@@ -41916,24 +42022,29 @@ fn preview_apply_focus_overlay_to_item(
     Ok(changed)
 }
 
-fn preview_apply_address_selected_overlay_to_item(
+fn preview_apply_selected_overlay_to_item(
     item: &mut boon_document::DisplayItem,
     layout_proof: &Value,
     snapshot: Option<&DocumentRenderSnapshot>,
+    selected_nodes: &BTreeSet<String>,
     selected_address: Option<&str>,
 ) -> bool {
     if !item.style.contains_key("selected") {
         return false;
     }
-    let selected = selected_address
-        .and_then(|selected_address| {
-            snapshot
-                .and_then(|snapshot| focused_raw_address_from_snapshot(snapshot, &item.node.0))
-                .or_else(|| focused_raw_address(layout_proof, &item.node.0))
-                .or_else(|| focused_address(layout_proof, &item.node.0))
-                .map(|item_address| item_address == selected_address)
-        })
-        .unwrap_or(false);
+    let selected = if !selected_nodes.is_empty() {
+        selected_nodes.contains(&item.node.0)
+    } else {
+        selected_address
+            .and_then(|selected_address| {
+                snapshot
+                    .and_then(|snapshot| focused_raw_address_from_snapshot(snapshot, &item.node.0))
+                    .or_else(|| focused_raw_address(layout_proof, &item.node.0))
+                    .or_else(|| focused_address(layout_proof, &item.node.0))
+                    .map(|item_address| item_address == selected_address)
+            })
+            .unwrap_or(false)
+    };
     let changed = set_display_style_value(
         &mut item.style,
         "selected",
@@ -42017,6 +42128,84 @@ fn preview_selected_display_nodes_for_address(
         .collect()
 }
 
+fn preview_patch_retained_selected_nodes_overlay(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    selected_nodes: &BTreeSet<String>,
+    previous_nodes: &BTreeSet<String>,
+    fallback_previous_nodes: &BTreeSet<String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if shared.layout_frame_override.is_none() {
+        shared.layout_frame_override = Some(Arc::new(layout_frame_from_layout_proof(
+            &shared.layout_proof,
+        )?));
+    }
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
+    let mut target_nodes = fallback_previous_nodes.clone();
+    target_nodes.extend(previous_nodes.iter().cloned());
+    target_nodes.extend(selected_nodes.iter().cloned());
+    if let Some(frame) = shared.layout_frame_override.as_deref() {
+        target_nodes.extend(preview_current_selected_display_nodes(frame));
+    }
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+        return Ok(false);
+    };
+    let mut style_patch_nodes = Vec::new();
+    let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
+        snapshot.as_deref(),
+        frame,
+        &target_nodes,
+    );
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
+        if !target_nodes.contains(&item.node.0) || !item.style.contains_key("selected") {
+            continue;
+        }
+        let selected = selected_nodes.contains(&item.node.0);
+        if set_display_style_value(
+            &mut item.style,
+            "selected",
+            boon_document_model::StyleValue::Bool(selected),
+        ) {
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+            style_patch_nodes.push(item.node.0.clone());
+        }
+    }
+    if style_patch_nodes.is_empty() {
+        return Ok(false);
+    }
+    shared.update_count = shared.update_count.saturating_add(1);
+    shared.last_error = None;
+    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
+        status: "pass",
+        reason: None,
+        target_node_count: target_nodes.len(),
+        item_index_count: target_nodes.len(),
+        source_intent_update_count: 0,
+        source_intent_index_update_count: 0,
+        style_update_count: style_patch_nodes.len(),
+        style_update_nodes: style_patch_nodes,
+        text_update_count: 0,
+        text_update_nodes: Vec::new(),
+        text_update_binding_paths: Vec::new(),
+        text_update_values: Vec::new(),
+        changed: true,
+    });
+    Ok(true)
+}
+
 fn preview_patch_retained_selected_address_overlay(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     selected_address: &str,
@@ -42094,26 +42283,11 @@ fn preview_patch_retained_selected_address_overlay(
     if needs_item_address_fallback && layout_proof_fallback.is_none() {
         layout_proof_fallback = Some(shared.layout_proof.clone());
     }
-    let selected_address_text_nodes = snapshot
-        .as_deref()
-        .map(|snapshot| {
-            text_binding_paths_by_node(snapshot)
-                .iter()
-                .filter(|(_, paths)| {
-                    paths.iter().any(|path| {
-                        document_data_paths_overlap_normalized(path, "store.selected_address")
-                    })
-                })
-                .map(|(node, _)| node.clone())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
     let mut changed_nodes = Vec::new();
     let mut style_patch_nodes = Vec::new();
-    let mut text_updates = Vec::<(String, String, Vec<String>)>::new();
     let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
         snapshot.as_deref(),
         frame,
@@ -42174,51 +42348,7 @@ fn preview_patch_retained_selected_address_overlay(
             changed_nodes.push(item.node.0.clone());
         }
     }
-    if let Some(previous_selected_address) = previous_selected_address {
-        if selected_address_text_nodes.is_empty() {
-            for item in frame
-                .display_list
-                .iter_mut()
-                .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::Text))
-                .filter(|item| item.text.as_deref() == Some(previous_selected_address))
-                .filter(|item| {
-                    f64::from(item.bounds.y) < 40.0
-                        && f64::from(item.bounds.x) < 50.0
-                        && f64::from(item.bounds.width) <= 45.0
-                })
-            {
-                item.text = Some(selected_address.to_owned());
-                text_updates.push((
-                    item.node.0.clone(),
-                    selected_address.to_owned(),
-                    vec!["store.selected_address".to_owned()],
-                ));
-            }
-        } else {
-            let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
-                snapshot.as_deref(),
-                frame,
-                &selected_address_text_nodes,
-            );
-            for index in item_indexes {
-                let Some(item) = frame.display_list.get_mut(index) else {
-                    continue;
-                };
-                if !selected_address_text_nodes.contains(&item.node.0)
-                    || item.text.as_deref() == Some(selected_address)
-                {
-                    continue;
-                }
-                item.text = Some(selected_address.to_owned());
-                text_updates.push((
-                    item.node.0.clone(),
-                    selected_address.to_owned(),
-                    vec!["store.selected_address".to_owned()],
-                ));
-            }
-        }
-    }
-    if style_patch_nodes.is_empty() && text_updates.is_empty() {
+    if style_patch_nodes.is_empty() {
         return Ok(false);
     }
     shared.update_count = shared.update_count.saturating_add(1);
@@ -42233,16 +42363,10 @@ fn preview_patch_retained_selected_address_overlay(
         source_intent_index_update_count: 0,
         style_update_count: style_patch_nodes.len(),
         style_update_nodes: style_patch_nodes,
-        text_update_count: text_updates.len(),
-        text_update_nodes: text_updates
-            .iter()
-            .map(|(node, _, _)| node.clone())
-            .collect(),
-        text_update_binding_paths: text_updates
-            .iter()
-            .map(|(node, _, paths)| (node.clone(), paths.clone()))
-            .collect(),
-        text_update_values: text_updates,
+        text_update_count: 0,
+        text_update_nodes: Vec::new(),
+        text_update_binding_paths: Vec::new(),
+        text_update_values: Vec::new(),
         changed: true,
     });
     Ok(true)
@@ -59440,17 +59564,10 @@ fn preview_update_shared_focus_node_from_runtime_state(
     else {
         return Ok(false);
     };
-    let mut focus_state_summary = state_summary.clone();
-    if let Some(address) = event.address.as_deref()
-        && let Some(root) = focus_state_summary.as_object_mut()
-    {
-        insert_nested_json_value(root, "store.selected_address", json!(address));
-        insert_nested_json_value(root, "store.selected_input.address", json!(address));
-    }
     let focused_text = event
         .address
         .as_deref()
-        .and_then(|address| focused_editing_text_for_address(&focus_state_summary, address))
+        .and_then(|address| focused_editing_text_for_address(state_summary, address))
         .or_else(|| event.target_text.clone())
         .or_else(|| event.text.clone())
         .unwrap_or_default();
@@ -59461,6 +59578,24 @@ fn preview_update_shared_focus_node_from_runtime_state(
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
     };
+    let previous_selected_nodes = preview_current_selected_display_nodes(frame);
+    let retained_selection_patch = layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        .and_then(cached_document_render_snapshot)
+        .map(|snapshot| {
+            preview_retained_selection_patch_from_state_summary(
+                &snapshot,
+                None,
+                state_summary,
+                &previous_selected_nodes,
+            )
+        })
+        .filter(|patch| !patch.is_empty());
+    let selected_nodes = retained_selection_patch
+        .as_ref()
+        .map(|patch| patch.current_nodes.clone())
+        .unwrap_or_default();
     let mut changed = false;
     for item in &mut frame.display_list {
         let is_target = item.node.0 == target_node;
@@ -59496,16 +59631,20 @@ fn preview_update_shared_focus_node_from_runtime_state(
         {
             changed = true;
         }
-        if let Some(address) = event.address.as_deref() {
-            changed |= preview_apply_address_selected_overlay_to_item(
+        if !selected_nodes.is_empty() || event.address.is_some() {
+            changed |= preview_apply_selected_overlay_to_item(
                 item,
                 &layout_proof,
                 None,
-                Some(address),
+                &selected_nodes,
+                event.address.as_deref(),
             );
         }
     }
     let mut bound_sync_nodes = BTreeSet::from([target_node.to_owned()]);
+    if let Some(selection_patch) = retained_selection_patch.as_ref() {
+        bound_sync_nodes.extend(selection_patch.sync_nodes.iter().cloned());
+    }
     if let Some(layout_hash) = shared
         .layout_proof
         .get("layout_frame_hash")
@@ -59514,13 +59653,13 @@ fn preview_update_shared_focus_node_from_runtime_state(
     {
         extend_target_nodes_for_available_summary_bindings(
             &snapshot,
-            &focus_state_summary,
+            state_summary,
             &mut bound_sync_nodes,
         );
     }
     changed |= preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         &mut shared,
-        &focus_state_summary,
+        state_summary,
         Some(&bound_sync_nodes),
     );
     if changed {
@@ -62979,6 +63118,8 @@ mod tests {
         let overlay_lookup = PreviewRenderOverlayLookup::from_layout_proof(&layout_proof);
         let focus_overlay = PreviewFocusOverlayState {
             focused_node: Some("cell-a".to_owned()),
+            previous_selected_nodes: BTreeSet::new(),
+            selected_nodes: BTreeSet::new(),
             previous_selected_address: Some("B1".to_owned()),
             selected_address: Some("A1".to_owned()),
             focused_text: "42".to_owned(),
@@ -63056,6 +63197,189 @@ mod tests {
             }),
             "input overlay sidecar should carry the focused caret primitive"
         );
+    }
+
+    #[test]
+    fn input_overlay_render_scene_patch_uses_generic_selected_node_sets() {
+        let mut frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut frame,
+            root.clone(),
+            dev_node(
+                "choice-alpha",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Alpha".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("bg", "#ffffff"),
+                    ("__selected_bg", "#010203"),
+                    ("selected", "false"),
+                ],
+            ),
+        );
+        append_child(
+            &mut frame,
+            root,
+            dev_node(
+                "choice-beta",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Beta".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("bg", "#ffffff"),
+                    ("__selected_bg", "#010203"),
+                    ("selected", "true"),
+                ],
+            ),
+        );
+        let layout = layout_frame_for_document_frame(&frame, (320.0, 120.0)).unwrap();
+        let layout_proof = json!({});
+        let overlay_lookup = PreviewRenderOverlayLookup::from_layout_proof(&layout_proof);
+        let focus_overlay = PreviewFocusOverlayState {
+            focused_node: Some("choice-alpha".to_owned()),
+            previous_selected_nodes: BTreeSet::from(["choice-beta".to_owned()]),
+            selected_nodes: BTreeSet::from(["choice-alpha".to_owned()]),
+            previous_selected_address: None,
+            selected_address: None,
+            focused_text: "Alpha".to_owned(),
+            focused_caret_index: 5,
+            replace_focused_text_on_next_edit: false,
+            caret_visible: true,
+            selection_proxy: true,
+        };
+        let hover_overlay = PreviewHoverOverlayState::default();
+        let mut overlay_frame = layout.clone();
+        preview_apply_focus_overlay_state_to_render_frame(
+            &mut overlay_frame,
+            &layout_proof,
+            &focus_overlay,
+        );
+        let overlay_frame = preview_frame_with_viewport_background(&overlay_frame, 320.0, 120.0);
+
+        let touched_nodes = preview_input_overlay_render_scene_touched_nodes(
+            &layout,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+        );
+        assert_eq!(
+            touched_nodes,
+            BTreeSet::from([
+                boon_document_model::DocumentNodeId("choice-alpha".to_owned()),
+                boon_document_model::DocumentNodeId("choice-beta".to_owned()),
+            ])
+        );
+        let mut patch_columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let sidecar = preview_input_overlay_render_scene_patch_from_base(
+            &layout,
+            &overlay_lookup,
+            &hover_overlay,
+            &focus_overlay,
+            &touched_nodes,
+            320,
+            120,
+            &mut patch_columns,
+        )
+        .expect("generic selected node overlay should produce a render-scene sidecar");
+
+        let base_frame = preview_frame_with_viewport_background(&layout, 320.0, 120.0);
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let mut patched_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &base_frame,
+            320,
+            120,
+            &mut columns,
+        );
+        patched_scene.apply_patch(&sidecar.patch).unwrap();
+
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+        let full_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            &overlay_frame,
+            320,
+            120,
+            &mut columns,
+        );
+        assert_eq!(patched_scene.items, full_scene.items);
+        assert_eq!(
+            patched_scene.visual_primitives,
+            full_scene.visual_primitives
+        );
+        assert_eq!(patched_scene.text_runs, full_scene.text_runs);
+    }
+
+    #[test]
+    fn retained_selected_node_overlay_patches_generic_node_sets() {
+        let mut document_frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut document_frame,
+            root.clone(),
+            dev_node(
+                "choice-alpha",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Alpha".to_owned()),
+                &[("width", "96"), ("height", "24"), ("selected", "false")],
+            ),
+        );
+        append_child(
+            &mut document_frame,
+            root,
+            dev_node(
+                "choice-beta",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Beta".to_owned()),
+                &[("width", "96"), ("height", "24"), ("selected", "true")],
+            ),
+        );
+        let layout_frame = layout_frame_for_document_frame(&document_frame, (320.0, 120.0))
+            .expect("test frame should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({}),
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+
+        let changed = preview_patch_retained_selected_nodes_overlay(
+            &shared_render_state,
+            &BTreeSet::from(["choice-alpha".to_owned()]),
+            &BTreeSet::from(["choice-beta".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .expect("generic selected-node patch should apply");
+
+        assert!(changed);
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == "choice-alpha")
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        assert_eq!(
+            frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == "choice-beta")
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+        let stats = preview_retained_bound_sync_stats_snapshot()
+            .expect("generic selected-node patch should record retained sync stats");
+        assert_eq!(stats.style_update_count, 2);
+        assert_eq!(stats.text_update_count, 0);
     }
 
     #[test]
@@ -87726,6 +88050,157 @@ document:
             frame_text_for_node(&frame, &formula_node).as_deref(),
             Some("=add(A0,A1)"),
             "focus-only cell selection must patch the main formula input above the grid"
+        );
+    }
+
+    #[test]
+    fn focus_only_route_uses_generic_selection_binding_without_address_payload() {
+        let mut document_frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut document_frame,
+            root.clone(),
+            dev_node(
+                "choice-alpha",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Alpha".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("selected", "false"),
+                ],
+            ),
+        );
+        append_child(
+            &mut document_frame,
+            root.clone(),
+            dev_node(
+                "choice-beta",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Beta".to_owned()),
+                &[
+                    ("width", "96"),
+                    ("height", "24"),
+                    ("size", "14"),
+                    ("selected", "true"),
+                ],
+            ),
+        );
+        append_child(
+            &mut document_frame,
+            root,
+            dev_node(
+                "detail-input",
+                boon_document_model::DocumentNodeKind::TextInput,
+                Some("Beta detail".to_owned()),
+                &[("width", "160"), ("height", "24"), ("size", "14")],
+            ),
+        );
+        let layout_frame = layout_frame_for_document_frame(&document_frame, (420.0, 120.0))
+            .expect("test document should lower");
+        let mut data_binding_targets = BTreeMap::new();
+        data_binding_targets.insert(
+            "store.active_item".to_owned(),
+            vec![
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("choice-alpha".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("alpha")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("choice-beta".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("beta")).unwrap(),
+                },
+            ],
+        );
+        data_binding_targets.insert(
+            "store.active_detail".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("detail-input".to_owned()),
+                attr: "text".to_owned(),
+            }],
+        );
+        let derived_indexes = document_derived_indexes_for_frame(&document_frame).unwrap();
+        let retained_layout_cache = retained_layout_cache_for_document_layout(
+            &document_frame,
+            &derived_indexes,
+            &layout_frame,
+        )
+        .unwrap();
+        let layout_hash = "focus-only-generic-selection-binding-test".to_owned();
+        cache_document_render_snapshot(
+            layout_hash.clone(),
+            DocumentRenderSnapshot {
+                document_frame,
+                runtime_document_state_values: BTreeMap::from([(
+                    "store.active_item".to_owned(),
+                    json!("beta"),
+                )]),
+                derived_indexes,
+                display_items_by_node: document_display_items_by_node(&layout_frame),
+                retained_layout_cache,
+                layout_frame: Arc::new(layout_frame.clone()),
+                structural_data_reads: BTreeSet::new(),
+                structural_data_read_aliases: Vec::new(),
+                source_intents: Vec::new(),
+                data_binding_targets: Arc::new(data_binding_targets.into()),
+                hit_route_static_cache_key: None,
+            },
+        );
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({"layout_frame_hash": layout_hash}),
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let event = boon_runtime::LiveSourceEvent {
+            source: "choice.select".to_owned(),
+            target_text: Some("Alpha".to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        };
+
+        let changed = preview_update_shared_focus_node_from_runtime_state(
+            &shared_render_state,
+            &json!({
+                "target_node": "choice-alpha",
+                "source_intent": {"intent": "focus"}
+            }),
+            &event,
+            &json!({
+                "store": {
+                    "active_item": "alpha",
+                    "active_detail": "Alpha detail"
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(changed);
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == "choice-alpha")
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+        assert_eq!(
+            frame
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == "choice-beta")
+                .and_then(|item| item.style.get("selected")),
+            Some(&boon_document_model::StyleValue::Bool(false))
+        );
+        assert_eq!(
+            frame_text_for_node(&frame, "detail-input").as_deref(),
+            Some("Alpha detail")
         );
     }
 

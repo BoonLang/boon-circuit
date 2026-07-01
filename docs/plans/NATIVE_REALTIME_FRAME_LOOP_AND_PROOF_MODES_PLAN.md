@@ -952,6 +952,96 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   updating the focus-only host route to avoid injecting selection identity
   through address-specific code.
 
+2026-07-01 generic selected-node overlay sidecar slice:
+
+- `PreviewFocusOverlayState` now carries previous/current selected node sets
+  alongside the older address fallback fields. The simple source-click path
+  seeds those node sets from the generic retained selection patch collector,
+  so downstream focus/selection overlay work can remain document-node based.
+- Retained focus/selection item patching now applies selected state from
+  generic node membership first and falls back to address lookup only when no
+  selected node set is available. The old item-level address-only patch helper
+  was replaced with a generic selected-overlay helper.
+- Input-overlay render-scene patching now includes previous/current selected
+  node sets when computing touched nodes. The sidecar path can therefore patch
+  stale and newly selected primitives without rediscovering identity from app
+  field names when generic binding evidence exists.
+- Render proof diagnostics now report selected-node counts and bounded samples
+  in `input_overlay_focus_state`, making it visible when the generic path is
+  active.
+- Added a non-Cells render-scene sidecar fixture using arbitrary selected
+  `choice-*` nodes and no address/source-intent metadata, proving the sidecar
+  can match full overlay lowering from node sets alone.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_uses_generic_selected_node_sets`
+  - `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_matches_full_overlay_lowering`
+  - `cargo test -q -p boon_native_playground cells_input_overlay_render_scene_patch_updates_stale_selected_cell_primitives`
+  - `cargo test -q -p boon_native_playground cells_click_selection_updates_formula_bar_and_selected_style`
+  - `cargo test -q -p boon_native_playground retained_selection_patch_uses_generic_static_equality_bindings`
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`
+  - `cargo test -q -p boon_native_playground targeted_bound_sync_expands_to_selection_dependent_formula_bar`
+  - `cargo check -q -p boon_native_playground`
+- This is still not the full no-hacks cleanup. Remaining work includes
+  replacing focus-only route selection identity with a data-binding/source-
+  intent generic path, removing `store.selected_address` text fallback patching
+  from production, and auditing/reporting the remaining address-shaped fallback
+  helpers as diagnostics rather than product hot-path requirements.
+
+2026-07-01 generic focus-only selection patch slice:
+
+- The focus-only retained route now derives selected nodes from the generic
+  retained selection patch collector and the current state summary. It no
+  longer fabricates `store.selected_address` or `store.selected_input.address`
+  into a synthetic state summary before patching retained state.
+- Focus-only selection repaint now uses generic selected node membership when
+  available, with the older event payload fallback used only if no generic
+  static-equality binding evidence exists.
+- The retained selected overlay fallback no longer scans top-left text by
+  coordinates and previous address text. Text updates are left to the generic
+  bound-text/source-intent sync path, which already has binding targets and
+  state-summary currentness.
+- Added a non-Cells focus-only fixture using arbitrary `store.active_item`
+  static equality bindings and no address payload. It proves focus-only
+  retained selection and bound text updates work from data bindings alone.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground focus_only_route_uses_generic_selection_binding_without_address_payload`
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`
+  - `cargo test -q -p boon_native_playground cells_click_selection_updates_formula_bar_and_selected_style`
+  - `cargo test -q -p boon_native_playground targeted_bound_sync_expands_to_selection_dependent_formula_bar`
+  - `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_uses_generic_selected_node_sets`
+  - `cargo check -q -p boon_native_playground`
+- Remaining no-hacks work: address-shaped fallback helpers still exist for
+  older source-intent payloads and must be audited or moved behind explicit
+  diagnostic/fallback reporting. Broader runtime/compiler string-coupling and
+  aggregate native GPU release gates also remain open.
+
+2026-07-01 generic simple-click selection patch slice:
+
+- The simple source-click hot path now treats generic retained selection patch
+  evidence as authoritative. When previous/current selected node sets are
+  available from static-equality data bindings, it skips the older
+  source-intent address node-discovery pass for selected style sync.
+- Added a generic retained selected-node overlay patch helper. It patches
+  selected styles from explicit previous/current node sets and records retained
+  sync stats without relying on app field names, address source-intent values,
+  or text coordinate fallbacks.
+- The existing address-shaped retained selected overlay patch remains as a
+  compatibility fallback only when generic selected-node evidence is absent.
+- Focus overlay state is now refreshed from generic retained selection patches
+  even when no selected address payload is available.
+- Added direct non-Cells coverage for the retained selected-node patch helper
+  with arbitrary `choice-*` nodes.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground retained_selected_node_overlay_patches_generic_node_sets`
+  - `cargo test -q -p boon_native_playground cells_click_selection_updates_formula_bar_and_selected_style`
+  - `cargo test -q -p boon_native_playground input_overlay_render_scene_patch_uses_generic_selected_node_sets`
+  - `cargo test -q -p boon_native_playground focus_only_route_uses_generic_selection_binding_without_address_payload`
+- Remaining no-hacks work: the address fallback path still exists and should
+  be explicitly reported when used or removed after the verifier no longer
+  needs legacy address-payload compatibility. Broader runtime/compiler
+  hardcoded field-name audits and aggregate release performance gates remain
+  open.
+
 ## Implementation Slices
 
 1. Terminology and schema:

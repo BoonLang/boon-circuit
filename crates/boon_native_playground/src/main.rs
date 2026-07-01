@@ -38267,6 +38267,23 @@ fn selection_proxy_text_input_candidate_nodes(
     nodes
 }
 
+fn extend_bound_sync_nodes_for_selection_proxy_text_inputs(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &PreviewNativeInputState,
+    target_nodes: &mut BTreeSet<String>,
+) {
+    if !input_state.focused_selection_proxy {
+        return;
+    }
+    let Ok(shared) = shared_render_state.lock() else {
+        return;
+    };
+    target_nodes.extend(selection_proxy_text_input_candidate_nodes(
+        &shared,
+        input_state,
+    ));
+}
+
 fn selection_proxy_node_matches_editor_sources(
     layout_proof: &Value,
     node: &str,
@@ -40056,10 +40073,16 @@ fn preview_try_apply_simple_source_click_input(
             &bound_sync_nodes,
         )?;
     } else {
+        let mut runtime_bound_sync_nodes = bound_sync_nodes.clone();
+        extend_bound_sync_nodes_for_selection_proxy_text_inputs(
+            shared_render_state,
+            input_state,
+            &mut runtime_bound_sync_nodes,
+        );
         preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
             shared_render_state,
             live_runtime,
-            &bound_sync_nodes,
+            &runtime_bound_sync_nodes,
         )?;
     }
     let bound_input_sync_ms = elapsed_ms(bound_input_sync_started);
@@ -45998,6 +46021,19 @@ fn preview_apply_live_events_internal(
             if current_layout_hash == previous_layout_hash.as_deref()
                 && shared_render_state.layout_frame_override.is_some()
             {
+                let mut visible_state_sync_nodes = visible_state_sync_nodes.clone();
+                if let Some(layout_hash) = shared_render_state
+                    .layout_proof
+                    .get("layout_frame_hash")
+                    .and_then(Value::as_str)
+                    && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
+                {
+                    extend_target_nodes_for_available_summary_bindings(
+                        &snapshot,
+                        state_summary,
+                        &mut visible_state_sync_nodes,
+                    );
+                }
                 cache_layout_runtime_state_snapshot_for_hot_layout_proof(
                     &mut shared_render_state.layout_proof,
                     state_summary,
@@ -46006,7 +46042,7 @@ fn preview_apply_live_events_internal(
                 synced_bound_inputs = preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                     &mut shared_render_state,
                     state_summary,
-                    Some(visible_state_sync_nodes),
+                    Some(&visible_state_sync_nodes),
                 );
                 bound_input_sync_ms += elapsed_ms(bound_input_sync_started);
                 shared_render_state.last_error = None;
@@ -89003,6 +89039,91 @@ document:
             selected_cells,
             vec![b0_node],
             "clicking B0 should visually select only that cell display item"
+        );
+    }
+
+    #[test]
+    fn selection_proxy_noop_click_refreshes_bound_text_input_from_runtime() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-selection-proxy-noop-click-refreshes-bound-text",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (a2_x, a2_y, a2_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("A2"))
+                .unwrap();
+        let (_, _, formula_node) = formula_bar_input_center(&initial_layout);
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        {
+            let mut runtime = live_runtime.lock().unwrap();
+            runtime
+                .apply_source_event_turn(boon_runtime::LiveSourceEvent {
+                    source: "cell.sources.editor.select".to_owned(),
+                    address: Some("A2".to_owned()),
+                    ..boon_runtime::LiveSourceEvent::default()
+                })
+                .unwrap();
+            let summary = runtime.document_state_summary();
+            assert_eq!(summary["store"]["selected_address"], "A2");
+            assert_eq!(summary["store"]["selected_input"]["editing_text"], "15");
+        }
+        assert_eq!(
+            frame_text_for_node(&latest_preview_frame(&shared_render_state), &formula_node)
+                .as_deref(),
+            Some("5"),
+            "test precondition: retained formula bar is still stale before the no-op click"
+        );
+
+        let mut input_state = PreviewNativeInputState::default();
+        let _ = take_preview_native_input_timings();
+        clear_preview_retained_bound_sync_stats();
+        let input = real_window_shaped_click_input_from_index(0, a2_x, a2_y);
+        preview_apply_real_window_input(
+            &input,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+
+        let _ = take_preview_native_input_timings();
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, &formula_node).as_deref(),
+            Some("15"),
+            "a selection-proxy click that is a runtime no-op must still refresh the visible bound text input from current runtime state"
+        );
+        assert!(
+            preview_retained_bound_sync_text_update_nodes()
+                .contains(&boon_document_model::DocumentNodeId(formula_node.clone())),
+            "the formula text input must be included in retained sync nodes so WGPU patch proof can carry the updated glyphs"
+        );
+        let a2_item = frame
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == a2_node)
+            .expect("A2 retained display item should remain visible");
+        assert_eq!(
+            a2_item.style.get("selected"),
+            Some(&boon_document_model::StyleValue::Bool(true)),
+            "the same no-op click should keep the clicked cell visually selected"
         );
     }
 

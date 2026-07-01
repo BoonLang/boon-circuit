@@ -50658,6 +50658,10 @@ fn native_scroll_axis_attempt_summary(
         "axis": axis,
         "status": observation.get("status").cloned().unwrap_or_else(|| json!("missing")),
         "driver_pass": observation.get("driver_pass").cloned().unwrap_or_else(|| json!(false)),
+        "scroll_driver_process_count": observation.get("scroll_driver_process_count").cloned().unwrap_or_else(|| json!(0)),
+        "scroll_driver_sustained_burst": observation.get("scroll_driver_sustained_burst").cloned().unwrap_or_else(|| json!(false)),
+        "scroll_driver_repeat_count": observation.get("scroll_driver_repeat_count").cloned().unwrap_or_else(|| json!(0)),
+        "scroll_driver_repeat_delay_ms": observation.get("scroll_driver_repeat_delay_ms").cloned().unwrap_or_else(|| json!(0)),
         "desktop_pass": observation.get("desktop_pass").cloned().unwrap_or_else(|| json!(false)),
         "measured_loop_pass": observation.get("measured_loop_pass").cloned().unwrap_or_else(|| json!(false)),
         "measured_loop_same_frame_readback_proven": observation.get("measured_loop_same_frame_readback_proven").cloned().unwrap_or_else(|| json!(false)),
@@ -69207,10 +69211,9 @@ fn run_linux_human_like_desktop_surface_smoke(
             .unwrap_or(4)
             .saturating_add(1)
             .clamp(2, 8) as usize;
+    let scroll_driver_repeat_delay_ms = 20_u64;
     let driver_points = if scroll_only {
-        (0..scroll_driver_repeat_count)
-            .map(|_| [target_x.to_string(), target_y.to_string()])
-            .collect::<Vec<_>>()
+        vec![[target_x.to_string(), target_y.to_string()]]
     } else {
         vec![
             [target_x.to_string(), target_y.to_string()],
@@ -69222,12 +69225,24 @@ fn run_linux_human_like_desktop_surface_smoke(
     let mut driver_stderr = Vec::new();
     let mut last_driver_json = json!({"status": "not-run"});
     let mut last_driver_success = false;
-    let driver_command_count = driver_points.len();
+    let driver_process_count = driver_points.len();
+    let driver_command_count = if scroll_only {
+        scroll_driver_repeat_count
+    } else {
+        driver_process_count
+    };
     for point in driver_points {
         let mut command = Command::new(&driver_path);
         command.args([point[0].as_str(), point[1].as_str()]);
         if scroll_only {
-            command.args(["", scroll_mode.unwrap_or("scroll-only")]);
+            let repeat_count = scroll_driver_repeat_count.to_string();
+            let repeat_delay_ms = scroll_driver_repeat_delay_ms.to_string();
+            command.args([
+                "",
+                scroll_mode.unwrap_or("scroll-only"),
+                repeat_count.as_str(),
+                repeat_delay_ms.as_str(),
+            ]);
         }
         let output = command.env("WAYLAND_DISPLAY", &socket).output()?;
         last_driver_success = output.status.success();
@@ -69235,7 +69250,9 @@ fn run_linux_human_like_desktop_surface_smoke(
             .unwrap_or_else(|_| json!({"status": "fail", "reason": "driver stdout was not JSON"}));
         driver_stdout.extend_from_slice(&output.stdout);
         driver_stderr.extend_from_slice(&output.stderr);
-        thread::sleep(Duration::from_millis(250));
+        if !scroll_only {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
     fs::write(&driver_stdout_path, &driver_stdout)?;
     fs::write(&driver_stderr_path, &driver_stderr)?;
@@ -69510,6 +69527,10 @@ fn run_linux_human_like_desktop_surface_smoke(
         "scroll_only_driver_mode": scroll_only,
         "scroll_driver_mode": scroll_mode.unwrap_or(if scroll_only { "scroll-only" } else { "default" }),
         "scroll_driver_command_count": driver_command_count,
+        "scroll_driver_process_count": driver_process_count,
+        "scroll_driver_sustained_burst": scroll_only,
+        "scroll_driver_repeat_count": if scroll_only { scroll_driver_repeat_count } else { 1 },
+        "scroll_driver_repeat_delay_ms": if scroll_only { scroll_driver_repeat_delay_ms } else { 0 },
         "scroll_product_path_input_sample_count_min": native_gpu_budget_u64("frame", "product_path_scroll_input_sample_count_min").unwrap_or(4).max(2),
         "weston_control_plugin_path": plugin_path,
         "weston_test_driver_path": driver_path,

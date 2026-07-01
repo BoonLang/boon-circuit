@@ -1409,6 +1409,61 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   16.7ms, but final readiness still requires hardware-backed real-window
   evidence and broader p95 sample counts.
 
+2026-07-01 sustained native scroll evidence slice:
+
+- The isolated Weston native scroll driver now supports a sustained wheel burst
+  in one driver process:
+  - optional `repeat_count` and `repeat_delay_ms` arguments;
+  - per-run JSON reports for sent axis events, burst count, first/last scroll
+    monotonic timestamps, and repeat settings;
+  - no global desktop input, no screenshots, and no example-specific code.
+- `verify-native-gpu-scroll-speed` now uses that sustained app-owned native
+  wheel path for axis-specific scroll probes. Reports distinguish:
+  - `scroll_driver_process_count`;
+  - `scroll_driver_command_count`;
+  - `scroll_driver_sustained_burst`;
+  - `scroll_driver_repeat_count`;
+  - `scroll_driver_repeat_delay_ms`.
+- Fresh Cells report after this slice:
+  - `status=fail`;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_sample_count=4`;
+  - `speed_budget_timing_window=product-path-input-to-present`;
+  - `product_path_input_to_present_ms_p95=26.356046000000788`;
+  - `ux_frame_budget_pass=false`;
+  - `renderer_frame_budget_pass=true`;
+  - `renderer_cpu_frame_ms_p95=2.6573029999999997`;
+  - `present_blocking_ms_p95=28.846819999999997`;
+  - `measured_adapter_is_software=true`;
+  - blockers are now both explicit:
+    `native scroll-speed gate product-path input-to-present p95 is over target;
+    UX speed is not proven` and
+    `native scroll-speed gate ran on a software adapter; hardware-backed
+    real-window speed is not proven`.
+- Fresh verification:
+  - `cargo fmt --check`;
+  - `cargo check -q -p xtask`;
+  - `git diff --check`;
+  - direct `cc` compile of
+    `tools/linux-human-like/weston-test-driver.c` against the generated
+    Weston test protocol;
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+    target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the
+    UX p95 and software-adapter blockers above;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-cells.json` passed.
+- A diagnostic `BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT=1` scroll-speed run was
+  stopped after it failed to complete promptly, so offscreen-copy-to-present is
+  not promoted by this slice.
+- Independent subagent reads agreed on the next architecture targets:
+  - present/submit is the current measured wall-clock blocker after renderer
+    CPU work;
+  - add a generic surface-present coordinator with late swapchain acquisition,
+    per-frame combined present-path metrics, and adaptive present-mode evidence;
+  - implement active/pending document/layout/render snapshots so click and
+    scroll can keep presenting the active retained frame while heavier generic
+    runtime/layout work catches up.
+
 ## Implementation Slices
 
 1. Terminology and schema:

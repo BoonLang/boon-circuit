@@ -21,7 +21,8 @@ const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
-const LOW_LATENCY_SURFACE_FRAME_LATENCY: u32 = 1;
+const SINGLE_FRAME_SURFACE_FRAME_LATENCY: u32 = 1;
+const PACED_SURFACE_FRAME_LATENCY: u32 = 2;
 const NATIVE_TARGET_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0;
 pub const REQUESTED_ANIMATION_BURST_MIN_FRAMES: u32 = 2;
 pub const REQUESTED_ANIMATION_QUIET_MS: u64 = 100;
@@ -1421,7 +1422,10 @@ impl NativeRenderLoopState {
             self.clear_requested_animation_burst();
             return;
         }
-        if self.requested_animation_burst_frames_remaining > 0 {
+        let in_quiet_window = self
+            .requested_animation_burst_quiet_until_elapsed_ms
+            .is_some_and(|quiet_until| elapsed_ms < quiet_until);
+        if self.requested_animation_burst_frames_remaining > 0 || in_quiet_window {
             self.schedule_wake_after(now, native_target_frame_interval_duration());
         }
     }
@@ -1446,7 +1450,11 @@ impl NativeRenderLoopState {
     pub fn consume_due_wake(&mut self, now: Instant) -> bool {
         if self.next_wake_at.is_some_and(|wake_at| now >= wake_at) {
             self.next_wake_at = None;
-            let reason = if self.requested_animation_burst_frames_remaining > 0 {
+            let burst_pacing_active = self.requested_animation_burst_frames_remaining > 0
+                || self
+                    .requested_animation_burst_quiet_until_elapsed_ms
+                    .is_some();
+            let reason = if burst_pacing_active {
                 self.dirty_revision = self.dirty_revision.saturating_add(1);
                 NativeSchedulerReason::RequestedAnimation
             } else {
@@ -1802,11 +1810,6 @@ pub struct AppWindowSurfaceProof {
 fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
     if capabilities
         .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
-    {
-        wgpu::PresentMode::Mailbox
-    } else if capabilities
-        .present_modes
         .contains(&wgpu::PresentMode::Immediate)
     {
         wgpu::PresentMode::Immediate
@@ -1815,8 +1818,22 @@ fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::P
         .contains(&wgpu::PresentMode::AutoNoVsync)
     {
         wgpu::PresentMode::AutoNoVsync
+    } else if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::Mailbox)
+    {
+        wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo
+    }
+}
+
+fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) -> u32 {
+    match present_mode {
+        wgpu::PresentMode::Immediate | wgpu::PresentMode::AutoNoVsync => {
+            SINGLE_FRAME_SURFACE_FRAME_LATENCY
+        }
+        _ => PACED_SURFACE_FRAME_LATENCY,
     }
 }
 
@@ -2616,7 +2633,8 @@ async fn run_surface_probe_inner(
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
     }
     config.present_mode = low_latency_present_mode(&capabilities);
-    config.desired_maximum_frame_latency = LOW_LATENCY_SURFACE_FRAME_LATENCY;
+    config.desired_maximum_frame_latency =
+        interactive_desired_maximum_frame_latency(config.present_mode);
     let surface_copy_to_present_supported =
         capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
     let surface_copy_src_readback_supported =
@@ -7622,6 +7640,36 @@ mod tests {
     }
 
     #[test]
+    fn requested_animation_burst_paces_until_quiet_interval_expires() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+        assert!(state.consume_due_wake_after_poll(now));
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(12.0);
+        state.schedule_requested_animation_followup(now, 12.0);
+        assert!(state.next_wake_at.is_some());
+
+        let due = now + native_target_frame_interval_duration();
+        assert!(state.consume_due_wake(due));
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(29.0);
+        state.schedule_requested_animation_followup(due, 29.0);
+        assert!(
+            state.next_wake_at.is_some(),
+            "the burst should keep pacing frames during the quiet window after min frames are consumed"
+        );
+
+        state.clear_requested_animation_burst_if_quiet(200.0);
+        assert_eq!(
+            native_frame_pacing_snapshot(&state).state,
+            NativeFramePacingState::Idle
+        );
+    }
+
+    #[test]
     fn host_input_animation_burst_can_repaint_without_waiting_a_frame_interval() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
@@ -8027,7 +8075,7 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_present_mode_prefers_mailbox_for_paced_native_ui() {
+    fn low_latency_present_mode_prefers_app_paced_no_vsync_when_available() {
         let mut capabilities = wgpu::SurfaceCapabilities {
             formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
             present_modes: vec![
@@ -8041,7 +8089,7 @@ mod tests {
 
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::Immediate
         );
 
         capabilities.present_modes = vec![
@@ -8051,7 +8099,7 @@ mod tests {
         ];
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::AutoNoVsync
         );
 
         capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
@@ -8076,6 +8124,26 @@ mod tests {
         assert_eq!(
             low_latency_present_mode(&capabilities),
             wgpu::PresentMode::Fifo
+        );
+    }
+
+    #[test]
+    fn interactive_surface_latency_allows_two_paced_frames_in_flight() {
+        assert_eq!(
+            interactive_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox),
+            PACED_SURFACE_FRAME_LATENCY
+        );
+        assert_eq!(
+            interactive_desired_maximum_frame_latency(wgpu::PresentMode::Fifo),
+            PACED_SURFACE_FRAME_LATENCY
+        );
+        assert_eq!(
+            interactive_desired_maximum_frame_latency(wgpu::PresentMode::Immediate),
+            SINGLE_FRAME_SURFACE_FRAME_LATENCY
+        );
+        assert_eq!(
+            interactive_desired_maximum_frame_latency(wgpu::PresentMode::AutoNoVsync),
+            SINGLE_FRAME_SURFACE_FRAME_LATENCY
         );
     }
 

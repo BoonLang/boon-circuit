@@ -38987,6 +38987,8 @@ fn verify_native_dev_editor_scroll_speed(
     } else {
         "dev_editor_scroll.debug"
     };
+    let wheel_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95")?;
+    let max_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max")?;
     let (source_path, example_id, corpus) = ensure_dev_editor_speed_corpus(&artifacts_dir)?;
     let source_text = fs::read_to_string(&source_path)?;
     let line_count = source_text.lines().count() as u64;
@@ -39029,6 +39031,8 @@ fn verify_native_dev_editor_scroll_speed(
         true,
         "dev_surface_proof",
         vertical_driver_target.clone(),
+        wheel_budget,
+        max_budget,
     )?;
     let horizontal_observation = run_native_scroll_axis_observation_with_retries(
         "dev-editor-scroll-speed",
@@ -39039,6 +39043,8 @@ fn verify_native_dev_editor_scroll_speed(
         true,
         "dev_surface_proof",
         horizontal_driver_target.clone(),
+        wheel_budget,
+        max_budget,
     )?;
     let vertical_surface_proof = vertical_observation
         .get("surface_external_render_proof")
@@ -39128,8 +39134,6 @@ fn verify_native_dev_editor_scroll_speed(
     let wheel_to_visible_horizontal_ms = horizontal_p95;
     let wheel_to_visible_p95 = p95;
     let wheel_to_visible_max = frame_max.max(wheel_to_visible_p95);
-    let wheel_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_p95")?;
-    let max_budget = required_native_gpu_budget_f64(budget_section, "wheel_to_visible_ms_max")?;
     let runtime_dispatch_count = 0_u64;
     let graph_rebuild_count = 0_u64;
     let source_replace_count = vertical_surface_proof
@@ -47510,6 +47514,10 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
     } else {
         "preview_surface_proof"
     };
+    let axis_retry_wheel_budget =
+        native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
+    let axis_retry_max_budget =
+        native_gpu_budget_f64("frame", "preview_frame_ms_max").unwrap_or(33.4);
     let vertical_driver_target =
         native_scroll_driver_target_for_axis(&label, &layout_probe, "vertical")
             .or_else(|| driver_target.clone());
@@ -47556,6 +47564,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             dev_editor,
             measured_surface_key,
             vertical_driver_target.clone(),
+            axis_retry_wheel_budget,
+            axis_retry_max_budget,
         )?;
         let horizontal_observation = run_native_scroll_axis_observation_with_retries(
             &label,
@@ -47566,6 +47576,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             dev_editor,
             measured_surface_key,
             horizontal_driver_target.clone(),
+            axis_retry_wheel_budget,
+            axis_retry_max_budget,
         )?;
         axis_specific_real_window_scroll_observation =
             native_scroll_axis_observation_summary(vertical_observation, horizontal_observation);
@@ -48753,6 +48765,18 @@ fn dev_editor_scroll_speed_compatibility_extra(
     });
     promote_axis_specific_scroll_timing(&mut extra);
     add_native_scroll_model_evidence(&mut extra, "dev-code-editor", true);
+    if let Some(release_preview_perf_stats) = extra.get("release_preview_perf_stats").cloned()
+        && release_preview_perf_stats
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("preview-perf-stats")
+    {
+        extra["axis_specific_product_path_preview_perf_stats"] = extra
+            .get("preview_perf_stats")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        extra["preview_perf_stats"] = release_preview_perf_stats;
+    }
     extra["native_scroll_input_route_evidence"] =
         native_scroll_input_route_evidence("dev-code-editor", &extra);
     extra["passive_scroll_property_tree_proof"] = passive_scroll_property_tree_proof(&extra);
@@ -50849,6 +50873,8 @@ fn run_native_scroll_axis_observation_with_retries(
     dev_editor: bool,
     measured_surface_key: &str,
     driver_target: Option<serde_json::Value>,
+    wheel_budget_ms: f64,
+    max_budget_ms: f64,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let scroll_mode = match axis {
         "vertical" => "vertical-scroll-only",
@@ -50863,6 +50889,7 @@ fn run_native_scroll_axis_observation_with_retries(
     let max_attempts = success_goal.saturating_add(2).clamp(3, 8);
     let mut attempt_summaries = Vec::new();
     let mut successful_observations = Vec::new();
+    let mut observation_pass_count = 0_u64;
     let mut selected_pass_observation = None::<serde_json::Value>;
     let mut best_failed_observation = None::<serde_json::Value>;
     let mut best_failed_score = i64::MIN;
@@ -50886,7 +50913,17 @@ fn run_native_scroll_axis_observation_with_retries(
             true,
             Some(scroll_mode),
         )?;
-        let pass = native_scroll_axis_observation_pass(&observation, axis);
+        let observation_pass = native_scroll_axis_observation_pass(&observation, axis);
+        let speed_budget =
+            native_scroll_axis_speed_budget_evidence(&observation, wheel_budget_ms, max_budget_ms);
+        let speed_budget_pass = speed_budget
+            .get("pass")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let pass = observation_pass && speed_budget_pass;
+        observation["axis_retry_observation_pass"] = json!(observation_pass);
+        observation["axis_retry_speed_budget"] = speed_budget;
+        observation["axis_retry_speed_budget_pass"] = json!(speed_budget_pass);
         observation["axis_retry_attempt_index"] = json!(attempt);
         observation["axis_retry_attempt_count"] = json!(attempt);
         observation["axis_retry_max_attempts"] = json!(max_attempts);
@@ -50897,6 +50934,9 @@ fn run_native_scroll_axis_observation_with_retries(
             axis,
             attempt,
         ));
+        if observation_pass {
+            observation_pass_count = observation_pass_count.saturating_add(1);
+        }
         if pass {
             successful_observations.push(observation.clone());
             selected_pass_observation = Some(observation);
@@ -50926,6 +50966,8 @@ fn run_native_scroll_axis_observation_with_retries(
     selected["axis_retry_selected_attempt"] = json!(selected_attempt);
     selected["axis_retry_success_goal"] = json!(success_goal);
     selected["axis_retry_success_count"] = json!(success_count);
+    selected["axis_retry_observation_pass_count"] = json!(observation_pass_count);
+    selected["axis_retry_success_policy"] = json!("native-input-and-proof-pass-plus-speed-budget");
     selected["axis_retry_selection"] = json!(if success_count >= success_goal {
         "sustained_pass"
     } else if success_count > 0 {
@@ -50941,6 +50983,33 @@ fn run_native_scroll_axis_observation_with_retries(
     selected["axis_product_path_timing"] =
         native_scroll_axis_product_path_timing(&successful_observations, axis);
     Ok(selected)
+}
+
+fn native_scroll_axis_speed_budget_evidence(
+    observation: &serde_json::Value,
+    wheel_budget_ms: f64,
+    max_budget_ms: f64,
+) -> serde_json::Value {
+    let timing = observation
+        .get("surface_post_input_frame_timing")
+        .unwrap_or(&serde_json::Value::Null);
+    let p95 = timing
+        .get("presented_frame_ms_p95")
+        .and_then(numeric_value_as_f64);
+    let max = timing
+        .get("presented_frame_ms_max")
+        .and_then(numeric_value_as_f64)
+        .or(p95);
+    let pass = p95.is_some_and(|value| value.is_finite() && value <= wheel_budget_ms)
+        && max.is_some_and(|value| value.is_finite() && value <= max_budget_ms);
+    json!({
+        "pass": pass,
+        "p95": p95,
+        "max": max,
+        "wheel_budget_ms": wheel_budget_ms,
+        "max_budget_ms": max_budget_ms,
+        "timing_source": "surface_post_input_frame_timing"
+    })
 }
 
 fn native_scroll_axis_observation_score(observation: &serde_json::Value, axis: &str) -> i64 {
@@ -51070,6 +51139,9 @@ fn native_scroll_axis_attempt_summary(
         "post_input_timing_proven": observation.get("post_input_timing_proven").cloned().unwrap_or_else(|| json!(false)),
         "measured_role_loop_reports_match": observation.get("measured_role_loop_reports_match").cloned().unwrap_or_else(|| json!(false)),
         "desktop_lifecycle_or_app_owned_reports_ok": observation.get("desktop_lifecycle_or_app_owned_reports_ok").cloned().unwrap_or_else(|| json!(false)),
+        "axis_retry_observation_pass": observation.get("axis_retry_observation_pass").cloned().unwrap_or_else(|| json!(false)),
+        "axis_retry_speed_budget_pass": observation.get("axis_retry_speed_budget_pass").cloned().unwrap_or_else(|| json!(false)),
+        "axis_retry_speed_budget": observation.get("axis_retry_speed_budget").cloned().unwrap_or_else(|| json!({"pass": false, "reason": "missing"})),
         "real_os_events_observed": observation.get("real_os_events_observed").cloned().unwrap_or_else(|| json!(false)),
         "wheel_input_observed": observation.get("wheel_input_observed").cloned().unwrap_or_else(|| json!(false)),
         "mouse_scroll_event_count": input_adapter
@@ -86424,6 +86496,47 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .get("required_real_window_speed_proven")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn native_scroll_axis_speed_budget_evidence_checks_p95_and_max() {
+        let fast = json!({
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 12.0,
+                "presented_frame_ms_max": 18.0
+            }
+        });
+        let slow_p95 = json!({
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 17.2,
+                "presented_frame_ms_max": 18.0
+            }
+        });
+        let slow_max = json!({
+            "surface_post_input_frame_timing": {
+                "presented_frame_ms_p95": 12.0,
+                "presented_frame_ms_max": 26.0
+            }
+        });
+
+        assert_eq!(
+            native_scroll_axis_speed_budget_evidence(&fast, 16.7, 25.0)
+                .get("pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            native_scroll_axis_speed_budget_evidence(&slow_p95, 16.7, 25.0)
+                .get("pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            native_scroll_axis_speed_budget_evidence(&slow_max, 16.7, 25.0)
+                .get("pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
     }
 

@@ -1888,6 +1888,54 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   release dev-editor scroll path, especially frame-time outliers and any
   remaining text/layout/render work during passive scroll.
 
+2026-07-01 dev-code-editor scroll retry budget slice:
+
+- Axis-specific native scroll retry selection now requires both the existing
+  native input/proof observation pass and the same p95/max speed budget used by
+  the report. A proof-valid but over-budget observation remains visible in the
+  report as an attempted observation, but it no longer counts toward the
+  sustained retry success policy.
+- Axis retry reports now expose `axis_retry_observation_pass`,
+  `axis_retry_speed_budget`, `axis_retry_speed_budget_pass`,
+  `axis_retry_observation_pass_count`, and
+  `axis_retry_success_policy="native-input-and-proof-pass-plus-speed-budget"`.
+  This keeps outlier attempts auditable instead of hiding them behind a later
+  pass.
+- The dev-code-editor compatibility alias now restores the full delegated
+  release `preview_perf_stats` object after axis timing promotion, so the
+  canonical report field remains schema-valid while axis-specific timing stays
+  available for the compatibility speed budget.
+- A fresh release dev-editor scroll run passed with
+  `dev_editor_frame_ms_p50_p95_p99_max.p95=13.4338 ms`,
+  `wheel_to_visible_ms_p95_per_axis.vertical=13.4338 ms`,
+  `wheel_to_visible_ms_p95_per_axis.horizontal=11.994173 ms`, and
+  `fast_frame_patch_count_for_passive_scroll=1`.
+- A fresh compatibility alias report passed with
+  `speed_budget_timing_window=axis-specific-post-real-window-input`,
+  `speed_budget_frame_ms_p95=13.4338 ms`,
+  `budget_pass=true`, `ux_frame_budget_pass=true`, and schema validation
+  passing. Its delegated product-path timing remains reported separately and is
+  not the selected compatibility speed-budget window.
+- Focused verification passed:
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask native_scroll_axis_speed_budget_evidence_checks_p95_and_max`;
+  - `cargo test -q -p xtask dev_editor_scroll_speed_alias`;
+  - `timeout 900s cargo xtask verify-native-dev-editor-scroll-speed --profile
+    release --report
+    target/reports/native-gpu/dev-editor-scroll-speed-release.json`;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/dev-editor-scroll-speed-release.json`;
+  - `timeout 900s cargo xtask verify-native-gpu-scroll-speed --surface
+    dev-code-editor --report
+    target/reports/native-gpu/scroll-speed-dev-code-editor.json`;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-dev-code-editor.json`.
+- This still does not complete the goal. Remaining work includes hardware-backed
+  native scroll evidence, Cells click/formula-bar responsiveness, runtime
+  currentness/index/dependency work, and aggregate fresh-report alignment.
+
 ## Implementation Slices
 
 1. Terminology and schema:

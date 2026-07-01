@@ -1632,6 +1632,9 @@ pub struct NativeFrameTimingProof {
     pub frame_present_ms_p50: f64,
     pub frame_present_ms_p95: f64,
     pub frame_present_ms_max: f64,
+    pub sample_pacing_wait_ms_p50: f64,
+    pub sample_pacing_wait_ms_p95: f64,
+    pub sample_pacing_wait_ms_max: f64,
     pub post_present_bookkeeping_ms_p50: f64,
     pub post_present_bookkeeping_ms_p95: f64,
     pub post_present_bookkeeping_ms_max: f64,
@@ -2375,6 +2378,7 @@ async fn run_surface_probe_inner(
     let mut encoder_finish_samples = Vec::new();
     let mut queue_submit_samples = Vec::new();
     let mut frame_present_samples = Vec::new();
+    let mut sample_pacing_wait_samples = Vec::new();
     let mut post_present_bookkeeping_samples = Vec::new();
     let mut presented_frame_samples = Vec::new();
     let mut presented_frame_over_16_7_indices = Vec::new();
@@ -2388,8 +2392,13 @@ async fn run_surface_probe_inner(
     };
     let mut render_loop_state = NativeRenderLoopState::new(loop_mode);
     let mut surface_lifecycle = NativeSurfaceLifecycleState::new(width, height);
+    let mut next_forced_sample_frame_start = Instant::now();
 
     for frame_index in 0..total_frame_count {
+        let current_sample_pacing_wait_ms = wait_for_forced_sample_frame_pacing(
+            &mut next_forced_sample_frame_start,
+            frame_index > 0,
+        );
         let input = empty_input_adapter_proof(false);
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
@@ -2606,6 +2615,7 @@ async fn run_surface_probe_inner(
             encoder_finish_samples.push(current_encoder_finish_ms);
             queue_submit_samples.push(current_queue_submit_ms);
             frame_present_samples.push(current_frame_present_ms);
+            sample_pacing_wait_samples.push(current_sample_pacing_wait_ms);
             post_present_bookkeeping_samples.push(current_post_present_bookkeeping_ms);
             let sample_index = presented_frame_samples.len() as u32;
             presented_frame_samples.push(frame_ms);
@@ -2653,6 +2663,12 @@ async fn run_surface_probe_inner(
         frame_present_ms_p50: percentile(&frame_present_samples, 0.50),
         frame_present_ms_p95: percentile(&frame_present_samples, 0.95),
         frame_present_ms_max: frame_present_samples
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
+        sample_pacing_wait_ms_p50: percentile(&sample_pacing_wait_samples, 0.50),
+        sample_pacing_wait_ms_p95: percentile(&sample_pacing_wait_samples, 0.95),
+        sample_pacing_wait_ms_max: sample_pacing_wait_samples
             .iter()
             .copied()
             .fold(0.0_f64, f64::max),
@@ -2711,6 +2727,7 @@ async fn run_surface_probe_inner(
         let mut post_input_encoder_finish_samples = Vec::new();
         let mut post_input_queue_submit_samples = Vec::new();
         let mut post_input_frame_present_samples = Vec::new();
+        let mut post_input_sample_pacing_wait_samples = Vec::new();
         let mut post_input_post_present_bookkeeping_samples = Vec::new();
         let mut post_input_presented_frame_samples = Vec::new();
         let mut post_input_presented_frame_over_16_7_indices = Vec::new();
@@ -2718,7 +2735,12 @@ async fn run_surface_probe_inner(
         let mut post_input_render_hook_samples = Vec::new();
         let mut post_input_first_frame_ms = 0.0;
         let mut post_input_readback = None;
+        let mut post_input_next_forced_sample_frame_start = Instant::now();
         for frame_index in 0..post_input_total_frame_count {
+            let current_sample_pacing_wait_ms = wait_for_forced_sample_frame_pacing(
+                &mut post_input_next_forced_sample_frame_start,
+                frame_index > 0,
+            );
             let frame_input = if frame_index == 0 {
                 input_adapter.clone()
             } else {
@@ -2895,6 +2917,7 @@ async fn run_surface_probe_inner(
                 post_input_encoder_finish_samples.push(current_encoder_finish_ms);
                 post_input_queue_submit_samples.push(current_queue_submit_ms);
                 post_input_frame_present_samples.push(current_frame_present_ms);
+                post_input_sample_pacing_wait_samples.push(current_sample_pacing_wait_ms);
                 post_input_post_present_bookkeeping_samples
                     .push(current_post_present_bookkeeping_ms);
                 let sample_index = post_input_presented_frame_samples.len() as u32;
@@ -2947,6 +2970,12 @@ async fn run_surface_probe_inner(
             frame_present_ms_p50: percentile(&post_input_frame_present_samples, 0.50),
             frame_present_ms_p95: percentile(&post_input_frame_present_samples, 0.95),
             frame_present_ms_max: post_input_frame_present_samples
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max),
+            sample_pacing_wait_ms_p50: percentile(&post_input_sample_pacing_wait_samples, 0.50),
+            sample_pacing_wait_ms_p95: percentile(&post_input_sample_pacing_wait_samples, 0.95),
+            sample_pacing_wait_ms_max: post_input_sample_pacing_wait_samples
                 .iter()
                 .copied()
                 .fold(0.0_f64, f64::max),
@@ -5645,6 +5674,26 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn native_target_frame_interval() -> Duration {
+    Duration::from_micros((NATIVE_TARGET_FRAME_INTERVAL_MS * 1000.0).round() as u64)
+}
+
+fn wait_for_forced_sample_frame_pacing(next_frame_start: &mut Instant, enabled: bool) -> f64 {
+    let mut wait_ms = 0.0;
+    let now = Instant::now();
+    if enabled
+        && let Some(wait_duration) = next_frame_start.checked_duration_since(now)
+        && !wait_duration.is_zero()
+    {
+        let wait_started = Instant::now();
+        std::thread::sleep(wait_duration);
+        wait_ms = elapsed_ms(wait_started);
+    }
+    let frame_started = Instant::now();
+    *next_frame_start = frame_started + native_target_frame_interval();
+    wait_ms
 }
 
 fn percentile(values: &[f64], percentile: f64) -> f64 {

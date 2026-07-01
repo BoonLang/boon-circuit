@@ -1294,6 +1294,69 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   preview IPC blocking, and bounded materialization, so the remaining scroll
   miss is in the frame/present/render budget rather than app-level recompute.
 
+2026-07-01 scroll timing split and present-blocker evidence slice:
+
+- The scroll-speed verifier now separates renderer/model CPU work from
+  platform submit/present blocking. `non_os_scroll_model.frame_budget_model_pass`
+  is driven by renderer CPU timing plus upload/materialization evidence, while
+  `required_real_window_speed_proven` and `budget_pass` still require the real
+  wall-clock visible frame budget. This keeps the UX speed gate honest while
+  avoiding a false "renderer/materialization over target" diagnosis when the
+  renderer path is already within budget.
+- New generic report fields include `renderer_frame_budget_proven`,
+  `renderer_frame_budget_pass`, `renderer_cpu_frame_ms_p95`,
+  `cpu_submit_ready_ms_p95`, `present_blocking_ms_p95`, and
+  `frame_budget_split`. These are emitted for Cells, dev-code-editor, and other
+  scroll surfaces through the shared xtask scroll evidence path.
+- Forced verifier sample loops are now paced at the native 60 Hz target after
+  the first sample, with `sample_pacing_wait_ms_p50/p95/max` reported
+  separately from actual frame work. This prevents tight-loop forced presents
+  from being confused with normal product pacing, while keeping wall-clock
+  presentation over-budget failures visible.
+- A read-only subagent independently traced the same failure shape: post-input
+  scroll samples measure `presented_frame_ms` as `surface_acquire_ms +
+  present_submit_ms`, where `present_submit_ms` includes command recording,
+  `queue.submit`, `frame.present`, and post-present bookkeeping. The current
+  Cells failure is dominated by synchronous WGPU submit/present behavior under
+  the software/headless real-window path, not by Cells runtime, layout,
+  uploads, graph rebuilds, or passive-scroll dispatch.
+- Latest paced Cells scroll-speed report still fails honestly with one blocker:
+  `native scroll-speed gate real-window frame budget is over target; real-window
+  speed is not proven`. The report shows
+  `renderer_frame_budget_pass=true`, `renderer_cpu_frame_ms_p95=3.797977`,
+  `cpu_submit_ready_ms_p95=3.821984`, `wall_clock_frame_budget_pass=false`,
+  `scroll_frame_ms_p95=18.058102`, `present_blocking_ms_p95=22.498016`,
+  `sample_pacing_wait_ms_p95=6.210418`,
+  `software_adapter_wall_clock_budget_exempt=true`,
+  `required_real_window_speed_proven=false`, `materialized_cell_count_max=336`,
+  and `logical_cell_count=2600`. Pacing improved the diagnosis but did not
+  fully solve the real-window wall-clock p95 target on this adapter.
+- The same generic path previously passed dev-code-editor scroll-speed before
+  forced sample pacing. A refreshed paced run now fails with the same honest
+  real-window wall-clock blocker: `renderer_frame_budget_pass=true`,
+  `renderer_cpu_frame_ms_p95=10.277644`, `wall_clock_frame_budget_pass=false`,
+  `scroll_frame_ms_p95=19.485726`, `present_blocking_ms_p95=27.542755`,
+  `sample_pacing_wait_ms_p95=7.370771`, and `budget_pass=false`.
+- Fresh verification:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo test -q -p xtask scroll_budget`
+  - `cargo test -q -p xtask axis_specific`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`
+    failed honestly with only the real-window frame-budget blocker.
+  - `cargo xtask verify-report-schema target/reports/native-gpu/scroll-speed-cells.json`
+    passed.
+  - `cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json`
+    failed honestly with the same real-window frame-budget blocker after pacing.
+  - `cargo xtask verify-report-schema target/reports/native-gpu/scroll-speed-dev-code-editor.json`
+    passed.
+- Next implementation target: restructure the real-window verifier toward
+  sustained app-owned input sampled by the normal frame scheduler, and/or harden
+  adapter/surface selection so real 16.7ms wall-clock claims are made only on a
+  non-software adapter. The renderer/model path is currently fast enough for
+  Cells; the remaining blocker is real wall-clock present/submit behavior.
+
 ## Implementation Slices
 
 1. Terminology and schema:

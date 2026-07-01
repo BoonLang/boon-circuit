@@ -34482,6 +34482,7 @@ fn native_renderer_counter_inventory() -> serde_json::Value {
                 "frame_timing.encoder_finish_ms_p95",
                 "frame_timing.queue_submit_ms_p95",
                 "frame_timing.frame_present_ms_p95",
+                "frame_timing.sample_pacing_wait_ms_p95",
                 "frame_timing.post_present_bookkeeping_ms_p95",
                 "post_input_frame_timing"
             ],
@@ -34492,6 +34493,7 @@ fn native_renderer_counter_inventory() -> serde_json::Value {
                 "encoder_finish_ms": "CPU wall time spent finishing the WGPU command encoder into a command buffer",
                 "queue_submit_ms": "CPU wall time spent in queue.submit for the visible-surface command buffer",
                 "frame_present_ms": "CPU wall time spent in surface texture frame.present; this may include platform/present-mode blocking and does not prove GPU completion",
+                "sample_pacing_wait_ms": "verifier/sample-loop wait inserted before forced sample frames to maintain frame pacing; reported separately from frame work",
                 "post_present_bookkeeping_ms": "CPU wall time after frame.present for render-loop state updates and optional app-owned JSON report writes",
                 "presented_frame_ms": "single-frame visible presentation timing",
                 "readback_ms": "proof-mode readback timing, not interaction hot-path timing"
@@ -47512,12 +47514,15 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         "status": "not-run",
         "reason": "native scroll-speed axis-specific Weston wheel probes were not attempted"
     });
+    let mut isolated_launch_attempted = false;
+    let mut isolated_launch_success = false;
 
     if build.success()
         && selector_valid
         && prefer_isolated_real_window
         && isolated_real_window_available
     {
+        isolated_launch_attempted = true;
         let isolated_role_report_timeout_ms = 60_000_u64.saturating_add(input_sample_delay_ms);
         isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
             Path::new(speed_binary),
@@ -47534,29 +47539,8 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             true,
             dev_editor,
         )?;
-        let isolated_launch_success =
+        isolated_launch_success =
             isolated_scroll_real_window_wheel_delivery_proven(&isolated_real_window_launch_proof);
-        push_audit_check(
-            &mut checks,
-            &mut blockers,
-            format!("native-gpu-scroll-{label}:isolated-real-window-launch"),
-            isolated_launch_success,
-            format!(
-                "status={:?}, wheel_events={:?}, driver_effect_observed={:?}",
-                isolated_real_window_launch_proof
-                    .get("status")
-                    .and_then(serde_json::Value::as_str),
-                isolated_real_window_launch_proof
-                    .pointer("/preview_input_adapter/mouse_scroll_event_count")
-                    .and_then(serde_json::Value::as_u64),
-                isolated_real_window_launch_proof
-                    .get("driver_effect_observed")
-                    .and_then(serde_json::Value::as_bool)
-            ),
-            (!isolated_launch_success).then(|| {
-                "isolated Weston native launch did not prove real-window wheel delivery for this native scroll run".to_owned()
-            }),
-        );
         let vertical_observation = run_native_scroll_axis_observation_with_retries(
             &label,
             "vertical",
@@ -47692,6 +47676,36 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 );
             }
         }
+    }
+    if isolated_launch_attempted {
+        let axis_specific_delivery_success = axis_specific_real_window_scroll_observation
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("native-gpu-scroll-{label}:isolated-real-window-launch"),
+            isolated_launch_success || axis_specific_delivery_success,
+            format!(
+                "status={:?}, wheel_events={:?}, driver_effect_observed={:?}, axis_specific_status={:?}",
+                isolated_real_window_launch_proof
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                isolated_real_window_launch_proof
+                    .pointer("/preview_input_adapter/mouse_scroll_event_count")
+                    .and_then(serde_json::Value::as_u64),
+                isolated_real_window_launch_proof
+                    .get("driver_effect_observed")
+                    .and_then(serde_json::Value::as_bool),
+                axis_specific_real_window_scroll_observation
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+            ),
+            (!(isolated_launch_success || axis_specific_delivery_success)).then(|| {
+                "isolated Weston native launch did not prove real-window wheel delivery for this native scroll run".to_owned()
+            }),
+        );
     }
 
     let operator_host_input_evidence =
@@ -48295,18 +48309,32 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         format!("native-gpu-scroll-{label}:frame-budget-proof"),
         frame_budget_model_pass == Some(true),
         format!(
-            "frame_budget_model_pass={:?}, preview_frame_ms_p95={:?}, materialized_max={:?}",
+            "frame_budget_model_pass={:?}, renderer_cpu_frame_ms_p95={:?}, preview_frame_ms_p95={:?}, present_blocking_ms_p95={:?}, materialized_max={:?}",
             frame_budget_model_pass,
             extra
+                .get("renderer_cpu_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            extra
                 .get("preview_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            extra
+                .get("present_blocking_ms_p95")
                 .and_then(serde_json::Value::as_f64),
             extra
                 .get("materialized_cell_count_max")
                 .or_else(|| extra.get("materialized_line_count_max"))
         ),
         Some(if frame_budget_model_pass == Some(false) {
-            "native scroll-speed gate renderer frame/materialization budget is over target"
-                .to_owned()
+            if extra
+                .get("renderer_frame_budget_proven")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                "native scroll-speed gate lacks renderer CPU frame timing evidence".to_owned()
+            } else {
+                "native scroll-speed gate renderer frame/materialization budget is over target"
+                    .to_owned()
+            }
         } else {
             "native scroll-speed gate lacks renderer frame/materialization budget evidence"
                 .to_owned()
@@ -48829,6 +48857,20 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .pointer("/post_input_frame_timing/presented_frame_ms_max")
         .and_then(numeric_value_as_f64)
         .unwrap_or(preview_frame_ms);
+    let post_input_timing_f64 = |field: &str| {
+        extra
+            .pointer(&format!("/post_input_frame_timing/{field}"))
+            .and_then(numeric_value_as_f64)
+    };
+    let renderer_command_record_ms_p95 = post_input_timing_f64("command_record_ms_p95");
+    let renderer_encoder_finish_ms_p95 = post_input_timing_f64("encoder_finish_ms_p95");
+    let renderer_cpu_frame_ms_p95 = renderer_command_record_ms_p95
+        .map(|command_record| command_record + renderer_encoder_finish_ms_p95.unwrap_or(0.0));
+    let cpu_submit_ready_ms_p95 = renderer_cpu_frame_ms_p95.map(|renderer_cpu| {
+        renderer_cpu + post_input_timing_f64("surface_acquire_ms_p95").unwrap_or(0.0)
+    });
+    let present_blocking_ms_p95 = post_input_timing_f64("queue_submit_ms_p95").unwrap_or(0.0)
+        + post_input_timing_f64("frame_present_ms_p95").unwrap_or(0.0);
     let preview_frame_budget =
         native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
     let measured_surface_key = if dev_editor {
@@ -49030,6 +49072,11 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let wall_clock_frame_budget_pass = preview_frame_ms <= preview_frame_budget;
     let frame_upload_budget_pass =
         wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget;
+    let renderer_frame_budget_proven =
+        renderer_cpu_frame_ms_p95.is_some_and(|value| value.is_finite() && value > 0.0);
+    let renderer_frame_budget_pass = renderer_frame_budget_proven
+        && renderer_cpu_frame_ms_p95.unwrap_or(f64::INFINITY) <= preview_frame_budget
+        && render_upload_bytes <= upload_budget;
     let selected_wheel_input_observed = !matches!(
         wheel_input_evidence_source,
         "operator-host-plan" | "missing"
@@ -49059,6 +49106,24 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["software_adapter_wall_clock_budget_exempt"] = json!(software_adapter);
     extra["wall_clock_frame_budget_pass"] = json!(wall_clock_frame_budget_pass);
     extra["wall_clock_frame_budget_ms_p95"] = json!(preview_frame_ms);
+    extra["renderer_frame_budget_proven"] = json!(renderer_frame_budget_proven);
+    extra["renderer_frame_budget_pass"] = json!(renderer_frame_budget_pass);
+    extra["renderer_cpu_frame_ms_p95"] = renderer_cpu_frame_ms_p95
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    extra["cpu_submit_ready_ms_p95"] = cpu_submit_ready_ms_p95
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    extra["present_blocking_ms_p95"] = json!(present_blocking_ms_p95);
+    extra["frame_budget_split"] = json!({
+        "renderer_cpu_frame_ms_p95": extra["renderer_cpu_frame_ms_p95"].clone(),
+        "cpu_submit_ready_ms_p95": extra["cpu_submit_ready_ms_p95"].clone(),
+        "present_blocking_ms_p95": present_blocking_ms_p95,
+        "wall_clock_frame_ms_p95": preview_frame_ms,
+        "renderer_frame_budget_pass": renderer_frame_budget_pass,
+        "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
+        "note": "renderer/model budget excludes platform queue.submit/frame.present blocking; real UX speed still requires wall-clock pass"
+    });
     extra["wall_clock_frame_budget_note"] = json!(if software_adapter {
         "isolated Weston selected a software Vulkan adapter; wall-clock frame timing is reported and remains a product-speed blocker when over budget"
     } else {
@@ -49271,7 +49336,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 {"column_start_byte": 0},
                 {"column_start_byte": horizontal_after}
             ],
-            "frame_budget_model_pass": frame_upload_budget_pass,
+            "frame_budget_model_pass": renderer_frame_budget_pass,
+            "renderer_frame_budget_proven": renderer_frame_budget_proven,
+            "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
+            "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
+            "wall_clock_frame_ms_p95": preview_frame_ms,
+            "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
         });
@@ -49378,7 +49448,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "materialized_rows_equal_visible_plus_overscan": extra["materialized_rows_equal_visible_plus_overscan"],
             "row_local_page_window_refs_present": extra["row_local_page_window_refs_present"],
             "row_wave_segments_scoped_to_page_window": extra["row_wave_segments_scoped_to_page_window"],
-            "frame_budget_model_pass": frame_upload_budget_pass,
+            "frame_budget_model_pass": renderer_frame_budget_pass,
+            "renderer_frame_budget_proven": renderer_frame_budget_proven,
+            "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
+            "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
+            "wall_clock_frame_ms_p95": preview_frame_ms,
+            "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
         });
@@ -49476,7 +49551,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "logical_grid": {"columns": columns, "rows": rows, "cells": full_grid},
             "materialized_cell_count_max": materialized_cell_count_max,
             "materialized_is_virtualized": materialized_cell_count_max < full_grid,
-            "frame_budget_model_pass": frame_upload_budget_pass,
+            "frame_budget_model_pass": renderer_frame_budget_pass,
+            "renderer_frame_budget_proven": renderer_frame_budget_proven,
+            "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
+            "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
+            "wall_clock_frame_ms_p95": preview_frame_ms,
+            "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
         });
@@ -50354,6 +50434,9 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
     let frame_present_p50 = max_axis_f64("frame_present_ms_p50", 0.0);
     let frame_present_p95 = max_axis_f64("frame_present_ms_p95", 0.0);
     let frame_present_max = max_axis_f64("frame_present_ms_max", 0.0);
+    let sample_pacing_wait_p50 = max_axis_f64("sample_pacing_wait_ms_p50", 0.0);
+    let sample_pacing_wait_p95 = max_axis_f64("sample_pacing_wait_ms_p95", 0.0);
+    let sample_pacing_wait_max = max_axis_f64("sample_pacing_wait_ms_max", 0.0);
     let post_present_bookkeeping_p50 = max_axis_f64("post_present_bookkeeping_ms_p50", 0.0);
     let post_present_bookkeeping_p95 = max_axis_f64("post_present_bookkeeping_ms_p95", 0.0);
     let post_present_bookkeeping_max = max_axis_f64("post_present_bookkeeping_ms_max", 0.0);
@@ -50408,6 +50491,9 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
         "frame_present_ms_max": frame_present_max,
         "frame_present_ms_p50": frame_present_p50,
         "frame_present_ms_p95": frame_present_p95,
+        "sample_pacing_wait_ms_max": sample_pacing_wait_max,
+        "sample_pacing_wait_ms_p50": sample_pacing_wait_p50,
+        "sample_pacing_wait_ms_p95": sample_pacing_wait_p95,
         "post_present_bookkeeping_ms_max": post_present_bookkeeping_max,
         "post_present_bookkeeping_ms_p50": post_present_bookkeeping_p50,
         "post_present_bookkeeping_ms_p95": post_present_bookkeeping_p95,
@@ -67098,6 +67184,9 @@ fn require_frame_timing_split_fields(
         "frame_present_ms_p50",
         "frame_present_ms_p95",
         "frame_present_ms_max",
+        "sample_pacing_wait_ms_p50",
+        "sample_pacing_wait_ms_p95",
+        "sample_pacing_wait_ms_max",
         "post_present_bookkeeping_ms_p50",
         "post_present_bookkeeping_ms_p95",
         "post_present_bookkeeping_ms_max",
@@ -84174,7 +84263,12 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             "preview_frame_ms_p95": 24.0,
             "speed_timing_window": "post-real-window-input",
             "post_input_frame_timing": {
-                "measured_frame_count": 30
+                "measured_frame_count": 30,
+                "surface_acquire_ms_p95": 0.2,
+                "command_record_ms_p95": 3.0,
+                "encoder_finish_ms_p95": 0.4,
+                "queue_submit_ms_p95": 12.0,
+                "frame_present_ms_p95": 8.6
             },
             "operator_host_wheel_input": true,
             "app_owned_window_input": true,
@@ -84213,9 +84307,33 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         );
         assert_eq!(
             report
+                .get("renderer_frame_budget_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("renderer_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
                 .pointer("/non_os_scroll_model/frame_budget_model_pass")
                 .and_then(serde_json::Value::as_bool),
-            Some(false)
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("renderer_cpu_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(3.4)
+        );
+        assert_eq!(
+            report
+                .get("present_blocking_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(20.6)
         );
         assert_eq!(
             report

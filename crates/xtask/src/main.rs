@@ -58254,12 +58254,24 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("structured_external_render_proof_is_current")
             .and_then(serde_json::Value::as_bool)
             == Some(true);
+        let present_frame_key = present_probe.get("frame_evidence_key");
+        let readback_frame_key = readback_probe.get("frame_evidence_key");
+        let proof_frame_key = readback_probe
+            .pointer("/last_external_render_proof/proof/frame_evidence_key")
+            .or_else(|| {
+                visual_formula_probe
+                    .pointer("/structured_external_visible_surface_probe/proof_frame_evidence_key")
+            });
+        let proof_evidence_matches_presented_frame = present_frame_key.is_some()
+            && present_frame_key == readback_frame_key
+            && present_frame_key == proof_frame_key;
         let readback_proves_presented_frame = formula_bar_visual_pass
             && readback_probe
                 .get("surface_readback_is_current")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
             && same_input_generation
+            && proof_evidence_matches_presented_frame
             && readback_presented_revision
                 .zip(present_presented_revision)
                 .is_some_and(|(readback_revision, present_revision)| {
@@ -58268,7 +58280,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         let visual_proof_proves_presented_frame = readback_proves_presented_frame
             || (formula_bar_visual_pass
                 && structured_external_proof_is_current
-                && same_input_generation);
+                && same_input_generation
+                && proof_evidence_matches_presented_frame);
         let harness_click_to_formula_visible_ms = if visual_proof_proves_presented_frame {
             harness_click_to_present_ms
         } else {
@@ -58473,6 +58486,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "readback_presented_revision": readback_presented_revision,
             "present_presented_revision": present_presented_revision,
             "formula_visible_same_input_generation": same_input_generation,
+            "proof_evidence_matches_presented_frame": proof_evidence_matches_presented_frame,
             "harness_click_to_present_ms": harness_click_to_present_ms,
             "click_measurement_timing": click_measurement_timing,
             "formula_measurement_timing": formula_measurement_timing,
@@ -59264,6 +59278,11 @@ fn cells_recent_frame_visible_match_probe(
             .get("frame_evidence_key")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let frame_poll_diagnostics = entry
+            .get("last_poll_diagnostics")
+            .cloned()
+            .or_else(|| report.get("last_poll_diagnostics").cloned())
+            .unwrap_or(serde_json::Value::Null);
         let external_render_proof_hash = external_render_proof
             .pointer("/proof/artifact/artifact_sha256")
             .and_then(serde_json::Value::as_str)
@@ -59290,6 +59309,16 @@ fn cells_recent_frame_visible_match_probe(
             "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "accepted_input_frame_timing": entry.get("accepted_input_frame_timing").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_to_dirty_poll_ms": entry.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "dirty_poll_to_render_started_ms": entry.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_started_to_surface_acquired_ms": entry.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_started_to_render_hook_completed_ms": entry.get("render_started_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "surface_acquired_to_render_hook_completed_ms": entry.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_surface_acquired_ms": entry.get("render_hook_completed_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_present_ms": entry.get("render_hook_completed_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_to_queue_ms": entry.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "queue_to_present_ms": entry.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
             "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
             "desired_maximum_frame_latency": report.get("desired_maximum_frame_latency").cloned().unwrap_or(serde_json::Value::Null),
@@ -59299,9 +59328,13 @@ fn cells_recent_frame_visible_match_probe(
             "last_queue_submitted_elapsed_ms": entry.get("last_queue_submitted_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_present_completed_elapsed_ms": entry.get("last_present_completed_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "present_call_ms": entry.get("present_call_ms").cloned().unwrap_or_else(|| entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null)),
             "last_queue_submit_call_ms": entry.get("last_queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "queue_submit_call_ms": entry.get("queue_submit_call_ms").cloned().unwrap_or_else(|| entry.get("last_queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null)),
+            "surface_acquire_call_ms": entry.get("surface_acquire_call_ms").cloned().unwrap_or_else(|| entry.get("last_surface_acquire_call_ms").cloned().unwrap_or(serde_json::Value::Null)),
+            "encoder_finish_ms": entry.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_render_target_kind": entry.get("last_render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
-            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+            "last_poll_diagnostics": frame_poll_diagnostics,
             "frame_evidence_key": frame_evidence_key,
             "last_external_render_proof": external_render_proof,
             "accepted_by_revision": true,
@@ -59358,11 +59391,27 @@ fn cells_recent_frame_visible_match_probe(
             "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "accepted_input_frame_timing": entry.get("accepted_input_frame_timing").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_to_dirty_poll_ms": entry.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "dirty_poll_to_render_started_ms": entry.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_started_to_surface_acquired_ms": entry.get("render_started_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_started_to_render_hook_completed_ms": entry.get("render_started_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "surface_acquired_to_render_hook_completed_ms": entry.get("surface_acquired_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_surface_acquired_ms": entry.get("render_hook_completed_to_surface_acquired_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_completed_to_present_ms": entry.get("render_hook_completed_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "render_hook_to_queue_ms": entry.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "queue_to_present_ms": entry.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
-            "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
+            "present_call_ms": entry.get("present_call_ms").cloned().unwrap_or_else(|| entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null)),
+            "last_poll_diagnostics": entry
+                .get("last_poll_diagnostics")
+                .cloned()
+                .or_else(|| report.get("last_poll_diagnostics").cloned())
+                .unwrap_or(serde_json::Value::Null),
             "frame_evidence_key": entry.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
             "last_external_render_proof": entry.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null),
-            "recent_frame_evidence_match": true
+            "recent_frame_evidence_match": true,
+            "timing_frame_source": "recent_frame_evidence_visual_proof_match"
         });
         return Some((present_probe, readback_probe, visual_probe));
     }
@@ -59793,9 +59842,7 @@ fn wait_for_cells_formula_visible_match(
                                 started,
                             )
                     {
-                        if present_probe.is_none() {
-                            present_probe = Some(recent_present);
-                        }
+                        present_probe = Some(recent_present);
                         readback_probe = Some(recent_readback);
                         visual_formula_probe = Some(recent_visual);
                     }

@@ -43554,6 +43554,21 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
     live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
     target_nodes: &BTreeSet<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    if preview_bound_text_inputs_current_for_nodes(shared_render_state, live_runtime, target_nodes)
+        == Some(true)
+    {
+        record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
+            status: "pass",
+            reason: Some("target-bound-text-current".to_owned()),
+            target_node_count: target_nodes.len(),
+            changed: false,
+            ..PreviewRetainedBoundSyncStats::default()
+        });
+        return Ok(false);
+    }
     let (layout_proof, target_nodes, binding_projection_prefixes) = {
         let shared = shared_render_state
             .lock()
@@ -43581,9 +43596,6 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
             binding_projection_prefixes,
         )
     };
-    if target_nodes.is_empty() {
-        return Ok(false);
-    }
     let Some(state_summary) = preview_bound_text_input_targeted_state_summary_for_nodes(
         &layout_proof,
         live_runtime,
@@ -43607,6 +43619,83 @@ fn preview_sync_bound_text_inputs_for_nodes_from_runtime_state(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn preview_bound_text_inputs_current_for_nodes(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    target_nodes: &BTreeSet<String>,
+) -> Option<bool> {
+    if target_nodes.is_empty() {
+        return Some(true);
+    }
+    let (checks, required_paths) = {
+        let shared = shared_render_state.lock().ok()?;
+        let layout_hash = shared
+            .layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)?;
+        let snapshot = cached_document_render_snapshot(layout_hash)?;
+        let frame = shared.layout_frame_override.as_deref()?;
+        let text_binding_paths = text_binding_paths_by_node(&snapshot);
+        let mut checks = Vec::<(String, Vec<String>)>::new();
+        let mut required_paths = BTreeSet::<String>::new();
+        for item in &frame.display_list {
+            let node = item.node.0.as_str();
+            if !target_nodes.contains(node) {
+                continue;
+            }
+            let mut paths = Vec::<String>::new();
+            if let Some(bindings) = snapshot
+                .data_binding_targets
+                .state_binding_targets_by_node
+                .get(node)
+            {
+                for (path, target) in bindings {
+                    if matches!(
+                        target.attr.as_str(),
+                        "text" | "label" | "value" | "display_value"
+                    ) {
+                        paths.push(path.clone());
+                    }
+                }
+            }
+            if let Some(text_paths) = text_binding_paths.get(node) {
+                paths.extend(text_paths.iter().cloned());
+            }
+            paths.sort_by(|left, right| {
+                document_text_binding_path_rank(left)
+                    .cmp(&document_text_binding_path_rank(right))
+                    .then_with(|| left.cmp(right))
+            });
+            paths.dedup();
+            if paths.is_empty() {
+                continue;
+            }
+            for path in &paths {
+                required_paths.insert(path.clone());
+            }
+            checks.push((item.text.clone().unwrap_or_default(), paths));
+        }
+        (checks, required_paths)
+    };
+    if checks.is_empty() || required_paths.is_empty() {
+        return Some(true);
+    }
+    let required_paths = required_paths.into_iter().collect::<Vec<_>>();
+    let values = live_runtime
+        .lock()
+        .ok()?
+        .document_state_values(&required_paths);
+    for (current_text, paths) in checks {
+        let next_text = paths
+            .iter()
+            .find_map(|path| document_state_values_text(&values, path))?;
+        if current_text != next_text {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 fn preview_sync_bound_text_inputs_for_nodes_from_state_summary(

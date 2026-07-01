@@ -4366,6 +4366,7 @@ async fn run_surface_probe_inner(
                 last_presented_input_event_wake_count,
                 recent_presented_input_event_wake_elapsed_ms,
                 recent_input_wake_to_present_ms,
+                stats_input_timing.as_ref(),
                 stats_input_to_present_ms,
                 stats_proof_mode,
                 external_render_proof.as_ref(),
@@ -5227,6 +5228,7 @@ fn recent_frame_evidence_entry(
     presented_input_event_wake_count: u64,
     presented_input_event_wake_elapsed_ms: Option<f64>,
     input_wake_to_present_ms: Option<f64>,
+    accepted_input_frame_timing: Option<&NativeAcceptedInputFrameTiming>,
     input_accept_to_present_ms: Option<f64>,
     proof_mode: &str,
     external_render_proof: Option<&serde_json::Value>,
@@ -5235,6 +5237,85 @@ fn recent_frame_evidence_entry(
         presented_input_event_wake_elapsed_ms,
         state.last_accepted_host_input_elapsed_ms,
     );
+    let input_accept_to_dirty_poll_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.input_accept_to_dirty_poll_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_accepted_host_input_elapsed_ms,
+                state.last_dirty_poll_elapsed_ms,
+            )
+        });
+    let dirty_poll_to_render_started_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.dirty_poll_to_render_started_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_dirty_poll_elapsed_ms,
+                state.last_render_started_elapsed_ms,
+            )
+        });
+    let render_started_to_surface_acquired_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.render_started_to_surface_acquired_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_started_elapsed_ms,
+                state.last_surface_acquired_elapsed_ms,
+            )
+        });
+    let render_started_to_render_hook_completed_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.render_started_to_render_hook_completed_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_started_elapsed_ms,
+                state.last_render_hook_completed_elapsed_ms,
+            )
+        });
+    let surface_acquired_to_render_hook_completed_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.surface_acquired_to_render_hook_completed_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_surface_acquired_elapsed_ms,
+                state.last_render_hook_completed_elapsed_ms,
+            )
+        });
+    let render_hook_completed_to_present_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.render_hook_completed_to_present_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_hook_completed_elapsed_ms,
+                state.last_present_completed_elapsed_ms,
+            )
+        });
+    let render_hook_to_queue_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.render_hook_to_queue_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_hook_completed_elapsed_ms,
+                state.last_queue_submitted_elapsed_ms,
+            )
+        });
+    let queue_to_present_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.queue_to_present_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_queue_submitted_elapsed_ms,
+                state.last_present_completed_elapsed_ms,
+            )
+        });
+    let surface_acquire_call_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.surface_acquire_call_ms)
+        .or(state.last_surface_acquire_call_ms);
+    let encoder_finish_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.encoder_finish_ms)
+        .or(state.last_encoder_finish_ms);
+    let queue_submit_call_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.queue_submit_call_ms)
+        .or(state.last_queue_submit_call_ms);
+    let present_call_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.present_call_ms)
+        .or(state.last_present_call_ms);
+    let present_path_ms = accepted_input_frame_timing
+        .and_then(|timing| timing.present_path_ms)
+        .or(state.last_present_path_ms);
     serde_json::json!({
         "status": "pass",
         "recorded_elapsed_ms": elapsed_ms,
@@ -5257,6 +5338,7 @@ fn recent_frame_evidence_entry(
         "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
         "input_accept_to_present_ms": input_accept_to_present_ms,
         "frame_input_to_present_ms": input_accept_to_present_ms,
+        "accepted_input_frame_timing": accepted_input_frame_timing,
         "input_accept_timing_source": input_accept_to_present_ms.map(|_| "role_poll_hook_accepted_visible_host_input"),
         "input_wake_timing_source": input_wake_to_present_ms.map(|_| "recent_presented_input_generation"),
         "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
@@ -5269,6 +5351,24 @@ fn recent_frame_evidence_entry(
         "last_present_call_ms": state.last_present_call_ms,
         "last_queue_submit_call_ms": state.last_queue_submit_call_ms,
         "last_surface_acquire_call_ms": state.last_surface_acquire_call_ms,
+        "input_accept_to_dirty_poll_ms": input_accept_to_dirty_poll_ms,
+        "dirty_poll_to_render_started_ms": dirty_poll_to_render_started_ms,
+        "render_started_to_surface_acquired_ms": render_started_to_surface_acquired_ms,
+        "render_started_to_render_hook_completed_ms": render_started_to_render_hook_completed_ms,
+        "surface_acquired_to_render_hook_completed_ms": surface_acquired_to_render_hook_completed_ms,
+        "render_hook_completed_to_surface_acquired_ms": elapsed_delta_ms(
+            state.last_render_hook_completed_elapsed_ms,
+            state.last_surface_acquired_elapsed_ms,
+        ),
+        "render_hook_completed_to_present_ms": render_hook_completed_to_present_ms,
+        "render_hook_to_queue_ms": render_hook_to_queue_ms,
+        "queue_to_present_ms": queue_to_present_ms,
+        "surface_acquire_call_ms": surface_acquire_call_ms,
+        "encoder_finish_ms": encoder_finish_ms,
+        "queue_submit_call_ms": queue_submit_call_ms,
+        "present_call_ms": present_call_ms,
+        "present_path_ms": present_path_ms,
+        "last_poll_diagnostics": state.last_poll_diagnostics,
         "last_render_target_kind": state.last_render_target_kind,
         "proof_mode": proof_mode,
         "last_external_render_proof": compact_external_render_proof_for_recent_history(

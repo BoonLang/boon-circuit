@@ -6253,21 +6253,31 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             note_poll_phase!("world_or_source_input_ms", phase_started);
             let phase_started = Instant::now();
-            if !preview_has_world_scene
-                && let Err(error) = preview_apply_scroll_input_with_units(
+            if !preview_has_world_scene {
+                match preview_apply_scroll_input_with_units(
                     &input_delta,
                     Some(&input_context.source_path),
                     Some(&input_context.source_text),
                     Some(&input_context.runtime_units),
                     input_context.live_runtime.as_ref(),
                     &poll_shared_render_state,
-                )
-            {
-                if preview_note_render_error(&poll_shared_render_state, error.to_string())
-                    .map_err(|error| error.to_string())?
-                {
-                    role_dirty_reason =
-                        Some(boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged);
+                ) {
+                    Ok(true) => {
+                        if role_dirty_reason.is_none() {
+                            role_dirty_reason =
+                                Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                            .map_err(|error| error.to_string())?
+                        {
+                            role_dirty_reason = Some(
+                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                            );
+                        }
+                    }
                 }
             }
             note_poll_phase!("scroll_input_ms", phase_started);
@@ -44693,7 +44703,7 @@ fn preview_apply_scroll_input(
     source_text: Option<&str>,
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime_units = source_path
         .zip(source_text)
         .map(|(source_path, source_text)| project_units_for_source_text(source_path, source_text));
@@ -44714,15 +44724,15 @@ fn preview_apply_scroll_input_with_units(
     runtime_units: Option<&[boon_runtime::RuntimeSourceUnit]>,
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     if input.synthetic_input_probe {
-        return Ok(());
+        return Ok(false);
     }
     if input.scroll_delta_x.abs() <= f64::EPSILON && input.scroll_delta_y.abs() <= f64::EPSILON {
-        return Ok(());
+        return Ok(false);
     }
     let Some(position) = input.mouse_window_pos else {
-        return Ok(());
+        return Ok(false);
     };
     let (layout_proof, layout_frame_override, current_scroll_x, current_scroll_y) = {
         let shared = shared_render_state
@@ -44736,7 +44746,7 @@ fn preview_apply_scroll_input_with_units(
         )
     };
     if !layout_scroll_region_contains(&layout_proof, position.x, position.y) {
-        return Ok(());
+        return Ok(false);
     }
     let (scroll_delta_x, scroll_delta_y) = preview_scroll_deltas(input);
     let scroll_x_px = (current_scroll_x + scroll_delta_x * 5.0).clamp(0.0, 2_000.0);
@@ -44820,7 +44830,7 @@ fn preview_apply_scroll_input_with_units(
     shared.status_overlay = None;
     shared.update_count = shared.update_count.saturating_add(1);
     shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
-    Ok(())
+    Ok(true)
 }
 
 fn preview_scroll_deltas(input: &boon_native_app_window::NativeInputAdapterProof) -> (f64, f64) {

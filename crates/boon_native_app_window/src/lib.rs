@@ -1349,6 +1349,20 @@ impl NativePollResult {
     }
 }
 
+fn effective_poll_result_for_host_input(
+    mut poll_result: NativePollResult,
+    real_os_input: bool,
+) -> NativePollResult {
+    if !poll_result.dirty
+        && real_os_input
+        && poll_result.scheduler_reason == Some(NativeSchedulerReason::HostInput)
+        && poll_result.role_dirty_reason.is_some()
+    {
+        poll_result.dirty = true;
+    }
+    poll_result
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeCursorIcon {
@@ -3362,24 +3376,29 @@ async fn run_surface_probe_inner(
                     Duration::from_millis(next_wake_after_ms),
                 );
             }
-            render_loop_state.apply_poll_result(&poll_result, input.real_os_events_observed);
-            if poll_result.wants_animation_frame {
+            let effective_poll_result = effective_poll_result_for_host_input(
+                poll_result.clone(),
+                input.real_os_events_observed,
+            );
+            render_loop_state
+                .apply_poll_result(&effective_poll_result, input.real_os_events_observed);
+            if effective_poll_result.wants_animation_frame {
                 render_loop_state.request_animation_burst(
                     poll_started_at,
                     hold_started.elapsed().as_secs_f64() * 1000.0,
                     NativeSchedulerReason::RequestedAnimation,
                 );
-            } else if input.real_os_events_observed && poll_result.dirty {
+            } else if input.real_os_events_observed && effective_poll_result.dirty {
                 render_loop_state.request_animation_burst(
                     poll_started_at,
                     hold_started.elapsed().as_secs_f64() * 1000.0,
                     NativeSchedulerReason::HostInput,
                 );
             }
-            if poll_result.dirty {
+            if effective_poll_result.dirty {
                 render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
-            if input.real_os_events_observed && poll_result.dirty {
+            if input.real_os_events_observed && effective_poll_result.dirty {
                 render_loop_state.note_accepted_host_input(
                     sampled_input_event_wake_count,
                     poll_started_elapsed_ms,
@@ -7541,6 +7560,31 @@ mod tests {
 
         assert_eq!(state.dirty_revision, 1);
         assert!(!state.should_render(Instant::now(), false));
+    }
+
+    #[test]
+    fn host_input_dirty_reason_is_presentable_even_if_dirty_flag_was_false() {
+        let poll = NativePollResult {
+            dirty: false,
+            role_revision: 7,
+            scheduler_reason: Some(NativeSchedulerReason::HostInput),
+            role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+            next_wake_after_ms: None,
+            cursor_icon: NativeCursorIcon::Default,
+            wants_animation_frame: false,
+            diagnostics: None,
+            accessibility_update: None,
+        };
+
+        let effective = effective_poll_result_for_host_input(poll.clone(), true);
+        assert!(effective.dirty);
+        assert_eq!(
+            effective.role_dirty_reason,
+            Some(NativeRoleDirtyReason::ScrollChanged)
+        );
+
+        let without_real_input = effective_poll_result_for_host_input(poll, false);
+        assert!(!without_real_input.dirty);
     }
 
     #[test]

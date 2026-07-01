@@ -48959,12 +48959,19 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .or_else(|| extra.get("requested_animation_burst_count"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let product_path_min_input_sample_count =
+        native_gpu_budget_u64("frame", "product_path_scroll_input_sample_count_min")
+            .unwrap_or(4)
+            .max(2);
     let product_path_timing_has_sample = product_path_input_sample_count > 0
         && product_path_input_to_present_p95.is_some_and(|value| value.is_finite() && value > 0.0);
     let product_path_burst_evidence = product_path_requested_animation_burst_count > 0;
+    let product_path_sustained_sample_count_pass = !product_path_used_single_sample_fallback
+        && product_path_input_sample_count >= product_path_min_input_sample_count;
     let product_path_ux_timing_proven = product_path_timing_has_sample
         && product_path_render_loop_mode == "demand_driven"
-        && product_path_burst_evidence;
+        && product_path_burst_evidence
+        && product_path_sustained_sample_count_pass;
     let product_path_timing_status = if product_path_ux_timing_proven {
         "pass"
     } else if product_path_input_sample_count == 0 {
@@ -48973,6 +48980,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "not-demand-driven-product-path"
     } else if !product_path_burst_evidence {
         "missing-requested-animation-burst-evidence"
+    } else if !product_path_sustained_sample_count_pass {
+        "insufficient-input-to-present-samples"
     } else {
         "invalid-input-to-present-summary"
     };
@@ -49290,6 +49299,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "frame_pacing_state_at_sample": product_path_pacing_state,
         "requested_animation_burst_count": product_path_requested_animation_burst_count,
         "sample_count": product_path_input_sample_count,
+        "min_sample_count": product_path_min_input_sample_count,
+        "sustained_sample_count_pass": product_path_sustained_sample_count_pass,
         "summary_sample_count": product_path_summary_sample_count,
         "single_sample_fallback_used": product_path_used_single_sample_fallback,
         "p50": product_path_input_to_present_p50,
@@ -68911,8 +68922,15 @@ fn run_linux_human_like_desktop_surface_smoke(
         .as_ref()
         .map(|target| native_driver_weston_coordinates(target, 240.0, 220.0))
         .unwrap_or_else(|| native_driver_weston_coordinates(&json!({}), 240.0, 220.0));
+    let scroll_driver_repeat_count =
+        native_gpu_budget_u64("frame", "product_path_scroll_input_sample_count_min")
+            .unwrap_or(4)
+            .saturating_add(1)
+            .clamp(2, 8) as usize;
     let driver_points = if scroll_only {
-        vec![[target_x.to_string(), target_y.to_string()]]
+        (0..scroll_driver_repeat_count)
+            .map(|_| [target_x.to_string(), target_y.to_string()])
+            .collect::<Vec<_>>()
     } else {
         vec![
             [target_x.to_string(), target_y.to_string()],
@@ -68924,6 +68942,7 @@ fn run_linux_human_like_desktop_surface_smoke(
     let mut driver_stderr = Vec::new();
     let mut last_driver_json = json!({"status": "not-run"});
     let mut last_driver_success = false;
+    let driver_command_count = driver_points.len();
     for point in driver_points {
         let mut command = Command::new(&driver_path);
         command.args([point[0].as_str(), point[1].as_str()]);
@@ -69210,6 +69229,8 @@ fn run_linux_human_like_desktop_surface_smoke(
         "driver_target_region": driver_target,
         "scroll_only_driver_mode": scroll_only,
         "scroll_driver_mode": scroll_mode.unwrap_or(if scroll_only { "scroll-only" } else { "default" }),
+        "scroll_driver_command_count": driver_command_count,
+        "scroll_product_path_input_sample_count_min": native_gpu_budget_u64("frame", "product_path_scroll_input_sample_count_min").unwrap_or(4).max(2),
         "weston_control_plugin_path": plugin_path,
         "weston_test_driver_path": driver_path,
         "weston_log_path": weston_log_path,
@@ -84875,7 +84896,7 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
     }
 
     #[test]
-    fn product_path_single_frame_fallback_requires_burst_evidence() {
+    fn product_path_single_frame_fallback_is_diagnostic_until_sustained() {
         let mut report = json!({
             "preview_frame_ms_p95": 24.0,
             "frame_input_to_present_ms": 9.0,
@@ -84929,15 +84950,45 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         );
         assert_eq!(
             report
-                .get("speed_budget_frame_ms_p95")
+                .pointer("/product_path_ux_timing/status")
+                .and_then(serde_json::Value::as_str),
+            Some("insufficient-input-to-present-samples")
+        );
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/min_sample_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/sustained_sample_count_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("product_path_input_to_present_ms_p95")
                 .and_then(serde_json::Value::as_f64),
             Some(9.0)
         );
         assert_eq!(
             report
+                .get("speed_budget_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(24.0)
+        );
+        assert_eq!(
+            report
+                .get("product_path_ux_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
                 .get("budget_pass")
                 .and_then(serde_json::Value::as_bool),
-            Some(true)
+            Some(false)
         );
 
         let mut missing_burst = report.clone();

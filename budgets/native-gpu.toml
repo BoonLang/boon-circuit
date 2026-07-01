@@ -4,6 +4,7 @@ preview_frame_ms_p99 = 16.7
 preview_frame_ms_max = 33.4
 missed_frame_count = 0
 wheel_to_visible_ms_p95 = 50.0
+product_path_scroll_input_sample_count_min = 4
 
 [ipc]
 preview_blocked_on_ipc_count = 0

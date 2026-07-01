@@ -49175,6 +49175,13 @@ fn numeric_sample_pointer_values(samples: &[serde_json::Value], pointer: &str) -
         .collect()
 }
 
+fn numeric_object_field_or(report: &serde_json::Value, fields: &[&str]) -> Option<f64> {
+    fields
+        .iter()
+        .filter_map(|field| report.get(*field).and_then(numeric_value_as_f64))
+        .find(|value| value.is_finite())
+}
+
 fn report_numeric_or_elapsed_delta_ms(
     report: &serde_json::Value,
     field: &str,
@@ -57146,6 +57153,36 @@ fn cells_visible_click_retained_update_contract_summary(
     })
 }
 
+fn retained_visible_update_interaction_timing_sample(
+    samples: &[serde_json::Value],
+) -> Option<&serde_json::Value> {
+    samples
+        .iter()
+        .rev()
+        .find(|sample| {
+            let layout_source = sample
+                .get("layout_source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let retained_committed_update = matches!(
+                layout_source,
+                "visible_state_sync" | "paint_space_patch" | "patched_document_frame"
+            );
+            let render_patch_count = sample
+                .get("render_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let coalesced_render_patch_count = sample
+                .get("coalesced_render_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            sample.get("changed").and_then(serde_json::Value::as_bool) == Some(true)
+                && retained_committed_update
+                && (render_patch_count > 0 || coalesced_render_patch_count > 0)
+        })
+        .or_else(|| samples.last())
+}
+
 fn cells_visible_click_runtime_work_contract_summary(
     live_probe: &serde_json::Value,
 ) -> serde_json::Value {
@@ -58255,11 +58292,11 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("input_wake_to_present_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
-        let render_loop_input_accept_to_present_ms = present_probe
-            .get("frame_input_to_present_ms")
-            .or_else(|| present_probe.get("input_accept_to_present_ms"))
-            .and_then(numeric_value_as_f64)
-            .unwrap_or(f64::INFINITY);
+        let render_loop_input_accept_to_present_ms = numeric_object_field_or(
+            &present_probe,
+            &["frame_input_to_present_ms", "input_accept_to_present_ms"],
+        )
+        .unwrap_or(f64::INFINITY);
         let render_loop_legacy_input_accept_to_present_ms = present_probe
             .get("input_accept_to_present_ms")
             .and_then(numeric_value_as_f64)
@@ -58354,7 +58391,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         let sample_interaction_timing = last_poll_diagnostics
             .get("recent_interaction_timing_samples")
             .and_then(serde_json::Value::as_array)
-            .and_then(|samples| samples.last())
+            .and_then(|samples| retained_visible_update_interaction_timing_sample(samples))
             .cloned()
             .unwrap_or_else(|| json!(null));
         let sample_poll_phase_timings = last_poll_diagnostics

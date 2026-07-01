@@ -1870,9 +1870,9 @@ fn configured_low_latency_present_mode(
 
 fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) -> u32 {
     match present_mode {
-        wgpu::PresentMode::Immediate | wgpu::PresentMode::AutoNoVsync => {
-            SINGLE_FRAME_SURFACE_FRAME_LATENCY
-        }
+        wgpu::PresentMode::Mailbox
+        | wgpu::PresentMode::Immediate
+        | wgpu::PresentMode::AutoNoVsync => SINGLE_FRAME_SURFACE_FRAME_LATENCY,
         _ => PACED_SURFACE_FRAME_LATENCY,
     }
 }
@@ -5880,7 +5880,7 @@ fn write_render_loop_state_report(
         "input_to_present_accounted_event_wake_count": state.last_input_to_present_accounted_event_wake_count,
         "accepted_input_frame_timing": accepted_input_frame_timing,
         "latest_frame_timing_scope": "latest_presented_frame",
-        "frame_input_to_present_ms": extras.frame_input_to_present_ms,
+        "frame_input_to_present_ms": input_accept_to_present_ms,
         "input_accept_timing_source": if state.last_accepted_host_input_elapsed_ms.is_some() {
             "role_poll_hook_accepted_visible_host_input"
         } else {
@@ -8434,10 +8434,10 @@ mod tests {
     }
 
     #[test]
-    fn interactive_surface_latency_allows_two_paced_frames_in_flight() {
+    fn interactive_surface_latency_keeps_low_latency_modes_single_frame_in_flight() {
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox),
-            PACED_SURFACE_FRAME_LATENCY
+            SINGLE_FRAME_SURFACE_FRAME_LATENCY
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Fifo),

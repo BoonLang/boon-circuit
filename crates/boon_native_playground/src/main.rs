@@ -40166,7 +40166,7 @@ fn preview_try_apply_simple_source_click_input(
     // post-turn values. Reuse that summary to patch the clicked node and any
     // binding-dependent controls, such as the Cells formula bar, without a
     // second runtime read on the hot click path.
-    if post_turn_state_summary.is_some() && preview_retained_bound_sync_already_changed_text() {
+    if preview_retained_bound_sync_already_changed_text() {
         // The live-event visible-state sync already patched retained bound text
         // inputs from this same summary. Avoid repeating the scan on the click
         // hot path; the retained sync stats remain as the formula-bar proof.

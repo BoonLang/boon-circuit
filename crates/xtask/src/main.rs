@@ -48250,7 +48250,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             == Some(true)
             || background_app_owned_scroll_speed_proven,
         format!(
-            "evidence_tier={:?}, real_wheel_input={:?}, real_window_vertical={:?}, real_window_horizontal={:?}, background_app_owned_scroll_speed_proven={background_app_owned_scroll_speed_proven}",
+            "evidence_tier={:?}, real_wheel_input={:?}, real_window_vertical={:?}, real_window_horizontal={:?}, adapter_proven={:?}, adapter={:?}, present_mode={:?}, background_app_owned_scroll_speed_proven={background_app_owned_scroll_speed_proven}",
             extra
                 .get("evidence_tier")
                 .and_then(serde_json::Value::as_str),
@@ -48262,10 +48262,25 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 .and_then(serde_json::Value::as_bool),
             extra
                 .get("real_window_horizontal_wheel_input")
-                .and_then(serde_json::Value::as_bool)
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("real_window_speed_adapter_proven")
+                .and_then(serde_json::Value::as_bool),
+            extra
+                .get("measured_adapter_name")
+                .and_then(serde_json::Value::as_str),
+            extra
+                .get("measured_present_mode")
+                .and_then(serde_json::Value::as_str)
         ),
         (!background_app_owned_scroll_speed_proven).then(|| {
             if extra
+                .get("real_window_speed_adapter_proven")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                "native scroll-speed gate ran on a software adapter; hardware-backed real-window speed is not proven".to_owned()
+            } else if extra
                 .get("real_wheel_input")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true)
@@ -48878,6 +48893,46 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     } else {
         "preview_surface_proof"
     };
+    let measured_surface = extra
+        .get(measured_surface_key)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let measured_adapter_name = measured_surface
+        .get("adapter_name")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_adapter_backend = measured_surface
+        .get("adapter_backend")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_adapter_device_type = measured_surface
+        .get("adapter_device_type")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_present_mode = measured_surface
+        .get("present_mode")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_supported_present_modes = measured_surface
+        .get("supported_present_modes")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_non_vsync_present_mode_available = measured_surface
+        .get("non_vsync_present_mode_available")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            measured_present_mode
+                .as_str()
+                .is_some_and(|mode| !matches!(mode, "Fifo" | "AutoVsync"))
+        });
+    let measured_desired_maximum_frame_latency = measured_surface
+        .get("desired_maximum_frame_latency")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let measured_surface_format = measured_surface
+        .get("surface_format")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let measured_adapter_is_software_path = format!("/{measured_surface_key}/adapter_is_software");
     let software_adapter = extra
         .pointer(&measured_adapter_is_software_path)
@@ -49103,7 +49158,39 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     } else {
         "waiting-for-host-wheel-input".to_owned()
     };
+    let real_window_speed_adapter_proven = !software_adapter;
     extra["software_adapter_wall_clock_budget_exempt"] = json!(software_adapter);
+    extra["real_window_speed_adapter_proven"] = json!(real_window_speed_adapter_proven);
+    extra["real_window_speed_adapter_policy"] = json!(if software_adapter {
+        "software-diagnostic-only"
+    } else {
+        "hardware-backed-speed-proof"
+    });
+    extra["measured_surface_summary"] = json!({
+        "surface_key": measured_surface_key,
+        "adapter_name": measured_adapter_name,
+        "adapter_backend": measured_adapter_backend,
+        "adapter_device_type": measured_adapter_device_type,
+        "adapter_is_software": software_adapter,
+        "present_mode": measured_present_mode,
+        "supported_present_modes": measured_supported_present_modes,
+        "non_vsync_present_mode_available": measured_non_vsync_present_mode_available,
+        "desired_maximum_frame_latency": measured_desired_maximum_frame_latency,
+        "surface_format": measured_surface_format
+    });
+    extra["measured_adapter_name"] = extra["measured_surface_summary"]["adapter_name"].clone();
+    extra["measured_adapter_backend"] =
+        extra["measured_surface_summary"]["adapter_backend"].clone();
+    extra["measured_adapter_device_type"] =
+        extra["measured_surface_summary"]["adapter_device_type"].clone();
+    extra["measured_adapter_is_software"] = json!(software_adapter);
+    extra["measured_present_mode"] = extra["measured_surface_summary"]["present_mode"].clone();
+    extra["measured_supported_present_modes"] =
+        extra["measured_surface_summary"]["supported_present_modes"].clone();
+    extra["measured_non_vsync_present_mode_available"] =
+        json!(measured_non_vsync_present_mode_available);
+    extra["measured_desired_maximum_frame_latency"] =
+        extra["measured_surface_summary"]["desired_maximum_frame_latency"].clone();
     extra["wall_clock_frame_budget_pass"] = json!(wall_clock_frame_budget_pass);
     extra["wall_clock_frame_budget_ms_p95"] = json!(preview_frame_ms);
     extra["renderer_frame_budget_proven"] = json!(renderer_frame_budget_proven);
@@ -49168,6 +49255,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             == Some(true)
             && real_window_timing_proven
             && frame_upload_budget_pass
+            && real_window_speed_adapter_proven
     );
     extra["input_queue_depth_max"] = json!(input_queue_depth);
     extra["layout_rebuild_scope"] = json!("visible-plus-overscan-delta");
@@ -49350,6 +49438,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 && required_wheel_axes_observed
                 && selected_real_window_timing_ok
                 && frame_upload_budget_pass
+                && real_window_speed_adapter_proven
                 && wheel_to_visible_ms.is_some_and(|value| {
                     value
                         <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
@@ -49462,6 +49551,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 && required_wheel_axes_observed
                 && selected_real_window_timing_ok
                 && frame_upload_budget_pass
+                && real_window_speed_adapter_proven
                 && extra
                     .get("materialized_rows_equal_visible_plus_overscan")
                     .and_then(serde_json::Value::as_bool)
@@ -49565,6 +49655,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 && required_wheel_axes_observed
                 && selected_real_window_timing_ok
                 && frame_upload_budget_pass
+                && real_window_speed_adapter_proven
                 && wheel_to_visible_ms.is_some_and(|value| {
                     value
                         <= native_gpu_budget_f64("frame", "wheel_to_visible_ms_p95").unwrap_or(50.0)
@@ -84280,7 +84371,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 "scroll_delta_y": 360.0
             },
             "preview_surface_proof": {
-                "adapter_is_software": true
+                "adapter_name": "llvmpipe",
+                "adapter_backend": "Vulkan",
+                "adapter_device_type": "Cpu",
+                "adapter_is_software": true,
+                "present_mode": "Immediate",
+                "supported_present_modes": ["Immediate", "Fifo"],
+                "non_vsync_present_mode_available": true,
+                "desired_maximum_frame_latency": 1,
+                "surface_format": "Bgra8UnormSrgb"
             },
             "preview_native_gpu_render_proof": {
                 "visible_surface_metrics": {
@@ -84296,6 +84395,36 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             report
                 .get("software_adapter_wall_clock_budget_exempt")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("real_window_speed_adapter_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("real_window_speed_adapter_policy")
+                .and_then(serde_json::Value::as_str),
+            Some("software-diagnostic-only")
+        );
+        assert_eq!(
+            report
+                .get("measured_adapter_name")
+                .and_then(serde_json::Value::as_str),
+            Some("llvmpipe")
+        );
+        assert_eq!(
+            report
+                .get("measured_present_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("Immediate")
+        );
+        assert_eq!(
+            report
+                .get("measured_non_vsync_present_mode_available")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
@@ -84350,6 +84479,73 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
     }
 
     #[test]
+    fn software_adapter_under_budget_remains_diagnostic_only() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 12.0,
+            "speed_timing_window": "post-real-window-input",
+            "post_input_frame_timing": {
+                "measured_frame_count": 30,
+                "surface_acquire_ms_p95": 0.2,
+                "command_record_ms_p95": 3.0,
+                "encoder_finish_ms_p95": 0.4,
+                "queue_submit_ms_p95": 4.0,
+                "frame_present_ms_p95": 4.0
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_name": "llvmpipe",
+                "adapter_device_type": "Cpu",
+                "adapter_is_software": true,
+                "present_mode": "Immediate",
+                "supported_present_modes": ["Immediate", "Fifo"],
+                "non_vsync_present_mode_available": true
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .get("wall_clock_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("real_window_speed_adapter_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn dev_editor_scroll_budget_uses_dev_surface_adapter_flag() {
         let mut report = json!({
             "preview_frame_ms_p95": 12.0,
@@ -84370,7 +84566,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 "adapter_is_software": true
             },
             "dev_surface_proof": {
-                "adapter_is_software": false
+                "adapter_name": "discrete-gpu",
+                "adapter_backend": "Vulkan",
+                "adapter_device_type": "DiscreteGpu",
+                "adapter_is_software": false,
+                "present_mode": "Mailbox",
+                "supported_present_modes": ["Fifo", "Mailbox"],
+                "non_vsync_present_mode_available": true,
+                "desired_maximum_frame_latency": 1,
+                "surface_format": "Bgra8UnormSrgb"
             },
             "line_count": 10000,
             "longest_line_bytes": 2000,
@@ -84394,6 +84598,24 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .get("software_adapter_wall_clock_budget_exempt")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            report
+                .get("real_window_speed_adapter_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("measured_adapter_name")
+                .and_then(serde_json::Value::as_str),
+            Some("discrete-gpu")
+        );
+        assert_eq!(
+            report
+                .get("measured_present_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("Mailbox")
         );
         assert_eq!(
             report

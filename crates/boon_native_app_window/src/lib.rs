@@ -1557,11 +1557,18 @@ pub struct AppWindowSurfaceProof {
     pub adapter_backend: String,
     pub adapter_device: u32,
     pub adapter_vendor: u32,
+    pub adapter_device_type: String,
     pub adapter_is_software: bool,
     pub surface_format: String,
     pub present_mode: String,
+    pub supported_present_modes: Vec<String>,
+    pub non_vsync_present_mode_available: bool,
     pub desired_maximum_frame_latency: u32,
     pub alpha_mode: String,
+    pub supported_alpha_modes: Vec<String>,
+    pub supported_usages: String,
+    pub surface_copy_to_present_supported: bool,
+    pub surface_copy_src_readback_supported: bool,
     pub logical_size: Viewport,
     pub physical_size: PhysicalSize,
     pub acquired_surface_texture: bool,
@@ -1606,6 +1613,29 @@ fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::P
     } else {
         wgpu::PresentMode::Fifo
     }
+}
+
+fn surface_present_mode_names(capabilities: &wgpu::SurfaceCapabilities) -> Vec<String> {
+    capabilities
+        .present_modes
+        .iter()
+        .map(|mode| format!("{mode:?}"))
+        .collect()
+}
+
+fn surface_alpha_mode_names(capabilities: &wgpu::SurfaceCapabilities) -> Vec<String> {
+    capabilities
+        .alpha_modes
+        .iter()
+        .map(|mode| format!("{mode:?}"))
+        .collect()
+}
+
+fn surface_has_non_vsync_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> bool {
+    capabilities
+        .present_modes
+        .iter()
+        .any(|mode| !matches!(mode, wgpu::PresentMode::Fifo | wgpu::PresentMode::AutoVsync))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2335,6 +2365,10 @@ async fn run_surface_probe_inner(
     let mut width = ((size.width() * scale).round() as u32).max(1);
     let mut height = ((size.height() * scale).round() as u32).max(1);
     let capabilities = surface.get_capabilities(&adapter);
+    let supported_present_modes = surface_present_mode_names(&capabilities);
+    let non_vsync_present_mode_available = surface_has_non_vsync_present_mode(&capabilities);
+    let supported_alpha_modes = surface_alpha_mode_names(&capabilities);
+    let supported_usages = format!("{:?}", capabilities.usages);
     let mut config = surface
         .get_default_config(&adapter, width, height)
         .ok_or_else(|| NativeWindowError::Failed("surface default config unavailable".into()))?;
@@ -2348,11 +2382,13 @@ async fn run_surface_probe_inner(
     config.desired_maximum_frame_latency = LOW_LATENCY_SURFACE_FRAME_LATENCY;
     let surface_copy_to_present_supported =
         capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
+    let surface_copy_src_readback_supported =
+        capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC);
     if surface_copy_to_present_supported {
         config.usage |= wgpu::TextureUsages::COPY_DST;
     }
     if options.readback_artifact_dir.is_some() {
-        if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        if !surface_copy_src_readback_supported {
             return Err(NativeWindowError::Failed(format!(
                 "visible surface readback requires COPY_SRC usage, but supported usages are {:?}",
                 capabilities.usages
@@ -3058,11 +3094,18 @@ async fn run_surface_probe_inner(
         adapter_backend: format!("{:?}", adapter_info.backend),
         adapter_device: adapter_info.device,
         adapter_vendor: adapter_info.vendor,
+        adapter_device_type: format!("{:?}", adapter_info.device_type),
         adapter_is_software: matches!(adapter_info.device_type, wgpu::DeviceType::Cpu),
         surface_format: surface_format.clone(),
         present_mode: present_mode.clone(),
+        supported_present_modes,
+        non_vsync_present_mode_available,
         desired_maximum_frame_latency,
         alpha_mode,
+        supported_alpha_modes,
+        supported_usages,
+        surface_copy_to_present_supported,
+        surface_copy_src_readback_supported,
         logical_size: Viewport {
             surface: 1,
             width: size.width() as f32,

@@ -42405,28 +42405,15 @@ fn native_preview_manifest_scenario_evidence(
             _ => None,
         };
         let pass = match label.as_str() {
-            "vertical-wheel-scroll" => {
-                scroll_report
-                    .as_ref()
-                    .and_then(|report| report.get("operator_vertical_wheel_input"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            }
-            "horizontal-wheel-scroll" | "shift-wheel-horizontal-scroll" => {
-                scroll_report
-                    .as_ref()
-                    .and_then(|report| report.get("operator_horizontal_wheel_input"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            }
-            "headers-align-during-scroll" => {
-                scroll_report
-                    .as_ref()
-                    .and_then(|report| report.get("materialized_range_before_after"))
-                    .and_then(|value| value.get("status"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("operator-host-wheel-input")
-            }
+            "vertical-wheel-scroll" => scroll_report
+                .as_ref()
+                .is_some_and(native_scroll_report_vertical_input_covered),
+            "horizontal-wheel-scroll" | "shift-wheel-horizontal-scroll" => scroll_report
+                .as_ref()
+                .is_some_and(native_scroll_report_horizontal_input_covered),
+            "headers-align-during-scroll" => scroll_report
+                .as_ref()
+                .is_some_and(native_scroll_report_materialized_range_covered),
             _ if entry.id == "novywave" => runtime_or_output_has(label),
             _ => false,
         };
@@ -42495,6 +42482,44 @@ fn scenario_label_from_report_value(value: &serde_json::Value) -> Option<&str> {
                 .get("scenario_step")
                 .and_then(serde_json::Value::as_str)
         })
+}
+
+fn native_scroll_report_vertical_input_covered(report: &serde_json::Value) -> bool {
+    json_bool_any(
+        report,
+        &[
+            "operator_vertical_wheel_input",
+            "app_owned_window_vertical_wheel_input",
+            "real_vertical_wheel_input",
+            "real_window_vertical_wheel_input",
+        ],
+    )
+}
+
+fn native_scroll_report_horizontal_input_covered(report: &serde_json::Value) -> bool {
+    json_bool_any(
+        report,
+        &[
+            "operator_horizontal_wheel_input",
+            "app_owned_window_horizontal_wheel_input",
+            "real_horizontal_wheel_input",
+            "real_window_horizontal_wheel_input",
+        ],
+    )
+}
+
+fn native_scroll_report_materialized_range_covered(report: &serde_json::Value) -> bool {
+    matches!(
+        report
+            .pointer("/materialized_range_before_after/status")
+            .and_then(serde_json::Value::as_str),
+        Some("operator-host-wheel-input" | "app-window-wheel-input" | "real-window-wheel-input")
+    )
+}
+
+fn json_bool_any(value: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| value.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 fn native_manifest_scenario_evidence_entry(
@@ -48226,8 +48251,20 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 .and_then(serde_json::Value::as_bool)
         ),
         (!background_app_owned_scroll_speed_proven).then(|| {
-            "native scroll-speed gate has only lower-tier host-synthetic wheel evidence; real-window speed is not proven"
-                .to_owned()
+            if extra
+                .get("real_wheel_input")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && extra
+                    .get("real_window_timing_proven")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            {
+                "native scroll-speed gate real-window frame budget is over target; real-window speed is not proven".to_owned()
+            } else {
+                "native scroll-speed gate has only lower-tier host-synthetic wheel evidence; real-window speed is not proven"
+                    .to_owned()
+            }
         }),
     );
     push_audit_check(
@@ -48249,19 +48286,17 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         ),
         Some("native scroll-speed gate lacks non-OS scroll model evidence".to_owned()),
     );
+    let frame_budget_model_pass = extra
+        .pointer("/non_os_scroll_model/frame_budget_model_pass")
+        .and_then(serde_json::Value::as_bool);
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-scroll-{label}:frame-budget-proof"),
-        extra
-            .pointer("/non_os_scroll_model/frame_budget_model_pass")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true),
+        frame_budget_model_pass == Some(true),
         format!(
             "frame_budget_model_pass={:?}, preview_frame_ms_p95={:?}, materialized_max={:?}",
-            extra
-                .pointer("/non_os_scroll_model/frame_budget_model_pass")
-                .and_then(serde_json::Value::as_bool),
+            frame_budget_model_pass,
             extra
                 .get("preview_frame_ms_p95")
                 .and_then(serde_json::Value::as_f64),
@@ -48269,10 +48304,13 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
                 .get("materialized_cell_count_max")
                 .or_else(|| extra.get("materialized_line_count_max"))
         ),
-        Some(
+        Some(if frame_budget_model_pass == Some(false) {
+            "native scroll-speed gate renderer frame/materialization budget is over target"
+                .to_owned()
+        } else {
             "native scroll-speed gate lacks renderer frame/materialization budget evidence"
-                .to_owned(),
-        ),
+                .to_owned()
+        }),
     );
     if label == "novywave" {
         let timeline_status = extra
@@ -83084,6 +83122,45 @@ mod tests {
         assert!(scenario_ref_provenance_allows_duplicate(&generated));
         assert!(scenario_ref_provenance_allows_duplicate(&phased));
         assert!(!scenario_ref_provenance_allows_duplicate(&unphased));
+    }
+
+    #[test]
+    fn manifest_scroll_coverage_accepts_real_window_report_keys() {
+        let report = json!({
+            "status": "fail",
+            "app_owned_window_vertical_wheel_input": true,
+            "real_horizontal_wheel_input": true,
+            "materialized_range_before_after": {
+                "status": "real-window-wheel-input"
+            },
+            "required_real_window_speed_proven": false,
+            "preview_frame_ms_p95": 20.1
+        });
+
+        assert!(native_scroll_report_vertical_input_covered(&report));
+        assert!(native_scroll_report_horizontal_input_covered(&report));
+        assert!(native_scroll_report_materialized_range_covered(&report));
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "scenario coverage must not rewrite an over-budget scroll-speed report into a speed pass"
+        );
+    }
+
+    #[test]
+    fn manifest_scroll_coverage_rejects_planned_wheel_without_axis_evidence() {
+        let report = json!({
+            "operator_host_wheel_input": true,
+            "materialized_range_before_after": {
+                "status": "waiting-for-host-wheel-input"
+            }
+        });
+
+        assert!(!native_scroll_report_vertical_input_covered(&report));
+        assert!(!native_scroll_report_horizontal_input_covered(&report));
+        assert!(!native_scroll_report_materialized_range_covered(&report));
     }
 
     #[test]

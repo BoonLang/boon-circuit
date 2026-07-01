@@ -46569,9 +46569,6 @@ fn apply_layout_row_identity_to_event(
     fallback_hit_region: Option<&Value>,
     event: &mut boon_runtime::LiveSourceEvent,
 ) {
-    if event_has_address_payload(event) {
-        return;
-    }
     apply_source_intent_row_binding_to_event(layout_proof, node, event);
     let hit_region = document_hit_region_for_node(layout_proof, node);
     let hit_region = hit_region.as_ref().or(fallback_hit_region);
@@ -46588,13 +46585,6 @@ fn apply_layout_row_identity_to_event(
         event.target_key = Some(key);
         event.target_generation.get_or_insert(generation);
     }
-}
-
-fn event_has_address_payload(event: &boon_runtime::LiveSourceEvent) -> bool {
-    event
-        .address
-        .as_deref()
-        .is_some_and(|address| !address.is_empty())
 }
 
 fn apply_source_intent_row_binding_to_event(
@@ -50329,9 +50319,6 @@ impl PreviewHitRouteTable {
     }
 
     fn apply_row_identity_to_event(&self, node: &str, event: &mut boon_runtime::LiveSourceEvent) {
-        if event_has_address_payload(event) {
-            return;
-        }
         if let Some(intent) = self.source_intent_for_event(node, event) {
             if event.list_id.is_none() {
                 event.list_id = intent.list_id.clone();
@@ -83907,6 +83894,84 @@ document:
         assert_eq!(enriched["target_generation"], json!(7), "{enriched}");
         assert_eq!(enriched["source_id"], json!(11), "{enriched}");
         assert_eq!(enriched["bind_epoch"], json!(12), "{enriched}");
+    }
+
+    #[test]
+    fn layout_row_identity_enriches_live_event_with_legacy_address_payload() {
+        let layout_proof = json!({
+            "source_intent_assertions": [{
+                "node": "doc-node-test-row",
+                "source_path": "row.sources.select",
+                "list_id": "rows",
+                "target_key": 42,
+                "target_generation": 7,
+                "source_id": 11,
+                "bind_epoch": 12
+            }],
+            "hit_target_assertions": []
+        });
+        let mut event = boon_runtime::LiveSourceEvent {
+            source: "row.sources.select".to_owned(),
+            address: Some("legacy-address-payload".to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        };
+
+        apply_layout_row_identity_to_event(&layout_proof, "doc-node-test-row", None, &mut event);
+
+        assert_eq!(event.list_id.as_deref(), Some("rows"));
+        assert_eq!(event.target_key, Some(42));
+        assert_eq!(event.target_generation, Some(7));
+        assert_eq!(event.source_id, Some(11));
+        assert_eq!(event.bind_epoch, Some(12));
+        assert_eq!(event.address.as_deref(), Some("legacy-address-payload"));
+    }
+
+    #[test]
+    fn hit_route_table_enriches_live_event_with_legacy_address_payload() {
+        let source_intent = PreviewSourceIntentRecord {
+            node: "doc-node-test-row".to_owned(),
+            intent: "select".to_owned(),
+            source_path: "row.sources.select".to_owned(),
+            implicit: false,
+            list_id: Some("rows".to_owned()),
+            target_key: Some(42),
+            target_generation: Some(7),
+            source_id: Some(11),
+            bind_epoch: Some(12),
+        };
+        let mut source_intents_by_node = BTreeMap::new();
+        source_intents_by_node.insert(
+            "doc-node-test-row".to_owned(),
+            BTreeMap::from([("select".to_owned(), vec![0])]),
+        );
+        let route_table = PreviewHitRouteTable {
+            static_table: Arc::new(PreviewHitRouteStaticTable {
+                hit_table: Arc::new(boon_document::HitSideTable::default()),
+                source_intents: vec![source_intent],
+                source_intents_by_node,
+                display_items: Vec::new(),
+                display_items_by_node: BTreeMap::new(),
+                hit_index_by_node: BTreeMap::new(),
+                text_binding_paths_by_node: BTreeMap::new(),
+                source_intent_binding_paths_by_node: BTreeMap::new(),
+            }),
+            state_summary: None,
+            route_key_source: "test",
+        };
+        let mut event = boon_runtime::LiveSourceEvent {
+            source: "row.sources.select".to_owned(),
+            address: Some("legacy-address-payload".to_owned()),
+            ..boon_runtime::LiveSourceEvent::default()
+        };
+
+        route_table.apply_row_identity_to_event("doc-node-test-row", &mut event);
+
+        assert_eq!(event.list_id.as_deref(), Some("rows"));
+        assert_eq!(event.target_key, Some(42));
+        assert_eq!(event.target_generation, Some(7));
+        assert_eq!(event.source_id, Some(11));
+        assert_eq!(event.bind_epoch, Some(12));
+        assert_eq!(event.address.as_deref(), Some("legacy-address-payload"));
     }
 
     #[test]

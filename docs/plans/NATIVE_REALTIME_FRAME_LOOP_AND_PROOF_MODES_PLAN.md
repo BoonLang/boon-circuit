@@ -1241,6 +1241,59 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   the larger source-event route still carries `address` payload compatibility
   and selected-address overlay fallback remains for older evidence.
 
+2026-07-01 source-event row identity with legacy address payload slice:
+
+- The generic layout-proof and retained hit-route event enrichers no longer
+  treat a non-empty `address` payload as a reason to skip stable row identity.
+  Legacy address data can still ride along for compatibility, but source-intent
+  `list_id`, `target_key`, `target_generation`, `source_id`, and `bind_epoch`
+  now remain the primary dispatch identity when the layout/source route exposes
+  them.
+- Added regressions for both event-enrichment paths using a generic row source
+  and a legacy address payload. The assertions prove the row/source identity is
+  attached without mutating or discarding the compatibility address.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo test -q -p boon_native_playground row_identity`
+  - `cargo test -q -p boon_native_playground selection_proxy_`
+  - `cargo test -q -p boon_native_playground retained_bound_text_sync_uses_text_binding_without_address_metadata`
+  - `cargo test -q -p boon_native_playground focus_only_route_uses_generic_selection_binding_without_address_payload`
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`
+  - `cargo test -q -p boon_native_playground cells_press_only_input_defers_until_release_batch`
+  - `cargo check -q -p boon_native_playground`
+- This is a routing correctness and hot-path cleanup step, not a completion
+  claim. The remaining work is still to prove release-mode native UX latency
+  with app-owned host events/WGPU evidence and to finish the retained
+  frame-loop, proof identity, runtime currentness, and aggregate gate slices.
+
+2026-07-01 manifest scroll coverage and honest scroll-speed blocker slice:
+
+- `verify-native-gpu-preview-e2e --example cells` now counts current
+  real-window/app-owned scroll evidence when checking manifest scenario
+  coverage. The collector no longer requires old `operator_*` scroll booleans
+  when the scroll-speed report proves stronger `app_owned_window_*`,
+  `real_*`, or `real_window_*` wheel input fields.
+- This does not weaken the scroll-speed gate. An over-budget scroll-speed
+  report still fails; the verifier now reports that as an over-target
+  real-window frame-budget problem instead of incorrectly saying the evidence
+  is only lower-tier or missing.
+- Fresh verification:
+  - `cargo fmt --check`
+  - `cargo test -q -p xtask manifest_scroll_coverage`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json`
+    passed with `scenario_evidence.status=pass`, app-owned WGPU readback,
+    real-window input, and `preview_blocked_on_ipc_count=0`.
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`
+    still failed honestly: p95 `20.986136999999996ms`, max `22.901203ms`,
+    `required_real_window_speed_proven=false`, `runtime_dispatch_count_for_passive_scroll=0`,
+    `graph_rebuild_count=0`, `materialized_cell_count_max=336`, and
+    `logical_cell_count=2600`.
+- The next performance slice should target renderer/present pacing for scroll:
+  the fresh report shows no passive runtime dispatch, no graph rebuild, no
+  preview IPC blocking, and bounded materialization, so the remaining scroll
+  miss is in the frame/present/render budget rather than app-level recompute.
+
 ## Implementation Slices
 
 1. Terminology and schema:

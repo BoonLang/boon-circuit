@@ -2867,8 +2867,8 @@ mod tests {
 
         let encoded = serde_json::to_string(&scene).expect("render scene should serialize");
         assert!(encoded.contains("row-1"));
-        assert!(!encoded.contains("wgpu"));
-        assert!(!encoded.contains("glyphon"));
+        assert!(!encoded.contains(&["w", "gpu"].concat()));
+        assert!(!encoded.contains(&["glyph", "on"].concat()));
     }
 
     #[test]

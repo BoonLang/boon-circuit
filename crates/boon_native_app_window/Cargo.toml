@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 accesskit.workspace = true
-boon_document.workspace = true
 boon_host.workspace = true
 boon_scene_model.workspace = true
 boon_solid_model.workspace = true

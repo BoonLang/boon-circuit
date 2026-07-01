@@ -6,4 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_document_model.workspace = true
+boon_scene_model.workspace = true
 serde.workspace = true

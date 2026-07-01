@@ -28092,7 +28092,7 @@ manufacturing: Assembly/new(
         })?;
     let car_editor_hit_side_table = car_editor_document_indexes
         .try_hit_side_table(&car_editor_document, &car_editor_document_layout)?;
-    let car_editor_document_semantic = boon_document::SemanticScene::from_document_layout(
+    let car_editor_document_semantic = boon_document::semantic_scene_from_document_layout(
         &car_editor_document,
         &car_editor_document_layout,
     );
@@ -31272,7 +31272,7 @@ fn verify_semantic_scene(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         text: &mut text,
         capabilities: boon_document::RenderCapabilities::fake_portable(),
     });
-    let scene = boon_document::SemanticScene::from_document_layout(&frame, &layout);
+    let scene = boon_document::semantic_scene_from_document_layout(&frame, &layout);
     let button_id = boon_document::SemanticId("semantic:save".to_owned());
     let checkbox_id = boon_document::SemanticId("semantic:done".to_owned());
     let input_id = boon_document::SemanticId("semantic:filter".to_owned());
@@ -31709,7 +31709,7 @@ fn verify_accessibility_adapters(args: &[String]) -> Result<(), Box<dyn std::err
         "preview_semantic_scene_for_world_editor_session",
         "preview_native_accessibility_snapshot_for_host",
         "world_editor_session_visual_panel_status",
-        "SemanticScene::from_document_layout",
+        "semantic_scene_from_document_layout",
         "cached_document_render_snapshot",
         "layout_frame_override",
         "accessibility_update",

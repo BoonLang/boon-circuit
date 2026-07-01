@@ -609,6 +609,8 @@ dependencies = [
 name = "boon_host"
 version = "0.1.0"
 dependencies = [
+ "boon_document_model",
+ "boon_scene_model",
  "serde",
 ]
 
@@ -649,7 +651,6 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "app_window",
- "boon_document",
  "boon_host",
  "boon_scene_model",
  "boon_solid_model",

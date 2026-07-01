@@ -1,11 +1,16 @@
 pub use boon_document_model::{
     Axis, ChangeBatch, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind,
-    DocumentPatch, LayoutStylePatch, MaterialStylePatch, MaterializedRange, PaintStylePatch,
+    DocumentPatch, LayoutStylePatch, MaterialStylePatch, MaterializedRange, PaintStylePatch, Rect,
     ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan,
     StyleValue, TextStylePatch, TextValue, UiSemanticChange,
 };
 pub mod render_scene;
 use boon_host::Viewport;
+pub use boon_host::{
+    SemanticAction, SemanticActions, SemanticId, SemanticInputEvent, SemanticNode, SemanticPatch,
+    SemanticPatchOperation, SemanticRelations, SemanticRole, SemanticScene, SemanticSourceDispatch,
+    SemanticState, SemanticValue,
+};
 pub use render_scene::{
     RenderFontStyle, RenderFontWeight, RenderQuadBatch, RenderRichTextSpan, RenderScene,
     RenderSceneItem, RenderSceneMetrics, RenderScenePaintPatch, RenderScenePatch,
@@ -111,14 +116,6 @@ impl ComputedStyleIdentity {
     pub fn from_style(style: &BTreeMap<String, StyleValue>) -> Self {
         computed_style_identity(style)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -563,59 +560,6 @@ fn semantic_value_for_node(
     }
 }
 
-fn semantic_node_from_world_editor_node(
-    node: &boon_scene_model::WorldSemanticEditorNode,
-    tree: &boon_scene_model::WorldSemanticEditorTree,
-) -> SemanticNode {
-    let id = SemanticId::from_world_editor_node_id(&node.id);
-    let source_intent = world_editor_source_intent(node);
-    let source_path = source_intent
-        .as_ref()
-        .map(|intent| world_editor_source_path(node, intent));
-    SemanticNode {
-        id,
-        node: DocumentNodeId(format!("world:{}", node.id.0)),
-        role: semantic_role_for_world_editor_role(&node.role, &node.actions),
-        name: Some(node.label.clone()),
-        description: world_editor_description(node),
-        value: world_editor_value(node),
-        state: SemanticState {
-            focused: tree.focused.as_ref() == Some(&node.id),
-            checked: None,
-            disabled: !world_editor_node_enabled(node),
-            selected: node.selected,
-        },
-        actions: SemanticActions {
-            focus: node.actions.focus || node.actions.select || node.actions.export_3mf,
-            press: node.actions.select || node.actions.toggle_visibility || node.actions.export_3mf,
-            set_text: false,
-            increment: false,
-            decrement: false,
-        },
-        relations: SemanticRelations {
-            parent: world_editor_parent_id(&node.id, tree)
-                .map(SemanticId::from_world_editor_node_id),
-            children: node
-                .children
-                .iter()
-                .map(SemanticId::from_world_editor_node_id)
-                .collect(),
-            controls: Vec::new(),
-            labelled_by: Vec::new(),
-            described_by: Vec::new(),
-        },
-        bounds: None,
-        language: None,
-        heading_level: None,
-        href: None,
-        source_binding_id: source_path
-            .as_ref()
-            .map(|path| SourceBindingId(format!("source:{path}"))),
-        source_path,
-        source_intent,
-    }
-}
-
 pub fn document_frame_from_world_editor_tree(
     tree: &boon_scene_model::WorldSemanticEditorTree,
 ) -> DocumentFrame {
@@ -721,66 +665,6 @@ fn document_node_id_from_world_editor_node_id(
     DocumentNodeId(format!("world-doc:{}", node.0))
 }
 
-fn semantic_role_for_world_editor_role(
-    role: &boon_scene_model::WorldSemanticEditorRole,
-    actions: &boon_scene_model::WorldSemanticEditorActions,
-) -> SemanticRole {
-    match role {
-        boon_scene_model::WorldSemanticEditorRole::Editor => SemanticRole::Application,
-        boon_scene_model::WorldSemanticEditorRole::Viewport
-        | boon_scene_model::WorldSemanticEditorRole::Assembly
-        | boon_scene_model::WorldSemanticEditorRole::Parameters
-        | boon_scene_model::WorldSemanticEditorRole::Manufacturing => SemanticRole::Group,
-        boon_scene_model::WorldSemanticEditorRole::PartInstance
-        | boon_scene_model::WorldSemanticEditorRole::Parameter
-        | boon_scene_model::WorldSemanticEditorRole::Action
-            if actions.select || actions.edit_parameter || actions.export_3mf =>
-        {
-            SemanticRole::Button
-        }
-        boon_scene_model::WorldSemanticEditorRole::PartInstance => SemanticRole::Row,
-        boon_scene_model::WorldSemanticEditorRole::Parameter
-        | boon_scene_model::WorldSemanticEditorRole::Status => SemanticRole::Text,
-        boon_scene_model::WorldSemanticEditorRole::Action => SemanticRole::Button,
-    }
-}
-
-fn world_editor_description(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<String> {
-    match node.role {
-        boon_scene_model::WorldSemanticEditorRole::PartInstance => Some(format!(
-            "part {:?}, feature {:?}, {:?}",
-            node.part_id, node.feature_id, node.manufacturing_role
-        )),
-        boon_scene_model::WorldSemanticEditorRole::Action if node.actions.export_3mf => {
-            Some("Export the prepared printable assembly as 3MF".to_owned())
-        }
-        _ => None,
-    }
-}
-
-fn world_editor_value(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<SemanticValue> {
-    if node.role == boon_scene_model::WorldSemanticEditorRole::Status {
-        Some(SemanticValue::Text {
-            text: node.label.clone(),
-        })
-    } else if node.role == boon_scene_model::WorldSemanticEditorRole::PartInstance {
-        Some(SemanticValue::Text {
-            text: if node.visible { "visible" } else { "hidden" }.to_owned(),
-        })
-    } else {
-        None
-    }
-}
-
-fn world_editor_node_enabled(node: &boon_scene_model::WorldSemanticEditorNode) -> bool {
-    node.actions.focus
-        || node.actions.select
-        || node.actions.toggle_visibility
-        || node.actions.edit_parameter
-        || node.actions.export_3mf
-        || !node.children.is_empty()
-}
-
 fn world_editor_source_intent(node: &boon_scene_model::WorldSemanticEditorNode) -> Option<String> {
     if node.actions.export_3mf {
         Some("press".to_owned())
@@ -866,98 +750,6 @@ pub struct AccessibilityTree {
     pub node_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct SemanticId(pub String);
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticRole {
-    Application,
-    Group,
-    Row,
-    Text,
-    Button,
-    Checkbox,
-    TextInput,
-    Table,
-    Cell,
-    ScrollRegion,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SemanticValue {
-    Text { text: String },
-    Bool { value: bool },
-    Number { value: f64 },
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SemanticState {
-    pub focused: bool,
-    pub checked: Option<bool>,
-    pub disabled: bool,
-    pub selected: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SemanticActions {
-    pub focus: bool,
-    pub press: bool,
-    pub set_text: bool,
-    pub increment: bool,
-    pub decrement: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SemanticRelations {
-    pub parent: Option<SemanticId>,
-    pub children: Vec<SemanticId>,
-    pub controls: Vec<SemanticId>,
-    pub labelled_by: Vec<SemanticId>,
-    pub described_by: Vec<SemanticId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SemanticNode {
-    pub id: SemanticId,
-    pub node: DocumentNodeId,
-    pub role: SemanticRole,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub value: Option<SemanticValue>,
-    pub state: SemanticState,
-    pub actions: SemanticActions,
-    pub relations: SemanticRelations,
-    pub bounds: Option<Rect>,
-    pub language: Option<String>,
-    pub heading_level: Option<u8>,
-    pub href: Option<String>,
-    pub source_binding_id: Option<SourceBindingId>,
-    pub source_path: Option<String>,
-    pub source_intent: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SemanticScene {
-    pub root: Option<SemanticId>,
-    pub nodes: BTreeMap<SemanticId, SemanticNode>,
-    pub focused: Option<SemanticId>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SemanticPatch {
-    pub operations: Vec<SemanticPatchOperation>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SemanticPatchOperation {
-    UpsertNode { node: SemanticNode },
-    RemoveNode { id: SemanticId },
-    SetFocus { focused: Option<SemanticId> },
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDomSnapshot {
     pub root: Option<SemanticId>,
@@ -1025,16 +817,6 @@ pub enum SemanticWebAction {
     Decrement,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticAction {
-    Focus,
-    Press,
-    SetText,
-    Increment,
-    Decrement,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticWebBridgeMetrics {
     pub semantic_node_count: usize,
@@ -1070,147 +852,49 @@ pub enum SemanticWebInputEvent {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SemanticInputEvent {
-    Focus {
-        semantic_id: SemanticId,
-    },
-    Press {
-        semantic_id: SemanticId,
-    },
-    SetText {
-        semantic_id: SemanticId,
-        text: String,
-    },
-    ReplaceSelectedText {
-        semantic_id: SemanticId,
-        text: String,
-    },
-    Increment {
-        semantic_id: SemanticId,
-    },
-    Decrement {
-        semantic_id: SemanticId,
-    },
+pub type SemanticWebSourceDispatch = SemanticSourceDispatch;
+
+pub fn semantic_scene_from_document_layout(
+    document: &DocumentFrame,
+    layout: &LayoutFrame,
+) -> SemanticScene {
+    let mut display_by_node = BTreeMap::new();
+    for item in &layout.display_list {
+        display_by_node
+            .entry(item.node.clone())
+            .or_insert_with(|| item.clone());
+    }
+
+    let mut scene = SemanticScene {
+        root: document
+            .nodes
+            .contains_key(&document.root)
+            .then(|| SemanticId::from_document_node_id(&document.root)),
+        nodes: BTreeMap::new(),
+        focused: None,
+    };
+    for node in document.nodes.values() {
+        let item = display_by_node.get(&node.id);
+        let semantic = semantic_node_from_document_node(document, node, item);
+        if semantic.state.focused {
+            scene.focused = Some(semantic.id.clone());
+        }
+        scene.nodes.insert(semantic.id.clone(), semantic);
+    }
+    scene
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticWebSourceDispatch {
-    pub semantic_id: SemanticId,
-    pub node: DocumentNodeId,
-    pub source_path: String,
-    pub source_intent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-}
-
-pub type SemanticSourceDispatch = SemanticWebSourceDispatch;
-
-impl SemanticScene {
-    pub fn from_document_layout(document: &DocumentFrame, layout: &LayoutFrame) -> Self {
-        let mut display_by_node = BTreeMap::new();
-        for item in &layout.display_list {
-            display_by_node
-                .entry(item.node.clone())
-                .or_insert_with(|| item.clone());
-        }
-
-        let mut scene = Self {
-            root: document
-                .nodes
-                .contains_key(&document.root)
-                .then(|| SemanticId::from_document_node_id(&document.root)),
-            nodes: BTreeMap::new(),
-            focused: None,
-        };
-        for node in document.nodes.values() {
-            let item = display_by_node.get(&node.id);
-            let semantic = semantic_node_from_document_node(document, node, item);
-            if semantic.state.focused {
-                scene.focused = Some(semantic.id.clone());
-            }
-            scene.nodes.insert(semantic.id.clone(), semantic);
-        }
-        scene
-    }
-
-    pub fn node_from_document_layout(
-        document: &DocumentFrame,
-        layout: &LayoutFrame,
-        node_id: &DocumentNodeId,
-    ) -> Option<SemanticNode> {
-        let node = document.nodes.get(node_id)?;
-        let item = layout
-            .display_list
-            .iter()
-            .find(|item| item.node == *node_id);
-        Some(semantic_node_from_document_node(document, node, item))
-    }
-
-    pub fn from_world_editor_tree(tree: &boon_scene_model::WorldSemanticEditorTree) -> Self {
-        let mut scene = Self {
-            root: Some(SemanticId::from_world_editor_node_id(&tree.root)),
-            nodes: BTreeMap::new(),
-            focused: tree
-                .focused
-                .as_ref()
-                .map(SemanticId::from_world_editor_node_id),
-        };
-        for node in tree.nodes.values() {
-            let semantic = semantic_node_from_world_editor_node(node, tree);
-            scene.nodes.insert(semantic.id.clone(), semantic);
-        }
-        scene
-    }
-
-    pub fn diff(&self, next: &SemanticScene) -> SemanticPatch {
-        let mut operations = Vec::new();
-        for id in self.nodes.keys() {
-            if !next.nodes.contains_key(id) {
-                operations.push(SemanticPatchOperation::RemoveNode { id: id.clone() });
-            }
-        }
-        for (id, node) in &next.nodes {
-            if self.nodes.get(id) != Some(node) {
-                operations.push(SemanticPatchOperation::UpsertNode { node: node.clone() });
-            }
-        }
-        if self.focused != next.focused {
-            operations.push(SemanticPatchOperation::SetFocus {
-                focused: next.focused.clone(),
-            });
-        }
-        SemanticPatch { operations }
-    }
-
-    pub fn source_dispatch_for_event(
-        &self,
-        event: SemanticInputEvent,
-    ) -> Option<SemanticSourceDispatch> {
-        let (semantic_id, action, text) = match event {
-            SemanticInputEvent::Focus { semantic_id } => (semantic_id, SemanticAction::Focus, None),
-            SemanticInputEvent::Press { semantic_id } => (semantic_id, SemanticAction::Press, None),
-            SemanticInputEvent::SetText { semantic_id, text }
-            | SemanticInputEvent::ReplaceSelectedText { semantic_id, text } => {
-                (semantic_id, SemanticAction::SetText, Some(text))
-            }
-            SemanticInputEvent::Increment { semantic_id } => {
-                (semantic_id, SemanticAction::Increment, None)
-            }
-            SemanticInputEvent::Decrement { semantic_id } => {
-                (semantic_id, SemanticAction::Decrement, None)
-            }
-        };
-        let node = self.nodes.get(&semantic_id)?;
-        Some(SemanticSourceDispatch {
-            semantic_id,
-            node: node.node.clone(),
-            source_path: semantic_source_for_action(node, &action)?,
-            source_intent: node.source_intent.clone(),
-            text,
-        })
-    }
+pub fn semantic_node_from_document_layout(
+    document: &DocumentFrame,
+    layout: &LayoutFrame,
+    node_id: &DocumentNodeId,
+) -> Option<SemanticNode> {
+    let node = document.nodes.get(node_id)?;
+    let item = layout
+        .display_list
+        .iter()
+        .find(|item| item.node == *node_id);
+    Some(semantic_node_from_document_node(document, node, item))
 }
 
 impl SemanticWebBridgeSnapshot {
@@ -1387,16 +1071,6 @@ fn semantic_web_dom_id(id: &SemanticId) -> String {
         }
     }
     dom_id
-}
-
-impl SemanticId {
-    pub fn from_document_node_id(node: &DocumentNodeId) -> Self {
-        Self(format!("semantic:{}", node.0))
-    }
-
-    pub fn from_world_editor_node_id(node: &boon_scene_model::WorldSemanticEditorNodeId) -> Self {
-        Self(format!("semantic:{}", node.0))
-    }
 }
 
 impl SemanticDomSnapshot {
@@ -5599,7 +5273,7 @@ mod tests {
             capabilities: RenderCapabilities::fake_portable(),
         });
 
-        let scene = SemanticScene::from_document_layout(&frame, &layout);
+        let scene = semantic_scene_from_document_layout(&frame, &layout);
         assert_eq!(
             scene.root,
             Some(SemanticId("semantic:root".to_owned())),
@@ -5974,7 +5648,7 @@ mod tests {
         let hit_table = derived
             .try_hit_side_table(&frame, &layout)
             .expect("world editor document should produce typed hit table");
-        let scene = SemanticScene::from_document_layout(&frame, &layout);
+        let scene = semantic_scene_from_document_layout(&frame, &layout);
         let export_doc_id = document_node_id_from_world_editor_node_id(&export);
         let wheel_doc_id = document_node_id_from_world_editor_node_id(&wheel);
         let export_semantic_id = SemanticId::from_document_node_id(&export_doc_id);

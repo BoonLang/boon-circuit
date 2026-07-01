@@ -107,7 +107,7 @@ pub struct NativeAccessibilityActionRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeWorldEditorSessionActionReport {
-    pub dispatch: boon_document::SemanticSourceDispatch,
+    pub dispatch: boon_host::SemanticSourceDispatch,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_report: Option<boon_scene_model::WorldEditorSessionActionReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,7 +142,7 @@ pub struct NativeAccessibilityMetrics {
 }
 
 pub fn accesskit_tree_update_from_semantic_scene(
-    scene: &boon_document::SemanticScene,
+    scene: &boon_host::SemanticScene,
     toolkit_name: impl Into<String>,
     toolkit_version: impl Into<String>,
 ) -> NativeAccessibilitySnapshot {
@@ -248,8 +248,8 @@ pub fn accesskit_tree_update_from_semantic_scene(
 }
 
 pub fn accesskit_focus_update_from_semantic_node(
-    focused: &boon_document::SemanticId,
-    node: Option<&boon_document::SemanticNode>,
+    focused: &boon_host::SemanticId,
+    node: Option<&boon_host::SemanticNode>,
 ) -> NativeAccessibilitySnapshot {
     let focus = accesskit_node_id_for_semantic_id(focused);
     let mut id_map = BTreeMap::new();
@@ -309,8 +309,8 @@ pub fn accesskit_focus_update_from_semantic_node(
 }
 
 fn accesskit_node_id_map(
-    scene: &boon_document::SemanticScene,
-) -> BTreeMap<boon_document::SemanticId, accesskit::NodeId> {
+    scene: &boon_host::SemanticScene,
+) -> BTreeMap<boon_host::SemanticId, accesskit::NodeId> {
     scene
         .nodes
         .keys()
@@ -318,7 +318,7 @@ fn accesskit_node_id_map(
         .collect()
 }
 
-fn accesskit_node_id_for_semantic_id(id: &boon_document::SemanticId) -> accesskit::NodeId {
+fn accesskit_node_id_for_semantic_id(id: &boon_host::SemanticId) -> accesskit::NodeId {
     let digest = Sha256::digest(id.0.as_bytes());
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -343,9 +343,9 @@ pub fn native_accessibility_action_requests_from_accesskit(
 }
 
 pub fn native_accessibility_source_dispatches_from_requests(
-    scene: &boon_document::SemanticScene,
+    scene: &boon_host::SemanticScene,
     requests: &[NativeAccessibilityActionRequest],
-) -> Vec<boon_document::SemanticSourceDispatch> {
+) -> Vec<boon_host::SemanticSourceDispatch> {
     let native_to_semantic = accesskit_node_id_map(scene)
         .into_iter()
         .map(|(semantic_id, node_id)| (node_id.0, semantic_id))
@@ -361,7 +361,7 @@ pub fn native_accessibility_source_dispatches_from_requests(
 }
 
 pub fn native_accessibility_world_editor_session_reports_from_requests(
-    scene: &boon_document::SemanticScene,
+    scene: &boon_host::SemanticScene,
     requests: &[NativeAccessibilityActionRequest],
     session: &mut boon_scene_model::WorldEditorSession,
     bundle: &boon_solid_model::SolidModelBundle,
@@ -390,31 +390,31 @@ pub fn native_accessibility_world_editor_session_reports_from_requests(
 }
 
 fn native_accessibility_semantic_input_event(
-    semantic_id: boon_document::SemanticId,
+    semantic_id: boon_host::SemanticId,
     request: &NativeAccessibilityActionRequest,
-) -> Option<boon_document::SemanticInputEvent> {
+) -> Option<boon_host::SemanticInputEvent> {
     match request.action {
         NativeAccessibilityAction::Focus => {
-            Some(boon_document::SemanticInputEvent::Focus { semantic_id })
+            Some(boon_host::SemanticInputEvent::Focus { semantic_id })
         }
         NativeAccessibilityAction::Click => {
-            Some(boon_document::SemanticInputEvent::Press { semantic_id })
+            Some(boon_host::SemanticInputEvent::Press { semantic_id })
         }
-        NativeAccessibilityAction::SetValue => Some(boon_document::SemanticInputEvent::SetText {
+        NativeAccessibilityAction::SetValue => Some(boon_host::SemanticInputEvent::SetText {
             semantic_id,
             text: request.value.clone().unwrap_or_default(),
         }),
         NativeAccessibilityAction::ReplaceSelectedText => {
-            Some(boon_document::SemanticInputEvent::ReplaceSelectedText {
+            Some(boon_host::SemanticInputEvent::ReplaceSelectedText {
                 semantic_id,
                 text: request.value.clone().unwrap_or_default(),
             })
         }
         NativeAccessibilityAction::Increment => {
-            Some(boon_document::SemanticInputEvent::Increment { semantic_id })
+            Some(boon_host::SemanticInputEvent::Increment { semantic_id })
         }
         NativeAccessibilityAction::Decrement => {
-            Some(boon_document::SemanticInputEvent::Decrement { semantic_id })
+            Some(boon_host::SemanticInputEvent::Decrement { semantic_id })
         }
         NativeAccessibilityAction::Blur
         | NativeAccessibilityAction::ScrollIntoView
@@ -454,8 +454,8 @@ fn native_accessibility_action_value_from_accesskit(
 }
 
 fn accesskit_node_from_semantic_node(
-    semantic: &boon_document::SemanticNode,
-    id_map: &BTreeMap<boon_document::SemanticId, accesskit::NodeId>,
+    semantic: &boon_host::SemanticNode,
+    id_map: &BTreeMap<boon_host::SemanticId, accesskit::NodeId>,
 ) -> accesskit::Node {
     let mut node = accesskit::Node::new(accesskit_role_for_semantic_role(&semantic.role));
     if let Some(name) = &semantic.name {
@@ -539,28 +539,26 @@ fn accesskit_node_from_semantic_node(
     node
 }
 
-fn accesskit_role_for_semantic_role(role: &boon_document::SemanticRole) -> accesskit::Role {
+fn accesskit_role_for_semantic_role(role: &boon_host::SemanticRole) -> accesskit::Role {
     match role {
-        boon_document::SemanticRole::Application => accesskit::Role::Application,
-        boon_document::SemanticRole::Group => accesskit::Role::Group,
-        boon_document::SemanticRole::Row => accesskit::Role::Row,
-        boon_document::SemanticRole::Text => accesskit::Role::TextRun,
-        boon_document::SemanticRole::Button => accesskit::Role::Button,
-        boon_document::SemanticRole::Checkbox => accesskit::Role::CheckBox,
-        boon_document::SemanticRole::TextInput => accesskit::Role::TextInput,
-        boon_document::SemanticRole::Table => accesskit::Role::Table,
-        boon_document::SemanticRole::Cell => accesskit::Role::Cell,
-        boon_document::SemanticRole::ScrollRegion => accesskit::Role::ScrollView,
+        boon_host::SemanticRole::Application => accesskit::Role::Application,
+        boon_host::SemanticRole::Group => accesskit::Role::Group,
+        boon_host::SemanticRole::Row => accesskit::Role::Row,
+        boon_host::SemanticRole::Text => accesskit::Role::TextRun,
+        boon_host::SemanticRole::Button => accesskit::Role::Button,
+        boon_host::SemanticRole::Checkbox => accesskit::Role::CheckBox,
+        boon_host::SemanticRole::TextInput => accesskit::Role::TextInput,
+        boon_host::SemanticRole::Table => accesskit::Role::Table,
+        boon_host::SemanticRole::Cell => accesskit::Role::Cell,
+        boon_host::SemanticRole::ScrollRegion => accesskit::Role::ScrollView,
     }
 }
 
-fn accesskit_value_for_semantic_value(
-    value: Option<&boon_document::SemanticValue>,
-) -> Option<String> {
+fn accesskit_value_for_semantic_value(value: Option<&boon_host::SemanticValue>) -> Option<String> {
     match value? {
-        boon_document::SemanticValue::Text { text } => Some(text.clone()),
-        boon_document::SemanticValue::Bool { value } => Some(value.to_string()),
-        boon_document::SemanticValue::Number { value } => Some(value.to_string()),
+        boon_host::SemanticValue::Text { text } => Some(text.clone()),
+        boon_host::SemanticValue::Bool { value } => Some(value.to_string()),
+        boon_host::SemanticValue::Number { value } => Some(value.to_string()),
     }
 }
 
@@ -6670,28 +6668,28 @@ mod tests {
 
     #[test]
     fn accessibility_action_requests_route_to_semantic_source_dispatch() {
-        let root_id = boon_document::SemanticId("semantic:world-editor:root".to_owned());
+        let root_id = boon_host::SemanticId("semantic:world-editor:root".to_owned());
         let export_id =
-            boon_document::SemanticId("semantic:world-editor:manufacturing:export-3mf".to_owned());
-        let mut scene = boon_document::SemanticScene {
+            boon_host::SemanticId("semantic:world-editor:manufacturing:export-3mf".to_owned());
+        let mut scene = boon_host::SemanticScene {
             root: Some(root_id.clone()),
             focused: Some(export_id.clone()),
-            ..boon_document::SemanticScene::default()
+            ..boon_host::SemanticScene::default()
         };
         scene.nodes.insert(
             root_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: root_id.clone(),
-                node: boon_document::DocumentNodeId("world:world-editor:root".to_owned()),
-                role: boon_document::SemanticRole::Application,
+                node: boon_host::DocumentNodeId("world:world-editor:root".to_owned()),
+                role: boon_host::SemanticRole::Application,
                 name: Some("Car editor".to_owned()),
                 description: None,
                 value: None,
-                state: boon_document::SemanticState::default(),
-                actions: boon_document::SemanticActions::default(),
-                relations: boon_document::SemanticRelations {
+                state: boon_host::SemanticState::default(),
+                actions: boon_host::SemanticActions::default(),
+                relations: boon_host::SemanticRelations {
                     children: vec![export_id.clone()],
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
                 bounds: None,
                 language: None,
@@ -6704,35 +6702,35 @@ mod tests {
         );
         scene.nodes.insert(
             export_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: export_id.clone(),
-                node: boon_document::DocumentNodeId(
+                node: boon_host::DocumentNodeId(
                     "world:world-editor:manufacturing:export-3mf".to_owned(),
                 ),
-                role: boon_document::SemanticRole::Button,
+                role: boon_host::SemanticRole::Button,
                 name: Some("Export 3MF".to_owned()),
                 description: None,
                 value: None,
-                state: boon_document::SemanticState {
+                state: boon_host::SemanticState {
                     focused: true,
-                    ..boon_document::SemanticState::default()
+                    ..boon_host::SemanticState::default()
                 },
-                actions: boon_document::SemanticActions {
+                actions: boon_host::SemanticActions {
                     focus: true,
                     press: true,
                     set_text: false,
                     increment: false,
                     decrement: false,
                 },
-                relations: boon_document::SemanticRelations {
+                relations: boon_host::SemanticRelations {
                     parent: Some(root_id),
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
                 bounds: None,
                 language: None,
                 heading_level: None,
                 href: None,
-                source_binding_id: Some(boon_document::SourceBindingId(
+                source_binding_id: Some(boon_host::SourceBindingId(
                     "source:world.manufacturing.export_3mf".to_owned(),
                 )),
                 source_path: Some("world.manufacturing.export_3mf".to_owned()),
@@ -6775,10 +6773,10 @@ mod tests {
             let tree = session
                 .semantic_editor_tree(&bundle, "Car editor")
                 .expect("world editor semantic tree");
-            boon_document::SemanticScene::from_world_editor_tree(&tree)
+            boon_host::SemanticScene::from_world_editor_tree(&tree)
         };
         let node_id_for_name =
-            |scene: &boon_document::SemanticScene, name: &str| -> accesskit::NodeId {
+            |scene: &boon_host::SemanticScene, name: &str| -> accesskit::NodeId {
                 let semantic_id = scene
                     .nodes
                     .values()
@@ -7434,31 +7432,31 @@ mod tests {
 
     #[test]
     fn semantic_scene_lowers_to_accesskit_tree_update_with_stable_ids() {
-        let root_id = boon_document::SemanticId("semantic:root".to_owned());
-        let button_id = boon_document::SemanticId("semantic:save".to_owned());
-        let checkbox_id = boon_document::SemanticId("semantic:done".to_owned());
-        let input_id = boon_document::SemanticId("semantic:filter".to_owned());
-        let mut scene = boon_document::SemanticScene {
+        let root_id = boon_host::SemanticId("semantic:root".to_owned());
+        let button_id = boon_host::SemanticId("semantic:save".to_owned());
+        let checkbox_id = boon_host::SemanticId("semantic:done".to_owned());
+        let input_id = boon_host::SemanticId("semantic:filter".to_owned());
+        let mut scene = boon_host::SemanticScene {
             root: Some(root_id.clone()),
             focused: Some(input_id.clone()),
-            ..boon_document::SemanticScene::default()
+            ..boon_host::SemanticScene::default()
         };
         scene.nodes.insert(
             root_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: root_id.clone(),
-                node: boon_document::DocumentNodeId("root".to_owned()),
-                role: boon_document::SemanticRole::Application,
+                node: boon_host::DocumentNodeId("root".to_owned()),
+                role: boon_host::SemanticRole::Application,
                 name: Some("Boon app".to_owned()),
                 description: None,
                 value: None,
-                state: boon_document::SemanticState::default(),
-                actions: boon_document::SemanticActions::default(),
-                relations: boon_document::SemanticRelations {
+                state: boon_host::SemanticState::default(),
+                actions: boon_host::SemanticActions::default(),
+                relations: boon_host::SemanticRelations {
                     children: vec![button_id.clone(), checkbox_id.clone(), input_id.clone()],
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
-                bounds: Some(boon_document::Rect {
+                bounds: Some(boon_host::Rect {
                     x: 0.0,
                     y: 0.0,
                     width: 320.0,
@@ -7474,26 +7472,26 @@ mod tests {
         );
         scene.nodes.insert(
             button_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: button_id.clone(),
-                node: boon_document::DocumentNodeId("save".to_owned()),
-                role: boon_document::SemanticRole::Button,
+                node: boon_host::DocumentNodeId("save".to_owned()),
+                role: boon_host::SemanticRole::Button,
                 name: Some("Save".to_owned()),
                 description: None,
                 value: None,
-                state: boon_document::SemanticState::default(),
-                actions: boon_document::SemanticActions {
+                state: boon_host::SemanticState::default(),
+                actions: boon_host::SemanticActions {
                     focus: true,
                     press: true,
                     set_text: false,
                     increment: false,
                     decrement: false,
                 },
-                relations: boon_document::SemanticRelations {
+                relations: boon_host::SemanticRelations {
                     parent: Some(root_id.clone()),
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
-                bounds: Some(boon_document::Rect {
+                bounds: Some(boon_host::Rect {
                     x: 8.0,
                     y: 8.0,
                     width: 80.0,
@@ -7502,34 +7500,34 @@ mod tests {
                 language: None,
                 heading_level: None,
                 href: None,
-                source_binding_id: Some(boon_document::SourceBindingId("source:save".to_owned())),
+                source_binding_id: Some(boon_host::SourceBindingId("source:save".to_owned())),
                 source_path: Some("toolbar.save".to_owned()),
                 source_intent: Some("press".to_owned()),
             },
         );
         scene.nodes.insert(
             checkbox_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: checkbox_id.clone(),
-                node: boon_document::DocumentNodeId("done".to_owned()),
-                role: boon_document::SemanticRole::Checkbox,
+                node: boon_host::DocumentNodeId("done".to_owned()),
+                role: boon_host::SemanticRole::Checkbox,
                 name: Some("Done".to_owned()),
                 description: None,
-                value: Some(boon_document::SemanticValue::Bool { value: true }),
-                state: boon_document::SemanticState {
+                value: Some(boon_host::SemanticValue::Bool { value: true }),
+                state: boon_host::SemanticState {
                     checked: Some(true),
-                    ..boon_document::SemanticState::default()
+                    ..boon_host::SemanticState::default()
                 },
-                actions: boon_document::SemanticActions {
+                actions: boon_host::SemanticActions {
                     focus: true,
                     press: true,
                     set_text: false,
                     increment: false,
                     decrement: false,
                 },
-                relations: boon_document::SemanticRelations {
+                relations: boon_host::SemanticRelations {
                     parent: Some(root_id.clone()),
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
                 bounds: None,
                 language: None,
@@ -7542,29 +7540,29 @@ mod tests {
         );
         scene.nodes.insert(
             input_id.clone(),
-            boon_document::SemanticNode {
+            boon_host::SemanticNode {
                 id: input_id.clone(),
-                node: boon_document::DocumentNodeId("filter".to_owned()),
-                role: boon_document::SemanticRole::TextInput,
+                node: boon_host::DocumentNodeId("filter".to_owned()),
+                role: boon_host::SemanticRole::TextInput,
                 name: Some("Filter".to_owned()),
                 description: None,
-                value: Some(boon_document::SemanticValue::Text {
+                value: Some(boon_host::SemanticValue::Text {
                     text: "abc".to_owned(),
                 }),
-                state: boon_document::SemanticState {
+                state: boon_host::SemanticState {
                     focused: true,
-                    ..boon_document::SemanticState::default()
+                    ..boon_host::SemanticState::default()
                 },
-                actions: boon_document::SemanticActions {
+                actions: boon_host::SemanticActions {
                     focus: true,
                     press: false,
                     set_text: true,
                     increment: false,
                     decrement: false,
                 },
-                relations: boon_document::SemanticRelations {
+                relations: boon_host::SemanticRelations {
                     parent: Some(root_id.clone()),
-                    ..boon_document::SemanticRelations::default()
+                    ..boon_host::SemanticRelations::default()
                 },
                 bounds: None,
                 language: None,

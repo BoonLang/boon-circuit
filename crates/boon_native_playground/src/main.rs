@@ -48096,7 +48096,7 @@ fn preview_semantic_scene_for_shared_with_focus_overlay(
         } else {
             base_layout_frame
         };
-    Some(boon_document::SemanticScene::from_document_layout(
+    Some(boon_document::semantic_scene_from_document_layout(
         &snapshot.document_frame,
         layout_frame,
     ))
@@ -48738,7 +48738,7 @@ fn preview_native_accessibility_focus_snapshot_for_shared(
         .layout_frame_override
         .as_deref()
         .unwrap_or(snapshot.layout_frame.as_ref());
-    let semantic_node = boon_document::SemanticScene::node_from_document_layout(
+    let semantic_node = boon_document::semantic_node_from_document_layout(
         &snapshot.document_frame,
         layout_frame,
         &focused_document_node,

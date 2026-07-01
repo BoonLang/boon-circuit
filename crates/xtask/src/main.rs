@@ -46696,7 +46696,11 @@ fn native_preview_promote_isolated_measured_loop_evidence(
         "last_render_content_revision",
         "last_render_layout_revision",
         "last_render_scene_revision",
+        "render_loop_state",
         "preview_perf_stats",
+        "frame_input_to_present_ms",
+        "accepted_host_input_event_wake_count",
+        "input_to_present_accounted_event_wake_count",
     ] {
         if let Some(value) = measured_loop.get(key).cloned() {
             extra[key] = value;
@@ -48888,6 +48892,92 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         + post_input_timing_f64("frame_present_ms_p95").unwrap_or(0.0);
     let preview_frame_budget =
         native_gpu_budget_f64("frame", "preview_frame_ms_p95").unwrap_or(16.7);
+    let preview_perf_stats = extra
+        .get("preview_perf_stats")
+        .unwrap_or(&serde_json::Value::Null);
+    let preview_perf_summary_f64 = |summary: &str, field: &str| {
+        preview_perf_stats
+            .get(summary)
+            .and_then(|summary| summary.get(field))
+            .and_then(numeric_value_as_f64)
+    };
+    let preview_perf_summary_u64 = |summary: &str, field: &str| {
+        preview_perf_stats
+            .get(summary)
+            .and_then(|summary| summary.get(field))
+            .and_then(serde_json::Value::as_u64)
+    };
+    let product_path_summary_sample_count =
+        preview_perf_summary_u64("input_to_present_ms_p50_p95_p99_max", "sample_count")
+            .unwrap_or(0);
+    let product_path_summary_input_to_present_p50 =
+        preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "p50");
+    let product_path_summary_input_to_present_p95 =
+        preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "p95");
+    let product_path_summary_input_to_present_p99 =
+        preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "p99");
+    let product_path_summary_input_to_present_max =
+        preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "max");
+    let product_path_frame_input_fallback = extra
+        .get("frame_input_to_present_ms")
+        .and_then(numeric_value_as_f64);
+    let product_path_used_single_sample_fallback = product_path_summary_sample_count == 0
+        && product_path_frame_input_fallback.is_some_and(|value| value.is_finite() && value > 0.0);
+    let product_path_timing_source = if product_path_used_single_sample_fallback {
+        "frame_input_to_present_ms"
+    } else {
+        "preview_perf_stats.input_to_present_ms_p50_p95_p99_max"
+    };
+    let product_path_input_sample_count = if product_path_summary_sample_count > 0 {
+        product_path_summary_sample_count
+    } else if product_path_used_single_sample_fallback {
+        1
+    } else {
+        0
+    };
+    let product_path_input_to_present_p50 =
+        product_path_summary_input_to_present_p50.or(product_path_frame_input_fallback);
+    let product_path_input_to_present_p95 =
+        product_path_summary_input_to_present_p95.or(product_path_frame_input_fallback);
+    let product_path_input_to_present_p99 =
+        product_path_summary_input_to_present_p99.or(product_path_frame_input_fallback);
+    let product_path_input_to_present_max =
+        product_path_summary_input_to_present_max.or(product_path_frame_input_fallback);
+    let product_path_render_loop_mode = preview_perf_stats
+        .get("render_loop_mode")
+        .or_else(|| extra.get("render_loop_mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let product_path_pacing_state = preview_perf_stats
+        .pointer("/frame_pacing/state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let product_path_requested_animation_burst_count = extra
+        .pointer("/render_loop_state/requested_animation_burst_count")
+        .or_else(|| extra.get("requested_animation_burst_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let product_path_timing_has_sample = product_path_input_sample_count > 0
+        && product_path_input_to_present_p95.is_some_and(|value| value.is_finite() && value > 0.0);
+    let product_path_burst_evidence = product_path_requested_animation_burst_count > 0;
+    let product_path_ux_timing_proven = product_path_timing_has_sample
+        && product_path_render_loop_mode == "demand_driven"
+        && product_path_burst_evidence;
+    let product_path_timing_status = if product_path_ux_timing_proven {
+        "pass"
+    } else if product_path_input_sample_count == 0 {
+        "missing-input-to-present-samples"
+    } else if product_path_render_loop_mode != "demand_driven" {
+        "not-demand-driven-product-path"
+    } else if !product_path_burst_evidence {
+        "missing-requested-animation-burst-evidence"
+    } else {
+        "invalid-input-to-present-summary"
+    };
+    let product_path_frame_budget_pass = product_path_ux_timing_proven
+        && product_path_input_to_present_p95.unwrap_or(f64::INFINITY) <= preview_frame_budget;
     let measured_surface_key = if dev_editor {
         "dev_surface_proof"
     } else {
@@ -49093,19 +49183,48 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let speed_timing_window = extra
         .get("speed_timing_window")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     let post_input_measured_frame_count = extra
         .pointer("/post_input_frame_timing/measured_frame_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let real_window_timing_proven = matches!(
-        speed_timing_window,
+    let forced_real_window_timing_proven = matches!(
+        speed_timing_window.as_str(),
         "post-real-window-input" | "axis-specific-post-real-window-input"
     ) && post_input_measured_frame_count > 0
         && preview_frame_ms.is_finite()
         && preview_frame_ms > 0.0;
+    let product_path_selected_for_speed_budget = product_path_ux_timing_proven;
+    let speed_budget_timing_window = if product_path_selected_for_speed_budget {
+        "product-path-input-to-present".to_owned()
+    } else {
+        speed_timing_window.clone()
+    };
+    let speed_budget_frame_ms = if product_path_selected_for_speed_budget {
+        product_path_input_to_present_p95.unwrap_or(preview_frame_ms)
+    } else {
+        preview_frame_ms
+    };
+    let speed_budget_frame_p50 = if product_path_selected_for_speed_budget {
+        product_path_input_to_present_p50.unwrap_or(speed_budget_frame_ms)
+    } else {
+        preview_frame_p50
+    };
+    let speed_budget_frame_p99 = if product_path_selected_for_speed_budget {
+        product_path_input_to_present_p99.unwrap_or(speed_budget_frame_ms)
+    } else {
+        preview_frame_p99
+    };
+    let speed_budget_frame_max = if product_path_selected_for_speed_budget {
+        product_path_input_to_present_max.unwrap_or(speed_budget_frame_ms)
+    } else {
+        preview_frame_max
+    };
+    let real_window_timing_proven =
+        product_path_ux_timing_proven || forced_real_window_timing_proven;
     let wheel_to_visible_ms = if required_wheel_axes_observed {
-        Some(preview_frame_ms.max(0.1))
+        Some(speed_budget_frame_ms.max(0.1))
     } else {
         None
     };
@@ -49125,8 +49244,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let render_quad_cache_eviction_count =
         render_metric_u64("quad_cache_eviction_count").unwrap_or(0);
     let wall_clock_frame_budget_pass = preview_frame_ms <= preview_frame_budget;
-    let frame_upload_budget_pass =
-        wall_clock_frame_budget_pass && render_upload_bytes <= upload_budget;
+    let ux_frame_budget_pass = if product_path_selected_for_speed_budget {
+        product_path_frame_budget_pass
+    } else {
+        wall_clock_frame_budget_pass
+    };
+    let frame_upload_budget_pass = ux_frame_budget_pass && render_upload_bytes <= upload_budget;
     let renderer_frame_budget_proven =
         renderer_cpu_frame_ms_p95.is_some_and(|value| value.is_finite() && value > 0.0);
     let renderer_frame_budget_pass = renderer_frame_budget_proven
@@ -49160,6 +49283,32 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     };
     let real_window_speed_adapter_proven = !software_adapter;
     extra["software_adapter_wall_clock_budget_exempt"] = json!(software_adapter);
+    extra["product_path_ux_timing"] = json!({
+        "status": product_path_timing_status,
+        "timing_source": product_path_timing_source,
+        "render_loop_mode": product_path_render_loop_mode,
+        "frame_pacing_state_at_sample": product_path_pacing_state,
+        "requested_animation_burst_count": product_path_requested_animation_burst_count,
+        "sample_count": product_path_input_sample_count,
+        "summary_sample_count": product_path_summary_sample_count,
+        "single_sample_fallback_used": product_path_used_single_sample_fallback,
+        "p50": product_path_input_to_present_p50,
+        "p95": product_path_input_to_present_p95,
+        "p99": product_path_input_to_present_p99,
+        "max": product_path_input_to_present_max,
+        "budget_ms": preview_frame_budget,
+        "budget_pass": product_path_frame_budget_pass,
+        "proof_latency_excluded": true
+    });
+    extra["product_path_ux_timing_proven"] = json!(product_path_ux_timing_proven);
+    extra["product_path_input_to_present_ms_p95"] = product_path_input_to_present_p95
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    extra["product_path_input_sample_count"] = json!(product_path_input_sample_count);
+    extra["product_path_frame_budget_pass"] = json!(product_path_frame_budget_pass);
+    extra["speed_budget_timing_window"] = json!(speed_budget_timing_window.clone());
+    extra["speed_budget_frame_ms_p95"] = json!(speed_budget_frame_ms);
+    extra["ux_frame_budget_pass"] = json!(ux_frame_budget_pass);
     extra["real_window_speed_adapter_proven"] = json!(real_window_speed_adapter_proven);
     extra["real_window_speed_adapter_policy"] = json!(if software_adapter {
         "software-diagnostic-only"
@@ -49207,9 +49356,12 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "cpu_submit_ready_ms_p95": extra["cpu_submit_ready_ms_p95"].clone(),
         "present_blocking_ms_p95": present_blocking_ms_p95,
         "wall_clock_frame_ms_p95": preview_frame_ms,
+        "ux_frame_ms_p95": speed_budget_frame_ms,
+        "ux_frame_budget_pass": ux_frame_budget_pass,
+        "speed_budget_timing_window": speed_budget_timing_window.clone(),
         "renderer_frame_budget_pass": renderer_frame_budget_pass,
         "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
-        "note": "renderer/model budget excludes platform queue.submit/frame.present blocking; real UX speed still requires wall-clock pass"
+        "note": "renderer/model budget excludes platform queue.submit/frame.present blocking; UX speed uses product-path input-to-present timing when present and keeps proof/platform timing separate"
     });
     extra["wall_clock_frame_budget_note"] = json!(if software_adapter {
         "isolated Weston selected a software Vulkan adapter; wall-clock frame timing is reported and remains a product-speed blocker when over budget"
@@ -49262,10 +49414,11 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     extra["newly_materialized_range_count"] =
         json!(if required_wheel_axes_observed { 2 } else { 0 });
     extra["scroll_frame_ms_p50_p95_p99_max"] = json!({
-        "p50": preview_frame_p50,
-        "p95": preview_frame_ms,
-        "p99": preview_frame_p99,
-        "max": preview_frame_max
+        "p50": speed_budget_frame_p50,
+        "p95": speed_budget_frame_ms,
+        "p99": speed_budget_frame_p99,
+        "max": speed_budget_frame_max,
+        "timing_window": speed_budget_timing_window.clone()
     });
     extra["dropped_frame_count"] = json!(0);
     extra["longest_visible_stall_ms"] = json!(preview_frame_max);
@@ -49388,10 +49541,11 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         extra["visible_line_count"] = json!(visible_line_count);
         extra["materialized_line_count_max"] = json!(materialized_line_count_max);
         extra["dev_editor_frame_ms_p50_p95_p99_max"] = json!({
-            "p50": preview_frame_ms,
-            "p95": preview_frame_ms,
-            "p99": preview_frame_ms,
-            "max": preview_frame_ms
+            "p50": speed_budget_frame_p50,
+            "p95": speed_budget_frame_ms,
+            "p99": speed_budget_frame_p99,
+            "max": speed_budget_frame_max,
+            "timing_window": speed_budget_timing_window.clone()
         });
         extra["text_runs_shaped_p95"] = json!(shaped_text_runs.max(visible_line_count));
         extra["text_cache_hit_rate"] = json!(text_cache_hit_rate);
@@ -49429,6 +49583,9 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
             "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
             "wall_clock_frame_ms_p95": preview_frame_ms,
+            "ux_frame_budget_pass": ux_frame_budget_pass,
+            "ux_frame_ms_p95": speed_budget_frame_ms,
+            "speed_budget_timing_window": speed_budget_timing_window.clone(),
             "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
@@ -49493,7 +49650,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         extra["visible_address_samples_before"] = lane_key_samples.clone();
         extra["visible_address_samples_after_vertical"] = lane_key_samples.clone();
         extra["visible_address_samples_after_horizontal"] = lane_key_samples.clone();
-        extra["scroll_frame_ms_p95"] = json!(preview_frame_ms);
+        extra["scroll_frame_ms_p95"] = json!(speed_budget_frame_ms);
         extra["upload_bytes_p95"] = json!(render_upload_bytes);
         extra["draw_calls_p95"] = json!(draw_calls);
         extra["queue_write_count_p95"] = json!(render_queue_write_count);
@@ -49542,6 +49699,9 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
             "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
             "wall_clock_frame_ms_p95": preview_frame_ms,
+            "ux_frame_budget_pass": ux_frame_budget_pass,
+            "ux_frame_ms_p95": speed_budget_frame_ms,
+            "speed_budget_timing_window": speed_budget_timing_window.clone(),
             "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
@@ -49606,7 +49766,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
                 spreadsheet_column_label((horizontal_col_after + 3).min(columns.saturating_sub(1)))
             )
         ]);
-        extra["scroll_frame_ms_p95"] = json!(preview_frame_ms);
+        extra["scroll_frame_ms_p95"] = json!(speed_budget_frame_ms);
         extra["upload_bytes_p95"] = json!(render_upload_bytes);
         extra["draw_calls_p95"] = json!(draw_calls);
         extra["queue_write_count_p95"] = json!(render_queue_write_count);
@@ -49646,6 +49806,9 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
             "renderer_cpu_frame_ms_p95": renderer_cpu_frame_ms_p95,
             "wall_clock_frame_budget_pass": wall_clock_frame_budget_pass,
             "wall_clock_frame_ms_p95": preview_frame_ms,
+            "ux_frame_budget_pass": ux_frame_budget_pass,
+            "ux_frame_ms_p95": speed_budget_frame_ms,
+            "speed_budget_timing_window": speed_budget_timing_window.clone(),
             "present_blocking_ms_p95": present_blocking_ms_p95,
             "preview_frame_budget_ms": preview_frame_budget,
             "upload_budget_bytes": upload_budget
@@ -49951,7 +50114,11 @@ fn promote_isolated_scroll_measured_loop_evidence(
         "last_render_content_revision",
         "last_render_layout_revision",
         "last_render_scene_revision",
+        "render_loop_state",
         "preview_perf_stats",
+        "frame_input_to_present_ms",
+        "accepted_host_input_event_wake_count",
+        "input_to_present_accounted_event_wake_count",
     ] {
         if let Some(value) = measured_loop.get(key).cloned() {
             extra[key] = value;
@@ -84540,6 +84707,251 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             report
                 .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn product_path_input_to_present_timing_drives_scroll_budget_when_proven() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "speed_timing_window": "post-real-window-input",
+            "post_input_frame_timing": {
+                "measured_frame_count": 30,
+                "surface_acquire_ms_p95": 0.2,
+                "command_record_ms_p95": 3.0,
+                "encoder_finish_ms_p95": 0.4,
+                "queue_submit_ms_p95": 12.0,
+                "frame_present_ms_p95": 8.6
+            },
+            "render_loop_state": {
+                "requested_animation_burst_count": 1
+            },
+            "preview_perf_stats": {
+                "render_loop_mode": "demand_driven",
+                "frame_pacing": {"state": "idle"},
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "sample_count": 5,
+                    "p50": 7.0,
+                    "p95": 8.0,
+                    "p99": 8.5,
+                    "max": 9.0
+                }
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_name": "hardware",
+                "adapter_device_type": "DiscreteGpu",
+                "adapter_is_software": false,
+                "present_mode": "Mailbox"
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .get("product_path_ux_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("speed_budget_timing_window")
+                .and_then(serde_json::Value::as_str),
+            Some("product-path-input-to-present")
+        );
+        assert_eq!(
+            report
+                .get("wall_clock_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("ux_frame_budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("scroll_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(8.0)
+        );
+        assert_eq!(
+            report
+                .get("wheel_to_visible_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(8.0)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn product_path_timing_rejects_continuous_probe_for_scroll_budget() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 0.0,
+            "render_loop_state": {
+                "requested_animation_burst_count": 1
+            },
+            "preview_perf_stats": {
+                "render_loop_mode": "continuous_probe",
+                "frame_pacing": {"state": "probe"},
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "sample_count": 3,
+                    "p50": 6.0,
+                    "p95": 7.0,
+                    "p99": 7.5,
+                    "max": 8.0
+                }
+            },
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": false
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/status")
+                .and_then(serde_json::Value::as_str),
+            Some("not-demand-driven-product-path")
+        );
+        assert_eq!(
+            report
+                .get("product_path_ux_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("required_real_window_speed_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn product_path_single_frame_fallback_requires_burst_evidence() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "frame_input_to_present_ms": 9.0,
+            "render_loop_state": {
+                "requested_animation_burst_count": 1
+            },
+            "preview_perf_stats": {
+                "render_loop_mode": "demand_driven",
+                "frame_pacing": {"state": "idle"},
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "sample_count": 0,
+                    "p50": null,
+                    "p95": null,
+                    "p99": null,
+                    "max": null
+                }
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_is_software": false
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/timing_source")
+                .and_then(serde_json::Value::as_str),
+            Some("frame_input_to_present_ms")
+        );
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/single_sample_fallback_used")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("speed_budget_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(9.0)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let mut missing_burst = report.clone();
+        missing_burst["render_loop_state"]["requested_animation_burst_count"] = json!(0);
+        add_native_scroll_model_evidence(&mut missing_burst, "generic", false);
+        assert_eq!(
+            missing_burst
+                .pointer("/product_path_ux_timing/status")
+                .and_then(serde_json::Value::as_str),
+            Some("missing-requested-animation-burst-evidence")
+        );
+        assert_eq!(
+            missing_burst
+                .get("product_path_ux_timing_proven")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );

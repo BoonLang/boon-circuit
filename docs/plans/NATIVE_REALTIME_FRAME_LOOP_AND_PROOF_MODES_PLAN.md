@@ -1357,6 +1357,58 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   non-software adapter. The renderer/model path is currently fast enough for
   Cells; the remaining blocker is real wall-clock present/submit behavior.
 
+2026-07-01 product-path UX timing selector slice:
+
+- The scroll-speed evidence path now promotes normal DemandDriven product-path
+  UX timing separately from forced proof/platform timing. The selector prefers
+  `preview_perf_stats.input_to_present_ms_p50_p95_p99_max` and can use
+  `frame_input_to_present_ms` as a single-frame fallback, but only when the
+  measured loop stayed in `demand_driven` mode and recorded a requested-animation
+  burst. `continuous_probe` timing, missing samples, and missing burst evidence
+  are rejected instead of silently proving UX speed.
+- `post_input_frame_timing` remains reported as forced/proof/platform timing.
+  It no longer has to define `wheel_to_visible_ms_p95` or
+  `scroll_frame_ms_p95` when a stronger product-path input-to-present sample is
+  present. New report fields include `product_path_ux_timing`,
+  `product_path_ux_timing_proven`, `product_path_input_to_present_ms_p95`,
+  `speed_budget_timing_window`, `speed_budget_frame_ms_p95`, and
+  `ux_frame_budget_pass`.
+- The scroll model still keeps hardware honesty: software adapters remain
+  diagnostic-only for final real-window speed readiness, even if product-path
+  UX timing is under budget.
+- A read-only subagent independently identified the same minimal patch shape:
+  use the existing `take_frame_accepted_input_to_present_ms` product-path
+  stream, require DemandDriven plus burst evidence, keep same-frame WGPU proof
+  separate, and do not use forced post-input loops as UX latency.
+- Fresh Cells scroll-speed report still fails honestly with one blocker:
+  `native scroll-speed gate ran on a software adapter; hardware-backed
+  real-window speed is not proven`. The same report now shows the useful split:
+  `product_path_ux_timing.status=pass`,
+  `product_path_input_to_present_ms_p95=11.189790999998875`,
+  `speed_budget_timing_window=product-path-input-to-present`,
+  `ux_frame_budget_pass=true`, `wall_clock_frame_budget_pass=false`,
+  `wall_clock_frame_budget_ms_p95=17.827773999999998`,
+  `renderer_frame_budget_pass=true`, `renderer_cpu_frame_ms_p95=3.431165`,
+  `present_blocking_ms_p95=26.438848`,
+  `real_window_speed_adapter_policy=software-diagnostic-only`, and
+  `required_real_window_speed_proven=false`.
+- Focused verification:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo test -q -p xtask product_path_`
+  - `cargo test -q -p xtask scroll_budget`
+  - `cargo test -q -p xtask axis_specific`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`
+    failed honestly with only the software-adapter hardware-readiness blocker.
+  - `cargo xtask verify-report-schema target/reports/native-gpu/scroll-speed-cells.json`
+    passed.
+- Next implementation target: collect more than one product-path input sample
+  for sustained scroll bursts and run the same gate on a non-software adapter.
+  The current selector proves that the normal input-to-present path can be under
+  16.7ms, but final readiness still requires hardware-backed real-window
+  evidence and broader p95 sample counts.
+
 ## Implementation Slices
 
 1. Terminology and schema:

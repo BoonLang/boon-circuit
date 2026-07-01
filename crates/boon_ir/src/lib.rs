@@ -499,7 +499,16 @@ pub struct SourcePayloadSchema {
     pub typed_fields: Vec<SourcePayloadDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_lookup_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_lookup_field: Option<String>,
+}
+
+impl SourcePayloadSchema {
+    pub fn row_lookup_field_name(&self) -> Option<&str> {
+        self.row_lookup_field
+            .as_deref()
+            .or(self.address_lookup_field.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3044,7 +3053,7 @@ fn select_source_row_lookup_field(source: &str, candidates: Vec<String>) -> Opti
 }
 
 fn source_row_lookup_field_score(source: &str, candidate: &str) -> i32 {
-    let terms = source_address_intent_terms(source);
+    let terms = source_row_lookup_intent_terms(source);
     let mut score = 0;
     if matches!(candidate, "id" | "key" | "unique_id") {
         score += 50;
@@ -3072,7 +3081,7 @@ fn source_row_lookup_field_score(source: &str, candidate: &str) -> i32 {
     score
 }
 
-fn source_address_intent_terms(source: &str) -> Vec<String> {
+fn source_row_lookup_intent_terms(source: &str) -> Vec<String> {
     let mut terms = BTreeSet::new();
     for segment in source.split('.') {
         for part in segment.split('_') {
@@ -13622,6 +13631,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias() {
+        let schema = SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+            row_lookup_field: Some("file".to_owned()),
+            address_lookup_field: Some("address".to_owned()),
+        };
+        assert_eq!(schema.row_lookup_field_name(), Some("file"));
+
+        let legacy_schema = SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+            row_lookup_field: None,
+            address_lookup_field: Some("legacy_key".to_owned()),
+        };
+        assert_eq!(legacy_schema.row_lookup_field_name(), Some("legacy_key"));
+
+        let decoded: SourcePayloadSchema = serde_json::from_value(serde_json::json!({
+            "fields": [],
+            "row_lookup_field": "file"
+        }))
+        .unwrap();
+        assert_eq!(decoded.row_lookup_field_name(), Some("file"));
+        assert_eq!(decoded.address_lookup_field, None);
+    }
+
+    #[test]
     fn stripe_view_binding_uses_neutral_kind_metadata() {
         assert_eq!(canonical_view_node_kind("Element/stripe"), "Stripe");
     }
@@ -17270,12 +17306,12 @@ FUNCTION new_todo(todo) {
             source.path == "cell.sources.editor.commit"
                 && source.payload_schema.fields
                     == vec![SourcePayloadField::Address, SourcePayloadField::Text]
-                && source.payload_schema.address_lookup_field.as_deref() == Some("address")
+                && source.payload_schema.row_lookup_field_name() == Some("address")
         }));
         assert!(ir.sources.iter().any(|source| {
             source.path == "cell.sources.editor.cancel"
                 && source.payload_schema.fields == vec![SourcePayloadField::Address]
-                && source.payload_schema.address_lookup_field.as_deref() == Some("address")
+                && source.payload_schema.row_lookup_field_name() == Some("address")
         }));
         assert!(ir.view_bindings.iter().any(|binding| {
             binding.node_kind == "Input"

@@ -979,10 +979,8 @@ impl CompilerStaticProgramAnalysis {
             .filter_map(|source| {
                 source
                     .payload_schema
-                    .row_lookup_field
-                    .as_ref()
-                    .or(source.payload_schema.address_lookup_field.as_ref())
-                    .map(|field| (source.path.clone(), field.clone()))
+                    .row_lookup_field_name()
+                    .map(|field| (source.path.clone(), field.to_owned()))
             })
             .collect();
         Self {
@@ -2044,9 +2042,8 @@ pub fn compiler_source_route_sources_from_ir(ir: &TypedProgram) -> Vec<CompilerS
                 .collect(),
             row_lookup_field: source
                 .payload_schema
-                .row_lookup_field
-                .clone()
-                .or_else(|| source.payload_schema.address_lookup_field.clone()),
+                .row_lookup_field_name()
+                .map(str::to_owned),
         })
         .collect()
 }

@@ -1762,11 +1762,85 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo test -q -p xtask product_path`;
   - `cargo check -q -p xtask`;
   - `git diff --check`;
-  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+ - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
     target/reports/native-gpu/scroll-speed-cells.json` failed honestly with
     only the software-adapter blocker above;
   - `cargo xtask verify-report-schema
     target/reports/native-gpu/scroll-speed-cells.json` passed.
+
+2026-07-01 row-lookup schema alias accessor slice:
+
+- `SourcePayloadSchema` in both IR and machine-plan types now exposes a
+  generic `row_lookup_field_name()` accessor. The accessor prefers
+  `row_lookup_field` and treats `address_lookup_field` only as a legacy decode
+  alias.
+- `address_lookup_field` is now a defaulted, skipped-when-empty compatibility
+  field in both schema structs, so newer row-lookup-only payload schemas can
+  deserialize and serialize without requiring the old alias.
+- Compiler static analysis, compiler source-route metadata, runtime row
+  resolution reports, plan-executor row lookup, and report-schema expected row
+  lookup now read through the generic accessor rather than reaching directly
+  for the legacy alias.
+- The compiler legacy backend still emits the legacy alias deliberately for old
+  plan consumers, but it derives the generic row lookup value from the accessor
+  and backfills the compatibility alias from `row_lookup_field` when needed.
+- The IR row-intent scoring helper was renamed from address-intent terminology
+  to row-lookup terminology. Real app data and legacy source payload
+  `Address` compatibility remain unchanged.
+- A read-only subagent reviewed current reports and agreed the strongest next
+  blocker is no longer Cells click/runtime lookup. Current evidence points to
+  native scroll proof/report alignment: Cells scroll product-path p95 is under
+  budget on the available software-adapter report, dev-editor release scroll is
+  covered by the dedicated verifier, and the aggregate native GPU path still
+  needs report alignment plus hardware-backed scroll evidence.
+- Focused verification passed:
+  - `cargo fmt --check`;
+  - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias`;
+  - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias`;
+  - `cargo check -q -p boon_ir -p boon_plan -p boon_compiler -p boon_runtime -p boon_plan_executor -p boon_report_schema -p boon_native_playground -p xtask`;
+  - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`;
+  - `cargo test -q -p boon_runtime compiled_artifact_decodes_source_routes_and_action_table_without_ast`;
+  - `cargo test -q -p boon_ir scoped_source_lookup_prefers_source_intent_identity_field`;
+  - `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`;
+  - `cargo test -q -p boon_plan_executor --no-run`;
+  - `cargo test -q -p boon_report_schema native_gpu_schema`;
+  - `cargo test -q -p boon_native_playground row_identity`.
+- Existing warnings remain outside this slice:
+  `boon_plan` has an existing unreachable bytes-pattern warning, several native
+  GPU/playground helpers are dead-code warned under the checked feature set, and
+  `xtask` still has an unused diagnostic variable warning.
+- This is still not completion. Remaining work includes retiring the serialized
+  compatibility source intent, deciding when legacy `SourcePayloadField::Address`
+  can stop being a row-identity path, aligning aggregate native GPU required
+  reports with the active architecture contract, proving hardware-backed Cells
+  scroll speed, and finishing broader runtime formula/currentness gates.
+
+2026-07-01 native handoff aggregate scope alignment slice:
+
+- `verify-native-gpu-all` handoff requirements now match the active native GPU
+  architecture split more closely by removing NovyWave preview/visual reports
+  from the handoff aggregate. The architecture doc keeps those broader product
+  checks in regression scope unless `NATIVE_GPU_PIPELINE.md` and `AGENTS.md` are
+  updated together.
+- `native_gpu_regression_required_reports()` now adds NovyWave preview E2E and
+  NovyWave visual reports explicitly, so removing them from handoff does not
+  silently drop regression coverage.
+- Added focused xtask coverage proving the handoff aggregate does not require
+  NovyWave reports while regression still does.
+- Focused verification passed:
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo test -q -p xtask native_gpu_handoff_keeps_novywave_in_regression_scope`;
+  - `cargo test -q -p xtask native_gpu_handoff_requires_cells_visible_click_release_report`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask native_gpu`;
+  - `rg -n "payload_schema\\.address_lookup_field|source_address_intent_terms|source_address_lookup_fields|source_address_lookup_or_bound_row|address_lookup_field_for_source_id|address_lookup_field_for_list|set_address_lookup_fields|select_source_address_lookup_field" crates --glob '*.rs'`
+    returned no matches.
+- This does not complete aggregate readiness. The dev-code-editor compatibility
+  scroll report still needs a deliberate alias/hash-link decision against
+  `verify-native-dev-editor-scroll-speed --profile release`, and fresh
+  `verify-native-gpu-all --check-existing` still requires current reports for
+  this worktree.
 
 ## Implementation Slices
 

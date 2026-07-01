@@ -5084,11 +5084,7 @@ fn execute_indexed_update_branch(
                 row_index,
                 row,
                 source_binding_id,
-                source_route_slot
-                    .payload_schema
-                    .row_lookup_field
-                    .as_deref()
-                    .or(source_route_slot.payload_schema.address_lookup_field.as_deref())
+                source_route_slot.payload_schema.row_lookup_field_name()
             ),
             "field_path": output_name,
             "value": value,
@@ -6693,14 +6689,7 @@ fn resolve_plan_row_index(
         validate_plan_row_binding_epoch(plan, source_route_slot, list_slot, &rows[index], event)?;
         return Ok(index);
     }
-    if let Some(lookup_field) = source_route_slot
-        .payload_schema
-        .row_lookup_field
-        .as_deref()
-        .or(source_route_slot
-            .payload_schema
-            .address_lookup_field
-            .as_deref())
+    if let Some(lookup_field) = source_route_slot.payload_schema.row_lookup_field_name()
         && let Some(lookup_value) = generic_source_event_row_lookup_value(event, lookup_field)
         && let Some(index) = rows.iter().position(|row| {
             row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(lookup_value)

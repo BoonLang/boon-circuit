@@ -62367,18 +62367,6 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[("--example", "todo_mvc_physical")],
         ),
         native_gpu_required_report(
-            "preview-e2e-novywave",
-            "target/reports/native-gpu/preview-e2e-novywave.json",
-            "verify-native-gpu-preview-e2e",
-            &[("--example", "novywave")],
-        ),
-        native_gpu_required_report(
-            "novywave-visual",
-            "target/reports/native-gpu/novywave-visual.json",
-            "verify-native-gpu-novywave-visual",
-            &[],
-        ),
-        native_gpu_required_report(
             "todomvc-physical-reference-parity",
             "target/reports/native-gpu/todomvc-physical-reference-parity.json",
             "verify-native-todomvc-physical-reference-parity",
@@ -62447,6 +62435,18 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
     let mut reports = native_gpu_handoff_required_reports();
     reports.extend(native_gpu_headed_visual_required_reports());
     reports.extend([
+        native_gpu_required_report(
+            "preview-e2e-novywave",
+            "target/reports/native-gpu/preview-e2e-novywave.json",
+            "verify-native-gpu-preview-e2e",
+            &[("--example", "novywave")],
+        ),
+        native_gpu_required_report(
+            "novywave-visual",
+            "target/reports/native-gpu/novywave-visual.json",
+            "verify-native-gpu-novywave-visual",
+            &[],
+        ),
         native_gpu_required_report(
             "counter-interaction-speed",
             "target/reports/native-gpu/counter-interaction-speed.json",
@@ -83270,6 +83270,29 @@ mod tests {
         );
         assert_eq!(report.command, "verify-native-cells-visible-click-e2e");
         assert_eq!(report.required_argv, &[("--profile", "release")]);
+    }
+
+    #[test]
+    fn native_gpu_handoff_keeps_novywave_in_regression_scope() {
+        let handoff = native_gpu_handoff_required_reports();
+        assert!(
+            handoff
+                .iter()
+                .all(|report| !report.label.contains("novywave")),
+            "NovyWave product visual gates are regression scope, not native GPU handoff scope"
+        );
+
+        let regression = native_gpu_regression_required_reports();
+        assert!(
+            regression
+                .iter()
+                .any(|report| report.label == "preview-e2e-novywave")
+        );
+        assert!(
+            regression
+                .iter()
+                .any(|report| report.label == "novywave-visual")
+        );
     }
 
     #[test]

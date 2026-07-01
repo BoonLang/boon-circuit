@@ -19018,10 +19018,7 @@ fn expected_resolve_plan_row_index(
         return Ok(index);
     }
     if let Some(address) = expected_event_str(source_event, "address")
-        && let Some(lookup_field) = source_route_slot
-            .payload_schema
-            .address_lookup_field
-            .as_ref()
+        && let Some(lookup_field) = source_route_slot.payload_schema.row_lookup_field_name()
         && let Some(index) = rows.iter().position(|row| {
             row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(address)
         })

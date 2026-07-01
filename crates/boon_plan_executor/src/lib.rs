@@ -2563,10 +2563,7 @@ fn resolve_list_row_index_for_source_event(
         return Ok(index);
     }
     if let Some(address) = event.address.as_ref()
-        && let Some(lookup_field) = source_route_slot
-            .payload_schema
-            .address_lookup_field
-            .as_ref()
+        && let Some(lookup_field) = source_route_slot.payload_schema.row_lookup_field_name()
         && let Some(index) = rows.iter().position(|row| {
             row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(*address)
         })

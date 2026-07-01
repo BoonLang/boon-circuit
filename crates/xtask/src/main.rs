@@ -35646,6 +35646,32 @@ fn readback_sha256(readback: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn remove_null_frame_evidence_keys(mut value: serde_json::Value) -> serde_json::Value {
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object
+                    .get("frame_evidence_key")
+                    .is_some_and(serde_json::Value::is_null)
+                {
+                    object.remove("frame_evidence_key");
+                }
+                for child in object.values_mut() {
+                    strip(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    strip(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
 fn current_loop_surface_readback_hash_from_report(report: &serde_json::Value) -> Option<String> {
     report
         .get("last_interactive_readback_artifact")
@@ -35683,7 +35709,7 @@ fn wait_for_loop_readback_change(
                             "loop_error": loop_error,
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                             "loop_report": loop_report,
-                            "last_report": report
+                            "last_report": remove_null_frame_evidence_keys(report)
                         });
                     }
                     let readback = report
@@ -35764,7 +35790,7 @@ fn wait_for_loop_readback_change(
                             "accepted_by_external_render_proof_hash_change": external_render_proof_changed
                         });
                     }
-                    last_report = report;
+                    last_report = remove_null_frame_evidence_keys(report);
                 }
                 Err(error) => {
                     last_report = json!({"status": "read-error", "diagnostic": error.to_string()});
@@ -36784,8 +36810,11 @@ fn run_native_example_switch_live_probe(
         }));
     }
     thread::sleep(Duration::from_millis(1_000));
-    let initial_readback =
-        wait_for_loop_readback_change(&preview_loop_report, "missing", Duration::from_secs(5));
+    let initial_readback = remove_null_frame_evidence_keys(wait_for_loop_readback_change(
+        &preview_loop_report,
+        "missing",
+        Duration::from_secs(5),
+    ));
     let initial_frame_hash = initial_readback
         .get("frame_hash_after")
         .and_then(serde_json::Value::as_str)
@@ -54612,7 +54641,7 @@ fn verify_native_cells_visible_click_e2e(
             "structured_external_proof_changed": structured_external_proof_changed,
             "proof_current_changed": proof_current_changed,
             "measurement_source": "isolated-weston-real-app-window-mouse-click-plus-app-owned-render-proof-or-wgpu-readback-then-sparse-runtime-value",
-            "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
+            "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_preview_ipc_fallback",
             "visual_capture_method": "app-owned-wgpu-readback",
             "preview_loop_report": live_probe
                 .get("preview_loop_report")
@@ -57178,7 +57207,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "observed_input_adapter": observed_input_adapter,
         "real_os_input": real_os_input,
         "operator_host_input": false,
-        "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback",
+        "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_preview_ipc_fallback",
         "visual_capture_method": "app-owned-wgpu-readback",
         "preview_loop_report": preview_loop_report,
         "preview_report": preview_report,
@@ -82399,6 +82428,97 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("legacy address selection fallback")),
             "label contract must reject legacy selection fallback: {blockers:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_snapshots_drop_null_frame_evidence_placeholders() {
+        let real_key = json!({
+            "frame_seq": 7,
+            "content_revision": 11,
+            "layout_revision": 13,
+            "render_scene_revision": 17,
+            "surface_id": "preview:test",
+            "surface_epoch": 1,
+            "input_event_seq": null,
+            "present_id": 7,
+            "proof_request_id": null
+        });
+        let sanitized = remove_null_frame_evidence_keys(json!({
+            "initial_readback_probe": {
+                "status": "fail",
+                "last_report": {
+                    "frame_evidence_key": null,
+                    "preview_perf_stats": {
+                        "frame_evidence_key": null
+                    }
+                }
+            },
+            "readback_probe": {
+                "capture_method": "wgpu-visible-surface-copy-src-readback",
+                "frame_evidence_key": real_key,
+                "content_revision": 11,
+                "rendered_frame_count": 7,
+                "surface_epoch": 1
+            }
+        }));
+
+        assert!(
+            sanitized
+                .pointer("/initial_readback_probe/last_report/frame_evidence_key")
+                .is_none()
+        );
+        assert!(
+            sanitized
+                .pointer(
+                    "/initial_readback_probe/last_report/preview_perf_stats/frame_evidence_key"
+                )
+                .is_none()
+        );
+        assert!(
+            sanitized
+                .pointer("/readback_probe/frame_evidence_key")
+                .is_some()
+        );
+        let mut reasons = Vec::new();
+        collect_native_gpu_frame_evidence_reasons(&sanitized, "$", &mut reasons);
+        assert!(
+            reasons.is_empty(),
+            "sanitized diagnostics should not create frame evidence blockers: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn native_real_window_input_method_does_not_use_operator_host_token() {
+        let report = json!({
+            "status": "pass",
+            "native_gpu_contract": true,
+            "generated_at_utc": current_unix_seconds().to_string(),
+            "git_commit": git_commit(),
+            "worktree_fingerprint": worktree_fingerprint(),
+            "binary_hash": current_binary_hash(),
+            "real_os_input": true,
+            "operator_host_input": false,
+            "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_preview_ipc_fallback"
+        });
+        let reasons = native_gpu_report_integrity_reasons(&report, false, true);
+        assert!(
+            !reasons
+                .iter()
+                .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
+            "real-window driver evidence must not be classified as operator-host input: {reasons:?}"
+        );
+
+        let mut bad_report = report;
+        bad_report["input_injection_method"] = json!(
+            "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback"
+        );
+        let bad_reasons = native_gpu_report_integrity_reasons(&bad_report, false, true);
+        assert!(
+            bad_reasons
+                .iter()
+                .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
+            "legacy operator-host token should still be rejected: {bad_reasons:?}"
         );
     }
 

@@ -26644,6 +26644,10 @@ fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut
         "render_hook_ms_p50_p95_p99_max",
         "layout_ms_p50_p95_p99_max",
         "present_call_ms_p50_p95_p99_max",
+        "frame_present_call_ms_p50_p95_p99_max",
+        "surface_acquire_call_ms_p50_p95_p99_max",
+        "queue_submit_call_ms_p50_p95_p99_max",
+        "present_path_ms_p50_p95_p99_max",
         "input_to_present_ms_p50_p95_p99_max",
         "upload_bytes_p50_p95_max",
         "draw_call_count_p50_p95_max",
@@ -31578,6 +31582,10 @@ mod tests {
             "renders_per_second": 60.0,
             "render_hook_ms": 1.2,
             "present_call_ms": 2.4,
+            "frame_present_call_ms": 2.4,
+            "surface_acquire_call_ms": 0.2,
+            "queue_submit_call_ms": 0.4,
+            "present_path_ms": 3.0,
             "input_to_present_ms": 8.0,
             "render_hook_ms_p50_p95_p99_max": {
                 "p50": 1.2,
@@ -31598,6 +31606,34 @@ mod tests {
                 "p95": 2.4,
                 "p99": 2.4,
                 "max": 2.4,
+                "sample_count": 1
+            },
+            "frame_present_call_ms_p50_p95_p99_max": {
+                "p50": 2.4,
+                "p95": 2.4,
+                "p99": 2.4,
+                "max": 2.4,
+                "sample_count": 1
+            },
+            "surface_acquire_call_ms_p50_p95_p99_max": {
+                "p50": 0.2,
+                "p95": 0.2,
+                "p99": 0.2,
+                "max": 0.2,
+                "sample_count": 1
+            },
+            "queue_submit_call_ms_p50_p95_p99_max": {
+                "p50": 0.4,
+                "p95": 0.4,
+                "p99": 0.4,
+                "max": 0.4,
+                "sample_count": 1
+            },
+            "present_path_ms_p50_p95_p99_max": {
+                "p50": 3.0,
+                "p95": 3.0,
+                "p99": 3.0,
+                "max": 3.0,
                 "sample_count": 1
             },
             "input_to_present_ms_p50_p95_p99_max": {

@@ -23674,6 +23674,11 @@ fn preview_perf_footer_summary(
         .and_then(serde_json::Value::as_f64)
         .or_else(|| {
             stats
+                .get("present_path_ms")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .or_else(|| {
+            stats
                 .get("present_call_ms")
                 .and_then(serde_json::Value::as_f64)
         })
@@ -23685,6 +23690,7 @@ fn preview_perf_footer_summary(
         .map(format_ms_compact)
         .unwrap_or_else(|| "-".to_owned());
     let p95 = preview_perf_summary_p95(stats, "input_to_present_ms_p50_p95_p99_max")
+        .or_else(|| preview_perf_summary_p95(stats, "present_path_ms_p50_p95_p99_max"))
         .or_else(|| preview_perf_summary_p95(stats, "present_call_ms_p50_p95_p99_max"))
         .map(format_ms_compact)
         .unwrap_or_else(|| "-".to_owned());
@@ -62484,10 +62490,18 @@ mod tests {
             renders_per_second: 0.0,
             render_hook_ms: Some(1.0),
             present_call_ms: Some(1.2),
+            frame_present_call_ms: Some(1.2),
+            surface_acquire_call_ms: Some(0.2),
+            queue_submit_call_ms: Some(0.4),
+            present_path_ms: Some(1.8),
             input_to_present_ms: Some(4.0),
             render_hook_ms_p50_p95_p99_max: timing_summary.clone(),
             layout_ms_p50_p95_p99_max: timing_summary.clone(),
             present_call_ms_p50_p95_p99_max: timing_summary.clone(),
+            frame_present_call_ms_p50_p95_p99_max: timing_summary.clone(),
+            surface_acquire_call_ms_p50_p95_p99_max: timing_summary.clone(),
+            queue_submit_call_ms_p50_p95_p99_max: timing_summary.clone(),
+            present_path_ms_p50_p95_p99_max: timing_summary.clone(),
             input_to_present_ms_p50_p95_p99_max: timing_summary.clone(),
             upload_bytes_p50_p95_max: timing_summary.clone(),
             draw_call_count_p50_p95_max: timing_summary.clone(),
@@ -74108,6 +74122,10 @@ label:
                 "renders_per_second": 59.8,
                 "render_hook_ms": 1.3,
                 "present_call_ms": 2.1,
+                "frame_present_call_ms": 2.1,
+                "surface_acquire_call_ms": 0.2,
+                "queue_submit_call_ms": 0.5,
+                "present_path_ms": 2.8,
                 "input_to_present_ms": 8.4,
                 "render_hook_ms_p50_p95_p99_max": {
                     "p50": 1.3,
@@ -74128,6 +74146,34 @@ label:
                     "p95": 2.1,
                     "p99": 2.1,
                     "max": 2.1,
+                    "sample_count": 1
+                },
+                "frame_present_call_ms_p50_p95_p99_max": {
+                    "p50": 2.1,
+                    "p95": 2.1,
+                    "p99": 2.1,
+                    "max": 2.1,
+                    "sample_count": 1
+                },
+                "surface_acquire_call_ms_p50_p95_p99_max": {
+                    "p50": 0.2,
+                    "p95": 0.2,
+                    "p99": 0.2,
+                    "max": 0.2,
+                    "sample_count": 1
+                },
+                "queue_submit_call_ms_p50_p95_p99_max": {
+                    "p50": 0.5,
+                    "p95": 0.5,
+                    "p99": 0.5,
+                    "max": 0.5,
+                    "sample_count": 1
+                },
+                "present_path_ms_p50_p95_p99_max": {
+                    "p50": 2.8,
+                    "p95": 2.8,
+                    "p99": 2.8,
+                    "max": 2.8,
                     "sample_count": 1
                 },
                 "input_to_present_ms_p50_p95_p99_max": {
@@ -74272,10 +74318,18 @@ label:
                 renders_per_second: 0.0,
                 render_hook_ms: Some(1.0),
                 present_call_ms: Some(1.2),
+                frame_present_call_ms: Some(1.2),
+                surface_acquire_call_ms: Some(0.2),
+                queue_submit_call_ms: Some(0.4),
+                present_path_ms: Some(1.8),
                 input_to_present_ms: Some(4.0),
                 render_hook_ms_p50_p95_p99_max: perf_summary.clone(),
                 layout_ms_p50_p95_p99_max: perf_summary.clone(),
                 present_call_ms_p50_p95_p99_max: perf_summary.clone(),
+                frame_present_call_ms_p50_p95_p99_max: perf_summary.clone(),
+                surface_acquire_call_ms_p50_p95_p99_max: perf_summary.clone(),
+                queue_submit_call_ms_p50_p95_p99_max: perf_summary.clone(),
+                present_path_ms_p50_p95_p99_max: perf_summary.clone(),
                 input_to_present_ms_p50_p95_p99_max: perf_summary.clone(),
                 upload_bytes_p50_p95_max: perf_summary.clone(),
                 draw_call_count_p50_p95_max: perf_summary.clone(),

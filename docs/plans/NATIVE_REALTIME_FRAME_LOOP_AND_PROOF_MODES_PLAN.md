@@ -167,7 +167,8 @@ Add a tiny `PreviewPerfStats` snapshot with fixed scalar fields:
 - pacing state: idle, burst, or probe;
 - FPS or renders per second;
 - render-hook milliseconds;
-- present-call milliseconds;
+- present-path milliseconds plus surface-acquire, queue-submit, and
+  frame-present subphase milliseconds;
 - input-to-present milliseconds;
 - missed-frame count;
 - proof/readback mode;
@@ -189,6 +190,10 @@ Reports and HUD should expose the same key terms:
 - `render_hook_ms_p50_p95_p99_max`;
 - `layout_ms_p50_p95_p99_max`;
 - `present_call_ms_p50_p95_p99_max`;
+- `present_path_ms_p50_p95_p99_max`;
+- `surface_acquire_call_ms_p50_p95_p99_max`;
+- `queue_submit_call_ms_p50_p95_p99_max`;
+- `frame_present_call_ms_p50_p95_p99_max`;
 - `upload_bytes_p50_p95_max`;
 - `draw_call_count_p50_p95_max`;
 - `glyph_cache_hit_rate`;
@@ -221,10 +226,20 @@ is CPU-submit, compositor-present, GPU-completion, or proof-completion time.
 - `layout_ms`:
   - CPU wall time spent producing or updating `LayoutFrame`, layout fragments,
     or retained layout state.
-- `present_call_ms`:
-  - CPU wall time for the present path through surface acquisition, command
-    submission, and `frame.present()`;
+- `present_path_ms`:
+  - CPU wall time for the product present path through surface acquisition,
+    command submission, and `frame.present()`;
   - does not claim GPU completion.
+- `surface_acquire_call_ms`:
+  - CPU wall time inside the surface texture acquisition call for the presented
+    frame.
+- `queue_submit_call_ms`:
+  - CPU wall time inside the WGPU queue submit call for the presented frame.
+- `frame_present_call_ms`:
+  - CPU wall time inside `frame.present()` for the presented frame.
+- `present_call_ms`:
+  - legacy compatibility alias for `frame_present_call_ms` until all older
+    reports and consumers migrate to the explicit phase names.
 - `proof_overhead_ms`:
   - CPU/GPU/readback/reporting cost attributable to proof mode;
   - reported separately from `input_to_present_ms`.
@@ -1460,9 +1475,73 @@ native UX latency gates, and generic runtime/list/currentness work remain.
     CPU work;
   - add a generic surface-present coordinator with late swapchain acquisition,
     per-frame combined present-path metrics, and adaptive present-mode evidence;
-  - implement active/pending document/layout/render snapshots so click and
-    scroll can keep presenting the active retained frame while heavier generic
-    runtime/layout work catches up.
+ - implement active/pending document/layout/render snapshots so click and
+   scroll can keep presenting the active retained frame while heavier generic
+   runtime/layout work catches up.
+
+2026-07-01 explicit present-path timing semantics slice:
+
+- Native preview performance stats now expose the present path as explicit
+  phase telemetry:
+  - `surface_acquire_call_ms`;
+  - `queue_submit_call_ms`;
+  - `frame_present_call_ms`;
+  - `present_path_ms`;
+  - rolling `p50/p95/p99/max` summaries for each phase.
+- `present_call_ms` remains as a legacy compatibility alias for the
+  `frame.present()` call only. New code and reports should use
+  `present_path_ms` when discussing the full product present path.
+- Render-loop reports now include top-level aliases for
+  `surface_acquire_call_ms`, `queue_submit_call_ms`,
+  `frame_present_call_ms`, and `present_path_ms`, and the dev footer falls back
+  to `present_path_ms` before the legacy frame-present call when no
+  input-to-present sample exists.
+- Native report schema now requires the new present-path summary objects in
+  `preview_perf_stats`, so passing native reports cannot collapse surface
+  acquisition, queue submit, and frame present into one ambiguous number.
+- Scroll-speed reports now include the same present-path summary in
+  `product_path_ux_timing` and `frame_budget_split`, while leaving pass/fail
+  budget selection unchanged.
+- Fresh Cells scroll-speed report after this slice:
+  - `status=fail`;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_sample_count=4`;
+  - `product_path_input_to_present_ms_p95=23.963904000000184`;
+  - `ux_frame_budget_pass=false`;
+  - `wall_clock_frame_budget_pass=true`;
+  - `renderer_frame_budget_pass=true`;
+  - `renderer_cpu_frame_ms_p95=1.173273`;
+  - `preview_perf_surface_acquire_call_ms_p95=0.07087199999999999`;
+  - `preview_perf_queue_submit_call_ms_p95=0.346919`;
+  - `preview_perf_frame_present_call_ms_p95=26.837553`;
+  - `preview_perf_present_path_ms_p95=27.323849`;
+  - `measured_adapter_is_software=true`;
+  - blockers remain:
+    `native scroll-speed gate product-path input-to-present p95 is over target;
+    UX speed is not proven` and
+    `native scroll-speed gate ran on a software adapter; hardware-backed
+    real-window speed is not proven`.
+- Fresh verification:
+  - `cargo fmt --check`;
+  - `cargo test -q -p boon_native_app_window preview_perf_stats`;
+  - `cargo test -q -p boon_native_playground preview_perf`;
+  - `cargo test -q -p boon_report_schema native_gpu_schema`;
+  - `cargo test -q -p xtask product_path_input_to_present_timing_drives_scroll_budget_when_proven`;
+  - `cargo check -q -p xtask`;
+  - `cargo xtask verify-native-gpu-negative --report
+    target/reports/native-gpu/negative.json`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`;
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+    target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the
+    UX p95 and software-adapter blockers above;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-cells.json` passed;
+  - `git diff --check`.
+- This slice is measurement and schema hardening, not a performance completion
+  claim. The next implementation target is a generic surface-present
+  coordinator / retained active-frame presentation path that avoids treating
+  expensive frame-present blocking as normal interaction latency while keeping
+  proof identity and product-path metrics honest.
 
 ## Implementation Slices
 

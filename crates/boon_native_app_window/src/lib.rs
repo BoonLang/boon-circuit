@@ -822,9 +822,11 @@ pub struct NativeRenderLoopState {
     pub last_present_completed_elapsed_ms: Option<f64>,
     pub last_present_interval_ms: Option<f64>,
     pub last_frame_lateness_ms: Option<f64>,
+    pub last_surface_acquire_call_ms: Option<f64>,
     pub last_encoder_finish_ms: Option<f64>,
     pub last_queue_submit_call_ms: Option<f64>,
     pub last_present_call_ms: Option<f64>,
+    pub last_present_path_ms: Option<f64>,
     pub missed_frame_count: u64,
     pub telemetry_drop_count: u64,
     pub last_missed_frame_cause: Option<String>,
@@ -895,9 +897,11 @@ impl NativeRenderLoopState {
             last_present_completed_elapsed_ms: None,
             last_present_interval_ms: None,
             last_frame_lateness_ms: None,
+            last_surface_acquire_call_ms: None,
             last_encoder_finish_ms: None,
             last_queue_submit_call_ms: None,
             last_present_call_ms: None,
+            last_present_path_ms: None,
             missed_frame_count: 0,
             telemetry_drop_count: 0,
             last_missed_frame_cause: None,
@@ -1103,6 +1107,10 @@ impl NativeRenderLoopState {
         self.last_surface_acquired_elapsed_ms = Some(elapsed_ms);
     }
 
+    pub fn note_surface_acquire_call(&mut self, call_ms: f64) {
+        self.last_surface_acquire_call_ms = Some(call_ms);
+    }
+
     pub fn note_render_hook_completed(&mut self, elapsed_ms: f64) {
         self.last_render_hook_completed_elapsed_ms = Some(elapsed_ms);
     }
@@ -1146,6 +1154,11 @@ impl NativeRenderLoopState {
         self.last_encoder_finish_ms = Some(encoder_finish_ms);
         self.last_queue_submit_call_ms = Some(queue_submit_call_ms);
         self.last_present_call_ms = Some(present_call_ms);
+        self.last_present_path_ms = Some(
+            self.last_surface_acquire_call_ms.unwrap_or(0.0)
+                + queue_submit_call_ms
+                + present_call_ms,
+        );
     }
 
     pub fn note_render_target_kind(&mut self, render_target_kind: &'static str) {
@@ -1611,6 +1624,11 @@ pub struct AppWindowSurfaceProof {
 fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
     if capabilities
         .present_modes
+        .contains(&wgpu::PresentMode::Mailbox)
+    {
+        wgpu::PresentMode::Mailbox
+    } else if capabilities
+        .present_modes
         .contains(&wgpu::PresentMode::Immediate)
     {
         wgpu::PresentMode::Immediate
@@ -1619,11 +1637,6 @@ fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::P
         .contains(&wgpu::PresentMode::AutoNoVsync)
     {
         wgpu::PresentMode::AutoNoVsync
-    } else if capabilities
-        .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
-    {
-        wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo
     }
@@ -1826,6 +1839,9 @@ struct NativePreviewPerfAccumulator {
     render_hook_ms: VecDeque<f64>,
     layout_ms: VecDeque<f64>,
     present_call_ms: VecDeque<f64>,
+    surface_acquire_call_ms: VecDeque<f64>,
+    queue_submit_call_ms: VecDeque<f64>,
+    present_path_ms: VecDeque<f64>,
     input_to_present_ms: VecDeque<f64>,
     upload_bytes: VecDeque<f64>,
     draw_call_count: VecDeque<f64>,
@@ -1840,6 +1856,9 @@ impl Default for NativePreviewPerfAccumulator {
             render_hook_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             layout_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             present_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            surface_acquire_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            queue_submit_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            present_path_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             input_to_present_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             upload_bytes: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             draw_call_count: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
@@ -1856,6 +1875,9 @@ impl NativePreviewPerfAccumulator {
         render_hook_ms: Option<f64>,
         render_frame_metrics: Option<&NativeRenderFrameMetrics>,
         present_call_ms: Option<f64>,
+        surface_acquire_call_ms: Option<f64>,
+        queue_submit_call_ms: Option<f64>,
+        present_path_ms: Option<f64>,
         input_to_present_ms: Option<f64>,
         proof_overhead_ms: Option<f64>,
     ) {
@@ -1865,6 +1887,9 @@ impl NativePreviewPerfAccumulator {
             render_frame_metrics.and_then(|metrics| metrics.layout_ms),
         );
         push_perf_sample(&mut self.present_call_ms, present_call_ms);
+        push_perf_sample(&mut self.surface_acquire_call_ms, surface_acquire_call_ms);
+        push_perf_sample(&mut self.queue_submit_call_ms, queue_submit_call_ms);
+        push_perf_sample(&mut self.present_path_ms, present_path_ms);
         push_perf_sample(&mut self.input_to_present_ms, input_to_present_ms);
         push_perf_sample(
             &mut self.upload_bytes,
@@ -1901,6 +1926,18 @@ impl NativePreviewPerfAccumulator {
 
     fn present_call_summary(&self) -> NativePerfMetricSummary {
         metric_summary_from_samples(&self.present_call_ms)
+    }
+
+    fn surface_acquire_call_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.surface_acquire_call_ms)
+    }
+
+    fn queue_submit_call_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.queue_submit_call_ms)
+    }
+
+    fn present_path_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.present_path_ms)
     }
 
     fn input_to_present_summary(&self) -> NativePerfMetricSummary {
@@ -1940,10 +1977,18 @@ pub struct NativePreviewPerfStats {
     pub renders_per_second: f64,
     pub render_hook_ms: Option<f64>,
     pub present_call_ms: Option<f64>,
+    pub frame_present_call_ms: Option<f64>,
+    pub surface_acquire_call_ms: Option<f64>,
+    pub queue_submit_call_ms: Option<f64>,
+    pub present_path_ms: Option<f64>,
     pub input_to_present_ms: Option<f64>,
     pub render_hook_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub layout_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub present_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub frame_present_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub surface_acquire_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub queue_submit_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub present_path_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub input_to_present_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub upload_bytes_p50_p95_max: NativePerfMetricSummary,
     pub draw_call_count_p50_p95_max: NativePerfMetricSummary,
@@ -3646,6 +3691,7 @@ async fn run_surface_probe_inner(
             if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
                 consecutive_unsampled_input_resamples = 0;
             }
+            let surface_acquire_started = Instant::now();
             let Some(frame) = acquire_surface_texture_for_present(
                 &surface,
                 &device,
@@ -3657,6 +3703,7 @@ async fn run_surface_probe_inner(
             else {
                 continue;
             };
+            render_loop_state.note_surface_acquire_call(elapsed_ms(surface_acquire_started));
             render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -3679,6 +3726,7 @@ async fn run_surface_probe_inner(
             );
             frame
         } else {
+            let surface_acquire_started = Instant::now();
             let Some(frame) = acquire_surface_texture_for_present(
                 &surface,
                 &device,
@@ -3690,6 +3738,7 @@ async fn run_surface_probe_inner(
             else {
                 continue;
             };
+            render_loop_state.note_surface_acquire_call(elapsed_ms(surface_acquire_started));
             render_loop_state.note_surface_acquired(hold_started.elapsed().as_secs_f64() * 1000.0);
             let view = frame
                 .texture
@@ -4030,6 +4079,9 @@ async fn run_surface_probe_inner(
             render_loop_state.last_render_hook_completed_elapsed_ms,
         );
         let stats_present_call_ms = render_loop_state.last_present_call_ms;
+        let stats_surface_acquire_call_ms = render_loop_state.last_surface_acquire_call_ms;
+        let stats_queue_submit_call_ms = render_loop_state.last_queue_submit_call_ms;
+        let stats_present_path_ms = render_loop_state.last_present_path_ms;
         let stats_proof_mode = if last_interactive_readback_error.is_some() {
             "readback_error"
         } else if last_interactive_surface_readback_queued {
@@ -4051,6 +4103,9 @@ async fn run_surface_probe_inner(
             stats_render_hook_ms,
             render_loop_state.last_render_frame_metrics.as_ref(),
             stats_present_call_ms,
+            stats_surface_acquire_call_ms,
+            stats_queue_submit_call_ms,
+            stats_present_path_ms,
             stats_input_to_present_ms,
             None,
         );
@@ -4811,10 +4866,18 @@ fn native_preview_perf_stats_snapshot(
             state.last_render_hook_completed_elapsed_ms,
         ),
         present_call_ms: state.last_present_call_ms,
+        frame_present_call_ms: state.last_present_call_ms,
+        surface_acquire_call_ms: state.last_surface_acquire_call_ms,
+        queue_submit_call_ms: state.last_queue_submit_call_ms,
+        present_path_ms: state.last_present_path_ms,
         input_to_present_ms,
         render_hook_ms_p50_p95_p99_max: accumulator.render_hook_summary(),
         layout_ms_p50_p95_p99_max: accumulator.layout_summary(),
         present_call_ms_p50_p95_p99_max: accumulator.present_call_summary(),
+        frame_present_call_ms_p50_p95_p99_max: accumulator.present_call_summary(),
+        surface_acquire_call_ms_p50_p95_p99_max: accumulator.surface_acquire_call_summary(),
+        queue_submit_call_ms_p50_p95_p99_max: accumulator.queue_submit_call_summary(),
+        present_path_ms_p50_p95_p99_max: accumulator.present_path_summary(),
         input_to_present_ms_p50_p95_p99_max: accumulator.input_to_present_summary(),
         upload_bytes_p50_p95_max: accumulator.upload_bytes_summary(),
         draw_call_count_p50_p95_max: accumulator.draw_call_count_summary(),
@@ -5236,7 +5299,16 @@ fn write_render_loop_state_report(
         .map(|_| "async_latest_wins_atomic_replace")
         .unwrap_or("atomic_replace");
     let mut report_perf_accumulator = perf_accumulator.clone();
-    report_perf_accumulator.record(None, None, None, None, present_to_readback_report_ms);
+    report_perf_accumulator.record(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        present_to_readback_report_ms,
+    );
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
@@ -5450,6 +5522,10 @@ fn write_render_loop_state_report(
             serde_json::json!(state.last_encoder_finish_ms),
         );
         object.insert(
+            "last_surface_acquire_call_ms".to_owned(),
+            serde_json::json!(state.last_surface_acquire_call_ms),
+        );
+        object.insert(
             "last_queue_submit_call_ms".to_owned(),
             serde_json::json!(state.last_queue_submit_call_ms),
         );
@@ -5458,8 +5534,16 @@ fn write_render_loop_state_report(
             serde_json::json!(state.last_present_call_ms),
         );
         object.insert(
+            "last_present_path_ms".to_owned(),
+            serde_json::json!(state.last_present_path_ms),
+        );
+        object.insert(
             "encoder_finish_ms".to_owned(),
             serde_json::json!(state.last_encoder_finish_ms),
+        );
+        object.insert(
+            "surface_acquire_call_ms".to_owned(),
+            serde_json::json!(state.last_surface_acquire_call_ms),
         );
         object.insert(
             "queue_submit_call_ms".to_owned(),
@@ -5468,6 +5552,14 @@ fn write_render_loop_state_report(
         object.insert(
             "present_call_ms".to_owned(),
             serde_json::json!(state.last_present_call_ms),
+        );
+        object.insert(
+            "frame_present_call_ms".to_owned(),
+            serde_json::json!(state.last_present_call_ms),
+        );
+        object.insert(
+            "present_path_ms".to_owned(),
+            serde_json::json!(state.last_present_path_ms),
         );
         object.insert(
             "input_inline_resample_count".to_owned(),
@@ -6394,6 +6486,9 @@ mod tests {
             None,
             None,
             state.last_present_call_ms,
+            state.last_surface_acquire_call_ms,
+            state.last_queue_submit_call_ms,
+            state.last_present_path_ms,
             frame_input_to_present_ms,
             None,
         );
@@ -6471,7 +6566,16 @@ mod tests {
         };
         extras = extras.with_report_writer_stats(writer_stats);
         let mut perf_accumulator = NativePreviewPerfAccumulator::default();
-        perf_accumulator.record(None, None, state.last_present_call_ms, None, None);
+        perf_accumulator.record(
+            None,
+            None,
+            state.last_present_call_ms,
+            state.last_surface_acquire_call_ms,
+            state.last_queue_submit_call_ms,
+            state.last_present_path_ms,
+            None,
+            None,
+        );
         render_loop_report_snapshot(
             path,
             NativeWindowRole::Preview,
@@ -6873,9 +6977,10 @@ mod tests {
     fn preview_perf_stats_keep_proof_overhead_separate_from_ux_latency() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.note_surface_acquired(4.0);
+        state.note_surface_acquire_call(0.25);
         state.note_render_hook_completed(6.5);
         state.note_present_completed(12.0);
-        state.note_submit_phase_durations(0.2, 0.1, 1.4);
+        state.note_submit_phase_durations(0.25, 0.125, 1.5);
         state.mark_presented_with_content(2, 5);
         let render_metrics = NativeRenderFrameMetrics {
             layout_ms: Some(0.7),
@@ -6899,7 +7004,10 @@ mod tests {
         accumulator.record(
             Some(2.5),
             Some(&render_metrics),
-            Some(1.4),
+            Some(1.5),
+            state.last_surface_acquire_call_ms,
+            state.last_queue_submit_call_ms,
+            state.last_present_path_ms,
             Some(8.0),
             Some(24.0),
         );
@@ -6920,9 +7028,19 @@ mod tests {
         assert_eq!(stats.input_to_present_ms, Some(8.0));
         assert_eq!(stats.proof_overhead_ms, Some(24.0));
         assert_eq!(stats.render_hook_ms, Some(2.5));
-        assert_eq!(stats.present_call_ms, Some(1.4));
+        assert_eq!(stats.present_call_ms, Some(1.5));
+        assert_eq!(stats.frame_present_call_ms, Some(1.5));
+        assert_eq!(stats.surface_acquire_call_ms, Some(0.25));
+        assert_eq!(stats.queue_submit_call_ms, Some(0.125));
+        assert_eq!(stats.present_path_ms, Some(1.875));
         assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(8.0));
         assert_eq!(stats.render_hook_ms_p50_p95_p99_max.sample_count, 1);
+        assert_eq!(
+            stats.surface_acquire_call_ms_p50_p95_p99_max.p95,
+            Some(0.25)
+        );
+        assert_eq!(stats.queue_submit_call_ms_p50_p95_p99_max.p95, Some(0.125));
+        assert_eq!(stats.present_path_ms_p50_p95_p99_max.p95, Some(1.875));
         assert_eq!(stats.layout_ms_p50_p95_p99_max.p95, Some(0.7));
         assert_eq!(stats.upload_bytes_p50_p95_max.max, Some(4096.0));
         assert_eq!(stats.draw_call_count_p50_p95_max.max, Some(12.0));
@@ -6945,7 +7063,16 @@ mod tests {
             elapsed_delta_ms(raw_wake_elapsed_ms, state.last_present_completed_elapsed_ms);
         let accepted_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
         let mut accumulator = NativePreviewPerfAccumulator::default();
-        accumulator.record(None, None, None, accepted_input_to_present_ms, None);
+        accumulator.record(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            accepted_input_to_present_ms,
+            None,
+        );
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
@@ -7012,6 +7139,9 @@ mod tests {
                 Some(value as f64),
                 Some(&render_metrics),
                 Some((value * 2) as f64),
+                Some((value * 8) as f64),
+                Some((value * 9) as f64),
+                Some((value * 19) as f64),
                 Some((value * 3) as f64),
                 None,
             );
@@ -7025,6 +7155,9 @@ mod tests {
         assert_eq!(render.p50, Some(70.0));
         assert_eq!(render.max, Some(129.0));
         assert_eq!(input.max, Some(387.0));
+        assert_eq!(accumulator.surface_acquire_call_summary().max, Some(1032.0));
+        assert_eq!(accumulator.queue_submit_call_summary().max, Some(1161.0));
+        assert_eq!(accumulator.present_path_summary().max, Some(2451.0));
         assert_eq!(accumulator.layout_summary().max, Some(516.0));
         assert_eq!(accumulator.upload_bytes_summary().max, Some(645.0));
         assert_eq!(
@@ -7467,7 +7600,7 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_present_mode_prefers_non_vsync_modes_before_mailbox() {
+    fn low_latency_present_mode_prefers_mailbox_for_paced_native_ui() {
         let mut capabilities = wgpu::SurfaceCapabilities {
             formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
             present_modes: vec![
@@ -7481,7 +7614,7 @@ mod tests {
 
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Immediate
+            wgpu::PresentMode::Mailbox
         );
 
         capabilities.present_modes = vec![
@@ -7491,7 +7624,7 @@ mod tests {
         ];
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::AutoNoVsync
+            wgpu::PresentMode::Mailbox
         );
 
         capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
@@ -7504,6 +7637,12 @@ mod tests {
         assert_eq!(
             low_latency_present_mode(&capabilities),
             wgpu::PresentMode::AutoNoVsync
+        );
+
+        capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
+        assert_eq!(
+            low_latency_present_mode(&capabilities),
+            wgpu::PresentMode::Immediate
         );
 
         capabilities.present_modes = vec![wgpu::PresentMode::Fifo];

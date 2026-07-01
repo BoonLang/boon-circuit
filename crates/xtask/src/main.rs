@@ -48951,6 +48951,20 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "p99");
     let product_path_summary_input_to_present_max =
         preview_perf_summary_f64("input_to_present_ms_p50_p95_p99_max", "max");
+    let preview_perf_present_path_p50 =
+        preview_perf_summary_f64("present_path_ms_p50_p95_p99_max", "p50");
+    let preview_perf_present_path_p95 =
+        preview_perf_summary_f64("present_path_ms_p50_p95_p99_max", "p95");
+    let preview_perf_present_path_p99 =
+        preview_perf_summary_f64("present_path_ms_p50_p95_p99_max", "p99");
+    let preview_perf_present_path_max =
+        preview_perf_summary_f64("present_path_ms_p50_p95_p99_max", "max");
+    let preview_perf_surface_acquire_call_p95 =
+        preview_perf_summary_f64("surface_acquire_call_ms_p50_p95_p99_max", "p95");
+    let preview_perf_queue_submit_call_p95 =
+        preview_perf_summary_f64("queue_submit_call_ms_p50_p95_p99_max", "p95");
+    let preview_perf_frame_present_call_p95 =
+        preview_perf_summary_f64("frame_present_call_ms_p50_p95_p99_max", "p95");
     let product_path_frame_input_fallback = extra
         .get("frame_input_to_present_ms")
         .and_then(numeric_value_as_f64);
@@ -49342,6 +49356,13 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "max": product_path_input_to_present_max,
         "budget_ms": preview_frame_budget,
         "budget_pass": product_path_frame_budget_pass,
+        "present_path_ms_p50": preview_perf_present_path_p50,
+        "present_path_ms_p95": preview_perf_present_path_p95,
+        "present_path_ms_p99": preview_perf_present_path_p99,
+        "present_path_ms_max": preview_perf_present_path_max,
+        "surface_acquire_call_ms_p95": preview_perf_surface_acquire_call_p95,
+        "queue_submit_call_ms_p95": preview_perf_queue_submit_call_p95,
+        "frame_present_call_ms_p95": preview_perf_frame_present_call_p95,
         "proof_latency_excluded": true
     });
     extra["product_path_ux_timing_proven"] = json!(product_path_ux_timing_proven);
@@ -49395,10 +49416,17 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
     extra["present_blocking_ms_p95"] = json!(present_blocking_ms_p95);
+    extra["preview_perf_present_path_ms_p95"] = preview_perf_present_path_p95
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
     extra["frame_budget_split"] = json!({
         "renderer_cpu_frame_ms_p95": extra["renderer_cpu_frame_ms_p95"].clone(),
         "cpu_submit_ready_ms_p95": extra["cpu_submit_ready_ms_p95"].clone(),
         "present_blocking_ms_p95": present_blocking_ms_p95,
+        "preview_perf_present_path_ms_p95": extra["preview_perf_present_path_ms_p95"].clone(),
+        "preview_perf_surface_acquire_call_ms_p95": preview_perf_surface_acquire_call_p95,
+        "preview_perf_queue_submit_call_ms_p95": preview_perf_queue_submit_call_p95,
+        "preview_perf_frame_present_call_ms_p95": preview_perf_frame_present_call_p95,
         "wall_clock_frame_ms_p95": preview_frame_ms,
         "ux_frame_ms_p95": speed_budget_frame_ms,
         "ux_frame_budget_pass": ux_frame_budget_pass,

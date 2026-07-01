@@ -32277,15 +32277,13 @@ impl GenericScheduledRuntime {
         ));
         let read_key_prepare_ms = runtime_elapsed_ms(read_key_prepare_started);
 
-        let lookup_cache_entry_count = self.indexed_lookup_cache.text.len();
         let indexed_lookup_started = Instant::now();
-        let lookup_storage_started = Instant::now();
-        let (indices, probe) = self.storage.find_list_indices_by_textlike_indexed(
-            &projection.list,
-            &find_field,
-            &selected,
-        )?;
-        let lookup_storage_ms = runtime_elapsed_ms(lookup_storage_started);
+        let (indices, probe, lookup_profile) = self
+            .cached_find_list_indices_by_textlike_indexed_profiled(
+                &projection.list,
+                &find_field,
+                &selected,
+            )?;
         let indexed_lookup_ms = runtime_elapsed_ms(indexed_lookup_started);
         let source_index = indices.and_then(|indices| indices.into_iter().next());
         if !probe.used_index {
@@ -32512,9 +32510,9 @@ impl GenericScheduledRuntime {
                 selector_value_ms,
                 read_key_prepare_ms,
                 indexed_lookup_ms,
-                lookup_cache_check_ms: 0.0,
-                lookup_storage_ms,
-                lookup_cache_insert_ms: 0.0,
+                lookup_cache_check_ms: lookup_profile.cache_lookup_ms,
+                lookup_storage_ms: lookup_profile.storage_lookup_ms,
+                lookup_cache_insert_ms: lookup_profile.cache_insert_ms,
                 source_identity_ms: list_values_ms,
                 row_snapshot_ms: row_materialize_ms,
                 source_column_reads_ms,
@@ -32538,8 +32536,8 @@ impl GenericScheduledRuntime {
                 rebind_ms: 0.0,
                 used_index: probe.used_index,
                 lookup_index_rebuilt: probe.index_rebuilt,
-                lookup_cache_hit: false,
-                lookup_cache_entry_count,
+                lookup_cache_hit: lookup_profile.cache_hit,
+                lookup_cache_entry_count: lookup_profile.cache_entry_count,
                 lookup_candidate_count: probe.candidate_count,
                 source_index_found: source_index.is_some(),
                 output_row_count: rows.len(),
@@ -33294,7 +33292,16 @@ impl GenericScheduledRuntime {
                 changed_field_count = changed_field_count.saturating_add(changed_fields.len());
             }
             for field in changed_fields {
-                insert_changed_list_field_read_keys(&mut reads, list, index, &field);
+                let previous_value = previous.columns.owned_value(&field);
+                let current_value = current.columns.owned_value(&field);
+                insert_changed_list_field_read_keys_for_values(
+                    &mut reads,
+                    list,
+                    index,
+                    &field,
+                    previous_value.as_ref(),
+                    current_value.as_ref(),
+                );
             }
         }
         RootListViewChangedReads {
@@ -69519,6 +69526,192 @@ FUNCTION new_entry(entry) {
         assert_eq!(
             summary["store"]["visible_rows"][1]["entries"][0]["address"],
             "C0"
+        );
+    }
+
+    #[test]
+    fn root_list_find_projection_uses_cached_exact_text_lookup_for_generic_records() {
+        let source = r#"
+records:
+    LIST {
+        [key: TEXT { row-1 }, label: TEXT { first }]
+        [key: TEXT { row-2 }, label: TEXT { second }]
+        [key: TEXT { row-2 }, label: TEXT { duplicate }]
+        [key: TEXT { row-3 }, label: TEXT { third }]
+    }
+    |> List/map(record, new: new_record(record: record))
+
+store: [
+    sources: [
+        chosen: SOURCE
+    ]
+    chosen:
+        TEXT { row-1 } |> HOLD chosen {
+            LATEST {
+                sources.chosen.text
+            }
+        }
+    selected_record:
+        List/find(records, field: key, value: chosen)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Records }))
+
+FUNCTION new_record(record) {
+    [
+        key: record.key
+        label: record.label
+    ]
+}
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("generic-root-find-projection-cache", source).unwrap();
+        assert_eq!(
+            runtime.state_summary()["store"]["selected_record"]["key"],
+            "row-1"
+        );
+
+        runtime
+            .apply_source_event_turn(LiveSourceEvent {
+                source: "store.sources.chosen".to_owned(),
+                text: Some("row-2".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("selection source should refresh the root List/find projection");
+
+        let result = {
+            let generic = runtime.runtime.generic.as_mut().unwrap();
+            generic.reset_list_scan_counters();
+            generic
+                .cached_find_list_indices_by_textlike_indexed("records", "key", "row-2")
+                .expect("test should seed the generic exact lookup cache");
+            let field = generic
+                .generic_derived
+                .root_field_plan("store.selected_record")
+                .cloned()
+                .expect("root List/find projection should have a generic derived field plan");
+            generic
+                .materialize_root_list_view_field(&field, &BTreeSet::new())
+                .expect("root List/find projection should materialize directly")
+        };
+        let summary = runtime.state_summary();
+        assert_eq!(summary["store"]["selected_record"]["key"], "row-2");
+        assert_eq!(summary["store"]["selected_record"]["label"], "second");
+        let profile = result
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.direct_find_profile.as_ref())
+            .expect("root List/find projection should expose a direct-find profile");
+        assert!(
+            profile.used_index,
+            "direct projection should use the text index"
+        );
+        assert!(
+            profile.lookup_cache_hit,
+            "direct projection should route through the shared exact lookup cache: {profile:?}"
+        );
+        assert_eq!(
+            profile.lookup_candidate_count, 0,
+            "a cache hit should not visit lookup candidates"
+        );
+        assert_eq!(
+            runtime
+                .runtime
+                .generic
+                .as_ref()
+                .unwrap()
+                .list_scan_counters
+                .list_find_rows_scanned,
+            0,
+            "root List/find projection must not scan rows on indexed exact lookup"
+        );
+
+        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let reads = generic
+            .generic_derived_state
+            .root_reads_by_field
+            .get("store.selected_record")
+            .expect("root projection should record currentness reads");
+        assert!(
+            reads.contains(&list_lookup_text_read_key("records", "key", "row-2")),
+            "root projection should depend on the exact lookup value; reads={reads:?}"
+        );
+        assert!(
+            !reads.contains(&list_column_read_key("records", "key")),
+            "indexed root projection should not depend on the whole lookup column; reads={reads:?}"
+        );
+    }
+
+    #[test]
+    fn root_list_view_changed_reads_emit_exact_lookup_values_for_generic_text_fields() {
+        let source = r#"
+records:
+    LIST {
+        [key: TEXT { row-1 }, label: TEXT { first }]
+    }
+    |> List/map(record, new: record)
+
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { ready } |> HOLD noop { LATEST {} }
+    selected:
+        records
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Records }))
+"#;
+        let runtime =
+            LiveRuntime::from_source("generic-root-list-diff-exact-lookup", source).unwrap();
+        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let mut previous = RuntimeRowSnapshot::default();
+        previous
+            .columns
+            .insert_value("key".to_owned(), FieldValue::Text("row-1".to_owned()));
+        previous
+            .columns
+            .insert_value("label".to_owned(), FieldValue::Text("same".to_owned()));
+        let mut current = RuntimeRowSnapshot::default();
+        current
+            .columns
+            .insert_value("key".to_owned(), FieldValue::Text("row-3".to_owned()));
+        current
+            .columns
+            .insert_value("label".to_owned(), FieldValue::Text("same".to_owned()));
+
+        let changed = generic.root_list_view_changed_reads(
+            "store.selected",
+            "records",
+            &[previous],
+            &[current],
+        );
+        assert!(!changed.broad_fallback);
+        assert_eq!(changed.changed_row_count, 1);
+        assert_eq!(changed.changed_field_count, 1);
+        assert!(
+            changed
+                .changed_reads
+                .contains(&list_lookup_text_read_key("records", "key", "row-1")),
+            "old lookup values must invalidate exact cached/projection reads; reads={:?}",
+            changed.changed_reads
+        );
+        assert!(
+            changed
+                .changed_reads
+                .contains(&list_lookup_text_read_key("records", "key", "row-3")),
+            "new lookup values must invalidate exact cached/projection reads; reads={:?}",
+            changed.changed_reads
+        );
+        assert!(
+            !cache_entry_invalidated_by_reads(
+                &BTreeSet::from([list_lookup_text_read_key("records", "key", "row-2")]),
+                &BTreeMap::new(),
+                &changed.changed_reads,
+                &BTreeMap::new(),
+            ),
+            "an unrelated exact lookup value should stay current"
         );
     }
 

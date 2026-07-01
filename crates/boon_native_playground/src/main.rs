@@ -39642,6 +39642,13 @@ fn preview_try_apply_simple_source_click_input(
         events,
     )?;
     let live_events_ms = elapsed_ms(live_events_started);
+    let retained_selection_patch = post_turn_state_summary.as_ref().and_then(|summary| {
+        preview_retained_selection_patch_from_shared_snapshot(
+            shared_render_state,
+            summary,
+            &previous_selected_nodes,
+        )
+    });
     let mut bound_sync_nodes = BTreeSet::new();
     bound_sync_nodes.insert(node.clone());
     if let Some(previous_focused_node) = previous_focused_node {
@@ -39651,6 +39658,11 @@ fn preview_try_apply_simple_source_click_input(
         bound_sync_nodes.insert(focused_node.clone());
     }
     bound_sync_nodes.extend(previous_selected_nodes.iter().cloned());
+    if let Some(selection_patch) = retained_selection_patch.as_ref() {
+        selected_overlay_sync_nodes.extend(selection_patch.previous_nodes.iter().cloned());
+        selected_overlay_sync_nodes.extend(selection_patch.current_nodes.iter().cloned());
+        bound_sync_nodes.extend(selection_patch.sync_nodes.iter().cloned());
+    }
     if let Some(previous_selected_address) = previous_selected_address.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
@@ -39731,6 +39743,11 @@ fn preview_try_apply_simple_source_click_input(
         }
         input_state.focused_address = Some(selected_address.to_owned());
         input_state.selected_overlay_address = Some(selected_address.to_owned());
+    }
+    if let Some(selection_patch) = retained_selection_patch.as_ref()
+        && !selection_patch.current_nodes.is_empty()
+    {
+        input_state.selected_overlay_nodes = selection_patch.current_nodes.clone();
     }
     let selected_overlay_patch_ms = elapsed_ms(selected_overlay_patch_started);
     let selection_focus_overlay_state_started = Instant::now();
@@ -43341,6 +43358,75 @@ fn extend_target_nodes_for_binding_dependencies(
         }) {
             target_nodes.insert(node.clone());
         }
+    }
+    for (node, paths) in &snapshot.data_binding_targets.text_binding_paths_by_node {
+        if paths.iter().any(|path| {
+            dependency_paths
+                .iter()
+                .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        }) {
+            target_nodes.insert(node.clone());
+        }
+    }
+    for (node, bindings) in &snapshot
+        .data_binding_targets
+        .source_intent_binding_targets_by_node
+    {
+        if bindings.iter().any(|(path, _)| {
+            dependency_paths
+                .iter()
+                .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        }) {
+            target_nodes.insert(node.clone());
+        }
+    }
+}
+
+fn extend_target_nodes_for_non_static_binding_dependencies(
+    snapshot: &DocumentRenderSnapshot,
+    target_nodes: &mut BTreeSet<String>,
+) {
+    let mut dependency_paths = BTreeSet::new();
+    for node in target_nodes.iter() {
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                dependency_paths.insert(path.clone());
+            }
+        }
+        if let Some(paths) = snapshot
+            .data_binding_targets
+            .text_binding_paths_by_node
+            .get(node)
+        {
+            for path in paths {
+                dependency_paths.insert(path.clone());
+            }
+        }
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .source_intent_binding_targets_by_node
+            .get(node)
+        {
+            for (path, _) in bindings {
+                dependency_paths.insert(path.clone());
+            }
+        }
+    }
+    if dependency_paths.is_empty() {
+        return;
+    }
+    for (path, targets) in snapshot.data_binding_targets.non_static_targets.iter() {
+        if !dependency_paths
+            .iter()
+            .any(|dependency| document_data_paths_overlap_normalized(dependency, path))
+        {
+            continue;
+        }
+        target_nodes.extend(targets.iter().map(|target| target.node.0.clone()));
     }
     for (node, paths) in &snapshot.data_binding_targets.text_binding_paths_by_node {
         if paths.iter().any(|path| {
@@ -56166,6 +56252,108 @@ fn document_snapshot_data_binding_targets_for_patch<'a>(
         return matched;
     }
     document_snapshot_data_binding_targets(snapshot, path)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PreviewRetainedSelectionPatch {
+    previous_nodes: BTreeSet<String>,
+    current_nodes: BTreeSet<String>,
+    sync_nodes: BTreeSet<String>,
+}
+
+impl PreviewRetainedSelectionPatch {
+    fn is_empty(&self) -> bool {
+        self.previous_nodes.is_empty()
+            && self.current_nodes.is_empty()
+            && self.sync_nodes.is_empty()
+    }
+}
+
+fn preview_retained_selection_patch_from_state_summary(
+    snapshot: &DocumentRenderSnapshot,
+    previous_state_summary: Option<&Value>,
+    state_summary: &Value,
+    fallback_previous_nodes: &BTreeSet<String>,
+) -> PreviewRetainedSelectionPatch {
+    let mut patch = PreviewRetainedSelectionPatch::default();
+    for path in snapshot.data_binding_targets.static_equality_targets.keys() {
+        let Some(next_value) = state_summary_value_for_data_path(state_summary, path)
+            .or_else(|| snapshot.runtime_document_state_values.get(path))
+        else {
+            continue;
+        };
+        let previous_value = previous_state_summary
+            .and_then(|summary| state_summary_value_for_data_path(summary, path))
+            .or_else(|| snapshot.runtime_document_state_values.get(path));
+        if previous_value.is_some_and(|previous| json_values_equal(previous, next_value)) {
+            continue;
+        }
+        let targets = document_snapshot_data_binding_targets_for_patch(
+            snapshot,
+            path,
+            previous_state_summary,
+            next_value,
+        );
+        if targets.is_empty() {
+            continue;
+        }
+        patch
+            .sync_nodes
+            .extend(targets.iter().map(|target| target.node.0.clone()));
+        let Some(static_targets_by_value) = snapshot
+            .data_binding_targets
+            .static_equality_targets
+            .get(path)
+        else {
+            continue;
+        };
+        if let Some(previous_value) = previous_value
+            && let Ok(previous_key) = document_static_equality_value_key(previous_value)
+            && let Some(targets) = static_targets_by_value.get(&previous_key)
+        {
+            patch
+                .previous_nodes
+                .extend(targets.iter().map(|target| target.node.0.clone()));
+        }
+        if let Ok(next_key) = document_static_equality_value_key(next_value)
+            && let Some(targets) = static_targets_by_value.get(&next_key)
+        {
+            patch
+                .current_nodes
+                .extend(targets.iter().map(|target| target.node.0.clone()));
+        }
+    }
+    if !patch.previous_nodes.is_empty() || !patch.current_nodes.is_empty() {
+        patch
+            .previous_nodes
+            .extend(fallback_previous_nodes.iter().cloned());
+        patch
+            .sync_nodes
+            .extend(patch.previous_nodes.iter().cloned());
+        patch.sync_nodes.extend(patch.current_nodes.iter().cloned());
+        extend_target_nodes_for_non_static_binding_dependencies(snapshot, &mut patch.sync_nodes);
+    }
+    patch
+}
+
+fn preview_retained_selection_patch_from_shared_snapshot(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    state_summary: &Value,
+    fallback_previous_nodes: &BTreeSet<String>,
+) -> Option<PreviewRetainedSelectionPatch> {
+    let shared = shared_render_state.lock().ok()?;
+    let layout_hash = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)?;
+    let snapshot = cached_document_render_snapshot(layout_hash)?;
+    let patch = preview_retained_selection_patch_from_state_summary(
+        &snapshot,
+        None,
+        state_summary,
+        fallback_previous_nodes,
+    );
+    (!patch.is_empty()).then_some(patch)
 }
 
 fn document_snapshot_data_binding_targets_slow<'a>(
@@ -83084,6 +83272,101 @@ document:
         assert!(
             nodes.contains("formula-input"),
             "targeted retained sync must include controls whose source identity follows the selected cell"
+        );
+    }
+
+    #[test]
+    fn retained_selection_patch_uses_generic_static_equality_bindings() {
+        let mut data_binding_targets = BTreeMap::new();
+        data_binding_targets.insert(
+            "store.active_item".to_owned(),
+            vec![
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("item-alpha".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("alpha")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("item-beta".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("beta")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("item-gamma".to_owned()),
+                    attr: document_eq_static_binding_attr("selected", &json!("gamma")).unwrap(),
+                },
+                DocumentDataBindingTarget {
+                    node: boon_document_model::DocumentNodeId("detail-input".to_owned()),
+                    attr: "__source_intent:item".to_owned(),
+                },
+            ],
+        );
+        data_binding_targets.insert(
+            "store.active_item.label".to_owned(),
+            vec![DocumentDataBindingTarget {
+                node: boon_document_model::DocumentNodeId("detail-input".to_owned()),
+                attr: "text".to_owned(),
+            }],
+        );
+        let document_frame = boon_document_model::DocumentFrame::empty("root");
+        let derived_indexes = document_derived_indexes_for_frame(&document_frame).unwrap();
+        let layout_frame = boon_document::LayoutFrame {
+            display_list: Vec::new(),
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree { node_count: 0 },
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let retained_layout_cache = retained_layout_cache_for_document_layout(
+            &document_frame,
+            &derived_indexes,
+            &layout_frame,
+        )
+        .unwrap();
+        let runtime_document_state_values =
+            BTreeMap::from([("store.active_item".to_owned(), json!("alpha"))]);
+        let snapshot = DocumentRenderSnapshot {
+            document_frame,
+            runtime_document_state_values,
+            derived_indexes,
+            layout_frame: Arc::new(layout_frame),
+            display_items_by_node: BTreeMap::new(),
+            retained_layout_cache,
+            structural_data_reads: BTreeSet::new(),
+            structural_data_read_aliases: Vec::new(),
+            source_intents: Vec::new(),
+            data_binding_targets: Arc::new(data_binding_targets.into()),
+            hit_route_static_cache_key: None,
+        };
+        let state_summary = json!({
+            "store": {
+                "active_item": "beta"
+            }
+        });
+        let patch = preview_retained_selection_patch_from_state_summary(
+            &snapshot,
+            None,
+            &state_summary,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            patch.previous_nodes,
+            BTreeSet::from(["item-alpha".to_owned()])
+        );
+        assert_eq!(
+            patch.current_nodes,
+            BTreeSet::from(["item-beta".to_owned()])
+        );
+        assert!(
+            patch.sync_nodes.contains("item-alpha")
+                && patch.sync_nodes.contains("item-beta")
+                && patch.sync_nodes.contains("detail-input"),
+            "static selection patch should include old/new style nodes and dependent controls; patch={patch:?}"
+        );
+        assert!(
+            !patch.sync_nodes.contains("item-gamma"),
+            "unrelated static equality values should not be patched"
         );
     }
 

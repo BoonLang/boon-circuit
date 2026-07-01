@@ -865,6 +865,93 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   retained selection/focus genericization, and generic runtime/list/currentness
   work.
 
+2026-07-01 generic root `List/find` cache/currentness slice:
+
+- The root list-view projection path for generic `List/find(list, field, value)`
+  now uses the shared profiled exact text lookup cache instead of bypassing it
+  with a direct storage lookup. Direct-find profiles now report cache lookup
+  time, storage lookup time, cache insert time, cache-hit status, and cache
+  entry count from the same generic cache used by ordinary `List/find`.
+- Root list-view row diffs now emit exact old and new text lookup read keys for
+  changed textlike fields. A row changing from one key value to another
+  invalidates projections/caches for those two lookup values, while unrelated
+  exact lookup values can remain current.
+- Added non-Cells runtime fixtures with arbitrary record/key names proving:
+  - root `List/find` projection uses the exact text lookup cache and reports a
+    cache hit when seeded;
+  - root `List/find` projection keeps zero row scans on indexed exact lookup;
+  - root list-view changed reads include old/new lookup values without
+    invalidating unrelated exact lookups.
+- Focused verification passed:
+  - `cargo test -q -p boon_runtime root_list_find_projection_uses_cached_exact_text_lookup_for_generic_records`
+  - `cargo test -q -p boon_runtime root_list_view_changed_reads_emit_exact_lookup_values_for_generic_text_fields`
+  - `cargo test -q -p boon_runtime list_index_find`
+  - `cargo test -q -p boon_runtime exact_list_lookup_invalidation_tracks_old_and_new_text_values`
+  - `cargo test -q -p boon_runtime indexed_lookup_cache_invalidates_only_changed_list_field`
+  - `cargo test -q -p boon_runtime root_currentness_barrier`
+  - `cargo test -q -p boon_runtime root_list_view_prevalidated_clean_hit_still_refreshes_deferred_dirty_root`
+  - `cargo test -q -p boon_ir indexed_derived_startup_recompute_is_ir_semantic_not_path_heuristic`
+  - `cargo check -q -p boon_runtime`
+  - `cargo fmt --check`
+- This does not complete the full runtime plan. Remaining generic runtime work
+  still includes formula dependency tracking/fanout, range invalidation, startup
+  batch initialization, demand-current audit for all selected/render reads, and
+  broad cache invalidation cleanup outside this root list-view path.
+
+2026-07-01 retained overlay genericity review:
+
+- A read-only subagent review confirmed that the retained selection/focus patch
+  path is still address-shaped in native playground production code. The next
+  visual/click slice should replace address-string overlay state with generic
+  selected node sets derived from data-binding snapshots and source-intent
+  dependencies.
+- Proposed next implementation order:
+  - add generic non-address overlay tests first;
+  - add a data-binding-based retained selection patch collector;
+  - replace the simple-click retained patch block with generic selected-node
+    patch state;
+  - replace retained frame/render-scene address helpers with node-set helpers;
+  - move formula-bar proxy text refresh through bound text-input/source-intent
+    sync paths;
+  - update the focus-only host route last.
+- This is recorded as the next production no-hacks blocker. It is not resolved
+  by the root `List/find` runtime slice above.
+
+2026-07-01 generic retained selection pre-pass slice:
+
+- Added a generic `PreviewRetainedSelectionPatch` collector for retained
+  selection/focus work. It compares changed static-equality bindings in the
+  current post-turn state summary against the render snapshot's previous
+  runtime document values, then returns:
+  - previous selected/static-equality nodes;
+  - current selected/static-equality nodes;
+  - retained bound-sync nodes needed to patch style, text, and source-intent
+    bindings.
+- The collector is data-binding driven and has a non-address fixture using
+  `store.active_item` with arbitrary item nodes. It does not branch on Cells,
+  source paths, address fields, or fixture values.
+- The simple source-click path now asks this collector for changed
+  static-equality nodes after applying live events. Those nodes are fed into
+  the existing retained bound-sync path before the older address-shaped fallback
+  patcher runs. If the generic bound-sync updates the selected style nodes, the
+  old fallback is skipped by the existing retained-sync guard.
+- A narrower non-static dependency extender was added for this path so generic
+  sync can include bound text/source-intent controls without pulling every
+  static-equality alternative for the same data path into the hot patch set.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground retained_selection_patch_uses_generic_static_equality_bindings`
+  - `cargo test -q -p boon_native_playground static_equality_patch_lookup_uses_old_and_new_value_index`
+  - `cargo test -q -p boon_native_playground targeted_bound_sync_expands_to_selection_dependent_formula_bar`
+  - `cargo test -q -p boon_native_playground cells_click_selection_updates_formula_bar_and_selected_style`
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`
+  - `cargo check -q -p boon_native_playground`
+- This is a transition slice, not the full overlay cleanup. Remaining work
+  still includes replacing `PreviewFocusOverlayState` address fields with
+  selected node sets, replacing retained frame/render-scene address helpers,
+  removing `store.selected_address` text fallback patching from production, and
+  updating the focus-only host route to avoid injecting selection identity
+  through address-specific code.
+
 ## Implementation Slices
 
 1. Terminology and schema:

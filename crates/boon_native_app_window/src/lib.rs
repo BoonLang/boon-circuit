@@ -1810,9 +1810,9 @@ pub struct AppWindowSurfaceProof {
 fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
     if capabilities
         .present_modes
-        .contains(&wgpu::PresentMode::Immediate)
+        .contains(&wgpu::PresentMode::Mailbox)
     {
-        wgpu::PresentMode::Immediate
+        wgpu::PresentMode::Mailbox
     } else if capabilities
         .present_modes
         .contains(&wgpu::PresentMode::AutoNoVsync)
@@ -1820,12 +1820,43 @@ fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::P
         wgpu::PresentMode::AutoNoVsync
     } else if capabilities
         .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
+        .contains(&wgpu::PresentMode::Immediate)
     {
-        wgpu::PresentMode::Mailbox
+        wgpu::PresentMode::Immediate
     } else {
         wgpu::PresentMode::Fifo
     }
+}
+
+fn present_mode_from_name(name: &str) -> Option<wgpu::PresentMode> {
+    let normalized = name
+        .trim()
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match normalized.as_str() {
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "fiforelaxed" => Some(wgpu::PresentMode::FifoRelaxed),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        "autovsync" => Some(wgpu::PresentMode::AutoVsync),
+        "autonovsync" => Some(wgpu::PresentMode::AutoNoVsync),
+        _ => None,
+    }
+}
+
+fn configured_low_latency_present_mode(
+    capabilities: &wgpu::SurfaceCapabilities,
+    requested: Option<&str>,
+) -> wgpu::PresentMode {
+    if let Some(mode) = requested
+        .and_then(present_mode_from_name)
+        .filter(|mode| capabilities.present_modes.contains(mode))
+    {
+        return mode;
+    }
+    low_latency_present_mode(capabilities)
 }
 
 fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) -> u32 {
@@ -2632,7 +2663,9 @@ async fn run_surface_probe_inner(
     {
         config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
     }
-    config.present_mode = low_latency_present_mode(&capabilities);
+    let requested_present_mode = std::env::var("BOON_NATIVE_PRESENT_MODE").ok();
+    config.present_mode =
+        configured_low_latency_present_mode(&capabilities, requested_present_mode.as_deref());
     config.desired_maximum_frame_latency =
         interactive_desired_maximum_frame_latency(config.present_mode);
     let surface_copy_to_present_supported =
@@ -8075,7 +8108,7 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_present_mode_prefers_app_paced_no_vsync_when_available() {
+    fn low_latency_present_mode_prefers_mailbox_when_available() {
         let mut capabilities = wgpu::SurfaceCapabilities {
             formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
             present_modes: vec![
@@ -8089,7 +8122,7 @@ mod tests {
 
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Immediate
+            wgpu::PresentMode::Mailbox
         );
 
         capabilities.present_modes = vec![
@@ -8099,7 +8132,7 @@ mod tests {
         ];
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::AutoNoVsync
+            wgpu::PresentMode::Mailbox
         );
 
         capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
@@ -8124,6 +8157,43 @@ mod tests {
         assert_eq!(
             low_latency_present_mode(&capabilities),
             wgpu::PresentMode::Fifo
+        );
+    }
+
+    #[test]
+    fn configured_present_mode_honors_supported_override() {
+        let capabilities = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![
+                wgpu::PresentMode::Fifo,
+                wgpu::PresentMode::Immediate,
+                wgpu::PresentMode::Mailbox,
+            ],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        };
+
+        assert_eq!(
+            configured_low_latency_present_mode(&capabilities, Some("mailbox")),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            configured_low_latency_present_mode(&capabilities, Some("fifo-relaxed")),
+            wgpu::PresentMode::Mailbox,
+            "unsupported overrides fall back to the normal low-latency policy"
+        );
+        assert_eq!(
+            configured_low_latency_present_mode(&capabilities, Some("not-a-mode")),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            configured_low_latency_present_mode(&capabilities, None),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            configured_low_latency_present_mode(&capabilities, Some("immediate")),
+            wgpu::PresentMode::Immediate,
+            "supported overrides remain available for diagnostics"
         );
     }
 

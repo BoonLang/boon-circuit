@@ -55233,6 +55233,9 @@ fn verify_native_cells_interaction_speed(
 fn verify_native_cells_visible_click_e2e(
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(report) = report_arg(args) {
+        let _ = std::fs::remove_file(report);
+    }
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let profile = value_arg(args, "--profile").unwrap_or_else(|| "release".to_owned());
@@ -57328,6 +57331,11 @@ struct CellsVisibleClickTarget {
     expected_formula: String,
 }
 
+fn cells_visible_click_preview_hold_ms(target_count: usize) -> u64 {
+    let sample_budget_ms = (target_count as u64).saturating_mul(5_000);
+    90_000_u64.max(sample_budget_ms.saturating_add(30_000))
+}
+
 fn run_isolated_weston_cells_visible_click_e2e(
     binary: &Path,
     click_targets: &[CellsVisibleClickTarget],
@@ -57396,6 +57404,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
     let preview_loop_report = artifact_dir.join("preview-loop.json");
     let preview_stdout_path = artifact_dir.join("preview.stdout.txt");
     let preview_stderr_path = artifact_dir.join("preview.stderr.txt");
+    let preview_hold_ms = cells_visible_click_preview_hold_ms(click_targets.len());
+    let preview_hold_ms_arg = preview_hold_ms.to_string();
     let calibration_driver_stdout_path =
         artifact_dir.join("weston-test-driver-calibration-click.json");
     let calibration_driver_stderr_path =
@@ -57466,7 +57476,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 .to_str()
                 .ok_or("preview report path is not UTF-8")?,
             "--hold-ms",
-            "30000",
+            &preview_hold_ms_arg,
             "--title-token",
             &title_token,
             "--warmup-frame-count",
@@ -57628,6 +57638,35 @@ fn run_isolated_weston_cells_visible_click_e2e(
         .and_then(numeric_value_as_f64)
         .unwrap_or(NATIVE_APP_WINDOW_INITIAL_Y);
     for (index, (target, driver_target)) in resolved_targets.iter().enumerate() {
+        if let Some(exit_status) = preview.try_wait()? {
+            terminate_child_process(&mut weston);
+            return Ok(json!({
+                "status": "fail",
+                "reason": "preview exited before all visible-click samples completed",
+                "failure_category": "preview_lifecycle",
+                "preview_exit_status": exit_status.to_string(),
+                "preview_exit_code": exit_status.code(),
+                "preview_exit_success": exit_status.success(),
+                "completed_click_count": index,
+                "target_count": resolved_targets.len(),
+                "preview_hold_ms": preview_hold_ms,
+                "artifact_dir": artifact_dir,
+                "preview_report": preview_report,
+                "preview_loop_report": preview_loop_report,
+                "layout_probe_report": layout_probe_report,
+                "weston_log_path": weston_log_path,
+                "preview_stdout": preview_stdout_path,
+                "preview_stderr": preview_stderr_path,
+                "artifact_paths": [
+                    layout_probe_report,
+                    preview_report,
+                    preview_loop_report,
+                    weston_log_path,
+                    preview_stdout_path,
+                    preview_stderr_path
+                ]
+            }));
+        }
         let driver_stdout_path =
             artifact_dir.join(format!("weston-test-driver-target-click-{index}.json"));
         let driver_stderr_path = artifact_dir.join(format!(
@@ -83702,6 +83741,13 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("legacy_selection_fallback_used")
         );
+    }
+
+    #[test]
+    fn cells_visible_click_preview_hold_scales_with_target_count() {
+        assert_eq!(cells_visible_click_preview_hold_ms(0), 90_000);
+        assert_eq!(cells_visible_click_preview_hold_ms(4), 90_000);
+        assert_eq!(cells_visible_click_preview_hold_ms(64), 350_000);
     }
 
     #[test]

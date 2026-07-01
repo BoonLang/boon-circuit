@@ -136,6 +136,8 @@ pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub typed_fields: Vec<SourcePayloadDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_lookup_field: Option<String>,
     pub address_lookup_field: Option<String>,
 }
 

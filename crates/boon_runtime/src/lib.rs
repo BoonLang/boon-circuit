@@ -517,6 +517,30 @@ impl<'a> GenericSourceEvent<'a> {
     }
 }
 
+fn generic_source_event_payload_value<'a>(
+    event: &GenericSourceEvent<'a>,
+    field: &str,
+) -> Option<&'a str> {
+    source_payload_value(
+        field,
+        event.key,
+        event.text,
+        event.address,
+        &event.payload,
+        event.pointer_x,
+        event.pointer_y,
+        event.pointer_width,
+        event.pointer_height,
+    )
+}
+
+fn generic_source_event_row_lookup_value<'a>(
+    event: &GenericSourceEvent<'a>,
+    row_lookup_field: &str,
+) -> Option<&'a str> {
+    generic_source_event_payload_value(event, row_lookup_field).or(event.address)
+}
+
 fn plan_executor_scenario_step_meta(steps: &[ScenarioStep]) -> Vec<PlanExecutorScenarioStepMeta> {
     steps
         .iter()
@@ -5055,7 +5079,17 @@ fn execute_indexed_update_branch(
             "generation": row.generation,
             "source_binding_id": source_binding_id,
             "bind_epoch": source_binding_id,
-            "row_resolution": row_resolution_report(event, row_index, row, source_binding_id),
+            "row_resolution": row_resolution_report(
+                event,
+                row_index,
+                row,
+                source_binding_id,
+                source_route_slot
+                    .payload_schema
+                    .row_lookup_field
+                    .as_deref()
+                    .or(source_route_slot.payload_schema.address_lookup_field.as_deref())
+            ),
             "field_path": output_name,
             "value": value,
             "changed": changed,
@@ -6659,13 +6693,17 @@ fn resolve_plan_row_index(
         validate_plan_row_binding_epoch(plan, source_route_slot, list_slot, &rows[index], event)?;
         return Ok(index);
     }
-    if let Some(address) = event.address.as_ref()
-        && let Some(lookup_field) = source_route_slot
+    if let Some(lookup_field) = source_route_slot
+        .payload_schema
+        .row_lookup_field
+        .as_deref()
+        .or(source_route_slot
             .payload_schema
             .address_lookup_field
-            .as_ref()
+            .as_deref())
+        && let Some(lookup_value) = generic_source_event_row_lookup_value(event, lookup_field)
         && let Some(index) = rows.iter().position(|row| {
-            row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(*address)
+            row.fields.get(lookup_field).and_then(JsonValue::as_str) == Some(lookup_value)
         })
     {
         validate_plan_row_binding_epoch(plan, source_route_slot, list_slot, &rows[index], event)?;
@@ -6673,7 +6711,7 @@ fn resolve_plan_row_index(
     }
     let Some(target_text) = event.target_text else {
         return Err(format!(
-            "scoped source `{}` needs target_key, address, or target_text to resolve a row",
+            "scoped source `{}` needs target_key, row lookup payload, address, or target_text to resolve a row",
             event.source
         )
         .into());
@@ -6742,15 +6780,23 @@ fn row_resolution_report(
     row_index: usize,
     row: &PlanListRowState,
     source_binding_id: Option<u64>,
+    row_lookup_field: Option<&str>,
 ) -> JsonValue {
     json!({
         "method": if event.target_key.is_some() {
             "key_generation"
+        } else if row_lookup_field
+            .and_then(|field| generic_source_event_payload_value(event, field))
+            .is_some()
+        {
+            "row_lookup_payload"
         } else if event.address.is_some() {
             "address"
         } else {
             "target_text"
         },
+        "row_lookup_field": row_lookup_field,
+        "row_lookup_payload": row_lookup_field.and_then(|field| generic_source_event_payload_value(event, field)),
         "target_text": event.target_text,
         "target_occurrence": event.target_occurrence,
         "target_key": event.target_key,
@@ -10173,6 +10219,20 @@ fn cached_runtime_parsed_project(
     ))
 }
 
+fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<String, String> {
+    routes
+        .route_slots
+        .iter()
+        .filter_map(|route| {
+            route
+                .row_lookup_field
+                .as_ref()
+                .or(route.address_lookup_field.as_ref())
+                .map(|field| (route.source.clone(), field.clone()))
+        })
+        .collect()
+}
+
 fn source_address_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<String, String> {
     routes
         .route_slots
@@ -10181,6 +10241,7 @@ fn source_address_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMa
             route
                 .address_lookup_field
                 .as_ref()
+                .or(route.row_lookup_field.as_ref())
                 .map(|field| (route.source.clone(), field.clone()))
         })
         .collect()
@@ -14652,6 +14713,8 @@ impl CompiledProgram {
             .iter()
             .map(|route| route.source.clone())
             .collect();
+        static_analysis.source_row_lookup_fields =
+            source_row_lookup_fields_from_routes(&source_routes);
         static_analysis.source_address_lookup_fields =
             source_address_lookup_fields_from_routes(&source_routes);
         let source_route_count = source_routes.len();
@@ -17912,6 +17975,7 @@ fn source_route_artifact(route_id: usize, route: &SourceRoute) -> JsonValue {
         "route_id": route_id,
         "source_id": route.source_id.as_usize(),
         "source": route.source,
+        "row_lookup_field": route.row_lookup_field,
         "address_lookup_field": route.address_lookup_field,
         "payload_fields": route.payload_fields,
         "root_scalar_targets": route.root_scalar_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
@@ -18096,23 +18160,16 @@ impl SourceRoutePlan {
                 )
                 .into());
             }
-            if let Some(address_lookup_field) = route.address_lookup_field.as_ref() {
-                if address_lookup_field.is_empty() {
-                    return Err(format!(
-                        "{context}.route_slots[{route_index}].address_lookup_field is empty"
-                    )
-                    .into());
-                }
-                if !route
-                    .payload_fields
-                    .iter()
-                    .any(|field| matches!(field, SourcePayloadField::Address))
-                {
-                    return Err(format!(
-                        "{context}.route_slots[{route_index}] has address_lookup_field without Address payload"
-                    )
-                    .into());
-                }
+            if let Some(row_lookup_field) = route
+                .row_lookup_field
+                .as_ref()
+                .or(route.address_lookup_field.as_ref())
+                && row_lookup_field.is_empty()
+            {
+                return Err(format!(
+                    "{context}.route_slots[{route_index}].row_lookup_field is empty"
+                )
+                .into());
             }
             let mut rebuilt = route.clone();
             rebuilt.rebuild_actions();
@@ -18390,6 +18447,13 @@ impl SourceRoute {
         Ok(Self {
             source_id: SourceId(artifact_usize_field(object, "source_id", context)?),
             source: artifact_string_field(object, "source", context)?,
+            row_lookup_field: optional_string_field(object, "row_lookup_field", context)?.or_else(
+                || {
+                    optional_string_field(object, "address_lookup_field", context)
+                        .ok()
+                        .flatten()
+                },
+            ),
             address_lookup_field: optional_string_field(object, "address_lookup_field", context)?,
             payload_fields: source_payload_fields_from_artifact(
                 artifact_field(object, "payload_fields", context)?,
@@ -26645,6 +26709,7 @@ impl GenericScheduledRuntime {
         };
         let has_row_context = source_event.target_text.is_some()
             || source_event.address.is_some()
+            || self.source_event_has_row_lookup_payload(&source_event)
             || source_event.target_key.is_some()
             || source_event.target_generation.is_some();
         if !has_row_context {
@@ -26859,7 +26924,8 @@ impl GenericScheduledRuntime {
         step_id: &str,
         source_event: &GenericSourceEvent<'_>,
     ) -> RuntimeResult<Option<String>> {
-        if source_event.address.is_some() {
+        if source_event.address.is_some() || self.source_event_has_row_lookup_payload(source_event)
+        {
             return self.source_action_list_for_event(step_id, source_event.source);
         }
         let lists = self.source_action_lists_for_event(source_event.source)?;
@@ -26871,6 +26937,17 @@ impl GenericScheduledRuntime {
             [list] => Ok(Some(list.clone())),
             _ => Ok(None),
         }
+    }
+
+    fn source_event_has_row_lookup_payload(&self, source_event: &GenericSourceEvent<'_>) -> bool {
+        let Some(source_id) = self.source_routes.source_id(source_event.source) else {
+            return false;
+        };
+        let Some(lookup_field) = self.source_routes.row_lookup_field_for_source_id(source_id)
+        else {
+            return false;
+        };
+        generic_source_event_payload_value(source_event, lookup_field).is_some()
     }
 
     fn source_action_list_for_event(
@@ -28222,9 +28299,17 @@ impl GenericScheduledRuntime {
         .or_else(|| {
             let lookup_field = self
                 .source_routes
-                .address_lookup_field_for_source_id(input.source_id)?;
-            source_address_lookup_match_input(path, input.source, input.address, lookup_field)
-                .map(str::to_owned)
+                .row_lookup_field_for_source_id(input.source_id)?;
+            source_row_lookup_match_input(
+                path,
+                input.source,
+                input.key,
+                input.text,
+                input.address,
+                &input.payload,
+                lookup_field,
+            )
+            .map(str::to_owned)
         })
     }
 
@@ -28833,29 +28918,30 @@ impl GenericScheduledRuntime {
             }
             GenericBoundSourceIndex::Unspecified => {}
         }
-        if let Some(address) = source_event.address {
-            let source_id = self.source_routes.require_source_id(source_event.source)?;
-            if let Some(lookup_field) = self
-                .source_routes
-                .address_lookup_field_for_source_id(source_id)
+        let source_id = self.source_routes.require_source_id(source_event.source)?;
+        if let Some(lookup_field) = self.source_routes.row_lookup_field_for_source_id(source_id) {
+            if let Some(lookup_value) =
+                generic_source_event_row_lookup_value(&source_event, lookup_field)
             {
                 if self
                     .storage
                     .list_row_textlike_opt(list, 0, lookup_field)
                     .is_some()
-                    && let Some(index) =
-                        self.storage
-                            .find_list_index_by_textlike(list, lookup_field, address)?
+                    && let Some(index) = self.storage.find_list_index_by_textlike(
+                        list,
+                        lookup_field,
+                        lookup_value,
+                    )?
                 {
                     return Ok(Some(index));
                 }
-            } else if source_event.target_text.is_none() {
-                return Err(format!(
-                    "source `{}` carries an address payload but has no typed row lookup field",
-                    source_event.source
-                )
-                .into());
             }
+        } else if source_event.address.is_some() && source_event.target_text.is_none() {
+            return Err(format!(
+                "source `{}` carries an address payload but has no typed row lookup field",
+                source_event.source
+            )
+            .into());
         }
         let Some(target_text) = source_event.target_text else {
             return Ok(None);
@@ -42109,10 +42195,7 @@ impl GenericScheduledRuntime {
             .ok()?
             .iter()
             .filter_map(|source| self.source_routes.source_id(source))
-            .find_map(|source_id| {
-                self.source_routes
-                    .address_lookup_field_for_source_id(source_id)
-            })
+            .find_map(|source_id| self.source_routes.row_lookup_field_for_source_id(source_id))
     }
 
     #[cfg(test)]
@@ -55536,6 +55619,7 @@ struct ListSourceBindingSlot {
 struct SourceRoute {
     source_id: SourceId,
     source: String,
+    row_lookup_field: Option<String>,
     address_lookup_field: Option<String>,
     payload_fields: Vec<SourcePayloadField>,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
@@ -60080,19 +60164,36 @@ fn source_payload_match_input<'a>(
     }
 }
 
-fn source_address_lookup_match_input<'a>(
+fn source_row_lookup_match_input<'a>(
     input: &str,
     source: &str,
+    payload_key: Option<&'a str>,
+    payload_text: Option<&'a str>,
     payload_address: Option<&'a str>,
-    address_lookup_field: &str,
+    payload: &BTreeMap<String, &'a str>,
+    row_lookup_field: &str,
 ) -> Option<&'a str> {
-    let address = payload_address?;
-    if input == address_lookup_field || input == "address" {
-        return Some(address);
+    if input == "address" {
+        return payload_address;
+    }
+    let lookup_value = source_payload_value(
+        row_lookup_field,
+        payload_key,
+        payload_text,
+        payload_address,
+        payload,
+        None,
+        None,
+        None,
+        None,
+    )
+    .or(payload_address)?;
+    if input == row_lookup_field {
+        return Some(lookup_value);
     }
     let (input_scope, input_field) = input.split_once('.')?;
     let source_scope = source.split_once('.').map(|(scope, _)| scope)?;
-    (input_scope == source_scope && input_field == address_lookup_field).then_some(address)
+    (input_scope == source_scope && input_field == row_lookup_field).then_some(lookup_value)
 }
 
 fn source_payload_value<'a>(
@@ -60493,9 +60594,17 @@ impl SourceRoutePlan {
         self.require_source(source)?.list_append_target(list)
     }
 
+    fn row_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
+        self.for_source_id(source_id).and_then(|route| {
+            route
+                .row_lookup_field
+                .as_deref()
+                .or(route.address_lookup_field.as_deref())
+        })
+    }
+
     fn address_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
-        self.for_source_id(source_id)
-            .and_then(|route| route.address_lookup_field.as_deref())
+        self.row_lookup_field_for_source_id(source_id)
     }
 
     fn source_payload_has_text(&self, source: &str) -> bool {
@@ -60536,6 +60645,7 @@ impl SourceRoutePlan {
         self.route_slots.push(SourceRoute {
             source_id,
             source: source.to_owned(),
+            row_lookup_field: None,
             address_lookup_field: None,
             payload_fields: Vec::new(),
             root_scalar_targets: Vec::new(),
@@ -60565,10 +60675,20 @@ impl SourceRoutePlan {
 
     fn set_address_lookup_fields(&mut self, source_metadata: &[CompilerSourceRouteSource]) {
         for route in &mut self.route_slots {
+            route.row_lookup_field = source_metadata
+                .iter()
+                .find(|source| source.source_id == route.source_id.as_usize())
+                .and_then(|source| {
+                    source
+                        .row_lookup_field
+                        .clone()
+                        .or_else(|| source.address_lookup_field.clone())
+                });
             route.address_lookup_field = source_metadata
                 .iter()
                 .find(|source| source.source_id == route.source_id.as_usize())
-                .and_then(|source| source.address_lookup_field.clone());
+                .and_then(|source| source.address_lookup_field.clone())
+                .or_else(|| route.row_lookup_field.clone());
         }
     }
 }
@@ -66395,6 +66515,79 @@ document: Document/new(root: Element/label(element: [], label: store.external_fi
                 .document_state_summary()
                 .pointer("/store/external_file_tree_label"),
             Some(&json!("- local file"))
+        );
+    }
+
+    #[test]
+    fn row_scoped_source_resolves_named_lookup_payload_without_address() {
+        let source = r#"
+store: [
+    rows:
+        LIST {
+            [file: TEXT { wave_27.fst }, signal: TEXT { tx_data }, label: TEXT { - wave_27.fst }]
+            [file: TEXT { simple.vcd }, signal: TEXT { clk }, label: TEXT { - simple.vcd }]
+        }
+        |> List/map(row, new: new_row(row: row))
+]
+
+FUNCTION new_row(row) {
+    [
+        file: row.file
+        signal: row.signal
+        label: row.label
+        selected_file:
+            TEXT { none } |> HOLD selected_file {
+                LATEST {
+                    elements.select.event.press |> THEN { row.file }
+                }
+            }
+        elements: [
+            select: SOURCE
+        ]
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source("row-lookup-payload-without-address", source).unwrap();
+        let route = runtime
+            .runtime
+            .generic
+            .as_ref()
+            .and_then(|generic| {
+                generic
+                    .source_routes
+                    .route_slots
+                    .iter()
+                    .find(|route| route.source.ends_with(".elements.select"))
+            })
+            .expect("row select route should be compiled");
+        assert_eq!(route.row_lookup_field.as_deref(), Some("file"));
+        assert_eq!(route.address_lookup_field.as_deref(), Some("file"));
+        let source_path = route.source.clone();
+
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: source_path,
+                payload: BTreeMap::from([("file".to_owned(), "simple.vcd".to_owned())]),
+                target_text: Some("- simple.vcd".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("row-scoped source should resolve by typed lookup payload without address");
+
+        assert_eq!(
+            output.state_summary["rows"][1]["selected_file"],
+            "simple.vcd"
+        );
+        assert!(
+            output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("selected_file")
+                    && matches!(&delta.value, ProtocolValue::Text(value) if value == "simple.vcd")
+            }),
+            "selected_file should update through row-scoped source deltas: {:#?}",
+            output.semantic_deltas
         );
     }
 

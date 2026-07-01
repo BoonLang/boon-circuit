@@ -1071,6 +1071,56 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   perf-HUD positive gates, broadening active/pending snapshot currentness proof,
   and finishing the generic runtime/list/formula currentness work.
 
+2026-07-01 generic row-lookup payload runtime slice:
+
+- Row-scoped source resolution in `boon_runtime` can now use the typed row
+  lookup field from named source payloads before falling back to the legacy
+  address payload. This applies to both plan-executor row resolution and the
+  generic scheduled runtime path.
+- Source-event classification now treats a typed row-lookup payload as row
+  context, so a row source with `payload["file"]` can resolve its target row
+  without `event.address`.
+- Row resolution reports now expose `row_lookup_field`,
+  `row_lookup_payload`, and `method=row_lookup_payload` when the typed payload
+  path is used.
+- Artifact validation no longer requires every `address_lookup_field` route to
+  declare an `Address` payload. This keeps row identity metadata separate from
+  source payload expressions while preserving the legacy compiler metadata for
+  compatibility.
+- Added non-Cells runtime coverage with arbitrary `row.file` identity proving a
+  source event carrying only `payload["file"]` updates the selected row.
+- Focused verification passed:
+  - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`
+  - `cargo check -q -p boon_ir -p boon_runtime`
+- This still does not complete the source-identity architecture. The compiler
+  still names this metadata `address_lookup_field` and still auto-declares a
+  legacy `Address` payload for compatibility. The next slice should rename or
+  split that metadata into generic row lookup identity and then remove the
+  remaining address-shaped native/playground fallbacks once release verifiers no
+  longer rely on them.
+
+2026-07-01 row-lookup metadata alias slice:
+
+- `SourcePayloadSchema`, compiler source-route metadata, runtime source-route
+  artifacts, and static program analysis now carry `row_lookup_field` as the
+  generic source identity name. `address_lookup_field` remains serialized and
+  accepted as a compatibility alias during the transition.
+- Runtime route construction prefers `row_lookup_field` and falls back to
+  `address_lookup_field`; legacy consumers still see the old field populated so
+  existing native/playground paths do not break mid-migration.
+- Plan-executor test fixtures were updated with explicit `row_lookup_field:
+  None` defaults so schema changes compile in test builds, not just normal
+  library builds.
+- Focused verification passed:
+  - `cargo test -q -p boon_ir scoped_source_lookup_prefers_source_intent_identity_field`
+  - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`
+  - `cargo test -q -p boon_plan_executor --no-run`
+  - `cargo check -q -p boon_ir -p boon_plan -p boon_compiler -p boon_runtime -p boon_native_playground`
+- This still does not complete the architecture. The old compatibility field
+  and address-shaped helper names remain in a few call sites, and the larger
+  native UX/frame-loop/runtime-currentness plan still needs implementation and
+  release native GPU verification.
+
 ## Implementation Slices
 
 1. Terminology and schema:

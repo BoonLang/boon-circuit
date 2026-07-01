@@ -142,6 +142,7 @@ pub struct CompilerStaticProgramAnalysis {
     pub view_bindings: Vec<CompilerViewBinding>,
     pub row_scopes: Vec<CompilerRowScope>,
     pub source_paths: Vec<String>,
+    pub source_row_lookup_fields: BTreeMap<String, String>,
     pub source_address_lookup_fields: BTreeMap<String, String>,
 }
 
@@ -658,6 +659,7 @@ pub struct CompilerSourceRouteSource {
     pub path: String,
     pub source_id: usize,
     pub payload_fields: Vec<CompilerSourcePayloadField>,
+    pub row_lookup_field: Option<String>,
     pub address_lookup_field: Option<String>,
 }
 
@@ -977,6 +979,18 @@ impl CompilerStaticProgramAnalysis {
         source_paths: Vec<String>,
         source_address_lookup_fields: BTreeMap<String, String>,
     ) -> Self {
+        let source_row_lookup_fields = ir
+            .sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .payload_schema
+                    .row_lookup_field
+                    .as_ref()
+                    .or(source.payload_schema.address_lookup_field.as_ref())
+                    .map(|field| (source.path.clone(), field.clone()))
+            })
+            .collect();
         Self {
             typecheck_report: ir.typecheck_report.clone(),
             view_bindings: ir
@@ -1002,6 +1016,7 @@ impl CompilerStaticProgramAnalysis {
                 })
                 .collect(),
             source_paths,
+            source_row_lookup_fields,
             source_address_lookup_fields,
         }
     }
@@ -2034,6 +2049,11 @@ pub fn compiler_source_route_sources_from_ir(ir: &TypedProgram) -> Vec<CompilerS
                 .iter()
                 .map(compiler_source_payload_field)
                 .collect(),
+            row_lookup_field: source
+                .payload_schema
+                .row_lookup_field
+                .clone()
+                .or_else(|| source.payload_schema.address_lookup_field.clone()),
             address_lookup_field: source.payload_schema.address_lookup_field.clone(),
         })
         .collect()

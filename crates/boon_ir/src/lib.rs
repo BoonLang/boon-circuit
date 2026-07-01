@@ -497,6 +497,8 @@ pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub typed_fields: Vec<SourcePayloadDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_lookup_field: Option<String>,
     pub address_lookup_field: Option<String>,
 }
 
@@ -2943,8 +2945,8 @@ fn source_payload_schema(
             payload_fields.extend(field.referenced_payload_fields(variant));
         }
     }
-    let address_lookup_field = source_address_lookup_field(program, fields, source);
-    if address_lookup_field.is_some() {
+    let row_lookup_field = source_row_lookup_field(program, fields, source);
+    if row_lookup_field.is_some() {
         payload_fields.insert(SourcePayloadField::Address);
     }
     SourcePayloadSchema {
@@ -2957,7 +2959,8 @@ fn source_payload_schema(
                 field,
             })
             .collect(),
-        address_lookup_field,
+        row_lookup_field: row_lookup_field.clone(),
+        address_lookup_field: row_lookup_field,
     }
 }
 
@@ -2971,7 +2974,7 @@ fn source_payload_value_type(field: &SourcePayloadField) -> SourcePayloadValueTy
     }
 }
 
-fn source_address_lookup_field(
+fn source_row_lookup_field(
     program: &ParsedProgram,
     fields: &[FieldDef],
     source: &str,
@@ -3025,22 +3028,27 @@ fn source_address_lookup_field(
             candidates.push(lookup.to_owned());
         }
     }
-    select_source_address_lookup_field(source, candidates)
+    select_source_row_lookup_field(source, candidates)
 }
 
-fn select_source_address_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
+fn select_source_row_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
     candidates
         .into_iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
-            let score = source_address_lookup_field_score(source, &candidate);
+            let score = source_row_lookup_field_score(source, &candidate);
             (score > 0).then_some((index, candidate, score))
         })
         .max_by_key(|(index, _, score)| (*score, std::cmp::Reverse(*index)))
         .map(|(_, candidate, _)| candidate)
 }
 
-fn source_address_lookup_field_score(source: &str, candidate: &str) -> i32 {
+#[cfg(test)]
+fn select_source_address_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
+    select_source_row_lookup_field(source, candidates)
+}
+
+fn source_row_lookup_field_score(source: &str, candidate: &str) -> i32 {
     let terms = source_address_intent_terms(source);
     let mut score = 0;
     if matches!(candidate, "id" | "key" | "unique_id") {

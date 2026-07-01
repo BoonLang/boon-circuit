@@ -46,6 +46,10 @@ fn source_payload_schema_from_ir(value: &ir::SourcePayloadSchema) -> SourcePaylo
             .iter()
             .map(source_payload_descriptor_from_ir)
             .collect(),
+        row_lookup_field: value
+            .row_lookup_field
+            .clone()
+            .or_else(|| value.address_lookup_field.clone()),
         address_lookup_field: value.address_lookup_field.clone(),
     }
 }

@@ -15345,6 +15345,7 @@ mod tests {
                         field: SourcePayloadField::Text,
                         value_type: boon_plan::SourcePayloadValueType::Text,
                     }],
+                    row_lookup_field: None,
                     address_lookup_field: None,
                 },
             }],
@@ -16028,6 +16029,7 @@ mod tests {
                         field: SourcePayloadField::Text,
                         value_type: boon_plan::SourcePayloadValueType::Text,
                     }],
+                    row_lookup_field: None,
                     address_lookup_field: None,
                 },
             }],
@@ -18232,6 +18234,7 @@ mod tests {
                 payload_schema: boon_plan::SourcePayloadSchema {
                     fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
                     typed_fields: Vec::new(),
+                    row_lookup_field: None,
                     address_lookup_field: None,
                 },
             }],
@@ -18402,6 +18405,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -18519,6 +18523,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -18648,6 +18653,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -18808,6 +18814,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -18910,6 +18917,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -19061,6 +19069,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: vec![SourcePayloadField::Named("title".to_owned())],
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         }];
@@ -19213,6 +19222,7 @@ mod tests {
                 payload_schema: boon_plan::SourcePayloadSchema {
                     fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
                     typed_fields: Vec::new(),
+                    row_lookup_field: None,
                     address_lookup_field: None,
                 },
             }],
@@ -19392,6 +19402,7 @@ mod tests {
                             value_type: boon_plan::SourcePayloadValueType::Text,
                         },
                     ],
+                    row_lookup_field: None,
                     address_lookup_field: None,
                 },
             }],
@@ -20126,6 +20137,7 @@ mod tests {
             payload_schema: boon_plan::SourcePayloadSchema {
                 fields: vec![SourcePayloadField::Text],
                 typed_fields: Vec::new(),
+                row_lookup_field: None,
                 address_lookup_field: None,
             },
         };

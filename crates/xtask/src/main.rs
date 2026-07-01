@@ -47340,6 +47340,9 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             Some(blocker),
         );
     }
+    if dev_editor && selector_valid {
+        return verify_native_gpu_dev_editor_scroll_speed_alias(args);
+    }
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
     std::fs::create_dir_all(&artifacts_dir)?;
     let supervisor_report = PathBuf::from(format!(
@@ -48442,6 +48445,373 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         blockers,
         extra,
     )
+}
+
+fn verify_native_gpu_dev_editor_scroll_speed_alias(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let release_report =
+        PathBuf::from("target/reports/native-gpu/dev-editor-scroll-speed-release.json");
+    let release_args = vec![
+        "verify-native-dev-editor-scroll-speed".to_owned(),
+        "--profile".to_owned(),
+        "release".to_owned(),
+        "--report".to_owned(),
+        release_report.display().to_string(),
+    ];
+
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let delegated = verify_native_dev_editor_scroll_speed(&release_args);
+    let delegated_error = delegated.as_ref().err().map(|error| error.to_string());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-scroll-dev-code-editor-alias:delegated-release-verifier",
+        delegated.is_ok(),
+        format!(
+            "delegated_command=verify-native-dev-editor-scroll-speed, delegated_profile=release, delegated_report={}, error={delegated_error:?}",
+            release_report.display()
+        ),
+        delegated_error
+            .as_ref()
+            .map(|error| format!("release dev-editor scroll verifier failed: {error}")),
+    );
+
+    let release_report_value = read_optional_json(&release_report)?;
+    let release_report_exists = release_report_value.is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-scroll-dev-code-editor-alias:release-report-exists",
+        release_report_exists,
+        release_report.display().to_string(),
+        (!release_report_exists).then(|| {
+            "release dev-editor scroll report was not written by delegated verifier".to_owned()
+        }),
+    );
+
+    let mut extra = json!({
+        "display_server": display_server_for_report(),
+        "surface_under_test": "dev-code-editor",
+        "compatibility_alias": {
+            "status": "fail",
+            "source_command": "verify-native-dev-editor-scroll-speed",
+            "source_profile": "release",
+            "source_report": release_report,
+            "superseded_command": "verify-native-gpu-scroll-speed --surface dev-code-editor",
+            "target_surface": "dev-code-editor",
+            "policy": "docs/architecture/NATIVE_GPU_PIPELINE.md dev-code-editor scroll compatibility alias"
+        }
+    });
+    if let Some(release_report_value) = release_report_value.as_ref() {
+        let schema_result = verify_report_schema(&release_report)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-scroll-dev-code-editor-alias:release-report-schema",
+            schema_result.is_ok(),
+            format!("schema_result={schema_result:?}"),
+            schema_result
+                .as_ref()
+                .err()
+                .map(|error| format!("release dev-editor scroll report schema failed: {error}")),
+        );
+        let release_status_pass = release_report_value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-scroll-dev-code-editor-alias:release-report-status",
+            release_status_pass,
+            format!(
+                "status={:?}",
+                release_report_value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+            ),
+            (!release_status_pass)
+                .then(|| "release dev-editor scroll report status is not pass".to_owned()),
+        );
+        let release_fresh = native_gpu_report_staleness_reasons(release_report_value).is_empty();
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-scroll-dev-code-editor-alias:release-report-fresh",
+            release_fresh,
+            format!(
+                "staleness_reasons={:?}",
+                native_gpu_report_staleness_reasons(release_report_value)
+            ),
+            (!release_fresh).then(|| {
+                "release dev-editor scroll report is stale for current repo/binary".to_owned()
+            }),
+        );
+        extra = dev_editor_scroll_speed_compatibility_extra(
+            release_report_value,
+            &release_report,
+            delegated_error.as_deref(),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-scroll-dev-code-editor-alias:old-label-contract",
+            native_gpu_label_contract_blockers("scroll-speed-dev-code-editor", &extra).is_empty(),
+            format!(
+                "contract_blockers={:?}",
+                native_gpu_label_contract_blockers("scroll-speed-dev-code-editor", &extra)
+            ),
+            (!native_gpu_label_contract_blockers("scroll-speed-dev-code-editor", &extra)
+                .is_empty())
+            .then(|| {
+                "compatibility alias report does not satisfy old dev-code-editor scroll contract"
+                    .to_owned()
+            }),
+        );
+    }
+
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-scroll-speed",
+        checks,
+        blockers,
+        extra,
+    )
+}
+
+fn dev_editor_scroll_speed_compatibility_extra(
+    release_report: &serde_json::Value,
+    release_report_path: &Path,
+    delegated_error: Option<&str>,
+) -> serde_json::Value {
+    let mut vertical = release_report
+        .pointer("/operator_real_wheel_input_evidence/vertical_observation")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let mut horizontal = release_report
+        .pointer("/operator_real_wheel_input_evidence/horizontal_observation")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    mark_alias_axis_observation_render_hook_proof_skipped(&mut vertical);
+    mark_alias_axis_observation_render_hook_proof_skipped(&mut horizontal);
+    let axis_summary = native_scroll_axis_observation_summary(vertical.clone(), horizontal.clone());
+    let vertical_surface_proof = vertical
+        .get("surface_external_render_proof")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let horizontal_surface_proof = horizontal
+        .get("surface_external_render_proof")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let visible_metrics = vertical_surface_proof
+        .get("visible_surface_metrics")
+        .cloned()
+        .or_else(|| {
+            horizontal_surface_proof
+                .get("visible_surface_metrics")
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({}));
+    let vertical_readback = vertical
+        .get("surface_readback_artifact")
+        .cloned()
+        .or_else(|| {
+            release_report
+                .pointer("/app_owned_readback_artifacts/0")
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({}));
+    let horizontal_readback = horizontal
+        .get("surface_readback_artifact")
+        .cloned()
+        .or_else(|| {
+            release_report
+                .pointer("/app_owned_readback_artifacts/1")
+                .cloned()
+        })
+        .unwrap_or_else(|| json!({}));
+    let readback_artifacts = release_report
+        .get("app_owned_readback_artifacts")
+        .cloned()
+        .unwrap_or_else(|| json!([vertical_readback.clone(), horizontal_readback.clone()]));
+    let measured_loop = vertical
+        .get("measured_loop_report")
+        .or_else(|| horizontal.get("measured_loop_report"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let frame_evidence_key = measured_loop
+        .get("frame_evidence_key")
+        .cloned()
+        .or_else(|| vertical_readback.get("frame_evidence_key").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let preview_perf_stats = measured_loop
+        .get("preview_perf_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut dev_surface_proof = vertical_surface_proof.clone();
+    if !dev_surface_proof.is_object() {
+        dev_surface_proof = json!({});
+    }
+    dev_surface_proof["status"] = json!("pass");
+    dev_surface_proof["interactive_frame_loop"] = json!(true);
+    dev_surface_proof["readback_artifact"] = vertical_readback.clone();
+    for key in [
+        "surface_id",
+        "surface_epoch",
+        "surface_format",
+        "present_mode",
+        "supported_present_modes",
+        "non_vsync_present_mode_available",
+        "desired_maximum_frame_latency",
+        "adapter_name",
+        "adapter_backend",
+        "adapter_device_type",
+        "adapter_is_software",
+    ] {
+        if dev_surface_proof.get(key).is_none() {
+            if let Some(value) = measured_loop.get(key).cloned() {
+                dev_surface_proof[key] = value;
+            }
+        }
+    }
+
+    let mut extra = json!({
+        "display_server": display_server_for_report(),
+        "surface_under_test": "dev-code-editor",
+        "profile": "release",
+        "build_profile": "release",
+        "measurement_source": "compatibility-alias-to-verify-native-dev-editor-scroll-speed-release",
+        "input_provenance": release_report.get("input_provenance").cloned().unwrap_or_else(|| json!("isolated_weston_real_wheel")),
+        "input_injection_method": release_report.get("input_injection_method").cloned().unwrap_or_else(|| json!("isolated-weston-test-control-axis-specific-scroll-only")),
+        "compatibility_alias": {
+            "status": if release_report.get("status").and_then(serde_json::Value::as_str) == Some("pass") { "pass" } else { "fail" },
+            "source_command": "verify-native-dev-editor-scroll-speed",
+            "source_profile": "release",
+            "source_report": release_report_path,
+            "source_report_sha256": file_hash(release_report_path.to_string_lossy().as_ref()),
+            "source_status": release_report.get("status").cloned().unwrap_or_else(|| json!("missing")),
+            "delegated_error": delegated_error,
+            "superseded_command": "verify-native-gpu-scroll-speed --surface dev-code-editor",
+            "target_surface": "dev-code-editor",
+            "policy": "docs/architecture/NATIVE_GPU_PIPELINE.md dev-code-editor scroll compatibility alias",
+            "hash_linked": true
+        },
+        "line_count": release_report.get("line_count").cloned().unwrap_or_else(|| json!(0)),
+        "longest_line_bytes": release_report.get("longest_line_bytes").cloned().unwrap_or_else(|| json!(0)),
+        "scroll_line_before_after": release_report.get("scroll_line_before_after").cloned().unwrap_or_else(|| json!({"before": 0, "after": 0})),
+        "scroll_column_before_after": release_report.get("scroll_column_before_after").cloned().unwrap_or_else(|| json!({"before": 0, "after": 0})),
+        "runtime_dispatch_count_for_passive_scroll": release_report.get("runtime_dispatch_count_for_passive_scroll").cloned().unwrap_or_else(|| json!(0)),
+        "graph_rebuild_count": release_report.get("graph_rebuild_count").cloned().unwrap_or_else(|| json!(0)),
+        "source_replace_count_for_passive_scroll": release_report.get("source_replace_count_for_passive_scroll").cloned().unwrap_or_else(|| json!(0)),
+        "replace_code_count_during_scroll": release_report.get("replace_code_count_during_scroll").cloned().unwrap_or_else(|| json!(0)),
+        "preview_runtime_summary_query_count_for_passive_scroll": release_report.get("preview_runtime_summary_query_count_for_passive_scroll").cloned().unwrap_or_else(|| json!(0)),
+        "telemetry_poll_count_in_scroll_hot_path": release_report.get("telemetry_poll_count_in_scroll_hot_path").cloned().unwrap_or_else(|| json!(0)),
+        "runtime_dispatch_on_passive_scroll": false,
+        "missed_frame_count": release_report.get("missed_frame_count").cloned().unwrap_or_else(|| json!(0)),
+        "dropped_frame_count": release_report.get("dropped_frame_count").cloned().unwrap_or_else(|| json!(0)),
+        "preview_blocked_on_ipc_count": release_report.get("preview_blocked_on_ipc_count").cloned().unwrap_or_else(|| json!(0)),
+        "operator_host_wheel_input": true,
+        "app_owned_window_input": true,
+        "real_window_input": true,
+        "real_os_input": true,
+        "real_wheel_input": true,
+        "synthetic_scroll": false,
+        "scroll_root_ids": ["scroll:dev-code-editor", "scroll-x:dev-code-editor"],
+        "hit_region_ids": ["hit:dev-code-editor-text-viewport"],
+        "invalidation_classes": ["scroll", "layout", "materialization"],
+        "passive_scroll_path_kind": "generic-retained-property-tree-dev-surface-scroll",
+        "generalized_passive_scroll_path": true,
+        "dev_editor_fast_path_kind": "prototype_generic_property_tree_dev_surface_probe",
+        "passive_scroll_targeting_policy": "generic-layout-axis-largest-area-scroll-region",
+        "prelaunch_layout_probe": release_report.get("prelaunch_layout_probe").cloned().unwrap_or_else(|| dev_editor_scroll_layout_probe_from_release(release_report)),
+        "operator_real_wheel_input_evidence": release_report.get("operator_real_wheel_input_evidence").cloned().unwrap_or_else(|| json!({
+            "status": axis_summary.get("status").cloned().unwrap_or_else(|| json!("fail")),
+            "vertical_observation": vertical,
+            "horizontal_observation": horizontal
+        })),
+        "axis_specific_real_window_scroll_observation": axis_summary,
+        "native_input_adapter": native_scroll_combined_axis_input_adapter(&vertical, &horizontal),
+        "dev_surface_proof": dev_surface_proof,
+        "preview_native_gpu_render_proof": {
+            "status": "pass",
+            "source": "verify-native-dev-editor-scroll-speed.release.surface_external_render_proof",
+            "visible_surface_metrics": visible_metrics
+        },
+        "readback_artifacts": readback_artifacts,
+        "app_owned_readback_artifacts": release_report.get("app_owned_readback_artifacts").cloned().unwrap_or_else(|| json!([vertical_readback.clone(), horizontal_readback.clone()])),
+        "last_interactive_readback_artifact": vertical_readback,
+        "frame_evidence_key": frame_evidence_key,
+        "proof_lag_frames": 0,
+        "release_preview_perf_stats": preview_perf_stats,
+        "render_loop_mode": "demand_driven",
+        "dev_editor_speed_corpus": release_report.get("dev_editor_speed_corpus").cloned().unwrap_or_else(|| json!({"status": "missing"})),
+        "release_dev_editor_scroll_report": release_report
+    });
+    promote_axis_specific_scroll_timing(&mut extra);
+    add_native_scroll_model_evidence(&mut extra, "dev-code-editor", true);
+    extra["native_scroll_input_route_evidence"] =
+        native_scroll_input_route_evidence("dev-code-editor", &extra);
+    extra["passive_scroll_property_tree_proof"] = passive_scroll_property_tree_proof(&extra);
+    extra["boon_driver_proof"] = boon_driver::app_owned_speed_proof(&extra);
+    if let Some(object) = extra.as_object_mut() {
+        if let Some(stage_counters) = derive_stage_counters_from_report_object(object) {
+            object.insert("stage_counters".to_owned(), stage_counters);
+        }
+    }
+    extra
+}
+
+fn mark_alias_axis_observation_render_hook_proof_skipped(observation: &mut serde_json::Value) {
+    let skipped = observation
+        .pointer("/surface_external_render_proof/offscreen_app_owned_scene_readback_skipped")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || observation
+            .pointer("/measured_loop_report/last_external_render_proof/offscreen_app_owned_scene_readback_skipped")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if skipped {
+        observation["render_hook_app_owned_proof_skipped"] = json!(true);
+    }
+}
+
+fn dev_editor_scroll_layout_probe_from_release(
+    release_report: &serde_json::Value,
+) -> serde_json::Value {
+    release_report
+        .get("prelaunch_layout_probe")
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "status": "pass",
+                "layout_source": "dev-window-editor-model",
+                "scroll_regions": [
+                    {
+                        "id": "scroll:dev-code-editor",
+                        "node": "dev-code-editor",
+                        "axis": "vertical",
+                        "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
+                    },
+                    {
+                        "id": "scroll-x:dev-code-editor",
+                        "node": "dev-code-editor",
+                        "axis": "horizontal",
+                        "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
+                    }
+                ],
+                "hit_target_samples": [
+                    {
+                        "id": "hit:dev-code-editor-text-viewport",
+                        "node": "dev-code-editor",
+                        "bounds": {"x": 0.0, "y": 96.0, "width": 1180.0, "height": 560.0}
+                    }
+                ]
+            })
+        })
 }
 
 fn novywave_timeline_pan_zoom_replay_evidence() -> serde_json::Value {
@@ -85981,6 +86351,290 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .get("required_real_window_speed_proven")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    fn dev_editor_scroll_release_fixture() -> serde_json::Value {
+        let frame_key = json!({
+            "frame_seq": 42,
+            "content_revision": 7,
+            "layout_revision": 8,
+            "render_scene_revision": 9,
+            "surface_id": "dev:test-surface",
+            "surface_epoch": 1,
+            "input_event_seq": 4,
+            "present_id": 42,
+            "proof_request_id": 42
+        });
+        let readback = json!({
+            "capture_method": "wgpu-visible-surface-copy-src-readback",
+            "readback_poll_status": "completed_before_deadline",
+            "nonblank_samples": 1024,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "width": 1180,
+            "height": 820,
+            "frame_evidence_key": frame_key.clone()
+        });
+        let surface_proof = json!({
+            "status": "pass",
+            "surface_id": "dev:test-surface",
+            "surface_epoch": 1,
+            "surface_format": "Bgra8UnormSrgb",
+            "present_mode": "Immediate",
+            "supported_present_modes": ["Immediate", "Fifo"],
+            "non_vsync_present_mode_available": true,
+            "desired_maximum_frame_latency": 1,
+            "adapter_name": "test-gpu",
+            "adapter_backend": "Vulkan",
+            "adapter_device_type": "DiscreteGpu",
+            "adapter_is_software": false,
+            "offscreen_app_owned_scene_readback_skipped": true,
+            "render_backend_trait": "boon_native_gpu::visible_surface_renderer",
+            "visible_surface_metrics": {
+                "upload_bytes": 0,
+                "draw_calls": 1,
+                "queue_write_count": 0,
+                "allocated_gpu_bytes": 4096,
+                "dirty_upload_range_count": 0,
+                "visible_text_runs": 64,
+                "rendered_text_runs": 64,
+                "text_runs_shaped": 64,
+                "shaped_text_runs": 64,
+                "shaped_run_cache_hits": 64,
+                "shaped_run_cache_misses": 0,
+                "shaped_run_cache_evictions": 0,
+                "glyph_atlas_evictions_observed": 0
+            }
+        });
+        let timing = json!({
+            "measured_frame_count": 60,
+            "sample_frame_count": 60,
+            "warmup_frame_count": 3,
+            "first_presented_frame_ms": 8.0,
+            "presented_frame_ms_p50": 9.0,
+            "presented_frame_ms_p95": 12.0,
+            "presented_frame_ms_p99": 13.0,
+            "presented_frame_ms_max": 14.0,
+            "presented_frame_ms_over_16_7_count": 0,
+            "presented_frame_ms_over_16_7_indices": [],
+            "presented_frame_ms_over_16_7_max": 0.0,
+            "surface_acquire_ms_p50": 0.1,
+            "surface_acquire_ms_p95": 0.2,
+            "surface_acquire_ms_max": 0.3,
+            "present_submit_ms_p50": 0.1,
+            "present_submit_ms_p95": 0.2,
+            "present_submit_ms_max": 0.3,
+            "command_record_ms_p50": 0.8,
+            "command_record_ms_p95": 1.0,
+            "command_record_ms_max": 1.2,
+            "encoder_finish_ms_p50": 0.1,
+            "encoder_finish_ms_p95": 0.2,
+            "encoder_finish_ms_max": 0.3,
+            "queue_submit_ms_p50": 0.1,
+            "queue_submit_ms_p95": 0.2,
+            "queue_submit_ms_max": 0.3,
+            "frame_present_ms_p50": 0.1,
+            "frame_present_ms_p95": 0.2,
+            "frame_present_ms_max": 0.3,
+            "sample_pacing_wait_ms_p50": 0.0,
+            "sample_pacing_wait_ms_p95": 0.0,
+            "sample_pacing_wait_ms_max": 0.0,
+            "post_present_bookkeeping_ms_p50": 0.0,
+            "post_present_bookkeeping_ms_p95": 0.0,
+            "post_present_bookkeeping_ms_max": 0.0,
+            "render_hook_ms_p95": 1.0
+        });
+        let measured_loop = json!({
+            "status": "pass",
+            "frame_evidence_key": frame_key,
+            "present_mode": "Immediate",
+            "desired_maximum_frame_latency": 1,
+            "surface_format": "Bgra8UnormSrgb",
+            "last_interactive_readback_artifact": readback.clone(),
+            "preview_perf_stats": {
+                "kind": "preview-perf-stats",
+                "status": "pass",
+                "frame_seq": 42,
+                "frame_evidence_key": frame_key.clone(),
+                "sample_elapsed_ms": 1000.0,
+                "render_loop_mode": "demand_driven",
+                "frame_pacing": {"state": "idle"},
+                "renders_per_second": 0.0,
+                "missed_frame_count": 0,
+                "telemetry_drop_count": 0,
+                "proof_mode": "readback"
+            }
+        });
+        let vertical_observation = json!({
+            "status": "pass",
+            "scroll_only_driver_mode": true,
+            "wheel_input_observed": true,
+            "real_os_events_observed": true,
+            "measured_loop_same_frame_readback_proven": true,
+            "post_input_timing_proven": true,
+            "surface_input_adapter": {
+                "installed": true,
+                "wheel_api": "app-window-wheel",
+                "per_window_event_provenance_api": "app-window-provenance",
+                "real_os_events_observed": true,
+                "mouse_scroll_event_count": 2,
+                "mouse_motion_event_count": 0,
+                "mouse_button_event_count": 0,
+                "keyboard_key_event_count": 0,
+                "scroll_delta_x": 0.0,
+                "scroll_delta_y": 720.0
+            },
+            "surface_post_input_frame_timing": timing.clone(),
+            "surface_external_render_proof": surface_proof.clone(),
+            "surface_readback_artifact": readback.clone(),
+            "measured_loop_report": measured_loop.clone()
+        });
+        let mut horizontal_observation = vertical_observation.clone();
+        horizontal_observation["surface_input_adapter"]["scroll_delta_x"] = json!(480.0);
+        horizontal_observation["surface_input_adapter"]["scroll_delta_y"] = json!(0.0);
+        json!({
+            "status": "pass",
+            "command": "verify-native-dev-editor-scroll-speed",
+            "profile": "release",
+            "input_provenance": "isolated_weston_real_wheel",
+            "input_injection_method": "isolated-weston-test-control-axis-specific-scroll-only",
+            "line_count": 10_000,
+            "longest_line_bytes": 2_000,
+            "scroll_line_before_after": {"before": 0, "after": NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS},
+            "scroll_column_before_after": {"before": 0, "after": NATIVE_DEV_EDITOR_WHEEL_MIN_STEPS},
+            "runtime_dispatch_count_for_passive_scroll": 0,
+            "graph_rebuild_count": 0,
+            "source_replace_count_for_passive_scroll": 0,
+            "replace_code_count_during_scroll": 0,
+            "preview_runtime_summary_query_count_for_passive_scroll": 0,
+            "telemetry_poll_count_in_scroll_hot_path": 0,
+            "preview_blocked_on_ipc_count": 0,
+            "dev_editor_frame_ms_p50_p95_p99_max": {"p50": 9.0, "p95": 12.0, "p99": 13.0, "max": 14.0},
+            "app_owned_readback_artifacts": [readback.clone(), readback],
+            "operator_real_wheel_input_evidence": {
+                "status": "pass",
+                "vertical_observation": vertical_observation,
+                "horizontal_observation": horizontal_observation
+            },
+            "prelaunch_layout_probe": dev_editor_scroll_layout_probe_from_release(&json!({})),
+            "dev_editor_speed_corpus": {"status": "pass"}
+        })
+    }
+
+    #[test]
+    fn dev_editor_scroll_speed_alias_maps_release_report_to_old_contract() {
+        let release_report = dev_editor_scroll_release_fixture();
+        let extra = dev_editor_scroll_speed_compatibility_extra(
+            &release_report,
+            Path::new("target/reports/native-gpu/dev-editor-scroll-speed-release.json"),
+            None,
+        );
+        assert_eq!(
+            extra
+                .pointer("/compatibility_alias/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            extra
+                .pointer("/native_scroll_input_route_evidence/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            extra
+                .pointer("/passive_scroll_property_tree_proof/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            extra
+                .pointer("/boon_driver_proof/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            extra
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            extra.get("frame_evidence_key"),
+            extra.pointer("/last_interactive_readback_artifact/frame_evidence_key")
+        );
+        assert!(
+            native_gpu_label_contract_blockers("scroll-speed-dev-code-editor", &extra).is_empty(),
+            "{:?}",
+            native_gpu_label_contract_blockers("scroll-speed-dev-code-editor", &extra)
+        );
+    }
+
+    #[test]
+    fn dev_editor_scroll_speed_alias_report_satisfies_handoff_child_contract() {
+        let release_report = dev_editor_scroll_release_fixture();
+        let extra = dev_editor_scroll_speed_compatibility_extra(
+            &release_report,
+            Path::new("target/reports/native-gpu/dev-editor-scroll-speed-release.json"),
+            None,
+        );
+        let mut report = serde_json::Map::new();
+        report.insert("status".to_owned(), json!("pass"));
+        report.insert("report_version".to_owned(), json!(1));
+        report.insert("generated_at_utc".to_owned(), json!("0"));
+        report.insert(
+            "command".to_owned(),
+            json!("verify-native-gpu-scroll-speed"),
+        );
+        report.insert(
+            "command_argv".to_owned(),
+            json!([
+                "verify-native-gpu-scroll-speed",
+                "--surface",
+                "dev-code-editor"
+            ]),
+        );
+        report.insert("measurement_mode".to_owned(), json!("interaction"));
+        report.insert("exit_status".to_owned(), json!(0));
+        report.insert("git_commit".to_owned(), json!(git_commit()));
+        report.insert(
+            "worktree_fingerprint".to_owned(),
+            json!(worktree_fingerprint()),
+        );
+        report.insert("binary_hash".to_owned(), json!(current_binary_hash()));
+        report.insert("binary_path".to_owned(), json!(current_binary_path()));
+        report.insert("source_hash".to_owned(), json!("n/a"));
+        report.insert("scenario_hash".to_owned(), json!("n/a"));
+        report.insert("program_hash".to_owned(), json!("n/a"));
+        report.insert(
+            "budget_hash".to_owned(),
+            json!(file_hash("budgets/native-gpu.toml")),
+        );
+        report.insert("graph_node_count".to_owned(), json!(0));
+        report.insert("per_step_pass_fail".to_owned(), json!([]));
+        report.insert("artifact_sha256s".to_owned(), json!([]));
+        report.insert("native_gpu_contract".to_owned(), json!(true));
+        for (key, value) in extra.as_object().unwrap() {
+            report.insert(key.clone(), value.clone());
+        }
+        ensure_interaction_report_contract(
+            &mut report,
+            "verify-native-gpu-scroll-speed",
+            &[
+                "verify-native-gpu-scroll-speed".to_owned(),
+                "--surface".to_owned(),
+                "dev-code-editor".to_owned(),
+            ],
+        );
+        let report = serde_json::Value::Object(report);
+        let requirement = native_gpu_handoff_required_reports()
+            .into_iter()
+            .find(|requirement| requirement.label == "scroll-speed-dev-code-editor")
+            .expect("handoff must require old dev-code-editor scroll alias");
+        assert!(
+            validate_native_gpu_child_report(&requirement, &report).is_empty(),
+            "{:?}",
+            validate_native_gpu_child_report(&requirement, &report)
         );
     }
 

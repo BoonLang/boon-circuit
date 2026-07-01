@@ -1842,6 +1842,52 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   `verify-native-gpu-all --check-existing` still requires current reports for
   this worktree.
 
+2026-07-01 dev-code-editor scroll compatibility alias slice:
+
+- `verify-native-gpu-scroll-speed --surface dev-code-editor` now follows the
+  active native GPU architecture contract by acting as a compatibility alias to
+  `verify-native-dev-editor-scroll-speed --profile release`.
+- The old report path and aggregate identity remain intact:
+  `target/reports/native-gpu/scroll-speed-dev-code-editor.json`,
+  `command=verify-native-gpu-scroll-speed`, and command argv containing
+  `--surface dev-code-editor`.
+- The alias report hash-links the delegated release report through
+  `compatibility_alias.source_report_sha256`, carries the delegated WGPU
+  readback/frame-evidence proof, normalizes the release axis-specific scroll
+  observations into the old scroll model fields, and then runs the existing
+  generic route, property-tree, budget, Boon-driver, and stage-counter report
+  helpers.
+- Added focused xtask coverage proving:
+  - a synthetic passing release dev-editor scroll report maps to the old
+    `scroll-speed-dev-code-editor` label contract;
+  - the resulting compatibility report satisfies the handoff child-report
+    command/argv/label contract.
+- Focused verification passed:
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask dev_editor_scroll_speed_alias`;
+  - `cargo test -q -p xtask native_gpu`.
+- Fresh native verification now writes a schema-valid compatibility report, but
+  it fails honestly because the delegated release dev-editor scroll verifier is
+  over budget:
+  - `timeout 900s cargo xtask verify-native-gpu-scroll-speed --surface
+    dev-code-editor --report
+    target/reports/native-gpu/scroll-speed-dev-code-editor.json` failed after
+    writing the report;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-dev-code-editor.json` passed;
+  - delegated `target/reports/native-gpu/dev-editor-scroll-speed-release.json`
+    has `status=fail` with blocker `dev editor scroll exceeded
+    wheel-to-visible budget`;
+  - observed release `dev_editor_frame_ms_p50_p95_p99_max.p95` was
+    `24.143704 ms`, above the `16.7 ms` release target, and the alias report
+    propagated that as `budget_pass=false`.
+- This completes the compatibility/report-alignment slice but not the
+  performance goal. The next implementation slice should reduce the real
+  release dev-editor scroll path, especially frame-time outliers and any
+  remaining text/layout/render work during passive scroll.
+
 ## Implementation Slices
 
 1. Terminology and schema:

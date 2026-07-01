@@ -54860,18 +54860,6 @@ fn cells_structured_external_visible_surface_formula_probe(
         == Some("pass");
     let address_change_required = previous_address != expected_address;
     let formula_change_required = previous_formula != expected_formula;
-    let formula_text_visible = !formula_change_required
-        || retained_bound_sync_changed_text_path_to_value(
-            retained_sync,
-            "store.selected_input.editing_text",
-            expected_formula,
-        );
-    let address_text_visible = !address_change_required
-        || retained_bound_sync_changed_text_path_to_value(
-            retained_sync,
-            "store.selected_address",
-            expected_address,
-        );
     let focus_state_selected_address = external_proof
         .pointer("/input_overlay_focus_state/selected_address")
         .and_then(serde_json::Value::as_str)
@@ -54901,6 +54889,19 @@ fn cells_structured_external_visible_surface_formula_probe(
             == Some(true);
     let focus_state_matches = focus_state_selected_address == expected_address
         && (!address_change_required || focus_state_previous_address == previous_address);
+    let formula_text_visible = !formula_change_required
+        || retained_bound_sync_changed_text_path_to_value(
+            retained_sync,
+            "store.selected_input.editing_text",
+            expected_formula,
+        );
+    let address_text_retained_visible = !address_change_required
+        || retained_bound_sync_changed_text_path_to_value(
+            retained_sync,
+            "store.selected_address",
+            expected_address,
+        );
+    let address_text_visible = address_text_retained_visible || focus_state_matches;
     let selected_cell_visible = !address_change_required
         || (focused_node_probe_pass
             && focused_node_selected
@@ -54946,6 +54947,7 @@ fn cells_structured_external_visible_surface_formula_probe(
         "formula_change_required": formula_change_required,
         "address_change_required": address_change_required,
         "formula_text_visible": formula_text_visible,
+        "address_text_retained_visible": address_text_retained_visible,
         "address_text_visible": address_text_visible,
         "focus_state_selected_address": focus_state_selected_address,
         "focus_state_previous_address": focus_state_previous_address,
@@ -57676,7 +57678,12 @@ fn wait_for_cells_formula_visible_match(
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
                         }));
-                        if visual_formula_probe.is_none() {
+                        let visual_formula_pending = visual_formula_probe
+                            .as_ref()
+                            .and_then(|probe| probe.get("status"))
+                            .and_then(serde_json::Value::as_str)
+                            != Some("pass");
+                        if visual_formula_pending {
                             let retained_render_probe = json!({
                                 "status": "pass",
                                 "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
@@ -57715,6 +57722,8 @@ fn wait_for_cells_formula_visible_match(
                                 == Some("pass")
                             {
                                 readback_probe = Some(retained_render_probe);
+                                visual_formula_probe = Some(visual_probe);
+                            } else {
                                 visual_formula_probe = Some(visual_probe);
                             }
                         }
@@ -82668,6 +82677,41 @@ mod tests {
         assert_eq!(
             structured_result
                 .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let mut focus_address_structured_probe = structured_probe.clone();
+        focus_address_structured_probe["last_external_render_proof"]["retained_bound_sync"]["text_update_values"] = json!([
+            {
+                "node": "formula-input",
+                "text": "=add(A0,A1)",
+                "paths": ["store.selected_input.editing_text"]
+            }
+        ]);
+        let focus_address_result = cells_visual_formula_probe_from_readback(
+            &focus_address_structured_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            focus_address_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "same-frame focus/selected-node evidence should prove the selected address when the visible formula text is current"
+        );
+        assert_eq!(
+            focus_address_result
+                .pointer("/structured_external_visible_surface_probe/address_text_retained_visible")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            focus_address_result
+                .pointer("/structured_external_visible_surface_probe/focus_state_matches")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );

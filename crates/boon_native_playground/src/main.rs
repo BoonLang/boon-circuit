@@ -39713,13 +39713,28 @@ fn preview_try_apply_simple_source_click_input(
         events,
     )?;
     let live_events_ms = elapsed_ms(live_events_started);
-    let retained_selection_patch = post_turn_state_summary.as_ref().and_then(|summary| {
-        preview_retained_selection_patch_from_shared_snapshot(
-            shared_render_state,
-            summary,
-            &previous_selected_nodes,
-        )
-    });
+    let focused_selected_node_patch = focus_state_applied
+        && preview_display_node_has_style_key(shared_render_state, &node, "selected");
+    let retained_selection_patch = if focused_selected_node_patch {
+        let mut patch = PreviewRetainedSelectionPatch::default();
+        patch.current_nodes.insert(node.clone());
+        patch
+            .previous_nodes
+            .extend(previous_selected_nodes.iter().cloned());
+        patch.sync_nodes.insert(node.clone());
+        patch
+            .sync_nodes
+            .extend(previous_selected_nodes.iter().cloned());
+        Some(patch)
+    } else {
+        post_turn_state_summary.as_ref().and_then(|summary| {
+            preview_retained_selection_patch_from_shared_snapshot(
+                shared_render_state,
+                summary,
+                &previous_selected_nodes,
+            )
+        })
+    };
     let mut bound_sync_nodes = BTreeSet::new();
     bound_sync_nodes.insert(node.clone());
     if let Some(previous_focused_node) = previous_focused_node {
@@ -42127,6 +42142,30 @@ fn preview_current_selected_nodes_from_shared_layout(
     layout_frame_from_layout_proof(&shared.layout_proof)
         .ok()
         .map(|frame| preview_current_selected_display_nodes(&frame))
+}
+
+fn preview_display_node_has_style_key(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    node: &str,
+    style_key: &str,
+) -> bool {
+    let Ok(shared) = shared_render_state.lock() else {
+        return false;
+    };
+    if let Some(frame) = shared.layout_frame_override.as_deref() {
+        return frame
+            .display_list
+            .iter()
+            .any(|item| item.node.0 == node && item.style.contains_key(style_key));
+    }
+    layout_frame_from_layout_proof(&shared.layout_proof)
+        .ok()
+        .is_some_and(|frame| {
+            frame
+                .display_list
+                .iter()
+                .any(|item| item.node.0 == node && item.style.contains_key(style_key))
+        })
 }
 
 fn preview_selected_display_nodes_for_address(
@@ -63477,6 +63516,56 @@ mod tests {
             Some("generic selected-node binding evidence was unavailable")
         );
         assert_eq!(stats.style_update_count, 2);
+    }
+
+    #[test]
+    fn display_node_style_key_probe_uses_generic_node_identity() {
+        let mut document_frame = boon_document_model::DocumentFrame::empty("root");
+        let root = boon_document_model::DocumentNodeId("root".to_owned());
+        append_child(
+            &mut document_frame,
+            root.clone(),
+            dev_node(
+                "choice-alpha",
+                boon_document_model::DocumentNodeKind::Button,
+                Some("Alpha".to_owned()),
+                &[("width", "96"), ("height", "24"), ("selected", "false")],
+            ),
+        );
+        append_child(
+            &mut document_frame,
+            root,
+            dev_node(
+                "choice-beta",
+                boon_document_model::DocumentNodeKind::Button,
+                Some("Beta".to_owned()),
+                &[("width", "96"), ("height", "24")],
+            ),
+        );
+        let layout_frame = layout_frame_for_document_frame(&document_frame, (320.0, 120.0))
+            .expect("test frame should lower");
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: json!({}),
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+
+        assert!(preview_display_node_has_style_key(
+            &shared_render_state,
+            "choice-alpha",
+            "selected"
+        ));
+        assert!(!preview_display_node_has_style_key(
+            &shared_render_state,
+            "choice-beta",
+            "selected"
+        ));
     }
 
     #[test]

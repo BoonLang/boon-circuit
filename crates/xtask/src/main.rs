@@ -50736,12 +50736,20 @@ fn native_scroll_axis_product_path_samples(
         .collect()
 }
 
+const PRODUCT_PATH_PREVIEW_PERF_SUMMARY_KEYS: &[&str] = &[
+    "present_call_ms_p50_p95_p99_max",
+    "frame_present_call_ms_p50_p95_p99_max",
+    "surface_acquire_call_ms_p50_p95_p99_max",
+    "queue_submit_call_ms_p50_p95_p99_max",
+    "present_path_ms_p50_p95_p99_max",
+];
+
 fn native_scroll_axis_product_path_sample(
     observation: &serde_json::Value,
     axis: &str,
 ) -> Option<serde_json::Value> {
-    let summary = observation
-        .pointer("/measured_loop_report/preview_perf_stats/input_to_present_ms_p50_p95_p99_max")?;
+    let preview_perf_stats = observation.pointer("/measured_loop_report/preview_perf_stats")?;
+    let summary = preview_perf_stats.get("input_to_present_ms_p50_p95_p99_max")?;
     let sample_count = summary
         .get("sample_count")
         .and_then(serde_json::Value::as_u64)
@@ -50750,26 +50758,50 @@ fn native_scroll_axis_product_path_sample(
     if sample_count == 0 || p95.is_none_or(|value| !value.is_finite() || value <= 0.0) {
         return None;
     }
-    Some(json!({
-        "axis": axis,
-        "attempt": observation
-            .get("axis_retry_attempt_index")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        "render_loop_mode": observation
+    let mut sample = serde_json::Map::new();
+    sample.insert("axis".to_owned(), json!(axis));
+    sample.insert(
+        "attempt".to_owned(),
+        json!(
+            observation
+                .get("axis_retry_attempt_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+    );
+    sample.insert(
+        "render_loop_mode".to_owned(),
+        observation
             .pointer("/measured_loop_report/preview_perf_stats/render_loop_mode")
             .cloned()
             .unwrap_or_else(|| json!("missing")),
-        "frame_pacing_state": observation
+    );
+    sample.insert(
+        "frame_pacing_state".to_owned(),
+        observation
             .pointer("/measured_loop_report/preview_perf_stats/frame_pacing/state")
             .cloned()
             .unwrap_or_else(|| json!("missing")),
-        "requested_animation_burst_count": observation
-            .pointer("/measured_loop_report/render_loop_state/requested_animation_burst_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        "input_to_present_ms_p50_p95_p99_max": summary.clone()
-    }))
+    );
+    sample.insert(
+        "requested_animation_burst_count".to_owned(),
+        json!(
+            observation
+                .pointer("/measured_loop_report/render_loop_state/requested_animation_burst_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+    );
+    sample.insert(
+        "input_to_present_ms_p50_p95_p99_max".to_owned(),
+        summary.clone(),
+    );
+    for summary_key in PRODUCT_PATH_PREVIEW_PERF_SUMMARY_KEYS {
+        if let Some(summary) = preview_perf_stats.get(summary_key) {
+            sample.insert((*summary_key).to_owned(), summary.clone());
+        }
+    }
+    Some(serde_json::Value::Object(sample))
 }
 
 fn native_scroll_axis_product_path_timing(
@@ -50788,17 +50820,6 @@ fn native_scroll_product_path_timing_from_samples(
     let mut requested_animation_burst_count = 0_u64;
     let mut all_demand_driven = !samples.is_empty();
     let mut any_requested_burst = false;
-    let max_summary_f64 = |field: &str| {
-        samples
-            .iter()
-            .filter_map(|sample| {
-                sample
-                    .pointer(&format!("/input_to_present_ms_p50_p95_p99_max/{field}"))
-                    .and_then(numeric_value_as_f64)
-            })
-            .filter(|value| value.is_finite())
-            .max_by(f64::total_cmp)
-    };
     for sample in &samples {
         sample_count = sample_count.saturating_add(
             sample
@@ -50821,11 +50842,11 @@ fn native_scroll_product_path_timing_from_samples(
             .and_then(serde_json::Value::as_str)
             == Some("requested_animation_burst");
     }
-    let p50 = max_summary_f64("p50");
-    let p95 = max_summary_f64("p95");
-    let p99 = max_summary_f64("p99");
-    let max = max_summary_f64("max");
-    json!({
+    let input_to_present_summary = native_scroll_product_path_summary_from_samples(
+        &samples,
+        "input_to_present_ms_p50_p95_p99_max",
+    );
+    let mut timing = json!({
         "status": if sample_count > 0 { "pass" } else { "missing-samples" },
         "source": source,
         "aggregation": "conservative max percentile across independent product-path observations",
@@ -50834,14 +50855,55 @@ fn native_scroll_product_path_timing_from_samples(
             "state": if any_requested_burst { "requested_animation_burst" } else { "idle" }
         },
         "requested_animation_burst_count": requested_animation_burst_count,
-        "input_to_present_ms_p50_p95_p99_max": {
-            "sample_count": sample_count,
-            "p50": p50,
-            "p95": p95,
-            "p99": p99,
-            "max": max
-        },
+        "input_to_present_ms_p50_p95_p99_max": input_to_present_summary,
         "samples": samples
+    });
+    if let Some(timing) = timing.as_object_mut() {
+        for summary_key in PRODUCT_PATH_PREVIEW_PERF_SUMMARY_KEYS {
+            let summary = native_scroll_product_path_summary_from_samples(&samples, summary_key);
+            if summary
+                .get("sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            {
+                timing.insert((*summary_key).to_owned(), summary);
+            }
+        }
+    }
+    timing
+}
+
+fn native_scroll_product_path_summary_from_samples(
+    samples: &[serde_json::Value],
+    summary_key: &str,
+) -> serde_json::Value {
+    let mut sample_count = 0_u64;
+    for sample in samples {
+        sample_count = sample_count.saturating_add(
+            sample
+                .pointer(&format!("/{summary_key}/sample_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    let max_summary_f64 = |field: &str| {
+        samples
+            .iter()
+            .filter_map(|sample| {
+                sample
+                    .pointer(&format!("/{summary_key}/{field}"))
+                    .and_then(numeric_value_as_f64)
+            })
+            .filter(|value| value.is_finite())
+            .max_by(f64::total_cmp)
+    };
+    json!({
+        "sample_count": sample_count,
+        "p50": max_summary_f64("p50"),
+        "p95": max_summary_f64("p95"),
+        "p99": max_summary_f64("p99"),
+        "max": max_summary_f64("max")
     })
 }
 
@@ -51068,6 +51130,74 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
         "horizontal": horizontal_p95,
         "status": "axis-specific-post-real-window-input"
     });
+    let axis_loop_report_field = |axis: &str, field: &str| {
+        axis_summary
+            .pointer(&format!("/{axis}_observation/measured_loop_report/{field}"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let combined_axis_string_field = |field: &str| {
+        let vertical = axis_loop_report_field("vertical", field);
+        let horizontal = axis_loop_report_field("horizontal", field);
+        match (vertical.as_str(), horizontal.as_str()) {
+            (Some(vertical), Some(horizontal)) if vertical == horizontal => json!(vertical),
+            (Some(_), Some(_)) => json!("mixed"),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let combined_axis_bool_field = |field: &str| {
+        let vertical = axis_loop_report_field("vertical", field);
+        let horizontal = axis_loop_report_field("horizontal", field);
+        match (vertical.as_bool(), horizontal.as_bool()) {
+            (Some(vertical), Some(horizontal)) => json!(vertical && horizontal),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let combined_present_path = json!({
+        "present_path_mode": combined_axis_string_field("present_path_mode"),
+        "present_path_requested_mode": combined_axis_string_field("present_path_requested_mode"),
+        "present_path_selection_reason": combined_axis_string_field("present_path_selection_reason"),
+        "present_path_hooks_present": combined_axis_bool_field("present_path_hooks_present"),
+        "present_path_surface_copy_to_present_supported": combined_axis_bool_field("present_path_surface_copy_to_present_supported"),
+        "present_path_readback_enabled": combined_axis_bool_field("present_path_readback_enabled"),
+        "last_render_target_kind": combined_axis_string_field("last_render_target_kind")
+    });
+    extra["axis_specific_present_path"] = json!({
+        "status": "pass",
+        "vertical": {
+            "present_path_mode": axis_loop_report_field("vertical", "present_path_mode"),
+            "present_path_requested_mode": axis_loop_report_field("vertical", "present_path_requested_mode"),
+            "present_path_selection_reason": axis_loop_report_field("vertical", "present_path_selection_reason"),
+            "present_path_hooks_present": axis_loop_report_field("vertical", "present_path_hooks_present"),
+            "present_path_surface_copy_to_present_supported": axis_loop_report_field("vertical", "present_path_surface_copy_to_present_supported"),
+            "present_path_readback_enabled": axis_loop_report_field("vertical", "present_path_readback_enabled"),
+            "last_render_target_kind": axis_loop_report_field("vertical", "last_render_target_kind")
+        },
+        "horizontal": {
+            "present_path_mode": axis_loop_report_field("horizontal", "present_path_mode"),
+            "present_path_requested_mode": axis_loop_report_field("horizontal", "present_path_requested_mode"),
+            "present_path_selection_reason": axis_loop_report_field("horizontal", "present_path_selection_reason"),
+            "present_path_hooks_present": axis_loop_report_field("horizontal", "present_path_hooks_present"),
+            "present_path_surface_copy_to_present_supported": axis_loop_report_field("horizontal", "present_path_surface_copy_to_present_supported"),
+            "present_path_readback_enabled": axis_loop_report_field("horizontal", "present_path_readback_enabled"),
+            "last_render_target_kind": axis_loop_report_field("horizontal", "last_render_target_kind")
+        },
+        "combined": combined_present_path.clone()
+    });
+    for field in [
+        "present_path_mode",
+        "present_path_requested_mode",
+        "present_path_selection_reason",
+        "present_path_hooks_present",
+        "present_path_surface_copy_to_present_supported",
+        "present_path_readback_enabled",
+        "last_render_target_kind",
+    ] {
+        extra[field] = combined_present_path
+            .get(field)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
     if let Some(product_path_timing) = axis_summary.get("product_path_timing").cloned() {
         let product_path_sample_count = product_path_timing
             .pointer("/input_to_present_ms_p50_p95_p99_max/sample_count")
@@ -51112,6 +51242,11 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
                         .cloned()
                         .unwrap_or_else(|| json!({"sample_count": 0})),
                 );
+                for summary_key in PRODUCT_PATH_PREVIEW_PERF_SUMMARY_KEYS {
+                    if let Some(summary) = product_path_timing.get(summary_key) {
+                        preview_perf_stats.insert((*summary_key).to_owned(), summary.clone());
+                    }
+                }
             }
             if !extra
                 .get("render_loop_state")
@@ -84825,6 +84960,82 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
     }
 
     #[test]
+    fn product_path_timing_aggregates_present_phase_summaries() {
+        let metric = |p95: f64| {
+            json!({
+                "sample_count": 1,
+                "p50": p95 - 0.5,
+                "p95": p95,
+                "p99": p95 + 0.2,
+                "max": p95 + 0.5
+            })
+        };
+        let samples = vec![
+            json!({
+                "render_loop_mode": "demand_driven",
+                "frame_pacing_state": "requested_animation_burst",
+                "requested_animation_burst_count": 1,
+                "input_to_present_ms_p50_p95_p99_max": metric(8.0),
+                "present_call_ms_p50_p95_p99_max": metric(3.0),
+                "frame_present_call_ms_p50_p95_p99_max": metric(3.0),
+                "surface_acquire_call_ms_p50_p95_p99_max": metric(0.4),
+                "queue_submit_call_ms_p50_p95_p99_max": metric(0.2),
+                "present_path_ms_p50_p95_p99_max": metric(3.6)
+            }),
+            json!({
+                "render_loop_mode": "demand_driven",
+                "frame_pacing_state": "requested_animation_burst",
+                "requested_animation_burst_count": 1,
+                "input_to_present_ms_p50_p95_p99_max": metric(9.0),
+                "present_call_ms_p50_p95_p99_max": metric(4.0),
+                "frame_present_call_ms_p50_p95_p99_max": metric(4.0),
+                "surface_acquire_call_ms_p50_p95_p99_max": metric(0.5),
+                "queue_submit_call_ms_p50_p95_p99_max": metric(0.3),
+                "present_path_ms_p50_p95_p99_max": metric(4.8)
+            }),
+        ];
+
+        let timing = native_scroll_product_path_timing_from_samples(samples, "unit-test");
+
+        assert_eq!(
+            timing
+                .pointer("/input_to_present_ms_p50_p95_p99_max/sample_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            timing
+                .pointer("/present_path_ms_p50_p95_p99_max/sample_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            timing
+                .pointer("/present_path_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(4.8)
+        );
+        assert_eq!(
+            timing
+                .pointer("/surface_acquire_call_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.5)
+        );
+        assert_eq!(
+            timing
+                .pointer("/queue_submit_call_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.3)
+        );
+        assert_eq!(
+            timing
+                .pointer("/frame_present_call_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(4.0)
+        );
+    }
+
+    #[test]
     fn axis_specific_product_path_timing_promotes_sustained_samples() {
         let product_sample = |axis: &str, attempt: u64, p95: f64| {
             json!({
@@ -84868,6 +85079,41 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                         "p99": 9.2,
                         "max": 9.5
                     },
+                    "present_call_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 5.0,
+                        "p95": 6.0,
+                        "p99": 6.2,
+                        "max": 6.5
+                    },
+                    "frame_present_call_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 5.0,
+                        "p95": 6.0,
+                        "p99": 6.2,
+                        "max": 6.5
+                    },
+                    "surface_acquire_call_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 0.2,
+                        "p95": 0.3,
+                        "p99": 0.4,
+                        "max": 0.5
+                    },
+                    "queue_submit_call_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 0.4,
+                        "p95": 0.5,
+                        "p99": 0.6,
+                        "max": 0.7
+                    },
+                    "present_path_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 5.6,
+                        "p95": 6.8,
+                        "p99": 7.1,
+                        "max": 7.7
+                    },
                     "samples": [
                         product_sample("vertical", 1, 7.0),
                         product_sample("vertical", 2, 8.0),
@@ -84876,6 +85122,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                     ]
                 },
                 "vertical_observation": {
+                    "measured_loop_report": {
+                        "present_path_mode": "direct_visible_surface",
+                        "present_path_requested_mode": "direct_visible_surface",
+                        "present_path_selection_reason": "default_direct_visible_surface_with_separate_readback",
+                        "present_path_hooks_present": true,
+                        "present_path_surface_copy_to_present_supported": true,
+                        "present_path_readback_enabled": true,
+                        "last_render_target_kind": "visible-surface-direct"
+                    },
                     "render_hook_app_owned_proof_skipped": true,
                     "surface_post_input_frame_timing": {
                         "measured_frame_count": 30,
@@ -84892,6 +85147,15 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                     }
                 },
                 "horizontal_observation": {
+                    "measured_loop_report": {
+                        "present_path_mode": "direct_visible_surface",
+                        "present_path_requested_mode": "direct_visible_surface",
+                        "present_path_selection_reason": "default_direct_visible_surface_with_separate_readback",
+                        "present_path_hooks_present": true,
+                        "present_path_surface_copy_to_present_supported": true,
+                        "present_path_readback_enabled": true,
+                        "last_render_target_kind": "visible-surface-direct"
+                    },
                     "render_hook_app_owned_proof_skipped": true,
                     "surface_post_input_frame_timing": {
                         "measured_frame_count": 30,
@@ -84933,6 +85197,66 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .pointer("/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/sample_count")
                 .and_then(serde_json::Value::as_u64),
             Some(4)
+        );
+        assert_eq!(
+            report
+                .pointer("/preview_perf_stats/present_path_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(6.8)
+        );
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/present_path_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(6.8)
+        );
+        assert_eq!(
+            report
+                .pointer("/frame_budget_split/preview_perf_frame_present_call_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(6.0)
+        );
+        assert_eq!(
+            report
+                .get("present_path_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("direct_visible_surface")
+        );
+        assert_eq!(
+            report
+                .get("present_path_requested_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("direct_visible_surface")
+        );
+        assert_eq!(
+            report
+                .get("present_path_selection_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("default_direct_visible_surface_with_separate_readback")
+        );
+        assert_eq!(
+            report
+                .get("present_path_hooks_present")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("present_path_surface_copy_to_present_supported")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("present_path_readback_enabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("last_render_target_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("visible-surface-direct")
         );
         assert_eq!(
             report

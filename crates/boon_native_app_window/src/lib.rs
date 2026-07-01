@@ -622,6 +622,39 @@ pub enum NativeFramePacingState {
     Probe,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePresentPathMode {
+    DirectVisibleSurface,
+    AppOwnedOffscreenCopyToPresent,
+}
+
+impl NativePresentPathMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectVisibleSurface => "direct_visible_surface",
+            Self::AppOwnedOffscreenCopyToPresent => "app_owned_offscreen_copy_to_present",
+        }
+    }
+
+    fn render_target_kind(self) -> &'static str {
+        match self {
+            Self::DirectVisibleSurface => "visible-surface-direct",
+            Self::AppOwnedOffscreenCopyToPresent => "app-owned-offscreen-copy-to-present",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePresentPathSelection {
+    requested_mode: NativePresentPathMode,
+    selected_mode: NativePresentPathMode,
+    reason: &'static str,
+    hooks_present: bool,
+    surface_copy_to_present_supported: bool,
+    readback_enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeFramePacing {
     pub state: NativeFramePacingState,
@@ -805,6 +838,12 @@ pub struct NativeRenderLoopState {
     pub current_scheduler_reason: Option<NativeSchedulerReason>,
     pub current_role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub last_render_target_kind: Option<String>,
+    pub last_present_path_requested_mode: Option<NativePresentPathMode>,
+    pub last_present_path_mode: Option<NativePresentPathMode>,
+    pub last_present_path_selection_reason: Option<String>,
+    pub last_present_path_hooks_present: bool,
+    pub last_present_path_surface_copy_to_present_supported: bool,
+    pub last_present_path_readback_enabled: bool,
     pub last_poll_started_elapsed_ms: Option<f64>,
     pub last_dirty_poll_elapsed_ms: Option<f64>,
     pub last_accepted_host_input_event_wake_count: u64,
@@ -881,6 +920,12 @@ impl NativeRenderLoopState {
             current_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
             current_role_dirty_reason: None,
             last_render_target_kind: None,
+            last_present_path_requested_mode: None,
+            last_present_path_mode: None,
+            last_present_path_selection_reason: None,
+            last_present_path_hooks_present: false,
+            last_present_path_surface_copy_to_present_supported: false,
+            last_present_path_readback_enabled: false,
             last_poll_started_elapsed_ms: None,
             last_dirty_poll_elapsed_ms: None,
             last_accepted_host_input_event_wake_count: 0,
@@ -1163,6 +1208,16 @@ impl NativeRenderLoopState {
 
     pub fn note_render_target_kind(&mut self, render_target_kind: &'static str) {
         self.last_render_target_kind = Some(render_target_kind.to_owned());
+    }
+
+    fn note_present_path_selection(&mut self, selection: NativePresentPathSelection) {
+        self.last_present_path_requested_mode = Some(selection.requested_mode);
+        self.last_present_path_mode = Some(selection.selected_mode);
+        self.last_present_path_selection_reason = Some(selection.reason.to_owned());
+        self.last_present_path_hooks_present = selection.hooks_present;
+        self.last_present_path_surface_copy_to_present_supported =
+            selection.surface_copy_to_present_supported;
+        self.last_present_path_readback_enabled = selection.readback_enabled;
     }
 
     pub fn note_idle_wait(
@@ -1596,6 +1651,9 @@ pub struct AppWindowSurfaceProof {
     pub supported_usages: String,
     pub surface_copy_to_present_supported: bool,
     pub surface_copy_src_readback_supported: bool,
+    pub present_path_mode: Option<NativePresentPathMode>,
+    pub present_path_requested_mode: Option<NativePresentPathMode>,
+    pub present_path_selection_reason: Option<String>,
     pub logical_size: Viewport,
     pub physical_size: PhysicalSize,
     pub acquired_surface_texture: bool,
@@ -3165,6 +3223,9 @@ async fn run_surface_probe_inner(
         supported_usages,
         surface_copy_to_present_supported,
         surface_copy_src_readback_supported,
+        present_path_mode: render_loop_state.last_present_path_mode,
+        present_path_requested_mode: render_loop_state.last_present_path_requested_mode,
+        present_path_selection_reason: render_loop_state.last_present_path_selection_reason.clone(),
         logical_size: Viewport {
             surface: 1,
             width: size.width() as f32,
@@ -3213,6 +3274,7 @@ async fn run_surface_probe_inner(
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
     let mut preview_perf_accumulator = NativePreviewPerfAccumulator::default();
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
+    let requested_present_path_mode = requested_present_path_mode_from_env();
     let async_render_loop_report_writer = options
         .render_loop_state_report
         .as_ref()
@@ -3577,17 +3639,16 @@ async fn run_surface_probe_inner(
         let mut rendered_layout_revision = rendered_revision;
         let mut rendered_render_scene_revision = rendered_revision;
         let readback_enabled = options.readback_artifact_dir.is_some();
-        let use_offscreen_copy_to_present = should_use_offscreen_copy_to_present(
+        let present_path_selection = select_native_present_path_mode(
             hooks.is_some(),
             surface_copy_to_present_supported,
-            std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some(),
+            requested_present_path_mode,
             readback_enabled,
         );
-        let render_target_kind = if use_offscreen_copy_to_present {
-            "app-owned-offscreen-copy-to-present"
-        } else {
-            "visible-surface-direct"
-        };
+        let use_offscreen_copy_to_present = present_path_selection.selected_mode
+            == NativePresentPathMode::AppOwnedOffscreenCopyToPresent;
+        let render_target_kind = present_path_selection.selected_mode.render_target_kind();
+        render_loop_state.note_present_path_selection(present_path_selection);
         render_loop_state.note_render_target_kind(render_target_kind);
         let mut deferred_app_owned_readback_texture: Option<wgpu::Texture> = None;
 
@@ -4723,13 +4784,54 @@ fn should_defer_render_for_interactive_readback(
         && scheduler_reason != Some(NativeSchedulerReason::HostInput)
 }
 
-fn should_use_offscreen_copy_to_present(
+fn requested_present_path_mode_from_env() -> NativePresentPathMode {
+    if std::env::var_os("BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT").is_some() {
+        NativePresentPathMode::AppOwnedOffscreenCopyToPresent
+    } else {
+        NativePresentPathMode::DirectVisibleSurface
+    }
+}
+
+fn select_native_present_path_mode(
     hooks_present: bool,
     surface_copy_to_present_supported: bool,
-    explicit_offscreen_copy_requested: bool,
-    _readback_enabled: bool,
-) -> bool {
-    hooks_present && surface_copy_to_present_supported && explicit_offscreen_copy_requested
+    requested_mode: NativePresentPathMode,
+    readback_enabled: bool,
+) -> NativePresentPathSelection {
+    let (selected_mode, reason) = match requested_mode {
+        NativePresentPathMode::DirectVisibleSurface => (
+            NativePresentPathMode::DirectVisibleSurface,
+            if readback_enabled {
+                "default_direct_visible_surface_with_separate_readback"
+            } else {
+                "default_direct_visible_surface"
+            },
+        ),
+        NativePresentPathMode::AppOwnedOffscreenCopyToPresent if !hooks_present => (
+            NativePresentPathMode::DirectVisibleSurface,
+            "offscreen_copy_requested_without_render_hook",
+        ),
+        NativePresentPathMode::AppOwnedOffscreenCopyToPresent
+            if !surface_copy_to_present_supported =>
+        {
+            (
+                NativePresentPathMode::DirectVisibleSurface,
+                "offscreen_copy_requested_without_surface_copy_dst",
+            )
+        }
+        NativePresentPathMode::AppOwnedOffscreenCopyToPresent => (
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            "explicit_offscreen_copy_to_present",
+        ),
+    };
+    NativePresentPathSelection {
+        requested_mode,
+        selected_mode,
+        reason,
+        hooks_present,
+        surface_copy_to_present_supported,
+        readback_enabled,
+    }
 }
 
 fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json::Value>) -> bool {
@@ -5391,6 +5493,17 @@ fn write_render_loop_state_report(
         "last_queue_submitted_elapsed_ms": state.last_queue_submitted_elapsed_ms,
         "last_present_completed_elapsed_ms": state.last_present_completed_elapsed_ms,
         "last_render_target_kind": state.last_render_target_kind,
+        "present_path_mode": state
+            .last_present_path_mode
+            .map(NativePresentPathMode::as_str),
+        "present_path_requested_mode": state
+            .last_present_path_requested_mode
+            .map(NativePresentPathMode::as_str),
+        "present_path_selection_reason": state.last_present_path_selection_reason,
+        "present_path_hooks_present": state.last_present_path_hooks_present,
+        "present_path_surface_copy_to_present_supported": state
+            .last_present_path_surface_copy_to_present_supported,
+        "present_path_readback_enabled": state.last_present_path_readback_enabled,
         "last_poll_diagnostics": state.last_poll_diagnostics,
         "frame_pacing": preview_perf_stats.frame_pacing.clone(),
         "preview_perf_stats": preview_perf_stats.clone(),
@@ -6953,24 +7066,109 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_copy_to_present_is_explicit_diagnostic_path() {
-        assert!(
-            !should_use_offscreen_copy_to_present(true, true, false, false),
-            "normal demand-driven preview frames without proof readback should render directly to the visible surface"
+    fn present_path_mode_selection_is_explicit_and_generic() {
+        let direct = select_native_present_path_mode(
+            true,
+            true,
+            NativePresentPathMode::DirectVisibleSurface,
+            false,
         );
-        assert!(!should_use_offscreen_copy_to_present(
-            false, true, true, false
-        ));
-        assert!(!should_use_offscreen_copy_to_present(
-            true, false, true, false
-        ));
-        assert!(
-            !should_use_offscreen_copy_to_present(true, true, false, true),
+        assert_eq!(
+            direct.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface
+        );
+        assert_eq!(direct.reason, "default_direct_visible_surface");
+
+        let direct_with_readback = select_native_present_path_mode(
+            true,
+            true,
+            NativePresentPathMode::DirectVisibleSurface,
+            true,
+        );
+        assert_eq!(
+            direct_with_readback.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface,
             "proof readback alone must not force the product frame through offscreen copy-to-present"
         );
-        assert!(should_use_offscreen_copy_to_present(
-            true, true, true, false
-        ));
+        assert_eq!(
+            direct_with_readback.reason,
+            "default_direct_visible_surface_with_separate_readback"
+        );
+
+        let no_hook = select_native_present_path_mode(
+            false,
+            true,
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            false,
+        );
+        assert_eq!(
+            no_hook.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface
+        );
+        assert_eq!(
+            no_hook.reason,
+            "offscreen_copy_requested_without_render_hook"
+        );
+
+        let no_copy_support = select_native_present_path_mode(
+            true,
+            false,
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            false,
+        );
+        assert_eq!(
+            no_copy_support.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface
+        );
+        assert_eq!(
+            no_copy_support.reason,
+            "offscreen_copy_requested_without_surface_copy_dst"
+        );
+
+        let offscreen = select_native_present_path_mode(
+            true,
+            true,
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            false,
+        );
+        assert_eq!(
+            offscreen.selected_mode,
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent
+        );
+        assert_eq!(offscreen.reason, "explicit_offscreen_copy_to_present");
+        assert_eq!(
+            offscreen.selected_mode.render_target_kind(),
+            "app-owned-offscreen-copy-to-present"
+        );
+    }
+
+    #[test]
+    fn present_path_selection_is_recorded_in_render_loop_state() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let selection = select_native_present_path_mode(
+            true,
+            true,
+            NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            true,
+        );
+
+        state.note_present_path_selection(selection);
+
+        assert_eq!(
+            state.last_present_path_requested_mode,
+            Some(NativePresentPathMode::AppOwnedOffscreenCopyToPresent)
+        );
+        assert_eq!(
+            state.last_present_path_mode,
+            Some(NativePresentPathMode::AppOwnedOffscreenCopyToPresent)
+        );
+        assert_eq!(
+            state.last_present_path_selection_reason.as_deref(),
+            Some("explicit_offscreen_copy_to_present")
+        );
+        assert!(state.last_present_path_hooks_present);
+        assert!(state.last_present_path_surface_copy_to_present_supported);
+        assert!(state.last_present_path_readback_enabled);
     }
 
     #[test]

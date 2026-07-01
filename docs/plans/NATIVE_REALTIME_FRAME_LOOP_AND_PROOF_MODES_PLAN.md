@@ -1536,12 +1536,112 @@ native UX latency gates, and generic runtime/list/currentness work remain.
     UX p95 and software-adapter blockers above;
   - `cargo xtask verify-report-schema
     target/reports/native-gpu/scroll-speed-cells.json` passed;
+
+2026-07-01 product-path present-summary aggregation slice:
+
+- Scroll-speed axis retries now preserve the fixed preview perf summary
+  objects when promoting sustained product-path samples:
+  - `present_call_ms_p50_p95_p99_max`;
+  - `frame_present_call_ms_p50_p95_p99_max`;
+  - `surface_acquire_call_ms_p50_p95_p99_max`;
+  - `queue_submit_call_ms_p50_p95_p99_max`;
+  - `present_path_ms_p50_p95_p99_max`.
+- The aggregation remains generic: it operates on preview perf summary keys and
+  does not branch on Cells, addresses, source paths, or fixture strings.
+- Fresh Cells scroll-speed report after this slice:
+  - `status=fail`;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_sample_count=4`;
+  - `product_path_input_to_present_ms_p95=24.152110999999422`;
+  - `preview_perf_present_path_ms_p95=9.965287`;
+  - `preview_perf_surface_acquire_call_ms_p95=0.03236`;
+  - `preview_perf_queue_submit_call_ms_p95=0.16121000000000002`;
+  - `preview_perf_frame_present_call_ms_p95=9.778191`;
+  - `renderer_cpu_frame_ms_p95=2.302152`;
+  - `present_blocking_ms_p95=24.974257`;
+  - `ux_frame_budget_pass=false`;
+  - `wall_clock_frame_budget_pass=true`;
+  - `renderer_frame_budget_pass=true`;
+  - `measured_present_mode=Mailbox`;
+  - `measured_supported_present_modes=[Mailbox, Fifo, Immediate]`;
+  - `measured_adapter_is_software=true`;
+  - blockers remain:
+    `native scroll-speed gate product-path input-to-present p95 is over target;
+    UX speed is not proven` and
+    `native scroll-speed gate ran on a software adapter; hardware-backed
+    real-window speed is not proven`.
+- Fresh verification:
+  - `cargo fmt --check`;
+  - `cargo test -q -p xtask product_path_timing_aggregates_present_phase_summaries`;
+  - `cargo test -q -p xtask axis_specific_product_path_timing_promotes_sustained_samples`;
+  - `cargo check -q -p xtask`;
+  - `git diff --check`;
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+    target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the
+    UX p95 and software-adapter blockers above;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-cells.json` passed.
   - `git diff --check`.
 - This slice is measurement and schema hardening, not a performance completion
   claim. The next implementation target is a generic surface-present
   coordinator / retained active-frame presentation path that avoids treating
   expensive frame-present blocking as normal interaction latency while keeping
   proof identity and product-path metrics honest.
+
+2026-07-01 explicit present-path mode evidence slice:
+
+- Native app-window now has a generic `NativePresentPathMode`:
+  - `direct_visible_surface`;
+  - `app_owned_offscreen_copy_to_present`.
+- The selected mode, requested mode, selection reason, render target kind, hook
+  availability, copy-to-present support, and readback status are recorded in
+  `NativeRenderLoopState`, top-level render-loop reports, and native surface
+  proof vocabulary.
+- The default product path remains `direct_visible_surface`. Proof/readback
+  does not force offscreen copy-to-present; offscreen copy-to-present is
+  selected only when explicitly requested and the generic render hook plus
+  surface copy support are available.
+- Scroll-speed axis aggregation now promotes present-path mode evidence from
+  vertical/horizontal measured loop reports into the final scroll report.
+- Fresh Cells scroll-speed report after this slice:
+  - `status=fail`;
+  - `present_path_mode=direct_visible_surface`;
+  - `present_path_requested_mode=direct_visible_surface`;
+  - `present_path_selection_reason=default_direct_visible_surface_with_separate_readback`;
+  - `present_path_hooks_present=true`;
+  - `present_path_surface_copy_to_present_supported=true`;
+  - `present_path_readback_enabled=true`;
+  - `last_render_target_kind=visible-surface-direct`;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_sample_count=4`;
+  - `product_path_input_to_present_ms_p95=25.586091000001034`;
+  - `preview_perf_present_path_ms_p95=10.131971`;
+  - `renderer_cpu_frame_ms_p95=1.4025379999999998`;
+  - `present_blocking_ms_p95=19.00599`;
+  - `ux_frame_budget_pass=false`;
+  - `wall_clock_frame_budget_pass=true`;
+  - `renderer_frame_budget_pass=true`;
+  - `measured_present_mode=Mailbox`;
+  - `measured_adapter_is_software=true`;
+  - blockers remain:
+    `native scroll-speed gate product-path input-to-present p95 is over target;
+    UX speed is not proven` and
+    `native scroll-speed gate ran on a software adapter; hardware-backed
+    real-window speed is not proven`.
+- Fresh verification:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_app_window`;
+  - `cargo test -q -p boon_native_app_window present_path`;
+  - `cargo test -q -p boon_report_schema native_gpu_schema`;
+  - `cargo test -q -p xtask product_path_timing_aggregates_present_phase_summaries`;
+  - `cargo test -q -p xtask axis_specific_product_path_timing_promotes_sustained_samples`;
+  - `cargo check -q -p xtask`;
+  - `git diff --check`;
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+    target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the
+    UX p95 and software-adapter blockers above;
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-cells.json` passed.
 
 ## Implementation Slices
 

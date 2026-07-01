@@ -1189,11 +1189,57 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   text-input refresh with no focused address present.
 - Focused verification passed:
   - `cargo test -q -p boon_native_playground selection_proxy_state_summary_refresh_uses_node_text_binding_without_address`
-  - `cargo test -q -p boon_native_playground selection_proxy_retained_refresh_uses_selected_node_without_address`
+ - `cargo test -q -p boon_native_playground selection_proxy_retained_refresh_uses_selected_node_without_address`
 - This still does not complete Cells click latency. The remaining work is to
   remove the leftover selected-address compatibility dependency from the hot
   path, prove click-to-formula-bar timing through native host events and WGPU
   evidence, and finish the retained frame-loop/runtime-currentness slices.
+
+2026-07-01 selection-proxy selected-address fallback narrowing:
+
+- `preview_refresh_selection_proxy_from_state_summary` now applies selected or
+  focused document node text bindings before consulting the legacy
+  `/store/selected_address` compatibility field. A normal node/binding refresh
+  no longer mutates `focused_address` or depends on a spreadsheet-shaped
+  selected-address state path.
+- Added a regression where the state summary contains a conflicting
+  `store.selected_address`, while the selected text-input node has a valid
+  generic text binding. The selection-proxy focused text must use the node
+  binding and leave `focused_address` unset.
+- A read-only subagent audit agreed that selection-proxy focused text is the
+  safest next address-shaped hot path to retire, and identified deeper
+  follow-ups in source-event routing and retained selected-address style
+  fallback.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo test -q -p boon_native_playground selection_proxy_`
+  - `cargo check -q -p boon_native_playground`
+- This is still a compatibility-stage cleanup. Address-shaped fallbacks remain
+  for older layouts and the larger event dispatch spine still carries address
+  payloads; those need a row/node/binding identity migration before the
+  no-hacks audit can pass.
+
+2026-07-01 retained bound-text sync no-address fast path:
+
+- Retained bound text-input sync now keeps the address-shaped
+  focused-editing-text fallback lazy. If a generic text binding already
+  supplies the next retained text value, the sync path no longer resolves
+  `address` source-intent metadata just to discard it.
+- The retained sync collector now deduplicates text updates by display item, so
+  a text input with both state-binding and text-binding index entries is patched
+  once instead of queuing duplicate retained text work.
+- Added a generic no-address regression where a retained text input updates
+  from a cached document text binding with no address metadata present. The
+  proof asserts the retained frame text, the single text update, and zero legacy
+  selection fallback count.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo test -q -p boon_native_playground retained_bound_text_sync_uses_text_binding_without_address_metadata`
+  - `cargo test -q -p boon_native_playground selection_proxy_`
+  - `cargo check -q -p boon_native_playground`
+- This removes another avoidable address lookup from retained text syncing, but
+  the larger source-event route still carries `address` payload compatibility
+  and selected-address overlay fallback remains for older evidence.
 
 ## Implementation Slices
 

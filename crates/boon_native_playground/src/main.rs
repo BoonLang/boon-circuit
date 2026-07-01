@@ -38031,6 +38031,14 @@ fn preview_refresh_selection_proxy_from_state_summary(
     if !input_state.focused_selection_proxy {
         return false;
     }
+    if let Some(text) = selection_proxy_text_from_state_summary_by_node(
+        shared_render_state,
+        state_summary,
+        input_state,
+    ) {
+        preview_apply_selection_proxy_focused_text(input_state, text);
+        return true;
+    }
     if let Some(address) = state_summary
         .pointer("/store/selected_address")
         .and_then(Value::as_str)
@@ -38044,6 +38052,16 @@ fn preview_refresh_selection_proxy_from_state_summary(
         state_summary,
         input_state,
     )
+}
+
+fn preview_apply_selection_proxy_focused_text(
+    input_state: &mut PreviewNativeInputState,
+    text: String,
+) {
+    input_state.focused_text = text;
+    input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+    input_state.replace_focused_text_on_next_edit = false;
+    preview_reset_caret_blink(input_state);
 }
 
 fn preview_refresh_selection_proxy_focused_text_from_retained_input(
@@ -42772,6 +42790,7 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
     }
     let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue, String)>::new();
     let mut text_updates = Vec::<(usize, String, String, Vec<String>)>::new();
+    let mut text_update_indexes = BTreeSet::<usize>::new();
     let item_indexes = if let Some(target_nodes) = target_nodes {
         if !snapshot.display_items_by_node.is_empty() {
             target_nodes
@@ -42816,7 +42835,9 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                         continue;
                     };
                     let next_text = json_value_to_document_text(value);
-                    if item.text.as_deref() != Some(next_text.as_str()) {
+                    if item.text.as_deref() != Some(next_text.as_str())
+                        && text_update_indexes.insert(index)
+                    {
                         text_updates.push((index, next_text, node.to_owned(), vec![path.clone()]));
                     }
                     continue;
@@ -42857,7 +42878,8 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
             let Some(next_text) = text_from_binding else {
                 continue;
             };
-            if item.text.as_deref() != Some(next_text.as_str()) {
+            if item.text.as_deref() != Some(next_text.as_str()) && text_update_indexes.insert(index)
+            {
                 text_updates.push((index, next_text, node.to_owned(), paths.clone()));
             }
             continue;
@@ -42865,21 +42887,19 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         let binding_paths = text_binding_paths_for_node.cloned().unwrap_or_default();
         let text_from_binding = text_binding_paths_for_node
             .and_then(|paths| document_text_binding_value_for_paths(paths, state_summary));
-        let current_address =
+        let next_text = text_from_binding.or_else(|| {
             source_intent_binding_update_for_intent(&source_intent_updates, node, "address")
                 .or_else(|| focused_address(&shared.layout_proof, node))
                 .map(|address| {
                     resolve_source_intent_payload_value_from_summary(state_summary, address)
-                });
-        let next_text = text_from_binding.or_else(|| {
-            current_address
+                })
                 .as_deref()
                 .and_then(|address| focused_editing_text_for_address(state_summary, address))
         });
         let Some(next_text) = next_text else {
             continue;
         };
-        if item.text.as_deref() != Some(next_text.as_str()) {
+        if item.text.as_deref() != Some(next_text.as_str()) && text_update_indexes.insert(index) {
             text_updates.push((index, next_text, node.to_owned(), binding_paths));
         }
     }
@@ -62900,6 +62920,41 @@ mod tests {
     }
 
     #[test]
+    fn selection_proxy_node_binding_beats_selected_address_fallback() {
+        let layout_proof = cache_test_document_snapshot(
+            "selection-proxy-node-text-binding-beats-selected-address",
+            &[],
+            &["store.formula_bar.text"],
+        );
+        let shared_render_state = test_shared_render_state(
+            layout_proof,
+            test_text_input_layout_frame("test-node", "stale retained text"),
+        );
+        let mut input_state = PreviewNativeInputState {
+            focused_selection_proxy: true,
+            selected_overlay_nodes: BTreeSet::from(["test-node".to_owned()]),
+            ..PreviewNativeInputState::default()
+        };
+        let state_summary = json!({
+            "store": {
+                "selected_address": "legacy-address-should-not-win",
+                "formula_bar": {
+                    "text": "=generic-node-binding"
+                }
+            }
+        });
+
+        assert!(preview_refresh_selection_proxy_from_state_summary(
+            &shared_render_state,
+            &state_summary,
+            &mut input_state
+        ));
+        assert_eq!(input_state.focused_text, "=generic-node-binding");
+        assert_eq!(input_state.focused_caret_index, 21);
+        assert!(input_state.focused_address.is_none());
+    }
+
+    #[test]
     fn selection_proxy_retained_refresh_uses_selected_node_without_address() {
         let shared_render_state = test_shared_render_state(
             json!({}),
@@ -62920,6 +62975,52 @@ mod tests {
         assert_eq!(input_state.focused_text, "retained formula");
         assert_eq!(input_state.focused_caret_index, 16);
         assert!(input_state.focused_address.is_none());
+    }
+
+    #[test]
+    fn retained_bound_text_sync_uses_text_binding_without_address_metadata() {
+        clear_preview_retained_bound_sync_stats();
+        let layout_proof = cache_test_document_snapshot(
+            "retained-bound-text-sync-without-address",
+            &[],
+            &["store.formula_bar.text"],
+        );
+        let shared_render_state = test_shared_render_state(
+            layout_proof,
+            test_text_input_layout_frame("test-node", "stale retained text"),
+        );
+        let state_summary = json!({
+            "store": {
+                "formula_bar": {
+                    "text": "generic bound text"
+                }
+            }
+        });
+
+        assert!(
+            preview_sync_bound_text_inputs_for_nodes_from_state_summary(
+                &shared_render_state,
+                &state_summary,
+                &BTreeSet::from(["test-node".to_owned()])
+            )
+            .expect("generic bound text sync should not require address metadata")
+        );
+        let frame = latest_preview_frame(&shared_render_state);
+        assert_eq!(
+            frame_text_for_node(&frame, "test-node").as_deref(),
+            Some("generic bound text")
+        );
+        let stats = preview_retained_bound_sync_stats_snapshot()
+            .expect("bound text sync should record retained sync stats");
+        assert_eq!(stats.text_update_count, 1);
+        assert_eq!(
+            stats.text_update_binding_paths,
+            vec![(
+                "test-node".to_owned(),
+                vec!["store.formula_bar.text".to_owned()]
+            )]
+        );
+        assert_eq!(stats.legacy_selection_fallback_count, 0);
     }
 
     fn test_display_bounds(layout: &boon_document::LayoutFrame, node: &str) -> boon_document::Rect {

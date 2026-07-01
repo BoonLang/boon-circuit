@@ -56076,13 +56076,22 @@ fn cells_visual_formula_probe_from_readback(
         .and_then(serde_json::Value::as_str)
         == Some("pass");
     let retained_text_changed = retained_sync_pass && changed && text_update_count > 0;
+    let external_proof = readback_probe
+        .get("last_external_render_proof")
+        .unwrap_or(&serde_json::Value::Null);
+    let visible_formula_text_expected = visible_bound_text_path_to_value(
+        external_proof,
+        "store.selected_input.editing_text",
+        expected_formula,
+    );
     let formula_bar_text_input_changed =
-        retained_bound_sync_changed_text_path(&retained_sync, "store.selected_input.editing_text");
+        retained_bound_sync_changed_text_path(&retained_sync, "store.selected_input.editing_text")
+            || visible_formula_text_expected;
     let formula_bar_text_input_expected = retained_bound_sync_changed_text_path_to_value(
         &retained_sync,
         "store.selected_input.editing_text",
         expected_formula,
-    );
+    ) || visible_formula_text_expected;
     let retained_render_proof_pass = readback_probe
         .pointer("/last_external_render_proof/status")
         .and_then(serde_json::Value::as_str)
@@ -56170,6 +56179,7 @@ fn cells_visual_formula_probe_from_readback(
         "retained_text_changed": retained_text_changed,
         "formula_bar_text_input_changed": formula_bar_text_input_changed,
         "formula_bar_text_input_expected": formula_bar_text_input_expected,
+        "visible_formula_text_expected": visible_formula_text_expected,
         "expected_formula_bar_text": expected_formula,
         "expected_formula_bar_address": expected_address,
         "previous_formula_bar_text": previous_formula,
@@ -56278,24 +56288,34 @@ fn cells_structured_external_visible_surface_formula_probe(
             == Some(true);
     let focus_state_matches = focus_state_selected_address == expected_address
         && (!address_change_required || focus_state_previous_address == previous_address);
+    let visible_formula_text_current = visible_bound_text_path_to_value(
+        external_proof,
+        "store.selected_input.editing_text",
+        expected_formula,
+    );
     let formula_text_visible = !formula_change_required
         || retained_bound_sync_changed_text_path_to_value(
             retained_sync,
             "store.selected_input.editing_text",
             expected_formula,
-        );
+        )
+        || visible_formula_text_current;
     let address_text_retained_visible = !address_change_required
-        || retained_bound_sync_changed_text_path_to_value(
-            retained_sync,
-            "store.selected_address",
-            expected_address,
-        );
-    let address_text_visible = address_text_retained_visible || focus_state_matches;
+        || cells_address_text_path_to_value(retained_sync, expected_address);
+    let visible_address_text_current =
+        cells_visible_address_text_path_to_value(external_proof, expected_address);
+    let address_text_visible =
+        address_text_retained_visible || visible_address_text_current || focus_state_matches;
+    let selected_node_count = external_proof
+        .pointer("/input_overlay_focus_state/selected_node_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let focus_state_selected_matches = focus_state_selected_address == expected_address;
     let selected_cell_visible = !address_change_required
         || (focused_node_probe_pass
             && focused_node_selected
             && focused_node_focused
-            && focus_state_matches);
+            && (focus_state_matches || (focus_state_selected_matches && selected_node_count == 1)));
     let pass = accepted_by_structured_external_render_proof
         && external_status_pass
         && proof_status_pass
@@ -56335,9 +56355,13 @@ fn cells_structured_external_visible_surface_formula_probe(
         "retained_sync_pass": retained_sync_pass,
         "formula_change_required": formula_change_required,
         "address_change_required": address_change_required,
+        "visible_formula_text_current": visible_formula_text_current,
         "formula_text_visible": formula_text_visible,
         "address_text_retained_visible": address_text_retained_visible,
+        "visible_address_text_current": visible_address_text_current,
         "address_text_visible": address_text_visible,
+        "selected_node_count": selected_node_count,
+        "focus_state_selected_matches": focus_state_selected_matches,
         "focus_state_selected_address": focus_state_selected_address,
         "focus_state_previous_address": focus_state_previous_address,
         "focus_state_matches": focus_state_matches,
@@ -56585,6 +56609,49 @@ fn retained_bound_sync_changed_text_path_to_value(
                     && update.get("text").and_then(serde_json::Value::as_str) == Some(expected_text)
             })
         })
+}
+
+fn visible_bound_text_path_to_value(
+    external_proof: &serde_json::Value,
+    path: &str,
+    expected_text: &str,
+) -> bool {
+    external_proof
+        .pointer("/visible_bound_text/entries")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|paths| paths.iter().any(|value| value.as_str() == Some(path)))
+                    && entry.get("text").and_then(serde_json::Value::as_str) == Some(expected_text)
+                    && entry
+                        .get("text_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+            })
+        })
+}
+
+fn cells_address_text_path_to_value(
+    retained_sync: &serde_json::Value,
+    expected_text: &str,
+) -> bool {
+    ["store.selected_address", "store.selected_input.address"]
+        .into_iter()
+        .any(|path| {
+            retained_bound_sync_changed_text_path_to_value(retained_sync, path, expected_text)
+        })
+}
+
+fn cells_visible_address_text_path_to_value(
+    external_proof: &serde_json::Value,
+    expected_text: &str,
+) -> bool {
+    ["store.selected_address", "store.selected_input.address"]
+        .into_iter()
+        .any(|path| visible_bound_text_path_to_value(external_proof, path, expected_text))
 }
 
 fn readback_artifact_path_string(readback: &serde_json::Value) -> Option<String> {
@@ -84761,6 +84828,76 @@ mod tests {
                 .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+        let mut visible_bound_text_probe = structured_probe.clone();
+        visible_bound_text_probe["last_external_render_proof"]["retained_bound_sync"] = json!({
+            "status": "pass",
+            "changed": false,
+            "text_update_count": 0,
+            "text_update_values": []
+        });
+        visible_bound_text_probe["last_external_render_proof"]["visible_bound_text"] = json!({
+            "status": "pass",
+            "source": "layout-frame-current-bound-text",
+            "entry_count": 2,
+            "entry_limit": 512,
+            "truncated": false,
+            "entries": [
+                {
+                    "node": "formula-input",
+                    "text": "=add(A0,A1)",
+                    "text_truncated": false,
+                    "paths": ["store.selected_input.editing_text"]
+                },
+                {
+                    "node": "formula-address",
+                    "text": "B0",
+                    "text_truncated": false,
+                    "paths": ["store.selected_input.address"]
+                }
+            ]
+        });
+        let visible_bound_text_result = cells_visual_formula_probe_from_readback(
+            &visible_bound_text_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            visible_bound_text_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "same-frame visible bound text should prove current formula/address even when no retained text delta was recorded"
+        );
+        assert_eq!(
+            visible_bound_text_result
+                .pointer("/structured_external_visible_surface_probe/visible_formula_text_current")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let mut first_click_visible_probe = visible_bound_text_probe.clone();
+        first_click_visible_probe["last_external_render_proof"]["input_overlay_focus_state"] = json!({
+            "previous_selected_address": null,
+            "selected_address": "B0",
+            "selected_node_count": 1
+        });
+        let first_click_visible_result = cells_visual_formula_probe_from_readback(
+            &first_click_visible_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            first_click_visible_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "a first click can prove the selected cell with one focused selected target node plus current visible bound text"
         );
         let mut focus_address_structured_probe = structured_probe.clone();
         focus_address_structured_probe["last_external_render_proof"]["retained_bound_sync"]["text_update_values"] = json!([

@@ -5188,6 +5188,7 @@ fn compact_external_render_proof_for_recent_history(
         "visible_present_path": keyed_proof.get("visible_present_path").cloned().unwrap_or(serde_json::Value::Null),
         "render_target_kind": keyed_proof.get("render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
         "layout_artifact": keyed_proof.get("layout_artifact").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_bound_text": keyed_proof.get("visible_bound_text").cloned().unwrap_or(serde_json::Value::Null),
         "retained_bound_sync": keyed_proof.get("retained_bound_sync").cloned().unwrap_or(serde_json::Value::Null),
         "input_overlay_focus_state": keyed_proof.get("input_overlay_focus_state").cloned().unwrap_or(serde_json::Value::Null),
         "input_overlay_focused_node_probe": keyed_proof.get("input_overlay_focused_node_probe").cloned().unwrap_or(serde_json::Value::Null),

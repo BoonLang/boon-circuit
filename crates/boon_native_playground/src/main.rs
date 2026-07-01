@@ -11613,6 +11613,10 @@ fn native_gpu_app_owned_render_hook(
         "visible_surface_rendered": true,
         "visible_present_path": true,
         "visible_surface_metrics": visible_metrics_report,
+        "visible_bound_text": preview_visible_bound_text_report(
+            &visible_state,
+            layout_frame
+        ),
         "retained_bound_sync": preview_retained_bound_sync_stats_json_for(
             visible_state.retained_bound_sync_stats.as_ref()
         ),
@@ -36553,6 +36557,105 @@ fn preview_retained_bound_sync_text_update_nodes_for(
         .unwrap_or_default()
 }
 
+fn preview_visible_bound_text_report(
+    visible_state: &PreviewVisibleRenderState,
+    layout_frame: &boon_document::LayoutFrame,
+) -> serde_json::Value {
+    const ENTRY_LIMIT: usize = 512;
+    const TEXT_LIMIT_BYTES: usize = 512;
+    let Some(layout_hash) = visible_state.layout_frame_hash.as_deref() else {
+        return json!({
+            "status": "skipped",
+            "reason": "missing-layout-frame-hash",
+            "entry_limit": ENTRY_LIMIT,
+            "entries": []
+        });
+    };
+    let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+        return json!({
+            "status": "skipped",
+            "reason": "missing-document-render-snapshot",
+            "layout_frame_hash": layout_hash,
+            "entry_limit": ENTRY_LIMIT,
+            "entries": []
+        });
+    };
+    let mut entries = Vec::new();
+    let mut candidate_count = 0usize;
+    for item in &layout_frame.display_list {
+        let node = item.node.0.as_str();
+        let mut paths = BTreeSet::<String>::new();
+        if let Some(text_paths) = snapshot
+            .data_binding_targets
+            .text_binding_paths_by_node
+            .get(node)
+        {
+            paths.extend(text_paths.iter().cloned());
+        }
+        if let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(node)
+        {
+            for (path, target) in bindings {
+                if matches!(
+                    target.attr.as_str(),
+                    "text" | "label" | "value" | "display_value"
+                ) {
+                    paths.insert(path.clone());
+                }
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        candidate_count = candidate_count.saturating_add(1);
+        if entries.len() >= ENTRY_LIMIT {
+            continue;
+        }
+        let text = item.text.clone().unwrap_or_default();
+        let (text, text_truncated) = truncate_utf8_for_report(&text, TEXT_LIMIT_BYTES);
+        entries.push(json!({
+            "node": node,
+            "kind": format!("{:?}", item.kind),
+            "text": text,
+            "text_truncated": text_truncated,
+            "paths": paths.into_iter().collect::<Vec<_>>(),
+            "bounds": {
+                "x": f64::from(item.bounds.x),
+                "y": f64::from(item.bounds.y),
+                "width": f64::from(item.bounds.width),
+                "height": f64::from(item.bounds.height)
+            },
+            "focused": item.focused,
+            "selected": matches!(
+                item.style.get("selected"),
+                Some(boon_document_model::StyleValue::Bool(true))
+            )
+        }));
+    }
+    json!({
+        "status": "pass",
+        "source": "layout-frame-current-bound-text",
+        "layout_frame_hash": layout_hash,
+        "entry_count": candidate_count,
+        "entry_limit": ENTRY_LIMIT,
+        "truncated": candidate_count > ENTRY_LIMIT,
+        "entries": entries
+    })
+}
+
+fn truncate_utf8_for_report(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
 fn preview_retained_bound_sync_already_changed_text() -> bool {
     preview_retained_bound_sync_stats()
         .lock()
@@ -39435,6 +39538,7 @@ fn preview_try_apply_simple_source_click_input(
                 .cloned()
         });
     let previous_focused_node = input_state.focused_node.clone();
+    preview_seed_selected_overlay_address(shared_render_state, input_state);
     let route_dispatch_started = Instant::now();
     let (events, node, target_text, preserve_focus, focus_state_applied, click_candidate) =
         if let Some(candidate) = cached_candidate {

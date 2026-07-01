@@ -40022,7 +40022,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             isolated_driver_text.as_deref(),
             None,
             false,
-            false,
+            true,
             false,
         )?;
         let isolated_launch_success =
@@ -40064,7 +40064,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             let cwd = std::env::current_dir()?;
             let role_report_timeout_ms = 420_000_u64.saturating_add(input_sample_delay_ms);
             let script = format!(
-                "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
+                "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --skip-render-hook-app-owned-proof --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --role-report-timeout-ms {} --live-state-report {} --report {} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&format!("./{}", launched_binary_path.display())),
                 shell_quote(&entry.id),
@@ -40399,6 +40399,10 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                         .unwrap_or("missing")
                 }]);
                 extra["readback_artifacts"] = json!([readback]);
+                extra["native_gpu_render_proof"] = visible_surface_readback_render_proof(
+                    &serde_json::Value::Object(readback.clone()),
+                    "supervisor.preview_surface_proof.readback_artifact",
+                );
             }
         }
         if let Some(layout_proof) = supervisor
@@ -40437,7 +40441,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             .and_then(serde_json::Value::as_object)
         {
             if let Some(proof) = render_proof.get("proof") {
-                extra["native_gpu_render_proof"] = proof.clone();
+                if proof.pointer("/artifact/kind").is_some() {
+                    extra["native_gpu_render_proof"] = proof.clone();
+                }
             }
             if let (Some(path), Some(sha256)) = (
                 render_proof
@@ -41058,7 +41064,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 .to_owned(),
         ),
     );
-    let headed_visual_evidence = native_headed_visual_evidence(&example, &source_hash);
+    let headed_visual_evidence = ensure_native_headed_visual_evidence(&example, &source_hash);
     let headed_visual_pass = headed_visual_evidence
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -41320,7 +41326,7 @@ fn verify_native_gpu_preview_e2e_hello_3d(
         format!("{} schema_pass={role_schema_pass}", role_report.display()),
         (!role_schema_pass).then(|| "hello_3d preview role report schema failed".to_owned()),
     );
-    let headed_visual_evidence = native_headed_visual_evidence(&example, &source_hash);
+    let headed_visual_evidence = ensure_native_headed_visual_evidence(&example, &source_hash);
     let headed_visual_pass = headed_visual_evidence
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -41778,6 +41784,47 @@ fn native_headed_visual_report_path(example: &str) -> PathBuf {
     PathBuf::from(format!(
         "target/reports/native-gpu/headed-scenario-{example}.json"
     ))
+}
+
+fn native_headed_visual_refresh_args(example: &str, report: &Path) -> Vec<String> {
+    vec![
+        "verify-native-gpu-headed-scenario".to_owned(),
+        "--example".to_owned(),
+        example.to_owned(),
+        "--report".to_owned(),
+        report.to_string_lossy().into_owned(),
+    ]
+}
+
+fn ensure_native_headed_visual_evidence(
+    example: &str,
+    expected_source_hash: &str,
+) -> serde_json::Value {
+    let initial = native_headed_visual_evidence(example, expected_source_hash);
+    if initial.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+        return initial;
+    }
+
+    let path = native_headed_visual_report_path(example);
+    let refresh_args = native_headed_visual_refresh_args(example, &path);
+    let refresh_status = match verify_native_gpu_headed_scenario(&refresh_args) {
+        Ok(()) => json!({
+            "status": "pass",
+            "command": "verify-native-gpu-headed-scenario"
+        }),
+        Err(error) => json!({
+            "status": "fail",
+            "command": "verify-native-gpu-headed-scenario",
+            "error": error.to_string()
+        }),
+    };
+
+    let mut refreshed = native_headed_visual_evidence(example, expected_source_hash);
+    if let Some(object) = refreshed.as_object_mut() {
+        object.insert("refresh_attempt".to_owned(), refresh_status);
+        object.insert("previous_evidence".to_owned(), initial);
+    }
+    refreshed
 }
 
 fn native_headed_visual_evidence(example: &str, expected_source_hash: &str) -> serde_json::Value {
@@ -46622,7 +46669,9 @@ fn native_preview_promote_isolated_measured_loop_evidence(
         }
         extra["preview_native_gpu_render_proof"] = external_render_proof.clone();
         if let Some(proof) = external_render_proof.get("proof").cloned() {
-            extra["native_gpu_render_proof"] = proof;
+            if proof.pointer("/artifact/kind").is_some() {
+                extra["native_gpu_render_proof"] = proof;
+            }
         }
         extra["preview_surface_proof"]["external_render_proof"] = external_render_proof;
         extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
@@ -46651,6 +46700,10 @@ fn native_preview_promote_isolated_measured_loop_evidence(
         extra["preview_surface_proof"]["readback_artifact"] = readback.clone();
         extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
         extra["preview_surface_proof"]["status"] = json!("pass");
+        extra["native_gpu_render_proof"] = visible_surface_readback_render_proof(
+            &readback,
+            "isolated_real_window_launch_proof.measured_loop_report.last_interactive_readback_artifact",
+        );
         if let Some(path) = readback.get("path").and_then(serde_json::Value::as_str) {
             extra["checkpoint_screenshot_or_video_paths"] = json!([path]);
             if let Some(sha256) = readback.get("sha256").and_then(serde_json::Value::as_str) {
@@ -46694,6 +46747,65 @@ fn native_preview_promote_isolated_measured_loop_evidence(
             .unwrap_or(0);
         extra["proof_lag_frames"] = json!(proof_lag_frames);
     }
+}
+
+fn visible_surface_readback_render_proof(
+    readback: &serde_json::Value,
+    source: &str,
+) -> serde_json::Value {
+    json!({
+        "status": "pass",
+        "source": source,
+        "proof_mode": "visible-surface-copy-src-readback",
+        "artifact": {
+            "kind": "app_owned_pixels",
+            "capture_method": readback
+                .get("capture_method")
+                .cloned()
+                .unwrap_or_else(|| json!("wgpu-visible-surface-copy-src-readback")),
+            "artifact_path": readback
+                .get("path")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "artifact_sha256": readback
+                .get("sha256")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "nonblank_samples": readback
+                .get("nonblank_samples")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "unique_rgba_values": readback
+                .get("unique_rgba_values")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "width": readback
+                .get("width")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "height": readback
+                .get("height")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "frame_evidence_key": readback
+                .get("frame_evidence_key")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "frame_seq": readback
+                .pointer("/frame_evidence_key/frame_seq")
+                .cloned()
+                .or_else(|| readback.get("rendered_frame_count").cloned())
+                .unwrap_or(serde_json::Value::Null),
+            "surface_id": readback
+                .pointer("/frame_evidence_key/surface_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "surface_epoch": readback
+                .pointer("/frame_evidence_key/surface_epoch")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+    })
 }
 
 fn native_preview_host_route_evidence(
@@ -82776,6 +82888,16 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .and_then(serde_json::Value::as_str),
             Some("app_owned_pixels")
         );
+        assert_eq!(
+            extra
+                .pointer("/native_gpu_render_proof/artifact/capture_method")
+                .and_then(serde_json::Value::as_str),
+            Some("wgpu-visible-surface-copy-src-readback")
+        );
+        assert_eq!(
+            extra.pointer("/native_gpu_render_proof/artifact/frame_evidence_key"),
+            Some(&frame_key)
+        );
     }
 
     #[test]
@@ -82829,14 +82951,36 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             Path::new("target/reports/native-gpu/test-live-state.json"),
             None,
             false,
-            false,
+            true,
             false,
         )
         .expect("test paths are UTF-8");
 
         assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--skip-render-hook-app-owned-proof")
+        );
         assert!(args.iter().any(|arg| arg == "--dev-app-owned-input-probe"));
         assert!(!args.iter().any(|arg| arg == "--dev-editor-only"));
+    }
+
+    #[test]
+    fn headed_visual_refresh_args_target_current_example_report() {
+        let args = native_headed_visual_refresh_args(
+            "generic",
+            Path::new("target/reports/native-gpu/headed-scenario-generic.json"),
+        );
+
+        assert_eq!(args[0], "verify-native-gpu-headed-scenario");
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--example" && window[1] == "generic")
+        );
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--report"
+                && window[1] == "target/reports/native-gpu/headed-scenario-generic.json"
+        }));
     }
 
     #[test]

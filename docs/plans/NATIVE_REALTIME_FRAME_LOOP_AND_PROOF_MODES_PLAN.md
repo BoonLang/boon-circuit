@@ -742,6 +742,49 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   hit-rate improvement, broader no-hacks audits, and generic runtime/list
   currentness verification.
 
+2026-07-01 preview E2E proof-path refresh slice:
+
+- `verify-native-gpu-preview-e2e` now refreshes stale or missing headed visual
+  evidence through the existing `verify-native-gpu-headed-scenario` route before
+  judging the preview E2E result. This keeps headed proof tied to the current
+  source hash instead of failing on stale report artifacts.
+- Preview E2E now keeps render-hook offscreen readback out of the UX proof path
+  by launching with `--skip-render-hook-app-owned-proof` and promoting the
+  measured visible-surface WGPU readback as `native_gpu_render_proof`.
+- The promoted proof records `kind=app_owned_pixels`,
+  `capture_method=wgpu-visible-surface-copy-src-readback`, and carries the
+  visible-surface `frame_evidence_key` from the measured frame. Replacement
+  proofs that do not carry a real artifact are no longer promoted as native
+  render proof.
+- Compact preview frame metrics now include bounded retained chunk and asset
+  observability samples (`retained_chunks`, `asset_refs`, and
+  `asset_failure_diagnostics`) instead of omitting the fields that the visible
+  reality harness requires.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo check -q -p xtask`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo test -q -p xtask native_preview_promotes_measured_loop_real_window_evidence`
+  - `cargo test -q -p xtask isolated_preview_e2e_keeps_dev_app_owned_input_probe`
+  - `cargo test -q -p xtask isolated_weston_desktop_preview_e2e_uses_demand_driven_product_mode`
+  - `cargo test -q -p xtask headed_visual_refresh_args_target_current_example_report`
+  - `timeout 1200s cargo xtask verify-native-gpu-preview-e2e --example
+    todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/preview-e2e-todomvc.json`
+- Fresh Todomvc preview E2E report highlights:
+  - `status=pass`
+  - `visible_reality_harness.status=pass`
+  - `scenario_evidence.status=pass`
+  - `preview_surface_proof.external_render_proof.render_backend_trait=boon_native_gpu::encode_render_scene_to_surface`
+  - `preview_surface_proof.external_render_proof.offscreen_app_owned_scene_readback_skipped=true`
+  - `native_gpu_render_proof.artifact.kind=app_owned_pixels`
+  - `native_gpu_render_proof.artifact.capture_method=wgpu-visible-surface-copy-src-readback`
+- This slice improves proof identity and verifier freshness for generic native
+  preview E2E. It does not complete the full plan; Cells speed/click coverage,
+  aggregate native GPU gates, perf HUD, pending snapshot currentness, and the
+  no-hacks audit remain open.
+
 ## Implementation Slices
 
 1. Terminology and schema:

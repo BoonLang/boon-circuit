@@ -11684,17 +11684,20 @@ fn preview_compact_frame_metrics_json(
         "asset_upload_count": metrics.asset_upload_count,
         "asset_upload_bytes": metrics.asset_upload_bytes,
         "asset_failure_count": metrics.asset_failure_diagnostics.len(),
+        "asset_failure_diagnostics": &metrics.asset_failure_diagnostics,
         "retained_chunk_count": metrics.retained_chunk_count,
         "retained_chunk_hit_count": metrics.retained_chunk_hit_count,
         "retained_chunk_miss_count": metrics.retained_chunk_miss_count,
         "retained_chunk_reuse_count": metrics.retained_chunk_reuse_count,
         "dirty_chunk_count": metrics.dirty_chunk_count,
-        "retained_chunk_sample_count": metrics.retained_chunk_sample_count,
+        "retained_chunk_sample_count": metrics.retained_chunks.len(),
         "retained_chunk_inventory_truncated": metrics.retained_chunk_inventory_truncated,
-        "retained_chunk_inventory_omitted": true,
+        "retained_chunks": &metrics.retained_chunks,
+        "retained_chunk_inventory_omitted": false,
         "dirty_upload_ranges_omitted": true,
         "dirty_upload_chunk_ids_omitted": true,
-        "asset_refs_omitted": true
+        "asset_refs": &metrics.asset_refs,
+        "asset_refs_omitted": false
     })
 }
 

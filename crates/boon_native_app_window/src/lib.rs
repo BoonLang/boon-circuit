@@ -27,6 +27,7 @@ pub const REQUESTED_ANIMATION_BURST_MIN_FRAMES: u32 = 2;
 pub const REQUESTED_ANIMATION_QUIET_MS: u64 = 100;
 pub const REQUESTED_ANIMATION_HARD_CAP_MS: u64 = 1_000;
 pub const REQUESTED_ANIMATION_MAX_PENDING_SNAPSHOTS: u32 = 1;
+const PREVIEW_PERF_STATS_WINDOW: usize = 120;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1713,6 +1714,65 @@ pub struct FrameEvidenceKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativePerfMetricSummary {
+    pub p50: Option<f64>,
+    pub p95: Option<f64>,
+    pub p99: Option<f64>,
+    pub max: Option<f64>,
+    pub sample_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct NativePreviewPerfAccumulator {
+    render_hook_ms: VecDeque<f64>,
+    present_call_ms: VecDeque<f64>,
+    input_to_present_ms: VecDeque<f64>,
+    proof_overhead_ms: VecDeque<f64>,
+}
+
+impl Default for NativePreviewPerfAccumulator {
+    fn default() -> Self {
+        Self {
+            render_hook_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            present_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            input_to_present_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            proof_overhead_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+        }
+    }
+}
+
+impl NativePreviewPerfAccumulator {
+    fn record(
+        &mut self,
+        render_hook_ms: Option<f64>,
+        present_call_ms: Option<f64>,
+        input_to_present_ms: Option<f64>,
+        proof_overhead_ms: Option<f64>,
+    ) {
+        push_perf_sample(&mut self.render_hook_ms, render_hook_ms);
+        push_perf_sample(&mut self.present_call_ms, present_call_ms);
+        push_perf_sample(&mut self.input_to_present_ms, input_to_present_ms);
+        push_perf_sample(&mut self.proof_overhead_ms, proof_overhead_ms);
+    }
+
+    fn render_hook_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.render_hook_ms)
+    }
+
+    fn present_call_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.present_call_ms)
+    }
+
+    fn input_to_present_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.input_to_present_ms)
+    }
+
+    fn proof_overhead_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.proof_overhead_ms)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativePreviewPerfStats {
     pub kind: String,
     pub status: String,
@@ -1725,9 +1785,13 @@ pub struct NativePreviewPerfStats {
     pub render_hook_ms: Option<f64>,
     pub present_call_ms: Option<f64>,
     pub input_to_present_ms: Option<f64>,
+    pub render_hook_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub present_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub input_to_present_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub missed_frame_count: u64,
     pub proof_mode: String,
     pub proof_overhead_ms: Option<f64>,
+    pub proof_overhead_ms_p50_p95_max: NativePerfMetricSummary,
     pub telemetry_drop_count: u64,
     pub last_missed_frame_cause: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2301,6 +2365,7 @@ async fn run_surface_probe_inner(
                             Duration::ZERO,
                             wake_handle.generation(),
                             None,
+                            &NativePreviewPerfAccumulator::default(),
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
@@ -2311,7 +2376,7 @@ async fn run_surface_probe_inner(
                                 &app_surface,
                                 None,
                             ),
-                            Some(&error),
+                            Some(error.as_str()),
                         );
                     }
                     return Err(NativeWindowError::Failed(format!(
@@ -2394,6 +2459,7 @@ async fn run_surface_probe_inner(
                 Duration::ZERO,
                 wake_handle.generation(),
                 None,
+                &NativePreviewPerfAccumulator::default(),
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
@@ -2636,6 +2702,7 @@ async fn run_surface_probe_inner(
                             Duration::ZERO,
                             wake_handle.generation(),
                             None,
+                            &NativePreviewPerfAccumulator::default(),
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
@@ -2646,7 +2713,7 @@ async fn run_surface_probe_inner(
                                 &app_surface,
                                 Some(&input_adapter),
                             ),
-                            Some(&error),
+                            Some(error.as_str()),
                         );
                     }
                     return Err(NativeWindowError::Failed(format!(
@@ -2897,6 +2964,7 @@ async fn run_surface_probe_inner(
     let mut last_render_loop_report_write_ms: Option<f64> = None;
     let mut last_render_loop_report_enqueue_ms: Option<f64> = None;
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
+    let mut preview_perf_accumulator = NativePreviewPerfAccumulator::default();
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
     let async_render_loop_report_writer = options
         .render_loop_state_report
@@ -2946,6 +3014,7 @@ async fn run_surface_probe_inner(
                     hold_started.elapsed(),
                     wake_handle.generation(),
                     last_interactive_readback_artifact.as_ref(),
+                    &preview_perf_accumulator,
                     render_loop_report_extras(
                         resize_wake_count.load(Ordering::Relaxed),
                         input_event_wake_count.load(Ordering::Relaxed),
@@ -3317,6 +3386,7 @@ async fn run_surface_probe_inner(
                             hold_started.elapsed(),
                             wake_handle.generation(),
                             last_interactive_readback_artifact.as_ref(),
+                            &preview_perf_accumulator,
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
@@ -3330,7 +3400,7 @@ async fn run_surface_probe_inner(
                                 &app_surface,
                                 Some(&observed_input_adapter),
                             ),
-                            Some(&error),
+                            Some(error.as_str()),
                         );
                     }
                     return Err(NativeWindowError::Failed(format!(
@@ -3454,6 +3524,7 @@ async fn run_surface_probe_inner(
                                 hold_started.elapsed(),
                                 wake_handle.generation(),
                                 last_interactive_readback_artifact.as_ref(),
+                                &preview_perf_accumulator,
                                 render_loop_report_extras(
                                     resize_wake_count.load(Ordering::Relaxed),
                                     input_event_wake_count.load(Ordering::Relaxed),
@@ -3467,7 +3538,7 @@ async fn run_surface_probe_inner(
                                     &app_surface,
                                     Some(&observed_input_adapter),
                                 ),
-                                Some(&error),
+                                Some(error.as_str()),
                             );
                         }
                         return Err(NativeWindowError::Failed(format!(
@@ -3755,6 +3826,11 @@ async fn run_surface_probe_inner(
                 render_loop_state.last_present_completed_elapsed_ms,
             )
         });
+        let stats_render_hook_ms = elapsed_delta_ms(
+            render_loop_state.last_surface_acquired_elapsed_ms,
+            render_loop_state.last_render_hook_completed_elapsed_ms,
+        );
+        let stats_present_call_ms = render_loop_state.last_present_call_ms;
         let stats_proof_mode = if last_interactive_readback_error.is_some() {
             "readback_error"
         } else if last_interactive_surface_readback_queued {
@@ -3772,6 +3848,12 @@ async fn run_surface_probe_inner(
         } else {
             "off"
         };
+        preview_perf_accumulator.record(
+            stats_render_hook_ms,
+            stats_present_call_ms,
+            stats_input_to_present_ms,
+            None,
+        );
         notify_native_perf_stats(
             &mut hooks,
             native_preview_perf_stats_snapshot(
@@ -3779,6 +3861,7 @@ async fn run_surface_probe_inner(
                 &render_loop_state,
                 stats_elapsed,
                 render_loop_state.rendered_frame_count as f64 / stats_elapsed_seconds,
+                &preview_perf_accumulator,
                 stats_input_to_present_ms,
                 stats_proof_mode,
                 None,
@@ -3803,6 +3886,7 @@ async fn run_surface_probe_inner(
                 hold_started.elapsed(),
                 wake_handle.generation(),
                 last_interactive_readback_artifact.as_ref(),
+                &preview_perf_accumulator,
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
@@ -3900,6 +3984,7 @@ async fn run_surface_probe_inner(
             hold_started.elapsed(),
             wake_handle.generation(),
             last_interactive_readback_artifact.as_ref(),
+            &preview_perf_accumulator,
             render_loop_report_extras(
                 resize_wake_count.load(Ordering::Relaxed),
                 input_event_wake_count.load(Ordering::Relaxed),
@@ -4498,6 +4583,7 @@ fn native_preview_perf_stats_snapshot(
     state: &NativeRenderLoopState,
     elapsed: Duration,
     renders_per_second: f64,
+    accumulator: &NativePreviewPerfAccumulator,
     input_to_present_ms: Option<f64>,
     proof_mode: impl Into<String>,
     proof_overhead_ms: Option<f64>,
@@ -4518,9 +4604,13 @@ fn native_preview_perf_stats_snapshot(
         ),
         present_call_ms: state.last_present_call_ms,
         input_to_present_ms,
+        render_hook_ms_p50_p95_p99_max: accumulator.render_hook_summary(),
+        present_call_ms_p50_p95_p99_max: accumulator.present_call_summary(),
+        input_to_present_ms_p50_p95_p99_max: accumulator.input_to_present_summary(),
         missed_frame_count: state.missed_frame_count,
         proof_mode: proof_mode.into(),
         proof_overhead_ms,
+        proof_overhead_ms_p50_p95_max: accumulator.proof_overhead_summary(),
         telemetry_drop_count: state.telemetry_drop_count,
         last_missed_frame_cause: state.last_missed_frame_cause.clone(),
         frame_evidence_key,
@@ -4573,6 +4663,7 @@ struct NativeRenderLoopReportSnapshot {
     elapsed: Duration,
     wake_generation: u64,
     last_interactive_readback_artifact: Option<AppWindowReadbackArtifact>,
+    perf_accumulator: NativePreviewPerfAccumulator,
     extras: NativeRenderLoopReportExtras,
     loop_error: Option<String>,
 }
@@ -4706,6 +4797,7 @@ fn render_loop_report_snapshot(
     elapsed: Duration,
     wake_generation: u64,
     last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    perf_accumulator: &NativePreviewPerfAccumulator,
     extras: NativeRenderLoopReportExtras,
     loop_error: Option<&str>,
 ) -> NativeRenderLoopReportSnapshot {
@@ -4720,6 +4812,7 @@ fn render_loop_report_snapshot(
         elapsed,
         wake_generation,
         last_interactive_readback_artifact: last_interactive_readback_artifact.cloned(),
+        perf_accumulator: perf_accumulator.clone(),
         extras,
         loop_error: loop_error.map(str::to_owned),
     }
@@ -4739,6 +4832,7 @@ fn write_render_loop_state_report_snapshot(
         snapshot.elapsed,
         snapshot.wake_generation,
         snapshot.last_interactive_readback_artifact.as_ref(),
+        &snapshot.perf_accumulator,
         snapshot.extras,
         snapshot.loop_error.as_deref(),
     )
@@ -4775,6 +4869,7 @@ fn write_render_loop_state_report(
     elapsed: Duration,
     wake_generation: u64,
     last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    perf_accumulator: &NativePreviewPerfAccumulator,
     extras: NativeRenderLoopReportExtras,
     loop_error: Option<&str>,
 ) -> Result<(), NativeWindowError> {
@@ -4911,11 +5006,14 @@ fn write_render_loop_state_report(
         .as_ref()
         .map(|_| "async_latest_wins_atomic_replace")
         .unwrap_or("atomic_replace");
+    let mut report_perf_accumulator = perf_accumulator.clone();
+    report_perf_accumulator.record(None, None, None, present_to_readback_report_ms);
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
         elapsed,
         renders_per_second,
+        &report_perf_accumulator,
         input_accept_to_present_ms.or(input_wake_to_present_ms),
         proof_mode,
         present_to_readback_report_ms,
@@ -5417,6 +5515,39 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     sorted.sort_by(|left, right| left.total_cmp(right));
     let rank = ((sorted.len() - 1) as f64 * percentile).ceil() as usize;
     sorted[rank.min(sorted.len() - 1)]
+}
+
+fn push_perf_sample(samples: &mut VecDeque<f64>, sample: Option<f64>) {
+    let Some(sample) = sample else {
+        return;
+    };
+    if !sample.is_finite() {
+        return;
+    }
+    if samples.len() == PREVIEW_PERF_STATS_WINDOW {
+        samples.pop_front();
+    }
+    samples.push_back(sample.max(0.0));
+}
+
+fn metric_summary_from_samples(samples: &VecDeque<f64>) -> NativePerfMetricSummary {
+    if samples.is_empty() {
+        return NativePerfMetricSummary {
+            p50: None,
+            p95: None,
+            p99: None,
+            max: None,
+            sample_count: 0,
+        };
+    }
+    let values = samples.iter().copied().collect::<Vec<_>>();
+    NativePerfMetricSummary {
+        p50: Some(percentile(&values, 0.50)),
+        p95: Some(percentile(&values, 0.95)),
+        p99: Some(percentile(&values, 0.99)),
+        max: values.iter().copied().reduce(f64::max),
+        sample_count: values.len(),
+    }
 }
 
 fn sha256_file(path: &Path) -> Result<String, NativeWindowError> {
@@ -6009,6 +6140,8 @@ mod tests {
             ..NativeRenderLoopReportExtras::default()
         };
         extras = extras.with_report_writer_stats(writer_stats);
+        let mut perf_accumulator = NativePreviewPerfAccumulator::default();
+        perf_accumulator.record(None, state.last_present_call_ms, None, None);
         render_loop_report_snapshot(
             path,
             NativeWindowRole::Preview,
@@ -6025,6 +6158,7 @@ mod tests {
             Duration::from_millis(16),
             0,
             None,
+            &perf_accumulator,
             extras,
             None,
         )
@@ -6420,12 +6554,15 @@ mod tests {
             Some(8),
             None,
         );
+        let mut accumulator = NativePreviewPerfAccumulator::default();
+        accumulator.record(Some(2.5), Some(1.4), Some(8.0), Some(24.0));
 
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
             Duration::from_millis(120),
             60.0,
+            &accumulator,
             Some(8.0),
             "readback",
             Some(24.0),
@@ -6437,6 +6574,9 @@ mod tests {
         assert_eq!(stats.proof_overhead_ms, Some(24.0));
         assert_eq!(stats.render_hook_ms, Some(2.5));
         assert_eq!(stats.present_call_ms, Some(1.4));
+        assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(8.0));
+        assert_eq!(stats.render_hook_ms_p50_p95_p99_max.sample_count, 1);
+        assert_eq!(stats.proof_overhead_ms_p50_p95_max.max, Some(24.0));
         assert_eq!(stats.frame_evidence_key, Some(key));
     }
 
@@ -6454,11 +6594,14 @@ mod tests {
             state.last_accepted_host_input_elapsed_ms,
             state.last_present_completed_elapsed_ms,
         );
+        let mut accumulator = NativePreviewPerfAccumulator::default();
+        accumulator.record(None, None, accepted_input_to_present_ms, None);
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
             Duration::from_millis(64),
             60.0,
+            &accumulator,
             accepted_input_to_present_ms.or(raw_wake_to_present_ms),
             "off",
             None,
@@ -6472,8 +6615,32 @@ mod tests {
             Some(7.5),
             "product UX latency starts when the role poll hook accepts visible-changing host input, not at an earlier raw input wake"
         );
+        assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(7.5));
         assert_eq!(state.last_accepted_host_input_event_wake_count, 3);
         assert!(!state.last_accepted_host_input_press_only);
+    }
+
+    #[test]
+    fn preview_perf_accumulator_keeps_bounded_rolling_summaries() {
+        let mut accumulator = NativePreviewPerfAccumulator::default();
+        for value in 0..(PREVIEW_PERF_STATS_WINDOW + 10) {
+            accumulator.record(
+                Some(value as f64),
+                Some((value * 2) as f64),
+                Some((value * 3) as f64),
+                None,
+            );
+        }
+
+        let input = accumulator.input_to_present_summary();
+        let render = accumulator.render_hook_summary();
+
+        assert_eq!(input.sample_count, PREVIEW_PERF_STATS_WINDOW);
+        assert_eq!(render.sample_count, PREVIEW_PERF_STATS_WINDOW);
+        assert_eq!(render.p50, Some(70.0));
+        assert_eq!(render.max, Some(129.0));
+        assert_eq!(input.max, Some(387.0));
+        assert_eq!(accumulator.proof_overhead_summary().sample_count, 0);
     }
 
     #[test]

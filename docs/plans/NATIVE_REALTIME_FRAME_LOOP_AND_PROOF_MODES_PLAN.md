@@ -785,6 +785,51 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   aggregate native GPU gates, perf HUD, pending snapshot currentness, and the
   no-hacks audit remain open.
 
+2026-07-01 preview perf rolling-stats and guard slice:
+
+- `boon_native_app_window` now keeps a bounded rolling preview-performance
+  accumulator in the native preview process instead of publishing only the last
+  sample:
+  - `render_hook_ms_p50_p95_p99_max`;
+  - `present_call_ms_p50_p95_p99_max`;
+  - `input_to_present_ms_p50_p95_p99_max`;
+  - `proof_overhead_ms_p50_p95_max`.
+- Render-loop reports now snapshot the same accumulated preview-local timing
+  window before async report serialization. Proof overhead remains separate and
+  is added at report construction rather than folded into UX latency.
+- The dev footer still uses one compact `Preview perf` row from cached shell
+  state, but now shows rolling p95 during burst/probe modes when available.
+- `preview-perf-snapshot` no longer appends replace-worker latest-wins state to
+  the perf endpoint. It reports an explicit payload cap and whether the fixed
+  payload stayed within that cap.
+- Dev render proof now emits explicit zero guard fields for preview-perf
+  hot-path IPC/runtime origins:
+  - footer-lines IPC;
+  - render-hook IPC;
+  - runtime-summary queries;
+  - input-hot-path perf queries.
+- Native report schema now rejects preview perf stats that omit the rolling
+  summary objects and rejects incomplete dev preview-perf hot-path guard blocks.
+- Independent no-hacks audit still found production blockers that remain open:
+  - IR/runtime `address`, `value`, and `error` string-coupled behavior;
+  - native playground interaction-speed dispatch by example id;
+  - a Cells-shaped retained focus/selection fast path using app field names.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo test -q -p boon_native_app_window preview_perf`
+  - `cargo test -q -p boon_native_playground preview_perf`
+  - `cargo test -q -p boon_report_schema native_gpu_schema`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-gpu-negative --report
+    target/reports/native-gpu/negative.json`
+  - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
+  - `git diff --check`
+- This does not complete the full plan. Remaining work still includes aggregate
+  native GPU gates, renderer upload/layout/materialization stats in the HUD,
+  full active/pending runtime-layout-render snapshot ownership, the no-hacks
+  cleanup above, and generic runtime/list/currentness verification.
+
 ## Implementation Slices
 
 1. Terminology and schema:

@@ -103,6 +103,7 @@ const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
 const DEV_PREVIEW_PERF_REFRESH_MS: u64 = 250;
+const DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES: u64 = 4096;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
 const DEFAULT_PREVIEW_HEIGHT: f32 = 720.0;
@@ -10739,13 +10740,15 @@ fn preview_perf_snapshot_response(state: &PreviewIpcState) -> serde_json::Value 
         "runtime_state_locked": false,
         "full_state_mirroring_allowed": false,
         "full_state_mirroring_observed": false,
+        "max_payload_bytes": DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES,
         "preview_pid": std::process::id(),
         "preview_perf": state.preview_perf_stats.clone(),
     });
     attach_preview_ipc_counter_snapshot(&mut response, &ipc_counters);
-    attach_latest_wins_metrics(&mut response, state.replace_worker.metrics());
     let payload_bytes = serde_json::to_vec(&response).unwrap_or_default().len() as u64;
     response["preview_perf_payload_bytes"] = json!(payload_bytes);
+    response["preview_perf_payload_within_budget"] =
+        json!(payload_bytes <= DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES);
     response
 }
 
@@ -13047,6 +13050,15 @@ fn dev_visible_render_report(
             "hot_path_preview_summary_query_count": shell.hot_path_preview_summary_query_count,
             "hot_path_preview_perf_query_count": shell.hot_path_preview_perf_query_count,
             "preview_perf_hot_path_query_count": shell.hot_path_preview_perf_query_count,
+            "dev_footer_preview_perf_hot_path_ipc_count": 0,
+            "footer_lines_preview_perf_ipc_count": 0,
+            "render_hook_preview_perf_ipc_count": 0,
+            "preview_perf_runtime_summary_query_count": 0,
+            "preview_perf_hot_path_runtime_query_count": 0,
+            "dev_perf_row_queries_ipc_from_render_hook": false,
+            "dev_perf_row_queries_runtime_from_render_hook": false,
+            "preview_perf_snapshot_queried_in_render_hook": false,
+            "preview_perf_snapshot_queried_in_footer_lines": false,
             "command_probe_count": 0
         },
         "dev_render_cache": {
@@ -23552,6 +23564,10 @@ fn preview_perf_footer_summary(
         .and_then(serde_json::Value::as_f64)
         .map(format_ms_compact)
         .unwrap_or_else(|| "-".to_owned());
+    let p95 = preview_perf_summary_p95(stats, "input_to_present_ms_p50_p95_p99_max")
+        .or_else(|| preview_perf_summary_p95(stats, "present_call_ms_p50_p95_p99_max"))
+        .map(format_ms_compact)
+        .unwrap_or_else(|| "-".to_owned());
     let fps = stats
         .get("renders_per_second")
         .and_then(serde_json::Value::as_f64)
@@ -23569,9 +23585,16 @@ fn preview_perf_footer_summary(
         format!("mode idle, last {last}, render {render}, age {age}, proof {proof}, drops {drops}")
     } else {
         format!(
-            "mode {mode}, fps {fps}, last {last}, render {render}, age {age}, proof {proof}, drops {drops}"
+            "mode {mode}, fps {fps}, p95 {p95}, last {last}, render {render}, age {age}, proof {proof}, drops {drops}"
         )
     }
+}
+
+fn preview_perf_summary_p95(stats: &serde_json::Value, key: &str) -> Option<f64> {
+    stats
+        .get(key)
+        .and_then(|summary| summary.get("p95"))
+        .and_then(serde_json::Value::as_f64)
 }
 
 fn format_ms_compact(value: f64) -> String {
@@ -61809,6 +61832,20 @@ mod tests {
     fn test_preview_perf_stats(
         frame_evidence_key: boon_native_app_window::FrameEvidenceKey,
     ) -> boon_native_app_window::NativePreviewPerfStats {
+        let timing_summary = boon_native_app_window::NativePerfMetricSummary {
+            p50: Some(4.0),
+            p95: Some(4.0),
+            p99: Some(4.0),
+            max: Some(4.0),
+            sample_count: 1,
+        };
+        let empty_summary = boon_native_app_window::NativePerfMetricSummary {
+            p50: None,
+            p95: None,
+            p99: None,
+            max: None,
+            sample_count: 0,
+        };
         boon_native_app_window::NativePreviewPerfStats {
             kind: "preview-perf-stats".to_owned(),
             status: "pass".to_owned(),
@@ -61835,9 +61872,13 @@ mod tests {
             render_hook_ms: Some(1.0),
             present_call_ms: Some(1.2),
             input_to_present_ms: Some(4.0),
+            render_hook_ms_p50_p95_p99_max: timing_summary.clone(),
+            present_call_ms_p50_p95_p99_max: timing_summary.clone(),
+            input_to_present_ms_p50_p95_p99_max: timing_summary,
             missed_frame_count: 0,
             proof_mode: "off".to_owned(),
             proof_overhead_ms: None,
+            proof_overhead_ms_p50_p95_max: empty_summary,
             telemetry_drop_count: 0,
             last_missed_frame_cause: None,
             frame_evidence_key: Some(frame_evidence_key),
@@ -72929,9 +72970,37 @@ label:
                 "render_hook_ms": 1.3,
                 "present_call_ms": 2.1,
                 "input_to_present_ms": 8.4,
+                "render_hook_ms_p50_p95_p99_max": {
+                    "p50": 1.3,
+                    "p95": 1.3,
+                    "p99": 1.3,
+                    "max": 1.3,
+                    "sample_count": 1
+                },
+                "present_call_ms_p50_p95_p99_max": {
+                    "p50": 2.1,
+                    "p95": 2.1,
+                    "p99": 2.1,
+                    "max": 2.1,
+                    "sample_count": 1
+                },
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "p50": 8.4,
+                    "p95": 9.6,
+                    "p99": 9.6,
+                    "max": 9.6,
+                    "sample_count": 4
+                },
                 "missed_frame_count": 0,
                 "proof_mode": "off",
                 "proof_overhead_ms": null,
+                "proof_overhead_ms_p50_p95_max": {
+                    "p50": null,
+                    "p95": null,
+                    "p99": null,
+                    "max": null,
+                    "sample_count": 0
+                },
                 "telemetry_drop_count": 0,
                 "last_missed_frame_cause": null
             }
@@ -72942,6 +73011,7 @@ label:
 
         assert!(footer_text.contains("Preview perf: mode burst"));
         assert!(footer_text.contains("fps 59.8"));
+        assert!(footer_text.contains("p95 9.60ms"));
         assert!(footer_text.contains("last 8.40ms"));
         assert_eq!(shell.hot_path_preview_perf_query_count, 0);
     }
@@ -72969,6 +73039,20 @@ label:
         let source_path = PathBuf::from("examples/counter.bn");
         let source = "store: []\n".to_owned();
         let source_hash = boon_runtime::sha256_bytes(source.as_bytes());
+        let perf_summary = boon_native_app_window::NativePerfMetricSummary {
+            p50: Some(4.0),
+            p95: Some(4.0),
+            p99: Some(4.0),
+            max: Some(4.0),
+            sample_count: 1,
+        };
+        let empty_perf_summary = boon_native_app_window::NativePerfMetricSummary {
+            p50: None,
+            p95: None,
+            p99: None,
+            max: None,
+            sample_count: 0,
+        };
         let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
             layout_proof: json!({"status": "pass"}),
             layout_frame_override: None,
@@ -73013,9 +73097,13 @@ label:
                 render_hook_ms: Some(1.0),
                 present_call_ms: Some(1.2),
                 input_to_present_ms: Some(4.0),
+                render_hook_ms_p50_p95_p99_max: perf_summary.clone(),
+                present_call_ms_p50_p95_p99_max: perf_summary.clone(),
+                input_to_present_ms_p50_p95_p99_max: perf_summary,
                 missed_frame_count: 0,
                 proof_mode: "off".to_owned(),
                 proof_overhead_ms: None,
+                proof_overhead_ms_p50_p95_max: empty_perf_summary,
                 telemetry_drop_count: 0,
                 last_missed_frame_cause: None,
                 frame_evidence_key: Some(boon_native_app_window::FrameEvidenceKey {
@@ -73049,13 +73137,24 @@ label:
 
         assert_eq!(response["status"], "pass");
         assert_eq!(response["runtime_state_locked"], false);
+        assert_eq!(
+            response["max_payload_bytes"],
+            DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES
+        );
+        assert_eq!(response["preview_perf_payload_within_budget"], true);
         assert!(response.get("runtime_summary").is_none());
+        assert!(response.get("latest_wins_worker").is_none());
+        assert!(response.get("semantic_coalescing_reason").is_none());
         assert_eq!(response["preview_perf"]["frame_seq"], 3);
+        assert_eq!(
+            response["preview_perf"]["input_to_present_ms_p50_p95_p99_max"]["p95"],
+            4.0
+        );
         assert!(
             response["preview_perf_payload_bytes"]
                 .as_u64()
                 .unwrap_or(u64::MAX)
-                < 4096,
+                <= DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES,
             "{response}"
         );
     }

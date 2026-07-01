@@ -26258,6 +26258,9 @@ fn collect_native_ux_product_path_reasons(
                         "{child_path}=true substitutes non-native proof for native UX evidence"
                     ));
                 }
+                if key == "dev_hot_path_counters" {
+                    require_dev_preview_perf_hot_path_guards(child, &child_path, reasons);
+                }
                 if key == "cosmic_toplevel_probe"
                     && child.get("status").and_then(JsonValue::as_str) == Some("pass")
                 {
@@ -26389,6 +26392,39 @@ fn collect_native_ux_proof_currentness_reasons(report: &JsonValue, reasons: &mut
             "last_interactive_readback_artifact.frame_evidence_key must match top-level frame_evidence_key for native UX"
                 .to_owned(),
         );
+    }
+}
+
+fn require_dev_preview_perf_hot_path_guards(
+    value: &JsonValue,
+    path: &str,
+    reasons: &mut Vec<String>,
+) {
+    let Some(object) = value.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return;
+    };
+    for key in [
+        "preview_perf_hot_path_query_count",
+        "dev_footer_preview_perf_hot_path_ipc_count",
+        "footer_lines_preview_perf_ipc_count",
+        "render_hook_preview_perf_ipc_count",
+        "preview_perf_runtime_summary_query_count",
+        "preview_perf_hot_path_runtime_query_count",
+    ] {
+        if object.get(key).and_then(JsonValue::as_u64).is_none() {
+            reasons.push(format!("{path}.{key} must be an integer guard counter"));
+        }
+    }
+    for key in [
+        "dev_perf_row_queries_ipc_from_render_hook",
+        "dev_perf_row_queries_runtime_from_render_hook",
+        "preview_perf_snapshot_queried_in_render_hook",
+        "preview_perf_snapshot_queried_in_footer_lines",
+    ] {
+        if object.get(key).and_then(JsonValue::as_bool).is_none() {
+            reasons.push(format!("{path}.{key} must be a boolean guard"));
+        }
     }
 }
 
@@ -26603,6 +26639,45 @@ fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut
         .is_none_or(str::is_empty)
     {
         reasons.push(format!("{path}.proof_mode must be a nonempty string"));
+    }
+    for field in [
+        "render_hook_ms_p50_p95_p99_max",
+        "present_call_ms_p50_p95_p99_max",
+        "input_to_present_ms_p50_p95_p99_max",
+        "proof_overhead_ms_p50_p95_max",
+    ] {
+        match object.get(field) {
+            Some(summary) => {
+                verify_native_preview_perf_summary(summary, &format!("{path}.{field}"), reasons)
+            }
+            None => reasons.push(format!("{path}.{field} is missing")),
+        }
+    }
+}
+
+fn verify_native_preview_perf_summary(value: &JsonValue, path: &str, reasons: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        reasons.push(format!("{path} must be an object"));
+        return;
+    };
+    let Some(sample_count) = object.get("sample_count").and_then(JsonValue::as_u64) else {
+        reasons.push(format!("{path}.sample_count must be an integer"));
+        return;
+    };
+    for field in ["p50", "p95", "p99", "max"] {
+        let metric = object.get(field);
+        if sample_count == 0 {
+            if metric.is_some_and(|value| !value.is_null()) {
+                reasons.push(format!("{path}.{field} must be null when sample_count=0"));
+            }
+        } else if !metric
+            .and_then(JsonValue::as_f64)
+            .is_some_and(f64::is_finite)
+        {
+            reasons.push(format!(
+                "{path}.{field} must be a finite number when sample_count>0"
+            ));
+        }
     }
 }
 
@@ -31483,9 +31558,37 @@ mod tests {
             "render_hook_ms": 1.2,
             "present_call_ms": 2.4,
             "input_to_present_ms": 8.0,
+            "render_hook_ms_p50_p95_p99_max": {
+                "p50": 1.2,
+                "p95": 1.2,
+                "p99": 1.2,
+                "max": 1.2,
+                "sample_count": 1
+            },
+            "present_call_ms_p50_p95_p99_max": {
+                "p50": 2.4,
+                "p95": 2.4,
+                "p99": 2.4,
+                "max": 2.4,
+                "sample_count": 1
+            },
+            "input_to_present_ms_p50_p95_p99_max": {
+                "p50": 8.0,
+                "p95": 8.0,
+                "p99": 8.0,
+                "max": 8.0,
+                "sample_count": 1
+            },
             "missed_frame_count": 0,
             "proof_mode": "readback",
             "proof_overhead_ms": 4.0,
+            "proof_overhead_ms_p50_p95_max": {
+                "p50": 4.0,
+                "p95": 4.0,
+                "p99": 4.0,
+                "max": 4.0,
+                "sample_count": 1
+            },
             "telemetry_drop_count": 0,
             "last_missed_frame_cause": null,
             "frame_evidence_key": key.clone()
@@ -31622,6 +31725,19 @@ mod tests {
     }
 
     #[test]
+    fn native_gpu_schema_rejects_preview_perf_missing_percentile_summary() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["preview_perf_stats"]
+            .as_object_mut()
+            .unwrap()
+            .remove("input_to_present_ms_p50_p95_p99_max");
+        assert!(!schema_accepts(
+            report,
+            "native-preview-perf-missing-summary"
+        ));
+    }
+
+    #[test]
     fn native_gpu_schema_rejects_continuous_probe_ux_report() {
         let mut report = native_gpu_report_with_frame_evidence();
         report["render_loop_mode"] = json!("continuous_probe");
@@ -31670,6 +31786,18 @@ mod tests {
         report["preview_perf_hot_path_query_count"] = json!(1);
         report["dev_perf_row_queries_ipc_from_render_hook"] = json!(true);
         assert!(!schema_accepts(report, "native-dev-perf-hot-path-query"));
+    }
+
+    #[test]
+    fn native_gpu_schema_rejects_incomplete_dev_perf_hot_path_guards() {
+        let mut report = native_gpu_report_with_frame_evidence();
+        report["dev_hot_path_counters"] = json!({
+            "preview_perf_hot_path_query_count": 0
+        });
+        assert!(!schema_accepts(
+            report,
+            "native-dev-perf-hot-path-guards-incomplete"
+        ));
     }
 
     #[test]

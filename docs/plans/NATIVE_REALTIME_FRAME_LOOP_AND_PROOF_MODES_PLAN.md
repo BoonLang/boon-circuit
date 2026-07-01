@@ -701,6 +701,47 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   WGPU proof for the measured dev frame without putting readback on the UX hot
   path.
 
+2026-07-01 dev-editor proof/counter completion slice:
+
+- Dev-window interactive visible-surface readback is enabled for verifier proof
+  mode, with final report drain and proof-mode backpressure so timer/requested
+  animation frames do not advance past an in-flight measured proof frame.
+- Dev visible-surface proof now carries the same render-target metadata shape
+  used by preview proof, including the explicit app-owned offscreen-readback
+  skip marker when the dev hook already rendered a direct visible surface.
+- Dev render reports now distinguish lifetime render/layout counters from
+  passive-scroll hot-path counters:
+  - `full_layout_refresh_count` / `fast_frame_patch_count` remain lifetime
+    diagnostics;
+  - `passive_scroll_full_layout_refresh_count` /
+    `passive_scroll_fast_frame_patch_count` are the gate inputs;
+  - missing passive-scroll fields fail closed instead of falling back to
+    lifetime counters.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo check -q -p boon_native_playground`
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask native_scroll_axis`
+  - `git diff --check`
+  - `timeout 900s cargo xtask verify-native-dev-editor-scroll-speed --profile
+    release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json`
+  - `cargo xtask verify-report-schema
+    target/reports/native-gpu/dev-editor-scroll-speed-release.json`
+- Fresh release report highlights:
+  - `status=pass`
+  - `dev_editor_frame_ms_p50_p95_p99_max.p95=12.144384`
+  - `dev_editor_frame_ms_p50_p95_p99_max.max=19.247104`
+  - `full_layout_refresh_count_for_passive_scroll=0`
+  - `fast_frame_patch_count_for_passive_scroll=1`
+  - lifetime diagnostics remain visible:
+    `full_layout_refresh_count_lifetime=21`,
+    `fast_frame_patch_count_lifetime=4`
+  - both axes report measured-loop same-frame app-owned readback proof.
+- This does not complete the full realtime/proof plan. Remaining work still
+  includes full aggregate native GPU gates, direct retained render-scene patch
+  hit-rate improvement, broader no-hacks audits, and generic runtime/list
+  currentness verification.
+
 ## Implementation Slices
 
 1. Terminology and schema:

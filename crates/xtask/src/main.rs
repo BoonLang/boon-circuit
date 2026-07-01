@@ -39122,7 +39122,7 @@ fn verify_native_dev_editor_scroll_speed(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(u64::MAX),
         );
-    let full_layout_refresh_count_for_passive_scroll = vertical_surface_proof
+    let full_layout_refresh_count_lifetime = vertical_surface_proof
         .pointer("/dev_render_cache/full_layout_refresh_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(u64::MAX)
@@ -39132,13 +39132,33 @@ fn verify_native_dev_editor_scroll_speed(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(u64::MAX),
         );
-    let fast_frame_patch_count_for_passive_scroll = vertical_surface_proof
+    let fast_frame_patch_count_lifetime = vertical_surface_proof
         .pointer("/dev_render_cache/fast_frame_patch_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
         .min(
             horizontal_surface_proof
                 .pointer("/dev_render_cache/fast_frame_patch_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    let full_layout_refresh_count_for_passive_scroll = vertical_surface_proof
+        .pointer("/dev_render_cache/passive_scroll_full_layout_refresh_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX)
+        .max(
+            horizontal_surface_proof
+                .pointer("/dev_render_cache/passive_scroll_full_layout_refresh_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+        );
+    let fast_frame_patch_count_for_passive_scroll = vertical_surface_proof
+        .pointer("/dev_render_cache/passive_scroll_fast_frame_patch_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(
+            horizontal_surface_proof
+                .pointer("/dev_render_cache/passive_scroll_fast_frame_patch_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
         );
@@ -39434,6 +39454,12 @@ fn verify_native_dev_editor_scroll_speed(
         "telemetry_poll_count_in_scroll_hot_path": 0,
         "full_layout_refresh_count_for_passive_scroll": full_layout_refresh_count_for_passive_scroll,
         "fast_frame_patch_count_for_passive_scroll": fast_frame_patch_count_for_passive_scroll,
+        "full_layout_refresh_count_lifetime": full_layout_refresh_count_lifetime,
+        "fast_frame_patch_count_lifetime": fast_frame_patch_count_lifetime,
+        "dev_render_cache_lifetime_counts": {
+            "full_layout_refresh_count": full_layout_refresh_count_lifetime,
+            "fast_frame_patch_count": fast_frame_patch_count_lifetime
+        },
         "footer_telemetry_poll_delta": 0,
         "visible_line_count": visible_line_count,
         "materialized_line_count_max": visible_line_count + 8,
@@ -67792,6 +67818,9 @@ fn isolated_weston_desktop_preview_e2e_args(
     if skip_render_hook_app_owned_proof {
         args.push("--skip-render-hook-app-owned-proof".to_owned());
     }
+    if !target_dev_surface {
+        args.push("--dev-app-owned-input-probe".to_owned());
+    }
     Ok(args)
 }
 
@@ -82782,10 +82811,32 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             "1000"
         ));
         assert!(args.iter().any(|arg| arg == "--dev-editor-only"));
+        assert!(!args.iter().any(|arg| arg == "--dev-app-owned-input-probe"));
         assert!(
             args.iter()
                 .any(|arg| arg == "--skip-operator-host-input-probe")
         );
+    }
+
+    #[test]
+    fn isolated_preview_e2e_keeps_dev_app_owned_input_probe() {
+        let args = isolated_weston_desktop_preview_e2e_args(
+            "generic",
+            "test-title-token",
+            1500,
+            180_000,
+            Path::new("target/reports/native-gpu/test-supervisor.json"),
+            Path::new("target/reports/native-gpu/test-live-state.json"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("test paths are UTF-8");
+
+        assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
+        assert!(args.iter().any(|arg| arg == "--dev-app-owned-input-probe"));
+        assert!(!args.iter().any(|arg| arg == "--dev-editor-only"));
     }
 
     #[test]

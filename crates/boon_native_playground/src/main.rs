@@ -6756,12 +6756,22 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if layout_changed {
                     dirty = true;
                     let after_input = DevEditorSnapshot::from_shell(&shell);
-                    if before_input.editor_scroll_only(&after_input)
-                        && patch_dev_render_editor_scroll(&shell, &mut render_state)
-                    {
-                        layout_refreshed = true;
-                        role_dirty_reason =
-                            Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                    if before_input.editor_scroll_only(&after_input) {
+                        if patch_dev_render_editor_scroll(&shell, &mut render_state) {
+                            render_state.passive_scroll_fast_frame_patch_count = render_state
+                                .passive_scroll_fast_frame_patch_count
+                                .saturating_add(1);
+                            layout_refreshed = true;
+                            role_dirty_reason =
+                                Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                        } else {
+                            render_state.passive_scroll_full_layout_refresh_count = render_state
+                                .passive_scroll_full_layout_refresh_count
+                                .saturating_add(1);
+                            needs_layout_refresh = true;
+                            role_dirty_reason =
+                                Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
+                        }
                     } else if before_input.editor_visual_only(&after_input)
                         && patch_dev_render_editor_visual_state(&shell, &mut render_state)
                     {
@@ -6902,6 +6912,8 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &render_state.code_editor_model_report,
                 render_state.full_layout_refresh_count,
                 render_state.fast_frame_patch_count,
+                render_state.passive_scroll_full_layout_refresh_count,
+                render_state.passive_scroll_fast_frame_patch_count,
                 render_state.fast_render_scene_patch.as_ref(),
             )?;
             let layout_identity_fallback = format!("dev-content:{content_revision}");
@@ -7084,6 +7096,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
+    let dev_app_owned_input_probe = args.iter().any(|arg| arg == "--dev-app-owned-input-probe");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let skip_render_hook_app_owned_proof = args
         .iter()
@@ -7297,7 +7310,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("preview loop report path is not UTF-8")?
             .to_owned(),
     ]);
-    if probe && !real_window_input_probe {
+    if (probe && !real_window_input_probe) || dev_app_owned_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
     }
     if demand_driven_loop {
@@ -12719,6 +12732,8 @@ fn native_gpu_dev_visible_render_hook(
     code_editor_model_report: &serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+    passive_scroll_full_layout_refresh_count: u64,
+    passive_scroll_fast_frame_patch_count: u64,
     fast_render_scene_patch: Option<&DevFastRenderScenePatch>,
 ) -> Result<serde_json::Value, String> {
     let renderer = visible_renderer.get_or_insert_with(|| {
@@ -12854,6 +12869,8 @@ fn native_gpu_dev_visible_render_hook(
                 code_editor_model_report,
                 full_layout_refresh_count,
                 fast_frame_patch_count,
+                passive_scroll_full_layout_refresh_count,
+                passive_scroll_fast_frame_patch_count,
                 cache,
                 visible_metrics,
                 render_hook_phase_timings_ms.clone(),
@@ -12945,6 +12962,8 @@ fn native_gpu_dev_visible_render_hook(
         code_editor_model_report,
         full_layout_refresh_count,
         fast_frame_patch_count,
+        passive_scroll_full_layout_refresh_count,
+        passive_scroll_fast_frame_patch_count,
         cache,
         visible_metrics,
         render_hook_phase_timings_ms.clone(),
@@ -12981,6 +13000,8 @@ fn dev_visible_render_report(
     code_editor_model_report: &serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+    passive_scroll_full_layout_refresh_count: u64,
+    passive_scroll_fast_frame_patch_count: u64,
     cache: &DevRenderSceneCache,
     visible_metrics: boon_native_gpu::FrameMetrics,
     render_hook_phase_timings_ms: serde_json::Value,
@@ -13028,6 +13049,8 @@ fn dev_visible_render_report(
         "dev_render_cache": {
             "full_layout_refresh_count": full_layout_refresh_count,
             "fast_frame_patch_count": fast_frame_patch_count,
+            "passive_scroll_full_layout_refresh_count": passive_scroll_full_layout_refresh_count,
+            "passive_scroll_fast_frame_patch_count": passive_scroll_fast_frame_patch_count,
             "fast_frame_patch_supported": true
         },
         "layout_metrics": layout_frame.metrics
@@ -13259,6 +13282,8 @@ struct DevRenderState {
     code_editor_model_report: serde_json::Value,
     full_layout_refresh_count: u64,
     fast_frame_patch_count: u64,
+    passive_scroll_full_layout_refresh_count: u64,
+    passive_scroll_fast_frame_patch_count: u64,
     fast_render_scene_patch: Option<DevFastRenderScenePatch>,
 }
 

@@ -9646,8 +9646,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             )
             && !runtime_source.contains("fn plan_source_payload_field(")
             && !runtime_source.contains("fn source_id_for_path(ir: &TypedProgram")
-            && !runtime_source
-                .contains("fn set_address_lookup_fields(&mut self, ir: &TypedProgram)")
+            && !runtime_source.contains("fn set_row_lookup_fields(&mut self, ir: &TypedProgram)")
             && !runtime_source
                 .contains("for source in &ir.sources {\n            if let Some(route)");
     let runtime_source_route_bool_facts_extracted = runtime_compiler_runtime_program_aggregate

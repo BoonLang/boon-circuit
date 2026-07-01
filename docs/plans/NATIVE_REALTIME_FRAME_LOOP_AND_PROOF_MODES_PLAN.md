@@ -1281,6 +1281,80 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   with app-owned host events/WGPU evidence and to finish the retained
   frame-loop, proof identity, runtime currentness, and aggregate gate slices.
 
+2026-07-01 native document row-lookup naming cleanup slice:
+
+- Native document static analysis and document evaluation context now carry
+  `source_row_lookup_fields` instead of `source_address_lookup_fields`.
+  The native document-lowering path consumes the generic row-lookup metadata
+  emitted by runtime static analysis, keeping spreadsheet address terminology
+  out of this production hot path.
+- The implicit source-intent helper was renamed from address lookup to row
+  lookup, and its local variables now refer to row lookup values. The serialized
+  compatibility intent still emits `intent="address"` for older route consumers
+  until the remaining runtime/compiler compatibility aliases are retired.
+- The duplicate compiler/runtime static-analysis map named
+  `source_address_lookup_fields` was removed. Runtime static analysis now
+  exposes the generic `source_row_lookup_fields` map only; lower-level route
+  slots still serialize `address_lookup_field` as a compatibility alias.
+- `CompilerSourceRouteSource` and runtime `SourceRoute` no longer store a
+  second `address_lookup_field` identity. Compiler output carries
+  `row_lookup_field`; runtime route artifacts still emit and accept the legacy
+  `address_lookup_field` key as a compatibility alias derived from
+  `row_lookup_field`.
+- Runtime helper names now use row lookup terminology:
+  `row_lookup_field_for_source_id`, `row_lookup_field_for_list`, and
+  `set_row_lookup_fields`.
+- The route operation report now emits
+  `row_binding_identity=source_row_lookup_or_bound_row`, removing the old
+  `source_address_lookup_or_bound_row` label from runtime reporting.
+- The xtask architecture audit negative pattern now checks the renamed
+  `set_row_lookup_fields` helper, so the verifier continues to reject direct
+  IR-coupled route construction after the terminology cleanup.
+- Focused verification passed:
+  - `rg -n "source_address_lookup_fields" crates --glob '*.rs'` returns no
+    matches;
+  - `cargo check -q -p boon_compiler -p boon_runtime -p boon_native_playground`;
+  - `cargo check -q -p boon_compiler -p boon_runtime -p boon_ir -p boon_native_playground`;
+  - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`;
+  - `cargo test -q -p boon_ir scoped_source_lookup_prefers_source_intent_identity_field`;
+  - `cargo test -q -p boon_runtime compiled_artifact_decodes_source_routes_and_action_table_without_ast`;
+  - `cargo test -q -p boon_runtime source_routes_are_dense_by_hidden_source_id`;
+  - `cargo test -q -p boon_runtime compiled_artifact_emission_is_deterministic_and_schema_valid`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask native_gpu`;
+  - `cargo check -q -p boon_native_playground`;
+  - `cargo test -q -p boon_native_playground row_identity`;
+  - `cargo test -q -p boon_native_playground selection_proxy_`;
+  - `cargo test -q -p boon_native_playground cells_focus_only_route_syncs_formula_bar_text`;
+  - `cargo test -q -p boon_native_playground cells_click_selection_updates_formula_bar_and_selected_style`;
+  - `cargo fmt --check`;
+  - `git diff --check`.
+- `cargo test -q -p boon_runtime novywave_file_rows_use_generic_row_source`
+  currently fails before reaching row-route assertions with
+  `unsupported state initializer external_file_tree_file`; it is not accepted
+  as proof for this slice and remains separate verifier/fixture debt.
+- Fresh Cells scroll-speed verification against this worktree remains
+  schema-valid and fails honestly only on hardware readiness:
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json`
+    wrote `status=fail`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/scroll-speed-cells.json`
+    passed;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_to_present_ms_p95=10.305772999996409`;
+  - `ux_frame_budget_pass=true`;
+  - `wall_clock_frame_budget_pass=true`;
+  - `renderer_frame_budget_pass=true`;
+  - `renderer_cpu_frame_ms_p95=1.62293`;
+  - `preview_perf_present_path_ms_p95=9.935689`;
+  - `logical_cell_count=2600`;
+  - `materialized_cell_count_max=336`;
+  - remaining blocker:
+    `native scroll-speed gate ran on a software adapter; hardware-backed real-window speed is not proven`.
+- This is a no-hacks cleanup slice, not the full generic identity migration.
+  Remaining compatibility surfaces still include IR/plan
+  `SourcePayloadSchema.address_lookup_field`, legacy `SourcePayloadField::Address`,
+  and the serialized compatibility source intent.
+
 2026-07-01 manifest scroll coverage and honest scroll-speed blocker slice:
 
 - `verify-native-gpu-preview-e2e --example cells` now counts current

@@ -3043,11 +3043,6 @@ fn select_source_row_lookup_field(source: &str, candidates: Vec<String>) -> Opti
         .map(|(_, candidate, _)| candidate)
 }
 
-#[cfg(test)]
-fn select_source_address_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
-    select_source_row_lookup_field(source, candidates)
-}
-
 fn source_row_lookup_field_score(source: &str, candidate: &str) -> i32 {
     let terms = source_address_intent_terms(source);
     let mut score = 0;
@@ -13634,7 +13629,7 @@ mod tests {
     #[test]
     fn scoped_source_lookup_prefers_source_intent_identity_field() {
         assert_eq!(
-            select_source_address_lookup_field(
+            select_source_row_lookup_field(
                 "file_tree_row.scope_row_elements.select_scope",
                 vec!["file".to_owned(), "scope_key".to_owned()]
             )
@@ -13642,7 +13637,7 @@ mod tests {
             Some("scope_key")
         );
         assert_eq!(
-            select_source_address_lookup_field(
+            select_source_row_lookup_field(
                 "file_tree_row.file_row_elements.select_file",
                 vec!["file".to_owned(), "scope_key".to_owned()]
             )

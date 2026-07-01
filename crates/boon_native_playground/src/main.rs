@@ -9890,7 +9890,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
     let typecheck_report = Arc::clone(&static_analysis.typecheck_report);
     let source_binding_index = Arc::clone(&static_analysis.source_binding_index);
     let runtime_source_paths = Arc::clone(&static_analysis.runtime_source_paths);
-    let source_address_lookup_fields = Arc::clone(&static_analysis.source_address_lookup_fields);
+    let source_row_lookup_fields = Arc::clone(&static_analysis.source_row_lookup_fields);
     let runtime_row_scope_by_list = Arc::clone(&static_analysis.runtime_row_scope_by_list);
     let data_binding_index = Arc::clone(&static_analysis.data_binding_index);
     profile.typecheck_ms = elapsed_ms(typecheck_started);
@@ -9978,7 +9978,7 @@ fn native_document_layout_proof_with_project_state_mode_for_viewport_and_parsed(
         passed: None,
         source_binding_index,
         runtime_source_paths,
-        source_address_lookup_fields,
+        source_row_lookup_fields,
         runtime_row_scope_by_list,
         data_binding_index,
         data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -10462,7 +10462,7 @@ struct DocumentStaticAnalysis {
     typecheck_report: Arc<boon_typecheck::TypeCheckReport>,
     source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
     runtime_source_paths: Arc<BTreeSet<String>>,
-    source_address_lookup_fields: Arc<BTreeMap<String, String>>,
+    source_row_lookup_fields: Arc<BTreeMap<String, String>>,
     runtime_row_scope_by_list: Arc<BTreeMap<String, String>>,
     data_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
 }
@@ -10489,7 +10489,7 @@ fn cached_document_static_analysis(
             &runtime_analysis.view_bindings,
         )),
         runtime_source_paths: Arc::new(runtime_analysis.source_paths.iter().cloned().collect()),
-        source_address_lookup_fields: Arc::new(runtime_analysis.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::new(runtime_analysis.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::new(row_scope_by_list_from_runtime_analysis(
             &runtime_analysis.row_scopes,
         )),
@@ -25493,7 +25493,7 @@ fn document_block_context<'a>(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -25919,7 +25919,7 @@ fn document_function_call_context<'a>(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -25949,7 +25949,7 @@ fn document_function_args_context<'a>(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -26085,7 +26085,7 @@ fn document_function_item_context<'a>(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -26645,7 +26645,7 @@ fn lower_mapped_document_children(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -27162,7 +27162,7 @@ fn lower_canonical_list_map_children(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -30972,11 +30972,11 @@ fn push_contextual_source_intent_with_fields(
         event_fields,
     );
     if source_intent_kind_routes_event(Some(intent)) {
-        push_implicit_address_intent_for_source(context, node_id, source_intents, &source_path);
+        push_implicit_row_lookup_intent_for_source(context, node_id, source_intents, &source_path);
     }
 }
 
-fn push_implicit_address_intent_for_source(
+fn push_implicit_row_lookup_intent_for_source(
     context: &DocumentEvalContext<'_>,
     node_id: &boon_document_model::DocumentNodeId,
     source_intents: &mut Vec<serde_json::Value>,
@@ -30988,20 +30988,20 @@ fn push_implicit_address_intent_for_source(
     }) {
         return;
     }
-    let Some(address_lookup_field) = context
-        .source_address_lookup_fields
+    let Some(row_lookup_field) = context
+        .source_row_lookup_fields
         .get(source_path)
         .map(String::as_str)
     else {
         return;
     };
-    let Some(address) =
-        document_address_value_for_source_lookup(context, source_path, address_lookup_field)
+    let Some(row_lookup_value) =
+        document_row_lookup_value_for_source(context, source_path, row_lookup_field)
     else {
         return;
     };
-    let address = address.trim().to_owned();
-    if address.is_empty() {
+    let row_lookup_value = row_lookup_value.trim().to_owned();
+    if row_lookup_value.is_empty() {
         return;
     }
     let reads = document_context_take_data_reads(context);
@@ -31009,24 +31009,24 @@ fn push_implicit_address_intent_for_source(
     source_intents.push(json!({
         "node": node_id,
         "intent": "address",
-        "source_path": address,
+        "source_path": row_lookup_value,
         "implicit": true
     }));
 }
 
-fn document_address_value_for_source_lookup(
+fn document_row_lookup_value_for_source(
     context: &DocumentEvalContext<'_>,
     source_path: &str,
-    address_lookup_field: &str,
+    row_lookup_field: &str,
 ) -> Option<String> {
     let source_scope = source_path.split_once('.')?.0;
-    let direct_path = format!("{source_scope}.{address_lookup_field}");
+    let direct_path = format!("{source_scope}.{row_lookup_field}");
     let mut candidates = BTreeSet::new();
-    if let Some(address) = document_resolved_value(&direct_path, context)
+    if let Some(row_lookup_value) = document_resolved_value(&direct_path, context)
         .map(json_value_to_document_text)
-        .filter(|address| !address.trim().is_empty())
+        .filter(|row_lookup_value| !row_lookup_value.trim().is_empty())
     {
-        candidates.insert(address);
+        candidates.insert(row_lookup_value);
     }
     for (local, origins) in context.local_origins.merged() {
         if !origins
@@ -31035,12 +31035,12 @@ fn document_address_value_for_source_lookup(
         {
             continue;
         }
-        let local_path = format!("{local}.{address_lookup_field}");
-        if let Some(address) = document_resolved_value(&local_path, context)
+        let local_path = format!("{local}.{row_lookup_field}");
+        if let Some(row_lookup_value) = document_resolved_value(&local_path, context)
             .map(json_value_to_document_text)
-            .filter(|address| !address.trim().is_empty())
+            .filter(|row_lookup_value| !row_lookup_value.trim().is_empty())
         {
-            candidates.insert(address);
+            candidates.insert(row_lookup_value);
         }
     }
     if candidates.len() == 1 {
@@ -31609,7 +31609,7 @@ struct DocumentEvalContext<'a> {
     passed: Option<Value>,
     source_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
     runtime_source_paths: Arc<BTreeSet<String>>,
-    source_address_lookup_fields: Arc<BTreeMap<String, String>>,
+    source_row_lookup_fields: Arc<BTreeMap<String, String>>,
     runtime_row_scope_by_list: Arc<BTreeMap<String, String>>,
     data_binding_index: Arc<BTreeMap<(String, String), Vec<String>>>,
     data_reads: Arc<Mutex<BTreeSet<String>>>,
@@ -32204,7 +32204,7 @@ fn lower_document_for_each(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -32743,7 +32743,7 @@ fn document_eval_while_selector_value(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -32779,7 +32779,7 @@ fn document_eval_while_selector_value(
                 passed: context.passed.clone(),
                 source_binding_index: Arc::clone(&context.source_binding_index),
                 runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-                source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+                source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
                 runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
                 data_binding_index: Arc::clone(&context.data_binding_index),
                 data_reads: Arc::clone(&context.data_reads),
@@ -35115,7 +35115,7 @@ fn document_eval_pipe_function_call(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -35384,7 +35384,7 @@ fn document_eval_statement_sequence(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -35438,7 +35438,7 @@ fn document_eval_block_statement_sequence(
         passed: context.passed.clone(),
         source_binding_index: Arc::clone(&context.source_binding_index),
         runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-        source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+        source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
         runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
         data_binding_index: Arc::clone(&context.data_binding_index),
         data_reads: Arc::clone(&context.data_reads),
@@ -35691,7 +35691,7 @@ fn document_eval_list_retain_with_statement_children(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -35767,7 +35767,7 @@ fn document_eval_list_map(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -35813,7 +35813,7 @@ fn document_eval_list_quantifier(
             passed: context.passed.clone(),
             source_binding_index: Arc::clone(&context.source_binding_index),
             runtime_source_paths: Arc::clone(&context.runtime_source_paths),
-            source_address_lookup_fields: Arc::clone(&context.source_address_lookup_fields),
+            source_row_lookup_fields: Arc::clone(&context.source_row_lookup_fields),
             runtime_row_scope_by_list: Arc::clone(&context.runtime_row_scope_by_list),
             data_binding_index: Arc::clone(&context.data_binding_index),
             data_reads: Arc::clone(&context.data_reads),
@@ -67019,7 +67019,7 @@ FUNCTION cache_read_replay_app() {
             })),
             source_binding_index: Arc::new(BTreeMap::new()),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -67065,7 +67065,7 @@ FUNCTION cache_read_replay_app() {
             })),
             source_binding_index: Arc::new(BTreeMap::new()),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -67152,7 +67152,7 @@ FUNCTION cache_read_replay_app() {
                 })),
                 source_binding_index: Arc::new(BTreeMap::new()),
                 runtime_source_paths: Arc::new(BTreeSet::new()),
-                source_address_lookup_fields: Arc::new(BTreeMap::new()),
+                source_row_lookup_fields: Arc::new(BTreeMap::new()),
                 runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
                 data_binding_index: Arc::new(BTreeMap::new()),
                 data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -67427,7 +67427,7 @@ FUNCTION cache_read_replay_app() {
             passed: Some(state.clone()),
             source_binding_index: Arc::new(BTreeMap::new()),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -67520,7 +67520,7 @@ label:
                 passed: Some(root.clone()),
                 source_binding_index: Arc::new(BTreeMap::new()),
                 runtime_source_paths: Arc::new(BTreeSet::new()),
-                source_address_lookup_fields: Arc::new(BTreeMap::new()),
+                source_row_lookup_fields: Arc::new(BTreeMap::new()),
                 runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
                 data_binding_index: Arc::new(BTreeMap::new()),
                 data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -67597,7 +67597,7 @@ label:
             passed: None,
             source_binding_index: Arc::new(BTreeMap::new()),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -79614,7 +79614,7 @@ label:
             passed: Some(json!({"store": {"files_panel_width": 430}})),
             source_binding_index: Arc::new(BTreeMap::new()),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),
@@ -84488,7 +84488,7 @@ document:
             passed: None,
             source_binding_index: Arc::new(actual_source_binding_index),
             runtime_source_paths: Arc::new(BTreeSet::new()),
-            source_address_lookup_fields: Arc::new(BTreeMap::new()),
+            source_row_lookup_fields: Arc::new(BTreeMap::new()),
             runtime_row_scope_by_list: Arc::new(BTreeMap::new()),
             data_binding_index: Arc::new(BTreeMap::new()),
             data_reads: Arc::new(Mutex::new(BTreeSet::new())),

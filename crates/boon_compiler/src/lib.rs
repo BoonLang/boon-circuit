@@ -143,7 +143,6 @@ pub struct CompilerStaticProgramAnalysis {
     pub row_scopes: Vec<CompilerRowScope>,
     pub source_paths: Vec<String>,
     pub source_row_lookup_fields: BTreeMap<String, String>,
-    pub source_address_lookup_fields: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -660,7 +659,6 @@ pub struct CompilerSourceRouteSource {
     pub source_id: usize,
     pub payload_fields: Vec<CompilerSourcePayloadField>,
     pub row_lookup_field: Option<String>,
-    pub address_lookup_field: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -974,11 +972,7 @@ pub struct CompilerRuntimeGenericArg {
 }
 
 impl CompilerStaticProgramAnalysis {
-    pub fn from_ir_parts(
-        ir: &TypedProgram,
-        source_paths: Vec<String>,
-        source_address_lookup_fields: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn from_ir_parts(ir: &TypedProgram, source_paths: Vec<String>) -> Self {
         let source_row_lookup_fields = ir
             .sources
             .iter()
@@ -1017,7 +1011,6 @@ impl CompilerStaticProgramAnalysis {
                 .collect(),
             source_paths,
             source_row_lookup_fields,
-            source_address_lookup_fields,
         }
     }
 }
@@ -2054,7 +2047,6 @@ pub fn compiler_source_route_sources_from_ir(ir: &TypedProgram) -> Vec<CompilerS
                 .row_lookup_field
                 .clone()
                 .or_else(|| source.payload_schema.address_lookup_field.clone()),
-            address_lookup_field: source.payload_schema.address_lookup_field.clone(),
         })
         .collect()
 }
@@ -5294,11 +5286,7 @@ pub fn compiler_runtime_program_from_ir(ir: &TypedProgram) -> CompilerRuntimePro
         source_route_router_targets: compiler_source_route_router_targets_from_ir(ir),
         source_route_root_text_transform_targets:
             compiler_source_route_root_text_transform_targets_from_ir(ir),
-        static_analysis: CompilerStaticProgramAnalysis::from_ir_parts(
-            ir,
-            Vec::new(),
-            BTreeMap::new(),
-        ),
+        static_analysis: CompilerStaticProgramAnalysis::from_ir_parts(ir, Vec::new()),
         list_source_bindings: compiler_list_source_bindings_from_ir(ir),
         source_payload_counts: compiler_source_payload_counts_from_ir(ir),
         storage_layout_counts: compiler_typed_storage_layout_counts_from_ir(ir),

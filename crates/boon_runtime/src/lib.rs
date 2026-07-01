@@ -10227,21 +10227,6 @@ fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<St
             route
                 .row_lookup_field
                 .as_ref()
-                .or(route.address_lookup_field.as_ref())
-                .map(|field| (route.source.clone(), field.clone()))
-        })
-        .collect()
-}
-
-fn source_address_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<String, String> {
-    routes
-        .route_slots
-        .iter()
-        .filter_map(|route| {
-            route
-                .address_lookup_field
-                .as_ref()
-                .or(route.row_lookup_field.as_ref())
                 .map(|field| (route.source.clone(), field.clone()))
         })
         .collect()
@@ -14715,8 +14700,6 @@ impl CompiledProgram {
             .collect();
         static_analysis.source_row_lookup_fields =
             source_row_lookup_fields_from_routes(&source_routes);
-        static_analysis.source_address_lookup_fields =
-            source_address_lookup_fields_from_routes(&source_routes);
         let source_route_count = source_routes.len();
         let list_source_bindings = ListSourceBindingPlan::from_compiler_slots(list_source_bindings);
         let source_payload_counts =
@@ -17976,7 +17959,7 @@ fn source_route_artifact(route_id: usize, route: &SourceRoute) -> JsonValue {
         "source_id": route.source_id.as_usize(),
         "source": route.source,
         "row_lookup_field": route.row_lookup_field,
-        "address_lookup_field": route.address_lookup_field,
+        "address_lookup_field": route.row_lookup_field,
         "payload_fields": route.payload_fields,
         "root_scalar_targets": route.root_scalar_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
         "indexed_text_targets": route.indexed_text_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
@@ -18160,10 +18143,7 @@ impl SourceRoutePlan {
                 )
                 .into());
             }
-            if let Some(row_lookup_field) = route
-                .row_lookup_field
-                .as_ref()
-                .or(route.address_lookup_field.as_ref())
+            if let Some(row_lookup_field) = route.row_lookup_field.as_ref()
                 && row_lookup_field.is_empty()
             {
                 return Err(format!(
@@ -18454,7 +18434,6 @@ impl SourceRoute {
                         .flatten()
                 },
             ),
-            address_lookup_field: optional_string_field(object, "address_lookup_field", context)?,
             payload_fields: source_payload_fields_from_artifact(
                 artifact_field(object, "payload_fields", context)?,
                 &format!("{context}.payload_fields"),
@@ -27070,7 +27049,7 @@ impl GenericScheduledRuntime {
         };
         let Some(lookup_field) = self
             .source_routes
-            .address_lookup_field_for_source_id(input.source_id)
+            .row_lookup_field_for_source_id(input.source_id)
         else {
             return Ok(BTreeMap::new());
         };
@@ -42163,7 +42142,7 @@ impl GenericScheduledRuntime {
     ) -> RuntimeResult<(String, usize)> {
         for slot in &self.storage.lists.list_slots {
             let list = &slot.name;
-            let Some(lookup_field) = self.address_lookup_field_for_list(list) else {
+            let Some(lookup_field) = self.row_lookup_field_for_list(list) else {
                 continue;
             };
             if self
@@ -42189,7 +42168,7 @@ impl GenericScheduledRuntime {
         Err(format!("cell `{address}` not found in any addressed generic list").into())
     }
 
-    fn address_lookup_field_for_list(&self, list: &str) -> Option<&str> {
+    fn row_lookup_field_for_list(&self, list: &str) -> Option<&str> {
         self.list_source_bindings
             .source_paths(list)
             .ok()?
@@ -55620,7 +55599,6 @@ struct SourceRoute {
     source_id: SourceId,
     source: String,
     row_lookup_field: Option<String>,
-    address_lookup_field: Option<String>,
     payload_fields: Vec<SourcePayloadField>,
     root_scalar_targets: Vec<SourceRouteScalarTarget>,
     indexed_text_targets: Vec<SourceRouteScalarTarget>,
@@ -60402,7 +60380,7 @@ impl SourceRoutePlan {
                     .collect();
             }
         }
-        routes.set_address_lookup_fields(source_metadata);
+        routes.set_row_lookup_fields(source_metadata);
         for route in &mut routes.route_slots {
             route.rebuild_actions();
         }
@@ -60595,16 +60573,8 @@ impl SourceRoutePlan {
     }
 
     fn row_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
-        self.for_source_id(source_id).and_then(|route| {
-            route
-                .row_lookup_field
-                .as_deref()
-                .or(route.address_lookup_field.as_deref())
-        })
-    }
-
-    fn address_lookup_field_for_source_id(&self, source_id: SourceId) -> Option<&str> {
-        self.row_lookup_field_for_source_id(source_id)
+        self.for_source_id(source_id)
+            .and_then(|route| route.row_lookup_field.as_deref())
     }
 
     fn source_payload_has_text(&self, source: &str) -> bool {
@@ -60646,7 +60616,6 @@ impl SourceRoutePlan {
             source_id,
             source: source.to_owned(),
             row_lookup_field: None,
-            address_lookup_field: None,
             payload_fields: Vec::new(),
             root_scalar_targets: Vec::new(),
             indexed_text_targets: Vec::new(),
@@ -60673,22 +60642,12 @@ impl SourceRoutePlan {
         }
     }
 
-    fn set_address_lookup_fields(&mut self, source_metadata: &[CompilerSourceRouteSource]) {
+    fn set_row_lookup_fields(&mut self, source_metadata: &[CompilerSourceRouteSource]) {
         for route in &mut self.route_slots {
             route.row_lookup_field = source_metadata
                 .iter()
                 .find(|source| source.source_id == route.source_id.as_usize())
-                .and_then(|source| {
-                    source
-                        .row_lookup_field
-                        .clone()
-                        .or_else(|| source.address_lookup_field.clone())
-                });
-            route.address_lookup_field = source_metadata
-                .iter()
-                .find(|source| source.source_id == route.source_id.as_usize())
-                .and_then(|source| source.address_lookup_field.clone())
-                .or_else(|| route.row_lookup_field.clone());
+                .and_then(|source| source.row_lookup_field.clone());
         }
     }
 }
@@ -61148,8 +61107,8 @@ impl SourceRoute {
             "source_id": self.source_id.as_usize(),
             "source": self.source,
             "payload_schema_field_count": self.payload_fields.len(),
-            "row_binding_identity": if self.address_lookup_field.is_some() {
-                "source_address_lookup_or_bound_row"
+            "row_binding_identity": if self.row_lookup_field.is_some() {
+                "source_row_lookup_or_bound_row"
             } else {
                 "source_id_only"
             },
@@ -66337,7 +66296,7 @@ FUNCTION decorate(value) {
         assert_eq!(
             cells_compiled
                 .source_routes
-                .address_lookup_field_for_source_id(SourceId(commit_source.id.0)),
+                .row_lookup_field_for_source_id(SourceId(commit_source.id.0)),
             Some("address")
         );
         let cells_event = GenericSourceEvent {
@@ -66564,7 +66523,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("row select route should be compiled");
         assert_eq!(route.row_lookup_field.as_deref(), Some("file"));
-        assert_eq!(route.address_lookup_field.as_deref(), Some("file"));
         let source_path = route.source.clone();
 
         let output = runtime
@@ -77062,7 +77020,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 )
             });
         assert_eq!(
-            route.address_lookup_field.as_deref(),
+            route.row_lookup_field.as_deref(),
             Some("file"),
             "file row selection should use typed row identity, not one source per fixture file"
         );
@@ -77105,7 +77063,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("file tree scope row select route should be compiled");
         assert_eq!(
-            scope_route.address_lookup_field.as_deref(),
+            scope_route.row_lookup_field.as_deref(),
             Some("scope_key"),
             "scope row selection should use typed scope identity, not fixture file globals"
         );
@@ -77165,7 +77123,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("external file row route should be compiled");
         assert_eq!(
-            external_file_route.address_lookup_field.as_deref(),
+            external_file_route.row_lookup_field.as_deref(),
             Some("file")
         );
         let external_file_route_debug = format!("{external_file_route:#?}");
@@ -77255,7 +77213,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("external scope row route should be compiled");
         assert_eq!(
-            external_scope_route.address_lookup_field.as_deref(),
+            external_scope_route.row_lookup_field.as_deref(),
             Some("scope_key")
         );
         let generic = runtime

@@ -48244,6 +48244,39 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
             "native scroll-speed gate has only planned wheel input; observed app-window wheel input is required".to_owned()
         }),
     );
+    let ux_frame_budget_pass_value = extra
+        .get("ux_frame_budget_pass")
+        .and_then(serde_json::Value::as_bool);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-gpu-scroll-{label}:ux-frame-budget"),
+        ux_frame_budget_pass_value == Some(true),
+        format!(
+            "ux_frame_budget_pass={ux_frame_budget_pass_value:?}, speed_budget_timing_window={:?}, speed_budget_frame_ms_p95={:?}, budget_ms={:?}, product_path_samples={:?}",
+            extra
+                .get("speed_budget_timing_window")
+                .and_then(serde_json::Value::as_str),
+            extra
+                .get("speed_budget_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            native_gpu_budget_f64("frame", "preview_frame_ms_p95"),
+            extra
+                .get("product_path_input_sample_count")
+                .and_then(serde_json::Value::as_u64)
+        ),
+        (ux_frame_budget_pass_value != Some(true)).then(|| {
+            if extra
+                .get("speed_budget_timing_window")
+                .and_then(serde_json::Value::as_str)
+                == Some("product-path-input-to-present")
+            {
+                "native scroll-speed gate product-path input-to-present p95 is over target; UX speed is not proven".to_owned()
+            } else {
+                "native scroll-speed gate real-window frame budget is over target; UX speed is not proven".to_owned()
+            }
+        }),
+    );
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -50420,16 +50453,25 @@ fn run_native_scroll_axis_observation_with_retries(
         "horizontal" => "horizontal-scroll-only",
         _ => return Err(format!("unsupported native scroll axis `{axis}`").into()),
     };
-    let max_attempts = 3_u64;
+    let product_path_min_input_sample_count =
+        native_gpu_budget_u64("frame", "product_path_scroll_input_sample_count_min")
+            .unwrap_or(4)
+            .max(2);
+    let success_goal = product_path_min_input_sample_count.div_ceil(2).max(1);
+    let max_attempts = success_goal.saturating_add(2).clamp(3, 8);
     let mut attempt_summaries = Vec::new();
+    let mut successful_observations = Vec::new();
+    let mut selected_pass_observation = None::<serde_json::Value>;
     let mut best_failed_observation = None::<serde_json::Value>;
     let mut best_failed_score = i64::MIN;
     let mut fallback_observation = json!({
         "status": "not-run",
         "reason": "native scroll axis observation was not attempted"
     });
+    let mut attempts_run = 0_u64;
 
     for attempt in 1..=max_attempts {
+        attempts_run = attempt;
         let attempt_label = format!("{label}-native-scroll-speed-{axis}-attempt-{attempt}");
         let mut observation = run_linux_human_like_desktop_surface_smoke(
             &attempt_label,
@@ -50448,34 +50490,54 @@ fn run_native_scroll_axis_observation_with_retries(
         observation["axis_retry_max_attempts"] = json!(max_attempts);
         observation["axis_retry_selected_attempt"] = json!(attempt);
         observation["axis_retry_selection"] = json!("pass");
-        observation["axis_retry_previous_attempts"] = json!(attempt_summaries);
+        attempt_summaries.push(native_scroll_axis_attempt_summary(
+            &observation,
+            axis,
+            attempt,
+        ));
         if pass {
-            return Ok(observation);
+            successful_observations.push(observation.clone());
+            selected_pass_observation = Some(observation);
+            if successful_observations.len() as u64 >= success_goal {
+                break;
+            }
+            continue;
         }
         let score = native_scroll_axis_observation_score(&observation, axis);
         if score > best_failed_score {
             best_failed_score = score;
             best_failed_observation = Some(observation.clone());
         }
-        attempt_summaries.push(native_scroll_axis_attempt_summary(
-            &observation,
-            axis,
-            attempt,
-        ));
         fallback_observation = observation;
     }
 
-    let mut selected = best_failed_observation.unwrap_or(fallback_observation);
+    let mut selected = selected_pass_observation
+        .or(best_failed_observation)
+        .unwrap_or(fallback_observation);
     let selected_attempt = selected
         .get("axis_retry_attempt_index")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(max_attempts);
-    selected["axis_retry_attempt_count"] = json!(max_attempts);
+        .unwrap_or(attempts_run);
+    let success_count = successful_observations.len() as u64;
+    selected["axis_retry_attempt_count"] = json!(attempts_run);
     selected["axis_retry_max_attempts"] = json!(max_attempts);
     selected["axis_retry_selected_attempt"] = json!(selected_attempt);
-    selected["axis_retry_selection"] = json!("best_failed_observation");
+    selected["axis_retry_success_goal"] = json!(success_goal);
+    selected["axis_retry_success_count"] = json!(success_count);
+    selected["axis_retry_selection"] = json!(if success_count >= success_goal {
+        "sustained_pass"
+    } else if success_count > 0 {
+        "partial_pass"
+    } else {
+        "best_failed_observation"
+    });
     selected["axis_retry_best_failed_score"] = json!(best_failed_score);
     selected["axis_retry_previous_attempts"] = json!(attempt_summaries);
+    selected["axis_retry_successful_product_path_samples"] = json!(
+        native_scroll_axis_product_path_samples(&successful_observations, axis)
+    );
+    selected["axis_product_path_timing"] =
+        native_scroll_axis_product_path_timing(&successful_observations, axis);
     Ok(selected)
 }
 
@@ -50621,6 +50683,133 @@ fn native_scroll_axis_attempt_summary(
             .and_then(|timing| timing.get("presented_frame_ms_p95"))
             .cloned()
             .unwrap_or_else(|| json!(null)),
+        "product_path_input_to_present_ms_p95": observation
+            .pointer("/measured_loop_report/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/p95")
+            .cloned()
+            .unwrap_or_else(|| json!(null)),
+        "product_path_input_sample_count": observation
+            .pointer("/measured_loop_report/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/sample_count")
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
+    })
+}
+
+fn native_scroll_axis_product_path_samples(
+    observations: &[serde_json::Value],
+    axis: &str,
+) -> Vec<serde_json::Value> {
+    observations
+        .iter()
+        .filter_map(|observation| native_scroll_axis_product_path_sample(observation, axis))
+        .collect()
+}
+
+fn native_scroll_axis_product_path_sample(
+    observation: &serde_json::Value,
+    axis: &str,
+) -> Option<serde_json::Value> {
+    let summary = observation
+        .pointer("/measured_loop_report/preview_perf_stats/input_to_present_ms_p50_p95_p99_max")?;
+    let sample_count = summary
+        .get("sample_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let p95 = summary.get("p95").and_then(numeric_value_as_f64);
+    if sample_count == 0 || p95.is_none_or(|value| !value.is_finite() || value <= 0.0) {
+        return None;
+    }
+    Some(json!({
+        "axis": axis,
+        "attempt": observation
+            .get("axis_retry_attempt_index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "render_loop_mode": observation
+            .pointer("/measured_loop_report/preview_perf_stats/render_loop_mode")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
+        "frame_pacing_state": observation
+            .pointer("/measured_loop_report/preview_perf_stats/frame_pacing/state")
+            .cloned()
+            .unwrap_or_else(|| json!("missing")),
+        "requested_animation_burst_count": observation
+            .pointer("/measured_loop_report/render_loop_state/requested_animation_burst_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "input_to_present_ms_p50_p95_p99_max": summary.clone()
+    }))
+}
+
+fn native_scroll_axis_product_path_timing(
+    observations: &[serde_json::Value],
+    axis: &str,
+) -> serde_json::Value {
+    let samples = native_scroll_axis_product_path_samples(observations, axis);
+    native_scroll_product_path_timing_from_samples(samples, "axis-retry-product-path-input")
+}
+
+fn native_scroll_product_path_timing_from_samples(
+    samples: Vec<serde_json::Value>,
+    source: &str,
+) -> serde_json::Value {
+    let mut sample_count = 0_u64;
+    let mut requested_animation_burst_count = 0_u64;
+    let mut all_demand_driven = !samples.is_empty();
+    let mut any_requested_burst = false;
+    let max_summary_f64 = |field: &str| {
+        samples
+            .iter()
+            .filter_map(|sample| {
+                sample
+                    .pointer(&format!("/input_to_present_ms_p50_p95_p99_max/{field}"))
+                    .and_then(numeric_value_as_f64)
+            })
+            .filter(|value| value.is_finite())
+            .max_by(f64::total_cmp)
+    };
+    for sample in &samples {
+        sample_count = sample_count.saturating_add(
+            sample
+                .pointer("/input_to_present_ms_p50_p95_p99_max/sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        requested_animation_burst_count = requested_animation_burst_count.saturating_add(
+            sample
+                .get("requested_animation_burst_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        all_demand_driven &= sample
+            .get("render_loop_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("demand_driven");
+        any_requested_burst |= sample
+            .get("frame_pacing_state")
+            .and_then(serde_json::Value::as_str)
+            == Some("requested_animation_burst");
+    }
+    let p50 = max_summary_f64("p50");
+    let p95 = max_summary_f64("p95");
+    let p99 = max_summary_f64("p99");
+    let max = max_summary_f64("max");
+    json!({
+        "status": if sample_count > 0 { "pass" } else { "missing-samples" },
+        "source": source,
+        "aggregation": "conservative max percentile across independent product-path observations",
+        "render_loop_mode": if all_demand_driven { "demand_driven" } else { "mixed-or-missing" },
+        "frame_pacing": {
+            "state": if any_requested_burst { "requested_animation_burst" } else { "idle" }
+        },
+        "requested_animation_burst_count": requested_animation_burst_count,
+        "input_to_present_ms_p50_p95_p99_max": {
+            "sample_count": sample_count,
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+            "max": max
+        },
+        "samples": samples
     })
 }
 
@@ -50633,12 +50822,33 @@ fn native_scroll_axis_observation_summary(
         native_scroll_axis_observation_pass(&horizontal_observation, "horizontal");
     let combined_input_adapter =
         native_scroll_combined_axis_input_adapter(&vertical_observation, &horizontal_observation);
+    let product_path_timing = native_scroll_product_path_timing_from_samples(
+        [vertical_observation.clone(), horizontal_observation.clone()]
+            .into_iter()
+            .flat_map(|observation| {
+                observation
+                    .get("axis_retry_successful_product_path_samples")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        observation
+                            .get("axis_product_path_timing")
+                            .and_then(|timing| timing.get("samples"))
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+            })
+            .collect(),
+        "axis-specific-product-path-input-to-present",
+    );
     json!({
         "status": if vertical_pass && horizontal_pass { "pass" } else { "fail" },
         "method": "isolated-weston-test-control-axis-specific-scroll-only",
         "vertical_pass": vertical_pass,
         "horizontal_pass": horizontal_pass,
         "combined_input_adapter": combined_input_adapter,
+        "product_path_timing": product_path_timing,
         "vertical_observation": vertical_observation,
         "horizontal_observation": horizontal_observation
     })
@@ -50826,6 +51036,76 @@ fn promote_axis_specific_scroll_timing(extra: &mut serde_json::Value) -> bool {
         "horizontal": horizontal_p95,
         "status": "axis-specific-post-real-window-input"
     });
+    if let Some(product_path_timing) = axis_summary.get("product_path_timing").cloned() {
+        let product_path_sample_count = product_path_timing
+            .pointer("/input_to_present_ms_p50_p95_p99_max/sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let existing_product_path_sample_count = extra
+            .pointer("/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if product_path_sample_count > 0
+            && product_path_sample_count >= existing_product_path_sample_count
+        {
+            extra["axis_specific_product_path_timing"] = product_path_timing.clone();
+            if !extra
+                .get("preview_perf_stats")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                extra["preview_perf_stats"] = json!({});
+            }
+            if let Some(preview_perf_stats) = extra
+                .get_mut("preview_perf_stats")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                preview_perf_stats.insert(
+                    "render_loop_mode".to_owned(),
+                    product_path_timing
+                        .get("render_loop_mode")
+                        .cloned()
+                        .unwrap_or_else(|| json!("missing")),
+                );
+                preview_perf_stats.insert(
+                    "frame_pacing".to_owned(),
+                    product_path_timing
+                        .get("frame_pacing")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"state": "missing"})),
+                );
+                preview_perf_stats.insert(
+                    "input_to_present_ms_p50_p95_p99_max".to_owned(),
+                    product_path_timing
+                        .get("input_to_present_ms_p50_p95_p99_max")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"sample_count": 0})),
+                );
+            }
+            if !extra
+                .get("render_loop_state")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                extra["render_loop_state"] = json!({});
+            }
+            if let Some(render_loop_state) = extra
+                .get_mut("render_loop_state")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let existing_burst_count = render_loop_state
+                    .get("requested_animation_burst_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let product_burst_count = product_path_timing
+                    .get("requested_animation_burst_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                render_loop_state.insert(
+                    "requested_animation_burst_count".to_owned(),
+                    json!(existing_burst_count.max(product_burst_count)),
+                );
+            }
+        }
+    }
     true
 }
 
@@ -84492,6 +84772,148 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .pointer("/post_input_frame_timing/post_present_bookkeeping_ms_p95")
                 .and_then(serde_json::Value::as_f64),
             Some(0.5)
+        );
+    }
+
+    #[test]
+    fn axis_specific_product_path_timing_promotes_sustained_samples() {
+        let product_sample = |axis: &str, attempt: u64, p95: f64| {
+            json!({
+                "axis": axis,
+                "attempt": attempt,
+                "render_loop_mode": "demand_driven",
+                "frame_pacing_state": "requested_animation_burst",
+                "requested_animation_burst_count": 1,
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "sample_count": 1,
+                    "p50": p95 - 1.0,
+                    "p95": p95,
+                    "p99": p95 + 0.2,
+                    "max": p95 + 0.5
+                }
+            })
+        };
+        let mut report = json!({
+            "preview_frame_ms_p95": 24.0,
+            "speed_timing_window": "axis-specific-post-real-window-input",
+            "axis_specific_real_window_scroll_observation": {
+                "status": "pass",
+                "combined_input_adapter": {
+                    "installed": true,
+                    "real_os_events_observed": true,
+                    "synthetic_input_probe": false,
+                    "mouse_scroll_event_count": 4,
+                    "scroll_delta_x": 240.0,
+                    "scroll_delta_y": 360.0
+                },
+                "product_path_timing": {
+                    "status": "pass",
+                    "source": "axis-specific-product-path-input-to-present",
+                    "render_loop_mode": "demand_driven",
+                    "frame_pacing": {"state": "requested_animation_burst"},
+                    "requested_animation_burst_count": 4,
+                    "input_to_present_ms_p50_p95_p99_max": {
+                        "sample_count": 4,
+                        "p50": 8.0,
+                        "p95": 9.0,
+                        "p99": 9.2,
+                        "max": 9.5
+                    },
+                    "samples": [
+                        product_sample("vertical", 1, 7.0),
+                        product_sample("vertical", 2, 8.0),
+                        product_sample("horizontal", 1, 8.5),
+                        product_sample("horizontal", 2, 9.0)
+                    ]
+                },
+                "vertical_observation": {
+                    "render_hook_app_owned_proof_skipped": true,
+                    "surface_post_input_frame_timing": {
+                        "measured_frame_count": 30,
+                        "presented_frame_ms_p50": 18.0,
+                        "presented_frame_ms_p95": 24.0,
+                        "presented_frame_ms_p99": 25.0,
+                        "presented_frame_ms_max": 25.0,
+                        "command_record_ms_p95": 3.0,
+                        "encoder_finish_ms_p95": 0.3,
+                        "queue_submit_ms_p95": 12.0,
+                        "frame_present_ms_p95": 8.0,
+                        "sample_frame_count": 30,
+                        "warmup_frame_count": 3
+                    }
+                },
+                "horizontal_observation": {
+                    "render_hook_app_owned_proof_skipped": true,
+                    "surface_post_input_frame_timing": {
+                        "measured_frame_count": 30,
+                        "presented_frame_ms_p50": 19.0,
+                        "presented_frame_ms_p95": 25.0,
+                        "presented_frame_ms_p99": 26.0,
+                        "presented_frame_ms_max": 26.0,
+                        "command_record_ms_p95": 3.2,
+                        "encoder_finish_ms_p95": 0.4,
+                        "queue_submit_ms_p95": 12.2,
+                        "frame_present_ms_p95": 8.1,
+                        "sample_frame_count": 30,
+                        "warmup_frame_count": 3
+                    }
+                }
+            },
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "preview_surface_proof": {
+                "adapter_name": "hardware",
+                "adapter_device_type": "DiscreteGpu",
+                "adapter_is_software": false,
+                "present_mode": "Mailbox"
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0
+                }
+            }
+        });
+
+        assert!(promote_axis_specific_scroll_timing(&mut report));
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .pointer("/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/sample_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            report
+                .get("product_path_ux_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .get("speed_budget_timing_window")
+                .and_then(serde_json::Value::as_str),
+            Some("product-path-input-to-present")
+        );
+        assert_eq!(
+            report
+                .get("speed_budget_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(9.0)
+        );
+        assert_eq!(
+            report
+                .get("budget_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

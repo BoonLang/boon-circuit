@@ -50796,6 +50796,14 @@ fn native_scroll_axis_product_path_sample(
         "input_to_present_ms_p50_p95_p99_max".to_owned(),
         summary.clone(),
     );
+    if let Some(accepted_input_frame_timing) =
+        observation.pointer("/measured_loop_report/accepted_input_frame_timing")
+    {
+        sample.insert(
+            "accepted_input_frame_timing".to_owned(),
+            accepted_input_frame_timing.clone(),
+        );
+    }
     for summary_key in PRODUCT_PATH_PREVIEW_PERF_SUMMARY_KEYS {
         if let Some(summary) = preview_perf_stats.get(summary_key) {
             sample.insert((*summary_key).to_owned(), summary.clone());
@@ -85030,6 +85038,65 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             timing
                 .pointer("/frame_present_call_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64),
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn product_path_sample_carries_frame_scoped_accepted_input_timing() {
+        let observation = json!({
+            "axis_retry_attempt_index": 2,
+            "measured_loop_report": {
+                "preview_perf_stats": {
+                    "render_loop_mode": "demand_driven",
+                    "frame_pacing": {"state": "requested_animation_burst"},
+                    "input_to_present_ms_p50_p95_p99_max": {
+                        "sample_count": 1,
+                        "p50": 12.0,
+                        "p95": 12.0,
+                        "p99": 12.0,
+                        "max": 12.0
+                    },
+                    "present_path_ms_p50_p95_p99_max": {
+                        "sample_count": 1,
+                        "p50": 4.0,
+                        "p95": 4.0,
+                        "p99": 4.0,
+                        "max": 4.0
+                    }
+                },
+                "render_loop_state": {
+                    "requested_animation_burst_count": 1
+                },
+                "accepted_input_frame_timing": {
+                    "timing_scope": "accepted_visible_host_input_frame",
+                    "input_event_wake_count": 9,
+                    "input_to_present_ms": 12.0,
+                    "dirty_poll_to_render_started_ms": 0.4,
+                    "render_hook_completed_to_present_ms": 4.8
+                }
+            }
+        });
+
+        let sample = native_scroll_axis_product_path_sample(&observation, "vertical")
+            .expect("valid product path sample");
+
+        assert_eq!(
+            sample
+                .pointer("/accepted_input_frame_timing/timing_scope")
+                .and_then(serde_json::Value::as_str),
+            Some("accepted_visible_host_input_frame")
+        );
+        assert_eq!(
+            sample
+                .pointer("/accepted_input_frame_timing/dirty_poll_to_render_started_ms")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.4)
+        );
+        assert_eq!(
+            sample
+                .pointer("/present_path_ms_p50_p95_p99_max/p95")
                 .and_then(serde_json::Value::as_f64),
             Some(4.0)
         );

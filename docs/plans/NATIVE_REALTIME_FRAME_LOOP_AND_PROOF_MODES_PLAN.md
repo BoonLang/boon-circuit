@@ -1640,6 +1640,57 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
     target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the
     UX p95 and software-adapter blockers above;
+ - `cargo xtask verify-report-schema
+    target/reports/native-gpu/scroll-speed-cells.json` passed.
+
+2026-07-01 frame-scoped accepted-input and immediate host-input burst slice:
+
+- Native app-window now records `accepted_input_frame_timing` for the exact
+  accepted host-input frame that contributes to product UX latency. This fixes
+  stale phase attribution where the latest report compared the original input
+  dirty poll with a later requested-animation follow-up frame.
+- Scroll-speed product-path samples now carry the frame-scoped accepted-input
+  timing object, including input-to-present, dirty-poll-to-render-start,
+  render-hook, queue, present, present-path, render target, and scheduler
+  evidence.
+- Host-input requested-animation bursts now make the first repaint immediately
+  consumable inside the same DemandDriven loop turn. Follow-up burst frames
+  remain paced at the target frame interval. This is generic scheduler behavior;
+  it does not branch on Cells, source paths, addresses, or fixture text.
+- The stale role-dirty guard remains intact: a stale role dirty poll still does
+  not invent an unrenderable content revision unless the host-input burst
+  explicitly supplies a scheduler-only repaint.
+- Fresh Cells scroll-speed report after this slice:
+  - `status=fail`;
+  - `product_path_ux_timing_proven=true`;
+  - `product_path_input_sample_count=4`;
+  - `product_path_input_to_present_ms_p95=10.710324000003313`;
+  - `preview_perf_present_path_ms_p95=10.151646`;
+  - `renderer_cpu_frame_ms_p95=1.274174`;
+  - `present_blocking_ms_p95=19.00976`;
+  - `ux_frame_budget_pass=true`;
+  - `wall_clock_frame_budget_pass=true`;
+  - `renderer_frame_budget_pass=true`;
+  - `measured_present_mode=Mailbox`;
+  - `measured_adapter_is_software=true`;
+  - accepted-input samples show `dirty_poll_to_render_started_ms` around
+    `0.003-0.004ms` instead of the previous `~16.7ms`;
+  - remaining blocker:
+    `native scroll-speed gate ran on a software adapter; hardware-backed
+    real-window speed is not proven`.
+- Fresh verification:
+  - `cargo fmt --check`;
+  - `cargo test -q -p boon_native_app_window requested_animation_burst_is_bounded_inside_demand_driven_mode`;
+  - `cargo test -q -p boon_native_app_window host_input_animation_burst_can_repaint_without_waiting_a_frame_interval`;
+  - `cargo test -q -p boon_native_app_window stale_role_dirty_poll_does_not_invent_unrenderable_content_revision`;
+  - `cargo test -q -p boon_native_app_window accepted_`;
+  - `cargo check -q -p boon_native_app_window`;
+  - `cargo test -q -p xtask product_path`;
+  - `cargo check -q -p xtask`;
+  - `git diff --check`;
+  - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
+    target/reports/native-gpu/scroll-speed-cells.json` failed honestly with
+    only the software-adapter blocker above;
   - `cargo xtask verify-report-schema
     target/reports/native-gpu/scroll-speed-cells.json` passed.
 

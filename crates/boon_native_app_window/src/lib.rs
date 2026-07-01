@@ -810,6 +810,7 @@ pub struct NativeRenderLoopState {
     pub last_accepted_host_input_event_wake_count: u64,
     pub last_accepted_host_input_elapsed_ms: Option<f64>,
     pub last_accepted_host_input_press_only: bool,
+    pub last_input_to_present_accounted_event_wake_count: u64,
     pub last_external_wake_generation: u64,
     pub last_external_wake_observed_elapsed_ms: Option<f64>,
     pub last_render_started_elapsed_ms: Option<f64>,
@@ -883,6 +884,7 @@ impl NativeRenderLoopState {
             last_accepted_host_input_event_wake_count: 0,
             last_accepted_host_input_elapsed_ms: None,
             last_accepted_host_input_press_only: false,
+            last_input_to_present_accounted_event_wake_count: 0,
             last_external_wake_generation: 0,
             last_external_wake_observed_elapsed_ms: None,
             last_render_started_elapsed_ms: None,
@@ -1065,6 +1067,27 @@ impl NativeRenderLoopState {
         self.last_accepted_host_input_event_wake_count = input_event_wake_count;
         self.last_accepted_host_input_elapsed_ms = Some(elapsed_ms);
         self.last_accepted_host_input_press_only = press_only;
+    }
+
+    pub fn take_frame_accepted_input_to_present_ms(
+        &mut self,
+        presented_input_event_wake_count: u64,
+    ) -> Option<f64> {
+        if presented_input_event_wake_count == 0
+            || self.last_accepted_host_input_event_wake_count == 0
+            || self.last_accepted_host_input_event_wake_count
+                <= self.last_input_to_present_accounted_event_wake_count
+            || self.last_accepted_host_input_event_wake_count != presented_input_event_wake_count
+        {
+            return None;
+        }
+        let latency_ms = elapsed_delta_ms(
+            self.last_accepted_host_input_elapsed_ms,
+            self.last_present_completed_elapsed_ms,
+        )?;
+        self.last_input_to_present_accounted_event_wake_count =
+            self.last_accepted_host_input_event_wake_count;
+        Some(latency_ms)
     }
 
     pub fn note_external_wake_observed(&mut self, generation: u64, elapsed_ms: f64) {
@@ -3909,21 +3932,8 @@ async fn run_surface_probe_inner(
         }
         let stats_elapsed = hold_started.elapsed();
         let stats_elapsed_seconds = stats_elapsed.as_secs_f64().max(0.001);
-        let stats_presented_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
-            &input_event_wake_timeline,
-            last_presented_input_event_wake_count,
-            hold_started,
-        );
-        let stats_input_to_present_ms = elapsed_delta_ms(
-            render_loop_state.last_accepted_host_input_elapsed_ms,
-            render_loop_state.last_present_completed_elapsed_ms,
-        )
-        .or_else(|| {
-            elapsed_delta_ms(
-                stats_presented_input_wake_elapsed_ms,
-                render_loop_state.last_present_completed_elapsed_ms,
-            )
-        });
+        let stats_input_to_present_ms = render_loop_state
+            .take_frame_accepted_input_to_present_ms(last_presented_input_event_wake_count);
         let stats_render_hook_ms = elapsed_delta_ms(
             render_loop_state.last_surface_acquired_elapsed_ms,
             render_loop_state.last_render_hook_completed_elapsed_ms,
@@ -4010,6 +4020,7 @@ async fn run_surface_probe_inner(
                         hold_started,
                     ),
                 )
+                .with_frame_input_to_present_ms(stats_input_to_present_ms)
                 .with_interactive_timing(
                     report_writer_stats.last_write_ms,
                     last_interactive_readback_finish_ms,
@@ -4306,6 +4317,7 @@ struct NativeRenderLoopReportExtras {
     presented_input_event_wake_count: Option<u64>,
     sampled_input_event_wake_elapsed_ms: Option<f64>,
     presented_input_event_wake_elapsed_ms: Option<f64>,
+    frame_input_to_present_ms: Option<f64>,
     last_render_loop_report_write_ms: Option<f64>,
     last_interactive_readback_finish_ms: Option<f64>,
     last_interactive_readback_completed_elapsed_ms: Option<f64>,
@@ -4334,6 +4346,11 @@ impl NativeRenderLoopReportExtras {
         self.presented_input_event_wake_count = Some(presented);
         self.sampled_input_event_wake_elapsed_ms = sampled_elapsed_ms;
         self.presented_input_event_wake_elapsed_ms = presented_elapsed_ms;
+        self
+    }
+
+    fn with_frame_input_to_present_ms(mut self, input_to_present_ms: Option<f64>) -> Self {
+        self.frame_input_to_present_ms = input_to_present_ms;
         self
     }
 
@@ -4404,6 +4421,7 @@ fn render_loop_report_extras(
         presented_input_event_wake_count: None,
         sampled_input_event_wake_elapsed_ms: None,
         presented_input_event_wake_elapsed_ms: None,
+        frame_input_to_present_ms: None,
         last_render_loop_report_write_ms: None,
         last_interactive_readback_finish_ms: None,
         last_interactive_readback_completed_elapsed_ms: None,
@@ -5021,10 +5039,18 @@ fn write_render_loop_state_report(
         state.last_accepted_host_input_elapsed_ms,
         state.last_dirty_poll_elapsed_ms,
     );
-    let input_accept_to_present_ms = elapsed_delta_ms(
-        state.last_accepted_host_input_elapsed_ms,
-        state.last_present_completed_elapsed_ms,
-    );
+    let input_accept_to_present_ms = if extras.presented_input_event_wake_count
+        == Some(state.last_accepted_host_input_event_wake_count)
+        && state.last_accepted_host_input_event_wake_count
+            > state.last_input_to_present_accounted_event_wake_count
+    {
+        elapsed_delta_ms(
+            state.last_accepted_host_input_elapsed_ms,
+            state.last_present_completed_elapsed_ms,
+        )
+    } else {
+        None
+    };
     let poll_started_to_dirty_poll_ms = elapsed_delta_ms(
         state.last_poll_started_elapsed_ms,
         state.last_dirty_poll_elapsed_ms,
@@ -5126,7 +5152,7 @@ fn write_render_loop_state_report(
         elapsed,
         renders_per_second,
         &report_perf_accumulator,
-        input_accept_to_present_ms.or(input_wake_to_present_ms),
+        extras.frame_input_to_present_ms,
         proof_mode,
         present_to_readback_report_ms,
         extras.frame_evidence_key.clone(),
@@ -5230,6 +5256,8 @@ fn write_render_loop_state_report(
         "accepted_host_input_event_wake_count": state.last_accepted_host_input_event_wake_count,
         "accepted_host_input_elapsed_ms": state.last_accepted_host_input_elapsed_ms,
         "accepted_host_input_press_only": state.last_accepted_host_input_press_only,
+        "input_to_present_accounted_event_wake_count": state.last_input_to_present_accounted_event_wake_count,
+        "frame_input_to_present_ms": extras.frame_input_to_present_ms,
         "input_accept_timing_source": if state.last_accepted_host_input_elapsed_ms.is_some() {
             "role_poll_hook_accepted_visible_host_input"
         } else {
@@ -6232,6 +6260,85 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn render_loop_report_uses_frame_scoped_input_latency_for_preview_perf_stats() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-native-report-frame-input-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loop.json");
+
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_accepted_host_input(3, 20.0, false);
+        state.note_present_completed(27.5);
+        state.mark_presented_with_revisions(1, 2, 3, 4);
+        let frame_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
+        let mut perf_accumulator = NativePreviewPerfAccumulator::default();
+        perf_accumulator.record(
+            None,
+            None,
+            state.last_present_call_ms,
+            frame_input_to_present_ms,
+            None,
+        );
+
+        write_render_loop_state_report(
+            &path,
+            NativeWindowRole::Preview,
+            std::process::id(),
+            &WindowId("window-test".to_owned()),
+            &SurfaceId("surface-test".to_owned()),
+            &NativeSurfaceLifecycleReport {
+                surface_epoch: 1,
+                final_width: 1,
+                final_height: 1,
+                ..NativeSurfaceLifecycleReport::default()
+            },
+            &state,
+            Duration::from_millis(16),
+            0,
+            None,
+            &perf_accumulator,
+            NativeRenderLoopReportExtras {
+                present_mode: "Immediate".to_owned(),
+                surface_format: "Bgra8Unorm".to_owned(),
+                desired_maximum_frame_latency: 1,
+                ..NativeRenderLoopReportExtras::default()
+            }
+            .with_input_generation(3, 3, None, None)
+            .with_frame_input_to_present_ms(frame_input_to_present_ms),
+            None,
+        )
+        .unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(report["frame_input_to_present_ms"], serde_json::json!(7.5));
+        assert_eq!(
+            report["input_to_present_accounted_event_wake_count"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            report["input_accept_to_present_ms"],
+            serde_json::Value::Null,
+            "consumed accepted input must not be recomputed as a second product latency"
+        );
+        assert_eq!(
+            report["preview_perf_stats"]["input_to_present_ms"],
+            serde_json::json!(7.5)
+        );
+        assert_eq!(
+            report["preview_perf_stats"]["input_to_present_ms_p50_p95_p99_max"]["p95"],
+            serde_json::json!(7.5)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn test_render_loop_report_snapshot(
         path: &Path,
         rendered_frame_count: u64,
@@ -6725,10 +6832,7 @@ mod tests {
         let raw_wake_elapsed_ms = Some(8.0);
         let raw_wake_to_present_ms =
             elapsed_delta_ms(raw_wake_elapsed_ms, state.last_present_completed_elapsed_ms);
-        let accepted_input_to_present_ms = elapsed_delta_ms(
-            state.last_accepted_host_input_elapsed_ms,
-            state.last_present_completed_elapsed_ms,
-        );
+        let accepted_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
         let mut accumulator = NativePreviewPerfAccumulator::default();
         accumulator.record(None, None, None, accepted_input_to_present_ms, None);
         let stats = native_preview_perf_stats_snapshot(
@@ -6737,7 +6841,7 @@ mod tests {
             Duration::from_millis(64),
             60.0,
             &accumulator,
-            accepted_input_to_present_ms.or(raw_wake_to_present_ms),
+            accepted_input_to_present_ms,
             "off",
             None,
             None,
@@ -6752,7 +6856,31 @@ mod tests {
         );
         assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(7.5));
         assert_eq!(state.last_accepted_host_input_event_wake_count, 3);
+        assert_eq!(state.last_input_to_present_accounted_event_wake_count, 3);
         assert!(!state.last_accepted_host_input_press_only);
+    }
+
+    #[test]
+    fn accepted_host_input_latency_is_frame_scoped_and_single_use() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_accepted_host_input(3, 20.0, false);
+        state.note_present_completed(27.5);
+
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(2), None);
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(3), Some(7.5));
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(3), None);
+
+        state.note_present_completed(44.0);
+        assert_eq!(
+            state.take_frame_accepted_input_to_present_ms(3),
+            None,
+            "later frames must not keep reusing the old accepted input timestamp"
+        );
+
+        state.note_accepted_host_input(4, 45.0, false);
+        state.note_present_completed(50.0);
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(4), Some(5.0));
+        assert_eq!(state.last_input_to_present_accounted_event_wake_count, 4);
     }
 
     #[test]

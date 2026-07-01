@@ -56712,6 +56712,11 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
         let render_loop_input_accept_to_present_ms = present_probe
+            .get("frame_input_to_present_ms")
+            .or_else(|| present_probe.get("input_accept_to_present_ms"))
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let render_loop_legacy_input_accept_to_present_ms = present_probe
             .get("input_accept_to_present_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
@@ -56869,6 +56874,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "input_wake_to_present_ms": input_wake_to_present_ms,
             "render_loop_input_wake_to_present_ms": render_loop_input_wake_to_present_ms,
             "render_loop_input_accept_to_present_ms": render_loop_input_accept_to_present_ms,
+            "render_loop_legacy_input_accept_to_present_ms": render_loop_legacy_input_accept_to_present_ms,
             "input_accept_timing_source": present_probe.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_to_input_accept_ms": present_probe.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_dirty_poll_ms": present_probe.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57651,6 +57657,8 @@ fn wait_for_cells_formula_visible_match(
                             "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_to_present_accounted_event_wake_count": report.get("input_to_present_accounted_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_to_present_ms": report.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "generation_timed_frame": generation_timed_frame,
                             "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -57825,6 +57833,8 @@ fn wait_for_cells_formula_visible_match(
                             "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "input_to_present_accounted_event_wake_count": report.get("input_to_present_accounted_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "frame_input_to_present_ms": report.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -64319,9 +64329,9 @@ fn require_active_pending_snapshot_backpressure(
     let currentness_policy = field("pending_snapshot_commit_currentness_policy")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if currentness_policy != "source-revision-plus-frame-evidence-no-regression" {
+    if currentness_policy != "source-revision-plus-exact-frame-evidence" {
         blockers.push(format!(
-            "{label}.pending_snapshot_commit_currentness_policy must be source-revision-plus-frame-evidence-no-regression"
+            "{label}.pending_snapshot_commit_currentness_policy must be source-revision-plus-exact-frame-evidence"
         ));
     }
     if frame_evidence_status == "stale-rejected"

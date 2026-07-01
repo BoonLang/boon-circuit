@@ -465,7 +465,8 @@ native UX latency gates, and generic runtime/list/currentness work remain.
 - Final source replacement commit validates that the accepted frame evidence and
   current preview frame evidence still share the same surface id and surface
   epoch, and that frame sequence, content revision, layout revision,
-  render-scene revision, and present id have not regressed.
+  render-scene revision, and present id have not regressed. A later slice
+  tightens this from no-regression to exact frame-evidence matching.
 - A stale frame-evidence result is rejected before mutating active preview
   source, runtime units, runtime summary, live runtime, world scene/session, or
   retained shared render state.
@@ -1120,6 +1121,79 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   and address-shaped helper names remain in a few call sites, and the larger
   native UX/frame-loop/runtime-currentness plan still needs implementation and
   release native GPU verification.
+
+2026-07-01 frame-scoped input latency measurement slice:
+
+- `NativeRenderLoopState` now accounts accepted host-input latency once per
+  presented input generation. `preview_perf_stats.input_to_present_ms` is fed
+  only from the frame that actually presented the accepted input, so later
+  timer/proof/burst frames cannot keep inflating an old click's latency.
+- Render-loop reports now expose `frame_input_to_present_ms` and
+  `input_to_present_accounted_event_wake_count` separately from older
+  wake/accept debug timings. Report `preview_perf_stats.input_to_present_ms`
+  uses the frame-scoped value instead of recomputing from stale state.
+- The Cells visible-click verifier now prefers `frame_input_to_present_ms` for
+  `render_loop_input_accept_to_present_ms`, while still recording the legacy
+  accept-to-present value for transition diagnostics.
+- Added focused coverage for:
+  - accepted input latency starts at the role poll hook accept point;
+  - accepted input latency is single-use for the presented input frame;
+  - serialized render-loop reports carry the frame-scoped value into
+    `preview_perf_stats`.
+- Focused verification passed:
+  - `cargo fmt --check`
+  - `cargo test -q -p boon_native_app_window`
+  - `cargo check -q -p boon_native_app_window -p xtask`
+  - `cargo check -q -p boon_native_playground`
+- This improves measurement honesty but does not complete performance. The next
+  slices still need retained hot-path work, no-address native input cleanup,
+  active/pending snapshot currentness, and fresh release native GPU reports.
+
+2026-07-01 exact pending frame-evidence currentness slice:
+
+- Pending source/runtime/layout/render snapshot commits now require the current
+  preview `FrameEvidenceKey` to exactly match the accepted pending snapshot
+  frame evidence for surface id, surface epoch, frame sequence, content
+  revision, layout revision, render-scene revision, and present id.
+- Same-surface newer frames are now rejected with `frame_seq_changed` instead
+  of accepted under the old no-regression rule. This makes the commit rule match
+  the active/pending contract: a pending snapshot may commit only while it is
+  still the current frame snapshot.
+- The reported `pending_snapshot_commit_currentness_policy` is now
+  `source-revision-plus-exact-frame-evidence`, and `xtask` validates that
+  policy string in active/pending backpressure proof.
+- Added focused coverage for exact frame-evidence currentness on an advanced
+  same-surface frame. Existing stale surface-epoch coverage still proves stale
+  frame evidence is rejected before mutating active preview state.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground pending_frame_evidence_commit_requires_exact_current_frame`
+  - `cargo test -q -p boon_native_playground replace_source_commit_rejects_stale_surface_epoch_before_state_mutation`
+ - `cargo check -q -p boon_native_playground -p xtask`
+- This improves active/pending currentness, but layout and render-scene
+  revisions are still sourced from the current frame evidence model. The full
+  plan still needs independent retained layout/render identities, no-address
+  native input cleanup, release native GPU reports, and the full aggregate
+  gates.
+
+2026-07-01 generic node/binding selection-proxy refresh slice:
+
+- Selection-proxy focused text refresh now tries stable document node identity
+  and cached document text-binding targets before falling back to the legacy
+  selected-address path. This keeps formula-bar/text-input refresh generic:
+  the native input path does not need to know that a selected item is a
+  spreadsheet cell or that the state shape has `/store/selected_address`.
+- Retained text refresh also uses selected/focused overlay node identity first,
+  so an already-present layout frame can update the focused native text payload
+  without rediscovering the target from address-shaped metadata.
+- Added focused coverage for state-summary text binding refresh and retained
+  text-input refresh with no focused address present.
+- Focused verification passed:
+  - `cargo test -q -p boon_native_playground selection_proxy_state_summary_refresh_uses_node_text_binding_without_address`
+  - `cargo test -q -p boon_native_playground selection_proxy_retained_refresh_uses_selected_node_without_address`
+- This still does not complete Cells click latency. The remaining work is to
+  remove the leftover selected-address compatibility dependency from the hot
+  path, prove click-to-formula-bar timing through native host events and WGPU
+  evidence, and finish the retained frame-loop/runtime-currentness slices.
 
 ## Implementation Slices
 

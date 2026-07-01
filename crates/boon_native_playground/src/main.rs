@@ -37992,11 +37992,23 @@ fn preview_refresh_selection_proxy_focused_text_from_selected_input(
 }
 
 fn preview_refresh_selection_proxy_focused_text_from_state_summary(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     state_summary: &Value,
     input_state: &mut PreviewNativeInputState,
 ) -> bool {
     if !input_state.focused_selection_proxy {
         return false;
+    }
+    if let Some(text) = selection_proxy_text_from_state_summary_by_node(
+        shared_render_state,
+        state_summary,
+        input_state,
+    ) {
+        input_state.focused_text = text;
+        input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+        input_state.replace_focused_text_on_next_edit = false;
+        preview_reset_caret_blink(input_state);
+        return true;
     }
     let Some(address) = input_state.focused_address.as_deref() else {
         return false;
@@ -38012,6 +38024,7 @@ fn preview_refresh_selection_proxy_focused_text_from_state_summary(
 }
 
 fn preview_refresh_selection_proxy_from_state_summary(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     state_summary: &Value,
     input_state: &mut PreviewNativeInputState,
 ) -> bool {
@@ -38026,7 +38039,11 @@ fn preview_refresh_selection_proxy_from_state_summary(
     {
         input_state.focused_address = Some(address);
     }
-    preview_refresh_selection_proxy_focused_text_from_state_summary(state_summary, input_state)
+    preview_refresh_selection_proxy_focused_text_from_state_summary(
+        shared_render_state,
+        state_summary,
+        input_state,
+    )
 }
 
 fn preview_refresh_selection_proxy_focused_text_from_retained_input(
@@ -38035,6 +38052,15 @@ fn preview_refresh_selection_proxy_focused_text_from_retained_input(
 ) -> bool {
     if !input_state.focused_selection_proxy {
         return false;
+    }
+    if let Some(text) =
+        retained_text_input_text_for_selection_proxy_nodes(shared_render_state, input_state)
+    {
+        input_state.focused_text = text;
+        input_state.focused_caret_index = preview_text_char_count(&input_state.focused_text);
+        input_state.replace_focused_text_on_next_edit = false;
+        preview_reset_caret_blink(input_state);
+        return true;
     }
     let Some(address) = input_state.focused_address.as_deref() else {
         return false;
@@ -38047,6 +38073,122 @@ fn preview_refresh_selection_proxy_focused_text_from_retained_input(
     input_state.replace_focused_text_on_next_edit = false;
     preview_reset_caret_blink(input_state);
     true
+}
+
+fn selection_proxy_text_from_state_summary_by_node(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    state_summary: &Value,
+    input_state: &PreviewNativeInputState,
+) -> Option<String> {
+    let shared = shared_render_state.lock().ok()?;
+    for node in selection_proxy_text_input_candidate_nodes(&shared, input_state) {
+        if let Some(text) =
+            document_text_binding_value_for_node(&shared.layout_proof, &node, state_summary)
+        {
+            return Some(text);
+        }
+        let Some(layout_hash) = shared
+            .layout_proof
+            .get("layout_frame_hash")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(snapshot) = cached_document_render_snapshot(layout_hash) else {
+            continue;
+        };
+        let Some(bindings) = snapshot
+            .data_binding_targets
+            .state_binding_targets_by_node
+            .get(&node)
+        else {
+            continue;
+        };
+        for (path, target) in bindings {
+            if !matches!(
+                target.attr.as_str(),
+                "text" | "label" | "value" | "display_value"
+            ) {
+                continue;
+            }
+            let Some(value) = state_summary_value_for_data_path(state_summary, path) else {
+                continue;
+            };
+            return Some(json_value_to_document_text(value));
+        }
+    }
+    None
+}
+
+fn retained_text_input_text_for_selection_proxy_nodes(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &PreviewNativeInputState,
+) -> Option<String> {
+    let shared = shared_render_state.lock().ok()?;
+    let candidate_nodes = selection_proxy_text_input_candidate_nodes(&shared, input_state);
+    if candidate_nodes.is_empty() {
+        return None;
+    }
+    let frame = shared.layout_frame_override.as_deref()?;
+    frame
+        .display_list
+        .iter()
+        .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+        .find(|item| candidate_nodes.contains(&item.node.0))
+        .and_then(|item| item.text.clone())
+}
+
+fn selection_proxy_text_input_candidate_nodes(
+    shared: &PreviewSharedRenderState,
+    input_state: &PreviewNativeInputState,
+) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    if let Some(node) = input_state.focused_node.as_ref() {
+        nodes.insert(node.clone());
+    }
+    nodes.extend(input_state.selected_overlay_nodes.iter().cloned());
+    let Some(frame) = shared.layout_frame_override.as_deref() else {
+        return nodes;
+    };
+    for item in frame
+        .display_list
+        .iter()
+        .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+    {
+        let node = item.node.0.as_str();
+        if selection_proxy_node_matches_editor_sources(&shared.layout_proof, node, input_state) {
+            nodes.insert(item.node.0.clone());
+        }
+    }
+    nodes
+}
+
+fn selection_proxy_node_matches_editor_sources(
+    layout_proof: &Value,
+    node: &str,
+    input_state: &PreviewNativeInputState,
+) -> bool {
+    input_state
+        .focused_change_source
+        .as_ref()
+        .is_some_and(|source| {
+            live_source_for_node_intent(layout_proof, node, "change").as_deref()
+                == Some(source.as_str())
+        })
+        || input_state
+            .focused_submit_source
+            .as_ref()
+            .is_some_and(|source| {
+                live_source_for_node_intent(layout_proof, node, "submit").as_deref()
+                    == Some(source.as_str())
+            })
+        || input_state
+            .focused_key_down_source
+            .as_ref()
+            .is_some_and(|source| {
+                live_source_for_node_intent(layout_proof, node, "key_down").as_deref()
+                    == Some(source.as_str())
+            })
 }
 
 fn retained_text_input_text_for_address(
@@ -39821,7 +39963,11 @@ fn preview_try_apply_simple_source_click_input(
     let selection_proxy_text_refresh_started = Instant::now();
     let refreshed_selection_proxy_from_summary =
         post_turn_state_summary.as_ref().is_some_and(|summary| {
-            preview_refresh_selection_proxy_from_state_summary(summary, input_state)
+            preview_refresh_selection_proxy_from_state_summary(
+                shared_render_state,
+                summary,
+                input_state,
+            )
         });
     if !refreshed_selection_proxy_from_summary
         && !preview_refresh_selection_proxy_focused_text_from_retained_input(
@@ -51420,7 +51566,7 @@ fn attach_active_pending_snapshot_backpressure(
             value
                 .get("pending_snapshot_commit_currentness_policy")
                 .cloned()
-                .unwrap_or_else(|| json!("source-revision-plus-frame-evidence-no-regression")),
+                .unwrap_or_else(|| json!("source-revision-plus-exact-frame-evidence")),
         ),
     ];
     if let Some(backpressure) = value
@@ -57429,20 +57575,20 @@ fn preview_frame_evidence_commit_rejection(
     if accepted.surface_epoch != current.surface_epoch {
         return Some("surface_epoch_changed");
     }
-    if current.frame_seq < accepted.frame_seq {
-        return Some("frame_seq_regressed");
+    if current.frame_seq != accepted.frame_seq {
+        return Some("frame_seq_changed");
     }
-    if current.content_revision < accepted.content_revision {
-        return Some("content_revision_regressed");
+    if current.content_revision != accepted.content_revision {
+        return Some("content_revision_changed");
     }
-    if current.layout_revision < accepted.layout_revision {
-        return Some("layout_revision_regressed");
+    if current.layout_revision != accepted.layout_revision {
+        return Some("layout_revision_changed");
     }
-    if current.render_scene_revision < accepted.render_scene_revision {
-        return Some("render_scene_revision_regressed");
+    if current.render_scene_revision != accepted.render_scene_revision {
+        return Some("render_scene_revision_changed");
     }
-    if current.present_id < accepted.present_id {
-        return Some("present_id_regressed");
+    if current.present_id != accepted.present_id {
+        return Some("present_id_changed");
     }
     None
 }
@@ -57477,7 +57623,7 @@ fn attach_pending_frame_evidence_fields(
     value["pending_frame_evidence_rejection"] =
         rejection.map_or_else(|| json!(null), |reason| json!(reason));
     value["pending_snapshot_commit_currentness_policy"] =
-        json!("source-revision-plus-frame-evidence-no-regression");
+        json!("source-revision-plus-exact-frame-evidence");
 }
 
 fn preview_layout_frame_text_evidence(
@@ -57921,7 +58067,7 @@ fn preview_enqueue_source_project(
             None
         ),
         "pending_frame_evidence_rejection": null,
-        "pending_snapshot_commit_currentness_policy": "source-revision-plus-frame-evidence-no-regression"
+        "pending_snapshot_commit_currentness_policy": "source-revision-plus-exact-frame-evidence"
     });
     attach_latest_wins_metrics(&mut ack, queue_stats.metrics);
     attach_active_pending_snapshot_backpressure(
@@ -62342,6 +62488,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_frame_evidence_commit_requires_exact_current_frame() {
+        let accepted = test_frame_evidence_key(7, 1);
+        let advanced_same_surface = test_frame_evidence_key(8, 1);
+
+        assert_eq!(
+            preview_frame_evidence_commit_rejection(Some(&accepted), Some(&accepted)),
+            None
+        );
+        assert_eq!(
+            preview_frame_evidence_commit_rejection(Some(&accepted), Some(&advanced_same_surface)),
+            Some("frame_seq_changed"),
+            "a newer frame on the same surface is not the accepted pending snapshot"
+        );
+
+        let mut status = json!({});
+        attach_pending_frame_evidence_fields(
+            &mut status,
+            Some(&accepted),
+            Some(&advanced_same_surface),
+            Some("frame_seq_changed"),
+        );
+        assert_eq!(status["pending_frame_evidence_status"], "stale-rejected");
+        assert_eq!(
+            status["pending_snapshot_commit_currentness_policy"],
+            "source-revision-plus-exact-frame-evidence"
+        );
+    }
+
     fn find_document_field<'a>(
         statement: &'a AstStatement,
         name: &str,
@@ -62645,6 +62820,106 @@ mod tests {
             },
         );
         json!({ "layout_frame_hash": hash })
+    }
+
+    fn test_text_input_layout_frame(node: &str, text: &str) -> boon_document::LayoutFrame {
+        let style = BTreeMap::new();
+        boon_document::LayoutFrame {
+            display_list: vec![boon_document::DisplayItem {
+                node: boon_document_model::DocumentNodeId(node.to_owned()),
+                kind: boon_document_model::DocumentNodeKind::TextInput,
+                bounds: boon_document::Rect {
+                    x: 8.0,
+                    y: 12.0,
+                    width: 160.0,
+                    height: 24.0,
+                },
+                text: Some(text.to_owned()),
+                style_identity: boon_document::ComputedStyleIdentity::from_style(&style),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        }
+    }
+
+    fn test_shared_render_state(
+        layout_proof: Value,
+        layout_frame: boon_document::LayoutFrame,
+    ) -> Arc<Mutex<PreviewSharedRenderState>> {
+        Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof,
+            layout_frame_override: Some(Arc::new(layout_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }))
+    }
+
+    #[test]
+    fn selection_proxy_state_summary_refresh_uses_node_text_binding_without_address() {
+        let layout_proof = cache_test_document_snapshot(
+            "selection-proxy-node-text-binding",
+            &[],
+            &["store.formula_bar.text"],
+        );
+        let shared_render_state = test_shared_render_state(
+            layout_proof,
+            test_text_input_layout_frame("test-node", "stale retained text"),
+        );
+        let mut input_state = PreviewNativeInputState {
+            focused_selection_proxy: true,
+            selected_overlay_nodes: BTreeSet::from(["test-node".to_owned()]),
+            ..PreviewNativeInputState::default()
+        };
+        let state_summary = json!({
+            "store": {
+                "formula_bar": {
+                    "text": "=A1+B2"
+                }
+            }
+        });
+
+        assert!(preview_refresh_selection_proxy_from_state_summary(
+            &shared_render_state,
+            &state_summary,
+            &mut input_state
+        ));
+        assert_eq!(input_state.focused_text, "=A1+B2");
+        assert_eq!(input_state.focused_caret_index, 6);
+        assert!(input_state.focused_address.is_none());
+    }
+
+    #[test]
+    fn selection_proxy_retained_refresh_uses_selected_node_without_address() {
+        let shared_render_state = test_shared_render_state(
+            json!({}),
+            test_text_input_layout_frame("test-node", "retained formula"),
+        );
+        let mut input_state = PreviewNativeInputState {
+            focused_selection_proxy: true,
+            selected_overlay_nodes: BTreeSet::from(["test-node".to_owned()]),
+            ..PreviewNativeInputState::default()
+        };
+
+        assert!(
+            preview_refresh_selection_proxy_focused_text_from_retained_input(
+                &shared_render_state,
+                &mut input_state
+            )
+        );
+        assert_eq!(input_state.focused_text, "retained formula");
+        assert_eq!(input_state.focused_caret_index, 16);
+        assert!(input_state.focused_address.is_none());
     }
 
     fn test_display_bounds(layout: &boon_document::LayoutFrame, node: &str) -> boon_document::Rect {

@@ -826,9 +826,44 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo xtask verify-report-schema target/reports/native-gpu/negative.json`
   - `git diff --check`
 - This does not complete the full plan. Remaining work still includes aggregate
-  native GPU gates, renderer upload/layout/materialization stats in the HUD,
-  full active/pending runtime-layout-render snapshot ownership, the no-hacks
-  cleanup above, and generic runtime/list/currentness verification.
+  native GPU gates, full HUD presentation for renderer
+  upload/layout/materialization stats, full active/pending
+  runtime-layout-render snapshot ownership, the no-hacks cleanup above, and
+  generic runtime/list/currentness verification.
+
+2026-07-01 typed render-metrics preview stats slice:
+
+- Added a generic `NativeRenderFrameMetrics` payload to the native app-window
+  render-hook result. The payload carries renderer/layout facts without knowing
+  which Boon example is running:
+  - `layout_ms`;
+  - `upload_bytes`;
+  - `draw_call_count`;
+  - `glyph_cache_hit_rate`;
+  - `materialized_item_count`;
+  - `visible_display_item_count`;
+  - `queue_write_count`;
+  - `preview_blocked_on_ipc_count`.
+- The bounded preview-performance accumulator now records rolling summaries for
+  layout time, upload bytes, draw calls, glyph-cache hit rate, and materialized
+  item count alongside the existing render/present/input/proof timings.
+- The native playground render hooks publish those typed metrics from
+  app-owned WGPU frame metrics and layout materialization reports. This keeps
+  the preview perf snapshot and native reports on structured data instead of
+  parsing proof JSON or runtime summaries.
+- The native report schema now requires these render-resource summary objects
+  in `preview_perf_stats`, and the playground preview-perf fixtures cover the
+  expanded contract.
+- Focused verification passed:
+  - `cargo fmt`
+  - `cargo test -q -p boon_native_app_window preview_perf`
+  - `cargo test -q -p boon_native_playground preview_perf`
+  - `cargo test -q -p boon_report_schema native_gpu_schema`
+- This does not complete the full realtime plan. Remaining work still includes
+  showing the extra renderer-resource metrics in a polished dev-window HUD row
+  or panel, full native GPU aggregate gates, active/pending frame ownership,
+  retained selection/focus genericization, and generic runtime/list/currentness
+  work.
 
 ## Implementation Slices
 

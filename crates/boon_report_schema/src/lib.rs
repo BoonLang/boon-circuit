@@ -26642,8 +26642,13 @@ fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut
     }
     for field in [
         "render_hook_ms_p50_p95_p99_max",
+        "layout_ms_p50_p95_p99_max",
         "present_call_ms_p50_p95_p99_max",
         "input_to_present_ms_p50_p95_p99_max",
+        "upload_bytes_p50_p95_max",
+        "draw_call_count_p50_p95_max",
+        "glyph_cache_hit_rate_p50_p95_max",
+        "materialized_item_count_p50_p95_max",
         "proof_overhead_ms_p50_p95_max",
     ] {
         match object.get(field) {
@@ -26652,6 +26657,22 @@ fn verify_native_preview_perf_stats(value: &JsonValue, path: &str, reasons: &mut
             }
             None => reasons.push(format!("{path}.{field} is missing")),
         }
+    }
+    if !object
+        .get("glyph_cache_hit_rate")
+        .is_some_and(|value| value.is_null() || value.as_f64().is_some_and(f64::is_finite))
+    {
+        reasons.push(format!(
+            "{path}.glyph_cache_hit_rate must be null or finite"
+        ));
+    }
+    if !object
+        .get("materialized_item_count")
+        .is_some_and(|value| value.is_null() || value.as_u64().is_some())
+    {
+        reasons.push(format!(
+            "{path}.materialized_item_count must be null or an integer"
+        ));
     }
 }
 
@@ -31565,6 +31586,13 @@ mod tests {
                 "max": 1.2,
                 "sample_count": 1
             },
+            "layout_ms_p50_p95_p99_max": {
+                "p50": 1.0,
+                "p95": 1.0,
+                "p99": 1.0,
+                "max": 1.0,
+                "sample_count": 1
+            },
             "present_call_ms_p50_p95_p99_max": {
                 "p50": 2.4,
                 "p95": 2.4,
@@ -31577,6 +31605,36 @@ mod tests {
                 "p95": 8.0,
                 "p99": 8.0,
                 "max": 8.0,
+                "sample_count": 1
+            },
+            "upload_bytes_p50_p95_max": {
+                "p50": 2048.0,
+                "p95": 2048.0,
+                "p99": 2048.0,
+                "max": 2048.0,
+                "sample_count": 1
+            },
+            "draw_call_count_p50_p95_max": {
+                "p50": 8.0,
+                "p95": 8.0,
+                "p99": 8.0,
+                "max": 8.0,
+                "sample_count": 1
+            },
+            "glyph_cache_hit_rate": 0.98,
+            "glyph_cache_hit_rate_p50_p95_max": {
+                "p50": 0.98,
+                "p95": 0.98,
+                "p99": 0.98,
+                "max": 0.98,
+                "sample_count": 1
+            },
+            "materialized_item_count": 24,
+            "materialized_item_count_p50_p95_max": {
+                "p50": 24.0,
+                "p95": 24.0,
+                "p99": 24.0,
+                "max": 24.0,
                 "sample_count": 1
             },
             "missed_frame_count": 0,

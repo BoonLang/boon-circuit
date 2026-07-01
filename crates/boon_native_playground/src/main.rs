@@ -6493,7 +6493,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .world_scene
                 .clone()
                 .and_then(|world_scene| world_scene.lock().ok().map(|state| state.clone()));
-            let proof = native_gpu_app_owned_render_hook(
+            let render_output = native_gpu_app_owned_render_hook(
                 context,
                 render_world_scene.as_ref(),
                 &visible_render_state,
@@ -6511,6 +6511,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 skip_render_hook_app_owned_proof,
             )
             .map_err(|error| error.to_string())?;
+            let proof = render_output.proof;
             let layout_identity_fallback = format!("preview-content:{content_revision}");
             let layout_identity = preview_proof_identity_value(
                 &proof,
@@ -6539,6 +6540,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 content_revision,
                 layout_revision: Some(presented_layout_revision),
                 render_scene_revision: Some(presented_render_scene_revision),
+                render_frame_metrics: render_output.render_frame_metrics,
                 rendered: true,
                 content_changed,
                 role_dirty_reason: None,
@@ -6901,7 +6903,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .ok_or_else(|| "dev derived index cache was not initialized".to_owned())?;
             let content_revision = render_state.revision.max(1);
-            let proof = native_gpu_dev_visible_render_hook(
+            let render_output = native_gpu_dev_visible_render_hook(
                 context,
                 &mut visible_renderer,
                 &mut render_text_columns,
@@ -6917,6 +6919,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_state.passive_scroll_fast_frame_patch_count,
                 render_state.fast_render_scene_patch.as_ref(),
             )?;
+            let proof = render_output.proof;
             let layout_identity_fallback = format!("dev-content:{content_revision}");
             let layout_identity = preview_proof_identity_value(
                 &proof,
@@ -6943,6 +6946,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 content_revision,
                 layout_revision: Some(presented_layout_revision),
                 render_scene_revision: Some(presented_render_scene_revision),
+                render_frame_metrics: render_output.render_frame_metrics,
                 rendered: true,
                 content_changed: true,
                 role_dirty_reason: None,
@@ -10887,6 +10891,11 @@ fn native_gpu_render_proof(
     }))
 }
 
+struct PreviewNativeGpuRenderHookOutput {
+    proof: serde_json::Value,
+    render_frame_metrics: Option<boon_native_app_window::NativeRenderFrameMetrics>,
+}
+
 fn native_gpu_app_owned_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     world_scene: Option<&PreviewWorldSceneState>,
@@ -10910,14 +10919,17 @@ fn native_gpu_app_owned_render_hook(
         (String, String, boon_document::RenderScene),
     >,
     skip_app_owned_scene_proof: bool,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+) -> Result<PreviewNativeGpuRenderHookOutput, Box<dyn std::error::Error>> {
     if let Some(world_scene) = world_scene {
-        return native_gpu_world_scene_visible_render_hook(
-            context,
-            world_scene,
-            last_error,
-            status_overlay,
-        );
+        return Ok(PreviewNativeGpuRenderHookOutput {
+            proof: native_gpu_world_scene_visible_render_hook(
+                context,
+                world_scene,
+                last_error,
+                status_overlay,
+            )?,
+            render_frame_metrics: None,
+        });
     }
     if visible_state.status.as_deref() != Some("pass") {
         return Err("layout proof did not pass".into());
@@ -11626,7 +11638,42 @@ fn native_gpu_app_owned_render_hook(
         );
     }
     report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
-    Ok(report)
+    Ok(PreviewNativeGpuRenderHookOutput {
+        proof: report,
+        render_frame_metrics: Some(preview_native_render_frame_metrics(
+            &visible_metrics,
+            layout_frame,
+            Some(0.0),
+        )),
+    })
+}
+
+fn preview_native_render_frame_metrics(
+    metrics: &boon_native_gpu::FrameMetrics,
+    layout_frame: &boon_document::LayoutFrame,
+    layout_ms: Option<f64>,
+) -> boon_native_app_window::NativeRenderFrameMetrics {
+    let shaped_lookups = metrics
+        .shaped_run_cache_hits
+        .saturating_add(metrics.shaped_run_cache_misses);
+    let glyph_cache_hit_rate =
+        (shaped_lookups > 0).then(|| metrics.shaped_run_cache_hits as f64 / shaped_lookups as f64);
+    boon_native_app_window::NativeRenderFrameMetrics {
+        layout_ms,
+        upload_bytes: Some(metrics.upload_bytes),
+        draw_call_count: Some(u64::from(metrics.draw_calls)),
+        glyph_cache_hit_rate,
+        materialized_item_count: Some(
+            layout_frame
+                .materialization
+                .iter()
+                .map(|report| report.materialized_item_count)
+                .sum(),
+        ),
+        visible_display_item_count: Some(u64::from(metrics.visible_display_item_count)),
+        queue_write_count: Some(u64::from(metrics.queue_write_count)),
+        preview_blocked_on_ipc_count: Some(metrics.preview_blocked_on_ipc_count),
+    }
 }
 
 fn preview_compact_frame_metrics_json(
@@ -12741,7 +12788,7 @@ fn native_gpu_dev_visible_render_hook(
     passive_scroll_full_layout_refresh_count: u64,
     passive_scroll_fast_frame_patch_count: u64,
     fast_render_scene_patch: Option<&DevFastRenderScenePatch>,
-) -> Result<serde_json::Value, String> {
+) -> Result<PreviewNativeGpuRenderHookOutput, String> {
     let renderer = visible_renderer.get_or_insert_with(|| {
         boon_native_gpu::VisibleLayoutRenderer::new(
             context.device,
@@ -12878,7 +12925,7 @@ fn native_gpu_dev_visible_render_hook(
                 passive_scroll_full_layout_refresh_count,
                 passive_scroll_fast_frame_patch_count,
                 cache,
-                visible_metrics,
+                visible_metrics.clone(),
                 render_hook_phase_timings_ms.clone(),
             );
             report["dev_render_cache"]["fast_render_scene_patch"] = json!({
@@ -12901,7 +12948,14 @@ fn native_gpu_dev_visible_render_hook(
                 );
             }
             report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
-            return Ok(report);
+            return Ok(PreviewNativeGpuRenderHookOutput {
+                proof: report,
+                render_frame_metrics: Some(preview_native_render_frame_metrics(
+                    &visible_metrics,
+                    layout_frame,
+                    Some(0.0),
+                )),
+            });
         }
     }
     if !render_scene_cache_hit {
@@ -12971,7 +13025,7 @@ fn native_gpu_dev_visible_render_hook(
         passive_scroll_full_layout_refresh_count,
         passive_scroll_fast_frame_patch_count,
         cache,
-        visible_metrics,
+        visible_metrics.clone(),
         render_hook_phase_timings_ms.clone(),
     );
     report["dev_render_cache"]["fast_render_scene_patch"] = json!({
@@ -12996,7 +13050,14 @@ fn native_gpu_dev_visible_render_hook(
         );
     }
     report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
-    Ok(report)
+    Ok(PreviewNativeGpuRenderHookOutput {
+        proof: report,
+        render_frame_metrics: Some(preview_native_render_frame_metrics(
+            &visible_metrics,
+            layout_frame,
+            Some(0.0),
+        )),
+    })
 }
 
 fn dev_visible_render_report(
@@ -61873,8 +61934,15 @@ mod tests {
             present_call_ms: Some(1.2),
             input_to_present_ms: Some(4.0),
             render_hook_ms_p50_p95_p99_max: timing_summary.clone(),
+            layout_ms_p50_p95_p99_max: timing_summary.clone(),
             present_call_ms_p50_p95_p99_max: timing_summary.clone(),
-            input_to_present_ms_p50_p95_p99_max: timing_summary,
+            input_to_present_ms_p50_p95_p99_max: timing_summary.clone(),
+            upload_bytes_p50_p95_max: timing_summary.clone(),
+            draw_call_count_p50_p95_max: timing_summary.clone(),
+            glyph_cache_hit_rate: Some(0.8),
+            glyph_cache_hit_rate_p50_p95_max: timing_summary.clone(),
+            materialized_item_count: Some(26),
+            materialized_item_count_p50_p95_max: timing_summary,
             missed_frame_count: 0,
             proof_mode: "off".to_owned(),
             proof_overhead_ms: None,
@@ -72977,6 +73045,13 @@ label:
                     "max": 1.3,
                     "sample_count": 1
                 },
+                "layout_ms_p50_p95_p99_max": {
+                    "p50": 1.0,
+                    "p95": 1.0,
+                    "p99": 1.0,
+                    "max": 1.0,
+                    "sample_count": 1
+                },
                 "present_call_ms_p50_p95_p99_max": {
                     "p50": 2.1,
                     "p95": 2.1,
@@ -72990,6 +73065,36 @@ label:
                     "p99": 9.6,
                     "max": 9.6,
                     "sample_count": 4
+                },
+                "upload_bytes_p50_p95_max": {
+                    "p50": 2048.0,
+                    "p95": 2048.0,
+                    "p99": 2048.0,
+                    "max": 2048.0,
+                    "sample_count": 1
+                },
+                "draw_call_count_p50_p95_max": {
+                    "p50": 8.0,
+                    "p95": 8.0,
+                    "p99": 8.0,
+                    "max": 8.0,
+                    "sample_count": 1
+                },
+                "glyph_cache_hit_rate": 0.98,
+                "glyph_cache_hit_rate_p50_p95_max": {
+                    "p50": 0.98,
+                    "p95": 0.98,
+                    "p99": 0.98,
+                    "max": 0.98,
+                    "sample_count": 1
+                },
+                "materialized_item_count": 24,
+                "materialized_item_count_p50_p95_max": {
+                    "p50": 24.0,
+                    "p95": 24.0,
+                    "p99": 24.0,
+                    "max": 24.0,
+                    "sample_count": 1
                 },
                 "missed_frame_count": 0,
                 "proof_mode": "off",
@@ -73098,8 +73203,15 @@ label:
                 present_call_ms: Some(1.2),
                 input_to_present_ms: Some(4.0),
                 render_hook_ms_p50_p95_p99_max: perf_summary.clone(),
+                layout_ms_p50_p95_p99_max: perf_summary.clone(),
                 present_call_ms_p50_p95_p99_max: perf_summary.clone(),
-                input_to_present_ms_p50_p95_p99_max: perf_summary,
+                input_to_present_ms_p50_p95_p99_max: perf_summary.clone(),
+                upload_bytes_p50_p95_max: perf_summary.clone(),
+                draw_call_count_p50_p95_max: perf_summary.clone(),
+                glyph_cache_hit_rate: Some(0.8),
+                glyph_cache_hit_rate_p50_p95_max: perf_summary.clone(),
+                materialized_item_count: Some(26),
+                materialized_item_count_p50_p95_max: perf_summary,
                 missed_frame_count: 0,
                 proof_mode: "off".to_owned(),
                 proof_overhead_ms: None,

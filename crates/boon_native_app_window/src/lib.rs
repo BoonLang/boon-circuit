@@ -815,6 +815,8 @@ pub struct NativeRenderLoopState {
     pub last_render_started_elapsed_ms: Option<f64>,
     pub last_surface_acquired_elapsed_ms: Option<f64>,
     pub last_render_hook_completed_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_render_frame_metrics: Option<NativeRenderFrameMetrics>,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
     pub last_present_interval_ms: Option<f64>,
@@ -886,6 +888,7 @@ impl NativeRenderLoopState {
             last_render_started_elapsed_ms: None,
             last_surface_acquired_elapsed_ms: None,
             last_render_hook_completed_elapsed_ms: None,
+            last_render_frame_metrics: None,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
             last_present_interval_ms: None,
@@ -1079,6 +1082,10 @@ impl NativeRenderLoopState {
 
     pub fn note_render_hook_completed(&mut self, elapsed_ms: f64) {
         self.last_render_hook_completed_elapsed_ms = Some(elapsed_ms);
+    }
+
+    pub fn note_render_frame_metrics(&mut self, metrics: Option<NativeRenderFrameMetrics>) {
+        self.last_render_frame_metrics = metrics;
     }
 
     pub fn note_queue_submitted(&mut self, elapsed_ms: f64) {
@@ -1335,6 +1342,7 @@ pub struct NativeRenderHookResult {
     pub content_revision: u64,
     pub layout_revision: Option<u64>,
     pub render_scene_revision: Option<u64>,
+    pub render_frame_metrics: Option<NativeRenderFrameMetrics>,
     pub rendered: bool,
     pub content_changed: bool,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
@@ -1347,6 +1355,7 @@ impl NativeRenderHookResult {
             content_revision: 0,
             layout_revision: None,
             render_scene_revision: None,
+            render_frame_metrics: None,
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -1722,11 +1731,36 @@ pub struct NativePerfMetricSummary {
     pub sample_count: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NativeRenderFrameMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draw_call_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glyph_cache_hit_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_item_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_display_item_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_write_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_blocked_on_ipc_count: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 struct NativePreviewPerfAccumulator {
     render_hook_ms: VecDeque<f64>,
+    layout_ms: VecDeque<f64>,
     present_call_ms: VecDeque<f64>,
     input_to_present_ms: VecDeque<f64>,
+    upload_bytes: VecDeque<f64>,
+    draw_call_count: VecDeque<f64>,
+    glyph_cache_hit_rate: VecDeque<f64>,
+    materialized_item_count: VecDeque<f64>,
     proof_overhead_ms: VecDeque<f64>,
 }
 
@@ -1734,8 +1768,13 @@ impl Default for NativePreviewPerfAccumulator {
     fn default() -> Self {
         Self {
             render_hook_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            layout_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             present_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             input_to_present_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            upload_bytes: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            draw_call_count: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            glyph_cache_hit_rate: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            materialized_item_count: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             proof_overhead_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
         }
     }
@@ -1745,18 +1784,49 @@ impl NativePreviewPerfAccumulator {
     fn record(
         &mut self,
         render_hook_ms: Option<f64>,
+        render_frame_metrics: Option<&NativeRenderFrameMetrics>,
         present_call_ms: Option<f64>,
         input_to_present_ms: Option<f64>,
         proof_overhead_ms: Option<f64>,
     ) {
         push_perf_sample(&mut self.render_hook_ms, render_hook_ms);
+        push_perf_sample(
+            &mut self.layout_ms,
+            render_frame_metrics.and_then(|metrics| metrics.layout_ms),
+        );
         push_perf_sample(&mut self.present_call_ms, present_call_ms);
         push_perf_sample(&mut self.input_to_present_ms, input_to_present_ms);
+        push_perf_sample(
+            &mut self.upload_bytes,
+            render_frame_metrics
+                .and_then(|metrics| metrics.upload_bytes)
+                .map(|value| value as f64),
+        );
+        push_perf_sample(
+            &mut self.draw_call_count,
+            render_frame_metrics
+                .and_then(|metrics| metrics.draw_call_count)
+                .map(|value| value as f64),
+        );
+        push_perf_sample(
+            &mut self.glyph_cache_hit_rate,
+            render_frame_metrics.and_then(|metrics| metrics.glyph_cache_hit_rate),
+        );
+        push_perf_sample(
+            &mut self.materialized_item_count,
+            render_frame_metrics
+                .and_then(|metrics| metrics.materialized_item_count)
+                .map(|value| value as f64),
+        );
         push_perf_sample(&mut self.proof_overhead_ms, proof_overhead_ms);
     }
 
     fn render_hook_summary(&self) -> NativePerfMetricSummary {
         metric_summary_from_samples(&self.render_hook_ms)
+    }
+
+    fn layout_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.layout_ms)
     }
 
     fn present_call_summary(&self) -> NativePerfMetricSummary {
@@ -1765,6 +1835,22 @@ impl NativePreviewPerfAccumulator {
 
     fn input_to_present_summary(&self) -> NativePerfMetricSummary {
         metric_summary_from_samples(&self.input_to_present_ms)
+    }
+
+    fn upload_bytes_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.upload_bytes)
+    }
+
+    fn draw_call_count_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.draw_call_count)
+    }
+
+    fn glyph_cache_hit_rate_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.glyph_cache_hit_rate)
+    }
+
+    fn materialized_item_count_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.materialized_item_count)
     }
 
     fn proof_overhead_summary(&self) -> NativePerfMetricSummary {
@@ -1786,8 +1872,15 @@ pub struct NativePreviewPerfStats {
     pub present_call_ms: Option<f64>,
     pub input_to_present_ms: Option<f64>,
     pub render_hook_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub layout_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub present_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub input_to_present_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    pub upload_bytes_p50_p95_max: NativePerfMetricSummary,
+    pub draw_call_count_p50_p95_max: NativePerfMetricSummary,
+    pub glyph_cache_hit_rate: Option<f64>,
+    pub glyph_cache_hit_rate_p50_p95_max: NativePerfMetricSummary,
+    pub materialized_item_count: Option<u64>,
+    pub materialized_item_count_p50_p95_max: NativePerfMetricSummary,
     pub missed_frame_count: u64,
     pub proof_mode: String,
     pub proof_overhead_ms: Option<f64>,
@@ -3415,6 +3508,8 @@ async fn run_surface_probe_inner(
                 rendered_content_revision = presented_revisions.0;
                 rendered_layout_revision = presented_revisions.1;
                 rendered_render_scene_revision = presented_revisions.2;
+                render_loop_state
+                    .note_render_frame_metrics(render_result.render_frame_metrics.clone());
                 external_render_proof = Some(render_result.proof);
                 render_loop_state
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -3553,6 +3648,8 @@ async fn run_surface_probe_inner(
                     rendered_content_revision = presented_revisions.0;
                     rendered_layout_revision = presented_revisions.1;
                     rendered_render_scene_revision = presented_revisions.2;
+                    render_loop_state
+                        .note_render_frame_metrics(render_result.render_frame_metrics.clone());
                     external_render_proof = Some(render_result.proof);
                     render_loop_state
                         .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -3574,6 +3671,7 @@ async fn run_surface_probe_inner(
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+                    render_loop_state.note_render_frame_metrics(None);
                     render_loop_state
                         .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -3850,6 +3948,7 @@ async fn run_surface_probe_inner(
         };
         preview_perf_accumulator.record(
             stats_render_hook_ms,
+            render_loop_state.last_render_frame_metrics.as_ref(),
             stats_present_call_ms,
             stats_input_to_present_ms,
             None,
@@ -4605,8 +4704,21 @@ fn native_preview_perf_stats_snapshot(
         present_call_ms: state.last_present_call_ms,
         input_to_present_ms,
         render_hook_ms_p50_p95_p99_max: accumulator.render_hook_summary(),
+        layout_ms_p50_p95_p99_max: accumulator.layout_summary(),
         present_call_ms_p50_p95_p99_max: accumulator.present_call_summary(),
         input_to_present_ms_p50_p95_p99_max: accumulator.input_to_present_summary(),
+        upload_bytes_p50_p95_max: accumulator.upload_bytes_summary(),
+        draw_call_count_p50_p95_max: accumulator.draw_call_count_summary(),
+        glyph_cache_hit_rate: state
+            .last_render_frame_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.glyph_cache_hit_rate),
+        glyph_cache_hit_rate_p50_p95_max: accumulator.glyph_cache_hit_rate_summary(),
+        materialized_item_count: state
+            .last_render_frame_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.materialized_item_count),
+        materialized_item_count_p50_p95_max: accumulator.materialized_item_count_summary(),
         missed_frame_count: state.missed_frame_count,
         proof_mode: proof_mode.into(),
         proof_overhead_ms,
@@ -5007,7 +5119,7 @@ fn write_render_loop_state_report(
         .map(|_| "async_latest_wins_atomic_replace")
         .unwrap_or("atomic_replace");
     let mut report_perf_accumulator = perf_accumulator.clone();
-    report_perf_accumulator.record(None, None, None, present_to_readback_report_ms);
+    report_perf_accumulator.record(None, None, None, None, present_to_readback_report_ms);
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
@@ -6141,7 +6253,7 @@ mod tests {
         };
         extras = extras.with_report_writer_stats(writer_stats);
         let mut perf_accumulator = NativePreviewPerfAccumulator::default();
-        perf_accumulator.record(None, state.last_present_call_ms, None, None);
+        perf_accumulator.record(None, None, state.last_present_call_ms, None, None);
         render_loop_report_snapshot(
             path,
             NativeWindowRole::Preview,
@@ -6547,6 +6659,17 @@ mod tests {
         state.note_present_completed(12.0);
         state.note_submit_phase_durations(0.2, 0.1, 1.4);
         state.mark_presented_with_content(2, 5);
+        let render_metrics = NativeRenderFrameMetrics {
+            layout_ms: Some(0.7),
+            upload_bytes: Some(4096),
+            draw_call_count: Some(12),
+            glyph_cache_hit_rate: Some(0.75),
+            materialized_item_count: Some(42),
+            visible_display_item_count: Some(40),
+            queue_write_count: Some(3),
+            preview_blocked_on_ipc_count: Some(0),
+        };
+        state.note_render_frame_metrics(Some(render_metrics.clone()));
         let key = frame_evidence_key_for_presented_frame(
             &state,
             &SurfaceId("surface-test".to_owned()),
@@ -6555,7 +6678,13 @@ mod tests {
             None,
         );
         let mut accumulator = NativePreviewPerfAccumulator::default();
-        accumulator.record(Some(2.5), Some(1.4), Some(8.0), Some(24.0));
+        accumulator.record(
+            Some(2.5),
+            Some(&render_metrics),
+            Some(1.4),
+            Some(8.0),
+            Some(24.0),
+        );
 
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
@@ -6576,6 +6705,12 @@ mod tests {
         assert_eq!(stats.present_call_ms, Some(1.4));
         assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(8.0));
         assert_eq!(stats.render_hook_ms_p50_p95_p99_max.sample_count, 1);
+        assert_eq!(stats.layout_ms_p50_p95_p99_max.p95, Some(0.7));
+        assert_eq!(stats.upload_bytes_p50_p95_max.max, Some(4096.0));
+        assert_eq!(stats.draw_call_count_p50_p95_max.max, Some(12.0));
+        assert_eq!(stats.glyph_cache_hit_rate, Some(0.75));
+        assert_eq!(stats.materialized_item_count, Some(42));
+        assert_eq!(stats.materialized_item_count_p50_p95_max.p95, Some(42.0));
         assert_eq!(stats.proof_overhead_ms_p50_p95_max.max, Some(24.0));
         assert_eq!(stats.frame_evidence_key, Some(key));
     }
@@ -6595,7 +6730,7 @@ mod tests {
             state.last_present_completed_elapsed_ms,
         );
         let mut accumulator = NativePreviewPerfAccumulator::default();
-        accumulator.record(None, None, accepted_input_to_present_ms, None);
+        accumulator.record(None, None, None, accepted_input_to_present_ms, None);
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
@@ -6624,8 +6759,19 @@ mod tests {
     fn preview_perf_accumulator_keeps_bounded_rolling_summaries() {
         let mut accumulator = NativePreviewPerfAccumulator::default();
         for value in 0..(PREVIEW_PERF_STATS_WINDOW + 10) {
+            let render_metrics = NativeRenderFrameMetrics {
+                layout_ms: Some((value * 4) as f64),
+                upload_bytes: Some((value * 5) as u64),
+                draw_call_count: Some((value * 6) as u64),
+                glyph_cache_hit_rate: Some(0.5),
+                materialized_item_count: Some((value * 7) as u64),
+                visible_display_item_count: None,
+                queue_write_count: None,
+                preview_blocked_on_ipc_count: None,
+            };
             accumulator.record(
                 Some(value as f64),
+                Some(&render_metrics),
                 Some((value * 2) as f64),
                 Some((value * 3) as f64),
                 None,
@@ -6640,6 +6786,12 @@ mod tests {
         assert_eq!(render.p50, Some(70.0));
         assert_eq!(render.max, Some(129.0));
         assert_eq!(input.max, Some(387.0));
+        assert_eq!(accumulator.layout_summary().max, Some(516.0));
+        assert_eq!(accumulator.upload_bytes_summary().max, Some(645.0));
+        assert_eq!(
+            accumulator.materialized_item_count_summary().max,
+            Some(903.0)
+        );
         assert_eq!(accumulator.proof_overhead_summary().sample_count, 0);
     }
 
@@ -7223,6 +7375,7 @@ mod tests {
                 content_revision: 1,
                 layout_revision: None,
                 render_scene_revision: None,
+                render_frame_metrics: None,
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -7256,6 +7409,7 @@ mod tests {
                 content_revision: 2,
                 layout_revision: None,
                 render_scene_revision: None,
+                render_frame_metrics: None,
                 rendered: true,
                 content_changed: true,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -7277,6 +7431,7 @@ mod tests {
             content_revision: 2,
             layout_revision: None,
             render_scene_revision: None,
+            render_frame_metrics: None,
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -7332,6 +7487,7 @@ mod tests {
             content_revision: 10,
             layout_revision: Some(4),
             render_scene_revision: Some(7),
+            render_frame_metrics: None,
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -7354,6 +7510,7 @@ mod tests {
             content_revision: 1,
             layout_revision: None,
             render_scene_revision: None,
+            render_frame_metrics: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -7392,6 +7549,7 @@ mod tests {
             content_revision: 2,
             layout_revision: None,
             render_scene_revision: None,
+            render_frame_metrics: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -7430,6 +7588,7 @@ mod tests {
             content_revision: 4,
             layout_revision: None,
             render_scene_revision: None,
+            render_frame_metrics: None,
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -7507,6 +7666,7 @@ mod tests {
                 content_revision: semantic_revision,
                 layout_revision: None,
                 render_scene_revision: None,
+                render_frame_metrics: None,
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: None,

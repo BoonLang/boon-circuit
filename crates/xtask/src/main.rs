@@ -49382,11 +49382,13 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
     let product_path_timing_has_sample = product_path_input_sample_count > 0
         && product_path_input_to_present_p95.is_some_and(|value| value.is_finite() && value > 0.0);
     let product_path_burst_evidence = product_path_requested_animation_burst_count > 0;
+    let product_path_burst_pacing_sample = product_path_pacing_state == "requested_animation_burst";
     let product_path_sustained_sample_count_pass = !product_path_used_single_sample_fallback
         && product_path_input_sample_count >= product_path_min_input_sample_count;
     let product_path_ux_timing_proven = product_path_timing_has_sample
         && product_path_render_loop_mode == "demand_driven"
         && product_path_burst_evidence
+        && product_path_burst_pacing_sample
         && product_path_sustained_sample_count_pass;
     let product_path_timing_status = if product_path_ux_timing_proven {
         "pass"
@@ -49396,6 +49398,8 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "not-demand-driven-product-path"
     } else if !product_path_burst_evidence {
         "missing-requested-animation-burst-evidence"
+    } else if !product_path_burst_pacing_sample {
+        "not-requested-animation-burst-sample"
     } else if !product_path_sustained_sample_count_pass {
         "insufficient-input-to-present-samples"
     } else {
@@ -49714,6 +49718,7 @@ fn add_native_scroll_model_evidence(extra: &mut serde_json::Value, label: &str, 
         "render_loop_mode": product_path_render_loop_mode,
         "frame_pacing_state_at_sample": product_path_pacing_state,
         "requested_animation_burst_count": product_path_requested_animation_burst_count,
+        "requested_animation_burst_pacing_sample": product_path_burst_pacing_sample,
         "sample_count": product_path_input_sample_count,
         "min_sample_count": product_path_min_input_sample_count,
         "sustained_sample_count_pass": product_path_sustained_sample_count_pass,
@@ -86005,7 +86010,7 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             },
             "preview_perf_stats": {
                 "render_loop_mode": "demand_driven",
-                "frame_pacing": {"state": "idle"},
+                "frame_pacing": {"state": "requested_animation_burst"},
                 "input_to_present_ms_p50_p95_p99_max": {
                     "sample_count": 5,
                     "p50": 7.0,
@@ -86091,6 +86096,74 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
     }
 
     #[test]
+    fn product_path_timing_rejects_idle_samples_for_scroll_budget() {
+        let mut report = json!({
+            "preview_frame_ms_p95": 10.0,
+            "speed_timing_window": "post-real-window-input",
+            "post_input_frame_timing": {
+                "measured_frame_count": 30
+            },
+            "render_loop_state": {
+                "requested_animation_burst_count": 4
+            },
+            "preview_perf_stats": {
+                "render_loop_mode": "demand_driven",
+                "frame_pacing": {"state": "idle"},
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "sample_count": 4,
+                    "p50": 7.0,
+                    "p95": 8.0,
+                    "p99": 8.5,
+                    "max": 9.0
+                }
+            },
+            "operator_host_wheel_input": true,
+            "app_owned_window_input": true,
+            "real_window_input": true,
+            "native_input_adapter": {
+                "installed": true,
+                "mouse_scroll_event_count": 2,
+                "scroll_delta_x": 240.0,
+                "scroll_delta_y": 360.0
+            },
+            "preview_surface_proof": {
+                "adapter_name": "hardware",
+                "adapter_device_type": "DiscreteGpu",
+                "adapter_is_software": false,
+                "present_mode": "Mailbox"
+            },
+            "preview_native_gpu_render_proof": {
+                "visible_surface_metrics": {
+                    "upload_bytes": 0,
+                    "draw_calls": 1,
+                    "queue_write_count": 0
+                }
+            }
+        });
+
+        add_native_scroll_model_evidence(&mut report, "generic", false);
+
+        assert_eq!(
+            report
+                .pointer("/product_path_ux_timing/status")
+                .and_then(serde_json::Value::as_str),
+            Some("not-requested-animation-burst-sample")
+        );
+        assert_eq!(
+            report
+                .get("product_path_ux_timing_proven")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .get("speed_budget_timing_window")
+                .and_then(serde_json::Value::as_str),
+            Some("post-real-window-input")
+        );
+    }
+
+    #[test]
     fn product_path_timing_rejects_continuous_probe_for_scroll_budget() {
         let mut report = json!({
             "preview_frame_ms_p95": 0.0,
@@ -86159,7 +86232,7 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             },
             "preview_perf_stats": {
                 "render_loop_mode": "demand_driven",
-                "frame_pacing": {"state": "idle"},
+                "frame_pacing": {"state": "requested_animation_burst"},
                 "input_to_present_ms_p50_p95_p99_max": {
                     "sample_count": 0,
                     "p50": null,

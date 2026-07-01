@@ -6792,17 +6792,25 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         role_dirty_reason = Some(
                             boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
                         );
-                    } else if before_input.secondary_visual_only(&after_input)
-                        && patch_dev_render_secondary_content(&shell, &mut render_state)
-                    {
-                        render_state.revision = render_state.revision.saturating_add(1);
-                        render_state.fast_frame_patch_count =
-                            render_state.fast_frame_patch_count.saturating_add(1);
-                        render_state.fast_render_scene_patch = None;
-                        layout_refreshed = true;
-                        role_dirty_reason = Some(
-                            boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
-                        );
+                    } else if before_input.secondary_visual_only(&after_input) {
+                        let touched_nodes =
+                            patch_dev_render_secondary_content_touched(&shell, &mut render_state);
+                        if !touched_nodes.is_empty() {
+                            mark_dev_render_fast_scene_patch(
+                                &mut render_state,
+                                "dev_secondary_content",
+                                touched_nodes,
+                            );
+                            layout_refreshed = true;
+                            role_dirty_reason = Some(
+                                boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                            );
+                        } else {
+                            needs_layout_refresh = true;
+                            role_dirty_reason = Some(
+                                boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                            );
+                        }
                     } else {
                         needs_layout_refresh = true;
                         role_dirty_reason = Some(
@@ -6811,31 +6819,39 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            if !input_hot_path && shell.collect_preview_replace_result() {
+            let telemetry_refresh_allowed = !input_hot_path && !context.forced_frame;
+            if telemetry_refresh_allowed && shell.collect_preview_replace_result() {
                 dirty = true;
                 needs_layout_refresh = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
             }
-            if !input_hot_path && shell.refresh_preview_summary_if_due(context.now) {
+            if telemetry_refresh_allowed && shell.refresh_preview_summary_if_due(context.now) {
                 dirty = true;
                 needs_layout_refresh = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
             }
-            if !input_hot_path && shell.refresh_preview_perf_snapshot_if_due(context.now) {
+            if telemetry_refresh_allowed && shell.refresh_preview_perf_snapshot_if_due(context.now)
+            {
                 dirty = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
                 if !needs_layout_refresh
                     && !cache_needs_dev_render_layout(&render_state, context.width, context.height)
-                    && patch_dev_render_footer_content(&shell, &mut render_state)
                 {
-                    render_state.revision = render_state.revision.saturating_add(1);
-                    render_state.fast_frame_patch_count =
-                        render_state.fast_frame_patch_count.saturating_add(1);
-                    render_state.fast_render_scene_patch = None;
-                    layout_refreshed = true;
+                    let touched_nodes =
+                        patch_dev_render_footer_content_touched(&shell, &mut render_state);
+                    if !touched_nodes.is_empty() {
+                        mark_dev_render_fast_scene_patch(
+                            &mut render_state,
+                            "dev_footer_content",
+                            touched_nodes,
+                        );
+                        layout_refreshed = true;
+                    } else {
+                        needs_layout_refresh = true;
+                    }
                 } else {
                     needs_layout_refresh = true;
                 }
@@ -6860,7 +6876,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let caret_wake = input_state
                 .editor_focused
                 .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS);
-            let telemetry_wake = (!input_hot_path).then(|| {
+            let telemetry_wake = telemetry_refresh_allowed.then(|| {
                 shell
                     .preview_summary_wake_after_ms(context.now)
                     .min(shell.preview_perf_wake_after_ms(context.now))
@@ -6901,7 +6917,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let shell = shell
                 .lock()
                 .map_err(|_| "dev shell mutex poisoned".to_owned())?;
-            let render_state = render_state
+            let mut render_state = render_state
                 .lock()
                 .map_err(|_| "dev render state mutex poisoned".to_owned())?;
             let layout_frame = render_state
@@ -6929,6 +6945,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_state.passive_scroll_fast_frame_patch_count,
                 render_state.fast_render_scene_patch.as_ref(),
             )?;
+            clear_consumed_dev_fast_render_scene_patch(&mut render_state, content_revision);
             let proof = render_output.proof;
             let layout_identity_fallback = format!("dev-content:{content_revision}");
             let layout_identity = preview_proof_identity_value(
@@ -13440,6 +13457,50 @@ struct DevRenderSceneCache {
     render_scene: boon_document::RenderScene,
 }
 
+fn mark_dev_render_fast_scene_patch(
+    render_state: &mut DevRenderState,
+    kind: &'static str,
+    mut touched_nodes: BTreeSet<boon_document::DocumentNodeId>,
+) {
+    if touched_nodes.is_empty() {
+        return;
+    }
+    let (base_revision, patch_kind) =
+        if let Some(existing) = render_state.fast_render_scene_patch.take() {
+            touched_nodes.extend(existing.touched_nodes);
+            let patch_kind = if existing.kind == kind {
+                kind
+            } else {
+                "dev_composite_patch"
+            };
+            (existing.base_revision, patch_kind)
+        } else {
+            (render_state.revision.max(1), kind)
+        };
+    let target_revision = render_state.revision.saturating_add(1);
+    render_state.revision = target_revision;
+    render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
+    render_state.fast_render_scene_patch = Some(DevFastRenderScenePatch {
+        kind: patch_kind,
+        base_revision,
+        target_revision,
+        touched_nodes,
+    });
+}
+
+fn clear_consumed_dev_fast_render_scene_patch(
+    render_state: &mut DevRenderState,
+    content_revision: u64,
+) {
+    if render_state
+        .fast_render_scene_patch
+        .as_ref()
+        .is_some_and(|patch| patch.target_revision <= content_revision)
+    {
+        render_state.fast_render_scene_patch = None;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DevEditorSnapshot {
     source_hash: String,
@@ -13594,17 +13655,17 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
         return;
     };
     let caret_visible = boon_document_model::StyleValue::Bool(shell.caret_visible);
+    let mut touched_nodes = BTreeSet::new();
     for item in &mut frame.display_list {
         if dev_editor_item_source_line(item) == Some(shell.workspace.selected_buffer.caret().line) {
             item.style
                 .insert("editor_caret_visible".to_owned(), caret_visible);
             item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+            touched_nodes.insert(item.node.clone());
             break;
         }
     }
-    render_state.revision = render_state.revision.saturating_add(1);
-    render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
-    render_state.fast_render_scene_patch = None;
+    mark_dev_render_fast_scene_patch(render_state, "dev_editor_caret", touched_nodes);
 }
 
 fn editor_line_number_from_node_id(node_id: &str, prefix: &str) -> Option<usize> {
@@ -13702,7 +13763,7 @@ fn patch_dev_render_editor_visual_state(
     };
     let model = &shell.workspace.selected_buffer;
     let bracket_columns_by_line = model.bracket_columns_by_line();
-    let mut patched = false;
+    let mut touched_nodes = BTreeSet::new();
     for item in &mut frame.display_list {
         if item.node.0.starts_with("dev-code-editor-line-text-")
             && let Some(line_number) = dev_editor_item_source_line(item)
@@ -13715,7 +13776,7 @@ fn patch_dev_render_editor_visual_state(
                 shell.caret_visible,
             );
             item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
-            patched = true;
+            touched_nodes.insert(item.node.clone());
         } else if (item.node.0.starts_with("dev-code-editor-line-")
             || item.node.0.starts_with("dev-code-editor-gutter-")
             || item.node.0.starts_with("dev-code-editor-code-row-"))
@@ -13728,27 +13789,29 @@ fn patch_dev_render_editor_visual_state(
                 ),
             );
             item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
-            patched = true;
+            touched_nodes.insert(item.node.clone());
         }
     }
-    patched |= patch_dev_render_secondary_content(shell, render_state);
-    if patched {
-        render_state.revision = render_state.revision.saturating_add(1);
-        render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
-        render_state.fast_render_scene_patch = None;
+    touched_nodes.extend(patch_dev_render_secondary_content_touched(
+        shell,
+        render_state,
+    ));
+    if !touched_nodes.is_empty() {
+        mark_dev_render_fast_scene_patch(render_state, "dev_editor_visual", touched_nodes);
         if render_state.code_editor_model_report.is_object() {
             render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
             render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
         }
+        true
+    } else {
+        false
     }
-    patched
 }
 
 fn patch_dev_render_editor_scroll(
     shell: &DevWindowShell,
     render_state: &mut DevRenderState,
 ) -> bool {
-    let base_revision = render_state.revision.max(1);
     let Some(frame) = render_state.layout_frame.as_mut() else {
         return false;
     };
@@ -13925,15 +13988,7 @@ fn patch_dev_render_editor_scroll(
         }
     }
 
-    let target_revision = render_state.revision.saturating_add(1);
-    render_state.revision = target_revision;
-    render_state.fast_frame_patch_count = render_state.fast_frame_patch_count.saturating_add(1);
-    render_state.fast_render_scene_patch = Some(DevFastRenderScenePatch {
-        kind: "dev_editor_scroll",
-        base_revision,
-        target_revision,
-        touched_nodes,
-    });
+    mark_dev_render_fast_scene_patch(render_state, "dev_editor_scroll", touched_nodes);
     if render_state.code_editor_model_report.is_object() {
         render_state.code_editor_model_report["scroll_line"] = json!(model.scroll_line);
         render_state.code_editor_model_report["scroll_column"] = json!(model.scroll_column);
@@ -13941,21 +13996,24 @@ fn patch_dev_render_editor_scroll(
     true
 }
 
-fn patch_dev_render_secondary_content(
+fn patch_dev_render_secondary_content_touched(
     shell: &DevWindowShell,
     render_state: &mut DevRenderState,
-) -> bool {
-    let footer = patch_dev_render_footer_content(shell, render_state);
-    let type_inspector = patch_dev_render_type_inspector_content(shell, render_state);
-    footer || type_inspector
+) -> BTreeSet<boon_document::DocumentNodeId> {
+    let mut touched_nodes = patch_dev_render_footer_content_touched(shell, render_state);
+    touched_nodes.extend(patch_dev_render_type_inspector_content_touched(
+        shell,
+        render_state,
+    ));
+    touched_nodes
 }
 
-fn patch_dev_render_footer_content(
+fn patch_dev_render_footer_content_touched(
     shell: &DevWindowShell,
     render_state: &mut DevRenderState,
-) -> bool {
+) -> BTreeSet<boon_document::DocumentNodeId> {
     let Some(frame) = render_state.layout_frame.as_mut() else {
-        return false;
+        return BTreeSet::new();
     };
     let footer_row_count = frame
         .display_list
@@ -13971,7 +14029,7 @@ fn patch_dev_render_footer_content(
         .map(|index| index + 1)
         .unwrap_or(0);
     if footer_row_count == 0 {
-        return false;
+        return BTreeSet::new();
     }
     let footer_lines = wrap_footer_lines(shell.footer_lines(), DEV_FOOTER_VALUE_WRAP_CHARS);
     let effective_scroll_line = shell
@@ -13982,7 +14040,7 @@ fn patch_dev_render_footer_content(
         .skip(effective_scroll_line)
         .take(footer_row_count)
         .collect::<Vec<_>>();
-    let mut patched = false;
+    let mut touched_nodes = BTreeSet::new();
     for visible_index in 0..footer_row_count {
         let (label, value) = visible_rows
             .get(visible_index)
@@ -13992,15 +14050,16 @@ fn patch_dev_render_footer_content(
         let label_id = format!("dev-footer-row-{visible_index}-label");
         let value_id = format!("dev-footer-row-{visible_index}-value");
         for item in &mut frame.display_list {
+            let mut item_patched = false;
             if item.node.0 == label_id && item.text.as_deref() != Some(label.as_str()) {
                 item.text = Some(label.clone());
-                patched = true;
+                item_patched = true;
             } else if item.node.0 == value_id && item.text.as_deref() != Some(value.as_str()) {
                 item.text = Some(value.clone());
-                patched = true;
+                item_patched = true;
             }
             if item.node.0 == label_id {
-                patched |= apply_footer_selection_style(
+                item_patched |= apply_footer_selection_style(
                     &mut item.style,
                     shell.footer_selection.as_ref(),
                     line_index,
@@ -14009,7 +14068,7 @@ fn patch_dev_render_footer_content(
                     FooterLinePart::Label,
                 );
             } else if item.node.0 == value_id {
-                patched |= apply_footer_selection_style(
+                item_patched |= apply_footer_selection_style(
                     &mut item.style,
                     shell.footer_selection.as_ref(),
                     line_index,
@@ -14018,17 +14077,21 @@ fn patch_dev_render_footer_content(
                     FooterLinePart::Value,
                 );
             }
+            if item_patched {
+                item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+                touched_nodes.insert(item.node.clone());
+            }
         }
     }
-    patched
+    touched_nodes
 }
 
-fn patch_dev_render_type_inspector_content(
+fn patch_dev_render_type_inspector_content_touched(
     shell: &DevWindowShell,
     render_state: &mut DevRenderState,
-) -> bool {
+) -> BTreeSet<boon_document::DocumentNodeId> {
     let Some(frame) = render_state.layout_frame.as_mut() else {
-        return false;
+        return BTreeSet::new();
     };
     let content = shell.type_inspector_content(DEV_TYPE_INSPECTOR_WRAP_CHARS);
     let detail_row_count = frame
@@ -14061,27 +14124,28 @@ fn patch_dev_render_type_inspector_content(
         );
     }
 
-    let mut patched = false;
+    let mut touched_nodes = BTreeSet::new();
     for item in &mut frame.display_list {
+        let mut item_patched = false;
         if let Some(text) = updates.get(&item.node.0) {
             if item.text.as_deref() != Some(text.as_str()) {
                 item.text = Some(text.clone());
-                patched = true;
+                item_patched = true;
             }
             if item.node.0.starts_with("dev-type-inspector-detail-row-") {
-                patched |= set_display_style_value(
+                item_patched |= set_display_style_value(
                     &mut item.style,
                     "rich_text",
                     boon_document_model::StyleValue::Bool(true),
                 );
-                patched |= set_display_style_value(
+                item_patched |= set_display_style_value(
                     &mut item.style,
                     "syntax_spans_json",
                     boon_document_model::StyleValue::RichTextSpans(type_inspector_syntax_spans(
                         text,
                     )),
                 );
-                patched |= set_display_style_value(
+                item_patched |= set_display_style_value(
                     &mut item.style,
                     "text_inset",
                     boon_document_model::StyleValue::Text(text_inset_for_scroll_column(
@@ -14089,7 +14153,7 @@ fn patch_dev_render_type_inspector_content(
                         BOON_EDITOR_FONT_SIZE,
                     )),
                 );
-                patched |= set_display_style_value(
+                item_patched |= set_display_style_value(
                     &mut item.style,
                     "editor_selection_color",
                     boon_document_model::StyleValue::Text(BOON_EDITOR_SELECTION.to_owned()),
@@ -14106,24 +14170,30 @@ fn patch_dev_render_type_inspector_content(
                     .as_ref()
                     .and_then(|selection| selection.columns_for_line(line_index, text))
                 {
-                    patched |= set_display_style_value(
+                    item_patched |= set_display_style_value(
                         &mut item.style,
                         "editor_selection_start",
                         boon_document_model::StyleValue::Number(start as f64),
                     );
-                    patched |= set_display_style_value(
+                    item_patched |= set_display_style_value(
                         &mut item.style,
                         "editor_selection_end",
                         boon_document_model::StyleValue::Number(end as f64),
                     );
                 } else {
-                    patched |= remove_display_style_key(&mut item.style, "editor_selection_start");
-                    patched |= remove_display_style_key(&mut item.style, "editor_selection_end");
+                    item_patched |=
+                        remove_display_style_key(&mut item.style, "editor_selection_start");
+                    item_patched |=
+                        remove_display_style_key(&mut item.style, "editor_selection_end");
                 }
             }
         }
+        if item_patched {
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+            touched_nodes.insert(item.node.clone());
+        }
     }
-    patched
+    touched_nodes
 }
 
 #[derive(Clone, Copy)]
@@ -73392,6 +73462,104 @@ label:
             .map(|run| run.text.clone())
             .expect("patched first editor text run should exist");
         assert_eq!(first_text_after, expected_first_text);
+    }
+
+    #[test]
+    fn dev_render_scroll_patch_survives_footer_update_as_composite_patch() {
+        let source = (1..=120)
+            .map(|line| format!("line_{line:04}: value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut shell, _, _, _) = test_dev_editor_context(&source);
+        let mut render_state = DevRenderState::default();
+        let mut text = boon_native_gpu::GlyphonTextMeasurer::new();
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+
+        refresh_dev_render_layout(&shell, &mut render_state, &mut text, 1180, 820);
+        let base_revision = render_state.revision;
+        let base_layout = render_state
+            .layout_frame
+            .as_ref()
+            .expect("base layout should exist")
+            .clone();
+        let mut base_scene = render_state
+            .derived_indexes
+            .as_ref()
+            .expect("derived indexes should exist")
+            .try_render_scene(&base_layout, 1180, 820, &mut columns)
+            .expect("base render scene should lower");
+
+        shell.workspace.selected_buffer.scroll_line = 12;
+        assert!(patch_dev_render_editor_scroll(&shell, &mut render_state));
+        let scroll_patch = render_state
+            .fast_render_scene_patch
+            .as_ref()
+            .expect("scroll should create a direct render-scene patch request")
+            .clone();
+        assert_eq!(scroll_patch.kind, "dev_editor_scroll");
+        assert_eq!(scroll_patch.base_revision, base_revision);
+
+        shell.footer_selection = Some(FooterSelection {
+            anchor: FooterPosition { line: 0, column: 0 },
+            head: FooterPosition { line: 0, column: 4 },
+        });
+        let footer_touched = patch_dev_render_footer_content_touched(&shell, &mut render_state);
+        assert!(
+            footer_touched
+                .iter()
+                .any(|node| node.0.starts_with("dev-footer-row-")),
+            "footer patch should report touched footer nodes"
+        );
+        mark_dev_render_fast_scene_patch(&mut render_state, "dev_footer_content", footer_touched);
+
+        let composite_patch = render_state
+            .fast_render_scene_patch
+            .as_ref()
+            .expect("footer update should merge with the pending scroll patch");
+        assert_eq!(composite_patch.kind, "dev_composite_patch");
+        assert_eq!(
+            composite_patch.base_revision, base_revision,
+            "merged patches must keep the original cached render-scene base"
+        );
+        assert!(composite_patch.target_revision > scroll_patch.target_revision);
+        assert!(
+            composite_patch
+                .touched_nodes
+                .contains(&boon_document_model::DocumentNodeId(
+                    "dev-code-editor-line-text-1".to_owned()
+                ))
+        );
+        assert!(
+            composite_patch
+                .touched_nodes
+                .iter()
+                .any(|node| node.0.starts_with("dev-footer-row-"))
+        );
+
+        let patched_layout = render_state
+            .layout_frame
+            .as_ref()
+            .expect("patched layout should exist");
+        let patch = dev_render_scene_patch_for_touched_nodes(
+            patched_layout,
+            1180,
+            820,
+            &mut columns,
+            &composite_patch.touched_nodes,
+        )
+        .expect("composite touched-node patch should lower to render-scene entries");
+        let report = base_scene
+            .apply_patch(&patch)
+            .expect("composite dev render-scene patch should apply");
+        assert!(report.patched_text_runs > 0);
+        assert!(report.patched_items >= composite_patch.touched_nodes.len());
+
+        let target_revision = composite_patch.target_revision;
+        clear_consumed_dev_fast_render_scene_patch(&mut render_state, target_revision);
+        assert!(
+            render_state.fast_render_scene_patch.is_none(),
+            "rendered fast patches must not be merged into later unrelated updates"
+        );
     }
 
     #[test]

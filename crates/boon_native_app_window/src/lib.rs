@@ -1426,7 +1426,16 @@ impl NativeRenderLoopState {
             .requested_animation_burst_quiet_until_elapsed_ms
             .is_some_and(|quiet_until| elapsed_ms < quiet_until);
         if self.requested_animation_burst_frames_remaining > 0 || in_quiet_window {
-            self.schedule_wake_after(now, native_target_frame_interval_duration());
+            let delay = self
+                .last_render_started_elapsed_ms
+                .map(|render_started_ms| {
+                    let next_frame_deadline_ms =
+                        render_started_ms + NATIVE_TARGET_FRAME_INTERVAL_MS;
+                    let remaining_ms = (next_frame_deadline_ms - elapsed_ms).max(0.0);
+                    Duration::from_secs_f64(remaining_ms / 1000.0)
+                })
+                .unwrap_or_else(native_target_frame_interval_duration);
+            self.schedule_wake_after(now, delay);
         }
     }
 
@@ -3662,17 +3671,17 @@ async fn run_surface_probe_inner(
             );
             render_loop_state
                 .apply_poll_result(&effective_poll_result, input.real_os_events_observed);
-            if effective_poll_result.wants_animation_frame {
-                render_loop_state.request_animation_burst(
-                    poll_started_at,
-                    hold_started.elapsed().as_secs_f64() * 1000.0,
-                    NativeSchedulerReason::RequestedAnimation,
-                );
-            } else if input.real_os_events_observed && effective_poll_result.dirty {
+            if input.real_os_events_observed && effective_poll_result.dirty {
                 render_loop_state.request_animation_burst(
                     poll_started_at,
                     hold_started.elapsed().as_secs_f64() * 1000.0,
                     NativeSchedulerReason::HostInput,
+                );
+            } else if effective_poll_result.wants_animation_frame {
+                render_loop_state.request_animation_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                    NativeSchedulerReason::RequestedAnimation,
                 );
             }
             if effective_poll_result.dirty {
@@ -4337,6 +4346,16 @@ async fn run_surface_probe_inner(
         } else {
             "off"
         };
+        let recent_presented_input_event_wake_elapsed_ms =
+            input_event_wake_elapsed_ms_for_generation(
+                &input_event_wake_timeline,
+                last_presented_input_event_wake_count,
+                hold_started,
+            );
+        let recent_input_wake_to_present_ms = elapsed_delta_ms(
+            recent_presented_input_event_wake_elapsed_ms,
+            render_loop_state.last_present_completed_elapsed_ms,
+        );
         push_recent_frame_evidence(
             &mut recent_frame_evidence,
             recent_frame_evidence_entry(
@@ -4345,11 +4364,8 @@ async fn run_surface_probe_inner(
                 hold_started.elapsed().as_secs_f64() * 1000.0,
                 last_sampled_input_event_wake_count,
                 last_presented_input_event_wake_count,
-                input_event_wake_elapsed_ms_for_generation(
-                    &input_event_wake_timeline,
-                    last_presented_input_event_wake_count,
-                    hold_started,
-                ),
+                recent_presented_input_event_wake_elapsed_ms,
+                recent_input_wake_to_present_ms,
                 stats_input_to_present_ms,
                 stats_proof_mode,
                 external_render_proof.as_ref(),
@@ -5209,10 +5225,15 @@ fn recent_frame_evidence_entry(
     sampled_input_event_wake_count: u64,
     presented_input_event_wake_count: u64,
     presented_input_event_wake_elapsed_ms: Option<f64>,
-    input_to_present_ms: Option<f64>,
+    input_wake_to_present_ms: Option<f64>,
+    input_accept_to_present_ms: Option<f64>,
     proof_mode: &str,
     external_render_proof: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let input_wake_to_input_accept_ms = elapsed_delta_ms(
+        presented_input_event_wake_elapsed_ms,
+        state.last_accepted_host_input_elapsed_ms,
+    );
     serde_json::json!({
         "status": "pass",
         "recorded_elapsed_ms": elapsed_ms,
@@ -5231,8 +5252,12 @@ fn recent_frame_evidence_entry(
         "presented_input_event_wake_elapsed_ms": presented_input_event_wake_elapsed_ms,
         "presented_revision": state.presented_revision,
         "rendered_frame_count": state.rendered_frame_count,
-        "input_wake_to_present_ms": input_to_present_ms,
-        "frame_input_to_present_ms": input_to_present_ms,
+        "input_wake_to_present_ms": input_wake_to_present_ms,
+        "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
+        "input_accept_to_present_ms": input_accept_to_present_ms,
+        "frame_input_to_present_ms": input_accept_to_present_ms,
+        "input_accept_timing_source": input_accept_to_present_ms.map(|_| "role_poll_hook_accepted_visible_host_input"),
+        "input_wake_timing_source": input_wake_to_present_ms.map(|_| "recent_presented_input_generation"),
         "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
         "last_dirty_poll_elapsed_ms": state.last_dirty_poll_elapsed_ms,
         "last_render_started_elapsed_ms": state.last_render_started_elapsed_ms,
@@ -7860,6 +7885,55 @@ mod tests {
         assert_eq!(
             native_frame_pacing_snapshot(&state).state,
             NativeFramePacingState::Idle
+        );
+    }
+
+    #[test]
+    fn requested_animation_followup_uses_frame_start_deadline_after_blocking_present() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+        assert!(state.consume_due_wake_after_poll(now));
+        state.note_render_started(10.0);
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(25.0);
+
+        let present_return = now + Duration::from_millis(25);
+        state.schedule_requested_animation_followup(present_return, 25.0);
+        let next_wake = state
+            .next_wake_at
+            .expect("burst follow-up should schedule a wake");
+
+        assert!(
+            next_wake <= present_return + Duration::from_millis(2),
+            "follow-up should target the next frame deadline from render start, not present return plus a full interval"
+        );
+    }
+
+    #[test]
+    fn host_input_burst_shortens_existing_requested_animation_delay() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::RequestedAnimation);
+        let animation_wake = state
+            .next_wake_at
+            .expect("requested animation should schedule a delayed wake");
+        assert!(animation_wake > now);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+
+        assert_eq!(
+            state.next_wake_at,
+            Some(now),
+            "real host input must be able to pull an animation burst to an immediate wake"
+        );
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
         );
     }
 

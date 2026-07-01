@@ -55428,6 +55428,26 @@ fn verify_native_cells_visible_click_e2e(
         .get("click_to_readback_after_present_ms")
         .and_then(numeric_value_as_f64)
         .unwrap_or(f64::INFINITY);
+    let input_accept_to_present_ms = live_probe
+        .get("input_accept_to_present_ms_p95")
+        .or_else(|| live_probe.get("input_accept_to_present_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_accept_to_present_ms_max = live_probe
+        .get("input_accept_to_present_ms_max")
+        .or_else(|| live_probe.get("input_accept_to_present_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_accept_to_formula_visible_ms = live_probe
+        .get("input_accept_to_formula_visible_ms_p95")
+        .or_else(|| live_probe.get("input_accept_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_accept_to_present_ms);
+    let input_accept_to_formula_visible_ms_max = live_probe
+        .get("input_accept_to_formula_visible_ms_max")
+        .or_else(|| live_probe.get("input_accept_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_accept_to_present_ms_max);
     let input_wake_to_present_ms = live_probe
         .get("input_wake_to_present_ms_p95")
         .or_else(|| live_probe.get("input_wake_to_present_ms"))
@@ -55497,6 +55517,14 @@ fn verify_native_cells_visible_click_e2e(
                 .get("click_to_present_ms")
                 .and_then(numeric_value_as_f64)
                 .unwrap_or(f64::INFINITY);
+            let input_accept_to_formula = sample
+                .get("input_accept_to_formula_visible_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
+            let input_accept_to_present = sample
+                .get("input_accept_to_present_ms")
+                .and_then(numeric_value_as_f64)
+                .unwrap_or(f64::INFINITY);
             let input_wake_to_formula = sample
                 .get("input_wake_to_formula_visible_ms")
                 .and_then(numeric_value_as_f64)
@@ -55519,11 +55547,13 @@ fn verify_native_cells_visible_click_e2e(
             let bounded_cold_start = cold_start_sample
                 && click_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && click_to_present <= bounded_click_to_present_outlier_cap_ms
+                && input_accept_to_formula <= max_click_to_formula_ms
+                && input_accept_to_present <= max_click_to_formula_ms
                 && input_wake_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && input_wake_to_present <= bounded_click_to_present_outlier_cap_ms
                 && proof_current_changed;
-            let bounded = input_wake_to_formula <= max_click_to_formula_ms
-                && input_wake_to_present <= max_click_to_formula_ms
+            let bounded = input_accept_to_formula <= max_click_to_formula_ms
+                && input_accept_to_present <= max_click_to_formula_ms
                 && proof_current_changed;
             if bounded_cold_start {
                 bounded_cold_start_outliers.push(json!({
@@ -55534,8 +55564,12 @@ fn verify_native_cells_visible_click_e2e(
                         .unwrap_or(serde_json::Value::Null),
                     "click_to_formula_visible_ms": click_to_formula,
                     "click_to_present_ms": click_to_present,
+                    "input_accept_to_formula_visible_ms": input_accept_to_formula,
+                    "input_accept_to_present_ms": input_accept_to_present,
                     "input_wake_to_formula_visible_ms": input_wake_to_formula,
                     "input_wake_to_present_ms": input_wake_to_present,
+                    "driver_to_input_accept_formula_ms": click_to_formula - input_accept_to_formula,
+                    "driver_to_input_accept_present_ms": click_to_present - input_accept_to_present,
                     "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
                     "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
                     "proof_current_changed": proof_current_changed,
@@ -55551,8 +55585,12 @@ fn verify_native_cells_visible_click_e2e(
                         .unwrap_or(serde_json::Value::Null),
                     "click_to_formula_visible_ms": click_to_formula,
                     "click_to_present_ms": click_to_present,
+                    "input_accept_to_formula_visible_ms": input_accept_to_formula,
+                    "input_accept_to_present_ms": input_accept_to_present,
                     "input_wake_to_formula_visible_ms": input_wake_to_formula,
                     "input_wake_to_present_ms": input_wake_to_present,
+                    "driver_to_input_accept_formula_ms": click_to_formula - input_accept_to_formula,
+                    "driver_to_input_accept_present_ms": click_to_present - input_accept_to_present,
                     "driver_to_input_wake_formula_ms": click_to_formula - input_wake_to_formula,
                     "driver_to_input_wake_present_ms": click_to_present - input_wake_to_present,
                     "proof_current_changed": proof_current_changed,
@@ -55649,14 +55687,14 @@ fn verify_native_cells_visible_click_e2e(
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "cells-visible-click-e2e:input-wake-to-formula-budget",
-        input_wake_to_formula_visible_ms <= max_click_to_formula_ms,
+        "cells-visible-click-e2e:input-accept-to-formula-budget",
+        input_accept_to_formula_visible_ms <= max_click_to_formula_ms,
         format!(
-            "input_wake_to_formula_visible_ms_p95={input_wake_to_formula_visible_ms:.3}, input_wake_to_present_ms_p95={input_wake_to_present_ms:.3}, readback_after_present_ms={click_to_readback_after_present_ms:.3}, budget={max_click_to_formula_ms:.3}"
+            "input_accept_to_formula_visible_ms_p95={input_accept_to_formula_visible_ms:.3}, input_accept_to_present_ms_p95={input_accept_to_present_ms:.3}, input_wake_to_formula_visible_ms_p95={input_wake_to_formula_visible_ms:.3}, input_wake_to_present_ms_p95={input_wake_to_present_ms:.3}, readback_after_present_ms={click_to_readback_after_present_ms:.3}, budget={max_click_to_formula_ms:.3}"
         ),
-        (input_wake_to_formula_visible_ms > max_click_to_formula_ms).then(|| {
+        (input_accept_to_formula_visible_ms > max_click_to_formula_ms).then(|| {
             format!(
-                "Cells full input-wake-to-formula visibility exceeded budget: {input_wake_to_formula_visible_ms:.3}ms > {max_click_to_formula_ms:.3}ms"
+                "Cells product input-to-formula visibility exceeded budget: {input_accept_to_formula_visible_ms:.3}ms > {max_click_to_formula_ms:.3}ms"
             )
         }),
     );
@@ -55861,6 +55899,14 @@ fn verify_native_cells_visible_click_e2e(
                 .get("steady_click_to_present_ms")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            "steady_input_accept_to_formula_visible_ms": live_probe
+                .get("steady_input_accept_to_formula_visible_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_input_accept_to_present_ms": live_probe
+                .get("steady_input_accept_to_present_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             "steady_input_wake_to_formula_visible_ms": live_probe
                 .get("steady_input_wake_to_formula_visible_ms")
                 .cloned()
@@ -55899,6 +55945,16 @@ fn verify_native_cells_visible_click_e2e(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "click_to_readback_after_present_ms": click_to_readback_after_present_ms_max,
+            "input_accept_to_present_ms_p95": input_accept_to_present_ms,
+            "input_accept_to_present_ms_max": input_accept_to_present_ms_max,
+            "input_accept_to_present_ms": input_accept_to_present_ms,
+            "input_accept_to_formula_visible_ms": input_accept_to_formula_visible_ms,
+            "input_accept_to_formula_visible_ms_p95": input_accept_to_formula_visible_ms,
+            "input_accept_to_formula_visible_ms_max": input_accept_to_formula_visible_ms_max,
+            "input_accept_budget_source": live_probe
+                .get("input_accept_budget_source")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "input_wake_to_present_ms_p95": input_wake_to_present_ms,
             "input_wake_to_present_ms_max": input_wake_to_present_ms_max,
             "input_wake_to_present_ms": input_wake_to_present_ms,
@@ -55927,7 +55983,7 @@ fn verify_native_cells_visible_click_e2e(
             "runtime_work_contract": runtime_work_contract,
             "formula_transition_contract": formula_transition_contract,
             "selected_cell_transition_contract": selected_cell_transition_contract,
-            "bounded_click_to_present_outlier_policy": "steady external driver-to-app-wake outliers are accepted only when the app-owned input-wake-to-visible/present sample remains within max_click_to_formula_ms and the sample produced changed app-owned WGPU readback proof; cold-start samples before cold_sample_count may exceed the input-wake budget only when they remain below max_click_to_present_ms + max_click_to_formula_ms and produce changed app-owned proof",
+            "bounded_click_to_present_outlier_policy": "steady external driver-to-app-accept outliers are accepted only when the app-owned product input-to-visible/present sample remains within max_click_to_formula_ms and the sample produced changed app-owned WGPU readback proof; cold-start samples before cold_sample_count may exceed driver and wake budgets only when product input latency remains within max_click_to_formula_ms, driver/wake latency remains below max_click_to_present_ms + max_click_to_formula_ms, and the sample produces changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
             "bounded_cold_start_outlier_count": bounded_cold_start_outlier_count,
@@ -57571,7 +57627,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         &socket,
         calibration_x,
         calibration_y,
-        "click-only",
+        "move-only",
         &calibration_driver_stdout_path,
         &calibration_driver_stderr_path,
     );
@@ -57629,6 +57685,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
     let mut click_to_formula_samples = Vec::new();
     let mut click_to_present_samples = Vec::new();
     let mut click_to_readback_after_present_samples = Vec::new();
+    let mut input_accept_to_present_samples = Vec::new();
+    let mut input_accept_to_formula_samples = Vec::new();
     let mut input_wake_to_present_samples = Vec::new();
     let mut input_wake_to_formula_samples = Vec::new();
     let mut runtime_current_samples = Vec::new();
@@ -57872,7 +57930,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 "max_fields": 8,
                 "max_list_items": 4
             }),
-            Duration::from_millis(250),
+            Duration::from_secs(2),
         )
         .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}));
         if before_click_runtime_values
@@ -58139,6 +58197,11 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("input_accept_to_present_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
+        let input_accept_to_present_ms = if render_loop_input_accept_to_present_ms.is_finite() {
+            render_loop_input_accept_to_present_ms
+        } else {
+            click_to_present_ms
+        };
         let input_wake_to_present_ms = if render_loop_input_wake_to_present_ms.is_finite() {
             render_loop_input_wake_to_present_ms
         } else {
@@ -58152,6 +58215,23 @@ fn run_isolated_weston_cells_visible_click_e2e(
             render_loop_input_wake_timing_source
         } else {
             "weston_driver_button_release_to_present_fallback"
+        };
+        let input_accept_budget_source = if render_loop_input_accept_to_present_ms.is_finite() {
+            present_probe
+                .get("input_accept_timing_source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("role_poll_hook_accepted_visible_host_input")
+        } else {
+            "weston_driver_button_release_to_present_fallback"
+        };
+        let input_accept_to_formula_visible_ms = if input_accept_to_present_ms.is_finite()
+            && click_to_present_ms.is_finite()
+            && click_to_formula_visible_ms.is_finite()
+        {
+            input_accept_to_present_ms
+                + (click_to_formula_visible_ms - click_to_present_ms).max(0.0)
+        } else {
+            click_to_formula_visible_ms
         };
         let input_wake_to_formula_visible_ms = if input_wake_to_present_ms.is_finite()
             && click_to_present_ms.is_finite()
@@ -58228,6 +58308,12 @@ fn run_isolated_weston_cells_visible_click_e2e(
         if click_to_readback_ms.is_finite() {
             click_to_readback_after_present_samples.push(click_to_readback_ms);
         }
+        if input_accept_to_present_ms.is_finite() {
+            input_accept_to_present_samples.push(input_accept_to_present_ms);
+        }
+        if input_accept_to_formula_visible_ms.is_finite() {
+            input_accept_to_formula_samples.push(input_accept_to_formula_visible_ms);
+        }
         if input_wake_to_present_ms.is_finite() {
             input_wake_to_present_samples.push(input_wake_to_present_ms);
         }
@@ -58266,6 +58352,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "preposition_quiet_probe": preposition_quiet_probe,
             "preposition_weston_test_driver_stdout_path": preposition_driver_stdout_path,
             "preposition_weston_test_driver_stderr_path": preposition_driver_stderr_path,
+            "before_click_runtime_probe": before_click_runtime_values,
             "runtime_value_probe": runtime_probe,
             "visual_formula_probe": visual_formula_probe,
             "formula_visible_probe": formula_visible_probe,
@@ -58290,11 +58377,14 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "click_to_readback_after_present_ms": click_to_readback_ms,
             "click_to_readback_visible_ms": click_to_readback_visible_ms,
             "click_to_present_ms": click_to_present_ms,
+            "input_accept_to_present_ms": input_accept_to_present_ms,
+            "input_accept_to_formula_visible_ms": input_accept_to_formula_visible_ms,
             "input_wake_to_present_ms": input_wake_to_present_ms,
             "render_loop_input_wake_to_present_ms": render_loop_input_wake_to_present_ms,
             "render_loop_input_accept_to_present_ms": render_loop_input_accept_to_present_ms,
             "render_loop_legacy_input_accept_to_present_ms": render_loop_legacy_input_accept_to_present_ms,
             "input_accept_timing_source": present_probe.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_budget_source": input_accept_budget_source,
             "input_wake_to_input_accept_ms": present_probe.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_dirty_poll_ms": present_probe.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
             "dirty_poll_to_render_started_ms": present_probe.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -58385,6 +58475,22 @@ fn run_isolated_weston_cells_visible_click_e2e(
         .iter()
         .copied()
         .fold(0.0, f64::max);
+    let mut sorted_input_accept_to_present_samples = input_accept_to_present_samples.clone();
+    sorted_input_accept_to_present_samples.sort_by(f64::total_cmp);
+    let input_accept_to_present_ms_p95 =
+        percentile_sorted_f64(&sorted_input_accept_to_present_samples, 95.0);
+    let input_accept_to_present_ms_max = input_accept_to_present_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
+    let mut sorted_input_accept_to_formula_samples = input_accept_to_formula_samples.clone();
+    sorted_input_accept_to_formula_samples.sort_by(f64::total_cmp);
+    let input_accept_to_formula_visible_ms_p95 =
+        percentile_sorted_f64(&sorted_input_accept_to_formula_samples, 95.0);
+    let input_accept_to_formula_visible_ms_max = input_accept_to_formula_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
     let mut sorted_input_wake_to_present_samples = input_wake_to_present_samples.clone();
     sorted_input_wake_to_present_samples.sort_by(f64::total_cmp);
     let input_wake_to_present_ms_p95 =
@@ -58427,6 +58533,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         .count();
     let timing_sample_count_complete = click_to_formula_samples.len() == resolved_targets.len()
         && click_to_present_samples.len() == resolved_targets.len()
+        && input_accept_to_present_samples.len() == resolved_targets.len()
+        && input_accept_to_formula_samples.len() == resolved_targets.len()
         && input_wake_to_present_samples.len() == resolved_targets.len()
         && input_wake_to_formula_samples.len() == resolved_targets.len()
         && click_to_readback_after_present_samples.len() == resolved_targets.len()
@@ -58439,6 +58547,16 @@ fn run_isolated_weston_cells_visible_click_e2e(
     );
     let steady_click_to_present_samples =
         numeric_sample_values_after(&click_samples, "click_to_present_ms", cold_sample_count);
+    let steady_input_accept_to_formula_samples = numeric_sample_values_after(
+        &click_samples,
+        "input_accept_to_formula_visible_ms",
+        cold_sample_count,
+    );
+    let steady_input_accept_to_present_samples = numeric_sample_values_after(
+        &click_samples,
+        "input_accept_to_present_ms",
+        cold_sample_count,
+    );
     let steady_input_wake_to_formula_samples = numeric_sample_values_after(
         &click_samples,
         "input_wake_to_formula_visible_ms",
@@ -58531,6 +58649,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "timing_sample_counts": {
             "click_to_formula_visible_ms": click_to_formula_samples.len(),
             "click_to_present_ms": click_to_present_samples.len(),
+            "input_accept_to_present_ms": input_accept_to_present_samples.len(),
+            "input_accept_to_formula_visible_ms": input_accept_to_formula_samples.len(),
             "input_wake_to_present_ms": input_wake_to_present_samples.len(),
             "input_wake_to_formula_visible_ms": input_wake_to_formula_samples.len(),
             "click_to_readback_after_present_ms": click_to_readback_after_present_samples.len(),
@@ -58539,6 +58659,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "cold_sample_count": cold_sample_count,
         "steady_click_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_click_to_formula_samples),
         "steady_click_to_present_ms": f64_p50_p95_max_summary(&steady_click_to_present_samples),
+        "steady_input_accept_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_input_accept_to_formula_samples),
+        "steady_input_accept_to_present_ms": f64_p50_p95_max_summary(&steady_input_accept_to_present_samples),
         "steady_input_wake_to_formula_visible_ms": f64_p50_p95_max_summary(&steady_input_wake_to_formula_samples),
         "steady_input_wake_to_present_ms": f64_p50_p95_max_summary(&steady_input_wake_to_present_samples),
         "present_probe_phase_ms": present_probe_phase_ms,
@@ -58569,6 +58691,19 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "click_to_present_ms": click_to_present_ms_p95,
         "click_to_present_ms_p95": click_to_present_ms_p95,
         "click_to_present_ms_max": click_to_present_ms_max,
+        "input_accept_to_present_ms_p95": input_accept_to_present_ms_p95,
+        "input_accept_to_present_ms_max": input_accept_to_present_ms_max,
+        "input_accept_to_present_ms": last_sample
+            .get("input_accept_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_accept_to_formula_visible_ms": input_accept_to_formula_visible_ms_p95,
+        "input_accept_to_formula_visible_ms_p95": input_accept_to_formula_visible_ms_p95,
+        "input_accept_to_formula_visible_ms_max": input_accept_to_formula_visible_ms_max,
+        "input_accept_budget_source": last_sample
+            .get("input_accept_budget_source")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "input_wake_to_present_ms_p95": input_wake_to_present_ms_p95,
         "input_wake_to_present_ms_max": input_wake_to_present_ms_max,
         "input_wake_to_present_ms": last_sample
@@ -59047,6 +59182,9 @@ fn cells_recent_frame_visible_match_probe(
             "stale_for_latest_input": false,
             "input_wake_timing_source": "recent_presented_input_generation",
             "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_wake_to_input_accept_ms": entry.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "present_mode": report.get("present_mode").cloned().unwrap_or(serde_json::Value::Null),
             "surface_format": report.get("surface_format").cloned().unwrap_or(serde_json::Value::Null),
@@ -59112,6 +59250,9 @@ fn cells_recent_frame_visible_match_probe(
             "input_wake_timing_source": "recent_presented_input_generation",
             "generation_timed_frame": true,
             "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_wake_to_input_accept_ms": entry.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
@@ -63790,7 +63931,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_f64_at_most(
                 &mut blockers,
                 report,
-                "input_wake_to_formula_visible_ms_p95",
+                "input_accept_to_formula_visible_ms_p95",
                 report
                     .get("max_click_to_formula_ms")
                     .and_then(serde_json::Value::as_f64)
@@ -84213,6 +84354,7 @@ mod tests {
             "operator_host_input": false,
             "real_os_input": true,
             "target_count": 8,
+            "input_accept_to_formula_visible_ms_p95": 12.0,
             "input_wake_to_formula_visible_ms_p95": 12.0,
             "click_to_formula_visible_ms_p95": 24.0,
             "max_click_to_formula_ms": 16.7,

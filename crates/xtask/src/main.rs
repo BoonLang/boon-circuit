@@ -37100,6 +37100,22 @@ fn send_xtask_preview_ipc_request(
     Ok(value)
 }
 
+fn request_xtask_preview_verifier_frame(
+    connect: &str,
+    reason: &str,
+    product_frame_evidence_key: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut request = json!({
+        "kind": "request-verifier-frame",
+        "reason": reason
+    });
+    if let Some(frame_key) = product_frame_evidence_key {
+        request["product_frame_evidence_key"] = frame_key;
+    }
+    send_xtask_preview_ipc_request(connect, request, Duration::from_millis(100))
+        .unwrap_or_else(|error| json!({"status": "ipc-error", "diagnostic": error.to_string()}))
+}
+
 const XTASK_SOURCE_PROJECT_BINARY_TRANSPORT: &str = "unix-stream-binary-source";
 const XTASK_SOURCE_PROJECT_BINARY_FRAME_VERSION: u64 = 1;
 
@@ -49898,6 +49914,19 @@ fn f64_p50_p95_max_summary(values: &[f64]) -> serde_json::Value {
     })
 }
 
+fn report_field_or_render_state(report: &serde_json::Value, field: &str) -> serde_json::Value {
+    report
+        .get(field)
+        .cloned()
+        .or_else(|| {
+            report
+                .get("render_loop_state")
+                .and_then(|state| state.get(field))
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn numeric_sample_values_after(
     samples: &[serde_json::Value],
     field: &str,
@@ -49917,6 +49946,73 @@ fn numeric_sample_pointer_values(samples: &[serde_json::Value], pointer: &str) -
         .filter_map(|sample| sample.pointer(pointer).and_then(numeric_value_as_f64))
         .filter(|value| value.is_finite())
         .collect()
+}
+
+fn numeric_sample_over_budget_count(
+    samples: &[serde_json::Value],
+    field: &str,
+    budget_ms: f64,
+) -> usize {
+    samples
+        .iter()
+        .filter_map(|sample| sample.get(field).and_then(numeric_value_as_f64))
+        .filter(|value| value.is_finite() && *value > budget_ms)
+        .count()
+}
+
+fn bool_sample_field_count(samples: &[serde_json::Value], field: &str, expected: bool) -> usize {
+    samples
+        .iter()
+        .filter(|sample| sample.get(field).and_then(serde_json::Value::as_bool) == Some(expected))
+        .count()
+}
+
+fn sample_with_max_numeric_field(samples: &[serde_json::Value], field: &str) -> serde_json::Value {
+    samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .get(field)
+                .and_then(numeric_value_as_f64)
+                .filter(|value| value.is_finite())
+                .map(|value| (value, sample))
+        })
+        .max_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map(|(_, sample)| sample)
+        .map(cells_visible_click_latency_sample_summary)
+        .unwrap_or_else(|| json!({"status": "missing", "field": field}))
+}
+
+fn cells_visible_click_latency_sample_summary(sample: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "index": sample.get("index").cloned().unwrap_or(serde_json::Value::Null),
+        "target_address": sample.get("target_address").cloned().unwrap_or(serde_json::Value::Null),
+        "click_to_formula_visible_ms": sample.get("click_to_formula_visible_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "input_accept_to_formula_visible_ms": sample.get("input_accept_to_formula_visible_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "input_wake_to_formula_visible_ms": sample.get("input_wake_to_formula_visible_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "input_wake_to_input_accept_ms": sample.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "click_to_readback_after_present_ms": sample.get("click_to_readback_after_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "click_to_present_ms": sample.get("click_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "present_call_ms": sample.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "queue_to_present_ms": sample.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "render_hook_to_queue_ms": sample.get("render_hook_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "render_hook_completed_to_present_ms": sample.get("render_hook_completed_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "formula_visible_timing_source": sample.get("formula_visible_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+        "product_formula_visibility_timing_source": sample.get("product_formula_visibility_timing_source").cloned().unwrap_or(serde_json::Value::Null),
+        "visual_proof_proves_presented_frame": sample.get("visual_proof_proves_presented_frame").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_evidence_matches_presented_frame": sample.get("proof_evidence_matches_presented_frame").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_lag_frames": sample.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+        "last_interactive_surface_readback_pending": sample.pointer("/present_probe/last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
+        "last_interactive_surface_readback_skipped_for_backpressure": sample.pointer("/present_probe/last_interactive_surface_readback_skipped_for_backpressure").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_readback_deferred_count": sample.pointer("/present_probe/proof_readback_deferred_count").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_readback_deferred_for_product_input_count": sample.pointer("/present_probe/proof_readback_deferred_for_product_input_count").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_readback_deferred_for_interaction_burst_count": sample.pointer("/present_probe/proof_readback_deferred_for_interaction_burst_count").cloned().unwrap_or(serde_json::Value::Null),
+        "proof_readback_queued_during_interaction_quiet_count": sample.pointer("/present_probe/proof_readback_queued_during_interaction_quiet_count").cloned().unwrap_or(serde_json::Value::Null),
+        "last_proof_readback_deferred_reason": sample.pointer("/present_probe/last_proof_readback_deferred_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "post_present_proof_queue_enqueued_count": sample.pointer("/present_probe/post_present_proof_queue_enqueued_count").cloned().unwrap_or(serde_json::Value::Null),
+        "post_present_proof_queue_completed_count": sample.pointer("/present_probe/post_present_proof_queue_completed_count").cloned().unwrap_or(serde_json::Value::Null),
+        "recent_post_present_proof_queue_count": sample.pointer("/present_probe/recent_post_present_proof_queue_count").cloned().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn numeric_object_field_or(report: &serde_json::Value, fields: &[&str]) -> Option<f64> {
@@ -60780,7 +60876,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
                     && (observed_global_y - target_y as f64).abs() <= 1.5
             })
             .unwrap_or(false);
-        let measured_click_mode = "click-only";
+        let measured_click_mode = "button-only";
         let measured_click_includes_pointer_move = measured_click_mode == "click-only";
         let (
             preposition_driver_probe,
@@ -61885,6 +61981,177 @@ fn run_isolated_weston_cells_visible_click_e2e(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("missing")
         .to_owned();
+    let proof_readback_deferred_count =
+        report_field_or_render_state(&loop_after, "proof_readback_deferred_count");
+    let proof_readback_deferred_for_product_input_count = report_field_or_render_state(
+        &loop_after,
+        "proof_readback_deferred_for_product_input_count",
+    );
+    let proof_readback_deferred_for_interaction_burst_count = report_field_or_render_state(
+        &loop_after,
+        "proof_readback_deferred_for_interaction_burst_count",
+    );
+    let proof_readback_queued_during_interaction_quiet_count = report_field_or_render_state(
+        &loop_after,
+        "proof_readback_queued_during_interaction_quiet_count",
+    );
+    let last_proof_readback_deferred_reason =
+        report_field_or_render_state(&loop_after, "last_proof_readback_deferred_reason");
+    let post_present_proof_queue_enqueued_count =
+        report_field_or_render_state(&loop_after, "post_present_proof_queue_enqueued_count");
+    let post_present_proof_queue_completed_count =
+        report_field_or_render_state(&loop_after, "post_present_proof_queue_completed_count");
+    let post_present_proof_queue_deferred_count =
+        report_field_or_render_state(&loop_after, "post_present_proof_queue_deferred_count");
+    let recent_post_present_proof_queue_count =
+        report_field_or_render_state(&loop_after, "recent_post_present_proof_queue_count");
+    let product_budget_ms = 16.7_f64;
+    let product_max_budget_ms = 33.4_f64;
+    let present_stall_budget_ms = 16.7_f64;
+    let scheduling_delay_budget_ms = 16.7_f64;
+    let render_queue_gap_budget_ms = 8.0_f64;
+    let proof_readback_budget_ms = 16.7_f64;
+    let exact_same_frame_visual_proof_count =
+        bool_sample_field_count(&click_samples, "visual_proof_proves_presented_frame", true);
+    let proof_key_mismatch_count = bool_sample_field_count(
+        &click_samples,
+        "proof_evidence_matches_presented_frame",
+        false,
+    );
+    let product_accept_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "input_accept_to_formula_visible_ms",
+        product_budget_ms,
+    );
+    let product_accept_hard_outlier_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "input_accept_to_formula_visible_ms",
+        product_max_budget_ms,
+    );
+    let wake_to_accept_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "input_wake_to_input_accept_ms",
+        scheduling_delay_budget_ms,
+    );
+    let present_call_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "present_call_ms",
+        present_stall_budget_ms,
+    );
+    let queue_to_present_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "queue_to_present_ms",
+        present_stall_budget_ms,
+    );
+    let render_hook_to_queue_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "render_hook_to_queue_ms",
+        render_queue_gap_budget_ms,
+    );
+    let proof_readback_over_budget_count = numeric_sample_over_budget_count(
+        &click_samples,
+        "click_to_readback_after_present_ms",
+        proof_readback_budget_ms,
+    );
+    let proof_readback_summary = f64_p50_p95_max_summary(&click_to_readback_after_present_samples);
+    let product_diagnosis = if product_accept_hard_outlier_count > 0 {
+        "accepted_input_product_hard_outliers"
+    } else if product_accept_over_budget_count > 0 {
+        "accepted_input_product_tail_over_16_7ms"
+    } else {
+        "accepted_input_product_within_60fps_budget"
+    };
+    let wake_diagnosis = if wake_to_accept_over_budget_count > 0 {
+        "raw_input_wake_is_delayed_before_acceptance"
+    } else {
+        "raw_input_wake_to_acceptance_within_budget"
+    };
+    let present_diagnosis =
+        if present_call_over_budget_count > 0 || queue_to_present_over_budget_count > 0 {
+            "surface_queue_or_present_stalls"
+        } else if render_hook_to_queue_over_budget_count > 0 {
+            "post_render_hook_to_queue_gap"
+        } else {
+            "submit_present_tail_within_budget"
+        };
+    let proof_diagnosis = if proof_readback_over_budget_count > 0
+        && exact_same_frame_visual_proof_count < click_samples.len()
+    {
+        "readback_proof_lag_is_being_reported_separately_from_product_ux"
+    } else if proof_readback_over_budget_count > 0 {
+        "readback_proof_over_budget"
+    } else {
+        "readback_proof_within_budget"
+    };
+    let latency_diagnosis = json!({
+        "summary": {
+            "product_accepted_input": product_diagnosis,
+            "raw_wake_to_accept": wake_diagnosis,
+            "queue_present": present_diagnosis,
+            "harness_proof": proof_diagnosis
+        },
+        "interpretation": [
+            "input_accept_to_formula_visible_ms is the product UX timing for accepted visible host input",
+            "input_wake_to_formula_visible_ms includes wake/sampling delay before the app accepted the click",
+            "click_to_formula_visible_ms is a harness/proof timing when exact same-frame visual proof is missing",
+            "click_to_readback_after_present_ms is proof/readback overhead and must not be counted as normal UX latency"
+        ],
+        "budgets_ms": {
+            "product_p95": product_budget_ms,
+            "product_max": product_max_budget_ms,
+            "raw_wake_to_accept": scheduling_delay_budget_ms,
+            "present_stall": present_stall_budget_ms,
+            "render_hook_to_queue_gap": render_queue_gap_budget_ms,
+            "proof_readback": proof_readback_budget_ms
+        },
+        "sample_count": click_samples.len(),
+        "counts": {
+            "product_accept_over_16_7ms": product_accept_over_budget_count,
+            "product_accept_over_33_4ms": product_accept_hard_outlier_count,
+            "wake_to_accept_over_16_7ms": wake_to_accept_over_budget_count,
+            "present_call_over_16_7ms": present_call_over_budget_count,
+            "queue_to_present_over_16_7ms": queue_to_present_over_budget_count,
+            "render_hook_to_queue_over_8ms": render_hook_to_queue_over_budget_count,
+            "proof_readback_over_16_7ms": proof_readback_over_budget_count,
+            "exact_same_frame_visual_proof": exact_same_frame_visual_proof_count,
+            "proof_key_mismatch": proof_key_mismatch_count
+        },
+        "proof_lane_backpressure": {
+            "proof_readback_deferred_count": proof_readback_deferred_count.clone(),
+            "proof_readback_deferred_for_product_input_count": proof_readback_deferred_for_product_input_count.clone(),
+            "proof_readback_deferred_for_interaction_burst_count": proof_readback_deferred_for_interaction_burst_count.clone(),
+            "proof_readback_queued_during_interaction_quiet_count": proof_readback_queued_during_interaction_quiet_count.clone(),
+            "last_proof_readback_deferred_reason": last_proof_readback_deferred_reason.clone(),
+            "post_present_proof_queue_enqueued_count": post_present_proof_queue_enqueued_count.clone(),
+            "post_present_proof_queue_completed_count": post_present_proof_queue_completed_count.clone(),
+            "post_present_proof_queue_deferred_count": post_present_proof_queue_deferred_count.clone(),
+            "recent_post_present_proof_queue_count": recent_post_present_proof_queue_count.clone()
+        },
+        "summaries": {
+            "product_accept_to_formula_ms": f64_p50_p95_max_summary(&input_accept_to_formula_samples),
+            "raw_wake_to_formula_ms": f64_p50_p95_max_summary(&input_wake_to_formula_samples),
+            "wake_to_accept_ms": f64_p50_p95_max_summary(&input_wake_to_input_accept_samples),
+            "present_call_ms": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "present_call_ms", 0)),
+            "queue_to_present_ms": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "queue_to_present_ms", 0)),
+            "render_hook_to_queue_ms": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_hook_to_queue_ms", 0)),
+            "proof_readback_after_present_ms": proof_readback_summary
+        },
+        "worst_samples": {
+            "product_accept_to_formula": sample_with_max_numeric_field(&click_samples, "input_accept_to_formula_visible_ms"),
+            "raw_wake_to_formula": sample_with_max_numeric_field(&click_samples, "input_wake_to_formula_visible_ms"),
+            "wake_to_accept": sample_with_max_numeric_field(&click_samples, "input_wake_to_input_accept_ms"),
+            "present_call": sample_with_max_numeric_field(&click_samples, "present_call_ms"),
+            "render_hook_to_queue": sample_with_max_numeric_field(&click_samples, "render_hook_to_queue_ms"),
+            "proof_click_to_formula": sample_with_max_numeric_field(&click_samples, "click_to_formula_visible_ms"),
+            "proof_readback_after_present": sample_with_max_numeric_field(&click_samples, "click_to_readback_after_present_ms")
+        },
+        "next_architecture_cut": [
+            "run product UX in counters/product mode with no interactive readback jobs affecting scheduling or present",
+            "run WGPU readback proof as a separate FrameEvidenceKey-linked lane and report proof lag as proof latency",
+            "sample visible-changing input at the start of a hot frame-clock transaction instead of after unrelated follow-up frames",
+            "add a same-surface present-floor baseline to separate compositor present blocking from Boon-owned work"
+        ]
+    });
     let status = if all_clicks_pass && real_os_input && timing_sample_count_complete {
         "pass"
     } else {
@@ -61962,6 +62229,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "steady_input_wake_to_present_ms": f64_p50_p95_max_summary(&steady_input_wake_to_present_samples),
         "present_probe_phase_ms": present_probe_phase_ms,
         "steady_present_probe_phase_ms": steady_present_probe_phase_ms,
+        "latency_diagnosis": latency_diagnosis,
         "preview_perf_stats": preview_perf_stats,
         "preview_loop_input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
         "preview_loop_input_to_present_sample_count": preview_loop_input_to_present_sample_count,
@@ -61972,6 +62240,15 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "preview_loop_renders_per_second": preview_loop_renders_per_second,
         "preview_loop_render_loop_mode": preview_loop_render_loop_mode,
         "preview_loop_frame_pacing_state": preview_loop_frame_pacing_state,
+        "proof_readback_deferred_count": proof_readback_deferred_count,
+        "proof_readback_deferred_for_product_input_count": proof_readback_deferred_for_product_input_count,
+        "proof_readback_deferred_for_interaction_burst_count": proof_readback_deferred_for_interaction_burst_count,
+        "proof_readback_queued_during_interaction_quiet_count": proof_readback_queued_during_interaction_quiet_count,
+        "last_proof_readback_deferred_reason": last_proof_readback_deferred_reason,
+        "post_present_proof_queue_enqueued_count": post_present_proof_queue_enqueued_count,
+        "post_present_proof_queue_completed_count": post_present_proof_queue_completed_count,
+        "post_present_proof_queue_deferred_count": post_present_proof_queue_deferred_count,
+        "recent_post_present_proof_queue_count": recent_post_present_proof_queue_count,
         "native_input_reject_counts": native_input_reject_counts,
         "simple_source_click_count": simple_source_click_count,
         "generic_fallback_count": generic_fallback_count,
@@ -61981,6 +62258,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "click_to_formula_visible_ms": click_to_formula_visible_ms_p95,
         "click_to_formula_visible_ms_p95": click_to_formula_visible_ms_p95,
         "click_to_formula_visible_ms_max": click_to_formula_visible_ms_max,
+        "harness_click_release_to_formula_visual_proof_ms": click_to_formula_visible_ms_p95,
+        "harness_click_release_to_formula_visual_proof_ms_p95": click_to_formula_visible_ms_p95,
+        "harness_click_release_to_formula_visual_proof_ms_max": click_to_formula_visible_ms_max,
         "harness_click_to_formula_visible_ms": last_sample
             .get("harness_click_to_formula_visible_ms")
             .cloned()
@@ -61995,9 +62275,14 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .unwrap_or(serde_json::Value::Null),
         "click_to_readback_after_present_ms": click_to_readback_after_present_ms_max,
         "click_to_readback_after_present_ms_max": click_to_readback_after_present_ms_max,
+        "proof_readback_after_product_present_ms": click_to_readback_after_present_ms_max,
+        "proof_readback_after_product_present_ms_max": click_to_readback_after_present_ms_max,
         "click_to_present_ms": click_to_present_ms_p95,
         "click_to_present_ms_p95": click_to_present_ms_p95,
         "click_to_present_ms_max": click_to_present_ms_max,
+        "harness_click_release_to_product_present_probe_ms": click_to_present_ms_p95,
+        "harness_click_release_to_product_present_probe_ms_p95": click_to_present_ms_p95,
+        "harness_click_release_to_product_present_probe_ms_max": click_to_present_ms_max,
         "input_accept_to_present_ms_p95": input_accept_to_present_ms_p95,
         "input_accept_to_present_ms_max": input_accept_to_present_ms_max,
         "input_accept_to_present_ms": last_sample
@@ -62007,6 +62292,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "input_accept_to_formula_visible_ms": input_accept_to_formula_visible_ms_p95,
         "input_accept_to_formula_visible_ms_p95": input_accept_to_formula_visible_ms_p95,
         "input_accept_to_formula_visible_ms_max": input_accept_to_formula_visible_ms_max,
+        "product_input_accept_to_formula_present_ms": input_accept_to_formula_visible_ms_p95,
+        "product_input_accept_to_formula_present_ms_p95": input_accept_to_formula_visible_ms_p95,
+        "product_input_accept_to_formula_present_ms_max": input_accept_to_formula_visible_ms_max,
         "input_accept_budget_source": last_sample
             .get("input_accept_budget_source")
             .cloned()
@@ -62678,6 +62966,15 @@ fn cells_recent_frame_visible_match_probe(
             "queue_to_present_ms": entry.get("queue_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_present_call_ms": entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
             "present_call_ms": entry.get("present_call_ms").cloned().unwrap_or_else(|| entry.get("last_present_call_ms").cloned().unwrap_or(serde_json::Value::Null)),
+            "proof_readback_deferred_count": entry.get("proof_readback_deferred_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "proof_readback_deferred_count")),
+            "proof_readback_deferred_for_product_input_count": entry.get("proof_readback_deferred_for_product_input_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "proof_readback_deferred_for_product_input_count")),
+            "proof_readback_deferred_for_interaction_burst_count": entry.get("proof_readback_deferred_for_interaction_burst_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "proof_readback_deferred_for_interaction_burst_count")),
+            "proof_readback_queued_during_interaction_quiet_count": entry.get("proof_readback_queued_during_interaction_quiet_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "proof_readback_queued_during_interaction_quiet_count")),
+            "last_proof_readback_deferred_reason": entry.get("last_proof_readback_deferred_reason").cloned().unwrap_or_else(|| report_field_or_render_state(report, "last_proof_readback_deferred_reason")),
+            "post_present_proof_queue_enqueued_count": entry.get("post_present_proof_queue_enqueued_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "post_present_proof_queue_enqueued_count")),
+            "post_present_proof_queue_completed_count": entry.get("post_present_proof_queue_completed_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "post_present_proof_queue_completed_count")),
+            "post_present_proof_queue_deferred_count": entry.get("post_present_proof_queue_deferred_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "post_present_proof_queue_deferred_count")),
+            "recent_post_present_proof_queue_count": entry.get("recent_post_present_proof_queue_count").cloned().unwrap_or_else(|| report_field_or_render_state(report, "recent_post_present_proof_queue_count")),
             "last_poll_diagnostics": entry
                 .get("last_poll_diagnostics")
                 .cloned()
@@ -62738,6 +63035,24 @@ fn structured_external_visible_surface_proof_matches_report(report: &serde_json:
             == 0
 }
 
+fn cells_visible_click_report_bool(report: &serde_json::Value, field: &str) -> bool {
+    report_field_or_render_state(report, field).as_bool() == Some(true)
+}
+
+fn cells_visible_click_interactive_readback_busy(report: &serde_json::Value) -> bool {
+    cells_visible_click_report_bool(report, "last_interactive_surface_readback_pending")
+}
+
+fn cells_visible_click_verifier_frame_request_consumed(
+    report: &serde_json::Value,
+    request_count: u64,
+) -> bool {
+    report
+        .pointer("/last_poll_diagnostics/verifier_frame_request/consumed_count")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|consumed_count| consumed_count >= request_count)
+}
+
 fn wait_for_cells_formula_visible_match(
     connect: &str,
     loop_report: &Path,
@@ -62763,6 +63078,10 @@ fn wait_for_cells_formula_visible_match(
     let mut visual_formula_probe: Option<serde_json::Value> = None;
     let mut runtime_probe: Option<serde_json::Value> = None;
     let mut last_runtime_poll = Instant::now() - Duration::from_millis(50);
+    let mut verifier_frame_request_count = 0_u64;
+    let mut last_verifier_frame_request = Instant::now() - Duration::from_millis(50);
+    let mut last_verifier_frame_request_ack = json!({"status": "not-requested"});
+    let mut verifier_frame_request_in_flight: Option<u64> = None;
     while started.elapsed() < timeout {
         if loop_report.exists() {
             match read_json(loop_report) {
@@ -62903,6 +63222,15 @@ fn wait_for_cells_formula_visible_match(
                             "last_interactive_surface_readback_skipped_for_external_proof": report.get("last_interactive_surface_readback_skipped_for_external_proof").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_skipped_for_backpressure": report.get("last_interactive_surface_readback_skipped_for_backpressure").cloned().unwrap_or(serde_json::Value::Null),
                             "last_interactive_surface_readback_pending": report.get("last_interactive_surface_readback_pending").cloned().unwrap_or(serde_json::Value::Null),
+                            "proof_readback_deferred_count": report_field_or_render_state(&report, "proof_readback_deferred_count"),
+                            "proof_readback_deferred_for_product_input_count": report_field_or_render_state(&report, "proof_readback_deferred_for_product_input_count"),
+                            "proof_readback_deferred_for_interaction_burst_count": report_field_or_render_state(&report, "proof_readback_deferred_for_interaction_burst_count"),
+                            "proof_readback_queued_during_interaction_quiet_count": report_field_or_render_state(&report, "proof_readback_queued_during_interaction_quiet_count"),
+                            "last_proof_readback_deferred_reason": report_field_or_render_state(&report, "last_proof_readback_deferred_reason"),
+                            "post_present_proof_queue_enqueued_count": report_field_or_render_state(&report, "post_present_proof_queue_enqueued_count"),
+                            "post_present_proof_queue_completed_count": report_field_or_render_state(&report, "post_present_proof_queue_completed_count"),
+                            "post_present_proof_queue_deferred_count": report_field_or_render_state(&report, "post_present_proof_queue_deferred_count"),
+                            "recent_post_present_proof_queue_count": report_field_or_render_state(&report, "recent_post_present_proof_queue_count"),
                             "wake_to_queue_ms": report.get("wake_to_queue_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "encoder_finish_ms": report.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "queue_submit_call_ms": report.get("queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -63312,6 +63640,48 @@ fn wait_for_cells_formula_visible_match(
             .and_then(|probe| probe.get("status"))
             .and_then(serde_json::Value::as_str)
             == Some("pass");
+        if let Some(request_count) = verifier_frame_request_in_flight {
+            let request_consumed =
+                cells_visible_click_verifier_frame_request_consumed(&last_report, request_count);
+            let request_stale = last_verifier_frame_request.elapsed() >= Duration::from_millis(250);
+            if request_consumed || request_stale {
+                verifier_frame_request_in_flight = None;
+            }
+        }
+        let readback_lane_busy = cells_visible_click_interactive_readback_busy(&last_report);
+        if present_pass
+            && runtime_pass
+            && !visual_pass
+            && verifier_frame_request_in_flight.is_none()
+            && !readback_lane_busy
+            && verifier_frame_request_count < 8
+            && last_verifier_frame_request.elapsed() >= Duration::from_millis(8)
+        {
+            last_verifier_frame_request = Instant::now();
+            verifier_frame_request_count = verifier_frame_request_count.saturating_add(1);
+            let product_frame_evidence_key = product_present_probe
+                .as_ref()
+                .and_then(|probe| probe.get("frame_evidence_key").cloned())
+                .or_else(|| {
+                    present_probe
+                        .as_ref()
+                        .and_then(|probe| probe.get("frame_evidence_key").cloned())
+                });
+            last_verifier_frame_request_ack = request_xtask_preview_verifier_frame(
+                connect,
+                "cells-visible-click-proof-after-product-present",
+                product_frame_evidence_key,
+            );
+            verifier_frame_request_in_flight = last_verifier_frame_request_ack
+                .get("request_count")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|_| {
+                    last_verifier_frame_request_ack
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pass")
+                });
+        }
         if present_pass && runtime_pass && visual_pass {
             let present_probe_value = present_probe.unwrap_or_else(|| json!({"status": "missing"}));
             return json!({
@@ -63322,7 +63692,10 @@ fn wait_for_cells_formula_visible_match(
                 "proof_present_probe": proof_present_probe.unwrap_or_else(|| present_probe_value.clone()),
                 "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
                 "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
-                "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"}))
+                "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"})),
+                "verifier_frame_request_count": verifier_frame_request_count,
+                "verifier_frame_request_in_flight": verifier_frame_request_in_flight,
+                "last_verifier_frame_request_ack": last_verifier_frame_request_ack
             });
         }
         thread::sleep(Duration::from_millis(5));
@@ -63346,6 +63719,9 @@ fn wait_for_cells_formula_visible_match(
         "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
         "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
         "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "verifier_frame_request_count": verifier_frame_request_count,
+        "verifier_frame_request_in_flight": verifier_frame_request_in_flight,
+        "last_verifier_frame_request_ack": last_verifier_frame_request_ack,
         "last_report": last_report,
         "last_response": last_response
     })
@@ -88620,6 +88996,39 @@ mod tests {
         assert_eq!(cells_visible_click_preview_hold_ms(0), 90_000);
         assert_eq!(cells_visible_click_preview_hold_ms(4), 90_000);
         assert_eq!(cells_visible_click_preview_hold_ms(64), 350_000);
+    }
+
+    #[test]
+    fn cells_visible_click_verifier_requests_wait_for_readback_backpressure() {
+        assert!(cells_visible_click_interactive_readback_busy(&json!({
+            "render_loop_state": {
+                "last_interactive_surface_readback_pending": true
+            }
+        })));
+        assert!(!cells_visible_click_interactive_readback_busy(&json!({
+            "last_interactive_surface_readback_pending": false
+        })));
+
+        assert!(cells_visible_click_verifier_frame_request_consumed(
+            &json!({
+                "last_poll_diagnostics": {
+                    "verifier_frame_request": {
+                        "consumed_count": 42
+                    }
+                }
+            }),
+            42,
+        ));
+        assert!(!cells_visible_click_verifier_frame_request_consumed(
+            &json!({
+                "last_poll_diagnostics": {
+                    "verifier_frame_request": {
+                        "consumed_count": 41
+                    }
+                }
+            }),
+            42,
+        ));
     }
 
     fn write_mouse_position_loop_report(

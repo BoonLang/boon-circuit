@@ -6035,6 +6035,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         prewarm_worker: PreviewPrewarmWorkerQueue::default(),
         replace_worker: PreviewReplaceWorkerQueue::default(),
         ipc_counters: PreviewIpcCounterState::default(),
+        verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
         shutdown: PreviewShutdownState::default(),
     }));
     let preview_shutdown = preview_ipc_state
@@ -6361,6 +6362,14 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "preview render state mutex poisoned".to_owned())?
                 .update_count;
             note_poll_phase!("before_update_count_lock_ms", phase_started);
+            let phase_started = Instant::now();
+            let verifier_frame_request = if context.input_delta.real_os_events_observed {
+                None
+            } else {
+                preview_take_verifier_frame_request(&poll_preview_ipc_state)?
+            };
+            let verifier_frame_requested = verifier_frame_request.is_some();
+            note_poll_phase!("verifier_frame_request_ms", phase_started);
             let mut role_dirty_reason = None;
             let phase_started = Instant::now();
             let mut input_state = poll_input_state
@@ -6642,14 +6651,19 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|_| "preview render state mutex poisoned".to_owned())?
                     .last_dirty_reason;
             }
+            if verifier_frame_requested && role_dirty_reason.is_none() {
+                role_dirty_reason =
+                    Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
+            }
             let dirty = after_update_count != before_update_count
                 || after_content_revision != last_poll_revision
                 || context.forced_frame
+                || verifier_frame_requested
                 || headed_scenario_poll.dirty;
             last_poll_revision = last_poll_revision.max(after_content_revision);
             note_poll_phase!("dirty_revision_compute_ms", phase_started);
             let phase_started = Instant::now();
-            let scheduler_reason = if context.forced_frame {
+            let scheduler_reason = if verifier_frame_requested || context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
             } else if context.input_delta.real_os_events_observed {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
@@ -6735,11 +6749,22 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             note_poll_phase!("accessibility_snapshot_ms", phase_started);
             poll_phase_timings_ms
                 .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
-            let frame_lane_hint = preview_frame_lane_hint_for_current_interaction_scope();
+            let frame_lane_hint = if verifier_frame_requested {
+                Some(boon_native_app_window::NativeFrameLane::ProofOrHarness)
+            } else {
+                preview_frame_lane_hint_for_current_interaction_scope()
+            };
             let poll_diagnostics = json!({
                 "kind": "preview_role_poll",
                 "dirty": dirty,
                 "forced_frame": context.forced_frame,
+                "verifier_frame_requested": verifier_frame_requested,
+                "verifier_frame_request": verifier_frame_request.as_ref().map(|(count, reason)| {
+                    json!({
+                        "consumed_count": count,
+                        "reason": reason
+                    })
+                }),
                 "real_os_events_observed": context.input_delta.real_os_events_observed,
                 "input_delta_real_os_events_observed": input_delta.real_os_events_observed,
                 "frame_lane_hint": frame_lane_hint.map(|lane| format!("{lane:?}")),
@@ -40539,6 +40564,57 @@ fn preview_try_apply_simple_source_click_input(
         if let Some(candidate) = cached_candidate {
             if !preview_candidate_accepts_pointer_edge(&candidate, has_press_edge, has_release_edge)
             {
+                let release_matches_handled_press_candidate = !has_press_edge
+                    && has_release_edge
+                    && releases.len() == 1
+                    && candidate.source_intent.as_deref() == Some("press")
+                    && (input_state.focused_node.as_deref() == Some(candidate.node.as_str())
+                        || input_state.last_click_node.as_deref() == Some(candidate.node.as_str()));
+                if release_matches_handled_press_candidate {
+                    for release in &releases {
+                        input_state.last_mouse_button_event_count = input_state
+                            .last_mouse_button_event_count
+                            .max(release.sequence);
+                        input_state.last_click_sequence = release.sequence;
+                    }
+                    input_state.last_mouse_motion_event_count = input_state
+                        .last_mouse_motion_event_count
+                        .max(input.mouse_motion_event_count);
+                    input_state.last_hover_window_position = position_key;
+                    input_state.last_click_node = Some(candidate.node.clone());
+                    input_state.hovered_node = Some(candidate.node.clone());
+                    input_state.hovered_target_text = candidate.target_text.clone();
+                    input_state.hovered_click_candidate = Some(candidate.clone());
+                    let remembered_candidate = input_state.hovered_click_candidate.clone();
+                    preview_remember_click_candidate(
+                        input_state,
+                        position_key,
+                        &remembered_candidate,
+                    );
+                    record_preview_native_input_timing(PreviewNativeInputTimingSample {
+                        scope: preview_current_interaction_timing_scope(),
+                        fast_path: "simple_source_click_absorbed_release",
+                        resolve_source: Some("cached_click_candidate"),
+                        route_table_key_source: Some("none"),
+                        shared_lock_wait_ms,
+                        route_table_lookup_ms,
+                        route_dispatch_ms: elapsed_ms(route_dispatch_started),
+                        hit_test_ms,
+                        event_build_ms: 0.0,
+                        live_events_ms: 0.0,
+                        bound_input_sync_ms: 0.0,
+                        selection_proxy_refresh_ms: 0.0,
+                        selection_proxy_text_refresh_ms: 0.0,
+                        selected_overlay_patch_ms: 0.0,
+                        selection_focus_overlay_state_ms: 0.0,
+                        resolve_ms: elapsed_ms(resolve_started),
+                        apply_ms: 0.0,
+                        hover_overlay_ms: 0.0,
+                        focus_overlay_ms: 0.0,
+                        total_ms: elapsed_ms(input_total_started),
+                    });
+                    return Ok(false);
+                }
                 return reject(
                     "cached_candidate_not_routable_for_pointer_edge",
                     input_state,
@@ -42690,6 +42766,11 @@ fn preview_apply_real_window_input_with_units(
         input_state,
     )? {
         return Ok(true);
+    }
+    if !preview_input_has_unhandled_source_events(input, input_state)
+        && !preview_input_has_pending_source_work(input_state)
+    {
+        return Ok(false);
     }
     if preview_try_apply_focused_keyboard_input(
         input,
@@ -53424,7 +53505,15 @@ struct PreviewIpcState {
     prewarm_worker: PreviewPrewarmWorkerQueue,
     replace_worker: PreviewReplaceWorkerQueue,
     ipc_counters: PreviewIpcCounterState,
+    verifier_frame_requests: PreviewVerifierFrameRequestState,
     shutdown: PreviewShutdownState,
+}
+
+#[derive(Clone, Default)]
+struct PreviewVerifierFrameRequestState {
+    request_count: u64,
+    consumed_count: u64,
+    last_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -53482,6 +53571,52 @@ impl PreviewShutdownState {
             format!("preview_shutdown_ipc:{reason}")
         })
     }
+}
+
+fn preview_request_verifier_frame_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let reason = request
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unspecified")
+        .to_owned();
+    let mut state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?;
+    state.verifier_frame_requests.request_count = state
+        .verifier_frame_requests
+        .request_count
+        .saturating_add(1);
+    state.verifier_frame_requests.last_reason = Some(reason.clone());
+    let request_count = state.verifier_frame_requests.request_count;
+    let consumed_count = state.verifier_frame_requests.consumed_count;
+    Ok(json!({
+        "kind": "request-verifier-frame-ack",
+        "status": "pass",
+        "reason": reason,
+        "request_count": request_count,
+        "consumed_count": consumed_count,
+        "pending_count": request_count.saturating_sub(consumed_count),
+        "preview_pid": std::process::id()
+    }))
+}
+
+fn preview_take_verifier_frame_request(
+    state: &Arc<Mutex<PreviewIpcState>>,
+) -> Result<Option<(u64, Option<String>)>, String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned".to_owned())?;
+    if state.verifier_frame_requests.consumed_count >= state.verifier_frame_requests.request_count {
+        return Ok(None);
+    }
+    state.verifier_frame_requests.consumed_count = state.verifier_frame_requests.request_count;
+    Ok(Some((
+        state.verifier_frame_requests.consumed_count,
+        state.verifier_frame_requests.last_reason.clone(),
+    )))
 }
 
 #[derive(Clone, Default)]
@@ -59555,6 +59690,28 @@ fn handle_preview_ipc_client(
                 .map_err(|_| "preview IPC state mutex poisoned")?;
             preview_perf_snapshot_response(&state)
         };
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("request-verifier-frame") {
+        let response =
+            preview_request_verifier_frame_response(&state, &request).unwrap_or_else(|error| {
+                json!({
+                    "kind": "request-verifier-frame-ack",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
+        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            wake_handle.wake();
+        }
         write_preview_ipc_response(
             &mut stream,
             &state,
@@ -77081,6 +77238,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -77156,6 +77314,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -77313,6 +77472,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         start_preview_ipc_server(
@@ -77698,6 +77858,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
 
@@ -80917,6 +81078,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -81636,6 +81798,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let todomvc_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
@@ -81988,6 +82151,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let stale_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
@@ -82085,6 +82249,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let result = PreviewReplaceBuildResult {
@@ -82196,6 +82361,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -82266,6 +82432,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -82330,6 +82497,7 @@ label:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let payload = SourceProjectPayload::single_unit(
@@ -87213,6 +87381,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let base = json!({
@@ -87274,6 +87443,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let request = json!({
@@ -88278,6 +88448,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let decrement_source_event = operator_host_input_probe_requests(&source_path, &source)
@@ -88447,6 +88618,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)
@@ -88539,6 +88711,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)
@@ -88639,6 +88812,7 @@ document:
             prewarm_worker: PreviewPrewarmWorkerQueue::default(),
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
+            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)
@@ -93065,6 +93239,105 @@ document:
         assert_eq!(hint.pressed, Some(true));
         let summary = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary["store"]["selected_address"], "B0");
+    }
+
+    #[test]
+    fn cells_release_after_press_selection_is_absorbed_without_generic_fallback() {
+        let cells_path = repo_path("examples/cells.bn");
+        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
+        let live_runtime = cells_live_runtime(
+            "native-cells-real-window-release-after-press",
+            &cells_path,
+            &cells_source,
+        );
+        let (initial_layout, initial_frame) =
+            preview_layout_for_scroll_window(&cells_path, &cells_source, &live_runtime, 0.0, 0.0)
+                .unwrap();
+        let (b0_x, b0_y, _b0_node) =
+            source_hit_center_for_target(&initial_layout, "cell.sources.editor.select", Some("B0"))
+                .unwrap();
+        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
+            layout_proof: initial_layout,
+            layout_frame_override: Some(Arc::new(initial_frame)),
+            update_count: 0,
+            scroll_x_px: 0.0,
+            scroll_y_px: 0.0,
+            last_error: None,
+            last_error_count: 0,
+            status_overlay: None,
+            last_dirty_reason: None,
+        }));
+        let mut input_state = PreviewNativeInputState::default();
+        let mut press = deterministic_click_input(0, b0_x, b0_y);
+        press.mouse_buttons_down = vec!["left".to_owned()];
+        press.mouse_button_event_count = 1;
+        press.mouse_total_event_count = 2;
+        press.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 1,
+            button: "left".to_owned(),
+            pressed: true,
+            window_protocol_id: Some(1),
+            event_elapsed_ms: None,
+        }];
+
+        let press_applied = preview_apply_real_window_input(
+            &press,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        assert!(press_applied);
+        assert_eq!(
+            live_runtime.lock().unwrap().document_state_summary()["store"]["selected_address"],
+            "B0"
+        );
+        let _ = take_preview_native_input_timings();
+        preview_set_hot_path_profile_enabled(true);
+
+        let mut release = deterministic_click_input(0, b0_x, b0_y);
+        release.mouse_buttons_down = Vec::new();
+        release.mouse_button_event_count = 2;
+        release.mouse_total_event_count = 3;
+        release.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
+            sequence: 2,
+            button: "left".to_owned(),
+            pressed: false,
+            window_protocol_id: Some(1),
+            event_elapsed_ms: None,
+        }];
+
+        let release_applied = preview_apply_real_window_input(
+            &release,
+            &cells_path,
+            &cells_source,
+            Some(&live_runtime),
+            &shared_render_state,
+            &mut input_state,
+        )
+        .unwrap();
+        preview_set_hot_path_profile_enabled(false);
+        let timings = take_preview_native_input_timings();
+
+        assert!(
+            !release_applied,
+            "release after a press-selected cell should be consumed without creating another product update"
+        );
+        assert_eq!(input_state.last_mouse_button_event_count, 2);
+        assert!(
+            timings
+                .iter()
+                .any(|sample| sample.fast_path == "simple_source_click_absorbed_release"),
+            "release absorption should be visible in input timings: {timings:?}"
+        );
+        assert!(
+            !timings
+                .iter()
+                .any(|sample| sample.fast_path == "generic_fallback"),
+            "release after press selection must not fall through to generic fallback: {timings:?}"
+        );
     }
 
     #[test]

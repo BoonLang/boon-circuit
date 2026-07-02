@@ -129,6 +129,37 @@ The current evidence says the next useful work is not another route-cache,
 binding-scan, or JSON-size tweak. Preserve these broader cuts as explicit TODOs
 until they are implemented, deleted, or replaced by a simpler measured design.
 
+### 2026-07-02 Late Status: Cells Click Path
+
+Fresh release verifier evidence after the input-path fixes:
+
+- Fixed: release-only cell commits were caused by a press-handled cached
+  candidate rejecting its paired release and falling through to the broad
+  generic fallback. The release is now absorbed as clean input when the press
+  candidate already handled selection. `simple_source_click_count` remains 64
+  and native input reject counts are zero.
+- Fixed: raw host wake commits with no sampled button/key/scroll/motion delta
+  were being relabeled as `HostInput` product frames. Raw wakes still wake the
+  loop, but only reportable input deltas own the product input lane.
+- Still failing: product accepted-input p95 is near budget, but wake-to-visible
+  still fails because the frame is submitted after a cold/demand wake and then
+  waits in queue/present. With `Mailbox`, Cells release report showed product
+  p95 about `16.83ms`, max about `29.55ms`, wake-to-present p95 about
+  `22.23ms`. With `BOON_NATIVE_PRESENT_MODE=immediate`, accepted-input p95
+  improved to about `14.47ms`, but wake-to-present still failed around
+  `22.04ms` and max outlier was about `34.21ms`.
+- Current root cause: not Cells runtime, list lookup, formula recompute, or
+  proof readback completion. The remaining product blocker is frame pacing and
+  present/queue scheduling: input is accepted after waking, then the product
+  frame often spends 9-16ms in `queue.submit()` / `frame.present()`, with rare
+  26-32ms compositor/surface outliers.
+- Next architecture cut: implement a real active frame clock for interaction
+  bursts. During pointer/text bursts the preview must already have a scheduled
+  frame, sample input at the start of that frame, patch retained state, submit
+  immediately, and push proof/readback/report work behind the product frame by
+  exact `FrameEvidenceKey`. Do not try to make more Cells/runtime micro-tweaks
+  until this hot-loop boundary is cut.
+
 - [ ] Source-input transaction split:
   - make `HostInputEvent -> retained visual patch -> present` the first-frame
     product transaction;
@@ -11700,3 +11731,261 @@ host-input follow-up cut:
     before release/proof cleanup can relabel the interaction;
   - do not keep tuning runtime/list/formula for this blocker unless a fresh
     product-only report shows runtime work has returned.
+
+2026-07-02 current Cells outlier diagnosis after product-frame readback deferral:
+
+- Fresh evidence remains
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json`.
+  The report is schema-valid and still `status="fail"`, but the failure is now
+  split into separate lanes:
+  - product-only accepted input to formula/present:
+    `p95=14.784872 ms`, `max=25.278492 ms`;
+  - preview product perf accumulator:
+    `p50=11.063688 ms`, `p95=14.901104 ms`, `p99=max=37.236907 ms`;
+  - `product_missed_frame_count=2`, `missed_frame_count=4`;
+  - `last_missed_frame_cause="interactive_readback_backpressure"`;
+  - `render_hook_ms.p95=2.121757 ms`, so render hook/layout/runtime is not the
+    current product outlier source.
+- Current product outliers are mostly queue/present and frame ownership:
+  - sample `22` has product `25.278492 ms`; the time is almost entirely
+    `present_call_ms=23.276644 ms` / `queue_to_present_ms=23.276801 ms`;
+  - top wake samples are release/null events with `pressed=false` and
+    `input_wake_to_input_accept_ms` around `30-35 ms`, while their
+    accepted-input product work remains about `10-12 ms`;
+  - sample `37` has product `11.131217 ms`, but raw
+    `input_wake_to_formula_visible_ms=70.544716 ms` because the input was not
+    sampled until roughly one or more frame intervals later and then hit queue
+    submit/present work.
+- Current harness/proof-side `click_to_formula_visible_ms` is intentionally not
+  product UX latency, but it is still too expensive and confusing:
+  - `click_to_formula_visible_ms.p50=158.925207 ms`,
+    `p95=211.715505 ms`, `max=863.590744 ms`;
+  - `click_to_readback_after_present_ms.p50=55.698563 ms`,
+    `p95=120.581667 ms`, `max=791.318004 ms`;
+  - proof lag is `46` samples at 1 frame, `15` at 3 frames, and `3` at 5
+    frames;
+  - sample `34` proves the problem directly: product
+    `input_accept_to_formula_visible_ms=9.952121 ms`, but harness
+    `click_to_formula_visible_ms=863.590744 ms` because readback proof completed
+    `791.318004 ms` after product present.
+- Code-level cause of the 200ms-class harness number:
+  - `wait_for_cells_formula_visible_match` waits for product present and then
+    proof/readback/crop evidence;
+  - if the proof key does not exactly equal the product-present frame key,
+    xtask computes harness visible latency from readback-visible timing instead
+    of product-present timing;
+  - `proof_only_contract` remains honest (`status="pass"`, current structured
+    proof covers all 64 samples), but exact same-frame visual proof count is
+    still zero, so the harness metric measures proof lag/readback polling.
+- Code-level cause of the remaining missed frames:
+  - `run_visible_surface_probe_with_hooks_and_wake` still tracks interactive
+    readback jobs and reports `interactive_readback_backpressure`;
+  - non-product follow-up frames can still perform compatibility readback while
+    product clicks are arriving;
+  - `native_gpu_app_owned_render_hook` still has proof/report-shaped behavior
+    in the same render hook API, even though product input frames currently
+    defer most proof work.
+- Required architecture cut, not a verifier wording patch:
+  - make product/counters mode run with no interactive readback jobs or proof
+    subscribers able to affect product scheduling, queue submit, or present;
+  - proof deferral alone is insufficient: the current offscreen/readback path
+    can still submit proof GPU copy work on the same `wgpu::Queue` immediately
+    after product present, so product metrics may exclude proof completion while
+    later product frames still see queue/present tails and
+    `interactive_readback_backpressure`;
+  - run a separate readback proof lane keyed by the product `FrameEvidenceKey`;
+  - make that proof lane bounded and latest-wins: one pending proof target per
+    semantic verifier need, coalesced during interactive bursts, and scheduled
+    only when the product lane is idle or explicitly in verifier/proof mode;
+  - keep exact proof identity mandatory, but report proof lag as proof latency,
+    never as product UX latency;
+  - add a same-surface present-floor baseline so `present_call`/`queue_to_present`
+    spikes can be separated from Boon-owned render/runtime work;
+  - split raw wake diagnostics from accepted-input product gates, while keeping
+    raw wake samples visible until the `PreviewHotLoop`/frame-clock owner removes
+    release/follow-up relabeling.
+
+2026-07-02 implementation checkpoint: interaction-burst proof readback guard:
+
+- Implemented a generic native app-window guard that defers interactive WGPU
+  proof readback while a requested-animation/product interaction burst is
+  active:
+  - `NativeRenderLoopState::interaction_burst_active`;
+  - `NativeRenderLoopState::defer_proof_readback_for_product_lane`;
+  - new `InteractiveSurfaceReadbackDecision::DeferInteractionBurst`.
+- This is intentionally not Cells-specific:
+  - no branches on example name, source path, cell address, formula text, or
+    spreadsheet fixture state;
+  - the decision is based only on frame lane, scheduler reason, verifier frame
+    status, and bounded requested-animation burst state.
+- Product/proof accounting added:
+  - `proof_readback_deferred_count`;
+  - `proof_readback_deferred_for_product_input_count`;
+  - `proof_readback_deferred_for_interaction_burst_count`;
+  - `last_proof_readback_deferred_reason`.
+- These counters are serialized both through `render_loop_state` and as
+  top-level render-loop report fields, and are included in
+  `post_present_proof_isolation`.
+- Important behavior change:
+  - product input frames still defer readback as before;
+  - animation follow-up frames inside the product burst now defer proof readback
+    instead of queuing it or reporting readback backpressure;
+  - explicit verifier/proof frames remain allowed to read back.
+- Focused verification:
+  - `cargo test -p boon_native_app_window readback` passed;
+  - `cargo check -p xtask` passed;
+  - `cargo test -p xtask cells_visible_click` passed;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`
+    passed for the existing report artifact.
+- Still required before claiming performance fixed:
+  - rerun fresh release `verify-native-cells-visible-click-e2e` on the current
+    binary/worktree;
+  - confirm `interactive_readback_backpressure` disappears from product bursts;
+  - inspect the new deferral counters to prove proof work was deferred/coalesced
+    rather than hidden;
+  - compare product p95/max and wake-to-accept tails against the previous
+    `14.784872 ms` product p95, `25.278492 ms` product max, and
+    `64.785872 ms` raw wake p95 shape;
+  - if present tails remain, implement the same-surface present-floor baseline
+    and `PreviewHotLoop`/frame-clock ownership cut.
+
+2026-07-02 fresh diagnosis: why 58ms-class outliers and 200ms+ proof p95 remain:
+
+- Fresh release verifier:
+  `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+  still writes a schema-valid `status="fail"` report.
+- Accepted product-click path is no longer the multi-second problem:
+  - `input_accept_to_formula_visible_ms_p95=14.736394 ms`;
+  - `input_accept_to_formula_visible_ms_max=14.736394 ms`;
+  - click frames mostly spend about `2.35-2.65 ms` in render hook work and
+    about `8.33-10.39 ms` in `present_call` / `queue_to_present`.
+- The remaining product/frame outliers have two concrete causes:
+  - a mouse-motion product frame, not a cell click, records
+    `input_to_present_ms=41.140381 ms` with
+    `render_started_to_render_hook_completed_ms=10.752069 ms`,
+    `encode_scene_ms=8.502562 ms`, and
+    `present_call_ms=29.913096 ms`;
+  - one click frame records `input_to_present_ms=14.736394 ms`, but the time
+    after render is a queue-submit / submit-to-present gap:
+    `queue_submit_call_ms=11.916733 ms`,
+    `render_hook_to_queue_ms=11.963623 ms`, and
+    `present_call_ms=0.036535 ms`.
+- The 58ms-class historical product outliers are therefore not Cells formula
+  evaluation. They are frame-clock/present ownership outliers:
+  - burst follow-up frames can still be associated with recent input and report
+    long `input_wake_to_present_ms` tails;
+  - direct surface `present` can block for roughly one or two frame intervals;
+  - some frames alternate between a slow `queue_submit` call and a slow
+    `present_call`, so the next architecture cut must own frame pacing and
+    present-floor measurement instead of tuning runtime/list/formula code.
+- The harness/proof-side `click_to_formula_visible_ms` is still awful because
+  it is waiting for proof/readback evidence, not for the product UI update:
+  - fresh report shows `click_to_formula_visible_ms_p95=4372.492369 ms`;
+  - worst sample has product
+    `input_accept_to_formula_visible_ms=14.736394 ms`, product present in
+    `click_to_present_ms=28.874271 ms`, and then waits
+    `click_to_readback_after_present_ms=4343.618098 ms`;
+  - exact same-frame visual proof count is still zero and proof evidence does
+    not match the product-present `FrameEvidenceKey` for the click samples, so
+    xtask falls back to readback-completion timing for the harness metric.
+- The preview-loop artifact proves proof backlog, even though the final report
+  previously failed to lift these counters into `live_probe`:
+  - `proof_readback_deferred_count=34`;
+  - `proof_readback_deferred_for_product_input_count=6`;
+  - `proof_readback_deferred_for_interaction_burst_count=28`;
+  - `post_present_proof_queue_enqueued_count=194`;
+  - `post_present_proof_queue_completed_count=184`;
+  - `recent_post_present_proof_queue_count=64`.
+- A diagnostic plumbing patch now propagates those counters into the final
+  Cells visible-click report and per-click `present_probe` objects. This does
+  not fix performance or weaken gates; it makes future failing reports name
+  the proof backlog instead of requiring a separate artifact lookup.
+- Architecture conclusion:
+  - product lane is close for real click frames but still at the mercy of
+    direct-present / queue-submit cadence;
+  - proof lane is not product latency and must become a bounded, latest-wins,
+    `FrameEvidenceKey`-linked proof service;
+  - normal UX gates should use accepted-input product frame timing, while proof
+    gates should require current app-owned WGPU evidence and report proof lag
+    separately;
+  - the next code cut should be `PreviewHotLoop` / explicit frame-clock owner,
+    late acquire or frame-in-flight present policy, and same-surface
+    present-floor baseline, not another Cells formula/runtime micro-optimization.
+
+2026-07-02 post-plumbing verifier result:
+
+- After propagating proof/readback counters into the final report, a fresh
+  release visible-click run still fails, but now the report names the proof
+  backlog directly:
+  - `proof_readback_deferred_count=13`;
+  - `proof_readback_deferred_for_product_input_count=2`;
+  - `proof_readback_deferred_for_interaction_burst_count=11`;
+  - `post_present_proof_queue_enqueued_count=65`;
+  - `post_present_proof_queue_completed_count=60`;
+  - `recent_post_present_proof_queue_count=64`.
+- The run stops after one click because current visual proof is missing, while
+  product state and product presentation are already current:
+  - runtime value probe sees `store.selected_address="A2"` and
+    `store.selected_input.editing_text="15"` in `7.151319 ms`;
+  - accepted product timing is
+    `input_accept_to_formula_visible_ms=12.988243 ms`;
+  - raw wake timing is slightly over budget at
+    `input_wake_to_formula_visible_ms=17.872409 ms`;
+  - exact/current structured WGPU proof is false because baseline/current
+    readback evidence is unavailable or does not match the product
+    `FrameEvidenceKey`.
+- This confirms the current guard is only a diagnostic/protection layer, not the
+  final architecture. Simply deferring proof readback during bursts protects the
+  product lane but can starve the verifier. The correct cut is a separate,
+  bounded proof service:
+  - product frames publish `FrameEvidenceKey` and present immediately;
+  - proof requests are coalesced latest-wins per semantic need;
+  - baseline and current proof requests cannot be silently starved;
+  - proof lag is reported and budgeted separately from accepted-input UX;
+  - product reports must never mark UI latency as failed only because proof
+    readback completed late or was intentionally deferred.
+
+2026-07-02 armed input-sampling / present-policy result:
+
+- Implemented a generic requested-animation prewarm substate. Pointer-motion
+  prewarm can now arm an input-sampling turn without forcing a clean follow-up
+  present. The report exposes `requested_animation_prewarm_count`,
+  `armed_frame_token`, `clean_armed_poll_count`,
+  `skipped_clean_burst_present_count`, and
+  `input_waited_for_already_armed_frame_count`.
+- Fixed the first prewarm attempt where the armed token stayed sticky across
+  idle polls. Clean armed turns now clear the token after the skipped present,
+  so the counters represent real sampling turns instead of idle-loop churn.
+- Changed the generic native present policy to prefer nonblocking present modes
+  (`Immediate`, `AutoNoVsync`, `Mailbox`, then `Fifo`) and to use bounded
+  multiple frames in flight by default. This is not Cells-specific; it is a
+  native-window latency policy.
+- Fresh release Cells visible-click status is still `fail`:
+  - harness/proof `click_to_formula_visible_ms_p95=266.946876 ms`;
+  - accepted product `product_input_to_present_ms_p95=18.678639 ms`;
+  - product missed frames remain nonzero (`product_missed_frame_count=9`);
+  - `present_path_ms_p95=17.052182 ms`;
+  - `queue_submit_call_ms_p95=14.409348 ms`;
+  - wake-to-formula p95 remains over budget
+    (`input_wake_to_formula_visible_ms_p95=76.012297 ms` in the full harness
+    timing, with product-commit `wake_formula=24.186 ms`).
+- Current interpretation:
+  - Cells runtime/list/formula work is no longer the dominant blocker for this
+    report;
+  - proof/readback still makes the harness click-to-formula metric much worse
+    than product UI latency;
+  - product interaction is close but not complete because the single app-window
+    loop can still spend a frame interval around `queue.submit` / `present` and
+    because input wake/accept is not yet owned by a continuously armed frame
+    clock.
+- Next architecture cut should be larger, not another local micro-patch:
+  - split host input sampling from the present/proof lane with a latest-wins
+    event queue;
+  - make proof/readback a bounded coalescing service keyed by
+    `FrameEvidenceKey`, not work performed in front of product submission;
+  - keep the product lane measured by accepted-input-to-present/formula timing
+    and keep proof lag measured separately;
+  - add a same-surface present-floor benchmark so verifier budgets know the
+    unavoidable WGPU/compositor floor on the current adapter/session;
+  - only after that, revisit retained layout/render patching if product p95 is
+    still above 16.7ms.

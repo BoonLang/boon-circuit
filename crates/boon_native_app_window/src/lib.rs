@@ -28,7 +28,6 @@ const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
-const SINGLE_FRAME_SURFACE_FRAME_LATENCY: u32 = 1;
 const PACED_SURFACE_FRAME_LATENCY: u32 = 2;
 const MAX_CONFIGURED_SURFACE_FRAME_LATENCY: u32 = 8;
 const NATIVE_TARGET_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0;
@@ -41,6 +40,7 @@ const RECENT_PRODUCT_FRAME_COMMIT_LIMIT: usize = 256;
 const RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT: usize = 64;
 const RECENT_POST_PRESENT_PROOF_ARTIFACT_LIMIT: usize = 64;
 const RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT: usize = 16;
+const PRE_INPUT_COMPLETED_PROOF_DRAIN_LIMIT: usize = 4;
 const POST_PRESENT_PROOF_SUBSCRIBER_PENDING_BATCH_LIMIT: usize = 4;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -1084,6 +1084,16 @@ pub struct NativeRenderLoopState {
     pub post_present_proof_subscriber_error_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_post_present_proof_subscriber_error: Option<String>,
+    #[serde(default)]
+    pub proof_readback_deferred_count: u64,
+    #[serde(default)]
+    pub proof_readback_deferred_for_product_input_count: u64,
+    #[serde(default)]
+    pub proof_readback_deferred_for_interaction_burst_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_proof_readback_deferred_reason: Option<String>,
+    #[serde(default)]
+    pub proof_readback_queued_during_interaction_quiet_count: u64,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
     pub last_present_interval_ms: Option<f64>,
@@ -1099,6 +1109,16 @@ pub struct NativeRenderLoopState {
     pub pre_input_subscriber_drain_skip_count: u64,
     pub last_pre_input_subscriber_drain_skip_reason: Option<String>,
     pub requested_animation_burst_count: u64,
+    pub requested_animation_prewarm_count: u64,
+    pub requested_animation_burst_present_on_wake: bool,
+    pub armed_frame_token: u64,
+    pub armed_frame_started_elapsed_ms: Option<f64>,
+    #[serde(skip)]
+    pub armed_frame_pending: bool,
+    pub clean_armed_poll_count: u64,
+    pub skipped_clean_burst_present_count: u64,
+    pub input_waited_for_already_armed_frame_count: u64,
+    pub last_burst_exit_reason: Option<String>,
     pub requested_animation_burst_frames_remaining: u32,
     pub requested_animation_burst_started_elapsed_ms: Option<f64>,
     pub requested_animation_burst_quiet_until_elapsed_ms: Option<f64>,
@@ -1196,6 +1216,11 @@ impl NativeRenderLoopState {
             post_present_proof_artifact_count: 0,
             post_present_proof_subscriber_error_count: 0,
             last_post_present_proof_subscriber_error: None,
+            proof_readback_deferred_count: 0,
+            proof_readback_deferred_for_product_input_count: 0,
+            proof_readback_deferred_for_interaction_burst_count: 0,
+            last_proof_readback_deferred_reason: None,
+            proof_readback_queued_during_interaction_quiet_count: 0,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
             last_present_interval_ms: None,
@@ -1211,6 +1236,15 @@ impl NativeRenderLoopState {
             pre_input_subscriber_drain_skip_count: 0,
             last_pre_input_subscriber_drain_skip_reason: None,
             requested_animation_burst_count: 0,
+            requested_animation_prewarm_count: 0,
+            requested_animation_burst_present_on_wake: false,
+            armed_frame_token: 0,
+            armed_frame_started_elapsed_ms: None,
+            armed_frame_pending: false,
+            clean_armed_poll_count: 0,
+            skipped_clean_burst_present_count: 0,
+            input_waited_for_already_armed_frame_count: 0,
+            last_burst_exit_reason: None,
             requested_animation_burst_frames_remaining: 0,
             requested_animation_burst_started_elapsed_ms: None,
             requested_animation_burst_quiet_until_elapsed_ms: None,
@@ -1388,6 +1422,11 @@ impl NativeRenderLoopState {
         self.last_accepted_host_input_event = host_input_event;
         self.last_accepted_host_input_elapsed_ms = Some(elapsed_ms);
         self.last_accepted_host_input_press_only = press_only;
+        if self.armed_frame_pending || self.armed_frame_started_elapsed_ms.is_some() {
+            self.input_waited_for_already_armed_frame_count = self
+                .input_waited_for_already_armed_frame_count
+                .saturating_add(1);
+        }
         self.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
         self.current_scheduler_reason = Some(NativeSchedulerReason::HostInput);
         self.last_frame_lane = Some(NativeFrameLane::ProductInteraction);
@@ -1635,6 +1674,30 @@ impl NativeRenderLoopState {
         self.last_post_present_proof_subscriber_error = Some(error);
     }
 
+    pub fn note_proof_readback_deferred(&mut self, reason: &str) {
+        self.proof_readback_deferred_count = self.proof_readback_deferred_count.saturating_add(1);
+        match reason {
+            "product_input_frame" => {
+                self.proof_readback_deferred_for_product_input_count = self
+                    .proof_readback_deferred_for_product_input_count
+                    .saturating_add(1);
+            }
+            "interaction_burst" => {
+                self.proof_readback_deferred_for_interaction_burst_count = self
+                    .proof_readback_deferred_for_interaction_burst_count
+                    .saturating_add(1);
+            }
+            _ => {}
+        }
+        self.last_proof_readback_deferred_reason = Some(reason.to_owned());
+    }
+
+    pub fn note_proof_readback_queued_during_interaction_quiet(&mut self) {
+        self.proof_readback_queued_during_interaction_quiet_count = self
+            .proof_readback_queued_during_interaction_quiet_count
+            .saturating_add(1);
+    }
+
     pub fn note_preissued_frame_evidence_key(&mut self, key: FrameEvidenceKey, elapsed_ms: f64) {
         self.last_preissued_frame_evidence_key = Some(key);
         self.last_preissued_frame_evidence_elapsed_ms = Some(elapsed_ms);
@@ -1675,6 +1738,8 @@ impl NativeRenderLoopState {
                 .requested_animation_burst_frames_remaining
                 .saturating_sub(1);
         }
+        self.armed_frame_pending = false;
+        self.armed_frame_started_elapsed_ms = None;
         self.last_present_completed_elapsed_ms = Some(elapsed_ms);
     }
 
@@ -1759,6 +1824,26 @@ impl NativeRenderLoopState {
         if self.mode != NativeRenderLoopMode::DemandDriven {
             return;
         }
+        self.extend_requested_animation_burst(elapsed_ms, true);
+        self.last_scheduler_reason = Some(reason);
+        self.current_scheduler_reason = Some(reason);
+        self.schedule_wake_after(now, native_target_frame_interval_duration());
+    }
+
+    pub fn request_interactive_prewarm_burst(&mut self, now: Instant, elapsed_ms: f64) {
+        if self.mode != NativeRenderLoopMode::DemandDriven {
+            return;
+        }
+        self.requested_animation_prewarm_count =
+            self.requested_animation_prewarm_count.saturating_add(1);
+        self.extend_requested_animation_burst(elapsed_ms, false);
+        if self.current_scheduler_reason.is_none() {
+            self.last_scheduler_reason = Some(NativeSchedulerReason::RequestedAnimation);
+        }
+        self.schedule_wake_after(now, native_target_frame_interval_duration());
+    }
+
+    fn extend_requested_animation_burst(&mut self, elapsed_ms: f64, present_on_wake: bool) {
         let active = self
             .requested_animation_burst_hard_stop_elapsed_ms
             .is_some_and(|hard_stop| elapsed_ms <= hard_stop);
@@ -1768,7 +1853,10 @@ impl NativeRenderLoopState {
             self.requested_animation_burst_started_elapsed_ms = Some(elapsed_ms);
             self.requested_animation_burst_hard_stop_elapsed_ms =
                 Some(elapsed_ms + REQUESTED_ANIMATION_HARD_CAP_MS as f64);
+            self.requested_animation_burst_present_on_wake = false;
+            self.last_burst_exit_reason = None;
         }
+        self.requested_animation_burst_present_on_wake |= present_on_wake;
         let hard_stop = self
             .requested_animation_burst_hard_stop_elapsed_ms
             .unwrap_or(elapsed_ms + REQUESTED_ANIMATION_HARD_CAP_MS as f64);
@@ -1777,9 +1865,6 @@ impl NativeRenderLoopState {
         self.requested_animation_burst_frames_remaining = self
             .requested_animation_burst_frames_remaining
             .max(REQUESTED_ANIMATION_BURST_MIN_FRAMES);
-        self.last_scheduler_reason = Some(reason);
-        self.current_scheduler_reason = Some(reason);
-        self.schedule_wake_after(now, native_target_frame_interval_duration());
     }
 
     pub fn consume_due_wake_after_poll(&mut self, now: Instant) -> bool {
@@ -1830,15 +1915,43 @@ impl NativeRenderLoopState {
                 .requested_animation_burst_quiet_until_elapsed_ms
                 .is_some_and(|quiet_until| elapsed_ms >= quiet_until)
         {
+            self.last_burst_exit_reason = Some("quiet_interval_elapsed".to_owned());
             self.clear_requested_animation_burst();
         }
     }
 
     fn clear_requested_animation_burst(&mut self) {
         self.requested_animation_burst_frames_remaining = 0;
+        self.requested_animation_burst_present_on_wake = false;
+        self.armed_frame_pending = false;
+        self.armed_frame_started_elapsed_ms = None;
         self.requested_animation_burst_started_elapsed_ms = None;
         self.requested_animation_burst_quiet_until_elapsed_ms = None;
         self.requested_animation_burst_hard_stop_elapsed_ms = None;
+    }
+
+    pub fn interaction_burst_active(&self, elapsed_ms: f64) -> bool {
+        self.requested_animation_burst_frames_remaining > 0
+            || self
+                .requested_animation_burst_quiet_until_elapsed_ms
+                .is_some_and(|quiet_until| elapsed_ms < quiet_until)
+    }
+
+    pub fn interaction_quiet_proof_readback_frame(&self, elapsed_ms: f64) -> bool {
+        self.current_frame_lane == Some(NativeFrameLane::AnimationFollowup)
+            && self.requested_animation_burst_frames_remaining == 0
+            && self
+                .requested_animation_burst_quiet_until_elapsed_ms
+                .is_some_and(|quiet_until| elapsed_ms < quiet_until)
+    }
+
+    pub fn defer_proof_readback_for_product_lane(&self, elapsed_ms: f64) -> bool {
+        if self.current_frame_lane == Some(NativeFrameLane::ProofOrHarness)
+            || self.current_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
+        {
+            return false;
+        }
+        self.interaction_burst_active(elapsed_ms)
     }
 
     pub fn consume_due_wake(&mut self, now: Instant) -> bool {
@@ -1849,8 +1962,17 @@ impl NativeRenderLoopState {
                     .requested_animation_burst_quiet_until_elapsed_ms
                     .is_some();
             let reason = if burst_pacing_active {
-                self.dirty_revision = self.dirty_revision.saturating_add(1);
-                NativeSchedulerReason::RequestedAnimation
+                if self.requested_animation_burst_present_on_wake {
+                    self.dirty_revision = self.dirty_revision.saturating_add(1);
+                    NativeSchedulerReason::RequestedAnimation
+                } else {
+                    self.armed_frame_token = self.armed_frame_token.saturating_add(1);
+                    self.armed_frame_pending = true;
+                    self.armed_frame_started_elapsed_ms = None;
+                    self.last_scheduler_reason = Some(NativeSchedulerReason::RequestedAnimation);
+                    self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
+                    return true;
+                }
             } else {
                 NativeSchedulerReason::Timer
             };
@@ -1864,6 +1986,52 @@ impl NativeRenderLoopState {
             true
         } else {
             false
+        }
+    }
+
+    pub fn note_armed_frame_input_sampled(&mut self, elapsed_ms: f64) {
+        if self.armed_frame_pending && self.armed_frame_started_elapsed_ms.is_none() {
+            self.armed_frame_started_elapsed_ms = Some(elapsed_ms);
+        }
+    }
+
+    pub fn clean_armed_poll_pending(&self) -> bool {
+        self.armed_frame_pending
+            && self.armed_frame_started_elapsed_ms.is_some()
+            && self.dirty_revision == self.presented_revision
+            && self.current_scheduler_reason.is_none()
+    }
+
+    pub fn skip_clean_armed_burst_present(&mut self, now: Instant, elapsed_ms: f64) {
+        if !self.clean_armed_poll_pending() {
+            return;
+        }
+        self.clean_armed_poll_count = self.clean_armed_poll_count.saturating_add(1);
+        self.skipped_clean_burst_present_count =
+            self.skipped_clean_burst_present_count.saturating_add(1);
+        self.armed_frame_pending = false;
+        self.armed_frame_started_elapsed_ms = None;
+        if self.requested_animation_burst_frames_remaining > 0 {
+            self.requested_animation_burst_frames_remaining = self
+                .requested_animation_burst_frames_remaining
+                .saturating_sub(1);
+        }
+        if self
+            .requested_animation_burst_hard_stop_elapsed_ms
+            .is_some_and(|hard_stop| elapsed_ms > hard_stop)
+        {
+            self.last_burst_exit_reason = Some("hard_cap_elapsed".to_owned());
+            self.clear_requested_animation_burst();
+            return;
+        }
+        let in_quiet_window = self
+            .requested_animation_burst_quiet_until_elapsed_ms
+            .is_some_and(|quiet_until| elapsed_ms < quiet_until);
+        if self.requested_animation_burst_frames_remaining > 0 || in_quiet_window {
+            self.schedule_wake_after(now, native_target_frame_interval_duration());
+        } else {
+            self.last_burst_exit_reason = Some("clean_armed_poll_quiet".to_owned());
+            self.clear_requested_animation_burst();
         }
     }
 
@@ -1909,7 +2077,9 @@ impl NativeRenderLoopState {
             if poll_result.role_revision > self.presented_revision {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             } else if self.last_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame) {
-                self.dirty_revision = self.dirty_revision.max(self.presented_revision);
+                self.dirty_revision = self
+                    .dirty_revision
+                    .max(self.presented_revision.saturating_add(1));
             } else if scheduler_only_repaint
                 || host_input_visible_repaint
                 || accepted_real_input_visible_repaint
@@ -2000,6 +2170,23 @@ fn post_present_subscriber_drain_allowed(
     presented_input_event_wake_count: u64,
 ) -> bool {
     current_input_event_wake_count <= presented_input_event_wake_count
+}
+
+fn pre_submit_proof_poll_allowed(
+    product_input_frame: bool,
+    interaction_burst_active: bool,
+    frame_lane: Option<NativeFrameLane>,
+    scheduler_reason: Option<NativeSchedulerReason>,
+) -> bool {
+    if product_input_frame {
+        return false;
+    }
+    if frame_lane == Some(NativeFrameLane::ProofOrHarness)
+        || scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
+    {
+        return true;
+    }
+    !interaction_burst_active
 }
 
 #[cfg(test)]
@@ -2129,16 +2316,27 @@ impl AsyncPostPresentProofSubscriberWorker {
         Some(report)
     }
 
-    fn drain_completed(&self, state: &mut NativeRenderLoopState) {
-        loop {
+    fn drain_completed(&self, state: &mut NativeRenderLoopState) -> usize {
+        self.drain_completed_limit(state, usize::MAX)
+    }
+
+    fn drain_completed_limit(
+        &self,
+        state: &mut NativeRenderLoopState,
+        max_completed: usize,
+    ) -> usize {
+        let mut completed = 0_usize;
+        while completed < max_completed {
             match self.results.try_recv() {
                 Ok(Ok(artifact)) => {
                     state.note_post_present_proof_subscriber_worker_completed();
                     state.note_post_present_proof_artifact(artifact);
+                    completed = completed.saturating_add(1);
                 }
                 Ok(Err(error)) => {
                     state.note_post_present_proof_subscriber_worker_error();
                     state.note_post_present_proof_subscriber_error(error);
+                    completed = completed.saturating_add(1);
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -2148,6 +2346,7 @@ impl AsyncPostPresentProofSubscriberWorker {
             state.post_present_proof_subscriber_worker_pending_batch_count =
                 shared.pending.len() as u64;
         }
+        completed
     }
 
     fn shutdown(&mut self) {
@@ -2166,7 +2365,7 @@ impl AsyncPostPresentProofSubscriberWorker {
 
     fn shutdown_and_drain(&mut self, state: &mut NativeRenderLoopState) {
         self.shutdown();
-        self.drain_completed(state);
+        let _ = self.drain_completed(state);
     }
 }
 
@@ -2519,9 +2718,9 @@ pub struct AppWindowSurfaceProof {
 fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
     if capabilities
         .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
+        .contains(&wgpu::PresentMode::Immediate)
     {
-        wgpu::PresentMode::Mailbox
+        wgpu::PresentMode::Immediate
     } else if capabilities
         .present_modes
         .contains(&wgpu::PresentMode::AutoNoVsync)
@@ -2529,9 +2728,9 @@ fn low_latency_present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::P
         wgpu::PresentMode::AutoNoVsync
     } else if capabilities
         .present_modes
-        .contains(&wgpu::PresentMode::Immediate)
+        .contains(&wgpu::PresentMode::Mailbox)
     {
-        wgpu::PresentMode::Immediate
+        wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo
     }
@@ -2572,7 +2771,7 @@ fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) ->
     match present_mode {
         wgpu::PresentMode::Mailbox
         | wgpu::PresentMode::Immediate
-        | wgpu::PresentMode::AutoNoVsync => SINGLE_FRAME_SURFACE_FRAME_LATENCY,
+        | wgpu::PresentMode::AutoNoVsync => PACED_SURFACE_FRAME_LATENCY,
         _ => PACED_SURFACE_FRAME_LATENCY,
     }
 }
@@ -4731,10 +4930,18 @@ async fn run_surface_probe_inner(
     let mut consecutive_unsampled_input_resamples = 0_u8;
     loop {
         let pre_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        let loop_start_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
         let pre_input_subscriber_drain_allowed =
             pre_input_event_wake_count <= last_sampled_input_event_wake_count;
         if pre_input_subscriber_drain_allowed {
-            async_post_present_proof_worker.drain_completed(&mut render_loop_state);
+            let pre_input_proof_drain_limit =
+                if render_loop_state.interaction_burst_active(loop_start_elapsed_ms) {
+                    PRE_INPUT_COMPLETED_PROOF_DRAIN_LIMIT
+                } else {
+                    usize::MAX
+                };
+            let _ = async_post_present_proof_worker
+                .drain_completed_limit(&mut render_loop_state, pre_input_proof_drain_limit);
             if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
                 match result {
                     Ok(result) => {
@@ -4847,7 +5054,12 @@ async fn run_surface_probe_inner(
                 }
             }
         } else if interactive_readback_job.is_some() {
-            render_loop_state.note_pre_input_subscriber_drain_skipped("pending_host_input");
+            let skip_reason = if render_loop_state.interaction_burst_active(loop_start_elapsed_ms) {
+                "interaction_burst"
+            } else {
+                "pending_host_input"
+            };
+            render_loop_state.note_pre_input_subscriber_drain_skipped(skip_reason);
         }
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
@@ -4934,12 +5146,16 @@ async fn run_surface_probe_inner(
             sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         }
         let input_sample_elapsed = input_sample_started.elapsed();
+        render_loop_state
+            .note_armed_frame_input_sampled(hold_started.elapsed().as_secs_f64() * 1000.0);
         last_sampled_input_event_wake_count = sampled_input_event_wake_count;
         let sampled_delta_has_real_os_events = input.real_os_events_observed;
         let raw_host_input_wake_pending =
             sampled_input_event_wake_count > last_presented_input_event_wake_count;
         let host_input_observed_this_turn =
             input.real_os_events_observed || raw_host_input_wake_pending;
+        let reportable_host_input_this_turn =
+            host_input_observed_this_turn && native_input_delta_has_reportable_host_event(&input);
         let accessibility_started = Instant::now();
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
@@ -4949,6 +5165,7 @@ async fn run_surface_probe_inner(
         render_loop_state.note_input_poll();
         let hook_started = Instant::now();
         let mut poll_result = None;
+        let mut dirty_poll_result_this_turn = false;
         if host_input_observed_this_turn
             && let Some(input_poll_result) = poll_native_window_input_hooks(
                 &mut hooks,
@@ -4966,9 +5183,12 @@ async fn run_surface_probe_inner(
                 },
             )?
         {
-            let effective_input_poll_result =
-                effective_poll_result_for_host_input(input_poll_result, true);
+            let effective_input_poll_result = effective_poll_result_for_host_input(
+                input_poll_result,
+                reportable_host_input_this_turn,
+            );
             if effective_input_poll_result.dirty || sampled_delta_has_real_os_events {
+                dirty_poll_result_this_turn = effective_input_poll_result.dirty;
                 poll_result = Some(effective_input_poll_result);
             }
         }
@@ -5005,15 +5225,29 @@ async fn run_surface_probe_inner(
             }
             let effective_poll_result = effective_poll_result_for_host_input(
                 poll_result.clone(),
-                host_input_observed_this_turn,
+                reportable_host_input_this_turn,
             );
             render_loop_state
                 .apply_poll_result(&effective_poll_result, host_input_observed_this_turn);
-            if host_input_observed_this_turn && effective_poll_result.dirty {
+            dirty_poll_result_this_turn |= effective_poll_result.dirty;
+            if reportable_host_input_this_turn
+                && effective_poll_result.dirty
+                && native_input_delta_is_pointer_motion_only(&input)
+            {
+                render_loop_state.request_interactive_prewarm_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            } else if reportable_host_input_this_turn && effective_poll_result.dirty {
                 render_loop_state.request_animation_burst(
                     poll_started_at,
                     hold_started.elapsed().as_secs_f64() * 1000.0,
                     NativeSchedulerReason::HostInput,
+                );
+            } else if native_input_delta_is_pointer_motion_only(&input) {
+                render_loop_state.request_interactive_prewarm_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
                 );
             } else if effective_poll_result.wants_animation_frame {
                 render_loop_state.request_animation_burst(
@@ -5025,7 +5259,7 @@ async fn run_surface_probe_inner(
             if effective_poll_result.dirty {
                 render_loop_state.note_dirty_poll(role_poll_completed_elapsed_ms);
             }
-            if host_input_observed_this_turn && effective_poll_result.dirty {
+            if reportable_host_input_this_turn && effective_poll_result.dirty {
                 let sampled_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
                     &input_event_wake_timeline,
                     sampled_input_event_wake_count,
@@ -5046,10 +5280,24 @@ async fn run_surface_probe_inner(
                     )),
                 );
             }
+            if should_accept_input_cursor_after_poll(
+                host_input_observed_this_turn,
+                &input,
+                &effective_poll_result,
+            ) {
+                accept_input_cursor(&mut mouse, &mut input_cursor, &input);
+            }
+        } else if native_input_delta_is_pointer_motion_only(&input) {
+            render_loop_state.request_interactive_prewarm_burst(
+                poll_started_at,
+                hold_started.elapsed().as_secs_f64() * 1000.0,
+            );
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
-        } else if host_input_observed_this_turn && !native_input_delta_is_button_press_only(&input)
+        } else if reportable_host_input_this_turn
+            && !native_input_delta_is_button_press_only(&input)
         {
             let app_window_accept_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
+            dirty_poll_result_this_turn = true;
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
             render_loop_state.request_animation_burst(
                 poll_started_at,
@@ -5075,7 +5323,9 @@ async fn run_surface_probe_inner(
                 )),
             );
         }
-        render_loop_state.consume_due_wake_after_poll(Instant::now());
+        if !dirty_poll_result_this_turn {
+            render_loop_state.consume_due_wake_after_poll(Instant::now());
+        }
         let wake_generation = wake_handle.generation();
         let wake_generation_changed = wake_generation != last_wake_generation;
         if wake_generation_changed {
@@ -5129,6 +5379,14 @@ async fn run_surface_probe_inner(
         }
         if !unsampled_input_wake_count {
             consecutive_unsampled_input_resamples = 0;
+        }
+        if render_loop_state.clean_armed_poll_pending()
+            && !render_loop_state.should_render(Instant::now(), false)
+        {
+            render_loop_state.skip_clean_armed_burst_present(
+                Instant::now(),
+                hold_started.elapsed().as_secs_f64() * 1000.0,
+            );
         }
         if !render_loop_state.should_render(Instant::now(), false) {
             let bookkeeping_elapsed = bookkeeping_started.elapsed();
@@ -5498,7 +5756,21 @@ async fn run_surface_probe_inner(
             && external_render_proof_replaces_interactive_readback(
                 external_render_proof.as_deref(),
             );
-        if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
+        let product_input_frame = host_input_observed_this_turn
+            || render_loop_state.current_frame_lane == Some(NativeFrameLane::ProductInteraction)
+            || render_loop_state.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
+            || render_loop_state
+                .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count);
+        let loop_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
+        let allow_pre_submit_proof_poll = pre_submit_proof_poll_allowed(
+            product_input_frame,
+            render_loop_state.interaction_burst_active(loop_elapsed_ms),
+            render_loop_state.current_frame_lane,
+            render_loop_state.current_scheduler_reason,
+        );
+        if allow_pre_submit_proof_poll
+            && let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job)
+        {
             match result {
                 Ok(result) => {
                     last_interactive_readback_finish_ms = Some(result.finish_ms);
@@ -5529,17 +5801,17 @@ async fn run_surface_probe_inner(
             }
         }
         let readback_job_in_flight = interactive_readback_job.is_some();
-        let product_input_frame = host_input_observed_this_turn
-            || render_loop_state.current_frame_lane == Some(NativeFrameLane::ProductInteraction)
-            || render_loop_state.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
-            || render_loop_state
-                .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count);
+        let interaction_quiet_readback_frame =
+            render_loop_state.interaction_quiet_proof_readback_frame(loop_elapsed_ms);
+        let product_lane_proof_deferred =
+            render_loop_state.defer_proof_readback_for_product_lane(loop_elapsed_ms);
         let interactive_readback_decision = interactive_surface_readback_decision(
             options.role,
             readback_enabled,
             skip_interactive_surface_readback,
             readback_job_in_flight,
             product_input_frame,
+            product_lane_proof_deferred,
         );
         if interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure {
             render_loop_state.telemetry_drop_count =
@@ -5550,9 +5822,40 @@ async fn run_surface_probe_inner(
             == InteractiveSurfaceReadbackDecision::DeferProductInput
         {
             render_loop_state.note_post_present_subscriber_drain_deferred("product_input_frame");
+            render_loop_state.note_proof_readback_deferred("product_input_frame");
+        } else if interactive_readback_decision
+            == InteractiveSurfaceReadbackDecision::DeferInteractionBurst
+        {
+            render_loop_state.note_post_present_subscriber_drain_deferred("interaction_burst");
+            render_loop_state.note_proof_readback_deferred("interaction_burst");
         }
         let interactive_readback_requested =
             interactive_readback_decision == InteractiveSurfaceReadbackDecision::Queue;
+        if interactive_readback_requested && interaction_quiet_readback_frame {
+            render_loop_state.note_proof_readback_queued_during_interaction_quiet();
+        }
+        if !use_offscreen_copy_to_present {
+            let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+            if pre_present_input_event_wake_count > sampled_input_event_wake_count
+                && !render_loop_state
+                    .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count)
+                && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+            {
+                render_loop_state.note_input_pre_present_resample(
+                    pre_present_input_event_wake_count
+                        .saturating_sub(sampled_input_event_wake_count),
+                );
+                consecutive_unsampled_input_resamples =
+                    consecutive_unsampled_input_resamples.saturating_add(1);
+                render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+                render_loop_state.scheduled_wake_count =
+                    render_loop_state.scheduled_wake_count.saturating_add(1);
+                continue;
+            }
+            if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
+                consecutive_unsampled_input_resamples = 0;
+            }
+        }
         let interactive_readback =
             if interactive_readback_requested && !use_offscreen_copy_to_present {
                 let artifact_dir = options
@@ -5578,28 +5881,6 @@ async fn run_surface_probe_inner(
             } else {
                 None
             };
-        if !use_offscreen_copy_to_present {
-            let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
-            if pre_present_input_event_wake_count > sampled_input_event_wake_count
-                && !render_loop_state
-                    .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count)
-                && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
-            {
-                render_loop_state.note_input_pre_present_resample(
-                    pre_present_input_event_wake_count
-                        .saturating_sub(sampled_input_event_wake_count),
-                );
-                consecutive_unsampled_input_resamples =
-                    consecutive_unsampled_input_resamples.saturating_add(1);
-                render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
-                render_loop_state.scheduled_wake_count =
-                    render_loop_state.scheduled_wake_count.saturating_add(1);
-                continue;
-            }
-            if pre_present_input_event_wake_count <= sampled_input_event_wake_count {
-                consecutive_unsampled_input_resamples = 0;
-            }
-        }
         last_interactive_surface_readback_queued = interactive_readback_requested;
         last_interactive_surface_readback_skipped_for_external_proof =
             interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipExternalProof;
@@ -6566,6 +6847,7 @@ enum InteractiveSurfaceReadbackDecision {
     SkipExternalProof,
     SkipBackpressure,
     DeferProductInput,
+    DeferInteractionBurst,
     Off,
 }
 
@@ -6575,6 +6857,7 @@ fn interactive_surface_readback_decision(
     external_proof_replaces_readback: bool,
     readback_job_in_flight: bool,
     product_input_frame: bool,
+    interaction_burst_active: bool,
 ) -> InteractiveSurfaceReadbackDecision {
     if !matches!(role, NativeWindowRole::Preview | NativeWindowRole::Dev) || !readback_enabled {
         return InteractiveSurfaceReadbackDecision::Off;
@@ -6585,6 +6868,9 @@ fn interactive_surface_readback_decision(
     if product_input_frame {
         return InteractiveSurfaceReadbackDecision::DeferProductInput;
     }
+    if interaction_burst_active {
+        return InteractiveSurfaceReadbackDecision::DeferInteractionBurst;
+    }
     if readback_job_in_flight {
         return InteractiveSurfaceReadbackDecision::SkipBackpressure;
     }
@@ -6592,15 +6878,15 @@ fn interactive_surface_readback_decision(
 }
 
 fn should_defer_render_for_interactive_readback(
-    _readback_enabled: bool,
-    _readback_job_in_flight: bool,
-    _real_os_input_observed: bool,
-    _scheduler_reason: Option<NativeSchedulerReason>,
+    readback_enabled: bool,
+    readback_job_in_flight: bool,
+    real_os_input_observed: bool,
+    scheduler_reason: Option<NativeSchedulerReason>,
 ) -> bool {
-    // Proof/readback backpressure must coalesce proof work, not stall product
-    // frames. `interactive_surface_readback_decision` still reports
-    // SkipBackpressure for verifier accounting.
-    false
+    readback_enabled
+        && readback_job_in_flight
+        && !real_os_input_observed
+        && scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
 }
 
 fn requested_present_path_mode_from_env() -> NativePresentPathMode {
@@ -7732,6 +8018,11 @@ fn post_present_proof_isolation_report(
         "worker_dropped_count": state.post_present_proof_subscriber_worker_dropped_count,
         "worker_error_count": state.post_present_proof_subscriber_worker_error_count,
         "subscriber_error_count": state.post_present_proof_subscriber_error_count,
+        "proof_readback_deferred_count": state.proof_readback_deferred_count,
+        "proof_readback_deferred_for_product_input_count": state.proof_readback_deferred_for_product_input_count,
+        "proof_readback_deferred_for_interaction_burst_count": state.proof_readback_deferred_for_interaction_burst_count,
+        "last_proof_readback_deferred_reason": state.last_proof_readback_deferred_reason.clone(),
+        "proof_readback_queued_during_interaction_quiet_count": state.proof_readback_queued_during_interaction_quiet_count,
         "artifact_count": state.post_present_proof_artifact_count,
         "recent_queue_count": state.recent_post_present_proof_queue.len(),
         "recent_artifact_count": state.recent_post_present_proof_artifacts.len()
@@ -8315,6 +8606,62 @@ fn write_render_loop_state_report(
         "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
     if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "requested_animation_burst_count".to_owned(),
+            serde_json::json!(state.requested_animation_burst_count),
+        );
+        object.insert(
+            "requested_animation_prewarm_count".to_owned(),
+            serde_json::json!(state.requested_animation_prewarm_count),
+        );
+        object.insert(
+            "requested_animation_burst_present_on_wake".to_owned(),
+            serde_json::json!(state.requested_animation_burst_present_on_wake),
+        );
+        object.insert(
+            "armed_frame_token".to_owned(),
+            serde_json::json!(state.armed_frame_token),
+        );
+        object.insert(
+            "armed_frame_started_elapsed_ms".to_owned(),
+            serde_json::json!(state.armed_frame_started_elapsed_ms),
+        );
+        object.insert(
+            "clean_armed_poll_count".to_owned(),
+            serde_json::json!(state.clean_armed_poll_count),
+        );
+        object.insert(
+            "skipped_clean_burst_present_count".to_owned(),
+            serde_json::json!(state.skipped_clean_burst_present_count),
+        );
+        object.insert(
+            "input_waited_for_already_armed_frame_count".to_owned(),
+            serde_json::json!(state.input_waited_for_already_armed_frame_count),
+        );
+        object.insert(
+            "last_burst_exit_reason".to_owned(),
+            serde_json::json!(state.last_burst_exit_reason),
+        );
+        object.insert(
+            "proof_readback_deferred_count".to_owned(),
+            serde_json::json!(state.proof_readback_deferred_count),
+        );
+        object.insert(
+            "proof_readback_deferred_for_product_input_count".to_owned(),
+            serde_json::json!(state.proof_readback_deferred_for_product_input_count),
+        );
+        object.insert(
+            "proof_readback_deferred_for_interaction_burst_count".to_owned(),
+            serde_json::json!(state.proof_readback_deferred_for_interaction_burst_count),
+        );
+        object.insert(
+            "last_proof_readback_deferred_reason".to_owned(),
+            serde_json::json!(state.last_proof_readback_deferred_reason),
+        );
+        object.insert(
+            "proof_readback_queued_during_interaction_quiet_count".to_owned(),
+            serde_json::json!(state.proof_readback_queued_during_interaction_quiet_count),
+        );
         object.insert(
             "accepted_host_input_event".to_owned(),
             serde_json::json!(state.last_accepted_host_input_event),
@@ -9099,6 +9446,16 @@ fn accept_input_cursor(
     cursor.accept(input);
 }
 
+fn should_accept_input_cursor_after_poll(
+    host_input_observed_this_turn: bool,
+    input: &NativeInputAdapterProof,
+    poll_result: &NativePollResult,
+) -> bool {
+    !(host_input_observed_this_turn
+        && native_input_delta_is_button_press_only(input)
+        && !poll_result.dirty)
+}
+
 fn accepted_host_input_event_summary(
     input: &NativeInputAdapterProof,
     input_event_wake_count: u64,
@@ -9276,6 +9633,14 @@ fn native_input_delta_is_button_press_only(input: &NativeInputAdapterProof) -> b
         && input.keyboard_events.is_empty()
         && input.scroll_delta_x == 0.0
         && input.scroll_delta_y == 0.0
+}
+
+fn native_input_delta_has_reportable_host_event(input: &NativeInputAdapterProof) -> bool {
+    !input.mouse_button_events.is_empty()
+        || !input.keyboard_events.is_empty()
+        || input.scroll_delta_x != 0.0
+        || input.scroll_delta_y != 0.0
+        || native_input_delta_is_pointer_motion_only(input)
 }
 
 fn native_input_delta_is_pointer_motion_only(input: &NativeInputAdapterProof) -> bool {
@@ -9854,6 +10219,47 @@ mod tests {
         );
         assert_eq!(artifact.frame_evidence_key, key);
         assert_eq!(artifact.completed_elapsed_ms, Some(61.0));
+    }
+
+    #[test]
+    fn async_post_present_proof_worker_drain_can_be_bounded() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 11,
+            content_revision: 12,
+            layout_revision: 4,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(16),
+            present_id: 21,
+            proof_request_id: None,
+        };
+        let shared = Arc::new((
+            Mutex::new(AsyncPostPresentProofSubscriberShared::default()),
+            Condvar::new(),
+        ));
+        let (sender, results) = mpsc::channel();
+        let worker = AsyncPostPresentProofSubscriberWorker {
+            shared,
+            results,
+            worker: None,
+        };
+        for index in 0..3_u64 {
+            sender
+                .send(Ok(native_post_present_json_proof_artifact(
+                    NativePostPresentProofRequestKind::VisibleBoundText,
+                    key.clone(),
+                    Some(index as f64),
+                    serde_json::json!({ "index": index }),
+                )))
+                .expect("send proof artifact");
+        }
+
+        assert_eq!(worker.drain_completed_limit(&mut state, 2), 2);
+        assert_eq!(state.post_present_proof_artifact_count, 2);
+        assert_eq!(worker.drain_completed(&mut state), 1);
+        assert_eq!(state.post_present_proof_artifact_count, 3);
     }
 
     #[test]
@@ -11414,6 +11820,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             InteractiveSurfaceReadbackDecision::Queue
         );
@@ -11422,6 +11829,7 @@ mod tests {
                 NativeWindowRole::Preview,
                 true,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -11434,20 +11842,47 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
             ),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, false, false),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Dev,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
             InteractiveSurfaceReadbackDecision::Queue
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true, false),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Dev,
+                true,
+                false,
+                true,
+                false,
+                false
+            ),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
         assert_eq!(
             interactive_surface_readback_decision(
                 NativeWindowRole::Preview,
+                true,
+                false,
+                true,
+                false,
+                true,
+            ),
+            InteractiveSurfaceReadbackDecision::DeferInteractionBurst
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                false,
                 false,
                 false,
                 false,
@@ -11462,11 +11897,19 @@ mod tests {
                 false,
                 false,
                 true,
+                true,
             ),
             InteractiveSurfaceReadbackDecision::DeferProductInput
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true, true),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Dev,
+                true,
+                false,
+                true,
+                true,
+                true
+            ),
             InteractiveSurfaceReadbackDecision::DeferProductInput
         );
     }
@@ -11537,6 +11980,18 @@ mod tests {
 
     #[test]
     fn verifier_readback_backpressure_never_defers_product_rendering() {
+        assert!(should_defer_render_for_interactive_readback(
+            true,
+            true,
+            false,
+            Some(NativeSchedulerReason::VerifierFrame)
+        ));
+        assert!(!should_defer_render_for_interactive_readback(
+            true,
+            false,
+            false,
+            Some(NativeSchedulerReason::VerifierFrame)
+        ));
         assert!(!should_defer_render_for_interactive_readback(
             true,
             true,
@@ -12246,6 +12701,68 @@ mod tests {
     }
 
     #[test]
+    fn proof_readback_defers_during_product_interaction_burst() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+        state.current_frame_lane = Some(NativeFrameLane::AnimationFollowup);
+
+        assert!(state.interaction_burst_active(11.0));
+        assert!(state.defer_proof_readback_for_product_lane(11.0));
+
+        state.note_proof_readback_deferred("interaction_burst");
+        assert_eq!(state.proof_readback_deferred_count, 1);
+        assert_eq!(state.proof_readback_deferred_for_interaction_burst_count, 1);
+        assert_eq!(state.proof_readback_deferred_for_product_input_count, 0);
+        assert_eq!(
+            state.last_proof_readback_deferred_reason.as_deref(),
+            Some("interaction_burst")
+        );
+
+        state.current_frame_lane = Some(NativeFrameLane::ProofOrHarness);
+        assert!(!state.defer_proof_readback_for_product_lane(11.0));
+
+        state.current_frame_lane = Some(NativeFrameLane::AnimationFollowup);
+        state.requested_animation_burst_frames_remaining = 0;
+        assert!(state.interaction_burst_active(11.0));
+        assert!(state.interaction_quiet_proof_readback_frame(11.0));
+        assert!(state.defer_proof_readback_for_product_lane(11.0));
+
+        state.current_frame_lane = Some(NativeFrameLane::ProofOrHarness);
+        assert!(!state.defer_proof_readback_for_product_lane(11.0));
+    }
+
+    #[test]
+    fn proof_frames_poll_completed_readback_during_interaction_burst() {
+        assert!(!pre_submit_proof_poll_allowed(
+            true,
+            true,
+            Some(NativeFrameLane::ProductInteraction),
+            Some(NativeSchedulerReason::HostInput),
+        ));
+        assert!(!pre_submit_proof_poll_allowed(
+            false,
+            true,
+            Some(NativeFrameLane::AnimationFollowup),
+            Some(NativeSchedulerReason::RequestedAnimation),
+        ));
+        assert!(pre_submit_proof_poll_allowed(
+            false,
+            true,
+            Some(NativeFrameLane::ProofOrHarness),
+            Some(NativeSchedulerReason::VerifierFrame),
+        ));
+        assert!(pre_submit_proof_poll_allowed(
+            false,
+            false,
+            Some(NativeFrameLane::RuntimeOrLayout),
+            Some(NativeSchedulerReason::ExternalWake),
+        ));
+    }
+
+    #[test]
     fn requested_animation_burst_paces_until_quiet_interval_expires() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
@@ -12324,6 +12841,94 @@ mod tests {
             state.next_wake_at.is_some_and(|wake_at| wake_at > now),
             "visible-changing host input should keep a short paced burst hot after the current product frame"
         );
+    }
+
+    #[test]
+    fn pointer_motion_prewarm_schedules_hot_burst_without_dirtying_current_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+        let presented = state.presented_revision;
+
+        state.request_interactive_prewarm_burst(now, 10.0);
+
+        assert_eq!(state.dirty_revision, presented);
+        assert_eq!(state.current_scheduler_reason, None);
+        assert_eq!(state.current_frame_lane, None);
+        assert!(!state.should_render(now, false));
+        assert_eq!(state.requested_animation_prewarm_count, 1);
+        assert_eq!(
+            state.requested_animation_burst_frames_remaining,
+            REQUESTED_ANIMATION_BURST_MIN_FRAMES
+        );
+
+        let due = now + native_target_frame_interval_duration();
+        assert!(state.consume_due_wake(due));
+        assert_eq!(
+            state.last_scheduler_reason,
+            Some(NativeSchedulerReason::RequestedAnimation)
+        );
+        assert_eq!(state.current_scheduler_reason, None);
+        assert_eq!(state.current_frame_lane, None);
+        assert!(!state.should_render(due, false));
+
+        state.note_armed_frame_input_sampled(27.0);
+        assert!(state.clean_armed_poll_pending());
+        state.skip_clean_armed_burst_present(due, 27.0);
+
+        assert_eq!(state.clean_armed_poll_count, 1);
+        assert_eq!(state.skipped_clean_burst_present_count, 1);
+        assert_eq!(
+            state.requested_animation_burst_frames_remaining,
+            REQUESTED_ANIMATION_BURST_MIN_FRAMES - 1
+        );
+
+        state.note_armed_frame_input_sampled(28.0);
+        assert!(
+            !state.clean_armed_poll_pending(),
+            "an armed sampling turn must be consumed after one clean poll"
+        );
+    }
+
+    #[test]
+    fn host_input_after_pointer_prewarm_preserves_product_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_interactive_prewarm_burst(now, 10.0);
+        let prewarm_wake = state
+            .next_wake_at
+            .expect("pointer prewarm should schedule a delayed frame");
+
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision,
+                scheduler_reason: Some(NativeSchedulerReason::HostInput),
+                role_dirty_reason: Some(NativeRoleDirtyReason::FocusChanged),
+                frame_lane: Some(NativeFrameLane::ProductInteraction),
+                accepted_host_input_event_hint: None,
+                next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
+                wants_animation_frame: false,
+                diagnostics: None,
+                accessibility_update: None,
+            },
+            true,
+        );
+        state.note_accepted_host_input(11, 12.0, false, None);
+
+        assert!(state.consume_due_wake_after_poll(prewarm_wake));
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert_eq!(
+            state.current_frame_lane,
+            Some(NativeFrameLane::ProductInteraction)
+        );
+        assert!(state.should_render(prewarm_wake, false));
     }
 
     #[test]
@@ -12571,6 +13176,12 @@ mod tests {
         assert_eq!(
             state.last_role_dirty_reason,
             Some(NativeRoleDirtyReason::SourcePayloadAccepted)
+        );
+        assert!(state.should_render(Instant::now(), false));
+        assert_eq!(state.dirty_revision, state.presented_revision + 1);
+        assert_eq!(
+            state.current_frame_lane,
+            Some(NativeFrameLane::ProofOrHarness)
         );
     }
 
@@ -12851,7 +13462,7 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_present_mode_prefers_mailbox_when_available() {
+    fn low_latency_present_mode_prefers_nonblocking_present_modes() {
         let mut capabilities = wgpu::SurfaceCapabilities {
             formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
             present_modes: vec![
@@ -12865,7 +13476,7 @@ mod tests {
 
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::Immediate
         );
 
         capabilities.present_modes = vec![
@@ -12875,7 +13486,7 @@ mod tests {
         ];
         assert_eq!(
             low_latency_present_mode(&capabilities),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::AutoNoVsync
         );
 
         capabilities.present_modes = vec![wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
@@ -12922,16 +13533,16 @@ mod tests {
         );
         assert_eq!(
             configured_low_latency_present_mode(&capabilities, Some("fifo-relaxed")),
-            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
             "unsupported overrides fall back to the normal low-latency policy"
         );
         assert_eq!(
             configured_low_latency_present_mode(&capabilities, Some("not-a-mode")),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::Immediate
         );
         assert_eq!(
             configured_low_latency_present_mode(&capabilities, None),
-            wgpu::PresentMode::Mailbox
+            wgpu::PresentMode::Immediate
         );
         assert_eq!(
             configured_low_latency_present_mode(&capabilities, Some("immediate")),
@@ -12941,10 +13552,10 @@ mod tests {
     }
 
     #[test]
-    fn interactive_surface_latency_keeps_low_latency_modes_single_frame_in_flight() {
+    fn interactive_surface_latency_uses_bounded_multiple_frames_in_flight() {
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox),
-            SINGLE_FRAME_SURFACE_FRAME_LATENCY
+            PACED_SURFACE_FRAME_LATENCY
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Fifo),
@@ -12952,11 +13563,11 @@ mod tests {
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Immediate),
-            SINGLE_FRAME_SURFACE_FRAME_LATENCY
+            PACED_SURFACE_FRAME_LATENCY
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::AutoNoVsync),
-            SINGLE_FRAME_SURFACE_FRAME_LATENCY
+            PACED_SURFACE_FRAME_LATENCY
         );
     }
 
@@ -12964,7 +13575,7 @@ mod tests {
     fn configured_surface_frame_latency_honors_bounded_override() {
         assert_eq!(
             configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, None),
-            (SINGLE_FRAME_SURFACE_FRAME_LATENCY, "present_mode_default")
+            (PACED_SURFACE_FRAME_LATENCY, "present_mode_default")
         );
         assert_eq!(
             configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("2")),
@@ -12980,7 +13591,7 @@ mod tests {
         );
         assert_eq!(
             configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("nope")),
-            (SINGLE_FRAME_SURFACE_FRAME_LATENCY, "invalid_env_default")
+            (PACED_SURFACE_FRAME_LATENCY, "invalid_env_default")
         );
     }
 
@@ -13712,6 +14323,86 @@ mod tests {
 
         assert!(native_input_delta_is_button_press_only(&press_only));
         assert!(!native_input_delta_is_button_press_only(&click_pair));
+    }
+
+    #[test]
+    fn clean_press_only_poll_does_not_accept_input_cursor() {
+        let press_only = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+                event_elapsed_ms: None,
+            }],
+            ..empty_input_adapter_proof(false)
+        };
+        let clean_poll = NativePollResult::clean(0);
+
+        assert!(
+            !should_accept_input_cursor_after_poll(true, &press_only, &clean_poll),
+            "a clean role poll must not consume the only press edge before source input accepts it"
+        );
+    }
+
+    #[test]
+    fn dirty_press_only_poll_accepts_input_cursor() {
+        let press_only = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+                event_elapsed_ms: None,
+            }],
+            ..empty_input_adapter_proof(false)
+        };
+        let dirty_poll = NativePollResult {
+            dirty: true,
+            scheduler_reason: Some(NativeSchedulerReason::HostInput),
+            ..NativePollResult::clean(1)
+        };
+
+        assert!(
+            should_accept_input_cursor_after_poll(true, &press_only, &dirty_poll),
+            "once a role accepts a press edge, the native cursor can advance"
+        );
+    }
+
+    #[test]
+    fn raw_wake_without_input_delta_is_not_reportable_host_input() {
+        let raw_wake = NativeInputAdapterProof {
+            real_os_events_observed: false,
+            ..empty_input_adapter_proof(false)
+        };
+        let press = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+                event_elapsed_ms: None,
+            }],
+            ..empty_input_adapter_proof(false)
+        };
+        let motion = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_motion_event_count: 3,
+            mouse_window_pos: Some(NativeMouseWindowPosition {
+                x: 10.0,
+                y: 20.0,
+                window_width: 640.0,
+                window_height: 480.0,
+            }),
+            ..empty_input_adapter_proof(false)
+        };
+
+        assert!(!native_input_delta_has_reportable_host_event(&raw_wake));
+        assert!(native_input_delta_has_reportable_host_event(&press));
+        assert!(native_input_delta_has_reportable_host_event(&motion));
     }
 
     #[test]

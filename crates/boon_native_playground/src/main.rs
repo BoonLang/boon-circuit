@@ -12277,6 +12277,8 @@ fn native_gpu_app_owned_render_hook(
         });
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
+        Some("preview_active_scene"),
+        Some("active_preview_scene_patch"),
         context.render_target_kind,
         Some(layout_identity.clone()),
         Some(product_render_scene_identity.clone()),
@@ -12337,6 +12339,7 @@ fn preview_native_render_frame_metrics(
         render_hook_outer_total_ms: None,
         render_hook_phase_timings: None,
         product_frame: None,
+        product_result: None,
         post_present_proof_requests: Vec::new(),
     }
 }
@@ -12498,6 +12501,8 @@ fn preview_product_patch_summary(
 
 fn preview_attach_product_proof_boundary(
     metrics: &mut boon_native_app_window::NativeRenderFrameMetrics,
+    product_result_owner: Option<&str>,
+    product_result_kind: Option<&str>,
     render_target_kind: &str,
     layout_identity: Option<String>,
     render_scene_identity: Option<String>,
@@ -12507,7 +12512,7 @@ fn preview_attach_product_proof_boundary(
     post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
 ) {
     let post_present_proof_request_count = post_present_proof_requests.len() as u32;
-    metrics.product_frame = Some(boon_native_app_window::NativeRenderedProductFrame {
+    let product_frame = boon_native_app_window::NativeRenderedProductFrame {
         schema_version: 1,
         render_target_kind: render_target_kind.to_owned(),
         visible_surface_rendered: true,
@@ -12518,7 +12523,18 @@ fn preview_attach_product_proof_boundary(
         legacy_render_hook_proof_built_pre_present,
         post_present_proof_request_count,
         product_patch,
-    });
+    };
+    metrics.product_frame = Some(product_frame.clone());
+    metrics.product_result =
+        product_result_owner.map(|owner| boon_native_app_window::NativeProductFrameResult {
+            schema_version: 1,
+            owner: owner.to_owned(),
+            result_kind: product_result_kind
+                .unwrap_or("presented_product_frame")
+                .to_owned(),
+            product_frame: product_frame.clone(),
+            post_present_proof_requests: post_present_proof_requests.clone(),
+        });
     metrics.post_present_proof_requests = post_present_proof_requests;
 }
 
@@ -13967,6 +13983,8 @@ fn native_gpu_dev_visible_render_hook(
                 preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
             preview_attach_product_proof_boundary(
                 &mut render_frame_metrics,
+                None,
+                None,
                 render_target_kind,
                 Some(cache.layout_frame_hash.clone()),
                 Some(cache.render_scene_identity.clone()),
@@ -14082,6 +14100,8 @@ fn native_gpu_dev_visible_render_hook(
         preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
+        None,
+        None,
         render_target_kind,
         Some(cache.layout_frame_hash.clone()),
         Some(cache.render_scene_identity.clone()),

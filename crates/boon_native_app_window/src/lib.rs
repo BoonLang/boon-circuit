@@ -3543,6 +3543,16 @@ pub struct NativeProductPatchSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductFrameResult {
+    pub schema_version: u32,
+    pub owner: String,
+    pub result_kind: String,
+    pub product_frame: NativeRenderedProductFrame,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeProductFrameCommit {
     pub schema_version: u32,
     pub commit_source: String,
@@ -3607,6 +3617,11 @@ pub struct NativeProductFrameCommit {
     pub post_present_proof_request_count: u32,
     pub legacy_pre_present_proof_request_count: u32,
     pub legacy_product_proof_built_pre_present: bool,
+    pub product_result_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_result_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_result_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -3643,6 +3658,8 @@ pub struct NativeRenderFrameMetrics {
     pub render_hook_phase_timings: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_frame: Option<NativeRenderedProductFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_result: Option<NativeProductFrameResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
 }
@@ -7535,9 +7552,29 @@ fn product_frame_commit_for_presented_frame(
     input_timing: Option<NativeAcceptedInputFrameTiming>,
 ) -> NativeProductFrameCommit {
     let render_frame_metrics = state.last_render_frame_metrics.as_ref();
-    let product_frame = render_frame_metrics.and_then(|metrics| metrics.product_frame.clone());
-    let post_present_proof_requests = render_frame_metrics
-        .map(|metrics| metrics.post_present_proof_requests.clone())
+    let product_result = render_frame_metrics.and_then(|metrics| metrics.product_result.clone());
+    let product_result_source = if product_result.is_some() {
+        "native_product_render_result"
+    } else if render_frame_metrics
+        .and_then(|metrics| metrics.product_frame.as_ref())
+        .is_some()
+    {
+        "legacy_render_frame_metrics"
+    } else {
+        "missing"
+    };
+    let product_result_owner = product_result.as_ref().map(|result| result.owner.clone());
+    let product_result_kind = product_result
+        .as_ref()
+        .map(|result| result.result_kind.clone());
+    let product_frame = product_result
+        .as_ref()
+        .map(|result| result.product_frame.clone())
+        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.product_frame.clone()));
+    let post_present_proof_requests = product_result
+        .as_ref()
+        .map(|result| result.post_present_proof_requests.clone())
+        .or_else(|| render_frame_metrics.map(|metrics| metrics.post_present_proof_requests.clone()))
         .unwrap_or_default();
     let legacy_pre_present_proof_request_count = post_present_proof_requests
         .iter()
@@ -7596,6 +7633,9 @@ fn product_frame_commit_for_presented_frame(
         post_present_proof_requests,
         legacy_pre_present_proof_request_count,
         legacy_product_proof_built_pre_present,
+        product_result_source: product_result_source.to_owned(),
+        product_result_owner,
+        product_result_kind,
         product_frame,
     }
 }
@@ -10637,6 +10677,108 @@ mod tests {
     }
 
     #[test]
+    fn product_frame_commit_prefers_typed_product_result_over_legacy_metrics() {
+        let key = FrameEvidenceKey {
+            frame_seq: 9,
+            content_revision: 11,
+            layout_revision: 3,
+            render_scene_revision: 5,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(13),
+            present_id: 9,
+            proof_request_id: None,
+        };
+        let typed_frame = NativeRenderedProductFrame {
+            schema_version: 1,
+            render_target_kind: "visible-surface-direct".to_owned(),
+            visible_surface_rendered: true,
+            visible_present_path: true,
+            layout_identity: Some("layout:typed".to_owned()),
+            render_scene_identity: Some("scene:typed".to_owned()),
+            legacy_proof_json_built_pre_present: false,
+            legacy_render_hook_proof_built_pre_present: false,
+            post_present_proof_request_count: 1,
+            product_patch: Some(NativeProductPatchSummary {
+                schema_version: 1,
+                status: "pass".to_owned(),
+                owner: "preview_active_scene".to_owned(),
+                patch_kind: "direct_input_overlay_render_scene_patch".to_owned(),
+                source: "retained_bound_sync".to_owned(),
+                active_scene_identity: Some("active-preview-scene:test".to_owned()),
+                route_identity: Some("route:test".to_owned()),
+                touched_node_count: 1,
+                touched_node_samples: vec!["node:test".to_owned()],
+                retained_text_update_count: 1,
+                retained_style_update_count: 1,
+                hover_node_count: 0,
+                focus_node_count: 1,
+                direct_render_scene_patch: true,
+                full_scene_build_before_present: false,
+                proof_json_required: false,
+                latest_report_required: false,
+            }),
+        };
+        let mut legacy_frame = typed_frame.clone();
+        legacy_frame.layout_identity = Some("layout:legacy".to_owned());
+        let typed_requests = vec![NativePostPresentProofRequestSummary {
+            kind: NativePostPresentProofRequestKind::VisibleBoundText,
+            currently_legacy_pre_present: false,
+            frame_local_snapshot_required: true,
+        }];
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
+            product_frame: Some(legacy_frame),
+            product_result: Some(NativeProductFrameResult {
+                schema_version: 1,
+                owner: "preview_active_scene".to_owned(),
+                result_kind: "active_preview_scene_patch".to_owned(),
+                product_frame: typed_frame,
+                post_present_proof_requests: typed_requests,
+            }),
+            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::RenderHookReportJson,
+                currently_legacy_pre_present: true,
+                frame_local_snapshot_required: true,
+            }],
+            ..NativeRenderFrameMetrics::default()
+        }));
+
+        let commit = product_frame_commit_for_presented_frame(
+            &state,
+            key,
+            NativeAdapterIdentity::default(),
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            None,
+        );
+
+        assert_eq!(commit.product_result_source, "native_product_render_result");
+        assert_eq!(
+            commit.product_result_owner.as_deref(),
+            Some("preview_active_scene")
+        );
+        assert_eq!(
+            commit.product_result_kind.as_deref(),
+            Some("active_preview_scene_patch")
+        );
+        assert_eq!(
+            commit
+                .product_frame
+                .as_ref()
+                .and_then(|frame| frame.layout_identity.as_deref()),
+            Some("layout:typed")
+        );
+        assert_eq!(commit.legacy_pre_present_proof_request_count, 0);
+        assert_eq!(commit.post_present_proof_requests.len(), 1);
+        assert_eq!(
+            commit.post_present_proof_requests[0].kind,
+            NativePostPresentProofRequestKind::VisibleBoundText
+        );
+    }
+
+    #[test]
     fn post_present_proof_subscriber_artifact_completes_matching_queue_request() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let key = FrameEvidenceKey {
@@ -12915,6 +13057,7 @@ mod tests {
             render_hook_outer_total_ms: None,
             render_hook_phase_timings: None,
             product_frame: None,
+            product_result: None,
             post_present_proof_requests: Vec::new(),
         };
         state.note_render_frame_metrics(Some(render_metrics.clone()));
@@ -13339,6 +13482,7 @@ mod tests {
                 render_hook_outer_total_ms: None,
                 render_hook_phase_timings: None,
                 product_frame: None,
+                product_result: None,
                 post_present_proof_requests: Vec::new(),
             };
             accumulator.record(

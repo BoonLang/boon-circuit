@@ -11648,3 +11648,55 @@ host-input follow-up cut:
     compositor/present blocking from Boon-owned queue/present work;
   - keep the report failing until both the product lane and proof lane pass
     their own contracts.
+
+2026-07-02 larger code cut started after root-cause checkpoint:
+
+- Tried removing the legacy interactive visible-surface readback whenever
+  structured post-present subscribers were present. That successfully removed
+  `interactive_readback_backpressure`, but it was too early for direct visible
+  surfaces: the current subscriber set proves bound text/retained sync, not a
+  WGPU visible-surface readback artifact. The verifier correctly failed the
+  proof lane.
+- Kept the useful architecture direction but corrected the implementation:
+  product-frame detection now treats any host-input, `ProductInteraction`, or
+  HostInput-scheduled frame as a product input frame, so legacy interactive
+  readback is deferred away from UX frames. Non-product follow-up frames may
+  still perform readback until a real offscreen/proof-only WGPU lane replaces
+  that compatibility path.
+- Expected effect:
+  - product input frames should stop queuing the old interactive readback job;
+  - proof/readback remains available on follow-up frames, preserving app-owned
+    WGPU evidence;
+  - if product max outliers remain, they are more likely true surface
+    queue/present/compositor blocking and should be addressed by the
+    `PreviewHotLoop` / present-floor work.
+- This is intentionally generic native-loop architecture: no Cells names,
+  spreadsheet addresses, source paths, or fixture fields were added to runtime,
+  compiler, renderer, or app-window production code.
+- Fresh release verifier after the corrected product-frame deferral:
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json`.
+  It is still `status="fail"`, but the failure shape improved:
+  - `product_only_ux_contract.status="pass"`;
+  - accepted-input product p95 is `14.784872 ms`;
+  - accepted-input product max is `25.278492 ms`, down from the earlier
+    `58.349786 ms` outlier class;
+  - `proof_only_contract.status="pass"`;
+  - `proof_isolation_contract.status="pass"`;
+  - `runtime_work_contract.status="pass"`;
+  - `retained_update_contract.status="pass"`;
+  - `legacy_pre_present_request_count=0`;
+  - proof lag remains bounded by the existing proof lane
+    (`proof_lag_max_frames=5`).
+- Remaining blocker:
+  - `input_wake_to_formula_visible_ms.p95=44.495696 ms`;
+  - worst wake samples are still release/null frames with
+    `input_wake_to_input_accept_ms` around `30-33 ms`;
+  - product accepted-to-present is now mostly within budget, so this is
+    event/frame ownership and sample attribution, not runtime/list/formula
+    work.
+- Next cut:
+  - implement a true product-only counters run plus separate readback proof run,
+    or a `PreviewHotLoop` frame-clock owner that samples press-selection frames
+    before release/proof cleanup can relabel the interaction;
+  - do not keep tuning runtime/list/formula for this blocker unless a fresh
+    product-only report shows runtime work has returned.

@@ -5530,7 +5530,9 @@ async fn run_surface_probe_inner(
         }
         let readback_job_in_flight = interactive_readback_job.is_some();
         let product_input_frame = host_input_observed_this_turn
-            && render_loop_state
+            || render_loop_state.current_frame_lane == Some(NativeFrameLane::ProductInteraction)
+            || render_loop_state.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
+            || render_loop_state
                 .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count);
         let interactive_readback_decision = interactive_surface_readback_decision(
             options.role,

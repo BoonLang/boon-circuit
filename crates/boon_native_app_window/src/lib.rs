@@ -16,19 +16,32 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wgpu::SurfaceTargetUnsafe;
 
-const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// The native loop currently owns both DemandDriven frame pacing and app-window
+// input discovery. Until `PreviewHotLoop` splits those responsibilities, this
+// timeout is the worst-case interval before mouse/keyboard state becomes
+// sampleable on paths where the app-window callback cannot interrupt our wait.
+// Keep it below a frame budget instead of treating it as an idle-only energy
+// knob; otherwise user-visible clicks can sit behind a 100ms sleep before the
+// product path even starts.
+const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
 const SINGLE_FRAME_SURFACE_FRAME_LATENCY: u32 = 1;
 const PACED_SURFACE_FRAME_LATENCY: u32 = 2;
+const MAX_CONFIGURED_SURFACE_FRAME_LATENCY: u32 = 8;
 const NATIVE_TARGET_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0;
 pub const REQUESTED_ANIMATION_BURST_MIN_FRAMES: u32 = 2;
 pub const REQUESTED_ANIMATION_QUIET_MS: u64 = 100;
 pub const REQUESTED_ANIMATION_HARD_CAP_MS: u64 = 1_000;
 pub const REQUESTED_ANIMATION_MAX_PENDING_SNAPSHOTS: u32 = 1;
 const PREVIEW_PERF_STATS_WINDOW: usize = 120;
+const RECENT_PRODUCT_FRAME_COMMIT_LIMIT: usize = 256;
+const RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT: usize = 64;
+const RECENT_POST_PRESENT_PROOF_ARTIFACT_LIMIT: usize = 64;
+const RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT: usize = 16;
+const POST_PRESENT_PROOF_SUBSCRIBER_PENDING_BATCH_LIMIT: usize = 4;
 
 static READBACK_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -600,12 +613,20 @@ pub struct NativeWindowOptions {
     pub hold_ms: u64,
     pub input_sample_delay_ms: u64,
     pub synthetic_input_probe: bool,
+    pub sample_input_after_initial_frames: bool,
     pub warmup_frame_count: u32,
     pub sample_frame_count: u32,
     pub readback_artifact_dir: Option<String>,
     pub render_loop_state_report: Option<String>,
     pub demand_driven_loop: bool,
+    pub proof_mode: NativeProofMode,
     pub skip_interactive_surface_readback_when_external_proof: bool,
+}
+
+impl NativeWindowOptions {
+    fn readback_enabled(&self) -> bool {
+        self.proof_mode == NativeProofMode::Readback && self.readback_artifact_dir.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -613,6 +634,23 @@ pub struct NativeWindowOptions {
 pub enum NativeRenderLoopMode {
     ContinuousProbe,
     DemandDriven,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeProofMode {
+    #[default]
+    Counters,
+    Readback,
+}
+
+impl NativeProofMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Counters => "counters",
+            Self::Readback => "readback",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -700,6 +738,17 @@ pub enum NativeRoleDirtyReason {
     CaretBlink,
     VerifierFrame,
     ErrorOverlayChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFrameLane {
+    ProductInteraction,
+    AnimationFollowup,
+    ProofOrHarness,
+    RuntimeOrLayout,
+    DevTelemetry,
+    SurfaceLifecycle,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -802,7 +851,16 @@ impl NativeSurfaceLifecycleState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NativeAcceptedInputFrameTiming {
     pub timing_scope: String,
+    pub frame_lane: NativeFrameLane,
     pub input_event_wake_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_input_event: Option<NativeHostInputEventSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_wake_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_wake_to_input_accept_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_wake_to_present_ms: Option<f64>,
     pub input_to_present_ms: f64,
     pub input_accept_elapsed_ms: Option<f64>,
     pub dirty_poll_elapsed_ms: Option<f64>,
@@ -837,7 +895,25 @@ impl NativeAcceptedInputFrameTiming {
     ) -> Self {
         Self {
             timing_scope: "accepted_visible_host_input_frame".to_owned(),
+            frame_lane: NativeFrameLane::ProductInteraction,
             input_event_wake_count,
+            host_input_event: state.last_accepted_host_input_event.clone(),
+            input_wake_elapsed_ms: state
+                .last_accepted_host_input_event
+                .as_ref()
+                .and_then(|event| event.wake_elapsed_ms),
+            input_wake_to_input_accept_ms: state
+                .last_accepted_host_input_event
+                .as_ref()
+                .and_then(|event| event.wake_to_accept_ms),
+            input_wake_to_present_ms: state.last_accepted_host_input_event.as_ref().and_then(
+                |event| {
+                    elapsed_delta_ms(
+                        event.wake_elapsed_ms,
+                        state.last_present_completed_elapsed_ms,
+                    )
+                },
+            ),
             input_to_present_ms,
             input_accept_elapsed_ms: state.last_accepted_host_input_elapsed_ms,
             dirty_poll_elapsed_ms: state.last_dirty_poll_elapsed_ms,
@@ -904,6 +980,12 @@ pub struct NativeRenderLoopState {
     pub last_render_layout_revision: u64,
     pub last_render_scene_revision: u64,
     pub rendered_frame_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_preissued_frame_evidence_key: Option<FrameEvidenceKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_preissued_frame_evidence_elapsed_ms: Option<f64>,
+    #[serde(default)]
+    pub last_frame_evidence_key_issued_before_present: bool,
     pub skipped_idle_poll_count: u64,
     pub input_poll_count: u64,
     pub input_inline_resample_count: u64,
@@ -934,6 +1016,9 @@ pub struct NativeRenderLoopState {
     pub last_role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub current_scheduler_reason: Option<NativeSchedulerReason>,
     pub current_role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub last_role_revision: u64,
+    pub last_frame_lane: Option<NativeFrameLane>,
+    pub current_frame_lane: Option<NativeFrameLane>,
     pub last_render_target_kind: Option<String>,
     pub last_present_path_requested_mode: Option<NativePresentPathMode>,
     pub last_present_path_mode: Option<NativePresentPathMode>,
@@ -944,6 +1029,8 @@ pub struct NativeRenderLoopState {
     pub last_poll_started_elapsed_ms: Option<f64>,
     pub last_dirty_poll_elapsed_ms: Option<f64>,
     pub last_accepted_host_input_event_wake_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accepted_host_input_event: Option<NativeHostInputEventSummary>,
     pub last_accepted_host_input_elapsed_ms: Option<f64>,
     pub last_accepted_host_input_press_only: bool,
     pub last_input_to_present_accounted_event_wake_count: u64,
@@ -956,6 +1043,47 @@ pub struct NativeRenderLoopState {
     pub last_render_hook_completed_elapsed_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_render_frame_metrics: Option<NativeRenderFrameMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_product_frame_commit: Option<NativeProductFrameCommit>,
+    pub product_frame_commit_count: u64,
+    #[serde(default)]
+    pub recent_post_present_proof_queue: VecDeque<NativePostPresentProofQueueEntry>,
+    #[serde(default)]
+    pub post_present_proof_queue_enqueued_count: u64,
+    #[serde(default)]
+    pub post_present_proof_queue_deferred_count: u64,
+    #[serde(default)]
+    pub post_present_proof_queue_legacy_pre_present_count: u64,
+    #[serde(default)]
+    pub post_present_proof_queue_completed_count: u64,
+    #[serde(default)]
+    pub post_present_subscriber_drain_deferred_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_post_present_subscriber_drain_deferred_reason: Option<String>,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_enqueued_batch_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_enqueued_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_dropped_batch_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_dropped_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_completed_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_error_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_pending_batch_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_post_present_proof_subscriber_worker_enqueue_ms: Option<f64>,
+    #[serde(default)]
+    pub recent_post_present_proof_artifacts: VecDeque<NativePostPresentProofArtifact>,
+    #[serde(default)]
+    pub post_present_proof_artifact_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_error_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_post_present_proof_subscriber_error: Option<String>,
     pub last_queue_submitted_elapsed_ms: Option<f64>,
     pub last_present_completed_elapsed_ms: Option<f64>,
     pub last_present_interval_ms: Option<f64>,
@@ -968,6 +1096,8 @@ pub struct NativeRenderLoopState {
     pub missed_frame_count: u64,
     pub telemetry_drop_count: u64,
     pub last_missed_frame_cause: Option<String>,
+    pub pre_input_subscriber_drain_skip_count: u64,
+    pub last_pre_input_subscriber_drain_skip_reason: Option<String>,
     pub requested_animation_burst_count: u64,
     pub requested_animation_burst_frames_remaining: u32,
     pub requested_animation_burst_started_elapsed_ms: Option<f64>,
@@ -988,6 +1118,9 @@ impl NativeRenderLoopState {
             last_render_layout_revision: 0,
             last_render_scene_revision: 0,
             rendered_frame_count: 0,
+            last_preissued_frame_evidence_key: None,
+            last_preissued_frame_evidence_elapsed_ms: None,
+            last_frame_evidence_key_issued_before_present: false,
             skipped_idle_poll_count: 0,
             input_poll_count: 0,
             input_inline_resample_count: 0,
@@ -1018,6 +1151,9 @@ impl NativeRenderLoopState {
             last_role_dirty_reason: None,
             current_scheduler_reason: Some(NativeSchedulerReason::FirstFrame),
             current_role_dirty_reason: None,
+            last_role_revision: 0,
+            last_frame_lane: None,
+            current_frame_lane: None,
             last_render_target_kind: None,
             last_present_path_requested_mode: None,
             last_present_path_mode: None,
@@ -1028,6 +1164,7 @@ impl NativeRenderLoopState {
             last_poll_started_elapsed_ms: None,
             last_dirty_poll_elapsed_ms: None,
             last_accepted_host_input_event_wake_count: 0,
+            last_accepted_host_input_event: None,
             last_accepted_host_input_elapsed_ms: None,
             last_accepted_host_input_press_only: false,
             last_input_to_present_accounted_event_wake_count: 0,
@@ -1038,6 +1175,27 @@ impl NativeRenderLoopState {
             last_surface_acquired_elapsed_ms: None,
             last_render_hook_completed_elapsed_ms: None,
             last_render_frame_metrics: None,
+            last_product_frame_commit: None,
+            product_frame_commit_count: 0,
+            recent_post_present_proof_queue: VecDeque::new(),
+            post_present_proof_queue_enqueued_count: 0,
+            post_present_proof_queue_deferred_count: 0,
+            post_present_proof_queue_legacy_pre_present_count: 0,
+            post_present_proof_queue_completed_count: 0,
+            post_present_subscriber_drain_deferred_count: 0,
+            last_post_present_subscriber_drain_deferred_reason: None,
+            post_present_proof_subscriber_worker_enqueued_batch_count: 0,
+            post_present_proof_subscriber_worker_enqueued_count: 0,
+            post_present_proof_subscriber_worker_dropped_batch_count: 0,
+            post_present_proof_subscriber_worker_dropped_count: 0,
+            post_present_proof_subscriber_worker_completed_count: 0,
+            post_present_proof_subscriber_worker_error_count: 0,
+            post_present_proof_subscriber_worker_pending_batch_count: 0,
+            last_post_present_proof_subscriber_worker_enqueue_ms: None,
+            recent_post_present_proof_artifacts: VecDeque::new(),
+            post_present_proof_artifact_count: 0,
+            post_present_proof_subscriber_error_count: 0,
+            last_post_present_proof_subscriber_error: None,
             last_queue_submitted_elapsed_ms: None,
             last_present_completed_elapsed_ms: None,
             last_present_interval_ms: None,
@@ -1050,6 +1208,8 @@ impl NativeRenderLoopState {
             missed_frame_count: 0,
             telemetry_drop_count: 0,
             last_missed_frame_cause: None,
+            pre_input_subscriber_drain_skip_count: 0,
+            last_pre_input_subscriber_drain_skip_reason: None,
             requested_animation_burst_count: 0,
             requested_animation_burst_frames_remaining: 0,
             requested_animation_burst_started_elapsed_ms: None,
@@ -1072,6 +1232,14 @@ impl NativeRenderLoopState {
         }
         self.current_scheduler_reason = Some(scheduler_reason);
         self.current_role_dirty_reason = role_dirty_reason;
+        let frame_lane = native_frame_lane_for_scheduler(
+            Some(scheduler_reason),
+            role_dirty_reason,
+            false,
+            false,
+        );
+        self.last_frame_lane = Some(frame_lane);
+        self.current_frame_lane = Some(frame_lane);
         self.dirty_revision
     }
 
@@ -1084,6 +1252,7 @@ impl NativeRenderLoopState {
         if self.presented_revision >= self.dirty_revision {
             self.current_scheduler_reason = None;
             self.current_role_dirty_reason = None;
+            self.current_frame_lane = None;
         }
     }
 
@@ -1111,6 +1280,7 @@ impl NativeRenderLoopState {
         if self.presented_revision >= self.dirty_revision {
             self.current_scheduler_reason = None;
             self.current_role_dirty_reason = None;
+            self.current_frame_lane = None;
         }
     }
 
@@ -1212,10 +1382,16 @@ impl NativeRenderLoopState {
         input_event_wake_count: u64,
         elapsed_ms: f64,
         press_only: bool,
+        host_input_event: Option<NativeHostInputEventSummary>,
     ) {
         self.last_accepted_host_input_event_wake_count = input_event_wake_count;
+        self.last_accepted_host_input_event = host_input_event;
         self.last_accepted_host_input_elapsed_ms = Some(elapsed_ms);
         self.last_accepted_host_input_press_only = press_only;
+        self.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+        self.current_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+        self.last_frame_lane = Some(NativeFrameLane::ProductInteraction);
+        self.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
     }
 
     pub fn take_frame_accepted_input_to_present_ms(
@@ -1253,6 +1429,16 @@ impl NativeRenderLoopState {
         Some(timing)
     }
 
+    pub fn current_frame_carries_unaccounted_host_input(
+        &self,
+        presented_input_event_wake_count: u64,
+    ) -> bool {
+        presented_input_event_wake_count != 0
+            && self.last_accepted_host_input_event_wake_count == presented_input_event_wake_count
+            && self.last_accepted_host_input_event_wake_count
+                > self.last_input_to_present_accounted_event_wake_count
+    }
+
     pub fn note_external_wake_observed(&mut self, generation: u64, elapsed_ms: f64) {
         self.last_external_wake_generation = generation;
         self.last_external_wake_observed_elapsed_ms = Some(elapsed_ms);
@@ -1278,6 +1464,183 @@ impl NativeRenderLoopState {
         self.last_render_frame_metrics = metrics;
     }
 
+    pub fn note_product_frame_commit(&mut self, commit: NativeProductFrameCommit) {
+        self.enqueue_post_present_proof_requests(
+            &commit.frame_evidence_key,
+            &commit.post_present_proof_requests,
+            commit.present_completed_elapsed_ms,
+        );
+        self.product_frame_commit_count = self.product_frame_commit_count.saturating_add(1);
+        self.last_product_frame_commit = Some(commit);
+    }
+
+    pub fn enqueue_post_present_proof_requests(
+        &mut self,
+        frame_evidence_key: &FrameEvidenceKey,
+        requests: &[NativePostPresentProofRequestSummary],
+        enqueued_elapsed_ms: Option<f64>,
+    ) {
+        for request in requests {
+            let status = if request.currently_legacy_pre_present {
+                self.post_present_proof_queue_legacy_pre_present_count = self
+                    .post_present_proof_queue_legacy_pre_present_count
+                    .saturating_add(1);
+                NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+            } else {
+                self.post_present_proof_queue_deferred_count = self
+                    .post_present_proof_queue_deferred_count
+                    .saturating_add(1);
+                NativePostPresentProofQueueStatus::Queued
+            };
+            self.post_present_proof_queue_enqueued_count = self
+                .post_present_proof_queue_enqueued_count
+                .saturating_add(1);
+            self.recent_post_present_proof_queue
+                .push_back(NativePostPresentProofQueueEntry {
+                    schema_version: 1,
+                    frame_evidence_key: frame_evidence_key.clone(),
+                    request: request.clone(),
+                    status,
+                    enqueued_elapsed_ms,
+                    completed_elapsed_ms: None,
+                });
+            while self.recent_post_present_proof_queue.len() > RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT
+            {
+                self.recent_post_present_proof_queue.pop_front();
+            }
+        }
+    }
+
+    pub fn note_post_present_proof_request_completed(
+        &mut self,
+        frame_evidence_key: &FrameEvidenceKey,
+        kind: NativePostPresentProofRequestKind,
+        completed_elapsed_ms: Option<f64>,
+    ) -> bool {
+        let Some(entry) = self
+            .recent_post_present_proof_queue
+            .iter_mut()
+            .rev()
+            .find(|entry| {
+                entry.frame_evidence_key == *frame_evidence_key && entry.request.kind == kind
+            })
+        else {
+            return false;
+        };
+        if entry.status != NativePostPresentProofQueueStatus::Queued {
+            return false;
+        }
+        entry.status = NativePostPresentProofQueueStatus::CompletedPostPresent;
+        entry.completed_elapsed_ms = completed_elapsed_ms;
+        self.post_present_proof_queue_completed_count = self
+            .post_present_proof_queue_completed_count
+            .saturating_add(1);
+        true
+    }
+
+    fn has_queued_post_present_proof_request(
+        &self,
+        frame_evidence_key: &FrameEvidenceKey,
+        kind: NativePostPresentProofRequestKind,
+    ) -> bool {
+        self.recent_post_present_proof_queue
+            .iter()
+            .rev()
+            .any(|entry| {
+                entry.frame_evidence_key == *frame_evidence_key
+                    && entry.request.kind == kind
+                    && entry.status == NativePostPresentProofQueueStatus::Queued
+            })
+    }
+
+    pub fn note_post_present_subscriber_drain_deferred(&mut self, reason: &str) {
+        self.post_present_subscriber_drain_deferred_count = self
+            .post_present_subscriber_drain_deferred_count
+            .saturating_add(1);
+        self.last_post_present_subscriber_drain_deferred_reason = Some(reason.to_owned());
+    }
+
+    fn note_post_present_proof_subscriber_worker_enqueue(
+        &mut self,
+        report: AsyncPostPresentProofSubscriberEnqueueReport,
+    ) {
+        self.post_present_proof_subscriber_worker_enqueued_batch_count = self
+            .post_present_proof_subscriber_worker_enqueued_batch_count
+            .saturating_add(report.enqueued_batches);
+        self.post_present_proof_subscriber_worker_enqueued_count = self
+            .post_present_proof_subscriber_worker_enqueued_count
+            .saturating_add(report.enqueued_subscribers);
+        self.post_present_proof_subscriber_worker_dropped_batch_count = self
+            .post_present_proof_subscriber_worker_dropped_batch_count
+            .saturating_add(report.dropped_batches);
+        self.post_present_proof_subscriber_worker_dropped_count = self
+            .post_present_proof_subscriber_worker_dropped_count
+            .saturating_add(report.dropped_subscribers);
+        self.post_present_proof_subscriber_worker_pending_batch_count = report.pending_batches;
+        self.last_post_present_proof_subscriber_worker_enqueue_ms = report.enqueue_ms;
+    }
+
+    fn note_post_present_proof_subscriber_worker_completed(&mut self) {
+        self.post_present_proof_subscriber_worker_completed_count = self
+            .post_present_proof_subscriber_worker_completed_count
+            .saturating_add(1);
+    }
+
+    fn note_post_present_proof_subscriber_worker_error(&mut self) {
+        self.post_present_proof_subscriber_worker_error_count = self
+            .post_present_proof_subscriber_worker_error_count
+            .saturating_add(1);
+    }
+
+    pub fn note_post_present_proof_artifact(&mut self, artifact: NativePostPresentProofArtifact) {
+        self.note_post_present_proof_request_completed(
+            &artifact.frame_evidence_key,
+            artifact.kind,
+            artifact.completed_elapsed_ms,
+        );
+        self.record_post_present_proof_artifact(artifact);
+    }
+
+    fn note_post_present_proof_artifact_if_request_queued(
+        &mut self,
+        artifact: NativePostPresentProofArtifact,
+    ) -> bool {
+        if !self.note_post_present_proof_request_completed(
+            &artifact.frame_evidence_key,
+            artifact.kind,
+            artifact.completed_elapsed_ms,
+        ) {
+            return false;
+        }
+        self.record_post_present_proof_artifact(artifact);
+        true
+    }
+
+    fn record_post_present_proof_artifact(&mut self, artifact: NativePostPresentProofArtifact) {
+        self.post_present_proof_artifact_count =
+            self.post_present_proof_artifact_count.saturating_add(1);
+        self.last_post_present_proof_subscriber_error = None;
+        self.recent_post_present_proof_artifacts.push_back(artifact);
+        while self.recent_post_present_proof_artifacts.len()
+            > RECENT_POST_PRESENT_PROOF_ARTIFACT_LIMIT
+        {
+            self.recent_post_present_proof_artifacts.pop_front();
+        }
+    }
+
+    pub fn note_post_present_proof_subscriber_error(&mut self, error: String) {
+        self.post_present_proof_subscriber_error_count = self
+            .post_present_proof_subscriber_error_count
+            .saturating_add(1);
+        self.last_post_present_proof_subscriber_error = Some(error);
+    }
+
+    pub fn note_preissued_frame_evidence_key(&mut self, key: FrameEvidenceKey, elapsed_ms: f64) {
+        self.last_preissued_frame_evidence_key = Some(key);
+        self.last_preissued_frame_evidence_elapsed_ms = Some(elapsed_ms);
+        self.last_frame_evidence_key_issued_before_present = true;
+    }
+
     pub fn note_queue_submitted(&mut self, elapsed_ms: f64) {
         self.last_queue_submitted_elapsed_ms = Some(elapsed_ms);
     }
@@ -1290,10 +1653,21 @@ impl NativeRenderLoopState {
             self.last_present_interval_ms = Some(interval_ms);
             let lateness_ms = (interval_ms - NATIVE_TARGET_FRAME_INTERVAL_MS).max(0.0);
             self.last_frame_lateness_ms = Some(lateness_ms);
-            if lateness_ms > NATIVE_TARGET_FRAME_INTERVAL_MS {
+            let frame_paced = self.mode == NativeRenderLoopMode::ContinuousProbe
+                || self.current_scheduler_reason == Some(NativeSchedulerReason::RequestedAnimation);
+            if frame_paced && lateness_ms > NATIVE_TARGET_FRAME_INTERVAL_MS {
                 self.missed_frame_count = self.missed_frame_count.saturating_add(1);
-                self.last_missed_frame_cause =
-                    Some("present_interval_exceeded_two_frames".to_owned());
+                self.last_missed_frame_cause = Some(
+                    match self.mode {
+                        NativeRenderLoopMode::ContinuousProbe => {
+                            "continuous_probe_present_interval_exceeded_two_frames"
+                        }
+                        NativeRenderLoopMode::DemandDriven => {
+                            "requested_animation_present_interval_exceeded_two_frames"
+                        }
+                    }
+                    .to_owned(),
+                );
             }
         }
         if self.requested_animation_burst_frames_remaining > 0 {
@@ -1359,6 +1733,12 @@ impl NativeRenderLoopState {
         self.loop_exit_reason = Some(reason.into());
     }
 
+    pub fn note_pre_input_subscriber_drain_skipped(&mut self, reason: impl Into<String>) {
+        self.pre_input_subscriber_drain_skip_count =
+            self.pre_input_subscriber_drain_skip_count.saturating_add(1);
+        self.last_pre_input_subscriber_drain_skip_reason = Some(reason.into());
+    }
+
     pub fn schedule_wake_after(&mut self, now: Instant, delay: Duration) -> Instant {
         let candidate = now + delay;
         if self
@@ -1399,15 +1779,20 @@ impl NativeRenderLoopState {
             .max(REQUESTED_ANIMATION_BURST_MIN_FRAMES);
         self.last_scheduler_reason = Some(reason);
         self.current_scheduler_reason = Some(reason);
-        let first_frame_delay = if reason == NativeSchedulerReason::HostInput {
-            Duration::ZERO
-        } else {
-            native_target_frame_interval_duration()
-        };
-        self.schedule_wake_after(now, first_frame_delay);
+        self.schedule_wake_after(now, native_target_frame_interval_duration());
     }
 
     pub fn consume_due_wake_after_poll(&mut self, now: Instant) -> bool {
+        if self.next_wake_at.is_some_and(|wake_at| now >= wake_at)
+            && self.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
+            && self.last_accepted_host_input_event_wake_count > 0
+            && self.last_accepted_host_input_event_wake_count
+                > self.last_input_to_present_accounted_event_wake_count
+        {
+            self.next_wake_at = None;
+            self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
+            return true;
+        }
         self.consume_due_wake(now)
     }
 
@@ -1472,6 +1857,9 @@ impl NativeRenderLoopState {
             self.last_scheduler_reason = Some(reason);
             self.current_scheduler_reason = Some(reason);
             self.current_role_dirty_reason = None;
+            let frame_lane = native_frame_lane_for_scheduler(Some(reason), None, false, false);
+            self.last_frame_lane = Some(frame_lane);
+            self.current_frame_lane = Some(frame_lane);
             self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
             true
         } else {
@@ -1489,6 +1877,7 @@ impl NativeRenderLoopState {
     pub fn apply_poll_result(&mut self, poll_result: &NativePollResult, real_os_input: bool) {
         self.last_poll_diagnostics = poll_result.diagnostics.clone();
         if poll_result.dirty {
+            self.last_role_revision = poll_result.role_revision;
             self.last_scheduler_reason = poll_result.scheduler_reason.or_else(|| {
                 if real_os_input {
                     Some(NativeSchedulerReason::HostInput)
@@ -1498,16 +1887,33 @@ impl NativeRenderLoopState {
             });
             self.current_scheduler_reason = self.last_scheduler_reason;
             self.current_role_dirty_reason = poll_result.role_dirty_reason;
+            let frame_lane = poll_result.frame_lane.unwrap_or_else(|| {
+                native_frame_lane_for_scheduler(
+                    self.current_scheduler_reason,
+                    poll_result.role_dirty_reason,
+                    real_os_input,
+                    poll_result.wants_animation_frame,
+                )
+            });
+            self.last_frame_lane = Some(frame_lane);
+            self.current_frame_lane = Some(frame_lane);
             if poll_result.role_dirty_reason.is_some() {
                 self.last_role_dirty_reason = poll_result.role_dirty_reason;
             }
             let scheduler_only_repaint = poll_result.role_dirty_reason.is_none()
                 && self.last_scheduler_reason == Some(NativeSchedulerReason::HostInput);
+            let host_input_visible_repaint = poll_result.role_revision <= self.presented_revision
+                && self.last_scheduler_reason == Some(NativeSchedulerReason::HostInput);
+            let accepted_real_input_visible_repaint =
+                real_os_input && poll_result.role_revision <= self.presented_revision;
             if poll_result.role_revision > self.presented_revision {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
             } else if self.last_scheduler_reason == Some(NativeSchedulerReason::VerifierFrame) {
                 self.dirty_revision = self.dirty_revision.max(self.presented_revision);
-            } else if scheduler_only_repaint {
+            } else if scheduler_only_repaint
+                || host_input_visible_repaint
+                || accepted_real_input_visible_repaint
+            {
                 self.dirty_revision = self.dirty_revision.saturating_add(1);
             } else {
                 self.dirty_revision = self.dirty_revision.max(poll_result.role_revision);
@@ -1515,12 +1921,259 @@ impl NativeRenderLoopState {
         }
         if poll_result.wants_animation_frame && !poll_result.dirty {
             self.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
+            if let Some(frame_lane) = poll_result.frame_lane {
+                self.last_frame_lane = Some(frame_lane);
+                self.current_frame_lane = Some(frame_lane);
+            }
+        }
+    }
+
+    pub fn content_validation_revision(&self) -> u64 {
+        if self.last_role_revision > 0 {
+            self.last_role_revision
+        } else {
+            self.dirty_revision
         }
     }
 }
 
+fn native_frame_lane_for_scheduler(
+    scheduler_reason: Option<NativeSchedulerReason>,
+    role_dirty_reason: Option<NativeRoleDirtyReason>,
+    real_os_input: bool,
+    wants_animation_frame: bool,
+) -> NativeFrameLane {
+    if matches!(scheduler_reason, Some(NativeSchedulerReason::VerifierFrame))
+        || matches!(
+            role_dirty_reason,
+            Some(NativeRoleDirtyReason::VerifierFrame)
+        )
+    {
+        return NativeFrameLane::ProofOrHarness;
+    }
+    if real_os_input || matches!(scheduler_reason, Some(NativeSchedulerReason::HostInput)) {
+        return NativeFrameLane::ProductInteraction;
+    }
+    if matches!(
+        scheduler_reason,
+        Some(NativeSchedulerReason::RequestedAnimation)
+    ) || wants_animation_frame
+    {
+        return NativeFrameLane::AnimationFollowup;
+    }
+    if matches!(
+        scheduler_reason,
+        Some(NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle)
+    ) {
+        return NativeFrameLane::SurfaceLifecycle;
+    }
+    if matches!(
+        role_dirty_reason,
+        Some(NativeRoleDirtyReason::TelemetrySummaryChanged)
+    ) {
+        return NativeFrameLane::DevTelemetry;
+    }
+    if matches!(
+        role_dirty_reason,
+        Some(
+            NativeRoleDirtyReason::RuntimeTurnApplied
+                | NativeRoleDirtyReason::DocumentPatchApplied
+                | NativeRoleDirtyReason::LayoutChanged
+                | NativeRoleDirtyReason::ScrollChanged
+                | NativeRoleDirtyReason::FocusChanged
+                | NativeRoleDirtyReason::SourcePayloadAccepted
+                | NativeRoleDirtyReason::WorkspaceSelectionChanged
+                | NativeRoleDirtyReason::ErrorOverlayChanged
+        )
+    ) {
+        return NativeFrameLane::RuntimeOrLayout;
+    }
+    NativeFrameLane::RuntimeOrLayout
+}
+
 fn native_target_frame_interval_duration() -> Duration {
     Duration::from_micros((NATIVE_TARGET_FRAME_INTERVAL_MS * 1000.0).round() as u64)
+}
+
+fn post_present_subscriber_drain_allowed(
+    current_input_event_wake_count: u64,
+    presented_input_event_wake_count: u64,
+) -> bool {
+    current_input_event_wake_count <= presented_input_event_wake_count
+}
+
+#[cfg(test)]
+fn run_post_present_proof_subscribers(
+    state: &mut NativeRenderLoopState,
+    subscribers: Vec<NativePostPresentProofSubscriber>,
+    frame_evidence_key: &FrameEvidenceKey,
+    completed_elapsed_ms: Option<f64>,
+) {
+    for subscriber in subscribers {
+        match subscriber(NativePostPresentProofContext {
+            frame_evidence_key: frame_evidence_key.clone(),
+            completed_elapsed_ms,
+        }) {
+            Ok(artifact) => state.note_post_present_proof_artifact(artifact),
+            Err(error) => state.note_post_present_proof_subscriber_error(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AsyncPostPresentProofSubscriberEnqueueReport {
+    enqueued_batches: u64,
+    enqueued_subscribers: u64,
+    dropped_batches: u64,
+    dropped_subscribers: u64,
+    pending_batches: u64,
+    enqueue_ms: Option<f64>,
+}
+
+struct AsyncPostPresentProofSubscriberBatch {
+    context: NativePostPresentProofContext,
+    subscribers: Vec<NativePostPresentProofSubscriber>,
+}
+
+#[derive(Default)]
+struct AsyncPostPresentProofSubscriberShared {
+    pending: VecDeque<AsyncPostPresentProofSubscriberBatch>,
+    shutdown: bool,
+}
+
+struct AsyncPostPresentProofSubscriberWorker {
+    shared: Arc<(Mutex<AsyncPostPresentProofSubscriberShared>, Condvar)>,
+    results: mpsc::Receiver<Result<NativePostPresentProofArtifact, String>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncPostPresentProofSubscriberWorker {
+    fn new() -> Self {
+        let shared = Arc::new((
+            Mutex::new(AsyncPostPresentProofSubscriberShared::default()),
+            Condvar::new(),
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let (sender, results) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("boon-post-present-proof-worker".to_owned())
+            .spawn(move || {
+                loop {
+                    let batch = {
+                        let (lock, cvar) = &*worker_shared;
+                        let mut shared = lock.lock().expect("post-present proof worker lock");
+                        while shared.pending.is_empty() && !shared.shutdown {
+                            shared = cvar.wait(shared).expect("post-present proof worker wait");
+                        }
+                        if shared.pending.is_empty() && shared.shutdown {
+                            break;
+                        }
+                        shared
+                            .pending
+                            .pop_front()
+                            .expect("pending proof batch after wait")
+                    };
+                    for subscriber in batch.subscribers {
+                        let result = subscriber(batch.context.clone());
+                        if sender.send(result).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("spawn post-present proof worker");
+        Self {
+            shared,
+            results,
+            worker: Some(worker),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        subscribers: Vec<NativePostPresentProofSubscriber>,
+        frame_evidence_key: FrameEvidenceKey,
+        completed_elapsed_ms: Option<f64>,
+        enqueue_started: Instant,
+    ) -> Option<AsyncPostPresentProofSubscriberEnqueueReport> {
+        if subscribers.is_empty() {
+            return None;
+        }
+        let subscriber_count = subscribers.len() as u64;
+        let mut report = AsyncPostPresentProofSubscriberEnqueueReport {
+            enqueued_batches: 1,
+            enqueued_subscribers: subscriber_count,
+            enqueue_ms: Some(elapsed_ms(enqueue_started)),
+            ..AsyncPostPresentProofSubscriberEnqueueReport::default()
+        };
+        let batch = AsyncPostPresentProofSubscriberBatch {
+            context: NativePostPresentProofContext {
+                frame_evidence_key,
+                completed_elapsed_ms,
+            },
+            subscribers,
+        };
+        let (lock, cvar) = &*self.shared;
+        let mut shared = lock.lock().expect("post-present proof enqueue lock");
+        while shared.pending.len() >= POST_PRESENT_PROOF_SUBSCRIBER_PENDING_BATCH_LIMIT {
+            if let Some(dropped) = shared.pending.pop_front() {
+                report.dropped_batches = report.dropped_batches.saturating_add(1);
+                report.dropped_subscribers = report
+                    .dropped_subscribers
+                    .saturating_add(dropped.subscribers.len() as u64);
+            }
+        }
+        shared.pending.push_back(batch);
+        report.pending_batches = shared.pending.len() as u64;
+        cvar.notify_one();
+        Some(report)
+    }
+
+    fn drain_completed(&self, state: &mut NativeRenderLoopState) {
+        loop {
+            match self.results.try_recv() {
+                Ok(Ok(artifact)) => {
+                    state.note_post_present_proof_subscriber_worker_completed();
+                    state.note_post_present_proof_artifact(artifact);
+                }
+                Ok(Err(error)) => {
+                    state.note_post_present_proof_subscriber_worker_error();
+                    state.note_post_present_proof_subscriber_error(error);
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let (lock, _) = &*self.shared;
+        if let Ok(shared) = lock.lock() {
+            state.post_present_proof_subscriber_worker_pending_batch_count =
+                shared.pending.len() as u64;
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut shared) = lock.lock() {
+            shared.shutdown = true;
+            cvar.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn shutdown_and_drain(&mut self, state: &mut NativeRenderLoopState) {
+        self.shutdown();
+        self.drain_completed(state);
+    }
+}
+
+impl Drop for AsyncPostPresentProofSubscriberWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1529,6 +2182,10 @@ pub struct NativePollResult {
     pub role_revision: u64,
     pub scheduler_reason: Option<NativeSchedulerReason>,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_lane: Option<NativeFrameLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_host_input_event_hint: Option<NativeHostInputEventHint>,
     pub next_wake_after_ms: Option<u64>,
     pub wants_animation_frame: bool,
     pub cursor_icon: NativeCursorIcon,
@@ -1545,6 +2202,8 @@ impl NativePollResult {
             role_revision,
             scheduler_reason: None,
             role_dirty_reason: None,
+            frame_lane: None,
+            accepted_host_input_event_hint: None,
             next_wake_after_ms: None,
             wants_animation_frame: false,
             cursor_icon: NativeCursorIcon::Default,
@@ -1565,6 +2224,10 @@ fn effective_poll_result_for_host_input(
     {
         poll_result.dirty = true;
     }
+    if poll_result.dirty && real_os_input {
+        poll_result.scheduler_reason = Some(NativeSchedulerReason::HostInput);
+        poll_result.frame_lane = Some(NativeFrameLane::ProductInteraction);
+    }
     poll_result
 }
 
@@ -1578,26 +2241,60 @@ pub enum NativeCursorIcon {
     Text,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeRenderHookResult {
-    pub proof: serde_json::Value,
+    pub proof: Option<serde_json::Value>,
     pub content_revision: u64,
     pub layout_revision: Option<u64>,
     pub render_scene_revision: Option<u64>,
     pub render_frame_metrics: Option<NativeRenderFrameMetrics>,
+    pub post_present_proof_subscribers: Vec<NativePostPresentProofSubscriber>,
     pub rendered: bool,
     pub content_changed: bool,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
 }
 
+impl std::fmt::Debug for NativeRenderHookResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeRenderHookResult")
+            .field("proof", &self.proof)
+            .field("content_revision", &self.content_revision)
+            .field("layout_revision", &self.layout_revision)
+            .field("render_scene_revision", &self.render_scene_revision)
+            .field("render_frame_metrics", &self.render_frame_metrics)
+            .field(
+                "post_present_proof_subscriber_count",
+                &self.post_present_proof_subscribers.len(),
+            )
+            .field("rendered", &self.rendered)
+            .field("content_changed", &self.content_changed)
+            .field("role_dirty_reason", &self.role_dirty_reason)
+            .finish()
+    }
+}
+
 impl NativeRenderHookResult {
     pub fn rendered_with_proof(proof: serde_json::Value) -> Self {
         Self {
-            proof,
+            proof: Some(proof),
             content_revision: 0,
             layout_revision: None,
             render_scene_revision: None,
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: None,
+        }
+    }
+
+    pub fn rendered_without_proof() -> Self {
+        Self {
+            proof: None,
+            content_revision: 0,
+            layout_revision: None,
+            render_scene_revision: None,
+            render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -1643,12 +2340,32 @@ impl NativeRenderHookResult {
                         | NativeSchedulerReason::RequestedAnimation
                 )
             );
+        let host_input_repaint_can_present_existing_content = matches!(
+            scheduler_reason,
+            Some(
+                NativeSchedulerReason::HostInput
+                    | NativeSchedulerReason::Timer
+                    | NativeSchedulerReason::RequestedAnimation
+            )
+        );
         let scheduler_idle_same_content_repaint =
             scheduler_reason.is_none() && role_dirty_reason.is_none() && !self.content_changed;
+        let external_retained_frame_repaint =
+            matches!(scheduler_reason, Some(NativeSchedulerReason::ExternalWake))
+                && matches!(
+                    role_dirty_reason,
+                    Some(
+                        NativeRoleDirtyReason::LayoutChanged
+                            | NativeRoleDirtyReason::ScrollChanged
+                            | NativeRoleDirtyReason::FocusChanged
+                    )
+                );
         if self.content_revision < dirty_revision
             && !same_content_surface_render
             && !scheduler_only_input_repaint
+            && !host_input_repaint_can_present_existing_content
             && !scheduler_idle_same_content_repaint
+            && !external_retained_frame_repaint
         {
             return Err(format!(
                 "render hook result content_revision {} is older than dirty_revision {}",
@@ -1664,29 +2381,10 @@ impl NativeRenderHookResult {
         scheduler_reason: Option<NativeSchedulerReason>,
         role_dirty_reason: Option<NativeRoleDirtyReason>,
     ) -> u64 {
-        if self.content_revision < dirty_revision
-            && (matches!(
-                scheduler_reason,
-                Some(
-                    NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle
-                )
-            ) || (role_dirty_reason.is_none()
-                && matches!(
-                    scheduler_reason,
-                    Some(
-                        NativeSchedulerReason::HostInput
-                            | NativeSchedulerReason::Timer
-                            | NativeSchedulerReason::RequestedAnimation
-                    )
-                ))
-                || (scheduler_reason.is_none()
-                    && role_dirty_reason.is_none()
-                    && !self.content_changed))
-        {
-            dirty_revision
-        } else {
-            self.content_revision
-        }
+        let _ = dirty_revision;
+        let _ = scheduler_reason;
+        let _ = role_dirty_reason;
+        self.content_revision
     }
 
     pub fn presented_revisions(
@@ -1783,6 +2481,7 @@ pub struct AppWindowSurfaceProof {
     pub supported_present_modes: Vec<String>,
     pub non_vsync_present_mode_available: bool,
     pub desired_maximum_frame_latency: u32,
+    pub desired_maximum_frame_latency_source: String,
     pub alpha_mode: String,
     pub supported_alpha_modes: Vec<String>,
     pub supported_usages: String,
@@ -1809,6 +2508,7 @@ pub struct AppWindowSurfaceProof {
     pub input_event_wake_count: u64,
     pub app_window_surface_content_report: Option<serde_json::Value>,
     pub input_sample_delay_ms: u64,
+    pub sample_input_after_initial_frames: bool,
     pub frame_timing: NativeFrameTimingProof,
     pub post_input_frame_timing: Option<NativeFrameTimingProof>,
     pub input_adapter: NativeInputAdapterProof,
@@ -1875,6 +2575,23 @@ fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) ->
         | wgpu::PresentMode::AutoNoVsync => SINGLE_FRAME_SURFACE_FRAME_LATENCY,
         _ => PACED_SURFACE_FRAME_LATENCY,
     }
+}
+
+fn configured_desired_maximum_frame_latency(
+    present_mode: wgpu::PresentMode,
+    requested: Option<&str>,
+) -> (u32, &'static str) {
+    let default = interactive_desired_maximum_frame_latency(present_mode);
+    let Some(requested) = requested else {
+        return (default, "present_mode_default");
+    };
+    let Ok(parsed) = requested.trim().parse::<u32>() else {
+        return (default, "invalid_env_default");
+    };
+    (
+        parsed.clamp(1, MAX_CONFIGURED_SURFACE_FRAME_LATENCY),
+        "env_override",
+    )
 }
 
 fn surface_present_mode_names(capabilities: &wgpu::SurfaceCapabilities) -> Vec<String> {
@@ -2017,6 +2734,61 @@ pub struct NativeMouseButtonEventProof {
     pub button: String,
     pub pressed: bool,
     pub window_protocol_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_elapsed_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeHostInputEventSummary {
+    pub scope: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_intent: Option<String>,
+    pub sequence: Option<u64>,
+    pub input_event_wake_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_wake_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_to_accept_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_to_accept_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_protocol_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub mouse_button_delta_count: usize,
+    pub keyboard_delta_count: usize,
+    pub has_scroll_delta: bool,
+    pub has_motion_delta: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeHostInputEventHint {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_protocol_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_elapsed_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -2040,13 +2812,261 @@ pub struct FrameEvidenceKey {
     pub proof_request_id: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativePerfMetricSummary {
     pub p50: Option<f64>,
     pub p95: Option<f64>,
     pub p99: Option<f64>,
     pub max: Option<f64>,
     pub sample_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePostPresentProofRequestKind {
+    VisibleBoundText,
+    RetainedBoundSync,
+    RenderHookReportJson,
+    ExternalAppOwnedReadback,
+    VisibleSurfaceReadback,
+    ProofHistory,
+    ArtifactHash,
+    DevRenderReportJson,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePostPresentProofRequestSummary {
+    pub kind: NativePostPresentProofRequestKind,
+    pub currently_legacy_pre_present: bool,
+    pub frame_local_snapshot_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePostPresentProofQueueStatus {
+    Queued,
+    LegacyAlreadyBuiltPrePresent,
+    CompletedPostPresent,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativePostPresentProofQueueEntry {
+    pub schema_version: u32,
+    pub frame_evidence_key: FrameEvidenceKey,
+    pub request: NativePostPresentProofRequestSummary,
+    pub status: NativePostPresentProofQueueStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueued_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_elapsed_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativePostPresentProofArtifact {
+    pub schema_version: u32,
+    pub frame_evidence_key: FrameEvidenceKey,
+    pub kind: NativePostPresentProofRequestKind,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_elapsed_ms: Option<f64>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativePostPresentProofContext {
+    pub frame_evidence_key: FrameEvidenceKey,
+    pub completed_elapsed_ms: Option<f64>,
+}
+
+pub type NativePostPresentProofSubscriber = Box<
+    dyn FnOnce(NativePostPresentProofContext) -> Result<NativePostPresentProofArtifact, String>
+        + Send,
+>;
+
+pub fn native_post_present_json_proof_artifact(
+    kind: NativePostPresentProofRequestKind,
+    frame_evidence_key: FrameEvidenceKey,
+    completed_elapsed_ms: Option<f64>,
+    payload: serde_json::Value,
+) -> NativePostPresentProofArtifact {
+    NativePostPresentProofArtifact {
+        schema_version: 1,
+        frame_evidence_key,
+        kind,
+        status: "pass".to_owned(),
+        completed_elapsed_ms,
+        payload,
+    }
+}
+
+pub fn native_post_present_json_proof_subscriber<F>(
+    kind: NativePostPresentProofRequestKind,
+    build_payload: F,
+) -> NativePostPresentProofSubscriber
+where
+    F: FnOnce(&NativePostPresentProofContext) -> serde_json::Value + Send + 'static,
+{
+    Box::new(move |context| {
+        let payload = build_payload(&context);
+        Ok(native_post_present_json_proof_artifact(
+            kind,
+            context.frame_evidence_key.clone(),
+            context.completed_elapsed_ms,
+            payload,
+        ))
+    })
+}
+
+fn proof_history_post_present_subscriber(
+    recent_frame_evidence_count: usize,
+) -> NativePostPresentProofSubscriber {
+    native_post_present_json_proof_subscriber(
+        NativePostPresentProofRequestKind::ProofHistory,
+        move |context| {
+            serde_json::json!({
+                "status": "pass",
+                "proof_history_updated": true,
+                "recent_frame_evidence_count": recent_frame_evidence_count,
+                "frame_seq": context.frame_evidence_key.frame_seq,
+                "input_event_seq": context.frame_evidence_key.input_event_seq
+            })
+        },
+    )
+}
+
+fn render_hook_report_json_post_present_subscriber(
+    report_path: String,
+    enqueue_ms: f64,
+) -> NativePostPresentProofSubscriber {
+    native_post_present_json_proof_subscriber(
+        NativePostPresentProofRequestKind::RenderHookReportJson,
+        move |context| {
+            serde_json::json!({
+                "status": "pass",
+                "report_snapshot_enqueued": true,
+                "report_path": report_path,
+                "enqueue_ms": enqueue_ms,
+                "frame_seq": context.frame_evidence_key.frame_seq,
+                "input_event_seq": context.frame_evidence_key.input_event_seq
+            })
+        },
+    )
+}
+
+pub fn native_post_present_artifact_hash_subscriber(
+    artifact_paths: Vec<String>,
+) -> NativePostPresentProofSubscriber {
+    Box::new(move |context| {
+        let mut artifact_sha256s = Vec::with_capacity(artifact_paths.len());
+        for artifact_path in &artifact_paths {
+            let sha256 = sha256_file(Path::new(artifact_path)).map_err(|error| {
+                format!("post-present artifact hash failed for {artifact_path}: {error}")
+            })?;
+            artifact_sha256s.push(serde_json::json!({
+                "path": artifact_path,
+                "sha256": sha256,
+            }));
+        }
+        let hashed_artifact_count = artifact_sha256s.len();
+        Ok(native_post_present_json_proof_artifact(
+            NativePostPresentProofRequestKind::ArtifactHash,
+            context.frame_evidence_key.clone(),
+            context.completed_elapsed_ms,
+            serde_json::json!({
+                "status": "pass",
+                "artifact_hash_status": if artifact_paths.is_empty() {
+                    "no_registered_artifacts"
+                } else {
+                    "hashed_registered_artifacts"
+                },
+                "registered_artifact_count": artifact_paths.len(),
+                "hashed_artifact_count": hashed_artifact_count,
+                "artifact_sha256s": artifact_sha256s,
+                "frame_seq": context.frame_evidence_key.frame_seq,
+                "input_event_seq": context.frame_evidence_key.input_event_seq,
+            }),
+        ))
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeRenderedProductFrame {
+    pub schema_version: u32,
+    pub render_target_kind: String,
+    pub visible_surface_rendered: bool,
+    pub visible_present_path: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_scene_identity: Option<String>,
+    pub legacy_proof_json_built_pre_present: bool,
+    pub legacy_render_hook_proof_built_pre_present: bool,
+    pub post_present_proof_request_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductFrameCommit {
+    pub schema_version: u32,
+    pub commit_source: String,
+    pub frame_evidence_key: FrameEvidenceKey,
+    pub frame_lane: NativeFrameLane,
+    pub scheduler_reason: Option<NativeSchedulerReason>,
+    pub role_dirty_reason: Option<NativeRoleDirtyReason>,
+    pub input_event_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_input_event: Option<NativeHostInputEventSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_timing: Option<NativeAcceptedInputFrameTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_to_present_ms: Option<f64>,
+    pub content_revision: u64,
+    pub layout_revision: u64,
+    pub render_scene_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_target_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_path_mode: Option<NativePresentPathMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_started_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_acquired_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_completed_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_submitted_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_completed_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_acquire_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_finish_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_submit_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_path_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_state_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_input_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_world_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_core_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_revision_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_total_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_phase_timings: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_frame: Option<NativeRenderedProductFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
+    pub post_present_proof_request_count: u32,
+    pub legacy_pre_present_proof_request_count: u32,
+    pub legacy_product_proof_built_pre_present: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2067,6 +3087,24 @@ pub struct NativeRenderFrameMetrics {
     pub queue_write_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_blocked_on_ipc_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_state_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_input_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_world_snapshot_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_core_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_revision_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_outer_total_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_hook_phase_timings: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_frame: Option<NativeRenderedProductFrame>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -2078,11 +3116,14 @@ struct NativePreviewPerfAccumulator {
     queue_submit_call_ms: VecDeque<f64>,
     present_path_ms: VecDeque<f64>,
     input_to_present_ms: VecDeque<f64>,
+    product_input_to_present_ms: VecDeque<f64>,
     upload_bytes: VecDeque<f64>,
     draw_call_count: VecDeque<f64>,
     glyph_cache_hit_rate: VecDeque<f64>,
     materialized_item_count: VecDeque<f64>,
     proof_overhead_ms: VecDeque<f64>,
+    product_frame_count: u64,
+    product_missed_frame_count: u64,
 }
 
 impl Default for NativePreviewPerfAccumulator {
@@ -2095,11 +3136,14 @@ impl Default for NativePreviewPerfAccumulator {
             queue_submit_call_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             present_path_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             input_to_present_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            product_input_to_present_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             upload_bytes: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             draw_call_count: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             glyph_cache_hit_rate: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             materialized_item_count: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
             proof_overhead_ms: VecDeque::with_capacity(PREVIEW_PERF_STATS_WINDOW),
+            product_frame_count: 0,
+            product_missed_frame_count: 0,
         }
     }
 }
@@ -2114,6 +3158,7 @@ impl NativePreviewPerfAccumulator {
         queue_submit_call_ms: Option<f64>,
         present_path_ms: Option<f64>,
         input_to_present_ms: Option<f64>,
+        frame_lane: Option<NativeFrameLane>,
         proof_overhead_ms: Option<f64>,
     ) {
         push_perf_sample(&mut self.render_hook_ms, render_hook_ms);
@@ -2126,6 +3171,18 @@ impl NativePreviewPerfAccumulator {
         push_perf_sample(&mut self.queue_submit_call_ms, queue_submit_call_ms);
         push_perf_sample(&mut self.present_path_ms, present_path_ms);
         push_perf_sample(&mut self.input_to_present_ms, input_to_present_ms);
+        if frame_lane == Some(NativeFrameLane::ProductInteraction)
+            && let Some(input_to_present_ms) = input_to_present_ms.filter(|value| value.is_finite())
+        {
+            self.product_frame_count = self.product_frame_count.saturating_add(1);
+            if input_to_present_ms > NATIVE_TARGET_FRAME_INTERVAL_MS {
+                self.product_missed_frame_count = self.product_missed_frame_count.saturating_add(1);
+            }
+            push_perf_sample(
+                &mut self.product_input_to_present_ms,
+                Some(input_to_present_ms),
+            );
+        }
         push_perf_sample(
             &mut self.upload_bytes,
             render_frame_metrics
@@ -2179,6 +3236,10 @@ impl NativePreviewPerfAccumulator {
         metric_summary_from_samples(&self.input_to_present_ms)
     }
 
+    fn product_input_to_present_summary(&self) -> NativePerfMetricSummary {
+        metric_summary_from_samples(&self.product_input_to_present_ms)
+    }
+
     fn upload_bytes_summary(&self) -> NativePerfMetricSummary {
         metric_summary_from_samples(&self.upload_bytes)
     }
@@ -2217,6 +3278,8 @@ pub struct NativePreviewPerfStats {
     pub queue_submit_call_ms: Option<f64>,
     pub present_path_ms: Option<f64>,
     pub input_to_present_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_lane: Option<NativeFrameLane>,
     pub render_hook_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub layout_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub present_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
@@ -2225,6 +3288,14 @@ pub struct NativePreviewPerfStats {
     pub queue_submit_call_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub present_path_ms_p50_p95_p99_max: NativePerfMetricSummary,
     pub input_to_present_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_input_to_present_ms: Option<f64>,
+    #[serde(default)]
+    pub product_input_to_present_ms_p50_p95_p99_max: NativePerfMetricSummary,
+    #[serde(default)]
+    pub product_frame_count: u64,
+    #[serde(default)]
+    pub product_missed_frame_count: u64,
     pub upload_bytes_p50_p95_max: NativePerfMetricSummary,
     pub draw_call_count_p50_p95_max: NativePerfMetricSummary,
     pub glyph_cache_hit_rate: Option<f64>,
@@ -2263,12 +3334,108 @@ pub struct AppWindowReadbackArtifact {
     pub readback_poll_status: String,
 }
 
+fn artifact_hash_requested_post_present(commit: &NativeProductFrameCommit) -> bool {
+    commit.post_present_proof_requests.iter().any(|request| {
+        request.kind == NativePostPresentProofRequestKind::ArtifactHash
+            && !request.currently_legacy_pre_present
+    })
+}
+
+fn post_present_artifact_hash_paths_for_frame(
+    key: &FrameEvidenceKey,
+    last_interactive_readback_artifact: Option<&AppWindowReadbackArtifact>,
+    recent_interactive_readback_artifacts: &VecDeque<AppWindowReadbackArtifact>,
+    external_render_proof: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let mut artifact_paths = Vec::new();
+    for artifact in recent_interactive_readback_artifacts.iter().rev() {
+        if artifact.frame_evidence_key.as_ref() == Some(key) {
+            push_existing_artifact_path(&mut artifact_paths, Some(&artifact.path));
+        }
+    }
+    if let Some(artifact) = last_interactive_readback_artifact
+        && artifact.frame_evidence_key.as_ref() == Some(key)
+    {
+        push_existing_artifact_path(&mut artifact_paths, Some(&artifact.path));
+    }
+    if let Some(proof) =
+        external_render_proof_with_frame_evidence_key(external_render_proof, Some(key)).as_ref()
+    {
+        collect_external_render_proof_artifact_paths_for_frame(proof, key, &mut artifact_paths);
+    }
+    artifact_paths
+}
+
+fn should_defer_empty_artifact_hash_for_pending_readback(
+    artifact_paths: &[String],
+    state: &NativeRenderLoopState,
+    key: &FrameEvidenceKey,
+    readback_pending: bool,
+) -> bool {
+    artifact_paths.is_empty()
+        && readback_pending
+        && state.has_queued_post_present_proof_request(
+            key,
+            NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+        )
+}
+
+fn collect_external_render_proof_artifact_paths_for_frame(
+    value: &serde_json::Value,
+    key: &FrameEvidenceKey,
+    artifact_paths: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let frame_key_matches = object
+                .get("frame_evidence_key")
+                .and_then(|value| serde_json::from_value::<FrameEvidenceKey>(value.clone()).ok())
+                .as_ref()
+                == Some(key);
+            let app_owned_readback = object
+                .get("capture_method")
+                .and_then(serde_json::Value::as_str)
+                == Some("wgpu-visible-surface-copy-src-readback")
+                || object.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("app_owned_pixels");
+            if frame_key_matches && app_owned_readback {
+                push_existing_artifact_path(
+                    artifact_paths,
+                    object
+                        .get("artifact_path")
+                        .or_else(|| object.get("path"))
+                        .and_then(serde_json::Value::as_str),
+                );
+            }
+            for child in object.values() {
+                collect_external_render_proof_artifact_paths_for_frame(child, key, artifact_paths);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_external_render_proof_artifact_paths_for_frame(child, key, artifact_paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_existing_artifact_path(artifact_paths: &mut Vec<String>, path: Option<&str>) {
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return;
+    };
+    if Path::new(path).is_file() && !artifact_paths.iter().any(|existing| existing == path) {
+        artifact_paths.push(path.to_owned());
+    }
+}
+
 struct PendingSurfaceReadback {
     buffer: wgpu::Buffer,
     role: NativeWindowRole,
     title: String,
     surface_id: SurfaceId,
     surface_epoch: u64,
+    frame_evidence_key: Option<FrameEvidenceKey>,
     width: u32,
     height: u32,
     unpadded_bytes_per_row: u32,
@@ -2371,6 +3538,7 @@ pub type NativeExitHook = Box<dyn FnMut() -> Option<String> + Send>;
 pub type NativePerfStatsHook = Box<dyn FnMut(NativePreviewPerfStats) + Send>;
 
 pub struct NativeWindowHooks {
+    pub input: Option<NativePollHook>,
     pub poll: Option<NativePollHook>,
     pub should_exit: Option<NativeExitHook>,
     pub render: NativeRenderHook,
@@ -2380,6 +3548,7 @@ pub struct NativeWindowHooks {
 impl NativeWindowHooks {
     pub fn from_render_hook(render: NativeRenderHook) -> Self {
         Self {
+            input: None,
             poll: None,
             should_exit: None,
             render,
@@ -2399,6 +3568,20 @@ fn notify_native_perf_stats(hooks: &mut Option<NativeWindowHooks>, stats: Native
     if let Some(callback) = hooks.as_mut().and_then(|hooks| hooks.perf_stats.as_mut()) {
         callback(stats);
     }
+}
+
+fn poll_native_window_input_hooks(
+    hooks: &mut Option<NativeWindowHooks>,
+    context: NativePollContext,
+) -> Result<Option<NativePollResult>, NativeWindowError> {
+    hooks
+        .as_mut()
+        .and_then(|hooks| hooks.input.as_mut())
+        .map(|poll| {
+            poll(context)
+                .map_err(|error| NativeWindowError::Failed(format!("role input hook: {error}")))
+        })
+        .transpose()
 }
 
 fn poll_native_window_hooks(
@@ -2675,8 +3858,14 @@ async fn run_surface_probe_inner(
     let requested_present_mode = std::env::var("BOON_NATIVE_PRESENT_MODE").ok();
     config.present_mode =
         configured_low_latency_present_mode(&capabilities, requested_present_mode.as_deref());
-    config.desired_maximum_frame_latency =
-        interactive_desired_maximum_frame_latency(config.present_mode);
+    let requested_desired_maximum_frame_latency =
+        std::env::var("BOON_NATIVE_DESIRED_MAXIMUM_FRAME_LATENCY").ok();
+    let (configured_desired_maximum_frame_latency, desired_maximum_frame_latency_source) =
+        configured_desired_maximum_frame_latency(
+            config.present_mode,
+            requested_desired_maximum_frame_latency.as_deref(),
+        );
+    config.desired_maximum_frame_latency = configured_desired_maximum_frame_latency;
     let surface_copy_to_present_supported =
         capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
     let surface_copy_src_readback_supported =
@@ -2684,7 +3873,7 @@ async fn run_surface_probe_inner(
     if surface_copy_to_present_supported {
         config.usage |= wgpu::TextureUsages::COPY_DST;
     }
-    if options.readback_artifact_dir.is_some() {
+    if options.readback_enabled() {
         if !surface_copy_src_readback_supported {
             return Err(NativeWindowError::Failed(format!(
                 "visible surface readback requires COPY_SRC usage, but supported usages are {:?}",
@@ -2696,6 +3885,7 @@ async fn run_surface_probe_inner(
     let surface_format = format!("{:?}", config.format);
     let present_mode = format!("{:?}", config.present_mode);
     let desired_maximum_frame_latency = config.desired_maximum_frame_latency;
+    let desired_maximum_frame_latency_source = desired_maximum_frame_latency_source.to_owned();
     let alpha_mode = format!("{:?}", config.alpha_mode);
     surface.configure(&device, &config);
     let warmup_frame_count = options.warmup_frame_count;
@@ -2762,6 +3952,7 @@ async fn run_surface_probe_inner(
             render_loop_state.apply_poll_result(&poll_result, false);
         }
         let rendered_revision = render_loop_state.dirty_revision;
+        let content_validation_revision = render_loop_state.content_validation_revision();
         let acquire_start = Instant::now();
         let Some(frame) = acquire_surface_texture_for_present(
             &surface,
@@ -2806,7 +3997,7 @@ async fn run_surface_probe_inner(
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
                 if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
-                    rendered_revision,
+                    content_validation_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 ) {
@@ -2830,9 +4021,11 @@ async fn run_surface_probe_inner(
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
+                                desired_maximum_frame_latency_source.as_str(),
                                 None,
                                 &app_surface,
                                 None,
+                                options.proof_mode,
                             ),
                             Some(error.as_str()),
                         );
@@ -2849,7 +4042,7 @@ async fn run_surface_probe_inner(
                 rendered_content_revision = presented_revisions.0;
                 rendered_layout_revision = presented_revisions.1;
                 rendered_render_scene_revision = presented_revisions.2;
-                external_render_proof = Some(render_result.proof);
+                external_render_proof = render_result.proof;
                 Some(elapsed_ms(render_start))
             }
             None => {
@@ -2872,8 +4065,22 @@ async fn run_surface_probe_inner(
                 None
             }
         };
+        let pending_frame_evidence_key = frame_evidence_key_for_next_presented_frame_with_revisions(
+            &render_loop_state,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            None,
+            None,
+            rendered_content_revision,
+            rendered_layout_revision,
+            rendered_render_scene_revision,
+        );
+        render_loop_state.note_preissued_frame_evidence_key(
+            pending_frame_evidence_key.clone(),
+            elapsed_ms(present_start),
+        );
         let readback_sample_frame =
-            frame_index + 1 == total_frame_count && options.readback_artifact_dir.is_some();
+            frame_index + 1 == total_frame_count && options.readback_enabled();
         if readback_sample_frame {
             pending_readback = Some(queue_visible_surface_readback(
                 &device,
@@ -2886,6 +4093,7 @@ async fn run_surface_probe_inner(
                 &options.title,
                 surface_id.clone(),
                 surface_lifecycle.epoch(),
+                Some(pending_frame_evidence_key.clone()),
             )?);
         }
         let current_command_record_ms = elapsed_ms(present_start);
@@ -2904,6 +4112,16 @@ async fn run_surface_probe_inner(
             rendered_content_revision,
             rendered_layout_revision,
             rendered_render_scene_revision,
+        );
+        debug_assert_eq!(
+            frame_evidence_key_for_presented_frame(
+                &render_loop_state,
+                &surface_id,
+                surface_lifecycle.epoch(),
+                None,
+                None,
+            ),
+            pending_frame_evidence_key
         );
         if let Some(report) = options.render_loop_state_report.as_deref() {
             write_render_loop_state_report(
@@ -2924,9 +4142,11 @@ async fn run_surface_probe_inner(
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
+                    desired_maximum_frame_latency_source.as_str(),
                     None,
                     &app_surface,
                     None,
+                    options.proof_mode,
                 ),
                 None,
             )?;
@@ -3039,14 +4259,21 @@ async fn run_surface_probe_inner(
     let readback_ms = readback_artifact
         .as_ref()
         .map(|_| elapsed_ms(readback_start));
-    if options.input_sample_delay_ms > 0 {
-        std::thread::sleep(Duration::from_millis(options.input_sample_delay_ms));
-    }
-    if options.synthetic_input_probe {
-        inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
-    }
-    let mut input_adapter =
-        sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe);
+    let mut input_adapter = if options.sample_input_after_initial_frames {
+        if options.input_sample_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(options.input_sample_delay_ms));
+        }
+        if options.synthetic_input_probe {
+            inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
+        }
+        sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe)
+    } else {
+        let mut input_adapter = empty_input_adapter_proof(options.synthetic_input_probe);
+        input_adapter.real_os_events_observed = input_event_wake_count.load(Ordering::Relaxed) > 0;
+        input_adapter.sampled_after_visible_window = false;
+        input_adapter.input_injection_method = "none-no-input-floor-observation".to_owned();
+        input_adapter
+    };
     let mut post_input_frame_timing = None;
     if input_adapter.real_os_events_observed && hooks.is_some() {
         let post_input_warmup_frame_count = warmup_frame_count;
@@ -3112,6 +4339,7 @@ async fn run_surface_probe_inner(
                     .apply_poll_result(&poll_result, frame_input.real_os_events_observed);
             }
             let rendered_revision = render_loop_state.dirty_revision;
+            let content_validation_revision = render_loop_state.content_validation_revision();
             let acquire_start = Instant::now();
             let Some(frame) = acquire_surface_texture_for_present(
                 &surface,
@@ -3156,7 +4384,7 @@ async fn run_surface_probe_inner(
                     NativeWindowError::Failed(format!("external render hook after input: {error}"))
                 })?;
                 if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
-                    rendered_revision,
+                    content_validation_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 ) {
@@ -3180,9 +4408,11 @@ async fn run_surface_probe_inner(
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
+                                desired_maximum_frame_latency_source.as_str(),
                                 None,
                                 &app_surface,
                                 Some(&input_adapter),
+                                options.proof_mode,
                             ),
                             Some(error.as_str()),
                         );
@@ -3199,11 +4429,27 @@ async fn run_surface_probe_inner(
                 rendered_content_revision = presented_revisions.0;
                 rendered_layout_revision = presented_revisions.1;
                 rendered_render_scene_revision = presented_revisions.2;
-                external_render_proof = Some(render_result.proof);
+                external_render_proof = render_result.proof;
                 post_input_render_hook_ms = Some(elapsed_ms(render_start));
             }
-            let readback_sample_frame = frame_index + 1 == post_input_total_frame_count
-                && options.readback_artifact_dir.is_some();
+            let pending_frame_evidence_key =
+                frame_evidence_key_for_next_presented_frame_with_revisions(
+                    &render_loop_state,
+                    &surface_id,
+                    surface_lifecycle.epoch(),
+                    (render_loop_state.last_accepted_host_input_event_wake_count > 0)
+                        .then_some(render_loop_state.last_accepted_host_input_event_wake_count),
+                    None,
+                    rendered_content_revision,
+                    rendered_layout_revision,
+                    rendered_render_scene_revision,
+                );
+            render_loop_state.note_preissued_frame_evidence_key(
+                pending_frame_evidence_key.clone(),
+                elapsed_ms(present_start),
+            );
+            let readback_sample_frame =
+                frame_index + 1 == post_input_total_frame_count && options.readback_enabled();
             if readback_sample_frame {
                 post_input_readback = Some(queue_visible_surface_readback(
                     &device,
@@ -3216,6 +4462,7 @@ async fn run_surface_probe_inner(
                     &options.title,
                     surface_id.clone(),
                     surface_lifecycle.epoch(),
+                    Some(pending_frame_evidence_key.clone()),
                 )?);
             }
             let current_command_record_ms = elapsed_ms(present_start);
@@ -3234,6 +4481,17 @@ async fn run_surface_probe_inner(
                 rendered_content_revision,
                 rendered_layout_revision,
                 rendered_render_scene_revision,
+            );
+            debug_assert_eq!(
+                frame_evidence_key_for_presented_frame(
+                    &render_loop_state,
+                    &surface_id,
+                    surface_lifecycle.epoch(),
+                    (render_loop_state.last_accepted_host_input_event_wake_count > 0)
+                        .then_some(render_loop_state.last_accepted_host_input_event_wake_count),
+                    None,
+                ),
+                pending_frame_evidence_key
             );
             let current_post_present_bookkeeping_ms = elapsed_ms(post_present_bookkeeping_start);
             let current_present_submit_ms = elapsed_ms(present_start);
@@ -3367,7 +4625,7 @@ async fn run_surface_probe_inner(
         artifact.frame_evidence_key = proof_frame_evidence_key.clone();
     }
     let surface_external_render_proof = external_render_proof_with_frame_evidence_key(
-        external_render_proof.clone(),
+        external_render_proof.as_ref(),
         proof_frame_evidence_key.as_ref(),
     );
 
@@ -3398,6 +4656,7 @@ async fn run_surface_probe_inner(
         supported_present_modes,
         non_vsync_present_mode_available,
         desired_maximum_frame_latency,
+        desired_maximum_frame_latency_source: desired_maximum_frame_latency_source.clone(),
         alpha_mode,
         supported_alpha_modes,
         supported_usages,
@@ -3429,6 +4688,7 @@ async fn run_surface_probe_inner(
         input_event_wake_count: input_event_wake_count.load(Ordering::Relaxed),
         app_window_surface_content_report: app_window_surface_content_report(&app_surface),
         input_sample_delay_ms: options.input_sample_delay_ms,
+        sample_input_after_initial_frames: options.sample_input_after_initial_frames,
         frame_timing,
         post_input_frame_timing,
         input_adapter,
@@ -3436,6 +4696,7 @@ async fn run_surface_probe_inner(
         readback_artifact,
     };
     let _ = ready_sender.send(Ok(proof));
+    let mut external_render_proof = external_render_proof.map(Arc::new);
     let hold_started = Instant::now();
     let mut input_cursor = NativeInputCursor::default();
     let mut last_wake_generation = 0;
@@ -3443,6 +4704,8 @@ async fn run_surface_probe_inner(
     let mut last_interactive_readback_finish_ms: Option<f64> = None;
     let mut last_interactive_readback_completed_elapsed_ms: Option<f64> = None;
     let mut last_interactive_readback_error: Option<String> = None;
+    let mut recent_interactive_readback_artifacts: VecDeque<AppWindowReadbackArtifact> =
+        VecDeque::new();
     let mut last_interactive_surface_readback_queued = false;
     let mut last_interactive_surface_readback_skipped_for_external_proof = false;
     let mut last_interactive_surface_readback_skipped_for_stale_input = false;
@@ -3453,6 +4716,8 @@ async fn run_surface_probe_inner(
     let mut last_render_loop_report_enqueue_ms: Option<f64> = None;
     let mut last_frame_evidence_key: Option<FrameEvidenceKey> = None;
     let mut recent_frame_evidence: VecDeque<serde_json::Value> = VecDeque::new();
+    let mut recent_product_frame_commits: VecDeque<NativeProductFrameCommit> = VecDeque::new();
+    let mut deferred_artifact_hash_readback_keys: VecDeque<FrameEvidenceKey> = VecDeque::new();
     let mut preview_perf_accumulator = NativePreviewPerfAccumulator::default();
     let mut offscreen_present_target: Option<NativeOffscreenPresentTarget> = None;
     let requested_present_path_mode = requested_present_path_mode_from_env();
@@ -3460,95 +4725,129 @@ async fn run_surface_probe_inner(
         .render_loop_state_report
         .as_ref()
         .map(|_| AsyncRenderLoopReportWriter::new());
+    let mut async_post_present_proof_worker = AsyncPostPresentProofSubscriberWorker::new();
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
     loop {
-        if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
-            match result {
-                Ok(result) => {
-                    last_interactive_readback_finish_ms = Some(result.finish_ms);
-                    last_interactive_readback_completed_elapsed_ms =
-                        Some(result.completed_elapsed_ms);
-                    last_interactive_readback_artifact = Some(result.artifact);
-                    last_interactive_surface_readback_pending = false;
-                    last_interactive_readback_error = None;
+        let pre_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
+        let pre_input_subscriber_drain_allowed =
+            pre_input_event_wake_count <= last_sampled_input_event_wake_count;
+        if pre_input_subscriber_drain_allowed {
+            async_post_present_proof_worker.drain_completed(&mut render_loop_state);
+            if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
+                match result {
+                    Ok(result) => {
+                        last_interactive_readback_finish_ms = Some(result.finish_ms);
+                        last_interactive_readback_completed_elapsed_ms =
+                            Some(result.completed_elapsed_ms);
+                        note_completed_interactive_readback_artifact(
+                            &mut render_loop_state,
+                            &mut recent_interactive_readback_artifacts,
+                            &mut last_interactive_readback_artifact,
+                            &mut deferred_artifact_hash_readback_keys,
+                            result.artifact,
+                            Some(result.completed_elapsed_ms),
+                        );
+                        last_interactive_surface_readback_pending = false;
+                        last_interactive_readback_error = None;
+                    }
+                    Err(error) => {
+                        last_interactive_readback_finish_ms = None;
+                        last_interactive_readback_completed_elapsed_ms =
+                            Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+                        last_interactive_surface_readback_pending = false;
+                        last_interactive_readback_error = Some(error);
+                        render_loop_state.telemetry_drop_count =
+                            render_loop_state.telemetry_drop_count.saturating_add(1);
+                        render_loop_state.last_missed_frame_cause =
+                            Some("interactive_readback_error".to_owned());
+                    }
                 }
-                Err(error) => {
-                    last_interactive_readback_finish_ms = None;
-                    last_interactive_readback_completed_elapsed_ms =
-                        Some(hold_started.elapsed().as_secs_f64() * 1000.0);
-                    last_interactive_surface_readback_pending = false;
-                    last_interactive_readback_error = Some(error);
-                    render_loop_state.telemetry_drop_count =
-                        render_loop_state.telemetry_drop_count.saturating_add(1);
-                    render_loop_state.last_missed_frame_cause =
-                        Some("interactive_readback_error".to_owned());
-                }
-            }
-            if let (Some(report), Some(report_writer)) = (
-                options.render_loop_state_report.as_deref(),
-                async_render_loop_report_writer.as_ref(),
-            ) {
-                let report_enqueue_started = Instant::now();
-                let report_writer_stats = report_writer.stats();
-                last_render_loop_report_write_ms = report_writer_stats.last_write_ms;
-                let snapshot = render_loop_report_snapshot(
-                    Path::new(report),
-                    options.role,
-                    std::process::id(),
-                    &window_id,
-                    &surface_id,
-                    surface_lifecycle.report(),
-                    &render_loop_state,
-                    hold_started.elapsed(),
-                    wake_handle.generation(),
-                    last_interactive_readback_artifact.as_ref(),
-                    &preview_perf_accumulator,
-                    render_loop_report_extras(
-                        resize_wake_count.load(Ordering::Relaxed),
-                        input_event_wake_count.load(Ordering::Relaxed),
-                        present_mode.as_str(),
-                        surface_format.as_str(),
-                        desired_maximum_frame_latency,
-                        input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
-                        &app_surface,
-                        Some(&observed_input_adapter),
-                    )
-                    .with_input_generation(
-                        last_sampled_input_event_wake_count,
-                        last_presented_input_event_wake_count,
-                        input_event_wake_elapsed_ms_for_generation(
-                            &input_event_wake_timeline,
+                if let (Some(report), Some(report_writer)) = (
+                    options.render_loop_state_report.as_deref(),
+                    async_render_loop_report_writer.as_ref(),
+                ) {
+                    if input_event_wake_count.load(Ordering::Relaxed) > pre_input_event_wake_count {
+                        render_loop_state
+                            .note_pre_input_subscriber_drain_skipped("pending_host_input");
+                        render_loop_state.last_scheduler_reason =
+                            Some(NativeSchedulerReason::HostInput);
+                        render_loop_state.scheduled_wake_count =
+                            render_loop_state.scheduled_wake_count.saturating_add(1);
+                        continue;
+                    }
+                    let report_enqueue_started = Instant::now();
+                    let report_writer_stats = report_writer.stats();
+                    last_render_loop_report_write_ms = report_writer_stats.last_write_ms;
+                    let snapshot = render_loop_report_snapshot(
+                        Path::new(report),
+                        options.role,
+                        std::process::id(),
+                        &window_id,
+                        &surface_id,
+                        surface_lifecycle.report(),
+                        &render_loop_state,
+                        hold_started.elapsed(),
+                        wake_handle.generation(),
+                        last_interactive_readback_artifact.as_ref(),
+                        &preview_perf_accumulator,
+                        render_loop_report_extras(
+                            resize_wake_count.load(Ordering::Relaxed),
+                            input_event_wake_count.load(Ordering::Relaxed),
+                            present_mode.as_str(),
+                            surface_format.as_str(),
+                            desired_maximum_frame_latency,
+                            desired_maximum_frame_latency_source.as_str(),
+                            input_event_last_wake_elapsed_ms(
+                                &input_event_last_wake_at,
+                                hold_started,
+                            ),
+                            &app_surface,
+                            Some(&observed_input_adapter),
+                            options.proof_mode,
+                        )
+                        .with_input_generation(
                             last_sampled_input_event_wake_count,
-                            hold_started,
-                        ),
-                        input_event_wake_elapsed_ms_for_generation(
-                            &input_event_wake_timeline,
                             last_presented_input_event_wake_count,
-                            hold_started,
-                        ),
-                    )
-                    .with_interactive_timing(
-                        report_writer_stats.last_write_ms,
-                        last_interactive_readback_finish_ms,
-                        last_interactive_readback_completed_elapsed_ms,
-                        last_interactive_surface_readback_queued,
-                        last_interactive_surface_readback_skipped_for_external_proof,
-                        last_interactive_surface_readback_skipped_for_stale_input,
-                        last_interactive_surface_readback_skipped_for_backpressure,
-                        last_interactive_surface_readback_pending,
-                        last_interactive_readback_error.clone(),
-                    )
-                    .with_external_render_proof(external_render_proof.as_ref())
-                    .with_frame_evidence_key(last_frame_evidence_key.as_ref())
-                    .with_recent_frame_evidence(&recent_frame_evidence)
-                    .with_report_writer_stats(Some(report_writer_stats)),
-                    None,
-                );
-                last_render_loop_report_enqueue_ms =
-                    Some(report_writer.enqueue(snapshot, report_enqueue_started));
+                            input_event_wake_elapsed_ms_for_generation(
+                                &input_event_wake_timeline,
+                                last_sampled_input_event_wake_count,
+                                hold_started,
+                            ),
+                            input_event_wake_elapsed_ms_for_generation(
+                                &input_event_wake_timeline,
+                                last_presented_input_event_wake_count,
+                                hold_started,
+                            ),
+                        )
+                        .with_interactive_timing(
+                            report_writer_stats.last_write_ms,
+                            last_interactive_readback_finish_ms,
+                            last_interactive_readback_completed_elapsed_ms,
+                            last_interactive_surface_readback_queued,
+                            last_interactive_surface_readback_skipped_for_external_proof,
+                            last_interactive_surface_readback_skipped_for_stale_input,
+                            last_interactive_surface_readback_skipped_for_backpressure,
+                            last_interactive_surface_readback_pending,
+                            last_interactive_readback_error.clone(),
+                        )
+                        .with_external_render_proof(external_render_proof.as_ref())
+                        .with_frame_evidence_key(last_frame_evidence_key.as_ref())
+                        .with_recent_frame_evidence(&recent_frame_evidence)
+                        .with_recent_product_frame_commits(&recent_product_frame_commits)
+                        .with_recent_interactive_readback_artifacts(
+                            &recent_interactive_readback_artifacts,
+                        )
+                        .with_report_writer_stats(Some(report_writer_stats)),
+                        None,
+                    );
+                    last_render_loop_report_enqueue_ms =
+                        Some(report_writer.enqueue(snapshot, report_enqueue_started));
+                }
             }
+        } else if interactive_readback_job.is_some() {
+            render_loop_state.note_pre_input_subscriber_drain_skipped("pending_host_input");
         }
         if options.hold_ms > 0 && hold_started.elapsed() >= Duration::from_millis(options.hold_ms) {
             render_loop_state.note_loop_exit("hold_timeout_elapsed");
@@ -3614,7 +4913,8 @@ async fn run_surface_probe_inner(
         let input_sample_started = Instant::now();
         let mut sampled_input_event_wake_count_before =
             input_event_wake_count.load(Ordering::Relaxed);
-        let mut input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+        let mut input =
+            sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false, hold_started);
         let mut sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         for _ in 0..2 {
             if sampled_input_event_wake_count <= sampled_input_event_wake_count_before {
@@ -3624,11 +4924,22 @@ async fn run_surface_probe_inner(
                 sampled_input_event_wake_count - sampled_input_event_wake_count_before;
             render_loop_state.note_input_inline_resample(resample_gap);
             sampled_input_event_wake_count_before = sampled_input_event_wake_count;
-            input = sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false);
+            input = sample_input_adapter_delta(
+                &mut mouse,
+                &keyboard,
+                &input_cursor,
+                false,
+                hold_started,
+            );
             sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         }
         let input_sample_elapsed = input_sample_started.elapsed();
         last_sampled_input_event_wake_count = sampled_input_event_wake_count;
+        let sampled_delta_has_real_os_events = input.real_os_events_observed;
+        let raw_host_input_wake_pending =
+            sampled_input_event_wake_count > last_presented_input_event_wake_count;
+        let host_input_observed_this_turn =
+            input.real_os_events_observed || raw_host_input_wake_pending;
         let accessibility_started = Instant::now();
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
@@ -3637,22 +4948,49 @@ async fn run_surface_probe_inner(
         merge_input_adapter_proof(&mut observed_input_adapter, &input);
         render_loop_state.note_input_poll();
         let hook_started = Instant::now();
-        let poll_result = poll_native_window_hooks(
-            &mut hooks,
-            NativePollContext {
-                window_id: window_id.clone(),
-                surface_id: surface_id.clone(),
-                surface_epoch: surface_lifecycle.epoch(),
-                width,
-                height,
-                scale: current_scale as f32,
-                input_delta: input.clone(),
-                accessibility_actions,
-                now: poll_started_at,
-                forced_frame: false,
-            },
-        )?;
+        let mut poll_result = None;
+        if host_input_observed_this_turn
+            && let Some(input_poll_result) = poll_native_window_input_hooks(
+                &mut hooks,
+                NativePollContext {
+                    window_id: window_id.clone(),
+                    surface_id: surface_id.clone(),
+                    surface_epoch: surface_lifecycle.epoch(),
+                    width,
+                    height,
+                    scale: current_scale as f32,
+                    input_delta: input.clone(),
+                    accessibility_actions: accessibility_actions.clone(),
+                    now: poll_started_at,
+                    forced_frame: false,
+                },
+            )?
+        {
+            let effective_input_poll_result =
+                effective_poll_result_for_host_input(input_poll_result, true);
+            if effective_input_poll_result.dirty || sampled_delta_has_real_os_events {
+                poll_result = Some(effective_input_poll_result);
+            }
+        }
+        if poll_result.is_none() {
+            poll_result = poll_native_window_hooks(
+                &mut hooks,
+                NativePollContext {
+                    window_id: window_id.clone(),
+                    surface_id: surface_id.clone(),
+                    surface_epoch: surface_lifecycle.epoch(),
+                    width,
+                    height,
+                    scale: current_scale as f32,
+                    input_delta: input.clone(),
+                    accessibility_actions,
+                    now: poll_started_at,
+                    forced_frame: false,
+                },
+            )?;
+        }
         let hook_elapsed = hook_started.elapsed();
+        let role_poll_completed_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
         let bookkeeping_started = Instant::now();
         if let Some(poll_result) = poll_result {
             apply_native_cursor_icon(&app_surface, poll_result.cursor_icon);
@@ -3667,11 +5005,11 @@ async fn run_surface_probe_inner(
             }
             let effective_poll_result = effective_poll_result_for_host_input(
                 poll_result.clone(),
-                input.real_os_events_observed,
+                host_input_observed_this_turn,
             );
             render_loop_state
-                .apply_poll_result(&effective_poll_result, input.real_os_events_observed);
-            if input.real_os_events_observed && effective_poll_result.dirty {
+                .apply_poll_result(&effective_poll_result, host_input_observed_this_turn);
+            if host_input_observed_this_turn && effective_poll_result.dirty {
                 render_loop_state.request_animation_burst(
                     poll_started_at,
                     hold_started.elapsed().as_secs_f64() * 1000.0,
@@ -3685,29 +5023,56 @@ async fn run_surface_probe_inner(
                 );
             }
             if effective_poll_result.dirty {
-                render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
+                render_loop_state.note_dirty_poll(role_poll_completed_elapsed_ms);
             }
-            if input.real_os_events_observed && effective_poll_result.dirty {
+            if host_input_observed_this_turn && effective_poll_result.dirty {
+                let sampled_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
+                    &input_event_wake_timeline,
+                    sampled_input_event_wake_count,
+                    hold_started,
+                );
                 render_loop_state.note_accepted_host_input(
                     sampled_input_event_wake_count,
-                    poll_started_elapsed_ms,
+                    role_poll_completed_elapsed_ms,
                     native_input_delta_is_button_press_only(&input),
+                    Some(accepted_host_input_event_summary(
+                        &input,
+                        sampled_input_event_wake_count,
+                        sampled_input_wake_elapsed_ms,
+                        role_poll_completed_elapsed_ms,
+                        effective_poll_result
+                            .accepted_host_input_event_hint
+                            .as_ref(),
+                    )),
                 );
             }
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
-        } else if input.real_os_events_observed && !native_input_delta_is_button_press_only(&input)
+        } else if host_input_observed_this_turn && !native_input_delta_is_button_press_only(&input)
         {
+            let app_window_accept_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
             render_loop_state.mark_dirty(NativeSchedulerReason::HostInput, None);
             render_loop_state.request_animation_burst(
                 poll_started_at,
-                hold_started.elapsed().as_secs_f64() * 1000.0,
+                app_window_accept_elapsed_ms,
                 NativeSchedulerReason::HostInput,
             );
-            render_loop_state.note_dirty_poll(hold_started.elapsed().as_secs_f64() * 1000.0);
+            render_loop_state.note_dirty_poll(app_window_accept_elapsed_ms);
+            let sampled_input_wake_elapsed_ms = input_event_wake_elapsed_ms_for_generation(
+                &input_event_wake_timeline,
+                sampled_input_event_wake_count,
+                hold_started,
+            );
             render_loop_state.note_accepted_host_input(
                 sampled_input_event_wake_count,
-                poll_started_elapsed_ms,
+                app_window_accept_elapsed_ms,
                 false,
+                Some(accepted_host_input_event_summary(
+                    &input,
+                    sampled_input_event_wake_count,
+                    sampled_input_wake_elapsed_ms,
+                    app_window_accept_elapsed_ms,
+                    None,
+                )),
             );
         }
         render_loop_state.consume_due_wake_after_poll(Instant::now());
@@ -3729,7 +5094,24 @@ async fn run_surface_probe_inner(
         let current_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let unsampled_input_wake_count =
             current_input_event_wake_count > sampled_input_event_wake_count;
+        let render_due_after_poll = render_loop_state.should_render(Instant::now(), false);
         if unsampled_input_wake_count
+            && render_due_after_poll
+            && native_input_delta_is_pointer_motion_only(&input)
+            && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
+        {
+            render_loop_state.note_input_deferred_resample(
+                current_input_event_wake_count.saturating_sub(sampled_input_event_wake_count),
+            );
+            consecutive_unsampled_input_resamples =
+                consecutive_unsampled_input_resamples.saturating_add(1);
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+            continue;
+        }
+        if unsampled_input_wake_count
+            && !render_due_after_poll
             && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
         {
             render_loop_state.note_input_deferred_resample(
@@ -3778,9 +5160,9 @@ async fn run_surface_probe_inner(
             continue;
         }
         if should_defer_render_for_interactive_readback(
-            options.readback_artifact_dir.is_some(),
+            options.readback_enabled(),
             interactive_readback_job.is_some(),
-            input.real_os_events_observed,
+            host_input_observed_this_turn,
             render_loop_state.current_scheduler_reason,
         ) {
             let bookkeeping_elapsed = bookkeeping_started.elapsed();
@@ -3814,6 +5196,7 @@ async fn run_surface_probe_inner(
             accept_input_cursor(&mut mouse, &mut input_cursor, &input);
         }
         let rendered_revision = render_loop_state.dirty_revision;
+        let content_validation_revision = render_loop_state.content_validation_revision();
         render_loop_state.note_render_started(hold_started.elapsed().as_secs_f64() * 1000.0);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-app-window-interactive-encoder"),
@@ -3821,7 +5204,7 @@ async fn run_surface_probe_inner(
         let mut rendered_content_revision = rendered_revision;
         let mut rendered_layout_revision = rendered_revision;
         let mut rendered_render_scene_revision = rendered_revision;
-        let readback_enabled = options.readback_artifact_dir.is_some();
+        let readback_enabled = options.readback_enabled();
         let present_path_selection = select_native_present_path_mode(
             hooks.is_some(),
             surface_copy_to_present_supported,
@@ -3834,6 +5217,7 @@ async fn run_surface_probe_inner(
         render_loop_state.note_present_path_selection(present_path_selection);
         render_loop_state.note_render_target_kind(render_target_kind);
         let mut deferred_app_owned_readback_texture: Option<wgpu::Texture> = None;
+        let mut post_present_proof_subscribers: Vec<NativePostPresentProofSubscriber> = Vec::new();
 
         let frame = if use_offscreen_copy_to_present {
             let offscreen_texture = cached_offscreen_present_target(
@@ -3865,7 +5249,7 @@ async fn run_surface_probe_inner(
                     NativeWindowError::Failed(format!("external render hook: {error}"))
                 })?;
                 if let Err(error) = render_result.validate_for_presented_revision_with_scheduler(
-                    rendered_revision,
+                    content_validation_revision,
                     render_loop_state.current_scheduler_reason,
                     render_loop_state.current_role_dirty_reason,
                 ) {
@@ -3889,12 +5273,14 @@ async fn run_surface_probe_inner(
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
+                                desired_maximum_frame_latency_source.as_str(),
                                 input_event_last_wake_elapsed_ms(
                                     &input_event_last_wake_at,
                                     hold_started,
                                 ),
                                 &app_surface,
                                 Some(&observed_input_adapter),
+                                options.proof_mode,
                             ),
                             Some(error.as_str()),
                         );
@@ -3913,12 +5299,15 @@ async fn run_surface_probe_inner(
                 rendered_render_scene_revision = presented_revisions.2;
                 render_loop_state
                     .note_render_frame_metrics(render_result.render_frame_metrics.clone());
-                external_render_proof = Some(render_result.proof);
+                post_present_proof_subscribers = render_result.post_present_proof_subscribers;
+                external_render_proof = render_result.proof.map(Arc::new);
                 render_loop_state
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
             }
             let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
             if pre_present_input_event_wake_count > sampled_input_event_wake_count
+                && !render_loop_state
+                    .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count)
                 && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
             {
                 render_loop_state.note_input_pre_present_resample(
@@ -4008,7 +5397,7 @@ async fn run_surface_probe_inner(
                     })?;
                     if let Err(error) = render_result
                         .validate_for_presented_revision_with_scheduler(
-                            rendered_revision,
+                            content_validation_revision,
                             render_loop_state.current_scheduler_reason,
                             render_loop_state.current_role_dirty_reason,
                         )
@@ -4033,12 +5422,14 @@ async fn run_surface_probe_inner(
                                     present_mode.as_str(),
                                     surface_format.as_str(),
                                     desired_maximum_frame_latency,
+                                    desired_maximum_frame_latency_source.as_str(),
                                     input_event_last_wake_elapsed_ms(
                                         &input_event_last_wake_at,
                                         hold_started,
                                     ),
                                     &app_surface,
                                     Some(&observed_input_adapter),
+                                    options.proof_mode,
                                 ),
                                 Some(error.as_str()),
                             );
@@ -4057,7 +5448,8 @@ async fn run_surface_probe_inner(
                     rendered_render_scene_revision = presented_revisions.2;
                     render_loop_state
                         .note_render_frame_metrics(render_result.render_frame_metrics.clone());
-                    external_render_proof = Some(render_result.proof);
+                    post_present_proof_subscribers = render_result.post_present_proof_subscribers;
+                    external_render_proof = render_result.proof.map(Arc::new);
                     render_loop_state
                         .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -4085,18 +5477,41 @@ async fn run_surface_probe_inner(
             }
             frame
         };
+        let pending_frame_evidence_key = frame_evidence_key_for_next_presented_frame_with_revisions(
+            &render_loop_state,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            (sampled_input_event_wake_count > 0).then_some(sampled_input_event_wake_count),
+            None,
+            rendered_content_revision,
+            rendered_layout_revision,
+            rendered_render_scene_revision,
+        );
+        render_loop_state.note_preissued_frame_evidence_key(
+            pending_frame_evidence_key.clone(),
+            hold_started.elapsed().as_secs_f64() * 1000.0,
+        );
         let skip_interactive_surface_readback = options
             .skip_interactive_surface_readback_when_external_proof
             && options.role == NativeWindowRole::Preview
-            && options.readback_artifact_dir.is_some()
-            && external_render_proof_replaces_interactive_readback(external_render_proof.as_ref());
+            && options.readback_enabled()
+            && external_render_proof_replaces_interactive_readback(
+                external_render_proof.as_deref(),
+            );
         if let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job) {
             match result {
                 Ok(result) => {
                     last_interactive_readback_finish_ms = Some(result.finish_ms);
                     last_interactive_readback_completed_elapsed_ms =
                         Some(result.completed_elapsed_ms);
-                    last_interactive_readback_artifact = Some(result.artifact);
+                    note_completed_interactive_readback_artifact(
+                        &mut render_loop_state,
+                        &mut recent_interactive_readback_artifacts,
+                        &mut last_interactive_readback_artifact,
+                        &mut deferred_artifact_hash_readback_keys,
+                        result.artifact,
+                        Some(result.completed_elapsed_ms),
+                    );
                     last_interactive_surface_readback_pending = false;
                     last_interactive_readback_error = None;
                 }
@@ -4114,17 +5529,25 @@ async fn run_surface_probe_inner(
             }
         }
         let readback_job_in_flight = interactive_readback_job.is_some();
+        let product_input_frame = host_input_observed_this_turn
+            && render_loop_state
+                .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count);
         let interactive_readback_decision = interactive_surface_readback_decision(
             options.role,
             readback_enabled,
             skip_interactive_surface_readback,
             readback_job_in_flight,
+            product_input_frame,
         );
         if interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure {
             render_loop_state.telemetry_drop_count =
                 render_loop_state.telemetry_drop_count.saturating_add(1);
             render_loop_state.last_missed_frame_cause =
                 Some("interactive_readback_backpressure".to_owned());
+        } else if interactive_readback_decision
+            == InteractiveSurfaceReadbackDecision::DeferProductInput
+        {
+            render_loop_state.note_post_present_subscriber_drain_deferred("product_input_frame");
         }
         let interactive_readback_requested =
             interactive_readback_decision == InteractiveSurfaceReadbackDecision::Queue;
@@ -4147,6 +5570,7 @@ async fn run_surface_probe_inner(
                         &options.title,
                         surface_id.clone(),
                         surface_lifecycle.epoch(),
+                        Some(pending_frame_evidence_key.clone()),
                     )?,
                 ))
             } else {
@@ -4155,6 +5579,8 @@ async fn run_surface_probe_inner(
         if !use_offscreen_copy_to_present {
             let pre_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
             if pre_present_input_event_wake_count > sampled_input_event_wake_count
+                && !render_loop_state
+                    .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count)
                 && consecutive_unsampled_input_resamples < MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES
             {
                 render_loop_state.note_input_pre_present_resample(
@@ -4175,8 +5601,10 @@ async fn run_surface_probe_inner(
         last_interactive_surface_readback_queued = interactive_readback_requested;
         last_interactive_surface_readback_skipped_for_external_proof =
             interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipExternalProof;
-        last_interactive_surface_readback_skipped_for_backpressure =
-            interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure;
+        last_interactive_surface_readback_skipped_for_backpressure = interactive_readback_decision
+            == InteractiveSurfaceReadbackDecision::SkipBackpressure
+            || interactive_readback_decision
+                == InteractiveSurfaceReadbackDecision::DeferProductInput;
         let encoder_finish_started = Instant::now();
         let command_buffer = encoder.finish();
         let encoder_finish_ms = elapsed_ms(encoder_finish_started);
@@ -4199,15 +5627,44 @@ async fn run_surface_probe_inner(
         let stats_input_to_present_ms = stats_input_timing
             .as_ref()
             .map(|timing| timing.input_to_present_ms);
+        let stats_frame_lane = stats_input_timing
+            .as_ref()
+            .map(|timing| timing.frame_lane)
+            .or(render_loop_state.current_frame_lane);
+        let product_commit_scheduler_reason = render_loop_state.current_scheduler_reason;
+        let product_commit_role_dirty_reason = render_loop_state.current_role_dirty_reason;
+        let product_commit_frame_lane = stats_frame_lane.unwrap_or_else(|| {
+            native_frame_lane_for_scheduler(
+                product_commit_scheduler_reason,
+                product_commit_role_dirty_reason,
+                host_input_observed_this_turn,
+                false,
+            )
+        });
         render_loop_state.mark_presented_with_revisions(
             rendered_revision,
             rendered_content_revision,
             rendered_layout_revision,
             rendered_render_scene_revision,
         );
-        render_loop_state.schedule_requested_animation_followup(
-            Instant::now(),
-            hold_started.elapsed().as_secs_f64() * 1000.0,
+        debug_assert_eq!(
+            frame_evidence_key_for_presented_frame(
+                &render_loop_state,
+                &surface_id,
+                surface_lifecycle.epoch(),
+                (last_presented_input_event_wake_count > 0)
+                    .then_some(last_presented_input_event_wake_count),
+                None,
+            ),
+            pending_frame_evidence_key
+        );
+        let mut product_frame_commit = product_frame_commit_for_presented_frame(
+            &render_loop_state,
+            pending_frame_evidence_key.clone(),
+            product_commit_frame_lane,
+            product_commit_scheduler_reason,
+            product_commit_role_dirty_reason,
+            stats_input_timing.clone(),
         );
         let post_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let skip_interactive_surface_readback_for_stale_input = interactive_readback_requested
@@ -4226,15 +5683,27 @@ async fn run_surface_probe_inner(
             && !skip_interactive_surface_readback_for_stale_input)
             || (last_interactive_surface_readback_skipped_for_backpressure
                 && interactive_readback_job.is_some());
-        let current_frame_evidence_key = frame_evidence_key_for_presented_frame(
-            &render_loop_state,
-            &surface_id,
-            surface_lifecycle.epoch(),
-            (last_presented_input_event_wake_count > 0)
-                .then_some(last_presented_input_event_wake_count),
-            None,
-        );
+        let current_frame_evidence_key = pending_frame_evidence_key;
         last_frame_evidence_key = Some(current_frame_evidence_key.clone());
+        if interactive_readback_requested && !skip_interactive_surface_readback_for_stale_input {
+            add_post_present_proof_request_to_commit(
+                &mut product_frame_commit,
+                visible_surface_readback_post_present_request(),
+            );
+        }
+        render_loop_state.note_product_frame_commit(product_frame_commit.clone());
+        push_recent_product_frame_commit(&mut recent_product_frame_commits, &product_frame_commit);
+        render_loop_state.schedule_requested_animation_followup(
+            Instant::now(),
+            hold_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count {
+            render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+            continue;
+        }
         let deferred_interactive_readback = if !skip_interactive_surface_readback_for_stale_input
             && interactive_readback_requested
             && use_offscreen_copy_to_present
@@ -4263,6 +5732,7 @@ async fn run_surface_probe_inner(
                 &options.title,
                 surface_id.clone(),
                 surface_lifecycle.epoch(),
+                Some(current_frame_evidence_key.clone()),
             )?;
             queue.submit(Some(proof_encoder.finish()));
             Some((artifact_dir.to_owned(), pending))
@@ -4279,7 +5749,14 @@ async fn run_surface_probe_inner(
                         last_interactive_readback_finish_ms = Some(result.finish_ms);
                         last_interactive_readback_completed_elapsed_ms =
                             Some(result.completed_elapsed_ms);
-                        last_interactive_readback_artifact = Some(result.artifact);
+                        note_completed_interactive_readback_artifact(
+                            &mut render_loop_state,
+                            &mut recent_interactive_readback_artifacts,
+                            &mut last_interactive_readback_artifact,
+                            &mut deferred_artifact_hash_readback_keys,
+                            result.artifact,
+                            Some(result.completed_elapsed_ms),
+                        );
                         last_interactive_readback_error = None;
                     }
                     Err(error) => {
@@ -4343,6 +5820,8 @@ async fn run_surface_probe_inner(
             "skipped_stale_input"
         } else if last_interactive_surface_readback_skipped_for_backpressure {
             "readback_pending_backpressure"
+        } else if options.proof_mode == NativeProofMode::Counters {
+            "counters"
         } else {
             "off"
         };
@@ -4356,22 +5835,32 @@ async fn run_surface_probe_inner(
             recent_presented_input_event_wake_elapsed_ms,
             render_loop_state.last_present_completed_elapsed_ms,
         );
-        push_recent_frame_evidence(
-            &mut recent_frame_evidence,
-            recent_frame_evidence_entry(
-                &render_loop_state,
-                &current_frame_evidence_key,
-                hold_started.elapsed().as_secs_f64() * 1000.0,
-                last_sampled_input_event_wake_count,
-                last_presented_input_event_wake_count,
-                recent_presented_input_event_wake_elapsed_ms,
-                recent_input_wake_to_present_ms,
-                stats_input_timing.as_ref(),
-                stats_input_to_present_ms,
-                stats_proof_mode,
-                external_render_proof.as_ref(),
-            ),
+        let post_present_subscriber_allowed = post_present_subscriber_drain_allowed(
+            input_event_wake_count.load(Ordering::Relaxed),
+            last_presented_input_event_wake_count,
         );
+        if post_present_subscriber_allowed {
+            let proof_history_entry_count = recent_frame_evidence.len().saturating_add(1);
+            push_recent_frame_evidence(
+                &mut recent_frame_evidence,
+                recent_frame_evidence_entry(
+                    &render_loop_state,
+                    &current_frame_evidence_key,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                    last_sampled_input_event_wake_count,
+                    last_presented_input_event_wake_count,
+                    recent_presented_input_event_wake_elapsed_ms,
+                    recent_input_wake_to_present_ms,
+                    stats_input_timing.as_ref(),
+                    stats_input_to_present_ms,
+                    stats_proof_mode,
+                    external_render_proof.as_deref(),
+                ),
+            );
+            post_present_proof_subscribers.push(proof_history_post_present_subscriber(
+                proof_history_entry_count,
+            ));
+        }
         preview_perf_accumulator.record(
             stats_render_hook_ms,
             render_loop_state.last_render_frame_metrics.as_ref(),
@@ -4380,6 +5869,7 @@ async fn run_surface_probe_inner(
             stats_queue_submit_call_ms,
             stats_present_path_ms,
             stats_input_to_present_ms,
+            stats_frame_lane,
             None,
         );
         notify_native_perf_stats(
@@ -4391,12 +5881,25 @@ async fn run_surface_probe_inner(
                 render_loop_state.rendered_frame_count as f64 / stats_elapsed_seconds,
                 &preview_perf_accumulator,
                 stats_input_to_present_ms,
+                stats_frame_lane,
                 stats_proof_mode,
                 None,
-                Some(current_frame_evidence_key),
+                Some(current_frame_evidence_key.clone()),
             ),
         );
-        if let (Some(report), Some(report_writer)) = (
+        if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count {
+            render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+            continue;
+        }
+        if !post_present_subscriber_allowed {
+            render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
+            render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+            render_loop_state.scheduled_wake_count =
+                render_loop_state.scheduled_wake_count.saturating_add(1);
+        } else if let (Some(report), Some(report_writer)) = (
             options.render_loop_state_report.as_deref(),
             async_render_loop_report_writer.as_ref(),
         ) {
@@ -4421,9 +5924,11 @@ async fn run_surface_probe_inner(
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
+                    desired_maximum_frame_latency_source.as_str(),
                     input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                     &app_surface,
                     Some(&observed_input_adapter),
+                    options.proof_mode,
                 )
                 .with_input_generation(
                     last_sampled_input_event_wake_count,
@@ -4454,11 +5959,53 @@ async fn run_surface_probe_inner(
                 .with_external_render_proof(external_render_proof.as_ref())
                 .with_frame_evidence_key(last_frame_evidence_key.as_ref())
                 .with_recent_frame_evidence(&recent_frame_evidence)
+                .with_recent_product_frame_commits(&recent_product_frame_commits)
+                .with_recent_interactive_readback_artifacts(&recent_interactive_readback_artifacts)
                 .with_report_writer_stats(Some(report_writer_stats)),
                 None,
             );
-            last_render_loop_report_enqueue_ms =
-                Some(report_writer.enqueue(snapshot, report_enqueue_started));
+            let report_enqueue_ms = report_writer.enqueue(snapshot, report_enqueue_started);
+            last_render_loop_report_enqueue_ms = Some(report_enqueue_ms);
+            post_present_proof_subscribers.push(render_hook_report_json_post_present_subscriber(
+                report.to_owned(),
+                report_enqueue_ms,
+            ));
+        }
+        if post_present_subscriber_allowed
+            && artifact_hash_requested_post_present(&product_frame_commit)
+        {
+            let artifact_paths = post_present_artifact_hash_paths_for_frame(
+                &current_frame_evidence_key,
+                last_interactive_readback_artifact.as_ref(),
+                &recent_interactive_readback_artifacts,
+                external_render_proof.as_deref(),
+            );
+            if !should_defer_empty_artifact_hash_for_pending_readback(
+                &artifact_paths,
+                &render_loop_state,
+                &current_frame_evidence_key,
+                last_interactive_surface_readback_pending,
+            ) {
+                post_present_proof_subscribers
+                    .push(native_post_present_artifact_hash_subscriber(artifact_paths));
+            } else {
+                push_deferred_artifact_hash_readback_key(
+                    &mut deferred_artifact_hash_readback_keys,
+                    &current_frame_evidence_key,
+                );
+            }
+        }
+        if post_present_subscriber_allowed {
+            let post_present_completed_elapsed_ms =
+                Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+            if let Some(enqueue_report) = async_post_present_proof_worker.enqueue(
+                post_present_proof_subscribers,
+                current_frame_evidence_key.clone(),
+                post_present_completed_elapsed_ms,
+                Instant::now(),
+            ) {
+                render_loop_state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+            }
         }
         if skip_interactive_surface_readback_for_stale_input {
             continue;
@@ -4467,6 +6014,7 @@ async fn run_surface_probe_inner(
             std::thread::sleep(Duration::from_millis(16));
         }
     }
+    async_post_present_proof_worker.shutdown_and_drain(&mut render_loop_state);
     if let Some(result) = finish_interactive_readback_job_before_report(
         &mut interactive_readback_job,
         VISIBLE_SURFACE_READBACK_TIMEOUT,
@@ -4475,7 +6023,14 @@ async fn run_surface_probe_inner(
             Ok(result) => {
                 last_interactive_readback_finish_ms = Some(result.finish_ms);
                 last_interactive_readback_completed_elapsed_ms = Some(result.completed_elapsed_ms);
-                last_interactive_readback_artifact = Some(result.artifact);
+                note_completed_interactive_readback_artifact(
+                    &mut render_loop_state,
+                    &mut recent_interactive_readback_artifacts,
+                    &mut last_interactive_readback_artifact,
+                    &mut deferred_artifact_hash_readback_keys,
+                    result.artifact,
+                    Some(result.completed_elapsed_ms),
+                );
                 last_interactive_surface_readback_pending = false;
                 last_interactive_readback_error = None;
             }
@@ -4521,9 +6076,11 @@ async fn run_surface_probe_inner(
                 present_mode.as_str(),
                 surface_format.as_str(),
                 desired_maximum_frame_latency,
+                desired_maximum_frame_latency_source.as_str(),
                 input_event_last_wake_elapsed_ms(&input_event_last_wake_at, hold_started),
                 &app_surface,
                 Some(&observed_input_adapter),
+                options.proof_mode,
             )
             .with_input_generation(
                 last_sampled_input_event_wake_count,
@@ -4556,6 +6113,8 @@ async fn run_surface_probe_inner(
             .with_external_render_proof(external_render_proof.as_ref())
             .with_frame_evidence_key(last_frame_evidence_key.as_ref())
             .with_recent_frame_evidence(&recent_frame_evidence)
+            .with_recent_product_frame_commits(&recent_product_frame_commits)
+            .with_recent_interactive_readback_artifacts(&recent_interactive_readback_artifacts)
             .with_report_writer_stats(final_report_writer_stats),
             None,
         )?;
@@ -4580,6 +6139,7 @@ fn queue_texture_readback(
     title: &str,
     surface_id: SurfaceId,
     surface_epoch: u64,
+    frame_evidence_key: Option<FrameEvidenceKey>,
     capture_method: &'static str,
 ) -> Result<PendingSurfaceReadback, NativeWindowError> {
     let width = width.clamp(1, 1920);
@@ -4620,6 +6180,7 @@ fn queue_texture_readback(
         title: title.to_owned(),
         surface_id,
         surface_epoch,
+        frame_evidence_key,
         width,
         height,
         unpadded_bytes_per_row,
@@ -4640,6 +6201,7 @@ fn queue_visible_surface_readback(
     title: &str,
     surface_id: SurfaceId,
     surface_epoch: u64,
+    frame_evidence_key: Option<FrameEvidenceKey>,
 ) -> Result<PendingSurfaceReadback, NativeWindowError> {
     queue_texture_readback(
         device,
@@ -4652,6 +6214,7 @@ fn queue_visible_surface_readback(
         title,
         surface_id,
         surface_epoch,
+        frame_evidence_key,
         "wgpu-visible-surface-copy-src-readback",
     )
 }
@@ -4667,6 +6230,7 @@ fn queue_app_owned_present_target_readback(
     title: &str,
     surface_id: SurfaceId,
     surface_epoch: u64,
+    frame_evidence_key: Option<FrameEvidenceKey>,
 ) -> Result<PendingSurfaceReadback, NativeWindowError> {
     queue_texture_readback(
         device,
@@ -4679,6 +6243,7 @@ fn queue_app_owned_present_target_readback(
         title,
         surface_id,
         surface_epoch,
+        frame_evidence_key,
         "wgpu-app-owned-present-target-copy-to-visible-surface-readback",
     )
 }
@@ -4733,6 +6298,7 @@ struct NativeRenderLoopReportExtras {
     present_mode: String,
     surface_format: String,
     desired_maximum_frame_latency: u32,
+    desired_maximum_frame_latency_source: String,
     last_input_event_wake_elapsed_ms: Option<f64>,
     sampled_input_event_wake_count: Option<u64>,
     presented_input_event_wake_count: Option<u64>,
@@ -4750,9 +6316,12 @@ struct NativeRenderLoopReportExtras {
     last_interactive_readback_error: Option<String>,
     app_window_surface_content_report: Option<serde_json::Value>,
     observed_input_adapter: Option<NativeInputAdapterProof>,
-    external_render_proof: Option<serde_json::Value>,
+    configured_proof_mode: NativeProofMode,
+    external_render_proof: Option<Arc<serde_json::Value>>,
     frame_evidence_key: Option<FrameEvidenceKey>,
     recent_frame_evidence: Vec<serde_json::Value>,
+    recent_product_frame_commits: Vec<NativeProductFrameCommit>,
+    recent_interactive_readback_artifacts: Vec<AppWindowReadbackArtifact>,
     report_writer: Option<AsyncRenderLoopReportStats>,
 }
 
@@ -4803,7 +6372,7 @@ impl NativeRenderLoopReportExtras {
         self
     }
 
-    fn with_external_render_proof(mut self, proof: Option<&serde_json::Value>) -> Self {
+    fn with_external_render_proof(mut self, proof: Option<&Arc<serde_json::Value>>) -> Self {
         self.external_render_proof = proof.cloned();
         self
     }
@@ -4815,6 +6384,22 @@ impl NativeRenderLoopReportExtras {
 
     fn with_recent_frame_evidence(mut self, recent: &VecDeque<serde_json::Value>) -> Self {
         self.recent_frame_evidence = recent.iter().cloned().collect();
+        self
+    }
+
+    fn with_recent_product_frame_commits(
+        mut self,
+        recent: &VecDeque<NativeProductFrameCommit>,
+    ) -> Self {
+        self.recent_product_frame_commits = recent.iter().cloned().collect();
+        self
+    }
+
+    fn with_recent_interactive_readback_artifacts(
+        mut self,
+        recent: &VecDeque<AppWindowReadbackArtifact>,
+    ) -> Self {
+        self.recent_interactive_readback_artifacts = recent.iter().cloned().collect();
         self
     }
 
@@ -4833,9 +6418,11 @@ fn render_loop_report_extras(
     present_mode: &str,
     surface_format: &str,
     desired_maximum_frame_latency: u32,
+    desired_maximum_frame_latency_source: &str,
     last_input_event_wake_elapsed_ms: Option<f64>,
     app_surface: &app_window::surface::Surface,
     observed_input_adapter: Option<&NativeInputAdapterProof>,
+    configured_proof_mode: NativeProofMode,
 ) -> NativeRenderLoopReportExtras {
     NativeRenderLoopReportExtras {
         resize_wake_count,
@@ -4843,6 +6430,7 @@ fn render_loop_report_extras(
         present_mode: present_mode.to_owned(),
         surface_format: surface_format.to_owned(),
         desired_maximum_frame_latency,
+        desired_maximum_frame_latency_source: desired_maximum_frame_latency_source.to_owned(),
         last_input_event_wake_elapsed_ms,
         sampled_input_event_wake_count: None,
         presented_input_event_wake_count: None,
@@ -4860,9 +6448,12 @@ fn render_loop_report_extras(
         last_interactive_readback_error: None,
         app_window_surface_content_report: app_window_surface_content_report(app_surface),
         observed_input_adapter: observed_input_adapter.cloned(),
+        configured_proof_mode,
         external_render_proof: None,
         frame_evidence_key: None,
         recent_frame_evidence: Vec::new(),
+        recent_product_frame_commits: Vec::new(),
+        recent_interactive_readback_artifacts: Vec::new(),
         report_writer: None,
     }
 }
@@ -4972,6 +6563,7 @@ enum InteractiveSurfaceReadbackDecision {
     Queue,
     SkipExternalProof,
     SkipBackpressure,
+    DeferProductInput,
     Off,
 }
 
@@ -4980,12 +6572,16 @@ fn interactive_surface_readback_decision(
     readback_enabled: bool,
     external_proof_replaces_readback: bool,
     readback_job_in_flight: bool,
+    product_input_frame: bool,
 ) -> InteractiveSurfaceReadbackDecision {
     if !matches!(role, NativeWindowRole::Preview | NativeWindowRole::Dev) || !readback_enabled {
         return InteractiveSurfaceReadbackDecision::Off;
     }
     if external_proof_replaces_readback {
         return InteractiveSurfaceReadbackDecision::SkipExternalProof;
+    }
+    if product_input_frame {
+        return InteractiveSurfaceReadbackDecision::DeferProductInput;
     }
     if readback_job_in_flight {
         return InteractiveSurfaceReadbackDecision::SkipBackpressure;
@@ -4994,15 +6590,15 @@ fn interactive_surface_readback_decision(
 }
 
 fn should_defer_render_for_interactive_readback(
-    readback_enabled: bool,
-    readback_job_in_flight: bool,
-    real_os_input_observed: bool,
-    scheduler_reason: Option<NativeSchedulerReason>,
+    _readback_enabled: bool,
+    _readback_job_in_flight: bool,
+    _real_os_input_observed: bool,
+    _scheduler_reason: Option<NativeSchedulerReason>,
 ) -> bool {
-    readback_enabled
-        && readback_job_in_flight
-        && !real_os_input_observed
-        && scheduler_reason != Some(NativeSchedulerReason::HostInput)
+    // Proof/readback backpressure must coalesce proof work, not stall product
+    // frames. `interactive_surface_readback_decision` still reports
+    // SkipBackpressure for verifier accounting.
+    false
 }
 
 fn requested_present_path_mode_from_env() -> NativePresentPathMode {
@@ -5060,10 +6656,10 @@ fn external_render_proof_replaces_interactive_readback(proof: Option<&serde_json
 }
 
 fn external_render_proof_with_frame_evidence_key(
-    proof: Option<serde_json::Value>,
+    proof: Option<&serde_json::Value>,
     key: Option<&FrameEvidenceKey>,
 ) -> Option<serde_json::Value> {
-    let mut proof = proof?;
+    let mut proof = proof?.clone();
     let Some(key) = key else {
         return Some(proof);
     };
@@ -5164,12 +6760,283 @@ fn frame_evidence_key_for_presented_frame(
     }
 }
 
+fn frame_evidence_key_for_next_presented_frame_with_revisions(
+    state: &NativeRenderLoopState,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    input_event_seq: Option<u64>,
+    proof_request_id: Option<u64>,
+    content_revision: u64,
+    layout_revision: u64,
+    render_scene_revision: u64,
+) -> FrameEvidenceKey {
+    let next_frame_seq = state.rendered_frame_count.saturating_add(1);
+    FrameEvidenceKey {
+        frame_seq: next_frame_seq,
+        content_revision,
+        layout_revision,
+        render_scene_revision,
+        surface_id: surface_id.clone(),
+        surface_epoch,
+        input_event_seq,
+        present_id: next_frame_seq,
+        proof_request_id,
+    }
+}
+
+fn product_frame_commit_for_presented_frame(
+    state: &NativeRenderLoopState,
+    frame_evidence_key: FrameEvidenceKey,
+    frame_lane: NativeFrameLane,
+    scheduler_reason: Option<NativeSchedulerReason>,
+    role_dirty_reason: Option<NativeRoleDirtyReason>,
+    input_timing: Option<NativeAcceptedInputFrameTiming>,
+) -> NativeProductFrameCommit {
+    let render_frame_metrics = state.last_render_frame_metrics.as_ref();
+    let product_frame = render_frame_metrics.and_then(|metrics| metrics.product_frame.clone());
+    let post_present_proof_requests = render_frame_metrics
+        .map(|metrics| metrics.post_present_proof_requests.clone())
+        .unwrap_or_default();
+    let legacy_pre_present_proof_request_count = post_present_proof_requests
+        .iter()
+        .filter(|request| request.currently_legacy_pre_present)
+        .count() as u32;
+    let legacy_product_proof_built_pre_present = product_frame.as_ref().is_some_and(|frame| {
+        frame.legacy_proof_json_built_pre_present
+            || frame.legacy_render_hook_proof_built_pre_present
+    });
+    NativeProductFrameCommit {
+        schema_version: 1,
+        commit_source: "app_window_product_frame_commit".to_owned(),
+        input_event_seq: frame_evidence_key.input_event_seq,
+        content_revision: frame_evidence_key.content_revision,
+        layout_revision: frame_evidence_key.layout_revision,
+        render_scene_revision: frame_evidence_key.render_scene_revision,
+        render_target_kind: state.last_render_target_kind.clone(),
+        present_path_mode: state.last_present_path_mode,
+        render_started_elapsed_ms: state.last_render_started_elapsed_ms,
+        surface_acquired_elapsed_ms: state.last_surface_acquired_elapsed_ms,
+        render_hook_completed_elapsed_ms: state.last_render_hook_completed_elapsed_ms,
+        queue_submitted_elapsed_ms: state.last_queue_submitted_elapsed_ms,
+        present_completed_elapsed_ms: state.last_present_completed_elapsed_ms,
+        surface_acquire_call_ms: state.last_surface_acquire_call_ms,
+        encoder_finish_ms: state.last_encoder_finish_ms,
+        queue_submit_call_ms: state.last_queue_submit_call_ms,
+        present_call_ms: state.last_present_call_ms,
+        present_path_ms: state.last_present_path_ms,
+        render_hook_outer_state_snapshot_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_state_snapshot_ms),
+        render_hook_outer_input_snapshot_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_input_snapshot_ms),
+        render_hook_outer_world_snapshot_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_world_snapshot_ms),
+        render_hook_outer_core_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_core_ms),
+        render_hook_outer_revision_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_revision_ms),
+        render_hook_outer_total_ms: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_outer_total_ms),
+        render_hook_phase_timings: render_frame_metrics
+            .and_then(|metrics| metrics.render_hook_phase_timings.clone()),
+        input_to_present_ms: input_timing
+            .as_ref()
+            .map(|timing| timing.input_to_present_ms),
+        host_input_event: input_timing
+            .as_ref()
+            .and_then(|timing| timing.host_input_event.clone()),
+        input_timing,
+        frame_evidence_key,
+        frame_lane,
+        scheduler_reason,
+        role_dirty_reason,
+        post_present_proof_request_count: post_present_proof_requests.len() as u32,
+        post_present_proof_requests,
+        legacy_pre_present_proof_request_count,
+        legacy_product_proof_built_pre_present,
+        product_frame,
+    }
+}
+
+fn visible_surface_readback_post_present_request() -> NativePostPresentProofRequestSummary {
+    NativePostPresentProofRequestSummary {
+        kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+        currently_legacy_pre_present: false,
+        frame_local_snapshot_required: true,
+    }
+}
+
+fn add_post_present_proof_request_to_commit(
+    commit: &mut NativeProductFrameCommit,
+    request: NativePostPresentProofRequestSummary,
+) {
+    if commit
+        .post_present_proof_requests
+        .iter()
+        .any(|existing| existing.kind == request.kind)
+    {
+        return;
+    }
+    if request.currently_legacy_pre_present {
+        commit.legacy_pre_present_proof_request_count = commit
+            .legacy_pre_present_proof_request_count
+            .saturating_add(1);
+    }
+    commit.post_present_proof_requests.push(request);
+    commit.post_present_proof_request_count = commit.post_present_proof_requests.len() as u32;
+    if let Some(product_frame) = commit.product_frame.as_mut() {
+        product_frame.post_present_proof_request_count = commit.post_present_proof_request_count;
+    }
+}
+
 fn push_recent_frame_evidence(recent: &mut VecDeque<serde_json::Value>, entry: serde_json::Value) {
     const RECENT_FRAME_EVIDENCE_LIMIT: usize = 32;
     recent.push_back(entry);
     while recent.len() > RECENT_FRAME_EVIDENCE_LIMIT {
         recent.pop_front();
     }
+}
+
+fn push_recent_product_frame_commit(
+    recent: &mut VecDeque<NativeProductFrameCommit>,
+    commit: &NativeProductFrameCommit,
+) {
+    if commit.input_timing.is_none() {
+        return;
+    }
+    recent.push_back(commit.clone());
+    while recent.len() > RECENT_PRODUCT_FRAME_COMMIT_LIMIT {
+        recent.pop_front();
+    }
+}
+
+fn push_recent_interactive_readback_artifact(
+    recent: &mut VecDeque<AppWindowReadbackArtifact>,
+    artifact: &AppWindowReadbackArtifact,
+) {
+    recent.push_back(artifact.clone());
+    while recent.len() > RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT {
+        recent.pop_front();
+    }
+}
+
+fn push_deferred_artifact_hash_readback_key(
+    deferred: &mut VecDeque<FrameEvidenceKey>,
+    key: &FrameEvidenceKey,
+) {
+    if !deferred.iter().any(|existing| existing == key) {
+        deferred.push_back(key.clone());
+    }
+    while deferred.len() > RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT {
+        deferred.pop_front();
+    }
+}
+
+fn take_deferred_artifact_hash_readback_key(
+    deferred: &mut VecDeque<FrameEvidenceKey>,
+    key: &FrameEvidenceKey,
+) -> bool {
+    let Some(position) = deferred.iter().position(|existing| existing == key) else {
+        return false;
+    };
+    deferred.remove(position);
+    true
+}
+
+fn post_present_artifact_for_interactive_readback(
+    artifact: &AppWindowReadbackArtifact,
+    completed_elapsed_ms: Option<f64>,
+) -> Option<NativePostPresentProofArtifact> {
+    let frame_evidence_key = artifact.frame_evidence_key.clone()?;
+    Some(native_post_present_json_proof_artifact(
+        NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+        frame_evidence_key.clone(),
+        completed_elapsed_ms,
+        serde_json::json!({
+            "status": "pass",
+            "artifact_path": artifact.path,
+            "artifact_sha256": artifact.sha256,
+            "width": artifact.width,
+            "height": artifact.height,
+            "presented_revision": artifact.presented_revision,
+            "content_revision": artifact.content_revision,
+            "rendered_frame_count": artifact.rendered_frame_count,
+            "capture_method": artifact.capture_method,
+            "texture_format": artifact.texture_format,
+            "nonblank_samples": artifact.nonblank_samples,
+            "unique_rgba_values": artifact.unique_rgba_values,
+            "readback_deadline_ms": artifact.readback_deadline_ms,
+            "readback_poll_status": artifact.readback_poll_status,
+            "frame_seq": frame_evidence_key.frame_seq,
+            "input_event_seq": frame_evidence_key.input_event_seq,
+            "present_id": frame_evidence_key.present_id,
+        }),
+    ))
+}
+
+fn post_present_artifact_hash_for_interactive_readback(
+    artifact: &AppWindowReadbackArtifact,
+    completed_elapsed_ms: Option<f64>,
+) -> Option<NativePostPresentProofArtifact> {
+    let frame_evidence_key = artifact.frame_evidence_key.clone()?;
+    Some(native_post_present_json_proof_artifact(
+        NativePostPresentProofRequestKind::ArtifactHash,
+        frame_evidence_key.clone(),
+        completed_elapsed_ms,
+        serde_json::json!({
+            "status": "pass",
+            "artifact_hash_status": "hashed_registered_artifacts",
+            "registered_artifact_count": 1,
+            "hashed_artifact_count": 1,
+            "artifact_sha256s": [{
+                "path": artifact.path,
+                "sha256": artifact.sha256,
+                "source": "visible_surface_readback_completion"
+            }],
+            "frame_seq": frame_evidence_key.frame_seq,
+            "input_event_seq": frame_evidence_key.input_event_seq,
+        }),
+    ))
+}
+
+fn note_completed_interactive_readback_artifact(
+    state: &mut NativeRenderLoopState,
+    recent: &mut VecDeque<AppWindowReadbackArtifact>,
+    last: &mut Option<AppWindowReadbackArtifact>,
+    deferred_artifact_hash_readback_keys: &mut VecDeque<FrameEvidenceKey>,
+    artifact: AppWindowReadbackArtifact,
+    completed_elapsed_ms: Option<f64>,
+) {
+    let should_complete_artifact_hash = artifact.frame_evidence_key.as_ref().is_some_and(|key| {
+        take_deferred_artifact_hash_readback_key(deferred_artifact_hash_readback_keys, key)
+            && state.has_queued_post_present_proof_request(
+                key,
+                NativePostPresentProofRequestKind::ArtifactHash,
+            )
+    });
+    if let Some(post_present_artifact) =
+        post_present_artifact_for_interactive_readback(&artifact, completed_elapsed_ms)
+    {
+        state.note_post_present_proof_artifact(post_present_artifact);
+    }
+    if should_complete_artifact_hash
+        && let Some(post_present_artifact_hash) =
+            post_present_artifact_hash_for_interactive_readback(&artifact, completed_elapsed_ms)
+    {
+        state.note_post_present_proof_artifact_if_request_queued(post_present_artifact_hash);
+    }
+    push_recent_interactive_readback_artifact(recent, &artifact);
+    *last = Some(artifact);
+}
+
+fn recent_interactive_readback_artifact_for_frame<'a>(
+    recent: &'a [AppWindowReadbackArtifact],
+    key: Option<&FrameEvidenceKey>,
+) -> Option<&'a AppWindowReadbackArtifact> {
+    let key = key?;
+    recent
+        .iter()
+        .rev()
+        .find(|artifact| artifact.frame_evidence_key.as_ref() == Some(key))
 }
 
 fn compact_external_render_proof_for_recent_history(
@@ -5179,44 +7046,156 @@ fn compact_external_render_proof_for_recent_history(
     let Some(proof) = proof else {
         return serde_json::Value::Null;
     };
-    let keyed_proof = external_render_proof_with_frame_evidence_key(Some(proof.clone()), Some(key));
-    let Some(keyed_proof) = keyed_proof else {
-        return serde_json::Value::Null;
-    };
     serde_json::json!({
-        "status": keyed_proof.get("status").cloned().unwrap_or(serde_json::Value::Null),
-        "visible_surface_rendered": keyed_proof.get("visible_surface_rendered").cloned().unwrap_or(serde_json::Value::Null),
-        "visible_present_path": keyed_proof.get("visible_present_path").cloned().unwrap_or(serde_json::Value::Null),
-        "render_target_kind": keyed_proof.get("render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
-        "layout_artifact": keyed_proof.get("layout_artifact").cloned().unwrap_or(serde_json::Value::Null),
-        "visible_bound_text": keyed_proof.get("visible_bound_text").cloned().unwrap_or(serde_json::Value::Null),
-        "retained_bound_sync": keyed_proof.get("retained_bound_sync").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_focus_state": keyed_proof.get("input_overlay_focus_state").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_focused_node_probe": keyed_proof.get("input_overlay_focused_node_probe").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_render_scene_patch_applied": keyed_proof.get("input_overlay_render_scene_patch_applied").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_render_scene_patch_built_this_frame": keyed_proof.get("input_overlay_render_scene_patch_built_this_frame").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_render_scene_patch_direct_encode": keyed_proof.get("input_overlay_render_scene_patch_direct_encode").cloned().unwrap_or(serde_json::Value::Null),
-        "input_overlay_render_scene_patch_touched_node_count": keyed_proof.get("input_overlay_render_scene_patch_touched_node_count").cloned().unwrap_or(serde_json::Value::Null),
+        "status": proof.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_surface_rendered": proof.get("visible_surface_rendered").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_present_path": proof.get("visible_present_path").cloned().unwrap_or(serde_json::Value::Null),
+        "render_target_kind": proof.get("render_target_kind").cloned().unwrap_or(serde_json::Value::Null),
+        "layout_artifact": proof.get("layout_artifact").cloned().unwrap_or(serde_json::Value::Null),
+        "render_hook_phase_timings_ms": proof.get("render_hook_phase_timings_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "visible_bound_text": compact_visible_bound_text_for_recent_history(proof),
+        "retained_bound_sync": proof.get("retained_bound_sync").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_focus_state": proof.get("input_overlay_focus_state").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_focused_node_probe": proof.get("input_overlay_focused_node_probe").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_applied": proof.get("input_overlay_render_scene_patch_applied").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_built_this_frame": proof.get("input_overlay_render_scene_patch_built_this_frame").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_direct_encode": proof.get("input_overlay_render_scene_patch_direct_encode").cloned().unwrap_or(serde_json::Value::Null),
+        "input_overlay_render_scene_patch_touched_node_count": proof.get("input_overlay_render_scene_patch_touched_node_count").cloned().unwrap_or(serde_json::Value::Null),
         "proof": {
-            "status": keyed_proof.pointer("/proof/status").cloned().unwrap_or(serde_json::Value::Null),
-            "capture_method": keyed_proof.pointer("/proof/capture_method").cloned().unwrap_or(serde_json::Value::Null),
-            "frame_evidence_key": keyed_proof.pointer("/proof/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key)),
+            "status": proof.pointer("/proof/status").cloned().unwrap_or(serde_json::Value::Null),
+            "capture_method": proof.pointer("/proof/capture_method").cloned().unwrap_or(serde_json::Value::Null),
+            "frame_evidence_key": proof.pointer("/proof/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key)),
             "artifact": {
-                "path": keyed_proof.pointer("/proof/artifact/path").cloned().unwrap_or(serde_json::Value::Null),
-                "artifact_sha256": keyed_proof.pointer("/proof/artifact/artifact_sha256").cloned().unwrap_or(serde_json::Value::Null),
-                "frame_evidence_key": keyed_proof.pointer("/proof/artifact/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key))
+                "path": proof
+                    .pointer("/proof/artifact/artifact_path")
+                    .or_else(|| proof.pointer("/proof/artifact/path"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "artifact_sha256": proof.pointer("/proof/artifact/artifact_sha256").cloned().unwrap_or(serde_json::Value::Null),
+                "frame_evidence_key": proof.pointer("/proof/artifact/frame_evidence_key").cloned().unwrap_or_else(|| serde_json::json!(key))
             },
             "metrics": {
-                "preview_blocked_on_ipc_count": keyed_proof.pointer("/proof/metrics/preview_blocked_on_ipc_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
-                "frame_seq": keyed_proof.pointer("/proof/metrics/frame_seq").cloned().unwrap_or_else(|| serde_json::json!(key.frame_seq)),
-                "render_scene_source": keyed_proof.pointer("/proof/metrics/render_scene_source").cloned().unwrap_or(serde_json::Value::Null),
-                "dirty_chunk_count": keyed_proof.pointer("/proof/metrics/dirty_chunk_count").cloned().unwrap_or(serde_json::Value::Null),
-                "retained_chunk_hit_count": keyed_proof.pointer("/proof/metrics/retained_chunk_hit_count").cloned().unwrap_or(serde_json::Value::Null),
-                "retained_chunk_miss_count": keyed_proof.pointer("/proof/metrics/retained_chunk_miss_count").cloned().unwrap_or(serde_json::Value::Null),
-                "queue_write_count": keyed_proof.pointer("/proof/metrics/queue_write_count").cloned().unwrap_or(serde_json::Value::Null),
-                "draw_calls": keyed_proof.pointer("/proof/metrics/draw_calls").cloned().unwrap_or(serde_json::Value::Null)
+                "preview_blocked_on_ipc_count": proof.pointer("/proof/metrics/preview_blocked_on_ipc_count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+                "frame_seq": proof.pointer("/proof/metrics/frame_seq").cloned().unwrap_or_else(|| serde_json::json!(key.frame_seq)),
+                "render_scene_source": proof.pointer("/proof/metrics/render_scene_source").cloned().unwrap_or(serde_json::Value::Null),
+                "dirty_chunk_count": proof.pointer("/proof/metrics/dirty_chunk_count").cloned().unwrap_or(serde_json::Value::Null),
+                "retained_chunk_hit_count": proof.pointer("/proof/metrics/retained_chunk_hit_count").cloned().unwrap_or(serde_json::Value::Null),
+                "retained_chunk_miss_count": proof.pointer("/proof/metrics/retained_chunk_miss_count").cloned().unwrap_or(serde_json::Value::Null),
+                "queue_write_count": proof.pointer("/proof/metrics/queue_write_count").cloned().unwrap_or(serde_json::Value::Null),
+                "draw_calls": proof.pointer("/proof/metrics/draw_calls").cloned().unwrap_or(serde_json::Value::Null)
             }
         }
+    })
+}
+
+fn compact_visible_bound_text_for_recent_history(proof: &serde_json::Value) -> serde_json::Value {
+    const RECENT_VISIBLE_BOUND_TEXT_ENTRY_LIMIT: usize = 64;
+    const RECENT_VISIBLE_BOUND_TEXT_FALLBACK_LIMIT: usize = 8;
+    let Some(visible_bound_text) = proof.get("visible_bound_text") else {
+        return serde_json::Value::Null;
+    };
+    let Some(entries) = visible_bound_text
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return visible_bound_text.clone();
+    };
+
+    let mut compact_entries = Vec::new();
+    let mut selected_or_focused_count = 0usize;
+    for entry in entries {
+        let selected = entry.get("selected").and_then(serde_json::Value::as_bool) == Some(true);
+        let focused = entry.get("focused").and_then(serde_json::Value::as_bool) == Some(true);
+        let selection_bound_path = entry
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| path.contains("selected")))
+            });
+        if selected || focused || selection_bound_path {
+            selected_or_focused_count = selected_or_focused_count.saturating_add(1);
+            if compact_entries.len() < RECENT_VISIBLE_BOUND_TEXT_ENTRY_LIMIT {
+                compact_entries.push(compact_visible_bound_text_entry(entry));
+            }
+        }
+    }
+
+    if compact_entries.is_empty() {
+        compact_entries.extend(
+            entries
+                .iter()
+                .take(RECENT_VISIBLE_BOUND_TEXT_FALLBACK_LIMIT)
+                .map(compact_visible_bound_text_entry),
+        );
+    }
+
+    serde_json::json!({
+        "status": visible_bound_text.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "source": visible_bound_text.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        "layout_frame_hash": visible_bound_text.get("layout_frame_hash").cloned().unwrap_or(serde_json::Value::Null),
+        "entry_count": visible_bound_text
+            .get("entry_count")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(entries.len())),
+        "entry_limit": RECENT_VISIBLE_BOUND_TEXT_ENTRY_LIMIT,
+        "original_entry_limit": visible_bound_text.get("entry_limit").cloned().unwrap_or(serde_json::Value::Null),
+        "truncated": visible_bound_text.get("truncated").cloned().unwrap_or(serde_json::Value::Null),
+        "recent_history_compacted": true,
+        "selected_or_focused_entry_count": selected_or_focused_count,
+        "compact_entry_count": compact_entries.len(),
+        "entries": compact_entries
+    })
+}
+
+fn compact_visible_bound_text_entry(entry: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "node": entry.get("node").cloned().unwrap_or(serde_json::Value::Null),
+        "kind": entry.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "text": entry.get("text").cloned().unwrap_or(serde_json::Value::Null),
+        "text_truncated": entry.get("text_truncated").cloned().unwrap_or(serde_json::Value::Null),
+        "paths": entry.get("paths").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "source_intents": entry.get("source_intents").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "source_intent_count": entry.get("source_intent_count").cloned().unwrap_or(serde_json::Value::Null),
+        "bounds": entry.get("bounds").cloned().unwrap_or(serde_json::Value::Null),
+        "focused": entry.get("focused").cloned().unwrap_or(serde_json::Value::Null),
+        "selected": entry.get("selected").cloned().unwrap_or(serde_json::Value::Null)
+    })
+}
+
+fn compact_poll_diagnostics_for_recent_history(
+    diagnostics: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(diagnostics) = diagnostics else {
+        return serde_json::Value::Null;
+    };
+    if !diagnostics.is_object() {
+        return diagnostics.clone();
+    }
+    serde_json::json!({
+        "kind": diagnostics.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+        "dirty": diagnostics.get("dirty").cloned().unwrap_or(serde_json::Value::Null),
+        "forced_frame": diagnostics.get("forced_frame").cloned().unwrap_or(serde_json::Value::Null),
+        "focus_changed": diagnostics.get("focus_changed").cloned().unwrap_or(serde_json::Value::Null),
+        "real_os_events_observed": diagnostics.get("real_os_events_observed").cloned().unwrap_or(serde_json::Value::Null),
+        "input_delta_real_os_events_observed": diagnostics
+            .get("input_delta_real_os_events_observed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "before_update_count": diagnostics.get("before_update_count").cloned().unwrap_or(serde_json::Value::Null),
+        "after_update_count": diagnostics.get("after_update_count").cloned().unwrap_or(serde_json::Value::Null),
+        "after_content_revision": diagnostics.get("after_content_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "previous_poll_revision": diagnostics.get("previous_poll_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "scheduler_reason": diagnostics.get("scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "role_dirty_reason": diagnostics.get("role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "text_input_caret_active": diagnostics.get("text_input_caret_active").cloned().unwrap_or(serde_json::Value::Null),
+        "preview_has_world_scene": diagnostics.get("preview_has_world_scene").cloned().unwrap_or(serde_json::Value::Null),
+        "accessibility_snapshot_status": diagnostics.get("accessibility_snapshot_status").cloned().unwrap_or(serde_json::Value::Null),
+        "phase_timings_ms": diagnostics.get("phase_timings_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "recent_native_input_timing_samples": diagnostics.get("recent_native_input_timing_samples").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "native_input_reject_counts": diagnostics.get("native_input_reject_counts").cloned().unwrap_or(serde_json::Value::Null),
+        "recent_history_compacted": true
     })
 }
 
@@ -5235,6 +7214,10 @@ fn recent_frame_evidence_entry(
 ) -> serde_json::Value {
     let input_wake_to_input_accept_ms = elapsed_delta_ms(
         presented_input_event_wake_elapsed_ms,
+        state.last_accepted_host_input_elapsed_ms,
+    );
+    let poll_started_to_input_accept_ms = elapsed_delta_ms(
+        state.last_poll_started_elapsed_ms,
         state.last_accepted_host_input_elapsed_ms,
     );
     let input_accept_to_dirty_poll_ms = accepted_input_frame_timing
@@ -5320,6 +7303,13 @@ fn recent_frame_evidence_entry(
         "status": "pass",
         "recorded_elapsed_ms": elapsed_ms,
         "frame_evidence_key": key,
+        "frame_evidence_key_issued_before_present": state.last_frame_evidence_key_issued_before_present,
+        "preissued_frame_evidence_key": state.last_preissued_frame_evidence_key.clone(),
+        "preissued_frame_evidence_elapsed_ms": state.last_preissued_frame_evidence_elapsed_ms,
+        "preissued_frame_evidence_matches_presented_frame": state
+            .last_preissued_frame_evidence_key
+            .as_ref()
+            == Some(key),
         "frame_seq": key.frame_seq,
         "present_id": key.present_id,
         "content_revision": key.content_revision,
@@ -5329,6 +7319,9 @@ fn recent_frame_evidence_entry(
         "surface_epoch": key.surface_epoch,
         "input_event_wake_count": presented_input_event_wake_count,
         "input_event_seq": key.input_event_seq,
+        "accepted_host_input_event": accepted_input_frame_timing
+            .and_then(|timing| timing.host_input_event.clone())
+            .or_else(|| state.last_accepted_host_input_event.clone()),
         "sampled_input_event_wake_count": sampled_input_event_wake_count,
         "presented_input_event_wake_count": presented_input_event_wake_count,
         "presented_input_event_wake_elapsed_ms": presented_input_event_wake_elapsed_ms,
@@ -5338,10 +7331,14 @@ fn recent_frame_evidence_entry(
         "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
         "input_accept_to_present_ms": input_accept_to_present_ms,
         "frame_input_to_present_ms": input_accept_to_present_ms,
+        "frame_lane": accepted_input_frame_timing
+            .map(|timing| timing.frame_lane)
+            .or(state.last_frame_lane),
         "accepted_input_frame_timing": accepted_input_frame_timing,
         "input_accept_timing_source": input_accept_to_present_ms.map(|_| "role_poll_hook_accepted_visible_host_input"),
         "input_wake_timing_source": input_wake_to_present_ms.map(|_| "recent_presented_input_generation"),
         "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
+        "poll_started_to_input_accept_ms": poll_started_to_input_accept_ms,
         "last_dirty_poll_elapsed_ms": state.last_dirty_poll_elapsed_ms,
         "last_render_started_elapsed_ms": state.last_render_started_elapsed_ms,
         "last_surface_acquired_elapsed_ms": state.last_surface_acquired_elapsed_ms,
@@ -5368,8 +7365,11 @@ fn recent_frame_evidence_entry(
         "queue_submit_call_ms": queue_submit_call_ms,
         "present_call_ms": present_call_ms,
         "present_path_ms": present_path_ms,
-        "last_poll_diagnostics": state.last_poll_diagnostics,
+        "last_poll_diagnostics": compact_poll_diagnostics_for_recent_history(
+            state.last_poll_diagnostics.as_ref(),
+        ),
         "last_render_target_kind": state.last_render_target_kind,
+        "configured_proof_mode": proof_mode,
         "proof_mode": proof_mode,
         "last_external_render_proof": compact_external_render_proof_for_recent_history(
             external_render_proof,
@@ -5385,6 +7385,7 @@ fn native_preview_perf_stats_snapshot(
     renders_per_second: f64,
     accumulator: &NativePreviewPerfAccumulator,
     input_to_present_ms: Option<f64>,
+    frame_lane: Option<NativeFrameLane>,
     proof_mode: impl Into<String>,
     proof_overhead_ms: Option<f64>,
     frame_evidence_key: Option<FrameEvidenceKey>,
@@ -5408,6 +7409,7 @@ fn native_preview_perf_stats_snapshot(
         queue_submit_call_ms: state.last_queue_submit_call_ms,
         present_path_ms: state.last_present_path_ms,
         input_to_present_ms,
+        frame_lane,
         render_hook_ms_p50_p95_p99_max: accumulator.render_hook_summary(),
         layout_ms_p50_p95_p99_max: accumulator.layout_summary(),
         present_call_ms_p50_p95_p99_max: accumulator.present_call_summary(),
@@ -5416,6 +7418,14 @@ fn native_preview_perf_stats_snapshot(
         queue_submit_call_ms_p50_p95_p99_max: accumulator.queue_submit_call_summary(),
         present_path_ms_p50_p95_p99_max: accumulator.present_path_summary(),
         input_to_present_ms_p50_p95_p99_max: accumulator.input_to_present_summary(),
+        product_input_to_present_ms: if frame_lane == Some(NativeFrameLane::ProductInteraction) {
+            input_to_present_ms
+        } else {
+            None
+        },
+        product_input_to_present_ms_p50_p95_p99_max: accumulator.product_input_to_present_summary(),
+        product_frame_count: accumulator.product_frame_count,
+        product_missed_frame_count: accumulator.product_missed_frame_count,
         upload_bytes_p50_p95_max: accumulator.upload_bytes_summary(),
         draw_call_count_p50_p95_max: accumulator.draw_call_count_summary(),
         glyph_cache_hit_rate: state
@@ -5659,6 +7669,73 @@ fn write_render_loop_state_report_snapshot(
     )
 }
 
+fn post_present_proof_isolation_report(
+    state: &NativeRenderLoopState,
+    report_write_mode: &str,
+) -> serde_json::Value {
+    let mut queued_request_count = 0_u64;
+    let mut completed_request_count = 0_u64;
+    let mut legacy_pre_present_request_count = 0_u64;
+    for entry in &state.recent_post_present_proof_queue {
+        match entry.status {
+            NativePostPresentProofQueueStatus::Queued => {
+                queued_request_count = queued_request_count.saturating_add(1);
+            }
+            NativePostPresentProofQueueStatus::CompletedPostPresent => {
+                completed_request_count = completed_request_count.saturating_add(1);
+            }
+            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent => {
+                legacy_pre_present_request_count =
+                    legacy_pre_present_request_count.saturating_add(1);
+            }
+        }
+    }
+    let worker_status = if state.post_present_proof_subscriber_worker_error_count > 0 {
+        "error"
+    } else if state.post_present_proof_subscriber_worker_dropped_count > 0 {
+        "dropped"
+    } else if queued_request_count > 0
+        || state.post_present_proof_subscriber_worker_pending_batch_count > 0
+    {
+        "lagging"
+    } else if state.post_present_proof_subscriber_worker_enqueued_count > 0 {
+        "settled"
+    } else {
+        "unused"
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "status": "pass",
+        "product_path_status": "pass",
+        "proof_worker_status": worker_status,
+        "mode": "post_present_subscriber_queue",
+        "report_write_mode": report_write_mode,
+        "product_latency_includes_proof_completion": false,
+        "product_blocks_on_proof_subscribers": false,
+        "proof_latency_reported_separately": true,
+        "proof_lag_allowed_when_reported": true,
+        "proof_completion_required_for_product_present": false,
+        "report_write_in_hot_path": false,
+        "report_serialization_in_hot_path": false,
+        "hot_path_report_write_count": 0,
+        "hot_path_report_serialization_count": 0,
+        "queued_request_count": queued_request_count,
+        "completed_request_count": completed_request_count,
+        "legacy_pre_present_request_count": legacy_pre_present_request_count,
+        "worker_enqueued_batch_count": state.post_present_proof_subscriber_worker_enqueued_batch_count,
+        "worker_enqueued_count": state.post_present_proof_subscriber_worker_enqueued_count,
+        "worker_pending_batch_count": state.post_present_proof_subscriber_worker_pending_batch_count,
+        "worker_completed_count": state.post_present_proof_subscriber_worker_completed_count,
+        "worker_dropped_batch_count": state.post_present_proof_subscriber_worker_dropped_batch_count,
+        "worker_dropped_count": state.post_present_proof_subscriber_worker_dropped_count,
+        "worker_error_count": state.post_present_proof_subscriber_worker_error_count,
+        "subscriber_error_count": state.post_present_proof_subscriber_error_count,
+        "artifact_count": state.post_present_proof_artifact_count,
+        "recent_queue_count": state.recent_post_present_proof_queue.len(),
+        "recent_artifact_count": state.recent_post_present_proof_artifacts.len()
+    })
+}
+
 fn apply_native_cursor_icon(surface: &app_window::surface::Surface, icon: NativeCursorIcon) {
     #[cfg(target_os = "linux")]
     {
@@ -5726,11 +7803,20 @@ fn write_render_loop_state_report(
         presented_input_wake_elapsed_ms,
         state.last_accepted_host_input_elapsed_ms,
     );
-    let input_accept_to_dirty_poll_ms = elapsed_delta_ms(
+    let poll_started_to_input_accept_ms = elapsed_delta_ms(
+        state.last_poll_started_elapsed_ms,
         state.last_accepted_host_input_elapsed_ms,
-        state.last_dirty_poll_elapsed_ms,
     );
     let accepted_input_frame_timing = state.last_accounted_input_frame_timing.clone();
+    let input_accept_to_dirty_poll_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.input_accept_to_dirty_poll_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_accepted_host_input_elapsed_ms,
+                state.last_dirty_poll_elapsed_ms,
+            )
+        });
     let input_accept_to_present_ms = extras
         .frame_input_to_present_ms
         .or_else(|| {
@@ -5756,34 +7842,68 @@ fn write_render_loop_state_report(
         state.last_poll_started_elapsed_ms,
         state.last_dirty_poll_elapsed_ms,
     );
-    let dirty_poll_to_render_started_ms = elapsed_delta_ms(
-        state.last_dirty_poll_elapsed_ms,
-        state.last_render_started_elapsed_ms,
-    );
-    let render_started_to_surface_acquired_ms = elapsed_delta_ms(
-        state.last_render_started_elapsed_ms,
-        state.last_surface_acquired_elapsed_ms,
-    );
-    let render_started_to_render_hook_completed_ms = elapsed_delta_ms(
-        state.last_render_started_elapsed_ms,
-        state.last_render_hook_completed_elapsed_ms,
-    );
-    let surface_acquired_to_render_hook_completed_ms = elapsed_delta_ms(
-        state.last_surface_acquired_elapsed_ms,
-        state.last_render_hook_completed_elapsed_ms,
-    );
-    let render_hook_completed_to_surface_acquired_ms = elapsed_delta_ms(
-        state.last_render_hook_completed_elapsed_ms,
-        state.last_surface_acquired_elapsed_ms,
-    );
-    let render_hook_completed_to_present_ms = elapsed_delta_ms(
-        state.last_render_hook_completed_elapsed_ms,
-        state.last_present_completed_elapsed_ms,
-    );
-    let render_hook_to_queue_ms = elapsed_delta_ms(
-        state.last_render_hook_completed_elapsed_ms,
-        state.last_queue_submitted_elapsed_ms,
-    );
+    let dirty_poll_to_render_started_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.dirty_poll_to_render_started_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_dirty_poll_elapsed_ms,
+                state.last_render_started_elapsed_ms,
+            )
+        });
+    let render_started_to_surface_acquired_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.render_started_to_surface_acquired_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_started_elapsed_ms,
+                state.last_surface_acquired_elapsed_ms,
+            )
+        });
+    let render_started_to_render_hook_completed_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.render_started_to_render_hook_completed_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_started_elapsed_ms,
+                state.last_render_hook_completed_elapsed_ms,
+            )
+        });
+    let surface_acquired_to_render_hook_completed_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.surface_acquired_to_render_hook_completed_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_surface_acquired_elapsed_ms,
+                state.last_render_hook_completed_elapsed_ms,
+            )
+        });
+    let render_hook_completed_to_surface_acquired_ms = if accepted_input_frame_timing.is_some() {
+        None
+    } else {
+        elapsed_delta_ms(
+            state.last_render_hook_completed_elapsed_ms,
+            state.last_surface_acquired_elapsed_ms,
+        )
+    };
+    let render_hook_completed_to_present_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.render_hook_completed_to_present_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_hook_completed_elapsed_ms,
+                state.last_present_completed_elapsed_ms,
+            )
+        });
+    let render_hook_to_queue_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.render_hook_to_queue_ms)
+        .or_else(|| {
+            elapsed_delta_ms(
+                state.last_render_hook_completed_elapsed_ms,
+                state.last_queue_submitted_elapsed_ms,
+            )
+        });
     let poll_started_to_queue_ms = elapsed_delta_ms(
         state.last_poll_started_elapsed_ms,
         state.last_queue_submitted_elapsed_ms,
@@ -5796,13 +7916,40 @@ fn write_render_loop_state_report(
         presented_input_wake_elapsed_ms,
         state.last_queue_submitted_elapsed_ms,
     );
-    let queue_to_present_ms = match (
-        state.last_queue_submitted_elapsed_ms,
-        state.last_present_completed_elapsed_ms,
-    ) {
-        (Some(queue_ms), Some(present_ms)) if present_ms >= queue_ms => Some(present_ms - queue_ms),
-        _ => None,
-    };
+    let queue_to_present_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.queue_to_present_ms)
+        .or_else(|| {
+            match (
+                state.last_queue_submitted_elapsed_ms,
+                state.last_present_completed_elapsed_ms,
+            ) {
+                (Some(queue_ms), Some(present_ms)) if present_ms >= queue_ms => {
+                    Some(present_ms - queue_ms)
+                }
+                _ => None,
+            }
+        });
+    let surface_acquire_call_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.surface_acquire_call_ms)
+        .or(state.last_surface_acquire_call_ms);
+    let encoder_finish_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.encoder_finish_ms)
+        .or(state.last_encoder_finish_ms);
+    let queue_submit_call_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.queue_submit_call_ms)
+        .or(state.last_queue_submit_call_ms);
+    let present_call_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.present_call_ms)
+        .or(state.last_present_call_ms);
+    let present_path_ms = accepted_input_frame_timing
+        .as_ref()
+        .and_then(|timing| timing.present_path_ms)
+        .or(state.last_present_path_ms);
     let present_to_readback_report_ms = match (
         state.last_present_completed_elapsed_ms,
         extras.last_interactive_readback_completed_elapsed_ms,
@@ -5812,7 +7959,14 @@ fn write_render_loop_state_report(
         }
         _ => None,
     };
-    let proof_lag_frames = last_interactive_readback_artifact.and_then(|artifact| {
+    let frame_matched_interactive_readback_artifact =
+        recent_interactive_readback_artifact_for_frame(
+            &extras.recent_interactive_readback_artifacts,
+            extras.frame_evidence_key.as_ref(),
+        );
+    let proof_lag_artifact =
+        frame_matched_interactive_readback_artifact.or(last_interactive_readback_artifact);
+    let proof_lag_frames = proof_lag_artifact.and_then(|artifact| {
         artifact
             .frame_evidence_key
             .as_ref()
@@ -5837,6 +7991,8 @@ fn write_render_loop_state_report(
         "skipped_stale_input"
     } else if extras.last_interactive_surface_readback_skipped_for_backpressure {
         "readback_pending_backpressure"
+    } else if extras.configured_proof_mode == NativeProofMode::Counters {
+        "counters"
     } else {
         "off"
     };
@@ -5845,6 +8001,8 @@ fn write_render_loop_state_report(
         .as_ref()
         .map(|_| "async_latest_wins_atomic_replace")
         .unwrap_or("atomic_replace");
+    let post_present_proof_isolation =
+        post_present_proof_isolation_report(state, report_write_mode);
     let mut report_perf_accumulator = perf_accumulator.clone();
     report_perf_accumulator.record(
         None,
@@ -5854,15 +8012,21 @@ fn write_render_loop_state_report(
         None,
         None,
         None,
+        None,
         present_to_readback_report_ms,
     );
+    let input_accept_frame_lane = accepted_input_frame_timing
+        .as_ref()
+        .map(|timing| timing.frame_lane)
+        .or(state.last_frame_lane);
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
         elapsed,
         renders_per_second,
         &report_perf_accumulator,
-        extras.frame_input_to_present_ms,
+        input_accept_to_present_ms,
+        input_accept_frame_lane,
         proof_mode,
         present_to_readback_report_ms,
         extras.frame_evidence_key.clone(),
@@ -5878,9 +8042,33 @@ fn write_render_loop_state_report(
         }
     });
     let external_render_proof = external_render_proof_with_frame_evidence_key(
-        extras.external_render_proof.clone(),
+        extras.external_render_proof.as_deref(),
         extras.frame_evidence_key.as_ref(),
     );
+    let last_product_render_frame = state
+        .last_render_frame_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.product_frame.clone());
+    let last_post_present_proof_requests = state
+        .last_render_frame_metrics
+        .as_ref()
+        .map(|metrics| metrics.post_present_proof_requests.clone())
+        .unwrap_or_default();
+    let post_present_proof_request_count = last_post_present_proof_requests.len();
+    let legacy_pre_present_proof_request_count = last_post_present_proof_requests
+        .iter()
+        .filter(|request| request.currently_legacy_pre_present)
+        .count();
+    let legacy_product_proof_built_pre_present =
+        last_product_render_frame.as_ref().is_some_and(|frame| {
+            frame.legacy_proof_json_built_pre_present
+                || frame.legacy_render_hook_proof_built_pre_present
+        });
+    let last_product_frame_commit = state.last_product_frame_commit.clone();
+    let product_frame_commit_matches_frame_evidence_key =
+        last_product_frame_commit.as_ref().is_some_and(|commit| {
+            extras.frame_evidence_key.as_ref() == Some(&commit.frame_evidence_key)
+        });
     let mut report = serde_json::json!({
         "status": status,
         "role": role.as_str(),
@@ -5979,7 +8167,13 @@ fn write_render_loop_state_report(
         "accepted_host_input_press_only": state.last_accepted_host_input_press_only,
         "input_to_present_accounted_event_wake_count": state.last_input_to_present_accounted_event_wake_count,
         "accepted_input_frame_timing": accepted_input_frame_timing,
-        "latest_frame_timing_scope": "latest_presented_frame",
+        "frame_lane": input_accept_frame_lane,
+        "top_level_phase_timing_scope": if accepted_input_frame_timing.is_some() {
+            "accepted_visible_host_input_frame"
+        } else {
+            "latest_presented_frame"
+        },
+        "latest_frame_timing_scope": "latest_presented_frame_raw_last_fields",
         "frame_input_to_present_ms": input_accept_to_present_ms,
         "input_accept_timing_source": if state.last_accepted_host_input_elapsed_ms.is_some() {
             "role_poll_hook_accepted_visible_host_input"
@@ -5987,6 +8181,7 @@ fn write_render_loop_state_report(
             "missing_accepted_host_input"
         },
         "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
+        "poll_started_to_input_accept_ms": poll_started_to_input_accept_ms,
         "input_accept_to_dirty_poll_ms": input_accept_to_dirty_poll_ms,
         "input_accept_to_present_ms": input_accept_to_present_ms,
         "input_wake_to_dirty_poll_ms": input_wake_to_dirty_poll_ms,
@@ -6011,6 +8206,17 @@ fn write_render_loop_state_report(
         "report_serialization_in_hot_path": false,
         "hot_path_report_write_count": 0,
         "hot_path_report_serialization_count": 0,
+        "post_present_proof_isolation": post_present_proof_isolation,
+        "post_present_subscriber_drain_deferred_count": state.post_present_subscriber_drain_deferred_count,
+        "last_post_present_subscriber_drain_deferred_reason": state.last_post_present_subscriber_drain_deferred_reason.clone(),
+        "post_present_proof_subscriber_worker_enqueued_batch_count": state.post_present_proof_subscriber_worker_enqueued_batch_count,
+        "post_present_proof_subscriber_worker_enqueued_count": state.post_present_proof_subscriber_worker_enqueued_count,
+        "post_present_proof_subscriber_worker_dropped_batch_count": state.post_present_proof_subscriber_worker_dropped_batch_count,
+        "post_present_proof_subscriber_worker_dropped_count": state.post_present_proof_subscriber_worker_dropped_count,
+        "post_present_proof_subscriber_worker_completed_count": state.post_present_proof_subscriber_worker_completed_count,
+        "post_present_proof_subscriber_worker_error_count": state.post_present_proof_subscriber_worker_error_count,
+        "post_present_proof_subscriber_worker_pending_batch_count": state.post_present_proof_subscriber_worker_pending_batch_count,
+        "last_post_present_proof_subscriber_worker_enqueue_ms": state.last_post_present_proof_subscriber_worker_enqueue_ms,
         "last_render_loop_report_write_ms": extras.last_render_loop_report_write_ms,
         "last_render_loop_report_enqueue_ms": extras
             .report_writer
@@ -6053,9 +8259,50 @@ fn write_render_loop_state_report(
         "last_interactive_surface_readback_skipped_for_backpressure": extras.last_interactive_surface_readback_skipped_for_backpressure,
         "last_interactive_surface_readback_pending": extras.last_interactive_surface_readback_pending,
         "last_interactive_readback_error": extras.last_interactive_readback_error,
+        "interactive_readback_registry_limit": RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT,
+        "recent_interactive_readback_artifact_count": extras.recent_interactive_readback_artifacts.len(),
+        "recent_interactive_readback_artifacts": extras.recent_interactive_readback_artifacts.clone(),
+        "matching_interactive_readback_artifact_for_frame": frame_matched_interactive_readback_artifact,
+        "matching_interactive_readback_artifact_for_frame_status": if frame_matched_interactive_readback_artifact.is_some() {
+            "matched"
+        } else if extras.frame_evidence_key.is_some() {
+            "missing_for_frame"
+        } else {
+            "missing_frame_evidence_key"
+        },
         "app_window_surface_content_report": extras.app_window_surface_content_report,
         "observed_input_adapter": extras.observed_input_adapter,
         "last_external_render_proof": external_render_proof,
+        "last_product_render_frame": last_product_render_frame,
+        "last_product_frame_commit": last_product_frame_commit,
+        "product_frame_commit_count": state.product_frame_commit_count,
+        "recent_product_frame_commit_count": extras.recent_product_frame_commits.len(),
+        "recent_product_frame_commits": extras.recent_product_frame_commits,
+        "product_frame_commit_matches_frame_evidence_key": product_frame_commit_matches_frame_evidence_key,
+        "post_present_proof_queue_limit": RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT,
+        "post_present_proof_queue_enqueued_count": state.post_present_proof_queue_enqueued_count,
+        "post_present_proof_queue_deferred_count": state.post_present_proof_queue_deferred_count,
+        "post_present_proof_queue_legacy_pre_present_count": state.post_present_proof_queue_legacy_pre_present_count,
+        "post_present_proof_queue_completed_count": state.post_present_proof_queue_completed_count,
+        "recent_post_present_proof_queue_count": state.recent_post_present_proof_queue.len(),
+        "recent_post_present_proof_queue": state.recent_post_present_proof_queue.clone(),
+        "post_present_proof_artifact_limit": RECENT_POST_PRESENT_PROOF_ARTIFACT_LIMIT,
+        "post_present_proof_artifact_count": state.post_present_proof_artifact_count,
+        "post_present_proof_subscriber_error_count": state.post_present_proof_subscriber_error_count,
+        "last_post_present_proof_subscriber_error": state.last_post_present_proof_subscriber_error.clone(),
+        "recent_post_present_proof_artifact_count": state.recent_post_present_proof_artifacts.len(),
+        "recent_post_present_proof_artifacts": state.recent_post_present_proof_artifacts.clone(),
+        "post_present_proof_requests": last_post_present_proof_requests,
+        "post_present_proof_request_count": post_present_proof_request_count,
+        "legacy_pre_present_proof_request_count": legacy_pre_present_proof_request_count,
+        "legacy_product_proof_built_pre_present": legacy_product_proof_built_pre_present,
+        "frame_evidence_key_issued_before_present": state.last_frame_evidence_key_issued_before_present,
+        "preissued_frame_evidence_key": state.last_preissued_frame_evidence_key.clone(),
+        "preissued_frame_evidence_elapsed_ms": state.last_preissued_frame_evidence_elapsed_ms,
+        "preissued_frame_evidence_matches_presented_frame": state
+            .last_preissued_frame_evidence_key
+            .as_ref()
+            == extras.frame_evidence_key.as_ref(),
         "frame_evidence_key": extras.frame_evidence_key,
         "recent_frame_evidence": extras.recent_frame_evidence,
         "last_scheduler_reason": state.last_scheduler_reason,
@@ -6067,6 +8314,10 @@ fn write_render_loop_state_report(
     });
     if let Some(object) = report.as_object_mut() {
         object.insert(
+            "accepted_host_input_event".to_owned(),
+            serde_json::json!(state.last_accepted_host_input_event),
+        );
+        object.insert(
             "present_mode".to_owned(),
             serde_json::json!(extras.present_mode),
         );
@@ -6075,8 +8326,16 @@ fn write_render_loop_state_report(
             serde_json::json!(extras.surface_format),
         );
         object.insert(
+            "configured_proof_mode".to_owned(),
+            serde_json::json!(extras.configured_proof_mode.as_str()),
+        );
+        object.insert(
             "desired_maximum_frame_latency".to_owned(),
             serde_json::json!(extras.desired_maximum_frame_latency),
+        );
+        object.insert(
+            "desired_maximum_frame_latency_source".to_owned(),
+            serde_json::json!(extras.desired_maximum_frame_latency_source),
         );
         object.insert(
             "last_encoder_finish_ms".to_owned(),
@@ -6100,27 +8359,27 @@ fn write_render_loop_state_report(
         );
         object.insert(
             "encoder_finish_ms".to_owned(),
-            serde_json::json!(state.last_encoder_finish_ms),
+            serde_json::json!(encoder_finish_ms),
         );
         object.insert(
             "surface_acquire_call_ms".to_owned(),
-            serde_json::json!(state.last_surface_acquire_call_ms),
+            serde_json::json!(surface_acquire_call_ms),
         );
         object.insert(
             "queue_submit_call_ms".to_owned(),
-            serde_json::json!(state.last_queue_submit_call_ms),
+            serde_json::json!(queue_submit_call_ms),
         );
         object.insert(
             "present_call_ms".to_owned(),
-            serde_json::json!(state.last_present_call_ms),
+            serde_json::json!(present_call_ms),
         );
         object.insert(
             "frame_present_call_ms".to_owned(),
-            serde_json::json!(state.last_present_call_ms),
+            serde_json::json!(present_call_ms),
         );
         object.insert(
             "present_path_ms".to_owned(),
-            serde_json::json!(state.last_present_path_ms),
+            serde_json::json!(present_path_ms),
         );
         object.insert(
             "input_inline_resample_count".to_owned(),
@@ -6281,7 +8540,7 @@ fn finish_visible_surface_readback(
         presented_revision: None,
         content_revision: None,
         rendered_frame_count: None,
-        frame_evidence_key: None,
+        frame_evidence_key: pending.frame_evidence_key,
         capture_method: pending.capture_method.to_owned(),
         texture_format: format!("{:?}", pending.format),
         nonblank_samples,
@@ -6530,6 +8789,7 @@ fn sample_input_adapter(
             button: mouse_button_label(event.button).to_owned(),
             pressed: event.pressed,
             window_protocol_id: event.window_protocol_id,
+            event_elapsed_ms: None,
         })
         .collect::<Vec<_>>();
     let real_os_events_observed = mouse_window_pos.is_some()
@@ -6578,6 +8838,7 @@ fn sample_input_adapter_delta(
     keyboard: &Keyboard,
     cursor: &NativeInputCursor,
     synthetic_input_probe: bool,
+    hold_started: Instant,
 ) -> NativeInputAdapterProof {
     let mouse_window_pos = mouse
         .window_pos()
@@ -6619,6 +8880,10 @@ fn sample_input_adapter_delta(
             button: mouse_button_label(event.button).to_owned(),
             pressed: event.pressed,
             window_protocol_id: event.window_protocol_id,
+            event_elapsed_ms: event
+                .occurred_at
+                .checked_duration_since(hold_started)
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
         })
         .collect::<Vec<_>>();
     let new_scroll_observed = mouse_provenance.scroll_event_count
@@ -6832,6 +9097,175 @@ fn accept_input_cursor(
     cursor.accept(input);
 }
 
+fn accepted_host_input_event_summary(
+    input: &NativeInputAdapterProof,
+    input_event_wake_count: u64,
+    wake_elapsed_ms: Option<f64>,
+    accepted_elapsed_ms: f64,
+    semantic_hint: Option<&NativeHostInputEventHint>,
+) -> NativeHostInputEventSummary {
+    let hinted_button = semantic_hint.and_then(|hint| {
+        if hint.kind != "mouse_button" {
+            return None;
+        }
+        hint.sequence
+            .and_then(|sequence| {
+                input
+                    .mouse_button_events
+                    .iter()
+                    .find(|event| event.sequence == sequence)
+            })
+            .or_else(|| {
+                input.mouse_button_events.iter().find(|event| {
+                    hint.button
+                        .as_deref()
+                        .is_none_or(|button| event.button == button)
+                        && hint.pressed.is_none_or(|pressed| event.pressed == pressed)
+                })
+            })
+    });
+    let hinted_key = semantic_hint.and_then(|hint| {
+        if hint.kind != "keyboard_key" {
+            return None;
+        }
+        hint.sequence
+            .and_then(|sequence| {
+                input
+                    .keyboard_events
+                    .iter()
+                    .find(|event| event.sequence == sequence)
+            })
+            .or_else(|| {
+                input.keyboard_events.iter().find(|event| {
+                    hint.key.as_deref().is_none_or(|key| event.key == key)
+                        && hint.pressed.is_none_or(|pressed| event.pressed == pressed)
+                })
+            })
+    });
+    let latest_button = input
+        .mouse_button_events
+        .iter()
+        .max_by_key(|event| event.sequence);
+    let latest_key = input
+        .keyboard_events
+        .iter()
+        .max_by_key(|event| event.sequence);
+    let has_scroll_delta = input.scroll_delta_x != 0.0 || input.scroll_delta_y != 0.0;
+    let has_motion_delta = input.real_os_events_observed
+        && latest_button.is_none()
+        && latest_key.is_none()
+        && !has_scroll_delta
+        && input.mouse_window_pos.is_some();
+
+    let (kind, sequence, window_protocol_id, button, pressed, key, event_elapsed_ms) =
+        if let Some(event) = hinted_button {
+            (
+                "mouse_button",
+                Some(event.sequence),
+                event.window_protocol_id,
+                Some(event.button.clone()),
+                Some(event.pressed),
+                None,
+                event.event_elapsed_ms,
+            )
+        } else if let Some(event) = hinted_key {
+            (
+                "keyboard_key",
+                Some(event.sequence),
+                event.window_protocol_id,
+                None,
+                Some(event.pressed),
+                Some(event.key.clone()),
+                None,
+            )
+        } else if let Some(hint) = semantic_hint {
+            (
+                hint.kind.as_str(),
+                hint.sequence,
+                hint.window_protocol_id,
+                hint.button.clone(),
+                hint.pressed,
+                hint.key.clone(),
+                hint.event_elapsed_ms,
+            )
+        } else if let Some(event) = latest_button {
+            (
+                "mouse_button",
+                Some(event.sequence),
+                event.window_protocol_id,
+                Some(event.button.clone()),
+                Some(event.pressed),
+                None,
+                event.event_elapsed_ms,
+            )
+        } else if let Some(event) = latest_key {
+            (
+                "keyboard_key",
+                Some(event.sequence),
+                event.window_protocol_id,
+                None,
+                Some(event.pressed),
+                Some(event.key.clone()),
+                None,
+            )
+        } else if has_scroll_delta {
+            (
+                "mouse_scroll",
+                Some(input.mouse_scroll_event_count),
+                input.mouse_last_window_protocol_id,
+                None,
+                None,
+                None,
+                None,
+            )
+        } else if has_motion_delta {
+            (
+                "mouse_motion",
+                Some(input.mouse_motion_event_count),
+                input.mouse_last_window_protocol_id,
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            (
+                "raw_host_input_wake",
+                Some(input_event_wake_count),
+                input
+                    .mouse_last_window_protocol_id
+                    .or(input.keyboard_last_window_protocol_id),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+    let accepted_event_elapsed_ms = event_elapsed_ms.or(wake_elapsed_ms);
+
+    NativeHostInputEventSummary {
+        scope: "accepted_host_input_delta".to_owned(),
+        kind: kind.to_owned(),
+        source_intent: semantic_hint.and_then(|hint| hint.source_intent.clone()),
+        sequence,
+        input_event_wake_count,
+        wake_elapsed_ms: accepted_event_elapsed_ms,
+        raw_wake_elapsed_ms: wake_elapsed_ms,
+        event_elapsed_ms,
+        accepted_elapsed_ms: Some(accepted_elapsed_ms),
+        wake_to_accept_ms: elapsed_delta_ms(accepted_event_elapsed_ms, Some(accepted_elapsed_ms)),
+        event_to_accept_ms: elapsed_delta_ms(event_elapsed_ms, Some(accepted_elapsed_ms)),
+        window_protocol_id,
+        button,
+        pressed,
+        key,
+        mouse_button_delta_count: input.mouse_button_events.len(),
+        keyboard_delta_count: input.keyboard_events.len(),
+        has_scroll_delta,
+        has_motion_delta,
+    }
+}
+
 fn native_input_delta_is_button_press_only(input: &NativeInputAdapterProof) -> bool {
     let has_press = input.mouse_button_events.iter().any(|event| event.pressed);
     let has_release = input.mouse_button_events.iter().any(|event| !event.pressed);
@@ -6840,6 +9274,17 @@ fn native_input_delta_is_button_press_only(input: &NativeInputAdapterProof) -> b
         && input.keyboard_events.is_empty()
         && input.scroll_delta_x == 0.0
         && input.scroll_delta_y == 0.0
+}
+
+fn native_input_delta_is_pointer_motion_only(input: &NativeInputAdapterProof) -> bool {
+    input.real_os_events_observed
+        && input.mouse_button_events.is_empty()
+        && input.keyboard_events.is_empty()
+        && input.mouse_buttons_down.is_empty()
+        && input.pressed_keys.is_empty()
+        && input.scroll_delta_x == 0.0
+        && input.scroll_delta_y == 0.0
+        && input.mouse_window_pos.is_some()
 }
 
 fn mouse_button_label(button: u8) -> &'static str {
@@ -6939,6 +9384,25 @@ fn stable_debug_hash<T: std::fmt::Debug>(value: &T) -> String {
 mod tests {
     use super::*;
 
+    fn test_readback_artifact(key: FrameEvidenceKey, sequence: u64) -> AppWindowReadbackArtifact {
+        AppWindowReadbackArtifact {
+            path: format!("artifact-{sequence}.png"),
+            sha256: format!("sha-{sequence}"),
+            width: 8,
+            height: 8,
+            presented_revision: Some(key.frame_seq),
+            content_revision: Some(key.content_revision),
+            rendered_frame_count: Some(key.frame_seq),
+            frame_evidence_key: Some(key),
+            capture_method: "wgpu-visible-surface-copy-src-readback".to_owned(),
+            texture_format: "Rgba8Unorm".to_owned(),
+            nonblank_samples: 1,
+            unique_rgba_values: 1,
+            readback_deadline_ms: 5_000,
+            readback_poll_status: "completed_before_deadline".to_owned(),
+        }
+    }
+
     #[test]
     fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
         let mut base = empty_input_adapter_proof(false);
@@ -6970,6 +9434,946 @@ mod tests {
         assert!(
             base.pressed_keys.is_empty(),
             "current keyboard state must clear after a no-keys sample"
+        );
+    }
+
+    #[test]
+    fn recent_history_compacts_visible_bound_text_without_losing_selection_evidence() {
+        let mut entries = (0..96)
+            .map(|index| {
+                serde_json::json!({
+                    "node": format!("unrelated-{index}"),
+                    "kind": "Text",
+                    "text": format!("bulk-{index}"),
+                    "text_truncated": false,
+                    "paths": [format!("bulk.path.{index}")],
+                    "focused": false,
+                    "selected": false
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.push(serde_json::json!({
+            "node": "formula-bar",
+            "kind": "TextInput",
+            "text": "selected formula",
+            "text_truncated": false,
+            "paths": ["store.selected_input.editing_text"],
+            "focused": false,
+            "selected": false
+        }));
+        entries.push(serde_json::json!({
+            "node": "selected-cell",
+            "kind": "Text",
+            "text": "selected row",
+            "text_truncated": false,
+            "paths": ["record.selected_label"],
+            "focused": true,
+            "selected": true
+        }));
+        let proof = serde_json::json!({
+            "visible_bound_text": {
+                "status": "pass",
+                "source": "layout-frame-current-bound-text",
+                "entry_count": entries.len(),
+                "entry_limit": 512,
+                "truncated": false,
+                "entries": entries
+            }
+        });
+
+        let compact = compact_visible_bound_text_for_recent_history(&proof);
+        let compact_entries = compact
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .expect("compact visible text entries");
+
+        assert_eq!(compact["recent_history_compacted"], true);
+        assert_eq!(compact["entry_count"], 98);
+        assert!(compact_entries.len() <= 64);
+        assert!(compact_entries.iter().any(|entry| {
+            entry.get("node").and_then(serde_json::Value::as_str) == Some("formula-bar")
+                && entry.get("text").and_then(serde_json::Value::as_str) == Some("selected formula")
+        }));
+        assert!(compact_entries.iter().any(|entry| {
+            entry.get("node").and_then(serde_json::Value::as_str) == Some("selected-cell")
+                && entry.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+        }));
+        assert!(
+            !compact_entries.iter().any(|entry| {
+                entry.get("node").and_then(serde_json::Value::as_str) == Some("unrelated-95")
+            }),
+            "bulk unrelated entries should not dominate recent frame history"
+        );
+    }
+
+    #[test]
+    fn recent_history_preserves_render_hook_phase_timings() {
+        let key = FrameEvidenceKey {
+            frame_seq: 7,
+            content_revision: 11,
+            layout_revision: 3,
+            render_scene_revision: 5,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(13),
+            present_id: 17,
+            proof_request_id: None,
+        };
+        let proof = serde_json::json!({
+            "status": "pass",
+            "render_hook_phase_timings_ms": {
+                "encode_scene_ms": 0.42,
+                "report_json_ms": 0.11,
+                "total_with_report_json_ms": 0.57
+            },
+            "proof": {
+                "status": "pass",
+                "capture_method": "wgpu-visible-surface-copy-src-readback"
+            }
+        });
+
+        let compact = compact_external_render_proof_for_recent_history(Some(&proof), &key);
+
+        assert_eq!(
+            compact
+                .pointer("/render_hook_phase_timings_ms/encode_scene_ms")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.42)
+        );
+        assert_eq!(
+            compact
+                .pointer("/render_hook_phase_timings_ms/total_with_report_json_ms")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.57)
+        );
+        assert_eq!(
+            compact.pointer("/proof/frame_evidence_key"),
+            Some(&serde_json::to_value(key).expect("frame evidence key serializes"))
+        );
+    }
+
+    #[test]
+    fn post_present_proof_queue_tracks_deferred_and_legacy_requests_by_frame_key() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 7,
+            content_revision: 11,
+            layout_revision: 3,
+            render_scene_revision: 5,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(13),
+            present_id: 17,
+            proof_request_id: None,
+        };
+        let requests = vec![
+            NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            },
+            NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::ExternalAppOwnedReadback,
+                currently_legacy_pre_present: true,
+                frame_local_snapshot_required: true,
+            },
+        ];
+
+        state.enqueue_post_present_proof_requests(&key, &requests, Some(42.0));
+
+        assert_eq!(state.post_present_proof_queue_enqueued_count, 2);
+        assert_eq!(state.post_present_proof_queue_deferred_count, 1);
+        assert_eq!(state.post_present_proof_queue_legacy_pre_present_count, 1);
+        assert_eq!(state.recent_post_present_proof_queue.len(), 2);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].frame_evidence_key,
+            key
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::Queued
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[1].status,
+            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].enqueued_elapsed_ms,
+            Some(42.0)
+        );
+        assert!(state.note_post_present_proof_request_completed(
+            &key,
+            NativePostPresentProofRequestKind::VisibleBoundText,
+            Some(48.0),
+        ));
+        assert!(!state.note_post_present_proof_request_completed(
+            &key,
+            NativePostPresentProofRequestKind::ExternalAppOwnedReadback,
+            Some(49.0),
+        ));
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::CompletedPostPresent
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].completed_elapsed_ms,
+            Some(48.0)
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[1].status,
+            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+        );
+    }
+
+    #[test]
+    fn product_frame_commit_adds_visible_surface_readback_request_once() {
+        let key = FrameEvidenceKey {
+            frame_seq: 7,
+            content_revision: 11,
+            layout_revision: 3,
+            render_scene_revision: 5,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(13),
+            present_id: 17,
+            proof_request_id: None,
+        };
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
+            product_frame: Some(NativeRenderedProductFrame {
+                schema_version: 1,
+                render_target_kind: "visible-surface-direct".to_owned(),
+                visible_surface_rendered: true,
+                visible_present_path: true,
+                layout_identity: Some("layout:1".to_owned()),
+                render_scene_identity: Some("scene:1".to_owned()),
+                legacy_proof_json_built_pre_present: false,
+                legacy_render_hook_proof_built_pre_present: false,
+                post_present_proof_request_count: 1,
+            }),
+            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            ..NativeRenderFrameMetrics::default()
+        }));
+
+        let mut commit = product_frame_commit_for_presented_frame(
+            &state,
+            key.clone(),
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            None,
+        );
+
+        assert_eq!(commit.post_present_proof_request_count, 1);
+        add_post_present_proof_request_to_commit(
+            &mut commit,
+            visible_surface_readback_post_present_request(),
+        );
+        add_post_present_proof_request_to_commit(
+            &mut commit,
+            visible_surface_readback_post_present_request(),
+        );
+
+        assert_eq!(commit.post_present_proof_request_count, 2);
+        assert_eq!(commit.post_present_proof_requests.len(), 2);
+        assert_eq!(commit.legacy_pre_present_proof_request_count, 0);
+        assert!(commit.post_present_proof_requests.iter().any(|request| {
+            request.kind == NativePostPresentProofRequestKind::VisibleSurfaceReadback
+                && !request.currently_legacy_pre_present
+                && request.frame_local_snapshot_required
+        }));
+        assert_eq!(
+            commit
+                .product_frame
+                .as_ref()
+                .map(|frame| frame.post_present_proof_request_count),
+            Some(2)
+        );
+
+        let mut queue_state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        queue_state.note_product_frame_commit(commit);
+        assert_eq!(queue_state.post_present_proof_queue_enqueued_count, 2);
+        assert_eq!(queue_state.post_present_proof_queue_deferred_count, 2);
+        assert_eq!(
+            queue_state
+                .recent_post_present_proof_queue
+                .iter()
+                .filter(|entry| {
+                    entry.request.kind == NativePostPresentProofRequestKind::VisibleSurfaceReadback
+                        && entry.frame_evidence_key == key
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_present_proof_subscriber_artifact_completes_matching_queue_request() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 9,
+            content_revision: 12,
+            layout_revision: 4,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(15),
+            present_id: 19,
+            proof_request_id: None,
+        };
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::RetainedBoundSync,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            Some(50.0),
+        );
+
+        let subscriber = native_post_present_json_proof_subscriber(
+            NativePostPresentProofRequestKind::RetainedBoundSync,
+            |context| {
+                serde_json::json!({
+                    "frame_seq": context.frame_evidence_key.frame_seq,
+                    "completed_elapsed_ms": context.completed_elapsed_ms
+                })
+            },
+        );
+
+        run_post_present_proof_subscribers(&mut state, vec![subscriber], &key, Some(51.0));
+
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert_eq!(state.post_present_proof_subscriber_error_count, 0);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::CompletedPostPresent
+        );
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].completed_elapsed_ms,
+            Some(51.0)
+        );
+        let artifact = state
+            .recent_post_present_proof_artifacts
+            .back()
+            .expect("subscriber artifact");
+        assert_eq!(
+            artifact.kind,
+            NativePostPresentProofRequestKind::RetainedBoundSync
+        );
+        assert_eq!(artifact.frame_evidence_key, key);
+        assert_eq!(
+            artifact
+                .payload
+                .pointer("/frame_seq")
+                .and_then(|value| value.as_u64()),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn async_post_present_proof_worker_records_keyed_artifact() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 10,
+            content_revision: 12,
+            layout_revision: 4,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(16),
+            present_id: 20,
+            proof_request_id: None,
+        };
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            Some(50.0),
+        );
+        let subscriber = native_post_present_json_proof_subscriber(
+            NativePostPresentProofRequestKind::VisibleBoundText,
+            |context| {
+                serde_json::json!({
+                    "frame_seq": context.frame_evidence_key.frame_seq,
+                    "completed_elapsed_ms": context.completed_elapsed_ms
+                })
+            },
+        );
+        let mut worker = AsyncPostPresentProofSubscriberWorker::new();
+        let enqueue_report = worker
+            .enqueue(vec![subscriber], key.clone(), Some(61.0), Instant::now())
+            .expect("non-empty subscriber batch should enqueue");
+        state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_enqueued_batch_count,
+            1
+        );
+        assert_eq!(state.post_present_proof_subscriber_worker_enqueued_count, 1);
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_pending_batch_count,
+            1
+        );
+
+        worker.shutdown_and_drain(&mut state);
+
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_completed_count,
+            1
+        );
+        assert_eq!(state.post_present_proof_subscriber_worker_error_count, 0);
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_pending_batch_count,
+            0
+        );
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::CompletedPostPresent
+        );
+        let artifact = state
+            .recent_post_present_proof_artifacts
+            .back()
+            .expect("worker should record artifact");
+        assert_eq!(
+            artifact.kind,
+            NativePostPresentProofRequestKind::VisibleBoundText
+        );
+        assert_eq!(artifact.frame_evidence_key, key);
+        assert_eq!(artifact.completed_elapsed_ms, Some(61.0));
+    }
+
+    #[test]
+    fn lagging_post_present_proof_worker_is_reported_without_blocking_product_frame() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-post-present-proof-isolation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loop.json");
+
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_poll_started(1.0);
+        state.note_accepted_host_input(1, 2.0, false, None);
+        state.note_dirty_poll(2.5);
+        state.note_render_started(3.0);
+        state.note_surface_acquired(3.5);
+        state.note_surface_acquire_call(0.5);
+        state.note_render_hook_completed(5.0);
+        state.note_queue_submitted(5.5);
+        state.note_submit_phase_durations(0.2, 0.3, 1.0);
+        state.note_present_completed(6.5);
+        state.mark_presented_with_revisions(1, 2, 3, 4);
+        state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
+        state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
+            product_frame: Some(NativeRenderedProductFrame {
+                schema_version: 1,
+                render_target_kind: "visible-surface-direct".to_owned(),
+                visible_surface_rendered: true,
+                visible_present_path: true,
+                layout_identity: Some("layout-proof-isolation".to_owned()),
+                render_scene_identity: Some("scene-proof-isolation".to_owned()),
+                legacy_proof_json_built_pre_present: false,
+                legacy_render_hook_proof_built_pre_present: false,
+                post_present_proof_request_count: 1,
+            }),
+            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            ..NativeRenderFrameMetrics::default()
+        }));
+        let input_timing = state.take_frame_accepted_input_timing(1);
+        let key = frame_evidence_key_for_presented_frame(
+            &state,
+            &SurfaceId("preview:proof-isolation".to_owned()),
+            1,
+            Some(1),
+            None,
+        );
+        state.note_product_frame_commit(product_frame_commit_for_presented_frame(
+            &state,
+            key.clone(),
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            input_timing,
+        ));
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let subscriber: NativePostPresentProofSubscriber = Box::new(move |context| {
+            started_tx
+                .send(())
+                .expect("test should observe blocked subscriber start");
+            release_rx
+                .recv()
+                .expect("test should release blocked proof subscriber");
+            Ok(native_post_present_json_proof_artifact(
+                NativePostPresentProofRequestKind::VisibleBoundText,
+                context.frame_evidence_key.clone(),
+                context.completed_elapsed_ms,
+                serde_json::json!({
+                    "status": "pass",
+                    "blocked_worker_test": true,
+                    "frame_seq": context.frame_evidence_key.frame_seq
+                }),
+            ))
+        });
+        let mut worker = AsyncPostPresentProofSubscriberWorker::new();
+        let enqueue_report = worker
+            .enqueue(vec![subscriber], key.clone(), Some(7.0), Instant::now())
+            .expect("proof subscriber batch should enqueue");
+        state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("proof subscriber should be running but blocked");
+        worker.drain_completed(&mut state);
+
+        let mut recent_product_frame_commits = VecDeque::new();
+        if let Some(commit) = state.last_product_frame_commit.as_ref() {
+            push_recent_product_frame_commit(&mut recent_product_frame_commits, commit);
+        }
+        write_render_loop_state_report(
+            &path,
+            NativeWindowRole::Preview,
+            std::process::id(),
+            &WindowId("window-proof-isolation".to_owned()),
+            &SurfaceId("preview:proof-isolation".to_owned()),
+            &NativeSurfaceLifecycleReport {
+                surface_epoch: 1,
+                final_width: 1,
+                final_height: 1,
+                ..NativeSurfaceLifecycleReport::default()
+            },
+            &state,
+            Duration::from_millis(16),
+            1,
+            None,
+            &NativePreviewPerfAccumulator::default(),
+            NativeRenderLoopReportExtras {
+                present_mode: "Immediate".to_owned(),
+                surface_format: "Bgra8Unorm".to_owned(),
+                desired_maximum_frame_latency: 1,
+                desired_maximum_frame_latency_source: "present_mode_default".to_owned(),
+                ..NativeRenderLoopReportExtras::default()
+            }
+            .with_input_generation(1, 1, Some(0.0), Some(0.0))
+            .with_frame_evidence_key(Some(&key))
+            .with_recent_product_frame_commits(&recent_product_frame_commits),
+            None,
+        )
+        .unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            report["post_present_proof_isolation"]["status"],
+            serde_json::json!("pass")
+        );
+        assert_eq!(
+            report["post_present_proof_isolation"]["product_latency_includes_proof_completion"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            report["post_present_proof_isolation"]["product_blocks_on_proof_subscribers"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            report["post_present_proof_isolation"]["proof_worker_status"],
+            serde_json::json!("lagging")
+        );
+        assert_eq!(
+            report["post_present_proof_isolation"]["queued_request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(report["product_frame_commit_count"], serde_json::json!(1));
+        assert_eq!(
+            report["post_present_proof_artifact_count"],
+            serde_json::json!(0)
+        );
+
+        release_tx.send(()).unwrap();
+        worker.shutdown_and_drain(&mut state);
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn async_post_present_proof_worker_completes_history_and_report_requests() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 11,
+            content_revision: 13,
+            layout_revision: 5,
+            render_scene_revision: 7,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(17),
+            present_id: 21,
+            proof_request_id: None,
+        };
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::ProofHistory,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::RenderHookReportJson,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+            ],
+            Some(70.0),
+        );
+        let mut worker = AsyncPostPresentProofSubscriberWorker::new();
+        let enqueue_report = worker
+            .enqueue(
+                vec![
+                    proof_history_post_present_subscriber(3),
+                    render_hook_report_json_post_present_subscriber(
+                        "target/reports/native-gpu/loop.json".to_owned(),
+                        0.42,
+                    ),
+                ],
+                key.clone(),
+                Some(72.0),
+                Instant::now(),
+            )
+            .expect("history and report subscriber batch should enqueue");
+        state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+
+        worker.shutdown_and_drain(&mut state);
+
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_completed_count,
+            2
+        );
+        assert_eq!(state.post_present_proof_subscriber_worker_error_count, 0);
+        assert_eq!(state.post_present_proof_artifact_count, 2);
+        assert_eq!(state.post_present_proof_queue_completed_count, 2);
+        assert!(
+            state.recent_post_present_proof_queue.iter().all(
+                |entry| entry.status == NativePostPresentProofQueueStatus::CompletedPostPresent
+            )
+        );
+        let artifacts: Vec<_> = state.recent_post_present_proof_artifacts.iter().collect();
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == NativePostPresentProofRequestKind::ProofHistory
+                && artifact.frame_evidence_key == key
+                && artifact.payload["recent_frame_evidence_count"] == serde_json::json!(3)
+        }));
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.kind == NativePostPresentProofRequestKind::RenderHookReportJson
+                && artifact.frame_evidence_key == key
+                && artifact.payload["report_snapshot_enqueued"] == serde_json::json!(true)
+                && artifact.payload["report_path"]
+                    == serde_json::json!("target/reports/native-gpu/loop.json")
+        }));
+    }
+
+    #[test]
+    fn async_post_present_proof_worker_completes_artifact_hash_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-post-present-artifact-hash-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact_path = dir.join("proof-artifact.bin");
+        std::fs::write(&artifact_path, b"post-present artifact hash").unwrap();
+        let expected_sha256 = sha256_file(&artifact_path).unwrap();
+
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 12,
+            content_revision: 14,
+            layout_revision: 6,
+            render_scene_revision: 8,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(18),
+            present_id: 22,
+            proof_request_id: None,
+        };
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::ArtifactHash,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            Some(80.0),
+        );
+        let mut worker = AsyncPostPresentProofSubscriberWorker::new();
+        let enqueue_report = worker
+            .enqueue(
+                vec![native_post_present_artifact_hash_subscriber(vec![
+                    artifact_path.display().to_string(),
+                ])],
+                key.clone(),
+                Some(82.0),
+                Instant::now(),
+            )
+            .expect("artifact hash subscriber should enqueue");
+        state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+
+        worker.shutdown_and_drain(&mut state);
+
+        assert_eq!(
+            state.post_present_proof_subscriber_worker_completed_count,
+            1
+        );
+        assert_eq!(state.post_present_proof_subscriber_worker_error_count, 0);
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::CompletedPostPresent
+        );
+        let artifact = state
+            .recent_post_present_proof_artifacts
+            .back()
+            .expect("artifact hash worker should record artifact");
+        assert_eq!(
+            artifact.kind,
+            NativePostPresentProofRequestKind::ArtifactHash
+        );
+        assert_eq!(artifact.frame_evidence_key, key);
+        assert_eq!(
+            artifact.payload["artifact_hash_status"],
+            serde_json::json!("hashed_registered_artifacts")
+        );
+        assert_eq!(artifact.payload["registered_artifact_count"], 1);
+        assert_eq!(artifact.payload["hashed_artifact_count"], 1);
+        assert_eq!(
+            artifact.payload["artifact_sha256s"][0]["sha256"],
+            serde_json::json!(expected_sha256)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_hash_paths_are_collected_for_exact_frame_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-post-present-artifact-paths-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let readback_path = dir.join("readback.bin");
+        let external_path = dir.join("external.bin");
+        let stale_path = dir.join("stale.bin");
+        std::fs::write(&readback_path, b"readback artifact").unwrap();
+        std::fs::write(&external_path, b"external artifact").unwrap();
+        std::fs::write(&stale_path, b"stale artifact").unwrap();
+
+        let key = FrameEvidenceKey {
+            frame_seq: 21,
+            content_revision: 23,
+            layout_revision: 25,
+            render_scene_revision: 27,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 3,
+            input_event_seq: Some(29),
+            present_id: 31,
+            proof_request_id: None,
+        };
+        let stale_key = FrameEvidenceKey {
+            frame_seq: 20,
+            content_revision: 22,
+            layout_revision: 24,
+            render_scene_revision: 26,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 3,
+            input_event_seq: Some(28),
+            present_id: 30,
+            proof_request_id: None,
+        };
+        let mut current_artifact = test_readback_artifact(key.clone(), 1);
+        current_artifact.path = readback_path.display().to_string();
+        let mut stale_artifact = test_readback_artifact(stale_key.clone(), 2);
+        stale_artifact.path = stale_path.display().to_string();
+        let mut recent_artifacts = VecDeque::new();
+        recent_artifacts.push_back(stale_artifact.clone());
+        recent_artifacts.push_back(current_artifact.clone());
+        let external_proof = serde_json::json!({
+            "status": "pass",
+            "proof": {
+                "status": "pass",
+                "artifact": {
+                    "kind": "app_owned_pixels",
+                    "artifact_path": external_path.display().to_string(),
+                    "artifact_sha256": "0".repeat(64),
+                    "capture_method": "wgpu-visible-surface-copy-src-readback",
+                    "surface_id": key.surface_id.clone(),
+                    "surface_epoch": key.surface_epoch,
+                    "frame_seq": key.frame_seq
+                },
+                "stale_artifact": {
+                    "kind": "app_owned_pixels",
+                    "artifact_path": stale_path.display().to_string(),
+                    "artifact_sha256": "1".repeat(64),
+                    "capture_method": "wgpu-visible-surface-copy-src-readback",
+                    "frame_evidence_key": stale_key.clone()
+                }
+            }
+        });
+
+        let artifact_paths = post_present_artifact_hash_paths_for_frame(
+            &key,
+            Some(&current_artifact),
+            &recent_artifacts,
+            Some(&external_proof),
+        );
+
+        assert_eq!(artifact_paths.len(), 2);
+        assert!(artifact_paths.contains(&readback_path.display().to_string()));
+        assert!(artifact_paths.contains(&external_path.display().to_string()));
+        assert!(!artifact_paths.contains(&stale_path.display().to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_artifact_hash_is_deferred_while_exact_readback_is_pending() {
+        let key = FrameEvidenceKey {
+            frame_seq: 30,
+            content_revision: 31,
+            layout_revision: 32,
+            render_scene_revision: 33,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 4,
+            input_event_seq: Some(34),
+            present_id: 35,
+            proof_request_id: None,
+        };
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::ArtifactHash,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+            ],
+            Some(90.0),
+        );
+
+        assert!(should_defer_empty_artifact_hash_for_pending_readback(
+            &[],
+            &state,
+            &key,
+            true
+        ));
+        assert!(!should_defer_empty_artifact_hash_for_pending_readback(
+            &["target/artifacts/native-gpu/frames/already-ready.png".to_owned()],
+            &state,
+            &key,
+            true
+        ));
+        assert!(!should_defer_empty_artifact_hash_for_pending_readback(
+            &[],
+            &state,
+            &key,
+            false
+        ));
+
+        let mut no_readback_state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        no_readback_state.enqueue_post_present_proof_requests(
+            &key,
+            &[NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::ArtifactHash,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            Some(90.0),
+        );
+        assert!(!should_defer_empty_artifact_hash_for_pending_readback(
+            &[],
+            &no_readback_state,
+            &key,
+            true
+        ));
+    }
+
+    #[test]
+    fn post_present_subscriber_drain_yields_to_pending_host_input() {
+        assert!(post_present_subscriber_drain_allowed(3, 3));
+        assert!(post_present_subscriber_drain_allowed(2, 3));
+        assert!(!post_present_subscriber_drain_allowed(4, 3));
+    }
+
+    #[test]
+    fn recent_history_preserves_poll_input_timing_samples() {
+        let diagnostics = serde_json::json!({
+            "kind": "preview_role_poll",
+            "dirty": true,
+            "accessibility_snapshot_status": "deferred_product_input",
+            "phase_timings_ms": {
+                "source_input_ms": 5.0,
+                "passive_hover_ms": 0.25
+            },
+            "recent_native_input_timing_samples": [
+                {
+                    "fast_path": "simple_source_click",
+                    "total_ms": 1.25,
+                    "resolve_source": "cached_click_candidate"
+                }
+            ],
+            "native_input_reject_counts": {}
+        });
+
+        let compact = compact_poll_diagnostics_for_recent_history(Some(&diagnostics));
+
+        assert_eq!(
+            compact
+                .pointer("/accessibility_snapshot_status")
+                .and_then(serde_json::Value::as_str),
+            Some("deferred_product_input")
+        );
+        assert_eq!(
+            compact
+                .pointer("/recent_native_input_timing_samples/0/fast_path")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_source_click")
+        );
+        assert_eq!(
+            compact
+                .pointer("/phase_timings_ms/source_input_ms")
+                .and_then(serde_json::Value::as_f64),
+            Some(5.0)
         );
     }
 
@@ -7064,10 +10468,73 @@ mod tests {
         let path = dir.join("loop.json");
 
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
-        state.note_accepted_host_input(3, 20.0, false);
+        state.note_poll_started(18.0);
+        state.note_accepted_host_input(3, 20.0, false, None);
+        state.note_dirty_poll(21.0);
+        state.note_render_started(22.0);
+        state.note_surface_acquired(22.5);
+        state.note_surface_acquire_call(0.5);
+        state.note_render_hook_completed(24.0);
+        state.note_queue_submitted(26.0);
+        state.note_submit_phase_durations(0.2, 0.3, 1.5);
         state.note_present_completed(27.5);
         state.mark_presented_with_revisions(1, 2, 3, 4);
+        state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
         let frame_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
+        state.note_dirty_poll(140.0);
+        state.note_render_started(150.0);
+        state.note_surface_acquired(151.0);
+        state.note_surface_acquire_call(5.0);
+        state.note_render_hook_completed(152.0);
+        state.note_queue_submitted(153.0);
+        state.note_submit_phase_durations(6.0, 7.0, 8.0);
+        state.note_present_completed(160.0);
+        state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
+            layout_ms: Some(0.25),
+            product_frame: Some(NativeRenderedProductFrame {
+                schema_version: 1,
+                render_target_kind: "visible-surface-direct".to_owned(),
+                visible_surface_rendered: true,
+                visible_present_path: true,
+                layout_identity: Some("layout-test".to_owned()),
+                render_scene_identity: Some("scene-test".to_owned()),
+                legacy_proof_json_built_pre_present: true,
+                legacy_render_hook_proof_built_pre_present: true,
+                post_present_proof_request_count: 2,
+            }),
+            post_present_proof_requests: vec![
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                    currently_legacy_pre_present: true,
+                    frame_local_snapshot_required: true,
+                },
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::RenderHookReportJson,
+                    currently_legacy_pre_present: true,
+                    frame_local_snapshot_required: true,
+                },
+            ],
+            ..NativeRenderFrameMetrics::default()
+        }));
+        let product_commit_key = frame_evidence_key_for_presented_frame(
+            &state,
+            &SurfaceId("surface-test".to_owned()),
+            1,
+            Some(3),
+            None,
+        );
+        state.note_product_frame_commit(product_frame_commit_for_presented_frame(
+            &state,
+            product_commit_key.clone(),
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            state.last_accounted_input_frame_timing.clone(),
+        ));
+        let mut recent_product_frame_commits = VecDeque::new();
+        if let Some(commit) = state.last_product_frame_commit.as_ref() {
+            push_recent_product_frame_commit(&mut recent_product_frame_commits, commit);
+        }
         let mut perf_accumulator = NativePreviewPerfAccumulator::default();
         perf_accumulator.record(
             None,
@@ -7077,6 +10544,7 @@ mod tests {
             state.last_queue_submit_call_ms,
             state.last_present_path_ms,
             frame_input_to_present_ms,
+            Some(NativeFrameLane::ProductInteraction),
             None,
         );
 
@@ -7101,10 +10569,12 @@ mod tests {
                 present_mode: "Immediate".to_owned(),
                 surface_format: "Bgra8Unorm".to_owned(),
                 desired_maximum_frame_latency: 1,
+                desired_maximum_frame_latency_source: "present_mode_default".to_owned(),
                 ..NativeRenderLoopReportExtras::default()
             }
             .with_input_generation(3, 3, None, None)
-            .with_frame_input_to_present_ms(frame_input_to_present_ms),
+            .with_frame_evidence_key(Some(&product_commit_key))
+            .with_recent_product_frame_commits(&recent_product_frame_commits),
             None,
         )
         .unwrap();
@@ -7112,14 +10582,51 @@ mod tests {
         let report: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(report["frame_input_to_present_ms"], serde_json::json!(7.5));
+        assert_eq!(report["input_accept_to_present_ms"], serde_json::json!(7.5));
+        assert_eq!(
+            report["top_level_phase_timing_scope"],
+            serde_json::json!("accepted_visible_host_input_frame")
+        );
+        assert_eq!(
+            report["latest_frame_timing_scope"],
+            serde_json::json!("latest_presented_frame_raw_last_fields")
+        );
         assert_eq!(
             report["input_to_present_accounted_event_wake_count"],
             serde_json::json!(3)
         );
         assert_eq!(
-            report["input_accept_to_present_ms"],
-            serde_json::Value::Null,
-            "consumed accepted input must not be recomputed as a second product latency"
+            report["accepted_input_frame_timing"]["timing_scope"],
+            serde_json::json!("accepted_visible_host_input_frame")
+        );
+        assert_eq!(
+            report["poll_started_to_input_accept_ms"],
+            serde_json::json!(2.0),
+            "pre-accept poll/hook work must remain visible separately from accepted product latency"
+        );
+        assert_eq!(
+            report["accepted_input_frame_timing"]["dirty_poll_to_render_started_ms"],
+            serde_json::json!(1.0)
+        );
+        assert_eq!(
+            report["dirty_poll_to_render_started_ms"],
+            serde_json::json!(1.0),
+            "verifier-facing phase fields must describe the accepted input frame, not a later requested-animation frame"
+        );
+        assert_eq!(
+            report["render_hook_completed_to_present_ms"],
+            serde_json::json!(3.5)
+        );
+        assert_eq!(report["queue_to_present_ms"], serde_json::json!(1.5));
+        assert_eq!(report["surface_acquire_call_ms"], serde_json::json!(0.5));
+        assert_eq!(report["queue_submit_call_ms"], serde_json::json!(0.3));
+        assert_eq!(report["present_call_ms"], serde_json::json!(1.5));
+        assert_eq!(report["frame_present_call_ms"], serde_json::json!(1.5));
+        assert_eq!(report["present_path_ms"], serde_json::json!(2.3));
+        assert_eq!(
+            report["last_present_call_ms"],
+            serde_json::json!(8.0),
+            "latest-frame debug fields should still expose the most recent follow-up frame"
         );
         assert_eq!(
             report["preview_perf_stats"]["input_to_present_ms"],
@@ -7128,6 +10635,119 @@ mod tests {
         assert_eq!(
             report["preview_perf_stats"]["input_to_present_ms_p50_p95_p99_max"]["p95"],
             serde_json::json!(7.5)
+        );
+        assert_eq!(
+            report["preview_perf_stats"]["frame_lane"],
+            serde_json::json!("product_interaction")
+        );
+        assert_eq!(
+            report["preview_perf_stats"]["product_input_to_present_ms_p50_p95_p99_max"]["p95"],
+            serde_json::json!(7.5)
+        );
+        assert_eq!(
+            report["preview_perf_stats"]["product_missed_frame_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["last_product_render_frame"]["render_target_kind"],
+            serde_json::json!("visible-surface-direct")
+        );
+        assert_eq!(
+            report["last_product_render_frame"]["legacy_proof_json_built_pre_present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            report["post_present_proof_request_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["legacy_pre_present_proof_request_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["legacy_product_proof_built_pre_present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(report["product_frame_commit_count"], serde_json::json!(1));
+        assert_eq!(
+            report["recent_product_frame_commit_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            report["product_frame_commit_matches_frame_evidence_key"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            report["last_product_frame_commit"]["commit_source"],
+            serde_json::json!("app_window_product_frame_commit")
+        );
+        assert_eq!(
+            report["last_product_frame_commit"]["frame_lane"],
+            serde_json::json!("product_interaction")
+        );
+        assert_eq!(
+            report["last_product_frame_commit"]["input_to_present_ms"],
+            serde_json::json!(7.5)
+        );
+        assert_eq!(
+            report["last_product_frame_commit"]["post_present_proof_request_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["last_product_frame_commit"]["legacy_pre_present_proof_request_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["post_present_proof_queue_enqueued_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["post_present_proof_queue_deferred_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["post_present_proof_queue_legacy_pre_present_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["post_present_proof_queue_completed_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["post_present_subscriber_drain_deferred_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["last_post_present_subscriber_drain_deferred_reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["post_present_proof_artifact_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["post_present_proof_subscriber_error_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["recent_post_present_proof_artifact_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            report["recent_post_present_proof_queue_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            report["recent_post_present_proof_queue"][0]["frame_evidence_key"],
+            report["frame_evidence_key"]
+        );
+        assert_eq!(
+            report["recent_post_present_proof_queue"][0]["status"],
+            serde_json::json!("legacy_already_built_pre_present")
+        );
+        assert_eq!(
+            report["recent_product_frame_commits"][0]["frame_evidence_key"],
+            report["frame_evidence_key"]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -7149,6 +10769,7 @@ mod tests {
             present_mode: "Immediate".to_owned(),
             surface_format: "Bgra8Unorm".to_owned(),
             desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency_source: "present_mode_default".to_owned(),
             ..NativeRenderLoopReportExtras::default()
         };
         extras = extras.with_report_writer_stats(writer_stats);
@@ -7160,6 +10781,7 @@ mod tests {
             state.last_surface_acquire_call_ms,
             state.last_queue_submit_call_ms,
             state.last_present_path_ms,
+            None,
             None,
             None,
         );
@@ -7214,6 +10836,61 @@ mod tests {
         state.mark_presented(state.dirty_revision);
         state.schedule_wake_after(now, Duration::from_millis(4));
         assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn demand_driven_idle_gap_before_host_input_is_not_a_missed_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(10.0);
+
+        state.mark_dirty(NativeSchedulerReason::HostInput, None);
+        state.note_present_completed(160.0);
+
+        assert_eq!(
+            state.last_present_interval_ms,
+            Some(150.0),
+            "DemandDriven still reports the idle gap for diagnostics"
+        );
+        assert!(
+            state.last_frame_lateness_ms.unwrap_or_default() > NATIVE_TARGET_FRAME_INTERVAL_MS,
+            "the interval is late relative to continuous pacing, but DemandDriven idle is allowed"
+        );
+        assert_eq!(
+            state.missed_frame_count, 0,
+            "a long healthy DemandDriven idle gap before new host input is not a dropped frame"
+        );
+        assert_eq!(state.last_missed_frame_cause, None);
+    }
+
+    #[test]
+    fn requested_animation_followup_gap_counts_as_missed_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(10.0);
+
+        state.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
+        state.note_present_completed(60.0);
+
+        assert_eq!(state.missed_frame_count, 1);
+        assert_eq!(
+            state.last_missed_frame_cause.as_deref(),
+            Some("requested_animation_present_interval_exceeded_two_frames")
+        );
+    }
+
+    #[test]
+    fn continuous_probe_long_present_gap_counts_as_missed_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::ContinuousProbe);
+        state.mark_presented(state.dirty_revision);
+        state.note_present_completed(10.0);
+        state.note_present_completed(60.0);
+
+        assert_eq!(state.missed_frame_count, 1);
+        assert_eq!(
+            state.last_missed_frame_cause.as_deref(),
+            Some("continuous_probe_present_interval_exceeded_two_frames")
+        );
     }
 
     #[test]
@@ -7331,6 +11008,325 @@ mod tests {
     }
 
     #[test]
+    fn frame_evidence_key_can_be_preissued_before_present() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.mark_presented_with_revisions(7, 42, 43, 44);
+        let surface_id = SurfaceId("surface-test".to_owned());
+
+        let preissued = frame_evidence_key_for_next_presented_frame_with_revisions(
+            &state,
+            &surface_id,
+            9,
+            Some(5),
+            Some(12),
+            52,
+            53,
+            54,
+        );
+        state.note_preissued_frame_evidence_key(preissued.clone(), 3.5);
+
+        assert_eq!(preissued.frame_seq, 2);
+        assert_eq!(preissued.present_id, 2);
+        assert_eq!(preissued.content_revision, 52);
+        assert_eq!(preissued.layout_revision, 53);
+        assert_eq!(preissued.render_scene_revision, 54);
+        assert_eq!(
+            state.last_preissued_frame_evidence_key.as_ref(),
+            Some(&preissued)
+        );
+        assert_eq!(state.last_preissued_frame_evidence_elapsed_ms, Some(3.5));
+        assert!(state.last_frame_evidence_key_issued_before_present);
+
+        state.mark_presented_with_revisions(8, 52, 53, 54);
+
+        let presented =
+            frame_evidence_key_for_presented_frame(&state, &surface_id, 9, Some(5), Some(12));
+        assert_eq!(presented, preissued);
+    }
+
+    #[test]
+    fn recent_interactive_readback_registry_matches_exact_frame_key() {
+        let surface_id = SurfaceId("surface-test".to_owned());
+        let mut recent = VecDeque::new();
+        let mut expected_key = None;
+
+        for index in 0..(RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT + 2) {
+            let key = FrameEvidenceKey {
+                frame_seq: index as u64,
+                content_revision: 100 + index as u64,
+                layout_revision: 200 + index as u64,
+                render_scene_revision: 300 + index as u64,
+                surface_id: surface_id.clone(),
+                surface_epoch: 4,
+                input_event_seq: Some(index as u64),
+                present_id: index as u64,
+                proof_request_id: None,
+            };
+            if index == RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT {
+                expected_key = Some(key.clone());
+            }
+            let artifact = test_readback_artifact(key, index as u64);
+            push_recent_interactive_readback_artifact(&mut recent, &artifact);
+        }
+
+        assert_eq!(recent.len(), RECENT_INTERACTIVE_READBACK_ARTIFACT_LIMIT);
+        assert_eq!(
+            recent
+                .front()
+                .unwrap()
+                .frame_evidence_key
+                .as_ref()
+                .unwrap()
+                .frame_seq,
+            2
+        );
+        let expected_key = expected_key.expect("test should capture a retained key");
+        let matched = recent_interactive_readback_artifact_for_frame(
+            recent.make_contiguous(),
+            Some(&expected_key),
+        )
+        .expect("registry should find exact frame evidence key");
+        assert_eq!(matched.frame_evidence_key.as_ref(), Some(&expected_key));
+
+        let missing_key = FrameEvidenceKey {
+            frame_seq: 999,
+            content_revision: 999,
+            layout_revision: 999,
+            render_scene_revision: 999,
+            surface_id,
+            surface_epoch: 4,
+            input_event_seq: Some(999),
+            present_id: 999,
+            proof_request_id: None,
+        };
+        assert!(
+            recent_interactive_readback_artifact_for_frame(
+                recent.make_contiguous(),
+                Some(&missing_key),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_interactive_readback_records_visible_surface_post_present_artifact() {
+        let key = FrameEvidenceKey {
+            frame_seq: 42,
+            content_revision: 100,
+            layout_revision: 200,
+            render_scene_revision: 300,
+            surface_id: SurfaceId("surface-test".to_owned()),
+            surface_epoch: 4,
+            input_event_seq: Some(7),
+            present_id: 42,
+            proof_request_id: Some(99),
+        };
+        let artifact = test_readback_artifact(key.clone(), 1);
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+                currently_legacy_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            Some(1.0),
+        );
+        let mut recent = VecDeque::new();
+        let mut last = None;
+        let mut deferred_artifact_hash_readback_keys = VecDeque::new();
+
+        note_completed_interactive_readback_artifact(
+            &mut state,
+            &mut recent,
+            &mut last,
+            &mut deferred_artifact_hash_readback_keys,
+            artifact,
+            Some(12.5),
+        );
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            last.as_ref()
+                .and_then(|artifact| artifact.frame_evidence_key.as_ref()),
+            Some(&key)
+        );
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].status,
+            NativePostPresentProofQueueStatus::CompletedPostPresent
+        );
+
+        let post_present_artifact = state
+            .recent_post_present_proof_artifacts
+            .back()
+            .expect("completed readback should record a post-present artifact");
+        assert_eq!(
+            post_present_artifact.kind,
+            NativePostPresentProofRequestKind::VisibleSurfaceReadback
+        );
+        assert_eq!(post_present_artifact.frame_evidence_key, key);
+        assert_eq!(post_present_artifact.completed_elapsed_ms, Some(12.5));
+        assert_eq!(post_present_artifact.payload["status"], "pass");
+        assert_eq!(
+            post_present_artifact.payload["capture_method"],
+            "wgpu-visible-surface-copy-src-readback"
+        );
+        assert_eq!(
+            post_present_artifact.payload["artifact_path"],
+            "artifact-1.png"
+        );
+        assert_eq!(post_present_artifact.payload["artifact_sha256"], "sha-1");
+        assert_eq!(post_present_artifact.payload["frame_seq"], 42);
+        assert_eq!(post_present_artifact.payload["input_event_seq"], 7);
+        assert_eq!(post_present_artifact.payload["present_id"], 42);
+    }
+
+    #[test]
+    fn completed_interactive_readback_completes_matching_artifact_hash_request() {
+        let key = FrameEvidenceKey {
+            frame_seq: 43,
+            content_revision: 101,
+            layout_revision: 201,
+            render_scene_revision: 301,
+            surface_id: SurfaceId("surface-test".to_owned()),
+            surface_epoch: 4,
+            input_event_seq: Some(8),
+            present_id: 43,
+            proof_request_id: Some(100),
+        };
+        let artifact = test_readback_artifact(key.clone(), 2);
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::ArtifactHash,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+            ],
+            Some(2.0),
+        );
+        let mut recent = VecDeque::new();
+        let mut last = None;
+        let mut deferred_artifact_hash_readback_keys = VecDeque::new();
+        push_deferred_artifact_hash_readback_key(&mut deferred_artifact_hash_readback_keys, &key);
+
+        note_completed_interactive_readback_artifact(
+            &mut state,
+            &mut recent,
+            &mut last,
+            &mut deferred_artifact_hash_readback_keys,
+            artifact,
+            Some(13.5),
+        );
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(state.post_present_proof_artifact_count, 2);
+        assert_eq!(state.post_present_proof_queue_completed_count, 2);
+        assert!(state.recent_post_present_proof_queue.iter().all(|entry| {
+            entry.status == NativePostPresentProofQueueStatus::CompletedPostPresent
+                && entry.frame_evidence_key == key
+                && entry.completed_elapsed_ms == Some(13.5)
+        }));
+        let artifact_hash = state
+            .recent_post_present_proof_artifacts
+            .iter()
+            .find(|artifact| artifact.kind == NativePostPresentProofRequestKind::ArtifactHash)
+            .expect("completed readback should also record artifact hash proof");
+        assert_eq!(artifact_hash.frame_evidence_key, key);
+        assert_eq!(
+            artifact_hash.payload["artifact_hash_status"],
+            serde_json::json!("hashed_registered_artifacts")
+        );
+        assert_eq!(artifact_hash.payload["registered_artifact_count"], 1);
+        assert_eq!(artifact_hash.payload["hashed_artifact_count"], 1);
+        assert_eq!(
+            artifact_hash.payload["artifact_sha256s"][0]["path"],
+            serde_json::json!("artifact-2.png")
+        );
+        assert_eq!(
+            artifact_hash.payload["artifact_sha256s"][0]["sha256"],
+            serde_json::json!("sha-2")
+        );
+        assert_eq!(
+            artifact_hash.payload["artifact_sha256s"][0]["source"],
+            serde_json::json!("visible_surface_readback_completion")
+        );
+        assert!(deferred_artifact_hash_readback_keys.is_empty());
+    }
+
+    #[test]
+    fn completed_interactive_readback_does_not_race_non_deferred_artifact_hash() {
+        let key = FrameEvidenceKey {
+            frame_seq: 44,
+            content_revision: 102,
+            layout_revision: 202,
+            render_scene_revision: 302,
+            surface_id: SurfaceId("surface-test".to_owned()),
+            surface_epoch: 4,
+            input_event_seq: Some(9),
+            present_id: 44,
+            proof_request_id: Some(101),
+        };
+        let artifact = test_readback_artifact(key.clone(), 3);
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.enqueue_post_present_proof_requests(
+            &key,
+            &[
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+                NativePostPresentProofRequestSummary {
+                    kind: NativePostPresentProofRequestKind::ArtifactHash,
+                    currently_legacy_pre_present: false,
+                    frame_local_snapshot_required: true,
+                },
+            ],
+            Some(3.0),
+        );
+        let mut recent = VecDeque::new();
+        let mut last = None;
+        let mut deferred_artifact_hash_readback_keys = VecDeque::new();
+
+        note_completed_interactive_readback_artifact(
+            &mut state,
+            &mut recent,
+            &mut last,
+            &mut deferred_artifact_hash_readback_keys,
+            artifact,
+            Some(14.5),
+        );
+
+        assert_eq!(state.post_present_proof_artifact_count, 1);
+        assert_eq!(state.post_present_proof_queue_completed_count, 1);
+        assert!(
+            state
+                .recent_post_present_proof_artifacts
+                .iter()
+                .all(|artifact| artifact.kind != NativePostPresentProofRequestKind::ArtifactHash)
+        );
+        let artifact_hash_entry = state
+            .recent_post_present_proof_queue
+            .iter()
+            .find(|entry| entry.request.kind == NativePostPresentProofRequestKind::ArtifactHash)
+            .expect("artifact hash request remains queued for the real subscriber");
+        assert_eq!(
+            artifact_hash_entry.status,
+            NativePostPresentProofQueueStatus::Queued
+        );
+    }
+
+    #[test]
     fn external_visible_readback_proof_gets_frame_evidence_key() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented_with_revisions(7, 42, 43, 44);
@@ -7352,7 +11348,7 @@ mod tests {
         });
 
         let enriched =
-            external_render_proof_with_frame_evidence_key(Some(proof), Some(&key)).unwrap();
+            external_render_proof_with_frame_evidence_key(Some(&proof), Some(&key)).unwrap();
 
         assert_eq!(
             enriched.pointer("/proof/frame_evidence_key/frame_seq"),
@@ -7410,28 +11406,66 @@ mod tests {
     #[test]
     fn interactive_surface_readback_is_coalesced_while_previous_proof_is_pending() {
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Preview, true, false, false),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                false,
+                false,
+                false,
+            ),
             InteractiveSurfaceReadbackDecision::Queue
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Preview, true, true, false),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                true,
+                false,
+                false,
+            ),
             InteractiveSurfaceReadbackDecision::SkipExternalProof
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Preview, true, false, true),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                false,
+                true,
+                false,
+            ),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, false),
+            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, false, false),
             InteractiveSurfaceReadbackDecision::Queue
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true),
+            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true, false),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
         assert_eq!(
-            interactive_surface_readback_decision(NativeWindowRole::Preview, false, false, false),
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                false,
+                false,
+                false,
+                false,
+            ),
             InteractiveSurfaceReadbackDecision::Off
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                false,
+                false,
+                true,
+            ),
+            InteractiveSurfaceReadbackDecision::DeferProductInput
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(NativeWindowRole::Dev, true, false, true, true),
+            InteractiveSurfaceReadbackDecision::DeferProductInput
         );
     }
 
@@ -7500,14 +11534,14 @@ mod tests {
     }
 
     #[test]
-    fn verifier_readback_backpressure_defers_non_input_frames_only() {
-        assert!(should_defer_render_for_interactive_readback(
+    fn verifier_readback_backpressure_never_defers_product_rendering() {
+        assert!(!should_defer_render_for_interactive_readback(
             true,
             true,
             false,
             Some(NativeSchedulerReason::Timer)
         ));
-        assert!(should_defer_render_for_interactive_readback(
+        assert!(!should_defer_render_for_interactive_readback(
             true,
             true,
             false,
@@ -7562,10 +11596,40 @@ mod tests {
         assert_eq!(
             direct_with_readback.selected_mode,
             NativePresentPathMode::DirectVisibleSurface,
-            "proof readback alone must not force the product frame through offscreen copy-to-present"
+            "offscreen copy-to-present remains explicit because it can regress compositor present latency"
         );
         assert_eq!(
             direct_with_readback.reason,
+            "default_direct_visible_surface_with_separate_readback"
+        );
+
+        let direct_readback_without_copy_dst = select_native_present_path_mode(
+            true,
+            false,
+            NativePresentPathMode::DirectVisibleSurface,
+            true,
+        );
+        assert_eq!(
+            direct_readback_without_copy_dst.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface
+        );
+        assert_eq!(
+            direct_readback_without_copy_dst.reason,
+            "default_direct_visible_surface_with_separate_readback"
+        );
+
+        let direct_readback_without_hook = select_native_present_path_mode(
+            false,
+            true,
+            NativePresentPathMode::DirectVisibleSurface,
+            true,
+        );
+        assert_eq!(
+            direct_readback_without_hook.selected_mode,
+            NativePresentPathMode::DirectVisibleSurface
+        );
+        assert_eq!(
+            direct_readback_without_hook.reason,
             "default_direct_visible_surface_with_separate_readback"
         );
 
@@ -7663,6 +11727,15 @@ mod tests {
             visible_display_item_count: Some(40),
             queue_write_count: Some(3),
             preview_blocked_on_ipc_count: Some(0),
+            render_hook_outer_state_snapshot_ms: None,
+            render_hook_outer_input_snapshot_ms: None,
+            render_hook_outer_world_snapshot_ms: None,
+            render_hook_outer_core_ms: None,
+            render_hook_outer_revision_ms: None,
+            render_hook_outer_total_ms: None,
+            render_hook_phase_timings: None,
+            product_frame: None,
+            post_present_proof_requests: Vec::new(),
         };
         state.note_render_frame_metrics(Some(render_metrics.clone()));
         let key = frame_evidence_key_for_presented_frame(
@@ -7681,6 +11754,7 @@ mod tests {
             state.last_queue_submit_call_ms,
             state.last_present_path_ms,
             Some(8.0),
+            Some(NativeFrameLane::ProductInteraction),
             Some(24.0),
         );
 
@@ -7691,6 +11765,7 @@ mod tests {
             60.0,
             &accumulator,
             Some(8.0),
+            Some(NativeFrameLane::ProductInteraction),
             "readback",
             Some(24.0),
             Some(key.clone()),
@@ -7698,6 +11773,8 @@ mod tests {
 
         assert_eq!(stats.render_loop_mode, NativeRenderLoopMode::DemandDriven);
         assert_eq!(stats.input_to_present_ms, Some(8.0));
+        assert_eq!(stats.frame_lane, Some(NativeFrameLane::ProductInteraction));
+        assert_eq!(stats.product_input_to_present_ms, Some(8.0));
         assert_eq!(stats.proof_overhead_ms, Some(24.0));
         assert_eq!(stats.render_hook_ms, Some(2.5));
         assert_eq!(stats.present_call_ms, Some(1.5));
@@ -7706,6 +11783,12 @@ mod tests {
         assert_eq!(stats.queue_submit_call_ms, Some(0.125));
         assert_eq!(stats.present_path_ms, Some(1.875));
         assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(8.0));
+        assert_eq!(
+            stats.product_input_to_present_ms_p50_p95_p99_max.p95,
+            Some(8.0)
+        );
+        assert_eq!(stats.product_frame_count, 1);
+        assert_eq!(stats.product_missed_frame_count, 0);
         assert_eq!(stats.render_hook_ms_p50_p95_p99_max.sample_count, 1);
         assert_eq!(
             stats.surface_acquire_call_ms_p50_p95_p99_max.p95,
@@ -7726,7 +11809,28 @@ mod tests {
     #[test]
     fn accepted_host_input_timing_defines_product_input_to_present_latency() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
-        state.note_accepted_host_input(3, 20.0, false);
+        let host_input_event = NativeHostInputEventSummary {
+            scope: "accepted_host_input_delta".to_owned(),
+            kind: "mouse_button".to_owned(),
+            source_intent: None,
+            sequence: Some(17),
+            input_event_wake_count: 3,
+            wake_elapsed_ms: Some(8.0),
+            raw_wake_elapsed_ms: Some(8.0),
+            event_elapsed_ms: Some(8.0),
+            accepted_elapsed_ms: Some(20.0),
+            wake_to_accept_ms: Some(12.0),
+            event_to_accept_ms: Some(12.0),
+            window_protocol_id: Some(99),
+            button: Some("left".to_owned()),
+            pressed: Some(false),
+            key: None,
+            mouse_button_delta_count: 1,
+            keyboard_delta_count: 0,
+            has_scroll_delta: false,
+            has_motion_delta: false,
+        };
+        state.note_accepted_host_input(3, 20.0, false, Some(host_input_event.clone()));
         state.note_dirty_poll(21.0);
         state.note_render_started(22.0);
         state.note_surface_acquire_call(0.1);
@@ -7739,6 +11843,7 @@ mod tests {
         let raw_wake_elapsed_ms = Some(8.0);
         let raw_wake_to_present_ms =
             elapsed_delta_ms(raw_wake_elapsed_ms, state.last_present_completed_elapsed_ms);
+        state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
         let accepted_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
         let mut accumulator = NativePreviewPerfAccumulator::default();
         accumulator.record(
@@ -7749,6 +11854,7 @@ mod tests {
             None,
             None,
             accepted_input_to_present_ms,
+            Some(NativeFrameLane::ProductInteraction),
             None,
         );
         let stats = native_preview_perf_stats_snapshot(
@@ -7758,6 +11864,7 @@ mod tests {
             60.0,
             &accumulator,
             accepted_input_to_present_ms,
+            Some(NativeFrameLane::ProductInteraction),
             "off",
             None,
             None,
@@ -7778,6 +11885,13 @@ mod tests {
             .as_ref()
             .expect("accepted input timing should be captured once");
         assert_eq!(accepted_timing.input_event_wake_count, 3);
+        assert_eq!(
+            accepted_timing.host_input_event.as_ref(),
+            Some(&host_input_event)
+        );
+        assert_eq!(accepted_timing.input_wake_elapsed_ms, Some(8.0));
+        assert_eq!(accepted_timing.input_wake_to_input_accept_ms, Some(12.0));
+        assert_eq!(accepted_timing.input_wake_to_present_ms, Some(20.0));
         assert_eq!(accepted_timing.input_to_present_ms, 8.0);
         assert_eq!(accepted_timing.input_accept_to_dirty_poll_ms, Some(1.0));
         assert_eq!(accepted_timing.dirty_poll_to_render_started_ms, Some(1.0));
@@ -7792,12 +11906,80 @@ mod tests {
         assert_eq!(accepted_timing.queue_to_present_ms, Some(2.0));
         assert_eq!(accepted_timing.present_path_ms, Some(1.4));
         assert!(!state.last_accepted_host_input_press_only);
+
+        let key = frame_evidence_key_for_presented_frame(
+            &state,
+            &SurfaceId("surface-test".to_owned()),
+            1,
+            Some(3),
+            None,
+        );
+        let commit = product_frame_commit_for_presented_frame(
+            &state,
+            key,
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            Some(accepted_timing.clone()),
+        );
+        assert_eq!(commit.host_input_event.as_ref(), Some(&host_input_event));
+        assert_eq!(
+            commit
+                .input_timing
+                .as_ref()
+                .and_then(|timing| timing.input_wake_to_present_ms),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch() {
+        let mut input = empty_input_adapter_proof(false);
+        input.real_os_events_observed = true;
+        input.mouse_button_event_count = 2;
+        input.mouse_button_events = vec![
+            NativeMouseButtonEventProof {
+                sequence: 1,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(9),
+                event_elapsed_ms: Some(10.0),
+            },
+            NativeMouseButtonEventProof {
+                sequence: 2,
+                button: "left".to_owned(),
+                pressed: false,
+                window_protocol_id: Some(9),
+                event_elapsed_ms: Some(18.0),
+            },
+        ];
+        let hint = NativeHostInputEventHint {
+            kind: "mouse_button".to_owned(),
+            source_intent: Some("press".to_owned()),
+            sequence: Some(1),
+            window_protocol_id: Some(9),
+            button: Some("left".to_owned()),
+            pressed: Some(true),
+            key: None,
+            event_elapsed_ms: Some(10.0),
+        };
+
+        let summary = accepted_host_input_event_summary(&input, 2, Some(18.0), 20.0, Some(&hint));
+
+        assert_eq!(summary.source_intent.as_deref(), Some("press"));
+        assert_eq!(summary.sequence, Some(1));
+        assert_eq!(summary.pressed, Some(true));
+        assert_eq!(summary.event_elapsed_ms, Some(10.0));
+        assert_eq!(summary.wake_elapsed_ms, Some(10.0));
+        assert_eq!(summary.wake_to_accept_ms, Some(10.0));
+        assert_eq!(summary.raw_wake_elapsed_ms, Some(18.0));
+        assert_eq!(summary.mouse_button_delta_count, 2);
     }
 
     #[test]
     fn accepted_host_input_latency_is_frame_scoped_and_single_use() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
-        state.note_accepted_host_input(3, 20.0, false);
+        state.note_accepted_host_input(3, 20.0, false, None);
         state.note_present_completed(27.5);
 
         assert_eq!(state.take_frame_accepted_input_to_present_ms(2), None);
@@ -7811,32 +11993,100 @@ mod tests {
             "later frames must not keep reusing the old accepted input timestamp"
         );
 
-        state.note_accepted_host_input(4, 45.0, false);
+        state.note_accepted_host_input(4, 45.0, false, None);
         state.note_present_completed(50.0);
         assert_eq!(state.take_frame_accepted_input_to_present_ms(4), Some(5.0));
         assert_eq!(state.last_input_to_present_accounted_event_wake_count, 4);
     }
 
     #[test]
+    fn accepted_host_input_timing_owns_lane_during_requested_animation_burst() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.current_scheduler_reason = Some(NativeSchedulerReason::RequestedAnimation);
+        state.current_frame_lane = Some(NativeFrameLane::AnimationFollowup);
+        state.note_accepted_host_input(7, 10.0, false, None);
+        state.note_dirty_poll(10.5);
+        state.note_render_started(11.0);
+        state.note_surface_acquired(11.5);
+        state.note_render_hook_completed(12.0);
+        state.note_queue_submitted(13.0);
+        state.note_present_completed(14.0);
+
+        let timing = state
+            .take_frame_accepted_input_timing(7)
+            .expect("accepted host input should define product timing");
+
+        assert_eq!(timing.frame_lane, NativeFrameLane::ProductInteraction);
+        assert_eq!(
+            timing.scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert_eq!(timing.input_to_present_ms, 4.0);
+    }
+
+    #[test]
     fn accepted_input_frame_timing_is_not_rewritten_by_followup_burst_frames() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
-        state.note_accepted_host_input(7, 100.0, false);
+        state.note_accepted_host_input(7, 100.0, false, None);
         state.note_dirty_poll(101.0);
         state.note_render_started(102.0);
         state.note_surface_acquired(103.0);
+        state.note_surface_acquire_call(0.25);
         state.note_render_hook_completed(104.0);
         state.note_queue_submitted(104.0);
+        state.note_submit_phase_durations(0.125, 0.5, 2.0);
+        state.note_render_target_kind("surface");
+        state.note_present_path_selection(NativePresentPathSelection {
+            requested_mode: NativePresentPathMode::DirectVisibleSurface,
+            selected_mode: NativePresentPathMode::DirectVisibleSurface,
+            reason: "test-direct",
+            hooks_present: true,
+            surface_copy_to_present_supported: false,
+            readback_enabled: true,
+        });
         state.note_present_completed(106.0);
 
         let timing = state
             .take_frame_accepted_input_timing(7)
             .expect("input frame should be accounted");
         assert_eq!(timing.input_to_present_ms, 6.0);
+        assert_eq!(timing.input_accept_to_dirty_poll_ms, Some(1.0));
         assert_eq!(timing.dirty_poll_to_render_started_ms, Some(1.0));
+        assert_eq!(timing.render_started_to_surface_acquired_ms, Some(1.0));
+        assert_eq!(timing.render_started_to_render_hook_completed_ms, Some(2.0));
+        assert_eq!(
+            timing.surface_acquired_to_render_hook_completed_ms,
+            Some(1.0)
+        );
+        assert_eq!(timing.render_hook_completed_to_present_ms, Some(2.0));
+        assert_eq!(timing.render_hook_to_queue_ms, Some(0.0));
+        assert_eq!(timing.queue_to_present_ms, Some(2.0));
+        assert_eq!(timing.surface_acquire_call_ms, Some(0.25));
+        assert_eq!(timing.encoder_finish_ms, Some(0.125));
+        assert_eq!(timing.queue_submit_call_ms, Some(0.5));
+        assert_eq!(timing.present_call_ms, Some(2.0));
+        assert_eq!(timing.present_path_ms, Some(2.75));
+        assert_eq!(timing.render_target_kind.as_deref(), Some("surface"));
+        assert_eq!(
+            timing.present_path_mode,
+            Some(NativePresentPathMode::DirectVisibleSurface)
+        );
 
         state.note_render_started(140.0);
+        state.note_surface_acquired(140.5);
+        state.note_surface_acquire_call(3.25);
         state.note_render_hook_completed(141.0);
         state.note_queue_submitted(143.0);
+        state.note_submit_phase_durations(3.125, 3.5, 4.0);
+        state.note_render_target_kind("offscreen");
+        state.note_present_path_selection(NativePresentPathSelection {
+            requested_mode: NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            selected_mode: NativePresentPathMode::AppOwnedOffscreenCopyToPresent,
+            reason: "test-offscreen",
+            hooks_present: true,
+            surface_copy_to_present_supported: true,
+            readback_enabled: true,
+        });
         state.note_present_completed(144.0);
 
         assert_eq!(state.take_frame_accepted_input_timing(7), None);
@@ -7849,6 +12099,30 @@ mod tests {
             stored.dirty_poll_to_render_started_ms,
             Some(1.0),
             "later requested-animation frames must not make the product UX phase breakdown compare stale dirty-poll time with a newer render start"
+        );
+        assert_eq!(stored.surface_acquire_call_ms, Some(0.25));
+        assert_eq!(stored.encoder_finish_ms, Some(0.125));
+        assert_eq!(stored.queue_submit_call_ms, Some(0.5));
+        assert_eq!(stored.present_call_ms, Some(2.0));
+        assert_eq!(stored.present_path_ms, Some(2.75));
+        assert_eq!(stored.render_target_kind.as_deref(), Some("surface"));
+        assert_eq!(
+            stored.present_path_mode,
+            Some(NativePresentPathMode::DirectVisibleSurface)
+        );
+    }
+
+    #[test]
+    fn pre_input_subscriber_drain_skip_is_counted() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+
+        state.note_pre_input_subscriber_drain_skipped("pending_host_input");
+        state.note_pre_input_subscriber_drain_skipped("pending_host_input");
+
+        assert_eq!(state.pre_input_subscriber_drain_skip_count, 2);
+        assert_eq!(
+            state.last_pre_input_subscriber_drain_skip_reason.as_deref(),
+            Some("pending_host_input")
         );
     }
 
@@ -7865,6 +12139,15 @@ mod tests {
                 visible_display_item_count: None,
                 queue_write_count: None,
                 preview_blocked_on_ipc_count: None,
+                render_hook_outer_state_snapshot_ms: None,
+                render_hook_outer_input_snapshot_ms: None,
+                render_hook_outer_world_snapshot_ms: None,
+                render_hook_outer_core_ms: None,
+                render_hook_outer_revision_ms: None,
+                render_hook_outer_total_ms: None,
+                render_hook_phase_timings: None,
+                product_frame: None,
+                post_present_proof_requests: Vec::new(),
             };
             accumulator.record(
                 Some(value as f64),
@@ -7874,6 +12157,7 @@ mod tests {
                 Some((value * 9) as f64),
                 Some((value * 19) as f64),
                 Some((value * 3) as f64),
+                None,
                 None,
             );
         }
@@ -7965,18 +12249,21 @@ mod tests {
         let now = Instant::now();
         state.mark_presented(state.dirty_revision);
 
-        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
-        assert!(state.consume_due_wake_after_poll(now));
-        state.mark_presented(state.dirty_revision);
-        state.note_present_completed(12.0);
-        state.schedule_requested_animation_followup(now, 12.0);
-        assert!(state.next_wake_at.is_some());
-
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::RequestedAnimation);
+        assert!(!state.consume_due_wake_after_poll(now));
+        assert!(!state.should_render(now, false));
         let due = now + native_target_frame_interval_duration();
         assert!(state.consume_due_wake(due));
         state.mark_presented(state.dirty_revision);
+        state.note_present_completed(12.0);
+        state.schedule_requested_animation_followup(due, 12.0);
+        assert!(state.next_wake_at.is_some());
+
+        let next_due = due + native_target_frame_interval_duration();
+        assert!(state.consume_due_wake(next_due));
+        state.mark_presented(state.dirty_revision);
         state.note_present_completed(29.0);
-        state.schedule_requested_animation_followup(due, 29.0);
+        state.schedule_requested_animation_followup(next_due, 29.0);
         assert!(
             state.next_wake_at.is_some(),
             "the burst should keep pacing frames during the quiet window after min frames are consumed"
@@ -7995,8 +12282,9 @@ mod tests {
         let now = Instant::now();
         state.mark_presented(state.dirty_revision);
 
-        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
-        assert!(state.consume_due_wake_after_poll(now));
+        state.mark_dirty(NativeSchedulerReason::RequestedAnimation, None);
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::RequestedAnimation);
+        assert!(!state.consume_due_wake_after_poll(now));
         state.note_render_started(10.0);
         state.mark_presented(state.dirty_revision);
         state.note_present_completed(25.0);
@@ -8014,7 +12302,30 @@ mod tests {
     }
 
     #[test]
-    fn host_input_burst_shortens_existing_requested_animation_delay() {
+    fn host_input_product_frame_starts_bounded_followup_burst() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.mark_dirty(NativeSchedulerReason::HostInput, None);
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
+
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert_eq!(
+            state.requested_animation_burst_frames_remaining,
+            REQUESTED_ANIMATION_BURST_MIN_FRAMES
+        );
+        assert!(
+            state.next_wake_at.is_some_and(|wake_at| wake_at > now),
+            "visible-changing host input should keep a short paced burst hot after the current product frame"
+        );
+    }
+
+    #[test]
+    fn host_input_burst_keeps_followup_wake_off_current_input_frame() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
         state.mark_presented(state.dirty_revision);
@@ -8029,13 +12340,54 @@ mod tests {
 
         assert_eq!(
             state.next_wake_at,
-            Some(now),
-            "real host input must be able to pull an animation burst to an immediate wake"
+            Some(animation_wake),
+            "host input should preserve the current frame for HostInput and use the burst wake for the follow-up frame"
         );
         assert_eq!(
             state.current_scheduler_reason,
             Some(NativeSchedulerReason::HostInput)
         );
+    }
+
+    #[test]
+    fn due_burst_wake_after_host_input_poll_does_not_steal_product_frame() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.request_animation_burst(now, 10.0, NativeSchedulerReason::RequestedAnimation);
+        let due = state
+            .next_wake_at
+            .expect("requested animation should schedule a wake");
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision,
+                scheduler_reason: Some(NativeSchedulerReason::HostInput),
+                role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                frame_lane: Some(NativeFrameLane::ProductInteraction),
+                accepted_host_input_event_hint: None,
+                next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
+                wants_animation_frame: false,
+                diagnostics: None,
+                accessibility_update: None,
+            },
+            true,
+        );
+        state.note_accepted_host_input(9, 12.0, false, None);
+
+        assert!(state.consume_due_wake_after_poll(due));
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::HostInput),
+            "a due burst wake must not relabel an accepted host-input product frame"
+        );
+        assert_eq!(
+            state.current_frame_lane,
+            Some(NativeFrameLane::ProductInteraction)
+        );
+        assert!(state.should_render(due, false));
     }
 
     #[test]
@@ -8050,6 +12402,8 @@ mod tests {
                 role_revision: state.presented_revision,
                 scheduler_reason: Some(NativeSchedulerReason::HostInput),
                 role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8058,18 +12412,65 @@ mod tests {
             },
             true,
         );
-        assert!(!state.should_render(now, false));
+        assert!(state.should_render(now, false));
 
         state.request_animation_burst(now, 10.0, NativeSchedulerReason::HostInput);
-        assert!(state.consume_due_wake_after_poll(now));
+        assert!(!state.consume_due_wake_after_poll(now));
 
         assert!(state.should_render(now, false));
         assert_eq!(
             state.current_scheduler_reason,
-            Some(NativeSchedulerReason::RequestedAnimation)
+            Some(NativeSchedulerReason::HostInput)
         );
-        assert_eq!(state.current_role_dirty_reason, None);
+        assert_eq!(
+            state.current_role_dirty_reason,
+            Some(NativeRoleDirtyReason::ScrollChanged)
+        );
         assert_eq!(state.dirty_revision, state.presented_revision + 1);
+    }
+
+    #[test]
+    fn accepted_real_input_repaint_is_presentable_even_with_runtime_dirty_reason() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let now = Instant::now();
+        state.mark_presented(state.dirty_revision);
+
+        state.apply_poll_result(
+            &NativePollResult {
+                dirty: true,
+                role_revision: state.presented_revision,
+                scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
+                role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
+                next_wake_after_ms: None,
+                cursor_icon: NativeCursorIcon::Default,
+                wants_animation_frame: false,
+                diagnostics: None,
+                accessibility_update: None,
+            },
+            true,
+        );
+
+        assert!(state.should_render(now, false));
+        assert_eq!(state.dirty_revision, state.presented_revision + 1);
+        assert_eq!(
+            state.last_role_dirty_reason,
+            Some(NativeRoleDirtyReason::RuntimeTurnApplied)
+        );
+    }
+
+    #[test]
+    fn unaccounted_host_input_frame_is_not_pre_present_drop_eligible() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_accepted_host_input(5, 20.0, false, None);
+        state.note_present_completed(28.0);
+
+        assert!(state.current_frame_carries_unaccounted_host_input(5));
+        assert!(!state.current_frame_carries_unaccounted_host_input(4));
+
+        assert!(state.take_frame_accepted_input_timing(5).is_some());
+        assert!(!state.current_frame_carries_unaccounted_host_input(5));
     }
 
     #[test]
@@ -8137,6 +12538,8 @@ mod tests {
                 role_revision: state.presented_revision.saturating_add(1),
                 scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
                 role_dirty_reason: Some(NativeRoleDirtyReason::SourcePayloadAccepted),
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8152,6 +12555,8 @@ mod tests {
                 role_revision: state.presented_revision,
                 scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
                 role_dirty_reason: None,
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8554,6 +12959,30 @@ mod tests {
     }
 
     #[test]
+    fn configured_surface_frame_latency_honors_bounded_override() {
+        assert_eq!(
+            configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, None),
+            (SINGLE_FRAME_SURFACE_FRAME_LATENCY, "present_mode_default")
+        );
+        assert_eq!(
+            configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("2")),
+            (2, "env_override")
+        );
+        assert_eq!(
+            configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("0")),
+            (1, "env_override")
+        );
+        assert_eq!(
+            configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("99")),
+            (MAX_CONFIGURED_SURFACE_FRAME_LATENCY, "env_override")
+        );
+        assert_eq!(
+            configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("nope")),
+            (SINGLE_FRAME_SURFACE_FRAME_LATENCY, "invalid_env_default")
+        );
+    }
+
+    #[test]
     fn scheduled_wake_is_not_pushed_later_by_repeated_poll_results() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented(state.dirty_revision);
@@ -8580,6 +13009,8 @@ mod tests {
             role_revision: 1,
             scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
             role_dirty_reason: Some(NativeRoleDirtyReason::DocumentPatchApplied),
+            frame_lane: None,
+            accepted_host_input_event_hint: None,
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
@@ -8609,6 +13040,8 @@ mod tests {
             role_revision: 7,
             scheduler_reason: Some(NativeSchedulerReason::HostInput),
             role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+            frame_lane: None,
+            accepted_host_input_event_hint: None,
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
@@ -8622,13 +13055,58 @@ mod tests {
             effective.role_dirty_reason,
             Some(NativeRoleDirtyReason::ScrollChanged)
         );
+        assert_eq!(
+            effective.scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert_eq!(
+            effective.frame_lane,
+            Some(NativeFrameLane::ProductInteraction)
+        );
 
         let without_real_input = effective_poll_result_for_host_input(poll, false);
         assert!(!without_real_input.dirty);
     }
 
     #[test]
-    fn stale_role_dirty_poll_does_not_invent_unrenderable_content_revision() {
+    fn host_input_dominates_requested_animation_burst_accounting() {
+        let poll = NativePollResult {
+            dirty: true,
+            role_revision: 7,
+            scheduler_reason: Some(NativeSchedulerReason::RequestedAnimation),
+            role_dirty_reason: Some(NativeRoleDirtyReason::FocusChanged),
+            frame_lane: Some(NativeFrameLane::AnimationFollowup),
+            accepted_host_input_event_hint: None,
+            next_wake_after_ms: None,
+            cursor_icon: NativeCursorIcon::Default,
+            wants_animation_frame: true,
+            diagnostics: None,
+            accessibility_update: None,
+        };
+
+        let effective = effective_poll_result_for_host_input(poll, true);
+
+        assert_eq!(
+            effective.scheduler_reason,
+            Some(NativeSchedulerReason::HostInput)
+        );
+        assert_eq!(
+            effective.frame_lane,
+            Some(NativeFrameLane::ProductInteraction)
+        );
+        assert_eq!(
+            native_frame_lane_for_scheduler(
+                Some(NativeSchedulerReason::RequestedAnimation),
+                None,
+                true,
+                true,
+            ),
+            NativeFrameLane::ProductInteraction
+        );
+    }
+
+    #[test]
+    fn same_content_host_input_repaint_can_use_existing_content_revision() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.mark_presented(state.dirty_revision);
 
@@ -8638,6 +13116,8 @@ mod tests {
                 role_revision: state.presented_revision,
                 scheduler_reason: Some(NativeSchedulerReason::HostInput),
                 role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8647,11 +13127,66 @@ mod tests {
             true,
         );
 
-        assert_eq!(state.dirty_revision, state.presented_revision);
-        assert!(!state.should_render(Instant::now(), false));
+        assert_eq!(state.dirty_revision, state.presented_revision + 1);
+        assert!(state.should_render(Instant::now(), false));
         assert_eq!(
             state.last_role_dirty_reason,
             Some(NativeRoleDirtyReason::ScrollChanged)
+        );
+        let same_content = NativeRenderHookResult {
+            proof: Some(serde_json::json!({})),
+            content_revision: state.presented_revision,
+            layout_revision: None,
+            render_scene_revision: None,
+            render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
+            rendered: true,
+            content_changed: false,
+            role_dirty_reason: Some(NativeRoleDirtyReason::ScrollChanged),
+        };
+        assert!(
+            same_content
+                .validate_for_presented_revision_with_scheduler(
+                    state.dirty_revision,
+                    state.current_scheduler_reason,
+                    state.current_role_dirty_reason,
+                )
+                .is_ok(),
+            "same-content host input repaint should not require a new document content revision"
+        );
+        let changed_content_with_stale_revision = NativeRenderHookResult {
+            content_changed: true,
+            ..same_content
+        };
+        assert!(
+            changed_content_with_stale_revision
+                .validate_for_presented_revision_with_scheduler(
+                    state.dirty_revision,
+                    state.current_scheduler_reason,
+                    state.current_role_dirty_reason,
+                )
+                .is_ok(),
+            "host-input retained/runtime repaint may present an existing content revision until frame and content revisions are split"
+        );
+        assert!(
+            changed_content_with_stale_revision
+                .validate_for_presented_revision_with_scheduler(
+                    state.dirty_revision,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::LayoutChanged),
+                )
+                .is_ok(),
+            "external retained layout repaint may present an existing content revision"
+        );
+        assert!(
+            changed_content_with_stale_revision
+                .validate_for_presented_revision_with_scheduler(
+                    state.dirty_revision,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                )
+                .is_err(),
+            "external runtime changes must still provide a current content revision"
         );
     }
 
@@ -8663,6 +13198,8 @@ mod tests {
             role_revision: 0,
             scheduler_reason: Some(NativeSchedulerReason::VerifierFrame),
             role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            frame_lane: None,
+            accepted_host_input_event_hint: None,
             next_wake_after_ms: None,
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: false,
@@ -8675,11 +13212,12 @@ mod tests {
         assert_eq!(state.dirty_revision, 1);
         assert!(
             NativeRenderHookResult {
-                proof: serde_json::json!({}),
+                proof: Some(serde_json::json!({})),
                 content_revision: 1,
                 layout_revision: None,
                 render_scene_revision: None,
                 render_frame_metrics: None,
+                post_present_proof_subscribers: Vec::new(),
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -8697,6 +13235,8 @@ mod tests {
             role_revision: 2,
             scheduler_reason: Some(NativeSchedulerReason::Timer),
             role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
+            frame_lane: None,
+            accepted_host_input_event_hint: None,
             next_wake_after_ms: Some(16),
             cursor_icon: NativeCursorIcon::Default,
             wants_animation_frame: true,
@@ -8709,11 +13249,12 @@ mod tests {
         assert_eq!(state.dirty_revision, 2);
         assert!(
             (NativeRenderHookResult {
-                proof: serde_json::json!({}),
+                proof: Some(serde_json::json!({})),
                 content_revision: 2,
                 layout_revision: None,
                 render_scene_revision: None,
                 render_frame_metrics: None,
+                post_present_proof_subscribers: Vec::new(),
                 rendered: true,
                 content_changed: true,
                 role_dirty_reason: Some(NativeRoleDirtyReason::VerifierFrame),
@@ -8731,11 +13272,12 @@ mod tests {
     #[test]
     fn requested_animation_can_repaint_existing_scheduler_only_content() {
         let render = NativeRenderHookResult {
-            proof: serde_json::json!({}),
+            proof: Some(serde_json::json!({})),
             content_revision: 2,
             layout_revision: None,
             render_scene_revision: None,
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -8757,7 +13299,7 @@ mod tests {
                 Some(NativeSchedulerReason::RequestedAnimation),
                 None
             ),
-            3
+            2
         );
     }
 
@@ -8785,13 +13327,28 @@ mod tests {
     }
 
     #[test]
+    fn render_hook_result_can_present_without_external_proof_payload() {
+        let mut render = NativeRenderHookResult::rendered_without_proof();
+        render.content_revision = 3;
+        render.layout_revision = Some(3);
+        render.render_scene_revision = Some(3);
+
+        assert_eq!(render.proof, None);
+        assert!(
+            render.validate_for_presented_revision(3).is_ok(),
+            "product counters frames must not need pre-present proof JSON"
+        );
+    }
+
+    #[test]
     fn render_hook_result_can_carry_independent_layer_revisions() {
         let render = NativeRenderHookResult {
-            proof: serde_json::json!({}),
+            proof: Some(serde_json::json!({})),
             content_revision: 10,
             layout_revision: Some(4),
             render_scene_revision: Some(7),
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: true,
             role_dirty_reason: None,
@@ -8810,11 +13367,12 @@ mod tests {
     #[test]
     fn surface_dirty_revision_can_present_existing_content_revision() {
         let render = NativeRenderHookResult {
-            proof: serde_json::json!({}),
+            proof: Some(serde_json::json!({})),
             content_revision: 1,
             layout_revision: None,
             render_scene_revision: None,
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -8832,7 +13390,7 @@ mod tests {
         );
         assert_eq!(
             render.presented_content_revision(2, Some(NativeSchedulerReason::SurfaceChanged), None),
-            2
+            1
         );
         assert!(
             render
@@ -8847,13 +13405,64 @@ mod tests {
     }
 
     #[test]
+    fn external_runtime_cleanup_can_repaint_existing_content_revision() {
+        let same_content_runtime_cleanup = NativeRenderHookResult {
+            proof: Some(serde_json::json!({})),
+            content_revision: 13,
+            layout_revision: Some(7),
+            render_scene_revision: Some(9),
+            render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
+            rendered: true,
+            content_changed: false,
+            role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+        };
+
+        assert!(
+            same_content_runtime_cleanup
+                .validate_for_presented_revision_with_scheduler(
+                    14,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                )
+                .is_ok(),
+            "queued runtime cleanup may repaint the current content frame without inventing a semantic content revision"
+        );
+        assert_eq!(
+            same_content_runtime_cleanup.presented_revisions(
+                14,
+                Some(NativeSchedulerReason::ExternalWake),
+                Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+            ),
+            (13, 7, 9),
+            "frame revision may advance while content/layout/render-scene revisions stay keyed to the actual rendered state"
+        );
+
+        let changed_runtime_cleanup = NativeRenderHookResult {
+            content_changed: true,
+            ..same_content_runtime_cleanup
+        };
+        assert!(
+            changed_runtime_cleanup
+                .validate_for_presented_revision_with_scheduler(
+                    14,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                )
+                .is_ok(),
+            "changed runtime content has its own content revision and must not be compared to a frame repaint revision"
+        );
+    }
+
+    #[test]
     fn scheduler_only_host_input_can_repaint_existing_content_revision() {
         let render = NativeRenderHookResult {
-            proof: serde_json::json!({}),
+            proof: Some(serde_json::json!({})),
             content_revision: 2,
             layout_revision: None,
             render_scene_revision: None,
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -8871,28 +13480,61 @@ mod tests {
         );
         assert_eq!(
             render.presented_content_revision(3, Some(NativeSchedulerReason::HostInput), None),
-            3
+            2
         );
+        let changed_host_input_content = NativeRenderHookResult {
+            proof: Some(serde_json::json!({})),
+            content_revision: 2,
+            layout_revision: None,
+            render_scene_revision: None,
+            render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+        };
         assert!(
-            render
+            changed_host_input_content
                 .validate_for_presented_revision_with_scheduler(
                     3,
                     Some(NativeSchedulerReason::HostInput),
                     Some(NativeRoleDirtyReason::RuntimeTurnApplied),
                 )
+                .is_ok(),
+            "host-input retained/runtime repaint may present an existing content revision until frame and content revisions are split"
+        );
+        let changed_external_content = NativeRenderHookResult {
+            proof: Some(serde_json::json!({})),
+            content_revision: 2,
+            layout_revision: None,
+            render_scene_revision: None,
+            render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
+            rendered: true,
+            content_changed: true,
+            role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+        };
+        assert!(
+            changed_external_content
+                .validate_for_presented_revision_with_scheduler(
+                    3,
+                    Some(NativeSchedulerReason::ExternalWake),
+                    Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                )
                 .is_err(),
-            "real runtime input must still advance the content revision"
+            "external runtime input must not present stale semantic content"
         );
     }
 
     #[test]
     fn idle_same_content_frame_can_repaint_existing_content_revision() {
         let render = NativeRenderHookResult {
-            proof: serde_json::json!({}),
+            proof: Some(serde_json::json!({})),
             content_revision: 4,
             layout_revision: None,
             render_scene_revision: None,
             render_frame_metrics: None,
+            post_present_proof_subscribers: Vec::new(),
             rendered: true,
             content_changed: false,
             role_dirty_reason: None,
@@ -8904,7 +13546,7 @@ mod tests {
                 .is_ok(),
             "continuous verifier frames may repaint unchanged already-presented content"
         );
-        assert_eq!(render.presented_content_revision(5, None, None), 5);
+        assert_eq!(render.presented_content_revision(5, None, None), 4);
 
         let changed = NativeRenderHookResult {
             content_changed: true,
@@ -8928,6 +13570,8 @@ mod tests {
                 role_revision: state.presented_revision.saturating_add(1),
                 scheduler_reason: Some(NativeSchedulerReason::ExternalWake),
                 role_dirty_reason: Some(NativeRoleDirtyReason::RuntimeTurnApplied),
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8945,6 +13589,8 @@ mod tests {
                 role_revision: semantic_revision,
                 scheduler_reason: Some(NativeSchedulerReason::HostInput),
                 role_dirty_reason: None,
+                frame_lane: None,
+                accepted_host_input_event_hint: None,
                 next_wake_after_ms: None,
                 cursor_icon: NativeCursorIcon::Default,
                 wants_animation_frame: false,
@@ -8966,11 +13612,12 @@ mod tests {
         );
         assert!(
             (NativeRenderHookResult {
-                proof: serde_json::json!({}),
+                proof: Some(serde_json::json!({})),
                 content_revision: semantic_revision,
                 layout_revision: None,
                 render_scene_revision: None,
                 render_frame_metrics: None,
+                post_present_proof_subscribers: Vec::new(),
                 rendered: true,
                 content_changed: false,
                 role_dirty_reason: None,
@@ -9007,6 +13654,7 @@ mod tests {
                 button: "left".to_owned(),
                 pressed: true,
                 window_protocol_id: Some(42),
+                event_elapsed_ms: None,
             }],
             keyboard_events: vec![NativeKeyboardEventProof {
                 sequence: 11,
@@ -9036,6 +13684,7 @@ mod tests {
                 button: "left".to_owned(),
                 pressed: true,
                 window_protocol_id: Some(42),
+                event_elapsed_ms: None,
             }],
             ..empty_input_adapter_proof(false)
         };
@@ -9046,12 +13695,14 @@ mod tests {
                     button: "left".to_owned(),
                     pressed: true,
                     window_protocol_id: Some(42),
+                    event_elapsed_ms: None,
                 },
                 NativeMouseButtonEventProof {
                     sequence: 8,
                     button: "left".to_owned(),
                     pressed: false,
                     window_protocol_id: Some(42),
+                    event_elapsed_ms: None,
                 },
             ],
             ..empty_input_adapter_proof(false)
@@ -9059,6 +13710,43 @@ mod tests {
 
         assert!(native_input_delta_is_button_press_only(&press_only));
         assert!(!native_input_delta_is_button_press_only(&click_pair));
+    }
+
+    #[test]
+    fn pointer_motion_only_input_delta_can_yield_to_newer_input() {
+        let motion_only = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_motion_event_count: 3,
+            mouse_window_pos: Some(NativeMouseWindowPosition {
+                x: 10.0,
+                y: 20.0,
+                window_width: 640.0,
+                window_height: 480.0,
+            }),
+            ..empty_input_adapter_proof(false)
+        };
+        let button_delta = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_button_events: vec![NativeMouseButtonEventProof {
+                sequence: 7,
+                button: "left".to_owned(),
+                pressed: true,
+                window_protocol_id: Some(42),
+                event_elapsed_ms: None,
+            }],
+            mouse_window_pos: motion_only.mouse_window_pos.clone(),
+            ..empty_input_adapter_proof(false)
+        };
+        let scroll_delta = NativeInputAdapterProof {
+            real_os_events_observed: true,
+            mouse_window_pos: motion_only.mouse_window_pos.clone(),
+            scroll_delta_y: 120.0,
+            ..empty_input_adapter_proof(false)
+        };
+
+        assert!(native_input_delta_is_pointer_motion_only(&motion_only));
+        assert!(!native_input_delta_is_pointer_motion_only(&button_delta));
+        assert!(!native_input_delta_is_pointer_motion_only(&scroll_delta));
     }
 
     #[test]

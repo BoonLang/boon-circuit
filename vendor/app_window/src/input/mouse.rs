@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::time::Instant;
 
 type InputWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -120,6 +121,7 @@ pub struct MouseButtonEventRecord {
     pub button: u8,
     pub pressed: bool,
     pub window_protocol_id: Option<u64>,
+    pub occurred_at: Instant,
 }
 
 impl MouseWindowLocation {
@@ -317,6 +319,7 @@ impl Shared {
             button: key,
             pressed: down,
             window_protocol_id: (window_protocol_id != 0).then_some(window_protocol_id),
+            occurred_at: Instant::now(),
         });
         while recent_events.len() > 256 {
             recent_events.pop_front();

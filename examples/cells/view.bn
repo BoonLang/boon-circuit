@@ -195,7 +195,7 @@ FUNCTION cell_view(cell) {
     Element/button(
         element: [
             event: [
-                click: cell.sources.editor.select
+                press: cell.sources.editor.select
             ]
         ]
         style: [
@@ -211,7 +211,7 @@ FUNCTION cell_view(cell) {
         ]
         label: cell.display_text
         text: cell.display_text
-        target: cell.address
+        target: cell.editing_text
         key: cell.address
         address: cell.address
     )

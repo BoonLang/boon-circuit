@@ -26082,6 +26082,7 @@ fn report_is_native_gpu_command(report: &JsonValue) -> bool {
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
                 | "verify-native-counter-interaction-speed"
+                | "verify-native-cells-visible-click-e2e"
         )
 }
 
@@ -26096,6 +26097,7 @@ fn report_is_native_ux_command(report: &JsonValue) -> bool {
             "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-idle-wake"
                 | "verify-native-visible-launch"
+                | "verify-native-cells-visible-click-e2e"
                 | "verify-demand-driven-render-loop"
         )
 }

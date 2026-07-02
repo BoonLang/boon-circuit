@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,8 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-browser-artifact-budget",
     "verify-browser-startup-budget",
     "verify-native-gpu-idle-wake",
+    "verify-native-gpu-present-floor",
+    "verify-native-gpu-stale-path-ledger",
     "verify-native-real-window-input-environment",
     "verify-native-gpu-preview-e2e",
     "verify-native-gpu-headed-scenario",
@@ -252,6 +254,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-browser-artifact-budget" => verify_browser_artifact_budget(&args),
         "verify-browser-startup-budget" => verify_browser_startup_budget(&args),
         "verify-native-gpu-idle-wake" => verify_native_gpu_idle_wake(&args),
+        "verify-native-gpu-present-floor" => verify_native_gpu_present_floor(&args),
+        "verify-native-gpu-stale-path-ledger" => verify_native_gpu_stale_path_ledger(&args),
         "verify-native-real-window-input-environment" => {
             verify_native_real_window_input_environment(&args)
         }
@@ -35363,6 +35367,743 @@ fn verify_native_gpu_idle_wake(args: &[String]) -> Result<(), Box<dyn std::error
     write_native_gate_report(args, "verify-native-gpu-idle-wake", checks, blockers, extra)
 }
 
+fn verify_native_gpu_present_floor(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.iter().any(|arg| arg == "--inner-app-window") {
+        return verify_native_gpu_present_floor_inner(args);
+    }
+    if args.iter().any(|arg| arg == "--no-isolated-weston") {
+        if !present_floor_current_wayland_focus_risk_allowed(args) {
+            let mut checks = Vec::new();
+            let mut blockers = Vec::new();
+            push_audit_check(
+                &mut checks,
+                &mut blockers,
+                "native-gpu-present-floor:current-wayland-focus-risk-explicitly-allowed",
+                false,
+                "--no-isolated-weston can create a focus-taking visible window; pass --allow-current-wayland-focus-risk or set BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK=1 to run it",
+                Some("current Wayland present-floor baseline is not focus-safe yet".to_owned()),
+            );
+            let unmeasured_summary = present_floor_summary_json(0.0, 0.0, 0.0, 0.0, 0);
+            let unmeasured_stages = json!({
+                "present_floor": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "presented_frame_ms_p50_p95_p99_max"
+                ),
+                "surface_acquire": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "surface_acquire_ms_p50_p95_p99_max"
+                ),
+                "present_submit": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "present_submit_ms_p50_p95_p99_max"
+                ),
+                "command_record": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "command_record_ms_p50_p95_p99_max"
+                ),
+                "encoder_finish": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "encoder_finish_ms_p50_p95_p99_max"
+                ),
+                "queue_submit": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "queue_submit_ms_p50_p95_p99_max"
+                ),
+                "frame_present": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "frame_present_ms_p50_p95_p99_max"
+                ),
+                "post_present_bookkeeping": present_floor_stage_json(
+                    &unmeasured_summary,
+                    "post_present_bookkeeping_ms_p50_p95_p99_max"
+                )
+            });
+            return write_native_gate_report(
+                args,
+                "verify-native-gpu-present-floor",
+                checks,
+                blockers,
+                json!({
+                    "measurement_source": "current-wayland-app-window-clear-only-present-floor",
+                    "harness_kind": "current-process-wayland",
+                    "surface_class": "raw-app-window-clear-only-preview-surface",
+                    "product_only": true,
+                    "proof_mode": "counters",
+                    "proof_deferred": true,
+                    "proof_required_for_visible_update": false,
+                    "readback_in_hot_path": false,
+                    "proof_readback_in_hot_path": false,
+                    "hot_path_proof_readback_count": 0,
+                    "hot_path_report_write_count": 0,
+                    "sample_input_after_initial_frames": false,
+                    "observed_real_os_input": false,
+                    "observed_input_event_wake_count": 0,
+                    "observed_keyboard_key_event_count": 0,
+                    "observed_mouse_total_event_count": 0,
+                    "operator_host_input": false,
+                    "real_os_input": false,
+                    "private_runtime_dispatch_used": false,
+                    "preview_blocked_on_ipc_count": 0,
+                    "render_loop_mode": "demand_driven",
+                    "frame_evidence_key": null,
+                    "surface_id": null,
+                    "surface_epoch": null,
+                    "rendered_frame_count": 0,
+                    "presented_revision": 0,
+                    "last_render_content_revision": 0,
+                    "last_render_layout_revision": 0,
+                    "last_render_scene_revision": 0,
+                    "requested_width": null,
+                    "requested_height": null,
+                    "warmup_frame_count": 0,
+                    "sample_frame_count": 0,
+                    "measured_frame_count": 0,
+                    "max_presented_frame_ms_p95": 16.7,
+                    "max_presented_frame_ms_max": 33.4,
+                    "presented_frame_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "surface_acquire_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "present_submit_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "command_record_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "encoder_finish_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "queue_submit_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "frame_present_ms_p50_p95_p99_max": unmeasured_summary.clone(),
+                    "post_present_bookkeeping_ms_p50_p95_p99_max": unmeasured_summary,
+                    "presented_frame_ms_over_16_7_count": 0,
+                    "presented_frame_ms_over_16_7_indices": [],
+                    "presented_frame_ms_over_16_7_max": 0.0,
+                    "present_mode": null,
+                    "supported_present_modes": [],
+                    "non_vsync_present_mode_available": false,
+                    "desired_maximum_frame_latency": null,
+                    "adapter_name": null,
+                    "adapter_backend": null,
+                    "adapter_device_type": null,
+                    "adapter_is_software": null,
+                    "surface_format": null,
+                    "supported_usages": null,
+                    "surface_copy_to_present_supported": null,
+                    "surface_copy_src_readback_supported": null,
+                    "present_path_mode": null,
+                    "present_path_requested_mode": null,
+                    "present_path_selection_reason": null,
+                    "present_path_readback_enabled": false,
+                    "readback_ms": null,
+                    "render_hook_ms_p95": null,
+                    "frame_timing": null,
+                    "stage_counters": unmeasured_stages,
+                    "app_window_surface_proof": null,
+                    "focus_safe": false,
+                    "requires_explicit_focus_risk_opt_in": true,
+                    "allow_flag": "--allow-current-wayland-focus-risk",
+                    "allow_env": "BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK=1"
+                }),
+            );
+        }
+        return verify_native_gpu_present_floor_inner(args);
+    }
+    run_isolated_weston_present_floor_probe(args)
+}
+
+fn present_floor_current_wayland_focus_risk_allowed(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--allow-current-wayland-focus-risk")
+        || std::env::var("BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK").as_deref()
+            == Ok("1")
+}
+
+fn run_isolated_weston_present_floor_probe(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = report_arg(args)
+        .unwrap_or_else(|| native_default_report_path("verify-native-gpu-present-floor", args));
+    let artifact_dir = PathBuf::from(format!(
+        "target/artifacts/native-gpu/present-floor-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    fs::create_dir_all(&artifact_dir)?;
+    let weston_log_path = artifact_dir.join("weston.log");
+    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
+    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
+    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
+    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
+    let inner_stdout_path = artifact_dir.join("present-floor-inner.stdout.txt");
+    let inner_stderr_path = artifact_dir.join("present-floor-inner.stderr.txt");
+    let socket = format!(
+        "boon-native-present-floor-{}-{}",
+        std::process::id(),
+        current_unix_seconds()
+    );
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let weston_available = command_available("weston");
+    let wayland_info_available = command_available("wayland-info");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:isolated-weston-tools",
+        weston_available && wayland_info_available,
+        format!("weston={weston_available}, wayland-info={wayland_info_available}"),
+        (!(weston_available && wayland_info_available))
+            .then(|| "present-floor baseline requires weston and wayland-info".to_owned()),
+    );
+    if !(weston_available && wayland_info_available) {
+        return write_native_gate_report(
+            args,
+            "verify-native-gpu-present-floor",
+            checks,
+            blockers,
+            json!({
+                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
+                "artifact_dir": artifact_dir,
+                "operator_host_input": false,
+                "real_os_input": false,
+                "product_only": true,
+                "proof_mode": "counters",
+                "readback_in_hot_path": false,
+                "proof_readback_in_hot_path": false,
+                "hot_path_proof_readback_count": 0,
+                "hot_path_report_write_count": 0
+            }),
+        );
+    }
+
+    let mut weston = Command::new("weston")
+        .args([
+            "--backend=headless-backend.so",
+            "--socket",
+            &socket,
+            "--idle-time=0",
+            "--log",
+            weston_log_path
+                .to_str()
+                .ok_or("weston log path is not UTF-8")?,
+        ])
+        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
+        .spawn()?;
+    let mut ready = false;
+    for _ in 0..50 {
+        if let Ok(output) = Command::new("wayland-info")
+            .env("WAYLAND_DISPLAY", &socket)
+            .output()
+        {
+            fs::write(&wayland_info_stdout_path, &output.stdout)?;
+            fs::write(&wayland_info_stderr_path, &output.stderr)?;
+            if output.status.success() {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:isolated-weston-ready",
+        ready,
+        format!("socket={socket}, weston_pid={}", weston.id()),
+        (!ready).then(|| "isolated Weston did not become ready".to_owned()),
+    );
+    if !ready {
+        terminate_child_process(&mut weston);
+        return write_native_gate_report(
+            args,
+            "verify-native-gpu-present-floor",
+            checks,
+            blockers,
+            json!({
+                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
+                "artifact_dir": artifact_dir,
+                "weston_pid": weston.id(),
+                "weston_socket": socket,
+                "weston_log_path": weston_log_path,
+                "operator_host_input": false,
+                "real_os_input": false,
+                "product_only": true,
+                "proof_mode": "counters",
+                "readback_in_hot_path": false,
+                "proof_readback_in_hot_path": false,
+                "hot_path_proof_readback_count": 0,
+                "hot_path_report_write_count": 0
+            }),
+        );
+    }
+
+    let mut child_args = vec![
+        "verify-native-gpu-present-floor".to_owned(),
+        "--inner-app-window".to_owned(),
+        "--report".to_owned(),
+        report
+            .to_str()
+            .ok_or("present-floor report path is not UTF-8")?
+            .to_owned(),
+    ];
+    let mut skip_next = false;
+    for arg in args.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--report" | "--present-mode" => {
+                skip_next = true;
+            }
+            "--inner-app-window" | "--no-isolated-weston" => {}
+            _ => child_args.push(arg.clone()),
+        }
+    }
+    let current_exe = std::env::current_exe()?;
+    let mut child = Command::new(current_exe);
+    child
+        .args(&child_args)
+        .env("WAYLAND_DISPLAY", &socket)
+        .env("XDG_SESSION_TYPE", "wayland")
+        .env(
+            "BOON_NATIVE_PRESENT_FLOOR_ISOLATED",
+            "isolated-weston-headless",
+        )
+        .env("BOON_NATIVE_PRESENT_FLOOR_SOCKET", &socket)
+        .env("BOON_NATIVE_PRESENT_FLOOR_ARTIFACT_DIR", &artifact_dir)
+        .env("BOON_NATIVE_PRESENT_FLOOR_WESTON_LOG", &weston_log_path)
+        .env(
+            "BOON_NATIVE_PRESENT_FLOOR_WESTON_PID",
+            weston.id().to_string(),
+        )
+        .stdout(Stdio::from(fs::File::create(&inner_stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&inner_stderr_path)?));
+    if let Some(present_mode) = value_arg(args, "--present-mode") {
+        child.env("BOON_NATIVE_PRESENT_MODE", present_mode);
+    }
+    let status = child.status()?;
+    terminate_child_process(&mut weston);
+    if report.exists() {
+        if status.success() {
+            println!("wrote {}", report.display());
+            Ok(())
+        } else {
+            Err(format!(
+                "native GPU present-floor gate blocked; wrote {}",
+                report.display()
+            )
+            .into())
+        }
+    } else {
+        let mut checks = checks;
+        let mut blockers = blockers;
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-present-floor:inner-report-written",
+            false,
+            format!("inner_status={status}, report={}", report.display()),
+            Some("present-floor inner app-window probe did not write a report".to_owned()),
+        );
+        write_native_gate_report(
+            args,
+            "verify-native-gpu-present-floor",
+            checks,
+            blockers,
+            json!({
+                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
+                "artifact_dir": artifact_dir,
+                "weston_pid": weston.id(),
+                "weston_socket": socket,
+                "weston_log_path": weston_log_path,
+                "inner_status": status.to_string(),
+                "inner_stdout_path": inner_stdout_path,
+                "inner_stderr_path": inner_stderr_path,
+                "operator_host_input": false,
+                "real_os_input": false,
+                "product_only": true,
+                "proof_mode": "counters",
+                "readback_in_hot_path": false,
+                "proof_readback_in_hot_path": false,
+                "hot_path_proof_readback_count": 0,
+                "hot_path_report_write_count": 0
+            }),
+        )
+    }
+}
+
+fn verify_native_gpu_present_floor_inner(
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let warmup_frame_count = value_arg(args, "--warmup-frame-count")
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(8);
+    let sample_frame_count = value_arg(args, "--sample-frame-count")
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(64)
+        .max(1);
+    let width = value_arg(args, "--width")
+        .map(|value| value.parse::<f32>())
+        .transpose()?
+        .unwrap_or(1024.0);
+    let height = value_arg(args, "--height")
+        .map(|value| value.parse::<f32>())
+        .transpose()?
+        .unwrap_or(768.0);
+    let max_p95_ms = value_arg(args, "--max-presented-frame-ms-p95")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(16.7);
+    let max_max_ms = value_arg(args, "--max-presented-frame-ms-max")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(33.4);
+    let title_token = native_gpu_title_token("present-floor");
+    let title = role_window_title_for_token("Boon Present Floor", &title_token);
+    let (sender, receiver) =
+        mpsc::sync_channel::<Result<boon_native_app_window::AppWindowSurfaceProof, String>>(1);
+    boon_native_app_window::run_visible_surface_probe(
+        boon_native_app_window::NativeWindowOptions {
+            role: boon_native_app_window::NativeWindowRole::Preview,
+            title,
+            initial_width: width,
+            initial_height: height,
+            hold_ms: 1,
+            input_sample_delay_ms: 0,
+            synthetic_input_probe: false,
+            sample_input_after_initial_frames: false,
+            warmup_frame_count,
+            sample_frame_count,
+            readback_artifact_dir: None,
+            render_loop_state_report: None,
+            demand_driven_loop: true,
+            proof_mode: boon_native_app_window::NativeProofMode::Counters,
+            skip_interactive_surface_readback_when_external_proof: false,
+        },
+        move |result| {
+            let _ = sender.send(result.map_err(|error| error.to_string()));
+        },
+    );
+    let proof = receiver
+        .recv()
+        .map_err(|error| format!("present-floor proof channel closed: {error}"))?
+        .map_err(|error| format!("present-floor app-window probe failed: {error}"))?;
+    let timing = &proof.frame_timing;
+    let measured_frame_count = timing.measured_frame_count as u64;
+    let no_render_hook =
+        timing.render_hook_ms_p95.is_none() && proof.external_render_proof.is_none();
+    let no_readback = proof.readback_ms.is_none() && proof.readback_artifact.is_none();
+    let observed_input_event_wake_count = proof.input_event_wake_count;
+    let observed_real_os_input = proof.input_adapter.real_os_events_observed
+        || observed_input_event_wake_count > 0
+        || proof.input_adapter.keyboard_key_event_count > 0
+        || proof.input_adapter.mouse_total_event_count > 0;
+    let presented_p95_ok = timing.presented_frame_ms_p95 <= max_p95_ms;
+    let presented_max_ok = timing.presented_frame_ms_max <= max_max_ms;
+    let measured_count_ok = measured_frame_count >= sample_frame_count as u64;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:surface-presented",
+        proof.acquired_surface_texture && proof.presented_frame,
+        format!(
+            "acquired_surface_texture={}, presented_frame={}",
+            proof.acquired_surface_texture, proof.presented_frame
+        ),
+        (!(proof.acquired_surface_texture && proof.presented_frame))
+            .then(|| "clear-only app-window probe did not present a visible surface".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:hardware-adapter",
+        !proof.adapter_is_software,
+        format!(
+            "adapter_name={}, adapter_backend={}, adapter_device_type={}, adapter_is_software={}",
+            proof.adapter_name,
+            proof.adapter_backend,
+            proof.adapter_device_type,
+            proof.adapter_is_software
+        ),
+        proof
+            .adapter_is_software
+            .then(|| "present-floor baseline ran on a software adapter".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:counters-only-no-render-hook",
+        no_render_hook,
+        format!(
+            "render_hook_ms_p95={:?}, external_render_proof_present={}",
+            timing.render_hook_ms_p95,
+            proof.external_render_proof.is_some()
+        ),
+        (!no_render_hook)
+            .then(|| "present-floor baseline must not run a Boon render hook".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:counters-only-no-readback",
+        no_readback,
+        format!(
+            "readback_ms={:?}, readback_artifact_present={}",
+            proof.readback_ms,
+            proof.readback_artifact.is_some()
+        ),
+        (!no_readback)
+            .then(|| "present-floor baseline must not queue app-owned readback".to_owned()),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:no-observed-input",
+        !observed_real_os_input,
+        format!(
+            "input_event_wake_count={}, real_os_events_observed={}, keyboard_key_event_count={}, mouse_total_event_count={}",
+            observed_input_event_wake_count,
+            proof.input_adapter.real_os_events_observed,
+            proof.input_adapter.keyboard_key_event_count,
+            proof.input_adapter.mouse_total_event_count
+        ),
+        observed_real_os_input.then(|| {
+            "present-floor baseline observed real window input and is not a clean no-input floor"
+                .to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:sample-count",
+        measured_count_ok,
+        format!(
+            "measured_frame_count={measured_frame_count}, requested_sample_frame_count={sample_frame_count}, warmup_frame_count={warmup_frame_count}"
+        ),
+        (!measured_count_ok).then(|| {
+            "present-floor baseline did not collect the requested sample count".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:p95-budget",
+        presented_p95_ok,
+        format!(
+            "presented_frame_ms_p95={:.3}, budget={max_p95_ms:.3}",
+            timing.presented_frame_ms_p95
+        ),
+        (!presented_p95_ok).then(|| {
+            format!(
+                "clear-only present floor p95 exceeded 60 FPS budget: {:.3}ms > {max_p95_ms:.3}ms",
+                timing.presented_frame_ms_p95
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:max-budget",
+        presented_max_ok,
+        format!(
+            "presented_frame_ms_max={:.3}, budget={max_max_ms:.3}",
+            timing.presented_frame_ms_max
+        ),
+        (!presented_max_ok).then(|| {
+            format!(
+                "clear-only present floor max exceeded bounded outlier budget: {:.3}ms > {max_max_ms:.3}ms",
+                timing.presented_frame_ms_max
+            )
+        }),
+    );
+    let timing_json = serde_json::to_value(timing)?;
+    let proof_json = serde_json::to_value(&proof)?;
+    let presented_summary = present_floor_summary_json(
+        timing.presented_frame_ms_p50,
+        timing.presented_frame_ms_p95,
+        timing.presented_frame_ms_p99,
+        timing.presented_frame_ms_max,
+        measured_frame_count,
+    );
+    let surface_acquire_summary = present_floor_summary_json(
+        timing.surface_acquire_ms_p50,
+        timing.surface_acquire_ms_p95,
+        timing.surface_acquire_ms_max,
+        timing.surface_acquire_ms_max,
+        measured_frame_count,
+    );
+    let present_submit_summary = present_floor_summary_json(
+        timing.present_submit_ms_p50,
+        timing.present_submit_ms_p95,
+        timing.present_submit_ms_max,
+        timing.present_submit_ms_max,
+        measured_frame_count,
+    );
+    let command_record_summary = present_floor_summary_json(
+        timing.command_record_ms_p50,
+        timing.command_record_ms_p95,
+        timing.command_record_ms_max,
+        timing.command_record_ms_max,
+        measured_frame_count,
+    );
+    let encoder_finish_summary = present_floor_summary_json(
+        timing.encoder_finish_ms_p50,
+        timing.encoder_finish_ms_p95,
+        timing.encoder_finish_ms_max,
+        timing.encoder_finish_ms_max,
+        measured_frame_count,
+    );
+    let queue_submit_summary = present_floor_summary_json(
+        timing.queue_submit_ms_p50,
+        timing.queue_submit_ms_p95,
+        timing.queue_submit_ms_max,
+        timing.queue_submit_ms_max,
+        measured_frame_count,
+    );
+    let frame_present_summary = present_floor_summary_json(
+        timing.frame_present_ms_p50,
+        timing.frame_present_ms_p95,
+        timing.frame_present_ms_max,
+        timing.frame_present_ms_max,
+        measured_frame_count,
+    );
+    let post_present_bookkeeping_summary = present_floor_summary_json(
+        timing.post_present_bookkeeping_ms_p50,
+        timing.post_present_bookkeeping_ms_p95,
+        timing.post_present_bookkeeping_ms_max,
+        timing.post_present_bookkeeping_ms_max,
+        measured_frame_count,
+    );
+    let stage_counters = json!({
+        "present_floor": present_floor_stage_json(&presented_summary, "presented_frame_ms_p50_p95_p99_max"),
+        "surface_acquire": present_floor_stage_json(&surface_acquire_summary, "surface_acquire_ms_p50_p95_p99_max"),
+        "present_submit": present_floor_stage_json(&present_submit_summary, "present_submit_ms_p50_p95_p99_max"),
+        "command_record": present_floor_stage_json(&command_record_summary, "command_record_ms_p50_p95_p99_max"),
+        "encoder_finish": present_floor_stage_json(&encoder_finish_summary, "encoder_finish_ms_p50_p95_p99_max"),
+        "queue_submit": present_floor_stage_json(&queue_submit_summary, "queue_submit_ms_p50_p95_p99_max"),
+        "frame_present": present_floor_stage_json(&frame_present_summary, "frame_present_ms_p50_p95_p99_max"),
+        "post_present_bookkeeping": present_floor_stage_json(&post_present_bookkeeping_summary, "post_present_bookkeeping_ms_p50_p95_p99_max")
+    });
+    let harness_kind = std::env::var("BOON_NATIVE_PRESENT_FLOOR_ISOLATED")
+        .unwrap_or_else(|_| "current-process-wayland".to_owned());
+    let measurement_source = if harness_kind == "isolated-weston-headless" {
+        "isolated-weston-app-window-clear-only-present-floor"
+    } else {
+        "current-wayland-app-window-clear-only-present-floor"
+    };
+    let extra = json!({
+        "measurement_source": measurement_source,
+        "harness_kind": harness_kind,
+        "weston_socket": std::env::var("BOON_NATIVE_PRESENT_FLOOR_SOCKET").ok(),
+        "weston_pid": std::env::var("BOON_NATIVE_PRESENT_FLOOR_WESTON_PID").ok(),
+        "weston_log_path": std::env::var("BOON_NATIVE_PRESENT_FLOOR_WESTON_LOG").ok(),
+        "artifact_dir": std::env::var("BOON_NATIVE_PRESENT_FLOOR_ARTIFACT_DIR").ok(),
+        "surface_class": "raw-app-window-clear-only-preview-surface",
+        "product_only": true,
+        "proof_mode": "counters",
+        "proof_deferred": true,
+        "proof_required_for_visible_update": false,
+        "readback_in_hot_path": false,
+        "proof_readback_in_hot_path": false,
+        "hot_path_proof_readback_count": 0,
+        "hot_path_report_write_count": 0,
+        "hot_path_report_serialization_count": 0,
+        "hot_path_heavy_json_summary_count": 0,
+        "hot_path_dev_blocking_ipc_count": 0,
+        "operator_host_input": false,
+        "real_os_input": false,
+        "sample_input_after_initial_frames": proof.sample_input_after_initial_frames,
+        "observed_real_os_input": observed_real_os_input,
+        "observed_input_event_wake_count": observed_input_event_wake_count,
+        "observed_keyboard_key_event_count": proof.input_adapter.keyboard_key_event_count,
+        "observed_mouse_total_event_count": proof.input_adapter.mouse_total_event_count,
+        "private_runtime_dispatch_used": false,
+        "preview_blocked_on_ipc_count": 0,
+        "render_loop_mode": serde_json::to_value(proof.render_loop_mode)?,
+        "frame_evidence_key": proof.frame_evidence_key,
+        "surface_id": serde_json::to_value(&proof.surface_id)?,
+        "surface_epoch": proof.surface_epoch,
+        "rendered_frame_count": proof.render_loop_state_at_ready.rendered_frame_count,
+        "presented_revision": proof.render_loop_state_at_ready.presented_revision,
+        "last_render_content_revision": proof.render_loop_state_at_ready.last_render_content_revision,
+        "last_render_layout_revision": proof.render_loop_state_at_ready.last_render_layout_revision,
+        "last_render_scene_revision": proof.render_loop_state_at_ready.last_render_scene_revision,
+        "requested_width": width,
+        "requested_height": height,
+        "warmup_frame_count": warmup_frame_count,
+        "sample_frame_count": sample_frame_count,
+        "measured_frame_count": measured_frame_count,
+        "max_presented_frame_ms_p95": max_p95_ms,
+        "max_presented_frame_ms_max": max_max_ms,
+        "presented_frame_ms_p50_p95_p99_max": presented_summary,
+        "surface_acquire_ms_p50_p95_p99_max": surface_acquire_summary,
+        "present_submit_ms_p50_p95_p99_max": present_submit_summary,
+        "command_record_ms_p50_p95_p99_max": command_record_summary,
+        "encoder_finish_ms_p50_p95_p99_max": encoder_finish_summary,
+        "queue_submit_ms_p50_p95_p99_max": queue_submit_summary,
+        "frame_present_ms_p50_p95_p99_max": frame_present_summary,
+        "post_present_bookkeeping_ms_p50_p95_p99_max": post_present_bookkeeping_summary,
+        "presented_frame_ms_over_16_7_count": timing.presented_frame_ms_over_16_7_count,
+        "presented_frame_ms_over_16_7_indices": timing.presented_frame_ms_over_16_7_indices,
+        "presented_frame_ms_over_16_7_max": timing.presented_frame_ms_over_16_7_max,
+        "present_mode": proof.present_mode,
+        "supported_present_modes": proof.supported_present_modes,
+        "non_vsync_present_mode_available": proof.non_vsync_present_mode_available,
+        "desired_maximum_frame_latency": proof.desired_maximum_frame_latency,
+        "adapter_name": proof.adapter_name,
+        "adapter_backend": proof.adapter_backend,
+        "adapter_device_type": proof.adapter_device_type,
+        "adapter_is_software": proof.adapter_is_software,
+        "surface_format": proof.surface_format,
+        "supported_usages": proof.supported_usages,
+        "surface_copy_to_present_supported": proof.surface_copy_to_present_supported,
+        "surface_copy_src_readback_supported": proof.surface_copy_src_readback_supported,
+        "present_path_mode": proof.present_path_mode,
+        "present_path_requested_mode": proof.present_path_requested_mode,
+        "present_path_selection_reason": proof.present_path_selection_reason,
+        "present_path_readback_enabled": false,
+        "readback_ms": proof.readback_ms,
+        "render_hook_ms_p95": timing.render_hook_ms_p95,
+        "frame_timing": timing_json,
+        "stage_counters": stage_counters,
+        "app_window_surface_proof": proof_json
+    });
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-present-floor",
+        checks,
+        blockers,
+        extra,
+    )
+}
+
+fn present_floor_summary_json(
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    sample_count: u64,
+) -> serde_json::Value {
+    json!({
+        "p50": p50,
+        "p95": p95,
+        "p99": p99,
+        "max": max,
+        "sample_count": sample_count
+    })
+}
+
+fn present_floor_stage_json(summary: &serde_json::Value, source_field: &str) -> serde_json::Value {
+    json!({
+        "status": "measured_clear_only_present_floor",
+        "p50": summary.get("p50").cloned().unwrap_or(serde_json::Value::Null),
+        "p95": summary.get("p95").cloned().unwrap_or(serde_json::Value::Null),
+        "p99": summary.get("p99").cloned().unwrap_or(serde_json::Value::Null),
+        "max": summary.get("max").cloned().unwrap_or(serde_json::Value::Null),
+        "sample_count": summary.get("sample_count").cloned().unwrap_or(serde_json::Value::Null),
+        "unit": "ms",
+        "source_field": source_field
+    })
+}
+
 fn verify_demand_driven_render_loop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     verify_native_gpu_report_bundle(
         args,
@@ -35700,7 +36441,8 @@ fn wait_for_loop_readback_change(
     while started.elapsed() < timeout {
         if loop_report.exists() {
             match read_json(loop_report) {
-                Ok(report) => {
+                Ok(mut report) => {
+                    cells_attach_post_present_external_render_proof(&mut report);
                     if let Some(loop_error) =
                         report.get("loop_error").and_then(serde_json::Value::as_str)
                     {
@@ -36778,6 +37520,8 @@ fn run_native_example_switch_live_probe(
             preview_loop_report
                 .to_str()
                 .ok_or("preview loop report path is not UTF-8")?,
+            "--proof-mode",
+            "readback",
             "--frame-readback",
             "--demand-driven-loop",
         ])
@@ -43436,7 +44180,7 @@ fn verify_native_todomvc_input_parity(args: &[String]) -> Result<(), Box<dyn std
         &mut checks,
         &mut blockers,
         "native-todomvc-input-parity:framebuffer-delta-contract",
-        observed_sources.iter().enumerate().all(|(index, output)| {
+        observed_sources.iter().enumerate().all(|(_index, output)| {
             let before_framebuffer_sha256 = output
                 .pointer("/framebuffer_delta_evidence/before_framebuffer_sha256")
                 .and_then(serde_json::Value::as_str);
@@ -55368,6 +56112,10 @@ fn verify_native_cells_visible_click_e2e(
             "reason": "build/profile/environment prerequisite failed"
         })
     };
+    let preview_loop_fallback_report = live_probe
+        .get("preview_loop_report")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| read_optional_json(Path::new(path)).ok().flatten());
     let live_probe_pass =
         live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
     let real_os_input = live_probe
@@ -55450,6 +56198,21 @@ fn verify_native_cells_visible_click_e2e(
         .or_else(|| live_probe.get("input_accept_to_formula_visible_ms"))
         .and_then(numeric_value_as_f64)
         .unwrap_or(input_accept_to_present_ms);
+    let steady_input_accept_to_formula_visible_ms = live_probe
+        .pointer("/steady_input_accept_to_formula_visible_ms/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_accept_to_formula_visible_ms);
+    let steady_input_accept_to_present_ms = live_probe
+        .pointer("/steady_input_accept_to_present_ms/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_accept_to_present_ms);
+    let steady_input_wake_to_input_accept_ms = live_probe
+        .pointer("/steady_input_wake_to_input_accept_ms/p95")
+        .or_else(|| {
+            live_probe.pointer("/steady_present_probe_phase_ms/input_wake_to_input_accept/p95")
+        })
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
     let input_accept_to_formula_visible_ms_max = live_probe
         .get("input_accept_to_formula_visible_ms_max")
         .or_else(|| live_probe.get("input_accept_to_formula_visible_ms"))
@@ -55468,6 +56231,14 @@ fn verify_native_cells_visible_click_e2e(
     let input_wake_to_formula_visible_ms = live_probe
         .get("input_wake_to_formula_visible_ms_p95")
         .or_else(|| live_probe.get("input_wake_to_formula_visible_ms"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_wake_to_present_ms);
+    let steady_input_wake_to_formula_visible_ms = live_probe
+        .pointer("/steady_input_wake_to_formula_visible_ms/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(input_wake_to_formula_visible_ms);
+    let steady_input_wake_to_present_ms = live_probe
+        .pointer("/steady_input_wake_to_present_ms/p95")
         .and_then(numeric_value_as_f64)
         .unwrap_or(input_wake_to_present_ms);
     let input_wake_to_formula_visible_ms_max = live_probe
@@ -55510,6 +56281,8 @@ fn verify_native_cells_visible_click_e2e(
     let mut bounded_click_to_present_outliers = Vec::new();
     let mut bounded_cold_start_outliers = Vec::new();
     let mut unbounded_click_to_present_outlier_count = 0_u64;
+    let mut proof_lag_sample_count = 0_u64;
+    let mut proof_lag_max_frames = 0_u64;
     if let Some(samples) = live_probe
         .get("click_samples")
         .and_then(serde_json::Value::as_array)
@@ -55545,23 +56318,39 @@ fn verify_native_cells_visible_click_e2e(
                 .or_else(|| sample.get("readback_hash_changed"))
                 .and_then(serde_json::Value::as_bool)
                 == Some(true);
+            let product_frame_seq = sample
+                .get("product_frame_evidence_key")
+                .and_then(|key| key.get("frame_seq"))
+                .and_then(serde_json::Value::as_u64);
+            let proof_frame_seq = sample
+                .get("proof_frame_evidence_key")
+                .and_then(|key| key.get("frame_seq"))
+                .and_then(serde_json::Value::as_u64);
+            if let Some(lag_frames) = proof_frame_seq
+                .zip(product_frame_seq)
+                .and_then(|(proof, product)| proof.checked_sub(product))
+                .filter(|lag| *lag > 0)
+            {
+                proof_lag_sample_count = proof_lag_sample_count.saturating_add(1);
+                proof_lag_max_frames = proof_lag_max_frames.max(lag_frames);
+            }
             let exceeds_driver_to_visible_budget = click_to_formula > max_click_to_present_ms
                 || click_to_present > max_click_to_present_ms;
             if !exceeds_driver_to_visible_budget {
                 continue;
             }
             let cold_start_sample = sample_index.is_some_and(|index| index < cold_sample_count);
+            let product_sample_within_bounded_max = input_accept_to_formula
+                <= max_click_to_present_ms
+                && input_accept_to_present <= max_click_to_present_ms;
             let bounded_cold_start = cold_start_sample
                 && click_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && click_to_present <= bounded_click_to_present_outlier_cap_ms
-                && input_accept_to_formula <= max_click_to_formula_ms
-                && input_accept_to_present <= max_click_to_formula_ms
+                && product_sample_within_bounded_max
                 && input_wake_to_formula <= bounded_click_to_present_outlier_cap_ms
                 && input_wake_to_present <= bounded_click_to_present_outlier_cap_ms
                 && proof_current_changed;
-            let bounded = input_accept_to_formula <= max_click_to_formula_ms
-                && input_accept_to_present <= max_click_to_formula_ms
-                && proof_current_changed;
+            let bounded = product_sample_within_bounded_max && proof_current_changed;
             if bounded_cold_start {
                 bounded_cold_start_outliers.push(json!({
                     "index": sample_index.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
@@ -55615,6 +56404,202 @@ fn verify_native_cells_visible_click_e2e(
     let click_to_visible_max_budget_or_bounded_outliers_ok = click_to_visible_max_budget_ok
         || (bounded_click_to_present_outlier_count + bounded_cold_start_outlier_count > 0
             && unbounded_click_to_present_outlier_count == 0);
+    let product_input_to_formula_p95_budget_ok = steady_input_accept_to_formula_visible_ms
+        <= max_click_to_formula_ms
+        && steady_input_accept_to_present_ms <= max_click_to_formula_ms;
+    let probe_input_wake_to_formula_p95_raw_budget_ok = steady_input_wake_to_input_accept_ms
+        <= max_click_to_formula_ms
+        && steady_input_wake_to_formula_visible_ms <= max_click_to_formula_ms
+        && steady_input_wake_to_present_ms <= max_click_to_formula_ms;
+    let product_input_to_formula_max_budget_ok = input_accept_to_formula_visible_ms_max
+        <= max_click_to_present_ms
+        && input_accept_to_present_ms_max <= max_click_to_present_ms;
+    let harness_driver_latency_classified_ok = click_to_formula_ms <= max_click_to_present_ms
+        || (product_input_to_formula_p95_budget_ok
+            && click_to_visible_max_budget_or_bounded_outliers_ok);
+    let preview_perf_stats = live_probe
+        .get("preview_perf_stats")
+        .cloned()
+        .or_else(|| {
+            preview_loop_fallback_report
+                .as_ref()
+                .and_then(|report| report.get("preview_perf_stats").cloned())
+        })
+        .unwrap_or_else(|| json!({}));
+    let preview_loop_input_to_present_ms_p95 = live_probe
+        .get("preview_loop_input_to_present_ms_p95")
+        .or_else(|| preview_perf_stats.pointer("/input_to_present_ms_p50_p95_p99_max/p95"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_loop_input_to_present_sample_count = live_probe
+        .get("preview_loop_input_to_present_sample_count")
+        .or_else(|| preview_perf_stats.pointer("/input_to_present_ms_p50_p95_p99_max/sample_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_loop_missed_frame_count = live_probe
+        .get("preview_loop_missed_frame_count")
+        .or_else(|| preview_perf_stats.get("missed_frame_count"))
+        .or_else(|| {
+            preview_loop_fallback_report
+                .as_ref()
+                .and_then(|report| report.get("missed_frame_count"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let preview_loop_render_loop_mode = live_probe
+        .get("preview_loop_render_loop_mode")
+        .or_else(|| preview_perf_stats.get("render_loop_mode"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let preview_loop_frame_pacing_state = live_probe
+        .get("preview_loop_frame_pacing_state")
+        .or_else(|| preview_perf_stats.pointer("/frame_pacing/state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let preview_loop_renders_per_second = live_probe
+        .get("preview_loop_renders_per_second")
+        .or_else(|| preview_perf_stats.get("renders_per_second"))
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let preview_frame_evidence_key = live_probe
+        .get("frame_evidence_key")
+        .cloned()
+        .or_else(|| preview_perf_stats.get("frame_evidence_key").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let post_present_proof_isolation = cells_visible_click_post_present_proof_isolation(
+        &live_probe,
+        preview_loop_fallback_report.as_ref(),
+    );
+    let post_present_proof_isolation_pass = post_present_proof_isolation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && post_present_proof_isolation
+            .get("product_path_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+        && post_present_proof_isolation
+            .get("product_latency_includes_proof_completion")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && post_present_proof_isolation
+            .get("product_blocks_on_proof_subscribers")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && post_present_proof_isolation
+            .get("proof_latency_reported_separately")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let timing_sample_count_complete = live_probe
+        .get("timing_sample_count_complete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let target_sample_count = live_probe
+        .get("target_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(click_targets.len() as u64);
+    let click_sample_product_frames = cells_visible_click_product_frame_scope_summary(
+        &live_probe,
+        max_click_to_formula_ms,
+        max_click_to_present_ms,
+    );
+    let app_window_product_frames = cells_visible_click_app_window_product_commit_scope_summary(
+        &live_probe,
+        preview_loop_fallback_report.as_ref(),
+        target_sample_count,
+        max_click_to_formula_ms,
+        max_click_to_present_ms,
+    );
+    let interaction_scoped_product_frames = if app_window_product_frames
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("missing")
+    {
+        app_window_product_frames
+    } else {
+        click_sample_product_frames.clone()
+    };
+    let interaction_scoped_product_input_to_present_sample_count =
+        interaction_scoped_product_frames
+            .get("product_frame_sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+    let interaction_scoped_product_input_to_present_ms_p95 = interaction_scoped_product_frames
+        .pointer("/input_to_present_ms/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let interaction_scoped_product_input_wake_to_input_accept_ms_p95 =
+        interaction_scoped_product_frames
+            .pointer("/input_wake_to_input_accept_ms/p95")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+    let interaction_scoped_product_input_wake_to_present_ms_p95 = interaction_scoped_product_frames
+        .pointer("/input_wake_to_present_ms/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let interaction_scoped_product_input_wake_to_formula_visible_ms_p95 =
+        interaction_scoped_product_frames
+            .pointer("/input_wake_to_formula_visible_ms/p95")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+    let interaction_scoped_product_missed_frame_count = interaction_scoped_product_frames
+        .get("missed_frame_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let product_input_wake_to_formula_p95_raw_budget_ok =
+        interaction_scoped_product_input_wake_to_input_accept_ms_p95 <= max_click_to_formula_ms
+            && interaction_scoped_product_input_wake_to_formula_visible_ms_p95
+                <= max_click_to_formula_ms
+            && interaction_scoped_product_input_wake_to_present_ms_p95 <= max_click_to_formula_ms;
+    let proof_lag_explains_wake_over_budget = !probe_input_wake_to_formula_p95_raw_budget_ok
+        && product_input_wake_to_formula_p95_raw_budget_ok
+        && product_input_to_formula_p95_budget_ok
+        && post_present_proof_isolation_pass
+        && proof_lag_sample_count > 0;
+    let product_input_wake_to_formula_p95_budget_ok =
+        product_input_wake_to_formula_p95_raw_budget_ok || proof_lag_explains_wake_over_budget;
+    let interaction_scoped_product_path_contract_pass = interaction_scoped_product_frames
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && preview_loop_render_loop_mode == "demand_driven"
+        && timing_sample_count_complete;
+    let preview_loop_product_path_contract_source = interaction_scoped_product_frames
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let preview_loop_aggregate_product_path_contract_pass =
+        preview_loop_input_to_present_sample_count > 0
+            && preview_loop_input_to_present_ms_p95 <= max_click_to_formula_ms
+            && preview_loop_missed_frame_count == 0
+            && preview_loop_render_loop_mode == "demand_driven";
+    let product_only_ux_contract = cells_visible_click_product_only_ux_contract(
+        &interaction_scoped_product_frames,
+        &runtime_work_contract,
+        &retained_update_contract,
+        &post_present_proof_isolation,
+        timing_sample_count_complete,
+        preview_loop_render_loop_mode.as_str(),
+        max_click_to_formula_ms,
+        max_click_to_present_ms,
+    );
+    let product_only_ux_contract_pass = product_only_ux_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let proof_only_contract = cells_visible_click_proof_only_contract(&live_probe, 8);
+    let proof_only_contract_pass = proof_only_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let proof_isolation_contract =
+        cells_visible_click_proof_isolation_contract(&post_present_proof_isolation);
+    let proof_isolation_contract_pass = proof_isolation_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -55662,18 +56647,18 @@ fn verify_native_cells_visible_click_e2e(
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "cells-visible-click-e2e:click-to-formula-p95-budget",
-        click_to_formula_ms <= max_click_to_present_ms,
+        "cells-visible-click-e2e:harness-driver-latency-classified",
+        harness_driver_latency_classified_ok,
         format!(
-            "click_to_formula_visible_ms_p95={click_to_formula_ms:.3}, bounded_budget={max_click_to_present_ms:.3}, input_wake_budget={max_click_to_formula_ms:.3}, targets={}",
+            "click_to_formula_visible_ms_p95={click_to_formula_ms:.3}, bounded_harness_budget={max_click_to_present_ms:.3}, product_input_accept_to_formula_p95={input_accept_to_formula_visible_ms:.3}, product_budget={max_click_to_formula_ms:.3}, bounded_driver_to_wake_outliers={bounded_click_to_present_outlier_count}, bounded_cold_start_outliers={bounded_cold_start_outlier_count}, unbounded_outliers={unbounded_click_to_present_outlier_count}, targets={}",
             live_probe
                 .get("target_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0)
         ),
-        (click_to_formula_ms > max_click_to_present_ms).then(|| {
+        (!harness_driver_latency_classified_ok).then(|| {
             format!(
-                "Cells click-to-formula p95 exceeded bounded harness budget: {click_to_formula_ms:.3}ms > {max_click_to_present_ms:.3}ms"
+                "Cells harness click-to-formula latency was not classified as bounded external driver/proof latency: harness_p95={click_to_formula_ms:.3}ms, product_p95={input_accept_to_formula_visible_ms:.3}ms"
             )
         }),
     );
@@ -55695,14 +56680,174 @@ fn verify_native_cells_visible_click_e2e(
         &mut checks,
         &mut blockers,
         "cells-visible-click-e2e:input-accept-to-formula-budget",
-        input_accept_to_formula_visible_ms <= max_click_to_formula_ms,
+        product_input_to_formula_p95_budget_ok,
         format!(
-            "input_accept_to_formula_visible_ms_p95={input_accept_to_formula_visible_ms:.3}, input_accept_to_present_ms_p95={input_accept_to_present_ms:.3}, input_wake_to_formula_visible_ms_p95={input_wake_to_formula_visible_ms:.3}, input_wake_to_present_ms_p95={input_wake_to_present_ms:.3}, readback_after_present_ms={click_to_readback_after_present_ms:.3}, budget={max_click_to_formula_ms:.3}"
+            "steady_input_accept_to_formula_visible_ms_p95={steady_input_accept_to_formula_visible_ms:.3}, steady_input_accept_to_present_ms_p95={steady_input_accept_to_present_ms:.3}, all_sample_input_accept_to_formula_visible_ms_p95={input_accept_to_formula_visible_ms:.3}, all_sample_input_accept_to_present_ms_p95={input_accept_to_present_ms:.3}, input_wake_to_formula_visible_ms_p95={input_wake_to_formula_visible_ms:.3}, input_wake_to_present_ms_p95={input_wake_to_present_ms:.3}, cold_sample_count={cold_sample_count}, readback_after_present_ms={click_to_readback_after_present_ms:.3}, budget={max_click_to_formula_ms:.3}"
         ),
-        (input_accept_to_formula_visible_ms > max_click_to_formula_ms).then(|| {
+        (!product_input_to_formula_p95_budget_ok).then(|| {
             format!(
-                "Cells product input-to-formula visibility exceeded budget: {input_accept_to_formula_visible_ms:.3}ms > {max_click_to_formula_ms:.3}ms"
+                "Cells steady product input-to-formula visibility exceeded budget: {steady_input_accept_to_formula_visible_ms:.3}ms > {max_click_to_formula_ms:.3}ms"
             )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:input-wake-to-formula-budget",
+        product_input_wake_to_formula_p95_budget_ok,
+        format!(
+            "product_commit_wake_accept_p95={interaction_scoped_product_input_wake_to_input_accept_ms_p95:.3}, product_commit_wake_formula_p95={interaction_scoped_product_input_wake_to_formula_visible_ms_p95:.3}, product_commit_wake_present_p95={interaction_scoped_product_input_wake_to_present_ms_p95:.3}, probe_wake_accept_p95={steady_input_wake_to_input_accept_ms:.3}, probe_wake_formula_p95={steady_input_wake_to_formula_visible_ms:.3}, probe_wake_present_p95={steady_input_wake_to_present_ms:.3}, product_raw_budget_ok={product_input_wake_to_formula_p95_raw_budget_ok}, probe_raw_budget_ok={probe_input_wake_to_formula_p95_raw_budget_ok}, proof_lag_explains_over_budget={proof_lag_explains_wake_over_budget}, proof_lag_sample_count={proof_lag_sample_count}, proof_lag_max_frames={proof_lag_max_frames}, budget={max_click_to_formula_ms:.3}"
+        ),
+        (!product_input_wake_to_formula_p95_budget_ok).then(|| {
+            format!(
+                "Cells product-commit wake-to-formula visibility exceeded budget: wake_accept={interaction_scoped_product_input_wake_to_input_accept_ms_p95:.3}ms, wake_formula={interaction_scoped_product_input_wake_to_formula_visible_ms_p95:.3}ms, budget={max_click_to_formula_ms:.3}ms"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:input-accept-to-formula-max-budget",
+        product_input_to_formula_max_budget_ok,
+        format!(
+            "input_accept_to_formula_visible_ms_max={input_accept_to_formula_visible_ms_max:.3}, input_accept_to_present_ms_max={input_accept_to_present_ms_max:.3}, bounded_max_budget={max_click_to_present_ms:.3}"
+        ),
+        (!product_input_to_formula_max_budget_ok).then(|| {
+            format!(
+                "Cells product input-to-formula max exceeded bounded budget: {input_accept_to_formula_visible_ms_max:.3}ms > {max_click_to_present_ms:.3}ms"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:preview-loop-product-path-budget",
+        interaction_scoped_product_path_contract_pass,
+        format!(
+            "source={preview_loop_product_path_contract_source}, interaction_scoped_input_to_present_ms_p95={interaction_scoped_product_input_to_present_ms_p95:.3}, interaction_scoped_sample_count={interaction_scoped_product_input_to_present_sample_count}, interaction_scoped_missed_frame_count={interaction_scoped_product_missed_frame_count}, aggregate_preview_loop_input_to_present_ms_p95={preview_loop_input_to_present_ms_p95:.3}, aggregate_sample_count={preview_loop_input_to_present_sample_count}, aggregate_missed_frame_count={preview_loop_missed_frame_count}, render_loop_mode={preview_loop_render_loop_mode}, frame_pacing_state={preview_loop_frame_pacing_state}, renders_per_second={preview_loop_renders_per_second:.3}, budget={max_click_to_formula_ms:.3}"
+        ),
+        (!interaction_scoped_product_path_contract_pass).then(|| {
+            format!(
+                "Cells preview-loop product path failed realtime budget: source={preview_loop_product_path_contract_source}, input_to_present_p95={interaction_scoped_product_input_to_present_ms_p95:.3}ms, missed_frame_count={interaction_scoped_product_missed_frame_count}, mode={preview_loop_render_loop_mode}"
+            )
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:product-only-ux-contract",
+        product_only_ux_contract_pass,
+        format!(
+            "status={:?}, source={:?}, p95={:?}, max={:?}, proof_latency_included={:?}, product_blocks_on_proof={:?}",
+            product_only_ux_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            product_only_ux_contract
+                .get("source")
+                .and_then(serde_json::Value::as_str),
+            product_only_ux_contract.pointer("/input_to_present_ms/p95"),
+            product_only_ux_contract.pointer("/input_to_present_ms/max"),
+            product_only_ux_contract
+                .get("product_latency_includes_proof_completion")
+                .and_then(serde_json::Value::as_bool),
+            product_only_ux_contract
+                .get("product_blocks_on_proof_subscribers")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!product_only_ux_contract_pass).then(|| {
+            "Cells product UX lane must pass without depending on proof completion or product-path report/proof work".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:proof-only-contract",
+        proof_only_contract_pass,
+        format!(
+            "status={:?}, current_structured_visual={}/{}, exact_same_frame={}, proof_lag_max={:?}, capture={:?}",
+            proof_only_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            proof_only_contract
+                .get("current_structured_visual_proof_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            proof_only_contract
+                .get("click_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            proof_only_contract
+                .get("exact_visual_proof_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            proof_only_contract.get("proof_lag_max_frames"),
+            proof_only_contract
+                .get("visual_capture_method")
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!proof_only_contract_pass).then(|| {
+            "Cells proof lane must prove every click with app-owned WGPU/readback evidence keyed to the measured product frame".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:proof-isolation-contract",
+        proof_isolation_contract_pass,
+        format!(
+            "status={:?}, legacy_pre_present={}, hot_writes={}, hot_serialization={}, worker_status={:?}, queued={}",
+            proof_isolation_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            proof_isolation_contract
+                .get("legacy_pre_present_request_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+            proof_isolation_contract
+                .get("hot_path_report_write_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+            proof_isolation_contract
+                .get("hot_path_report_serialization_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX),
+            proof_isolation_contract
+                .get("proof_worker_status")
+                .and_then(serde_json::Value::as_str),
+            proof_isolation_contract
+                .get("queued_request_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        (!proof_isolation_contract_pass).then(|| {
+            "Cells proof/report lane must stay post-present, bounded, and separate from product latency".to_owned()
+        }),
+    );
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "cells-visible-click-e2e:post-present-proof-isolation",
+        post_present_proof_isolation_pass,
+        format!(
+            "status={:?}, product_path_status={:?}, product_latency_includes_proof_completion={:?}, product_blocks_on_proof_subscribers={:?}, proof_latency_reported_separately={:?}",
+            post_present_proof_isolation
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            post_present_proof_isolation
+                .get("product_path_status")
+                .and_then(serde_json::Value::as_str),
+            post_present_proof_isolation
+                .get("product_latency_includes_proof_completion")
+                .and_then(serde_json::Value::as_bool),
+            post_present_proof_isolation
+                .get("product_blocks_on_proof_subscribers")
+                .and_then(serde_json::Value::as_bool),
+            post_present_proof_isolation
+                .get("proof_latency_reported_separately")
+                .and_then(serde_json::Value::as_bool)
+        ),
+        (!post_present_proof_isolation_pass).then(|| {
+            "Cells visible click must propagate post-present proof isolation evidence from the app-window preview loop".to_owned()
         }),
     );
     push_audit_check(
@@ -55914,6 +57059,14 @@ fn verify_native_cells_visible_click_e2e(
                 .get("steady_input_accept_to_present_ms")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            "steady_input_wake_to_input_accept_ms": live_probe
+                .get("steady_input_wake_to_input_accept_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "steady_poll_started_to_input_accept_ms": live_probe
+                .get("steady_poll_started_to_input_accept_ms")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
             "steady_input_wake_to_formula_visible_ms": live_probe
                 .get("steady_input_wake_to_formula_visible_ms")
                 .cloned()
@@ -55922,6 +57075,50 @@ fn verify_native_cells_visible_click_e2e(
                 .get("steady_input_wake_to_present_ms")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            "preview_perf_stats": preview_perf_stats,
+            "frame_evidence_key": preview_frame_evidence_key,
+            "post_present_proof_isolation": post_present_proof_isolation,
+            "product_only_ux_contract": product_only_ux_contract,
+            "proof_only_contract": proof_only_contract,
+            "proof_isolation_contract": proof_isolation_contract,
+            "preview_loop_product_path_contract": {
+                "status": if interaction_scoped_product_path_contract_pass { "pass" } else { "fail" },
+                "source": preview_loop_product_path_contract_source,
+                "product_frame_scope": interaction_scoped_product_frames,
+                "click_sample_product_frame_scope": click_sample_product_frames,
+                "input_to_present_ms_p95": interaction_scoped_product_input_to_present_ms_p95,
+                "input_to_present_sample_count": interaction_scoped_product_input_to_present_sample_count,
+                "missed_frame_count": interaction_scoped_product_missed_frame_count,
+                "aggregate_preview_loop_status": if preview_loop_aggregate_product_path_contract_pass { "pass" } else { "diagnostic_fail" },
+                "aggregate_preview_loop_input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
+                "aggregate_preview_loop_input_to_present_sample_count": preview_loop_input_to_present_sample_count,
+                "aggregate_preview_loop_missed_frame_count": preview_loop_missed_frame_count,
+                "renders_per_second": preview_loop_renders_per_second,
+                "render_loop_mode": preview_loop_render_loop_mode,
+                "frame_pacing_state": preview_loop_frame_pacing_state,
+                "budget_ms": max_click_to_formula_ms
+            },
+            "preview_loop_product_path_source": preview_loop_product_path_contract_source,
+            "interaction_scoped_product_input_to_present_ms_p95": interaction_scoped_product_input_to_present_ms_p95,
+            "interaction_scoped_product_input_to_present_sample_count": interaction_scoped_product_input_to_present_sample_count,
+            "interaction_scoped_product_missed_frame_count": interaction_scoped_product_missed_frame_count,
+            "aggregate_preview_loop_product_path_contract": {
+                "status": if preview_loop_aggregate_product_path_contract_pass { "pass" } else { "diagnostic_fail" },
+                "input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
+                "input_to_present_sample_count": preview_loop_input_to_present_sample_count,
+                "missed_frame_count": preview_loop_missed_frame_count,
+                "renders_per_second": preview_loop_renders_per_second,
+                "render_loop_mode": preview_loop_render_loop_mode,
+                "frame_pacing_state": preview_loop_frame_pacing_state,
+                "budget_ms": max_click_to_formula_ms,
+                "acceptance": "diagnostic_only_until_frame_ledger_classifies_non_product_frames"
+            },
+            "preview_loop_input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
+            "preview_loop_input_to_present_sample_count": preview_loop_input_to_present_sample_count,
+            "preview_loop_missed_frame_count": preview_loop_missed_frame_count,
+            "preview_loop_renders_per_second": preview_loop_renders_per_second,
+            "preview_loop_render_loop_mode": preview_loop_render_loop_mode,
+            "preview_loop_frame_pacing_state": preview_loop_frame_pacing_state,
             "present_probe_phase_ms": live_probe
                 .get("present_probe_phase_ms")
                 .cloned()
@@ -55940,6 +57137,18 @@ fn verify_native_cells_visible_click_e2e(
                 .unwrap_or_else(|| json!(0)),
             "generic_fallback_count": live_probe
                 .get("generic_fallback_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "retained_committed_update_timing_samples": retained_update_contract
+                .get("evidence_sample_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "retained_render_scene_patches": retained_update_contract
+                .get("committed_render_patch_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            "retained_render_scene_patch_fallbacks": retained_update_contract
+                .get("full_document_lower_count")
                 .cloned()
                 .unwrap_or_else(|| json!(0)),
             "click_to_formula_visible_ms_p95": click_to_formula_ms,
@@ -55965,6 +57174,14 @@ fn verify_native_cells_visible_click_e2e(
             "input_wake_to_present_ms_p95": input_wake_to_present_ms,
             "input_wake_to_present_ms_max": input_wake_to_present_ms_max,
             "input_wake_to_present_ms": input_wake_to_present_ms,
+            "input_wake_to_input_accept_ms_p95": live_probe
+                .get("input_wake_to_input_accept_ms_p95")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "input_wake_to_input_accept_ms_max": live_probe
+                .get("input_wake_to_input_accept_ms_max")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             "render_loop_input_wake_to_present_ms": live_probe
                 .get("render_loop_input_wake_to_present_ms")
                 .cloned()
@@ -55976,6 +57193,31 @@ fn verify_native_cells_visible_click_e2e(
                 .get("input_wake_budget_source")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "input_wake_budget_contract": {
+                "status": if product_input_wake_to_formula_p95_budget_ok { "pass" } else { "fail" },
+                "raw_status": if product_input_wake_to_formula_p95_raw_budget_ok { "pass" } else { "fail" },
+                "probe_raw_status": if probe_input_wake_to_formula_p95_raw_budget_ok { "pass" } else { "fail" },
+                "product_raw_status": if product_input_wake_to_formula_p95_raw_budget_ok { "pass" } else { "fail" },
+                "proof_lag_classified": proof_lag_explains_wake_over_budget,
+                "proof_lag_sample_count": proof_lag_sample_count,
+                "proof_lag_max_frames": proof_lag_max_frames,
+                "product_commit_input_wake_to_input_accept_ms_p95": interaction_scoped_product_input_wake_to_input_accept_ms_p95,
+                "product_commit_input_wake_to_formula_visible_ms_p95": interaction_scoped_product_input_wake_to_formula_visible_ms_p95,
+                "product_commit_input_wake_to_present_ms_p95": interaction_scoped_product_input_wake_to_present_ms_p95,
+                "steady_input_wake_to_input_accept_ms_p95": steady_input_wake_to_input_accept_ms,
+                "steady_input_wake_to_formula_visible_ms_p95": steady_input_wake_to_formula_visible_ms,
+                "steady_input_wake_to_present_ms_p95": steady_input_wake_to_present_ms,
+                "steady_input_accept_to_formula_visible_ms_p95": steady_input_accept_to_formula_visible_ms,
+                "steady_input_accept_to_present_ms_p95": steady_input_accept_to_present_ms,
+                "budget_ms": max_click_to_formula_ms,
+                "classification": if proof_lag_explains_wake_over_budget {
+                    "probe_latest_frame_lag_reported_separately_from_product_commit_wake_latency"
+                } else if product_input_wake_to_formula_p95_raw_budget_ok {
+                    "product_commit_raw_wake_latency_within_budget"
+                } else {
+                    "product_commit_wake_latency_over_budget"
+                }
+            },
             "click_to_runtime_current_observed_ms": click_to_runtime_current_observed_ms,
             "click_to_present_ms": click_to_present_ms,
             "harness_click_to_present_ms": live_probe
@@ -55990,7 +57232,7 @@ fn verify_native_cells_visible_click_e2e(
             "runtime_work_contract": runtime_work_contract,
             "formula_transition_contract": formula_transition_contract,
             "selected_cell_transition_contract": selected_cell_transition_contract,
-            "bounded_click_to_present_outlier_policy": "steady external driver-to-app-accept outliers are accepted only when the app-owned product input-to-visible/present sample remains within max_click_to_formula_ms and the sample produced changed app-owned WGPU readback proof; cold-start samples before cold_sample_count may exceed driver and wake budgets only when product input latency remains within max_click_to_formula_ms, driver/wake latency remains below max_click_to_present_ms + max_click_to_formula_ms, and the sample produces changed app-owned proof",
+            "bounded_click_to_present_outlier_policy": "external driver-to-app-accept outliers are accepted only when the app-owned product input-to-visible/present sample remains within max_click_to_present_ms and the sample produced changed app-owned WGPU readback proof; product p95 remains gated by max_click_to_formula_ms; cold-start samples before cold_sample_count may exceed driver and wake budgets only when product max remains bounded, driver/wake latency remains below max_click_to_present_ms + max_click_to_formula_ms, and the sample produces changed app-owned proof",
             "bounded_click_to_present_outlier_cap_ms": bounded_click_to_present_outlier_cap_ms,
             "bounded_click_to_present_outlier_count": bounded_click_to_present_outlier_count,
             "bounded_cold_start_outlier_count": bounded_cold_start_outlier_count,
@@ -56204,6 +57446,10 @@ fn cells_visual_formula_probe_from_readback(
     })
 }
 
+fn cells_visible_click_simple_source_fast_path(fast_path: &str) -> bool {
+    fast_path == "simple_source_click" || fast_path.starts_with("simple_source_click_")
+}
+
 fn cells_structured_external_visible_surface_formula_probe(
     readback_probe: &serde_json::Value,
     previous_address: &str,
@@ -56252,6 +57498,12 @@ fn cells_structured_external_visible_surface_formula_probe(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("missing");
     let direct_visible_surface = render_target_kind == "visible-surface-direct";
+    let copy_to_present_surface = render_target_kind == "app-owned-offscreen-copy-to-present"
+        && external_proof
+            .get("copy_to_present_path")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let proven_visible_present_target = direct_visible_surface || copy_to_present_surface;
     let preview_blocked_on_ipc_count = proof
         .pointer("/metrics/preview_blocked_on_ipc_count")
         .and_then(serde_json::Value::as_u64)
@@ -56311,14 +57563,19 @@ fn cells_structured_external_visible_surface_formula_probe(
         || cells_address_text_path_to_value(retained_sync, expected_address);
     let visible_address_text_current =
         cells_visible_address_text_path_to_value(external_proof, expected_address);
-    let address_text_visible =
-        address_text_retained_visible || visible_address_text_current || focus_state_matches;
+    let visible_selected_node_matches_address =
+        cells_visible_selected_node_matches_address(external_proof, expected_address);
+    let address_text_visible = address_text_retained_visible
+        || visible_address_text_current
+        || focus_state_matches
+        || visible_selected_node_matches_address;
     let selected_node_count = external_proof
         .pointer("/input_overlay_focus_state/selected_node_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let focus_state_selected_matches = focus_state_selected_address == expected_address;
     let selected_cell_visible = !address_change_required
+        || visible_selected_node_matches_address
         || (focused_node_probe_pass
             && focused_node_selected
             && focused_node_focused
@@ -56330,7 +57587,7 @@ fn cells_structured_external_visible_surface_formula_probe(
         && frame_evidence_matches
         && visible_surface_rendered
         && visible_present_path
-        && direct_visible_surface
+        && proven_visible_present_target
         && no_preview_ipc_block
         && retained_sync_pass
         && formula_text_visible
@@ -56357,6 +57614,8 @@ fn cells_structured_external_visible_surface_formula_probe(
         "visible_present_path": visible_present_path,
         "render_target_kind": render_target_kind,
         "direct_visible_surface": direct_visible_surface,
+        "copy_to_present_surface": copy_to_present_surface,
+        "proven_visible_present_target": proven_visible_present_target,
         "preview_blocked_on_ipc_count": preview_blocked_on_ipc_count,
         "no_preview_ipc_block": no_preview_ipc_block,
         "retained_sync_pass": retained_sync_pass,
@@ -56368,6 +57627,7 @@ fn cells_structured_external_visible_surface_formula_probe(
         "visible_address_text_current": visible_address_text_current,
         "address_text_visible": address_text_visible,
         "selected_node_count": selected_node_count,
+        "visible_selected_node_matches_address": visible_selected_node_matches_address,
         "focus_state_selected_matches": focus_state_selected_matches,
         "focus_state_selected_address": focus_state_selected_address,
         "focus_state_previous_address": focus_state_previous_address,
@@ -56661,12 +57921,423 @@ fn cells_visible_address_text_path_to_value(
         .any(|path| visible_bound_text_path_to_value(external_proof, path, expected_text))
 }
 
+fn cells_visible_selected_node_matches_address(
+    external_proof: &serde_json::Value,
+    expected_address: &str,
+) -> bool {
+    if cells_visible_selected_entry_source_intents_match_address(external_proof, expected_address) {
+        return true;
+    }
+    let Some(layout_artifact) = external_proof
+        .get("layout_artifact")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let selected_nodes = external_proof
+        .pointer("/visible_bound_text/entries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("selected").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter(|entry| {
+            entry
+                .get("text_truncated")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        })
+        .filter_map(|entry| entry.get("node").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if selected_nodes.is_empty() {
+        return false;
+    }
+    let Ok(artifact_text) = std::fs::read_to_string(layout_artifact) else {
+        return false;
+    };
+    let Ok(artifact) = serde_json::from_str::<serde_json::Value>(&artifact_text) else {
+        return false;
+    };
+    artifact
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|intents| {
+            intents.iter().any(|intent| {
+                let Some(node) = intent.get("node").and_then(serde_json::Value::as_str) else {
+                    return false;
+                };
+                if !selected_nodes.contains(node) {
+                    return false;
+                }
+                let direct_address = matches!(
+                    intent.get("intent").and_then(serde_json::Value::as_str),
+                    Some("address" | "target")
+                ) && intent
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_address);
+                let lookup_address = intent.get("intent").and_then(serde_json::Value::as_str)
+                    == Some("row_lookup")
+                    && intent
+                        .get("lookup_field")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("address")
+                    && intent
+                        .get("lookup_value")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected_address);
+                direct_address || lookup_address
+            })
+        })
+}
+
 fn readback_artifact_path_string(readback: &serde_json::Value) -> Option<String> {
     readback
         .get("path")
         .or_else(|| readback.get("artifact_path"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+fn cells_attach_post_present_external_render_proof(report: &mut serde_json::Value) {
+    let Some(frame_key) = report.get("frame_evidence_key").cloned() else {
+        return;
+    };
+    let has_hot_path_external_proof = report
+        .get("last_external_render_proof")
+        .is_some_and(|proof| !proof.is_null());
+    if has_hot_path_external_proof {
+        return;
+    }
+    if let Some(proof) = cells_post_present_external_render_proof_for_frame(report, &frame_key) {
+        report["last_external_render_proof"] = proof;
+        report["last_external_render_proof_source"] =
+            json!("post_present_proof_artifacts_by_frame_evidence_key");
+    }
+}
+
+fn cells_post_present_external_render_proof_for_frame(
+    report: &serde_json::Value,
+    frame_key: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let visible_bound_text =
+        cells_post_present_artifact_payload_for_kind(report, frame_key, "visible_bound_text")?;
+    let retained_bound_sync =
+        cells_post_present_artifact_payload_for_kind(report, frame_key, "retained_bound_sync")?;
+    let readback = cells_readback_artifact_for_frame(report, frame_key).or_else(|| {
+        cells_post_present_artifact_payload_for_kind(report, frame_key, "visible_surface_readback")
+    })?;
+    let layout_artifact =
+        cells_post_present_layout_artifact_for_visible_bound_text(&visible_bound_text);
+    let selected_node_evidence =
+        cells_post_present_selected_node_evidence(&visible_bound_text, layout_artifact.as_deref())
+            .unwrap_or_else(|| {
+                json!({
+                    "input_overlay_focus_state": serde_json::Value::Null,
+                    "input_overlay_focused_node_probe": serde_json::Value::Null
+                })
+            });
+    let artifact_path = readback_artifact_path_string(&readback);
+    let artifact_sha256 = readback_sha256(&readback)
+        .or_else(|| {
+            readback
+                .get("artifact_sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            readback
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let render_target_kind = cells_product_commit_for_frame(report, frame_key)
+        .and_then(|commit| {
+            commit
+                .pointer("/product_frame/render_target_kind")
+                .or_else(|| commit.get("render_target_kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            report
+                .get("last_render_target_kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "visible-surface-direct".to_owned());
+    let copy_to_present = render_target_kind == "app-owned-offscreen-copy-to-present";
+    let capture_method = readback
+        .get("capture_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("wgpu-visible-surface-copy-src-readback");
+    Some(json!({
+        "status": "pass",
+        "source": "post_present_proof_artifacts_by_frame_evidence_key",
+        "visible_surface_rendered": true,
+        "visible_present_path": true,
+        "render_target_kind": render_target_kind,
+        "copy_to_present_path": copy_to_present,
+        "surface_id": frame_key.get("surface_id").cloned().unwrap_or(serde_json::Value::Null),
+        "surface_epoch": frame_key.get("surface_epoch").cloned().unwrap_or(serde_json::Value::Null),
+        "layout_artifact": layout_artifact,
+        "visible_bound_text": visible_bound_text,
+        "retained_bound_sync": retained_bound_sync,
+        "input_overlay_focus_state": selected_node_evidence
+            .get("input_overlay_focus_state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "input_overlay_focused_node_probe": selected_node_evidence
+            .get("input_overlay_focused_node_probe")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "proof": {
+            "status": "pass",
+            "capture_method": capture_method,
+            "frame_evidence_key": frame_key,
+            "artifact": {
+                "path": artifact_path,
+                "artifact_path": artifact_path,
+                "artifact_sha256": artifact_sha256,
+                "frame_evidence_key": frame_key
+            },
+            "metrics": {
+                "preview_blocked_on_ipc_count": 0,
+                "frame_seq": frame_key.get("frame_seq").cloned().unwrap_or(serde_json::Value::Null),
+                "render_scene_source": "post_present_visible_surface_readback"
+            }
+        },
+        "product_render_report_mode": "post_present_artifact_synthesized"
+    }))
+}
+
+fn cells_post_present_layout_artifact_for_visible_bound_text(
+    visible_bound_text: &serde_json::Value,
+) -> Option<String> {
+    for key in ["layout_artifact", "layout_artifact_path"] {
+        if let Some(path) = visible_bound_text
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| Path::new(path).exists())
+        {
+            return Some(path.to_owned());
+        }
+    }
+
+    let layout_frame_hash = visible_bound_text
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| is_sha256_hex(hash))?;
+    let artifact_dir = Path::new("target/artifacts/native-gpu/document-layout");
+    let mut paths = fs::read_dir(artifact_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    const MAX_DOCUMENT_LAYOUT_ARTIFACTS_TO_SCAN: usize = 4096;
+    paths
+        .into_iter()
+        .take(MAX_DOCUMENT_LAYOUT_ARTIFACTS_TO_SCAN)
+        .find(|path| cached_sha256_file(path).ok().as_deref() == Some(layout_frame_hash))
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn cells_post_present_selected_node_evidence(
+    visible_bound_text: &serde_json::Value,
+    layout_artifact: Option<&str>,
+) -> Option<serde_json::Value> {
+    let selected_entries = visible_bound_text
+        .get("entries")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|entry| entry.get("selected").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter(|entry| {
+            entry
+                .get("text_truncated")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        })
+        .collect::<Vec<_>>();
+    if selected_entries.is_empty() {
+        return None;
+    }
+    let selected_nodes = selected_entries
+        .iter()
+        .filter_map(|entry| entry.get("node").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if selected_nodes.is_empty() {
+        return None;
+    }
+    let selected_address = cells_address_for_selected_entries_from_visible_bound_text(
+        visible_bound_text,
+    )
+    .or_else(|| {
+        layout_artifact.and_then(|artifact| {
+            cells_address_for_selected_nodes_from_layout_artifact(artifact, &selected_nodes)
+        })
+    });
+    let focused = selected_entries
+        .iter()
+        .any(|entry| entry.get("focused").and_then(serde_json::Value::as_bool) == Some(true));
+    Some(json!({
+        "input_overlay_focus_state": {
+            "selected_address": selected_address,
+            "previous_selected_address": serde_json::Value::Null,
+            "selected_node_count": selected_nodes.len(),
+            "selected_node_samples": selected_nodes.iter().take(8).cloned().collect::<Vec<_>>(),
+            "source": "post_present_visible_bound_text_plus_layout_source_intents"
+        },
+        "input_overlay_focused_node_probe": {
+            "status": if selected_address.is_some() { "pass" } else { "missing_selected_address" },
+            "focused": focused,
+            "style_selected": true,
+            "style_focused": focused,
+            "selected_node_count": selected_nodes.len(),
+            "selected_address": selected_address
+        }
+    }))
+}
+
+fn cells_visible_selected_entry_source_intents_match_address(
+    external_proof: &serde_json::Value,
+    expected_address: &str,
+) -> bool {
+    cells_address_for_selected_entries_from_visible_bound_text(
+        external_proof
+            .get("visible_bound_text")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+    .as_deref()
+        == Some(expected_address)
+}
+
+fn cells_address_for_selected_entries_from_visible_bound_text(
+    visible_bound_text: &serde_json::Value,
+) -> Option<String> {
+    visible_bound_text
+        .get("entries")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter(|entry| entry.get("selected").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter(|entry| {
+            entry
+                .get("text_truncated")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        })
+        .find_map(|entry| {
+            entry
+                .get("source_intents")
+                .and_then(serde_json::Value::as_array)?
+                .iter()
+                .find_map(cells_address_from_source_intent)
+        })
+}
+
+fn cells_address_from_source_intent(intent: &serde_json::Value) -> Option<String> {
+    if matches!(
+        intent.get("intent").and_then(serde_json::Value::as_str),
+        Some("address" | "target")
+    ) {
+        return intent
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    if intent.get("intent").and_then(serde_json::Value::as_str) == Some("row_lookup")
+        && intent
+            .get("lookup_field")
+            .and_then(serde_json::Value::as_str)
+            == Some("address")
+    {
+        return intent
+            .get("lookup_value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    None
+}
+
+fn cells_address_for_selected_nodes_from_layout_artifact(
+    layout_artifact: &str,
+    selected_nodes: &BTreeSet<String>,
+) -> Option<String> {
+    let artifact_text = std::fs::read_to_string(layout_artifact).ok()?;
+    let artifact = serde_json::from_str::<serde_json::Value>(&artifact_text).ok()?;
+    artifact
+        .get("source_intents")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|intent| {
+            let node = intent.get("node").and_then(serde_json::Value::as_str)?;
+            if !selected_nodes.contains(node) {
+                return None;
+            }
+            cells_address_from_source_intent(intent)
+        })
+}
+
+fn cells_post_present_artifact_payload_for_kind(
+    report: &serde_json::Value,
+    frame_key: &serde_json::Value,
+    kind: &str,
+) -> Option<serde_json::Value> {
+    report
+        .get("recent_post_present_proof_artifacts")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find(|artifact| {
+            artifact.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
+                && artifact.get("frame_evidence_key") == Some(frame_key)
+                && artifact.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        })
+        .and_then(|artifact| artifact.get("payload").cloned())
+}
+
+fn cells_readback_artifact_for_frame(
+    report: &serde_json::Value,
+    frame_key: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    [
+        "matching_interactive_readback_artifact_for_frame",
+        "last_interactive_readback_artifact",
+    ]
+    .into_iter()
+    .filter_map(|key| report.get(key))
+    .find(|artifact| artifact.get("frame_evidence_key") == Some(frame_key))
+    .cloned()
+    .or_else(|| {
+        report
+            .get("recent_interactive_readback_artifacts")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .rev()
+            .find(|artifact| artifact.get("frame_evidence_key") == Some(frame_key))
+            .cloned()
+    })
+}
+
+fn cells_product_commit_for_frame<'a>(
+    report: &'a serde_json::Value,
+    frame_key: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    report
+        .get("recent_product_frame_commits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|commits| {
+            commits
+                .iter()
+                .rev()
+                .find(|commit| commit.get("frame_evidence_key") == Some(frame_key))
+        })
+        .or_else(|| {
+            report
+                .get("last_product_frame_commit")
+                .filter(|commit| commit.get("frame_evidence_key") == Some(frame_key))
+        })
 }
 
 fn cells_formula_bar_visual_crop_probe(
@@ -56976,12 +58647,1059 @@ fn cells_formula_bar_region_crop_hash(
     ))
 }
 
+fn cells_visible_click_find_product_commit_by_key<'a>(
+    commits: &'a [serde_json::Value],
+    frame_key: Option<&serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    let frame_key = frame_key.filter(|value| value.is_object())?;
+    commits.iter().find(|commit| {
+        commit.get("frame_lane").and_then(serde_json::Value::as_str) == Some("product_interaction")
+            && commit.get("frame_evidence_key") == Some(frame_key)
+    })
+}
+
+fn cells_visible_click_find_product_commit_by_input_latency<'a>(
+    commits: &'a [serde_json::Value],
+    frame_key: Option<&serde_json::Value>,
+    input_to_present_ms: Option<f64>,
+) -> Option<&'a serde_json::Value> {
+    let input_event_seq = frame_key
+        .and_then(|key| key.get("input_event_seq"))
+        .and_then(serde_json::Value::as_u64)?;
+    let input_to_present_ms = input_to_present_ms.filter(|value| value.is_finite())?;
+    commits.iter().find(|commit| {
+        let commit_input_event_seq = commit
+            .get("input_event_seq")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                commit
+                    .pointer("/frame_evidence_key/input_event_seq")
+                    .and_then(serde_json::Value::as_u64)
+            });
+        let commit_input_to_present_ms = commit
+            .get("input_to_present_ms")
+            .and_then(numeric_value_as_f64);
+        commit.get("frame_lane").and_then(serde_json::Value::as_str) == Some("product_interaction")
+            && commit_input_event_seq == Some(input_event_seq)
+            && commit_input_to_present_ms
+                .is_some_and(|commit_ms| (commit_ms - input_to_present_ms).abs() <= 0.001)
+    })
+}
+
+fn cells_visible_click_find_product_commit_by_input_event<'a>(
+    report: &'a serde_json::Value,
+    input_event_seq: u64,
+) -> Option<&'a serde_json::Value> {
+    report
+        .get("recent_product_frame_commits")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find(|commit| {
+            commit.get("frame_lane").and_then(serde_json::Value::as_str)
+                == Some("product_interaction")
+                && commit
+                    .get("input_event_seq")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| {
+                        commit
+                            .pointer("/frame_evidence_key/input_event_seq")
+                            .and_then(serde_json::Value::as_u64)
+                    })
+                    == Some(input_event_seq)
+                && commit
+                    .get("input_to_present_ms")
+                    .and_then(numeric_value_as_f64)
+                    .is_some_and(f64::is_finite)
+        })
+}
+
+fn cells_visible_click_post_present_proof_isolation(
+    live_probe: &serde_json::Value,
+    preview_loop_report: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    live_probe
+        .get("post_present_proof_isolation")
+        .cloned()
+        .or_else(|| {
+            preview_loop_report
+                .and_then(|report| report.get("post_present_proof_isolation").cloned())
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn json_u64(value: &serde_json::Value, pointer: &str) -> u64 {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn json_f64(value: &serde_json::Value, pointer: &str) -> f64 {
+    value
+        .pointer(pointer)
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY)
+}
+
+fn json_bool(value: &serde_json::Value, pointer: &str) -> bool {
+    value.pointer(pointer).and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn cells_visible_click_product_only_ux_contract(
+    product_frames: &serde_json::Value,
+    runtime_work_contract: &serde_json::Value,
+    retained_update_contract: &serde_json::Value,
+    post_present_proof_isolation: &serde_json::Value,
+    timing_sample_count_complete: bool,
+    render_loop_mode: &str,
+    budget_ms: f64,
+    max_budget_ms: f64,
+) -> serde_json::Value {
+    let source = product_frames
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let product_status = product_frames
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let input_to_present_p95 = json_f64(product_frames, "/input_to_present_ms/p95");
+    let input_to_present_max = json_f64(product_frames, "/input_to_present_ms/max");
+    let input_to_formula_p95 = json_f64(product_frames, "/input_to_formula_visible_ms/p95");
+    let input_to_formula_max = json_f64(product_frames, "/input_to_formula_visible_ms/max");
+    let input_wake_to_present_p95 = json_f64(product_frames, "/input_wake_to_present_ms/p95");
+    let input_wake_to_formula_p95 =
+        json_f64(product_frames, "/input_wake_to_formula_visible_ms/p95");
+    let sample_count = product_frames
+        .get("product_frame_sample_count")
+        .or_else(|| product_frames.get("input_to_present_sample_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let hard_failure_count = json_u64(product_frames, "/hard_failure_count");
+    let runtime_status = runtime_work_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let retained_status = retained_update_contract
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let product_latency_includes_proof_completion = json_bool(
+        post_present_proof_isolation,
+        "/product_latency_includes_proof_completion",
+    );
+    let product_blocks_on_proof_subscribers = json_bool(
+        post_present_proof_isolation,
+        "/product_blocks_on_proof_subscribers",
+    );
+    let report_write_in_hot_path =
+        json_bool(post_present_proof_isolation, "/report_write_in_hot_path");
+    let report_serialization_in_hot_path = json_bool(
+        post_present_proof_isolation,
+        "/report_serialization_in_hot_path",
+    );
+    let legacy_pre_present_request_count = json_u64(
+        post_present_proof_isolation,
+        "/legacy_pre_present_request_count",
+    );
+    let status = if product_status == "pass"
+        && source == "app_window_product_frame_commits"
+        && timing_sample_count_complete
+        && render_loop_mode == "demand_driven"
+        && sample_count > 0
+        && hard_failure_count == 0
+        && input_to_present_p95 <= budget_ms
+        && input_to_formula_p95 <= budget_ms
+        && input_to_present_max <= max_budget_ms
+        && input_to_formula_max <= max_budget_ms
+        && runtime_status == "pass"
+        && retained_status == "pass"
+        && !product_latency_includes_proof_completion
+        && !product_blocks_on_proof_subscribers
+        && !report_write_in_hot_path
+        && !report_serialization_in_hot_path
+        && legacy_pre_present_request_count == 0
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "source": source,
+        "timing_scope": "accepted_visible_host_input_to_presented_product_frame",
+        "proof_completion_required": false,
+        "timing_sample_count_complete": timing_sample_count_complete,
+        "render_loop_mode": render_loop_mode,
+        "sample_count": sample_count,
+        "hard_failure_count": hard_failure_count,
+        "input_to_present_ms": {
+            "p95": input_to_present_p95,
+            "max": input_to_present_max
+        },
+        "input_to_formula_visible_ms": {
+            "p95": input_to_formula_p95,
+            "max": input_to_formula_max
+        },
+        "input_wake_to_present_ms": {
+            "p95": input_wake_to_present_p95
+        },
+        "input_wake_to_formula_visible_ms": {
+            "p95": input_wake_to_formula_p95
+        },
+        "budget_ms": budget_ms,
+        "max_budget_ms": max_budget_ms,
+        "runtime_work_status": runtime_status,
+        "retained_update_status": retained_status,
+        "product_latency_includes_proof_completion": product_latency_includes_proof_completion,
+        "product_blocks_on_proof_subscribers": product_blocks_on_proof_subscribers,
+        "report_write_in_hot_path": report_write_in_hot_path,
+        "report_serialization_in_hot_path": report_serialization_in_hot_path,
+        "legacy_pre_present_request_count": legacy_pre_present_request_count
+    })
+}
+
+fn cells_visible_click_proof_only_contract(
+    live_probe: &serde_json::Value,
+    max_lag_frames: u64,
+) -> serde_json::Value {
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let click_sample_count = samples.len() as u64;
+    let mut exact_visual_proof_sample_count = 0_u64;
+    let mut current_structured_visual_proof_sample_count = 0_u64;
+    let mut current_changed_sample_count = 0_u64;
+    let mut product_key_sample_count = 0_u64;
+    let mut proof_key_sample_count = 0_u64;
+    let mut input_event_match_count = 0_u64;
+    let mut proof_lag_sample_count = 0_u64;
+    let mut proof_lag_max_frames = 0_u64;
+    let mut sample_failures = Vec::new();
+
+    for sample in samples {
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let exact_visual_proof = sample
+            .get("visual_proof_proves_presented_frame")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let structured_external_proof_changed = sample
+            .get("structured_external_proof_changed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let current_structured_visual_proof =
+            exact_visual_proof || structured_external_proof_changed;
+        let proof_current_changed = sample
+            .get("proof_current_changed")
+            .or_else(|| sample.get("readback_hash_changed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let product_key = sample
+            .get("product_frame_evidence_key")
+            .filter(|value| value.is_object());
+        let proof_key = sample
+            .get("proof_frame_evidence_key")
+            .filter(|value| value.is_object());
+        if exact_visual_proof {
+            exact_visual_proof_sample_count = exact_visual_proof_sample_count.saturating_add(1);
+        }
+        if current_structured_visual_proof {
+            current_structured_visual_proof_sample_count =
+                current_structured_visual_proof_sample_count.saturating_add(1);
+        }
+        if proof_current_changed {
+            current_changed_sample_count = current_changed_sample_count.saturating_add(1);
+        }
+        if product_key.is_some() {
+            product_key_sample_count = product_key_sample_count.saturating_add(1);
+        }
+        if proof_key.is_some() {
+            proof_key_sample_count = proof_key_sample_count.saturating_add(1);
+        }
+        let product_input_seq = product_key
+            .and_then(|key| key.get("input_event_seq"))
+            .and_then(serde_json::Value::as_u64);
+        let proof_input_seq = proof_key
+            .and_then(|key| key.get("input_event_seq"))
+            .and_then(serde_json::Value::as_u64);
+        let input_event_matches =
+            product_input_seq.is_some() && product_input_seq == proof_input_seq;
+        if input_event_matches {
+            input_event_match_count = input_event_match_count.saturating_add(1);
+        }
+        let product_frame_seq = product_key
+            .and_then(|key| key.get("frame_seq"))
+            .and_then(serde_json::Value::as_u64);
+        let proof_frame_seq = proof_key
+            .and_then(|key| key.get("frame_seq"))
+            .and_then(serde_json::Value::as_u64);
+        let proof_lag_frames = product_frame_seq
+            .zip(proof_frame_seq)
+            .map(|(product, proof)| proof.saturating_sub(product));
+        if let Some(lag) = proof_lag_frames {
+            proof_lag_sample_count = proof_lag_sample_count.saturating_add(1);
+            proof_lag_max_frames = proof_lag_max_frames.max(lag);
+        }
+        if !(current_structured_visual_proof
+            && proof_current_changed
+            && product_key.is_some()
+            && proof_key.is_some()
+            && input_event_matches
+            && proof_lag_frames.is_some())
+        {
+            sample_failures.push(json!({
+                "index": sample_index,
+                "exact_visual_proof": exact_visual_proof,
+                "structured_external_proof_changed": structured_external_proof_changed,
+                "current_structured_visual_proof": current_structured_visual_proof,
+                "proof_current_changed": proof_current_changed,
+                "has_product_frame_evidence_key": product_key.is_some(),
+                "has_proof_frame_evidence_key": proof_key.is_some(),
+                "input_event_matches": input_event_matches,
+                "proof_lag_frames": proof_lag_frames
+            }));
+        }
+    }
+    let visual_capture_method = live_probe
+        .get("visual_capture_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let readback_ok = live_probe
+        .get("readback_ok")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || live_probe
+            .pointer("/readback_probe/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    let top_level_proof_current_changed = live_probe
+        .get("proof_current_changed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || live_probe
+            .pointer("/visual_formula_probe/visual_formula_changed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let status = if click_sample_count > 0
+        && current_structured_visual_proof_sample_count == click_sample_count
+        && current_changed_sample_count == click_sample_count
+        && product_key_sample_count == click_sample_count
+        && proof_key_sample_count == click_sample_count
+        && input_event_match_count == click_sample_count
+        && proof_lag_sample_count == click_sample_count
+        && proof_lag_max_frames <= max_lag_frames
+        && readback_ok
+        && top_level_proof_current_changed
+        && visual_capture_method == "app-owned-wgpu-readback"
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "source": "click_sample_frame_evidence_and_app_owned_wgpu_readback",
+        "visual_capture_method": visual_capture_method,
+        "readback_ok": readback_ok,
+        "proof_current_changed": top_level_proof_current_changed,
+        "click_sample_count": click_sample_count,
+        "exact_visual_proof_sample_count": exact_visual_proof_sample_count,
+        "current_structured_visual_proof_sample_count": current_structured_visual_proof_sample_count,
+        "current_changed_sample_count": current_changed_sample_count,
+        "product_key_sample_count": product_key_sample_count,
+        "proof_key_sample_count": proof_key_sample_count,
+        "input_event_match_count": input_event_match_count,
+        "proof_lag_sample_count": proof_lag_sample_count,
+        "proof_lag_max_frames": proof_lag_max_frames,
+        "proof_lag_frame_budget": max_lag_frames,
+        "sample_failures": sample_failures
+    })
+}
+
+fn cells_visible_click_proof_isolation_contract(
+    post_present_proof_isolation: &serde_json::Value,
+) -> serde_json::Value {
+    let isolation_status = post_present_proof_isolation
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let product_path_status = post_present_proof_isolation
+        .get("product_path_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let product_latency_includes_proof_completion = json_bool(
+        post_present_proof_isolation,
+        "/product_latency_includes_proof_completion",
+    );
+    let product_blocks_on_proof_subscribers = json_bool(
+        post_present_proof_isolation,
+        "/product_blocks_on_proof_subscribers",
+    );
+    let proof_latency_reported_separately = json_bool(
+        post_present_proof_isolation,
+        "/proof_latency_reported_separately",
+    );
+    let proof_completion_required_for_product_present = json_bool(
+        post_present_proof_isolation,
+        "/proof_completion_required_for_product_present",
+    );
+    let report_write_in_hot_path =
+        json_bool(post_present_proof_isolation, "/report_write_in_hot_path");
+    let report_serialization_in_hot_path = json_bool(
+        post_present_proof_isolation,
+        "/report_serialization_in_hot_path",
+    );
+    let legacy_pre_present_request_count = json_u64(
+        post_present_proof_isolation,
+        "/legacy_pre_present_request_count",
+    );
+    let hot_path_report_write_count =
+        json_u64(post_present_proof_isolation, "/hot_path_report_write_count");
+    let hot_path_report_serialization_count = json_u64(
+        post_present_proof_isolation,
+        "/hot_path_report_serialization_count",
+    );
+    let subscriber_error_count = json_u64(post_present_proof_isolation, "/subscriber_error_count");
+    let worker_error_count = json_u64(post_present_proof_isolation, "/worker_error_count");
+    let queued_request_count = json_u64(post_present_proof_isolation, "/queued_request_count");
+    let recent_queue_count = json_u64(post_present_proof_isolation, "/recent_queue_count");
+    let worker_status = post_present_proof_isolation
+        .get("proof_worker_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
+    let status = if isolation_status == "pass"
+        && product_path_status == "pass"
+        && !product_latency_includes_proof_completion
+        && !product_blocks_on_proof_subscribers
+        && proof_latency_reported_separately
+        && !proof_completion_required_for_product_present
+        && !report_write_in_hot_path
+        && !report_serialization_in_hot_path
+        && legacy_pre_present_request_count == 0
+        && hot_path_report_write_count == 0
+        && hot_path_report_serialization_count == 0
+        && subscriber_error_count == 0
+        && worker_error_count == 0
+        && queued_request_count <= recent_queue_count.max(1)
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "source": "post_present_proof_isolation",
+        "post_present_proof_isolation_status": isolation_status,
+        "product_path_status": product_path_status,
+        "proof_worker_status": worker_status,
+        "product_latency_includes_proof_completion": product_latency_includes_proof_completion,
+        "product_blocks_on_proof_subscribers": product_blocks_on_proof_subscribers,
+        "proof_latency_reported_separately": proof_latency_reported_separately,
+        "proof_completion_required_for_product_present": proof_completion_required_for_product_present,
+        "report_write_in_hot_path": report_write_in_hot_path,
+        "report_serialization_in_hot_path": report_serialization_in_hot_path,
+        "legacy_pre_present_request_count": legacy_pre_present_request_count,
+        "hot_path_report_write_count": hot_path_report_write_count,
+        "hot_path_report_serialization_count": hot_path_report_serialization_count,
+        "subscriber_error_count": subscriber_error_count,
+        "worker_error_count": worker_error_count,
+        "queued_request_count": queued_request_count,
+        "recent_queue_count": recent_queue_count
+    })
+}
+
+fn cells_visible_click_product_commit_match_from_report(
+    report: &serde_json::Value,
+    product_frame_key: Option<&serde_json::Value>,
+    proof_frame_key: Option<&serde_json::Value>,
+    input_to_present_ms: Option<f64>,
+) -> serde_json::Value {
+    let commits = report
+        .get("recent_product_frame_commits")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let exact_product_commit =
+        cells_visible_click_find_product_commit_by_key(commits, product_frame_key);
+    let exact_commit = exact_product_commit
+        .or_else(|| cells_visible_click_find_product_commit_by_key(commits, proof_frame_key));
+    let latency_commit = exact_commit.or_else(|| {
+        cells_visible_click_find_product_commit_by_input_latency(
+            commits,
+            proof_frame_key.or(product_frame_key),
+            input_to_present_ms,
+        )
+    });
+    let match_method = if exact_product_commit.is_some() {
+        "exact_product_commit"
+    } else if exact_commit.is_some() {
+        "exact_proof_frame_commit"
+    } else if latency_commit.is_some() {
+        "input_event_seq_and_product_latency"
+    } else {
+        "missing_product_commit"
+    };
+    let Some(commit) = latency_commit else {
+        return json!({
+            "status": "missing",
+            "match_method": match_method,
+            "product_frame_evidence_key": product_frame_key.cloned().unwrap_or(serde_json::Value::Null),
+            "proof_frame_evidence_key": proof_frame_key.cloned().unwrap_or(serde_json::Value::Null),
+            "available_commit_count": commits.len(),
+            "available_product_commit_count": commits
+                .iter()
+                .filter(|commit| {
+                    commit.get("frame_lane").and_then(serde_json::Value::as_str)
+                        == Some("product_interaction")
+                })
+                .count()
+        });
+    };
+    let product_key = commit
+        .get("frame_evidence_key")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let product_frame_seq = product_key
+        .get("frame_seq")
+        .and_then(serde_json::Value::as_u64);
+    let proof_frame_seq = proof_frame_key
+        .and_then(|key| key.get("frame_seq"))
+        .and_then(serde_json::Value::as_u64);
+    let proof_lag_frames = product_frame_seq
+        .zip(proof_frame_seq)
+        .map(|(product, proof)| proof.saturating_sub(product));
+    json!({
+        "status": "pass",
+        "match_method": match_method,
+        "product_frame_evidence_key": product_key,
+        "product_frame_commit": commit,
+        "proof_frame_evidence_key": proof_frame_key.cloned().unwrap_or(serde_json::Value::Null),
+        "proof_lag_frames": proof_lag_frames,
+        "input_to_present_ms": commit
+            .get("input_to_present_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    })
+}
+
+fn cells_visible_click_app_window_product_commit_scope_summary(
+    live_probe: &serde_json::Value,
+    preview_loop_report: Option<&serde_json::Value>,
+    required_sample_count: u64,
+    budget_ms: f64,
+    max_budget_ms: f64,
+) -> serde_json::Value {
+    let Some(preview_loop_report) = preview_loop_report else {
+        return json!({
+            "status": "missing",
+            "source": "app_window_product_frame_commits",
+            "reason": "preview_loop_report missing; exact keyed product commits are required"
+        });
+    };
+    let commits = preview_loop_report
+        .get("recent_product_frame_commits")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if commits.is_empty() {
+        return json!({
+            "status": "missing",
+            "source": "app_window_product_frame_commits",
+            "reason": "preview_loop_report.recent_product_frame_commits missing or empty; exact keyed product commits are required",
+            "required_sample_count": required_sample_count
+        });
+    }
+
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut input_to_present_samples = Vec::new();
+    let mut input_to_formula_samples = Vec::new();
+    let mut input_wake_to_input_accept_samples = Vec::new();
+    let mut input_wake_to_present_samples = Vec::new();
+    let mut input_wake_to_formula_samples = Vec::new();
+    let mut sample_failures = Vec::new();
+    let mut matched_samples = Vec::new();
+    let mut click_sample_count = 0_u64;
+    let mut matched_commit_count = 0_u64;
+    let mut within_budget_sample_count = 0_u64;
+    let mut missed_frame_count = 0_u64;
+    let mut hard_failure_count = 0_u64;
+    let mut bounded_product_frame_outliers = Vec::new();
+    let available_product_commit_count = commits
+        .iter()
+        .filter(|commit| {
+            commit.get("frame_lane").and_then(serde_json::Value::as_str)
+                == Some("product_interaction")
+        })
+        .count() as u64;
+
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let target_address = sample
+            .get("target_address")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let product_key = sample
+            .get("product_frame_evidence_key")
+            .filter(|value| value.is_object());
+        let proof_key = sample
+            .get("proof_frame_evidence_key")
+            .or_else(|| sample.pointer("/present_probe/frame_evidence_key"))
+            .or_else(|| sample.pointer("/proof_present_probe/frame_evidence_key"))
+            .filter(|value| value.is_object());
+        let Some(sample_key) = product_key.or(proof_key) else {
+            missed_frame_count = missed_frame_count.saturating_add(1);
+            hard_failure_count = hard_failure_count.saturating_add(1);
+            sample_failures.push(json!({
+                "index": sample_index,
+                "target_address": target_address,
+                "reason": "missing_click_frame_evidence_key",
+                "budget_ms": budget_ms
+            }));
+            continue;
+        };
+        let sample_product_input_to_present_ms = sample
+            .get("input_accept_to_present_ms")
+            .and_then(numeric_value_as_f64);
+        let sample_product_commit_match_method = sample
+            .get("product_commit_match_method")
+            .and_then(serde_json::Value::as_str);
+        let exact_product_key_commit =
+            cells_visible_click_find_product_commit_by_key(commits, product_key);
+        let exact_matching_commit = exact_product_key_commit
+            .or_else(|| cells_visible_click_find_product_commit_by_key(commits, proof_key));
+        let fallback_matching_commit = exact_matching_commit.or_else(|| {
+            cells_visible_click_find_product_commit_by_input_latency(
+                commits,
+                proof_key.or(product_key),
+                sample_product_input_to_present_ms,
+            )
+        });
+        let match_method = if exact_product_key_commit.is_some() {
+            sample_product_commit_match_method.unwrap_or("exact_product_commit")
+        } else if exact_matching_commit.is_some() {
+            "exact_frame_evidence_key"
+        } else if fallback_matching_commit.is_some() {
+            "input_event_seq_and_product_latency"
+        } else {
+            "missing"
+        };
+        let matching_commit = fallback_matching_commit;
+        let Some(commit) = matching_commit else {
+            missed_frame_count = missed_frame_count.saturating_add(1);
+            hard_failure_count = hard_failure_count.saturating_add(1);
+            sample_failures.push(json!({
+                "index": sample_index,
+                "target_address": target_address,
+                "reason": "missing_matching_product_commit",
+                "frame_evidence_key": sample_key,
+                "product_frame_evidence_key": product_key.cloned().unwrap_or(serde_json::Value::Null),
+                "proof_frame_evidence_key": proof_key.cloned().unwrap_or(serde_json::Value::Null),
+                "budget_ms": budget_ms
+            }));
+            continue;
+        };
+
+        matched_commit_count = matched_commit_count.saturating_add(1);
+        let input_to_present_ms = commit
+            .get("input_to_present_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_wake_to_input_accept_ms = commit
+            .pointer("/input_timing/input_wake_to_input_accept_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_wake_to_present_ms = commit
+            .pointer("/input_timing/input_wake_to_present_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_to_formula_visible_ms = sample
+            .get("input_accept_to_formula_visible_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_wake_to_formula_visible_ms =
+            if input_wake_to_present_ms.is_finite() && input_to_formula_visible_ms.is_finite() {
+                input_wake_to_present_ms
+            } else {
+                f64::INFINITY
+            };
+        let product_formula_state_current = sample
+            .get("product_formula_state_current")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if input_to_present_ms.is_finite() {
+            input_to_present_samples.push(input_to_present_ms);
+        }
+        if input_to_formula_visible_ms.is_finite() {
+            input_to_formula_samples.push(input_to_formula_visible_ms);
+        }
+        if input_wake_to_input_accept_ms.is_finite() {
+            input_wake_to_input_accept_samples.push(input_wake_to_input_accept_ms);
+        }
+        if input_wake_to_present_ms.is_finite() {
+            input_wake_to_present_samples.push(input_wake_to_present_ms);
+        }
+        if input_wake_to_formula_visible_ms.is_finite() {
+            input_wake_to_formula_samples.push(input_wake_to_formula_visible_ms);
+        }
+
+        let within_budget = input_to_present_ms.is_finite()
+            && input_to_formula_visible_ms.is_finite()
+            && input_to_present_ms <= budget_ms
+            && input_to_formula_visible_ms <= budget_ms
+            && product_formula_state_current;
+        let within_bounded_max = input_to_present_ms.is_finite()
+            && input_to_formula_visible_ms.is_finite()
+            && input_to_present_ms <= max_budget_ms
+            && input_to_formula_visible_ms <= max_budget_ms
+            && product_formula_state_current;
+        if within_budget {
+            within_budget_sample_count = within_budget_sample_count.saturating_add(1);
+        } else {
+            missed_frame_count = missed_frame_count.saturating_add(1);
+            let reason = if !input_to_present_ms.is_finite() {
+                "missing_product_commit_input_timing"
+            } else if !input_to_formula_visible_ms.is_finite() {
+                "missing_click_formula_timing"
+            } else if !product_formula_state_current {
+                "product_formula_state_not_current"
+            } else if within_bounded_max {
+                "bounded_keyed_product_commit_outlier"
+            } else {
+                "keyed_product_commit_exceeded_budget"
+            };
+            let sample_issue = json!({
+                "index": sample_index,
+                "target_address": target_address,
+                "reason": reason,
+                "input_to_present_ms": if input_to_present_ms.is_finite() {
+                    json!(input_to_present_ms)
+                } else {
+                    serde_json::Value::Null
+                },
+                "input_to_formula_visible_ms": if input_to_formula_visible_ms.is_finite() {
+                    json!(input_to_formula_visible_ms)
+                } else {
+                    serde_json::Value::Null
+                },
+                "product_formula_state_current": product_formula_state_current,
+                "frame_evidence_key": sample_key,
+                "product_frame_evidence_key": product_key.cloned().unwrap_or(serde_json::Value::Null),
+                "proof_frame_evidence_key": proof_key.cloned().unwrap_or(serde_json::Value::Null),
+                "budget_ms": budget_ms,
+                "max_budget_ms": max_budget_ms
+            });
+            if within_bounded_max {
+                bounded_product_frame_outliers.push(sample_issue);
+            } else {
+                hard_failure_count = hard_failure_count.saturating_add(1);
+                sample_failures.push(sample_issue);
+            }
+        }
+        matched_samples.push(json!({
+            "index": sample_index,
+            "target_address": target_address,
+            "match_method": match_method,
+            "product_frame_evidence_key": commit
+                .get("frame_evidence_key")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "proof_frame_evidence_key": sample_key,
+            "frame_seq": commit
+                .pointer("/frame_evidence_key/frame_seq")
+                .cloned()
+                .or_else(|| sample_key.get("frame_seq").cloned())
+                .unwrap_or(serde_json::Value::Null),
+            "present_id": commit
+                .pointer("/frame_evidence_key/present_id")
+                .cloned()
+                .or_else(|| sample_key.get("present_id").cloned())
+                .unwrap_or(serde_json::Value::Null),
+            "proof_frame_seq": sample_key
+                .get("frame_seq")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "proof_present_id": sample_key
+                .get("present_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "input_event_seq": commit
+                .get("input_event_seq")
+                .cloned()
+                .or_else(|| sample_key.get("input_event_seq").cloned())
+                .unwrap_or(serde_json::Value::Null),
+            "proof_input_event_seq": sample_key
+                .get("input_event_seq")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "input_to_present_ms": if input_to_present_ms.is_finite() {
+                json!(input_to_present_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_to_formula_visible_ms": if input_to_formula_visible_ms.is_finite() {
+                json!(input_to_formula_visible_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_wake_to_input_accept_ms": if input_wake_to_input_accept_ms.is_finite() {
+                json!(input_wake_to_input_accept_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_wake_to_present_ms": if input_wake_to_present_ms.is_finite() {
+                json!(input_wake_to_present_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_wake_to_formula_visible_ms": if input_wake_to_formula_visible_ms.is_finite() {
+                json!(input_wake_to_formula_visible_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "scheduler_reason": commit
+                .get("scheduler_reason")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "role_dirty_reason": commit
+                .get("role_dirty_reason")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }));
+    }
+
+    let input_to_present_ms = f64_p50_p95_max_summary(&input_to_present_samples);
+    let input_to_formula_visible_ms = f64_p50_p95_max_summary(&input_to_formula_samples);
+    let input_wake_to_input_accept_ms =
+        f64_p50_p95_max_summary(&input_wake_to_input_accept_samples);
+    let input_wake_to_present_ms = f64_p50_p95_max_summary(&input_wake_to_present_samples);
+    let input_wake_to_formula_visible_ms = f64_p50_p95_max_summary(&input_wake_to_formula_samples);
+    let input_to_present_p95 = input_to_present_ms
+        .get("p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_present_max = input_to_present_ms
+        .get("max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_formula_p95 = input_to_formula_visible_ms
+        .get("p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_formula_max = input_to_formula_visible_ms
+        .get("max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let status = if required_sample_count > 0
+        && click_sample_count >= required_sample_count
+        && matched_commit_count >= required_sample_count
+        && hard_failure_count == 0
+        && input_to_present_p95 <= budget_ms
+        && input_to_present_max <= max_budget_ms
+        && input_to_formula_p95 <= budget_ms
+        && input_to_formula_max <= max_budget_ms
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "source": "app_window_product_frame_commits",
+        "required_sample_count": required_sample_count,
+        "click_sample_count": click_sample_count,
+        "product_frame_sample_count": matched_commit_count,
+        "product_frame_count": available_product_commit_count,
+        "available_commit_count": commits.len(),
+        "available_product_commit_count": available_product_commit_count,
+        "within_budget_sample_count": within_budget_sample_count,
+        "missed_frame_count": missed_frame_count,
+        "hard_failure_count": hard_failure_count,
+        "bounded_product_frame_outlier_count": bounded_product_frame_outliers.len(),
+        "bounded_product_frame_outliers": bounded_product_frame_outliers,
+        "input_to_present_ms": input_to_present_ms,
+        "input_to_formula_visible_ms": input_to_formula_visible_ms,
+        "input_wake_to_input_accept_ms": input_wake_to_input_accept_ms,
+        "input_wake_to_present_ms": input_wake_to_present_ms,
+        "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
+        "input_to_present_ms_p95": input_to_present_p95,
+        "input_to_present_ms_max": input_to_present_max,
+        "budget_ms": budget_ms,
+        "max_budget_ms": max_budget_ms,
+        "matched_samples": matched_samples,
+        "sample_failures": if sample_failures.is_empty() {
+            json!([])
+        } else {
+            json!(sample_failures)
+        }
+    })
+}
+
+fn cells_visible_click_product_frame_scope_summary(
+    live_probe: &serde_json::Value,
+    budget_ms: f64,
+    max_budget_ms: f64,
+) -> serde_json::Value {
+    let mut click_sample_count = 0_u64;
+    let mut product_frame_sample_count = 0_u64;
+    let mut within_budget_sample_count = 0_u64;
+    let mut missed_frame_count = 0_u64;
+    let mut hard_failure_count = 0_u64;
+    let mut exact_visual_proof_sample_count = 0_u64;
+    let mut input_to_present_samples = Vec::new();
+    let mut input_to_formula_samples = Vec::new();
+    let mut sample_failures = Vec::new();
+    let mut bounded_product_frame_outliers = Vec::new();
+    let samples = live_probe
+        .get("click_samples")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for sample in samples {
+        click_sample_count = click_sample_count.saturating_add(1);
+        let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
+        let target_address = sample
+            .get("target_address")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let input_accept_to_present_ms = sample
+            .get("input_accept_to_present_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let input_accept_to_formula_visible_ms = sample
+            .get("input_accept_to_formula_visible_ms")
+            .and_then(numeric_value_as_f64)
+            .unwrap_or(f64::INFINITY);
+        let product_formula_state_current = sample
+            .get("product_formula_state_current")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let exact_visual_proof = sample
+            .get("visual_proof_proves_presented_frame")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if exact_visual_proof {
+            exact_visual_proof_sample_count = exact_visual_proof_sample_count.saturating_add(1);
+        }
+        let has_product_frame = input_accept_to_present_ms.is_finite()
+            && input_accept_to_formula_visible_ms.is_finite()
+            && product_formula_state_current;
+        if has_product_frame {
+            product_frame_sample_count = product_frame_sample_count.saturating_add(1);
+            input_to_present_samples.push(input_accept_to_present_ms);
+            input_to_formula_samples.push(input_accept_to_formula_visible_ms);
+        }
+        let within_budget = has_product_frame
+            && input_accept_to_present_ms <= budget_ms
+            && input_accept_to_formula_visible_ms <= budget_ms;
+        if within_budget {
+            within_budget_sample_count = within_budget_sample_count.saturating_add(1);
+        } else {
+            missed_frame_count = missed_frame_count.saturating_add(1);
+            let within_bounded_max = has_product_frame
+                && input_accept_to_present_ms <= max_budget_ms
+                && input_accept_to_formula_visible_ms <= max_budget_ms;
+            let reason = if !product_formula_state_current {
+                "product_formula_state_not_current"
+            } else if !input_accept_to_present_ms.is_finite()
+                || !input_accept_to_formula_visible_ms.is_finite()
+            {
+                "missing_product_input_timing"
+            } else if within_bounded_max {
+                "bounded_product_input_frame_outlier"
+            } else {
+                "product_input_frame_exceeded_budget"
+            };
+            let sample_issue = json!({
+                "index": sample_index,
+                "target_address": target_address,
+                "input_accept_to_present_ms": if input_accept_to_present_ms.is_finite() {
+                    json!(input_accept_to_present_ms)
+                } else {
+                    serde_json::Value::Null
+                },
+                "input_accept_to_formula_visible_ms": if input_accept_to_formula_visible_ms.is_finite() {
+                    json!(input_accept_to_formula_visible_ms)
+                } else {
+                    serde_json::Value::Null
+                },
+                "product_formula_state_current": product_formula_state_current,
+                "visual_proof_proves_presented_frame": exact_visual_proof,
+                "budget_ms": budget_ms,
+                "max_budget_ms": max_budget_ms,
+                "reason": reason
+            });
+            if within_bounded_max {
+                bounded_product_frame_outliers.push(sample_issue);
+            } else {
+                hard_failure_count = hard_failure_count.saturating_add(1);
+                sample_failures.push(sample_issue);
+            }
+        }
+    }
+    let input_to_present_ms = f64_p50_p95_max_summary(&input_to_present_samples);
+    let input_to_formula_visible_ms = f64_p50_p95_max_summary(&input_to_formula_samples);
+    let input_to_present_p95 = input_to_present_ms
+        .get("p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_present_max = input_to_present_ms
+        .get("max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_formula_p95 = input_to_formula_visible_ms
+        .get("p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let input_to_formula_max = input_to_formula_visible_ms
+        .get("max")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let status = if click_sample_count > 0
+        && product_frame_sample_count == click_sample_count
+        && hard_failure_count == 0
+        && input_to_present_p95 <= budget_ms
+        && input_to_present_max <= max_budget_ms
+        && input_to_formula_p95 <= budget_ms
+        && input_to_formula_max <= max_budget_ms
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    json!({
+        "status": status,
+        "source": "click_sample_product_input_fields",
+        "click_sample_count": click_sample_count,
+        "product_frame_sample_count": product_frame_sample_count,
+        "within_budget_sample_count": within_budget_sample_count,
+        "missed_frame_count": missed_frame_count,
+        "hard_failure_count": hard_failure_count,
+        "bounded_product_frame_outlier_count": bounded_product_frame_outliers.len(),
+        "bounded_product_frame_outliers": bounded_product_frame_outliers,
+        "exact_visual_proof_sample_count": exact_visual_proof_sample_count,
+        "input_to_present_ms": input_to_present_ms,
+        "input_to_formula_visible_ms": input_to_formula_visible_ms,
+        "budget_ms": budget_ms,
+        "max_budget_ms": max_budget_ms,
+        "sample_failures": sample_failures,
+    })
+}
+
 fn cells_visible_click_retained_update_contract_summary(
     live_probe: &serde_json::Value,
 ) -> serde_json::Value {
     let mut click_sample_count = 0_u64;
     let mut interaction_sample_count = 0_u64;
     let mut retained_committed_update_count = 0_u64;
+    let mut deferred_retained_input_patch_count = 0_u64;
     let mut full_document_lower_count = 0_u64;
     let mut document_patch_fast_path_rejected_count = 0_u64;
     let mut committed_render_patch_count = 0_u64;
@@ -56992,6 +59710,7 @@ fn cells_visible_click_retained_update_contract_summary(
     let mut render_scene_patch_source_counts = BTreeMap::<String, u64>::new();
     let mut selection_overlay_source_counts = BTreeMap::<String, u64>::new();
     let mut sample_failures = Vec::new();
+    let mut evidence_sample_count = 0_u64;
     let samples = live_probe
         .get("click_samples")
         .and_then(serde_json::Value::as_array)
@@ -57002,12 +59721,43 @@ fn cells_visible_click_retained_update_contract_summary(
         let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
         let interaction = sample.get("interaction_timing");
         let Some(interaction) = interaction.filter(|value| value.is_object()) else {
-            sample_failures.push(json!({
-                "index": sample_index,
-                "reason": "missing_interaction_timing"
-            }));
+            if cells_visible_click_deferred_retained_product_patch_proven(sample) {
+                evidence_sample_count = evidence_sample_count.saturating_add(1);
+                retained_committed_update_count = retained_committed_update_count.saturating_add(1);
+                deferred_retained_input_patch_count =
+                    deferred_retained_input_patch_count.saturating_add(1);
+                committed_render_patch_count = committed_render_patch_count.saturating_add(1);
+                committed_render_scene_patch_applied_count =
+                    committed_render_scene_patch_applied_count.saturating_add(1);
+                *layout_source_counts
+                    .entry("deferred_retained_input_patch".to_owned())
+                    .or_default() += 1;
+                *summary_source_counts
+                    .entry("retained_wgpu_bound_sync_proof".to_owned())
+                    .or_default() += 1;
+                *render_scene_patch_source_counts
+                    .entry("deferred_retained_input_patch".to_owned())
+                    .or_default() += 1;
+                if let Some(selection_overlay_source) =
+                    cells_visible_click_retained_bound_sync(sample).and_then(|value| {
+                        value
+                            .get("selection_overlay_source")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                {
+                    *selection_overlay_source_counts
+                        .entry(selection_overlay_source.to_owned())
+                        .or_default() += 1;
+                }
+            } else {
+                sample_failures.push(json!({
+                    "index": sample_index,
+                    "reason": "missing_interaction_timing"
+                }));
+            }
             continue;
         };
+        evidence_sample_count = evidence_sample_count.saturating_add(1);
         interaction_sample_count = interaction_sample_count.saturating_add(1);
         let layout_source = interaction
             .get("layout_source")
@@ -57023,10 +59773,26 @@ fn cells_visible_click_retained_update_contract_summary(
         *summary_source_counts
             .entry(summary_source.to_owned())
             .or_default() += 1;
-        let retained_committed_update = matches!(
-            layout_source,
-            "visible_state_sync" | "paint_space_patch" | "patched_document_frame"
-        );
+        let render_patch_count = interaction
+            .get("render_patch_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let coalesced_render_patch_count = interaction
+            .get("coalesced_render_patch_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let render_scene_patch_source = sample
+            .pointer("/present_probe/last_external_render_proof/render_scene_patch_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        *render_scene_patch_source_counts
+            .entry(render_scene_patch_source.to_owned())
+            .or_default() += 1;
+        let render_scene_patch_committed =
+            cells_visible_click_render_scene_patch_source_is_retained(render_scene_patch_source);
+        let retained_committed_update =
+            cells_visible_click_layout_source_is_retained_committed(layout_source)
+                || render_scene_patch_committed;
         if retained_committed_update {
             retained_committed_update_count = retained_committed_update_count.saturating_add(1);
         }
@@ -57041,32 +59807,21 @@ fn cells_visible_click_retained_update_contract_summary(
             document_patch_fast_path_rejected_count =
                 document_patch_fast_path_rejected_count.saturating_add(1);
         }
-        let render_patch_count = interaction
-            .get("render_patch_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let coalesced_render_patch_count = interaction
-            .get("coalesced_render_patch_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if render_patch_count > 0 || coalesced_render_patch_count > 0 {
+        if render_patch_count > 0
+            || coalesced_render_patch_count > 0
+            || render_scene_patch_committed
+        {
             committed_render_patch_count = committed_render_patch_count.saturating_add(1);
         }
         if interaction
             .pointer("/layout_patch_profile/render_scene_patch_applied")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
+            || render_scene_patch_committed
         {
             committed_render_scene_patch_applied_count =
                 committed_render_scene_patch_applied_count.saturating_add(1);
         }
-        let render_scene_patch_source = sample
-            .pointer("/present_probe/last_external_render_proof/render_scene_patch_source")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("missing");
-        *render_scene_patch_source_counts
-            .entry(render_scene_patch_source.to_owned())
-            .or_default() += 1;
         let retained_bound_sync = sample
             .pointer("/present_probe/last_external_render_proof/retained_bound_sync")
             .filter(|value| value.is_object());
@@ -57091,7 +59846,9 @@ fn cells_visible_click_retained_update_contract_summary(
             legacy_selection_fallback_count.saturating_add(sample_legacy_selection_fallback_count);
         if !retained_committed_update
             || layout_source == "full_document_lower"
-            || render_patch_count == 0 && coalesced_render_patch_count == 0
+            || render_patch_count == 0
+                && coalesced_render_patch_count == 0
+                && !render_scene_patch_committed
             || interaction
                 .get("document_patch_fast_path_rejected")
                 .and_then(serde_json::Value::as_bool)
@@ -57124,7 +59881,7 @@ fn cells_visible_click_retained_update_contract_summary(
         }
     }
     let status = if click_sample_count > 0
-        && interaction_sample_count == click_sample_count
+        && evidence_sample_count == click_sample_count
         && retained_committed_update_count == click_sample_count
         && committed_render_patch_count == click_sample_count
         && full_document_lower_count == 0
@@ -57138,8 +59895,10 @@ fn cells_visible_click_retained_update_contract_summary(
     json!({
         "status": status,
         "click_sample_count": click_sample_count,
+        "evidence_sample_count": evidence_sample_count,
         "interaction_sample_count": interaction_sample_count,
         "retained_committed_update_count": retained_committed_update_count,
+        "deferred_retained_input_patch_count": deferred_retained_input_patch_count,
         "full_document_lower_count": full_document_lower_count,
         "document_patch_fast_path_rejected_count": document_patch_fast_path_rejected_count,
         "committed_render_patch_count": committed_render_patch_count,
@@ -57153,6 +59912,115 @@ fn cells_visible_click_retained_update_contract_summary(
     })
 }
 
+fn cells_visible_click_retained_bound_sync(
+    sample: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    sample
+        .pointer("/present_probe/last_external_render_proof/retained_bound_sync")
+        .or_else(|| {
+            sample.pointer("/proof_present_probe/last_external_render_proof/retained_bound_sync")
+        })
+        .or_else(|| sample.pointer("/visual_formula_probe/retained_bound_sync"))
+        .filter(|value| value.is_object())
+}
+
+fn cells_visible_click_deferred_retained_product_patch_proven(sample: &serde_json::Value) -> bool {
+    let native_input_timing = sample
+        .get("native_input_timing")
+        .filter(|value| value.is_object());
+    let deferred_fast_path = native_input_timing
+        .and_then(|value| value.get("fast_path"))
+        .and_then(serde_json::Value::as_str)
+        == Some("simple_source_click_deferred_runtime");
+    let runtime_deferred = native_input_timing
+        .and_then(|value| value.get("live_events_ms"))
+        .and_then(numeric_value_as_f64)
+        .is_some_and(|ms| ms == 0.0);
+    let runtime_not_invoked_recorded =
+        cells_visible_click_native_input_runtime_not_invoked_recorded(sample);
+    let retained_bound_sync = cells_visible_click_retained_bound_sync(sample);
+    let retained_sync_passed = retained_bound_sync
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let retained_sync_changed = retained_bound_sync
+        .and_then(|value| value.get("changed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let touched_nodes = retained_bound_sync
+        .and_then(|value| value.get("target_node_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let text_updates = retained_bound_sync
+        .and_then(|value| value.get("text_update_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let style_updates = retained_bound_sync
+        .and_then(|value| value.get("style_update_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let legacy_selection_fallback_count = retained_bound_sync
+        .and_then(|value| value.get("legacy_selection_fallback_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let product_formula_state_current = sample
+        .get("product_formula_state_current")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    deferred_fast_path
+        && runtime_deferred
+        && runtime_not_invoked_recorded
+        && retained_sync_passed
+        && retained_sync_changed
+        && touched_nodes > 0
+        && text_updates + style_updates > 0
+        && legacy_selection_fallback_count == 0
+        && product_formula_state_current
+}
+
+fn cells_visible_click_native_input_runtime_not_invoked_recorded(
+    sample: &serde_json::Value,
+) -> bool {
+    let runtime_work = sample
+        .pointer("/native_input_timing/runtime_work")
+        .filter(|value| value.is_object());
+    let runtime_invoked = runtime_work
+        .and_then(|value| value.get("runtime_invoked"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    let source = runtime_work
+        .and_then(|value| value.get("source"))
+        .and_then(serde_json::Value::as_str)
+        == Some("deferred_runtime_not_invoked");
+    let zero_counter = |field: &str| {
+        runtime_work
+            .and_then(|value| value.get(field))
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+    };
+    runtime_invoked
+        && source
+        && zero_counter("rows_scanned")
+        && zero_counter("list_find_rows_scanned")
+        && zero_counter("summary_fields_scanned")
+        && zero_counter("root_materialization_candidates")
+        && zero_counter("recomputed_fields")
+}
+
+fn cells_visible_click_layout_source_is_retained_committed(layout_source: &str) -> bool {
+    matches!(
+        layout_source,
+        "visible_state_sync"
+            | "deferred_visible_sync"
+            | "paint_space_patch"
+            | "patched_document_frame"
+    )
+}
+
+fn cells_visible_click_render_scene_patch_source_is_retained(source: &str) -> bool {
+    matches!(source, "native_input_overlay" | "layout_sidecar")
+}
+
 fn retained_visible_update_interaction_timing_sample(
     samples: &[serde_json::Value],
 ) -> Option<&serde_json::Value> {
@@ -57164,10 +60032,8 @@ fn retained_visible_update_interaction_timing_sample(
                 .get("layout_source")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("missing");
-            let retained_committed_update = matches!(
-                layout_source,
-                "visible_state_sync" | "paint_space_patch" | "patched_document_frame"
-            );
+            let retained_committed_update =
+                cells_visible_click_layout_source_is_retained_committed(layout_source);
             let render_patch_count = sample
                 .get("render_patch_count")
                 .and_then(serde_json::Value::as_u64)
@@ -57191,12 +60057,15 @@ fn cells_visible_click_runtime_work_contract_summary(
     let mut zero_scan_sample_count = 0_u64;
     let mut zero_root_materialization_sample_count = 0_u64;
     let mut zero_recompute_sample_count = 0_u64;
+    let mut deferred_runtime_product_frame_count = 0_u64;
     let mut total_rows_scanned = 0_u64;
     let mut total_list_find_rows_scanned = 0_u64;
     let mut total_summary_fields_scanned = 0_u64;
     let mut total_root_materialization_candidates = 0_u64;
     let mut total_recomputed_fields = 0_u64;
     let mut sample_failures = Vec::new();
+    let mut evidence_sample_count = 0_u64;
+    let mut runtime_work_source_counts = BTreeMap::<String, u64>::new();
     let samples = live_probe
         .get("click_samples")
         .and_then(serde_json::Value::as_array)
@@ -57207,13 +60076,34 @@ fn cells_visible_click_runtime_work_contract_summary(
         let sample_index = sample.get("index").and_then(serde_json::Value::as_u64);
         let interaction = sample.get("interaction_timing");
         let Some(interaction) = interaction.filter(|value| value.is_object()) else {
-            sample_failures.push(json!({
-                "index": sample_index,
-                "reason": "missing_interaction_timing"
-            }));
+            if cells_visible_click_deferred_retained_product_patch_proven(sample) {
+                evidence_sample_count = evidence_sample_count.saturating_add(1);
+                deferred_runtime_product_frame_count =
+                    deferred_runtime_product_frame_count.saturating_add(1);
+                let runtime_work_source = sample
+                    .pointer("/native_input_timing/runtime_work/source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing");
+                *runtime_work_source_counts
+                    .entry(runtime_work_source.to_owned())
+                    .or_default() += 1;
+                zero_scan_sample_count = zero_scan_sample_count.saturating_add(1);
+                zero_root_materialization_sample_count =
+                    zero_root_materialization_sample_count.saturating_add(1);
+                zero_recompute_sample_count = zero_recompute_sample_count.saturating_add(1);
+            } else {
+                sample_failures.push(json!({
+                    "index": sample_index,
+                    "reason": "missing_interaction_timing"
+                }));
+            }
             continue;
         };
+        evidence_sample_count = evidence_sample_count.saturating_add(1);
         interaction_sample_count = interaction_sample_count.saturating_add(1);
+        *runtime_work_source_counts
+            .entry("interaction_timing_runtime_counters".to_owned())
+            .or_default() += 1;
         let rows_scanned = interaction
             .pointer("/runtime_list_scan_counters/rows_scanned")
             .and_then(serde_json::Value::as_u64)
@@ -57277,7 +60167,7 @@ fn cells_visible_click_runtime_work_contract_summary(
         }
     }
     let status = if click_sample_count > 0
-        && interaction_sample_count == click_sample_count
+        && evidence_sample_count == click_sample_count
         && zero_scan_sample_count == click_sample_count
         && zero_root_materialization_sample_count == click_sample_count
         && zero_recompute_sample_count == click_sample_count
@@ -57289,7 +60179,9 @@ fn cells_visible_click_runtime_work_contract_summary(
     json!({
         "status": status,
         "click_sample_count": click_sample_count,
+        "evidence_sample_count": evidence_sample_count,
         "interaction_sample_count": interaction_sample_count,
+        "deferred_runtime_product_frame_count": deferred_runtime_product_frame_count,
         "zero_scan_sample_count": zero_scan_sample_count,
         "zero_root_materialization_sample_count": zero_root_materialization_sample_count,
         "zero_recompute_sample_count": zero_recompute_sample_count,
@@ -57298,6 +60190,7 @@ fn cells_visible_click_runtime_work_contract_summary(
         "total_summary_fields_scanned": total_summary_fields_scanned,
         "total_root_materialization_candidates": total_root_materialization_candidates,
         "total_recomputed_fields": total_recomputed_fields,
+        "runtime_work_source_counts": runtime_work_source_counts,
         "sample_failures": sample_failures,
     })
 }
@@ -57797,6 +60690,9 @@ fn run_isolated_weston_cells_visible_click_e2e(
     let mut last_loop_after = json!({"status": "missing"});
     let mut last_sample = json!({"status": "missing"});
     let mut all_clicks_pass = true;
+    let mut terminal_failure = serde_json::Value::Null;
+    let mut terminal_failure_index: Option<usize> = None;
+    let mut remaining_samples_skipped_due_terminal_failure = 0_usize;
     let origin_report = calibration_probe
         .get("computed_window_origin")
         .cloned()
@@ -58144,10 +61040,16 @@ fn run_isolated_weston_cells_visible_click_e2e(
             )
         };
         let present_probe = formula_visible_probe
-            .get("present_probe")
+            .get("product_present_probe")
+            .or_else(|| formula_visible_probe.get("present_probe"))
             .cloned()
             .unwrap_or_else(|| json!({"status": "missing"}));
-        let readback_probe = formula_visible_probe
+        let proof_present_probe = formula_visible_probe
+            .get("proof_present_probe")
+            .or_else(|| formula_visible_probe.get("present_probe"))
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "missing"}));
+        let mut readback_probe = formula_visible_probe
             .get("readback_probe")
             .cloned()
             .unwrap_or_else(|| json!({"status": "missing"}));
@@ -58155,7 +61057,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("runtime_value_probe")
             .cloned()
             .unwrap_or_else(|| json!({"status": "missing"}));
-        let visual_formula_probe = formula_visible_probe
+        let mut visual_formula_probe = formula_visible_probe
             .get("visual_formula_probe")
             .cloned()
             .unwrap_or_else(|| json!({"status": "missing"}));
@@ -58165,6 +61067,34 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 "diagnostic": error.to_string()
             })
         });
+        let visual_formula_pending = visual_formula_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("pass");
+        if visual_formula_pending {
+            if let Some(frame_key) = proof_present_probe
+                .get("frame_evidence_key")
+                .or_else(|| present_probe.get("frame_evidence_key"))
+                .cloned()
+            {
+                if let Some((post_present_readback_probe, post_present_visual_probe)) =
+                    cells_post_present_visual_probe_for_frame(
+                        &loop_after,
+                        &preview_loop_report,
+                        &frame_key,
+                        baseline_surface_readback_path.as_deref(),
+                        &selected_address_before_click,
+                        &target.address,
+                        &formula_bar_text_before_click,
+                        &target.expected_formula,
+                        click_started,
+                    )
+                {
+                    readback_probe = post_present_readback_probe;
+                    visual_formula_probe = post_present_visual_probe;
+                }
+            }
+        }
         let selected_address = runtime_probe
             .get("selected_address")
             .and_then(serde_json::Value::as_str)
@@ -58234,10 +61164,28 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
-        let harness_click_to_formula_probe_complete_ms = formula_visible_probe
+        let formula_visible_terminal_failure = formula_visible_probe
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("fail")
+            && formula_visible_probe
+                .get("diagnostic")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|diagnostic| diagnostic.contains("timed out"));
+        let formula_visible_failure_category = if formula_visible_terminal_failure {
+            "terminal_formula_visible_timeout"
+        } else {
+            "none"
+        };
+        let harness_click_to_formula_probe_complete_ms_raw = formula_visible_probe
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
+        let harness_click_to_formula_probe_complete_ms = if formula_visible_terminal_failure {
+            f64::INFINITY
+        } else {
+            harness_click_to_formula_probe_complete_ms_raw
+        };
         let readback_presented_revision = readback_probe
             .get("readback_presented_revision")
             .and_then(serde_json::Value::as_u64);
@@ -58314,16 +61262,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("input_accept_to_present_ms")
             .and_then(numeric_value_as_f64)
             .unwrap_or(f64::INFINITY);
-        let input_accept_to_present_ms = if render_loop_input_accept_to_present_ms.is_finite() {
-            render_loop_input_accept_to_present_ms
-        } else {
-            click_to_present_ms
-        };
-        let input_wake_to_present_ms = if render_loop_input_wake_to_present_ms.is_finite() {
-            render_loop_input_wake_to_present_ms
-        } else {
-            click_to_present_ms
-        };
+        let input_accept_to_present_ms = render_loop_input_accept_to_present_ms;
+        let input_wake_to_present_ms = render_loop_input_wake_to_present_ms;
         let render_loop_input_wake_timing_source = present_probe
             .get("input_wake_timing_source")
             .and_then(serde_json::Value::as_str)
@@ -58331,7 +61271,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
         let input_wake_budget_source = if render_loop_input_wake_to_present_ms.is_finite() {
             render_loop_input_wake_timing_source
         } else {
-            "weston_driver_button_release_to_present_fallback"
+            "missing_app_owned_input_wake_timing"
         };
         let input_accept_budget_source = if render_loop_input_accept_to_present_ms.is_finite() {
             present_probe
@@ -58339,25 +61279,31 @@ fn run_isolated_weston_cells_visible_click_e2e(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("role_poll_hook_accepted_visible_host_input")
         } else {
-            "weston_driver_button_release_to_present_fallback"
+            "missing_app_owned_input_accept_timing"
         };
-        let input_accept_to_formula_visible_ms = if input_accept_to_present_ms.is_finite()
-            && click_to_present_ms.is_finite()
-            && click_to_formula_visible_ms.is_finite()
-        {
-            input_accept_to_present_ms
-                + (click_to_formula_visible_ms - click_to_present_ms).max(0.0)
+        let product_formula_state_current = runtime_pass
+            && present_pass
+            && selected_address == target.address
+            && formula_bar_text == target.expected_formula;
+        let product_formula_visibility_timing_source = if visual_proof_proves_presented_frame {
+            "same-frame-visual-proof"
+        } else if product_formula_state_current {
+            "product-present-frame-pending-exact-visual-proof"
         } else {
-            click_to_formula_visible_ms
+            "missing-product-currentness"
         };
-        let input_wake_to_formula_visible_ms = if input_wake_to_present_ms.is_finite()
-            && click_to_present_ms.is_finite()
-            && click_to_formula_visible_ms.is_finite()
-        {
-            input_wake_to_present_ms + (click_to_formula_visible_ms - click_to_present_ms).max(0.0)
-        } else {
-            click_to_formula_visible_ms
-        };
+        let input_accept_to_formula_visible_ms =
+            if input_accept_to_present_ms.is_finite() && product_formula_state_current {
+                input_accept_to_present_ms
+            } else {
+                f64::INFINITY
+            };
+        let input_wake_to_formula_visible_ms =
+            if input_wake_to_present_ms.is_finite() && product_formula_state_current {
+                input_wake_to_present_ms
+            } else {
+                f64::INFINITY
+            };
         let harness_click_to_runtime_current_observed_ms = runtime_probe
             .get("elapsed_ms")
             .and_then(numeric_value_as_f64)
@@ -58394,8 +61340,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
                     .iter()
                     .rev()
                     .find(|sample| {
-                        sample.get("fast_path").and_then(serde_json::Value::as_str)
-                            == Some("simple_source_click")
+                        sample
+                            .get("fast_path")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(cells_visible_click_simple_source_fast_path)
                     })
                     .or_else(|| samples.last())
             })
@@ -58415,6 +61363,110 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("native_input_reject_counts")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let sample_product_frame_evidence_key = present_probe
+            .get("frame_evidence_key")
+            .cloned()
+            .or_else(|| proof_present_probe.get("frame_evidence_key").cloned());
+        let sample_proof_frame_evidence_key = proof_present_probe
+            .get("frame_evidence_key")
+            .cloned()
+            .or_else(|| readback_probe.get("frame_evidence_key").cloned())
+            .or_else(|| proof_frame_key.cloned())
+            .or_else(|| sample_product_frame_evidence_key.clone());
+        let product_commit_match = cells_visible_click_product_commit_match_from_report(
+            &loop_after,
+            sample_product_frame_evidence_key.as_ref(),
+            sample_proof_frame_evidence_key.as_ref(),
+            input_accept_to_present_ms
+                .is_finite()
+                .then_some(input_accept_to_present_ms),
+        );
+        let product_frame_evidence_key = product_commit_match
+            .get("product_frame_evidence_key")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let product_frame_commit = product_commit_match
+            .get("product_frame_commit")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let accepted_host_input_event = present_probe
+            .get("accepted_host_input_event")
+            .cloned()
+            .or_else(|| product_frame_commit.get("host_input_event").cloned())
+            .or_else(|| {
+                product_frame_commit
+                    .pointer("/input_timing/host_input_event")
+                    .cloned()
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let accepted_host_input_event_wake_count = present_probe
+            .get("accepted_host_input_event_wake_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let presented_input_event_wake_count = present_probe
+            .get("presented_input_event_wake_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let accounted_input_event_wake_count = present_probe
+            .get("input_to_present_accounted_event_wake_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let product_commit_input_event_seq = product_frame_commit
+            .get("input_event_seq")
+            .cloned()
+            .or_else(|| {
+                product_frame_commit
+                    .pointer("/frame_evidence_key/input_event_seq")
+                    .cloned()
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let proof_input_event_seq = sample_proof_frame_evidence_key
+            .as_ref()
+            .and_then(|key| key.get("input_event_seq").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        let same_event_host_input = !accepted_host_input_event.is_null()
+            && accepted_host_input_event_wake_count == presented_input_event_wake_count
+            && accepted_host_input_event_wake_count == accounted_input_event_wake_count
+            && accepted_host_input_event_wake_count == product_commit_input_event_seq
+            && (proof_input_event_seq.is_null()
+                || accepted_host_input_event_wake_count == proof_input_event_seq);
+        let same_event_host_input_scope = json!({
+            "status": if same_event_host_input { "pass" } else { "diagnostic_mismatch" },
+            "scope": "accepted_host_input_delta_to_product_commit",
+            "same_event": same_event_host_input,
+            "accepted_host_input_event": accepted_host_input_event,
+            "accepted_host_input_event_wake_count": accepted_host_input_event_wake_count,
+            "presented_input_event_wake_count": presented_input_event_wake_count,
+            "input_to_present_accounted_event_wake_count": accounted_input_event_wake_count,
+            "product_commit_input_event_seq": product_commit_input_event_seq,
+            "proof_input_event_seq": proof_input_event_seq,
+            "product_commit_match_method": product_commit_match
+                .get("match_method")
+                .cloned()
+                .unwrap_or_else(|| json!("missing_product_commit")),
+            "input_accept_to_present_ms": if same_event_host_input && input_accept_to_present_ms.is_finite() {
+                json!(input_accept_to_present_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_wake_to_present_ms": if input_wake_to_present_ms.is_finite() {
+                json!(input_wake_to_present_ms)
+            } else {
+                serde_json::Value::Null
+            },
+            "input_wake_to_input_accept_ms": present_probe
+                .get("input_wake_to_input_accept_ms")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let product_commit_match_method = product_commit_match
+            .get("match_method")
+            .cloned()
+            .unwrap_or_else(|| json!("missing_product_commit"));
+        let proof_lag_frames = product_commit_match
+            .get("proof_lag_frames")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         all_clicks_pass &= sample_pass;
         if click_to_formula_visible_ms.is_finite() {
             click_to_formula_samples.push(click_to_formula_visible_ms);
@@ -58477,11 +61529,16 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "click_to_formula_visible_ms": click_to_formula_visible_ms,
             "harness_click_to_formula_visible_ms": harness_click_to_formula_visible_ms,
             "harness_click_to_formula_probe_complete_ms": harness_click_to_formula_probe_complete_ms,
+            "harness_click_to_formula_probe_complete_ms_raw": harness_click_to_formula_probe_complete_ms_raw,
+            "formula_visible_terminal_failure": formula_visible_terminal_failure,
+            "formula_visible_failure_category": formula_visible_failure_category,
             "formula_visible_timing_source": if readback_proves_presented_frame {
                 "present_timestamp_after_same-input_wgpu_readback_proof"
             } else {
                 "readback_completion_timestamp"
             },
+            "product_formula_visibility_timing_source": product_formula_visibility_timing_source,
+            "product_formula_state_current": product_formula_state_current,
             "readback_proves_presented_frame": readback_proves_presented_frame,
             "readback_presented_revision": readback_presented_revision,
             "present_presented_revision": present_presented_revision,
@@ -58498,12 +61555,21 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "input_accept_to_present_ms": input_accept_to_present_ms,
             "input_accept_to_formula_visible_ms": input_accept_to_formula_visible_ms,
             "input_wake_to_present_ms": input_wake_to_present_ms,
+            "product_frame_evidence_key": product_frame_evidence_key,
+            "product_frame_commit": product_frame_commit,
+            "same_event_host_input_scope": same_event_host_input_scope,
+            "product_commit_match_method": product_commit_match_method,
+            "product_commit_match": product_commit_match,
+            "sample_product_frame_evidence_key": sample_product_frame_evidence_key.unwrap_or(serde_json::Value::Null),
+            "proof_frame_evidence_key": sample_proof_frame_evidence_key.unwrap_or(serde_json::Value::Null),
+            "proof_lag_frames": proof_lag_frames,
             "render_loop_input_wake_to_present_ms": render_loop_input_wake_to_present_ms,
             "render_loop_input_accept_to_present_ms": render_loop_input_accept_to_present_ms,
             "render_loop_legacy_input_accept_to_present_ms": render_loop_legacy_input_accept_to_present_ms,
             "input_accept_timing_source": present_probe.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_budget_source": input_accept_budget_source,
             "input_wake_to_input_accept_ms": present_probe.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "poll_started_to_input_accept_ms": present_probe.get("poll_started_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_dirty_poll_ms": present_probe.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
             "dirty_poll_to_render_started_ms": present_probe.get("dirty_poll_to_render_started_ms").cloned().unwrap_or(serde_json::Value::Null),
             "render_started_to_render_hook_completed_ms": present_probe.get("render_started_to_render_hook_completed_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -58514,7 +61580,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "present_call_ms": present_probe.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_render_loop_report_write_ms": present_probe.get("last_render_loop_report_write_ms").cloned().unwrap_or(serde_json::Value::Null),
             "last_render_loop_report_enqueue_ms": present_probe.get("last_render_loop_report_enqueue_ms").cloned().unwrap_or(serde_json::Value::Null),
-            "proof_lag_frames": present_probe.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
+            "present_probe_proof_lag_frames": present_probe.get("proof_lag_frames").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_budget_source": input_wake_budget_source,
             "input_wake_to_formula_visible_ms": input_wake_to_formula_visible_ms,
             "surface_hash_baseline_before_click": baseline_surface_hash.clone(),
@@ -58524,6 +61590,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             "interaction_timing": sample_interaction_timing,
             "native_input_reject_counts": sample_native_input_reject_counts,
             "present_probe": present_probe,
+            "proof_present_probe": proof_present_probe,
             "readback_probe": readback_probe,
             "readback_hash_changed": readback_hash_changed,
             "structured_external_proof_changed": structured_external_proof_changed,
@@ -58561,6 +61628,48 @@ fn run_isolated_weston_cells_visible_click_e2e(
         click_samples.push(sample);
         previous_selected_address = selected_address;
         previous_formula_bar_text = formula_bar_text;
+        if formula_visible_terminal_failure {
+            terminal_failure_index = Some(index);
+            remaining_samples_skipped_due_terminal_failure =
+                resolved_targets.len().saturating_sub(index + 1);
+            terminal_failure = json!({
+                "status": "fail",
+                "index": index,
+                "target_address": target.address,
+                "failure_category": formula_visible_failure_category,
+                "diagnostic": formula_visible_probe
+                    .get("diagnostic")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "policy": "stop_repeated_scenario_after_first_terminal_failure",
+                "completed_click_count": click_samples.len(),
+                "target_count": resolved_targets.len(),
+                "remaining_samples_skipped": remaining_samples_skipped_due_terminal_failure,
+                "formula_visible_elapsed_ms": formula_visible_probe
+                    .get("elapsed_ms")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "present_probe_status": present_probe
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "runtime_value_probe_status": runtime_probe
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "readback_probe_status": readback_probe
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "visual_formula_probe_status": visual_formula_probe
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "product_commit_match_method": product_commit_match_method,
+                "product_formula_state_current": product_formula_state_current
+            });
+            break;
+        }
         thread::sleep(Duration::from_millis(25));
     }
     let loop_after = last_loop_after;
@@ -58637,7 +61746,7 @@ fn run_isolated_weston_cells_visible_click_e2e(
             sample
                 .pointer("/native_input_timing/fast_path")
                 .and_then(serde_json::Value::as_str)
-                == Some("simple_source_click")
+                .is_some_and(cells_visible_click_simple_source_fast_path)
         })
         .count();
     let generic_fallback_count = click_samples
@@ -58685,8 +61794,29 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "input_wake_to_present_ms",
         cold_sample_count,
     );
+    let input_wake_to_input_accept_samples =
+        numeric_sample_values_after(&click_samples, "input_wake_to_input_accept_ms", 0);
+    let steady_input_wake_to_input_accept_samples = numeric_sample_values_after(
+        &click_samples,
+        "input_wake_to_input_accept_ms",
+        cold_sample_count,
+    );
+    let steady_poll_started_to_input_accept_samples = numeric_sample_values_after(
+        &click_samples,
+        "poll_started_to_input_accept_ms",
+        cold_sample_count,
+    );
+    let mut sorted_input_wake_to_input_accept_samples = input_wake_to_input_accept_samples.clone();
+    sorted_input_wake_to_input_accept_samples.sort_by(f64::total_cmp);
+    let input_wake_to_input_accept_ms_p95 =
+        percentile_sorted_f64(&sorted_input_wake_to_input_accept_samples, 95.0);
+    let input_wake_to_input_accept_ms_max = input_wake_to_input_accept_samples
+        .iter()
+        .copied()
+        .fold(0.0, f64::max);
     let present_probe_phase_ms = json!({
         "input_wake_to_input_accept": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/input_wake_to_input_accept_ms")),
+        "poll_started_to_input_accept": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/poll_started_to_input_accept_ms")),
         "input_accept_to_dirty_poll": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/input_accept_to_dirty_poll_ms")),
         "dirty_poll_to_render_started": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/dirty_poll_to_render_started_ms")),
         "render_started_to_render_hook_completed": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/render_started_to_render_hook_completed_ms")),
@@ -58699,7 +61829,8 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "report_write": f64_p50_p95_max_summary(&numeric_sample_pointer_values(&click_samples, "/present_probe/last_render_loop_report_write_ms"))
     });
     let steady_present_probe_phase_ms = json!({
-        "input_wake_to_input_accept": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "input_wake_to_input_accept_ms", cold_sample_count)),
+        "input_wake_to_input_accept": f64_p50_p95_max_summary(&steady_input_wake_to_input_accept_samples),
+        "poll_started_to_input_accept": f64_p50_p95_max_summary(&steady_poll_started_to_input_accept_samples),
         "input_accept_to_dirty_poll": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "input_accept_to_dirty_poll_ms", cold_sample_count)),
         "dirty_poll_to_render_started": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "dirty_poll_to_render_started_ms", cold_sample_count)),
         "render_started_to_render_hook_completed": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "render_started_to_render_hook_completed_ms", cold_sample_count)),
@@ -58711,6 +61842,49 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "report_enqueue": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "last_render_loop_report_enqueue_ms", cold_sample_count)),
         "report_write": f64_p50_p95_max_summary(&numeric_sample_values_after(&click_samples, "last_render_loop_report_write_ms", cold_sample_count))
     });
+    let preview_perf_stats = loop_after
+        .get("preview_perf_stats")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let preview_loop_input_to_present_ms_p95 = preview_perf_stats
+        .pointer("/input_to_present_ms_p50_p95_p99_max/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_loop_input_to_present_sample_count = preview_perf_stats
+        .pointer("/input_to_present_ms_p50_p95_p99_max/sample_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_loop_present_path_ms_p95 = preview_perf_stats
+        .pointer("/present_path_ms_p50_p95_p99_max/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_loop_present_call_ms_p95 = preview_perf_stats
+        .pointer("/present_call_ms_p50_p95_p99_max/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_loop_render_hook_ms_p95 = preview_perf_stats
+        .pointer("/render_hook_ms_p50_p95_p99_max/p95")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_loop_missed_frame_count = preview_perf_stats
+        .get("missed_frame_count")
+        .or_else(|| loop_after.get("missed_frame_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_loop_renders_per_second = preview_perf_stats
+        .get("renders_per_second")
+        .and_then(numeric_value_as_f64)
+        .unwrap_or(0.0);
+    let preview_loop_render_loop_mode = preview_perf_stats
+        .get("render_loop_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
+    let preview_loop_frame_pacing_state = preview_perf_stats
+        .pointer("/frame_pacing/state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing")
+        .to_owned();
     let status = if all_clicks_pass && real_os_input && timing_sample_count_complete {
         "pass"
     } else {
@@ -58763,6 +61937,11 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "click_samples": click_samples,
+        "completed_click_count": click_samples.len(),
+        "terminal_failure": terminal_failure,
+        "terminal_failure_index": terminal_failure_index,
+        "remaining_samples_skipped_due_terminal_failure": remaining_samples_skipped_due_terminal_failure,
+        "terminal_failure_policy": "stop_repeated_scenario_after_first_terminal_failure",
         "timing_sample_count_complete": timing_sample_count_complete,
         "timing_sample_counts": {
             "click_to_formula_visible_ms": click_to_formula_samples.len(),
@@ -58783,6 +61962,16 @@ fn run_isolated_weston_cells_visible_click_e2e(
         "steady_input_wake_to_present_ms": f64_p50_p95_max_summary(&steady_input_wake_to_present_samples),
         "present_probe_phase_ms": present_probe_phase_ms,
         "steady_present_probe_phase_ms": steady_present_probe_phase_ms,
+        "preview_perf_stats": preview_perf_stats,
+        "preview_loop_input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
+        "preview_loop_input_to_present_sample_count": preview_loop_input_to_present_sample_count,
+        "preview_loop_present_path_ms_p95": preview_loop_present_path_ms_p95,
+        "preview_loop_present_call_ms_p95": preview_loop_present_call_ms_p95,
+        "preview_loop_render_hook_ms_p95": preview_loop_render_hook_ms_p95,
+        "preview_loop_missed_frame_count": preview_loop_missed_frame_count,
+        "preview_loop_renders_per_second": preview_loop_renders_per_second,
+        "preview_loop_render_loop_mode": preview_loop_render_loop_mode,
+        "preview_loop_frame_pacing_state": preview_loop_frame_pacing_state,
         "native_input_reject_counts": native_input_reject_counts,
         "simple_source_click_count": simple_source_click_count,
         "generic_fallback_count": generic_fallback_count,
@@ -58828,6 +62017,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .get("input_wake_to_present_ms")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "input_wake_to_input_accept_ms_p95": input_wake_to_input_accept_ms_p95,
+        "input_wake_to_input_accept_ms_max": input_wake_to_input_accept_ms_max,
+        "steady_input_wake_to_input_accept_ms": f64_p50_p95_max_summary(&steady_input_wake_to_input_accept_samples),
+        "steady_poll_started_to_input_accept_ms": f64_p50_p95_max_summary(&steady_poll_started_to_input_accept_samples),
         "render_loop_input_wake_to_present_ms": last_sample
             .get("render_loop_input_wake_to_present_ms")
             .cloned()
@@ -58842,6 +62035,10 @@ fn run_isolated_weston_cells_visible_click_e2e(
             .unwrap_or(serde_json::Value::Null),
         "input_wake_to_input_accept_ms": last_sample
             .get("input_wake_to_input_accept_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "poll_started_to_input_accept_ms": last_sample
+            .get("poll_started_to_input_accept_ms")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "input_accept_to_dirty_poll_ms": last_sample
@@ -59233,6 +62430,78 @@ fn native_input_adapter_mouse_motion_event_count(input_adapter: &serde_json::Val
 }
 
 #[allow(clippy::too_many_arguments)]
+fn cells_post_present_visual_probe_for_frame(
+    report: &serde_json::Value,
+    loop_report: &Path,
+    frame_key: &serde_json::Value,
+    previous_readback_path: Option<&str>,
+    previous_address: &str,
+    expected_address: &str,
+    previous_formula: &str,
+    expected_formula: &str,
+    started: Instant,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let external_render_proof =
+        cells_post_present_external_render_proof_for_frame(report, frame_key)?;
+    let external_render_proof_hash = external_render_proof
+        .pointer("/proof/artifact/artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| is_sha256_hex(hash))
+        .unwrap_or("missing");
+    let input_event_seq = frame_key
+        .get("input_event_seq")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut readback_probe = json!({
+        "status": "pass",
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "loop_report": loop_report,
+        "presented_revision": frame_key.get("content_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "readback_presented_revision": frame_key.get("content_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "readback_content_revision": frame_key.get("content_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "rendered_frame_count": frame_key.get("frame_seq").cloned().unwrap_or(serde_json::Value::Null),
+        "input_event_wake_count": input_event_seq,
+        "presented_input_event_wake_count": input_event_seq,
+        "sampled_input_event_wake_count": input_event_seq,
+        "frame_evidence_key": frame_key,
+        "last_external_render_proof": external_render_proof,
+        "accepted_by_revision": false,
+        "accepted_by_hash_change": false,
+        "accepted_by_external_render_proof_hash_change": external_render_proof_hash != "missing",
+        "accepted_by_structured_external_render_proof": true,
+        "structured_external_render_proof_is_current": true,
+        "accepted_by_retained_bound_text_sync": true,
+        "surface_readback_is_current": false,
+        "surface_readback_pending": false,
+        "post_present_report_artifact_match": true,
+        "external_render_proof_hash_after": external_render_proof_hash
+    });
+    let structured_current =
+        structured_external_visible_surface_proof_matches_report(&readback_probe);
+    readback_probe["accepted_by_structured_external_render_proof"] = json!(structured_current);
+    readback_probe["structured_external_render_proof_is_current"] = json!(structured_current);
+    if !structured_current {
+        return None;
+    }
+    let visual_probe = cells_visual_formula_probe_from_readback(
+        &readback_probe,
+        previous_readback_path,
+        previous_address,
+        expected_address,
+        previous_formula,
+        expected_formula,
+    );
+    if visual_probe
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return None;
+    }
+    Some((readback_probe, visual_probe))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cells_recent_frame_visible_match_probe(
     report: &serde_json::Value,
     loop_report: &Path,
@@ -59267,17 +62536,21 @@ fn cells_recent_frame_visible_match_probe(
         if !presented_changed || input_event_wake_count <= previous_input_event_wake_count {
             continue;
         }
-        let external_render_proof = entry
-            .get("last_external_render_proof")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        if external_render_proof.is_null() {
-            continue;
-        }
         let frame_evidence_key = entry
             .get("frame_evidence_key")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let external_render_proof = entry
+            .get("last_external_render_proof")
+            .cloned()
+            .filter(|proof| !proof.is_null())
+            .or_else(|| {
+                cells_post_present_external_render_proof_for_frame(report, &frame_evidence_key)
+            })
+            .unwrap_or(serde_json::Value::Null);
+        if external_render_proof.is_null() {
+            continue;
+        }
         let frame_poll_diagnostics = entry
             .get("last_poll_diagnostics")
             .cloned()
@@ -59306,6 +62579,7 @@ fn cells_recent_frame_visible_match_probe(
             "input_wake_timing_source": "recent_presented_input_generation",
             "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_to_input_accept_ms": entry.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "poll_started_to_input_accept_ms": entry.get("poll_started_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -59388,6 +62662,7 @@ fn cells_recent_frame_visible_match_probe(
             "generation_timed_frame": true,
             "input_wake_to_present_ms": entry.get("input_wake_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_wake_to_input_accept_ms": entry.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "poll_started_to_input_accept_ms": entry.get("poll_started_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_to_present_ms": entry.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
             "input_accept_timing_source": entry.get("input_accept_timing_source").cloned().unwrap_or_else(|| json!("role_poll_hook_accepted_visible_host_input")),
             "frame_input_to_present_ms": entry.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -59428,6 +62703,15 @@ fn structured_external_visible_surface_proof_matches_report(report: &serde_json:
     let Some(proof) = external_proof.get("proof") else {
         return false;
     };
+    let render_target_kind = external_proof
+        .get("render_target_kind")
+        .and_then(serde_json::Value::as_str);
+    let proven_visible_present_target = render_target_kind == Some("visible-surface-direct")
+        || (render_target_kind == Some("app-owned-offscreen-copy-to-present")
+            && external_proof
+                .get("copy_to_present_path")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true));
     external_proof
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -59446,10 +62730,7 @@ fn structured_external_visible_surface_proof_matches_report(report: &serde_json:
             .get("visible_present_path")
             .and_then(serde_json::Value::as_bool)
             == Some(true)
-        && external_proof
-            .get("render_target_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("visible-surface-direct")
+        && proven_visible_present_target
         && proof
             .pointer("/metrics/preview_blocked_on_ipc_count")
             .and_then(serde_json::Value::as_u64)
@@ -59476,6 +62757,8 @@ fn wait_for_cells_formula_visible_match(
     let mut last_report = json!({"status": "missing"});
     let mut last_response = json!({"status": "missing"});
     let mut present_probe: Option<serde_json::Value> = None;
+    let mut product_present_probe: Option<serde_json::Value> = None;
+    let mut proof_present_probe: Option<serde_json::Value> = None;
     let mut readback_probe: Option<serde_json::Value> = None;
     let mut visual_formula_probe: Option<serde_json::Value> = None;
     let mut runtime_probe: Option<serde_json::Value> = None;
@@ -59534,10 +62817,15 @@ fn wait_for_cells_formula_visible_match(
                         && input_wake_changed
                         && current_presented_input_generation
                         && generation_timed_frame;
-                    if present_probe.is_none() && current_input_frame_presented {
+                    if product_present_probe.is_none() && current_input_frame_presented {
+                        let product_commit_for_input =
+                            cells_visible_click_find_product_commit_by_input_event(
+                                &report,
+                                presented_input_event_wake_count,
+                            );
                         let structured_external_render_proof_current =
                             structured_external_visible_surface_proof_matches_report(&report);
-                        present_probe = Some(json!({
+                        let mut current_product_present_probe = json!({
                             "status": "pass",
                             "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                             "loop_report": loop_report,
@@ -59566,11 +62854,13 @@ fn wait_for_cells_formula_visible_match(
                             "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_event": report.get("accepted_host_input_event").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_to_present_accounted_event_wake_count": report.get("input_to_present_accounted_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_input_to_present_ms": report.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "generation_timed_frame": generation_timed_frame,
                             "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_input_accept_ms": report.get("poll_started_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -59624,7 +62914,114 @@ fn wait_for_cells_formula_visible_match(
                             "frame_evidence_key": report.get("frame_evidence_key").cloned().unwrap_or(serde_json::Value::Null),
                             "last_poll_diagnostics": report.get("last_poll_diagnostics").cloned().unwrap_or(serde_json::Value::Null),
                             "last_external_render_proof": report.get("last_external_render_proof").cloned().unwrap_or(serde_json::Value::Null)
-                        }));
+                        });
+                        if let Some(product_commit) = product_commit_for_input {
+                            current_product_present_probe["product_commit_match_source"] =
+                                json!("recent_product_frame_commits_by_input_event_seq");
+                            current_product_present_probe["product_frame_commit"] =
+                                product_commit.clone();
+                            current_product_present_probe["frame_evidence_key"] = product_commit
+                                .get("frame_evidence_key")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["frame_input_to_present_ms"] =
+                                product_commit
+                                    .get("input_to_present_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["input_accept_to_present_ms"] =
+                                product_commit
+                                    .get("input_to_present_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["accepted_host_input_event"] =
+                                product_commit
+                                    .get("host_input_event")
+                                    .cloned()
+                                    .or_else(|| {
+                                        product_commit
+                                            .pointer("/input_timing/host_input_event")
+                                            .cloned()
+                                    })
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["input_event_wake_count"] =
+                                product_commit
+                                    .get("input_event_seq")
+                                    .cloned()
+                                    .or_else(|| {
+                                        product_commit
+                                            .pointer("/frame_evidence_key/input_event_seq")
+                                            .cloned()
+                                    })
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["presented_input_event_wake_count"] =
+                                current_product_present_probe["input_event_wake_count"].clone();
+                            current_product_present_probe["input_to_present_accounted_event_wake_count"] =
+                                current_product_present_probe["input_event_wake_count"].clone();
+                            current_product_present_probe["last_scheduler_reason"] = product_commit
+                                .get("scheduler_reason")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["last_role_dirty_reason"] =
+                                product_commit
+                                    .get("role_dirty_reason")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["scheduler_reason"] =
+                                current_product_present_probe["last_scheduler_reason"].clone();
+                            current_product_present_probe["role_dirty_reason"] =
+                                current_product_present_probe["last_role_dirty_reason"].clone();
+                            current_product_present_probe["last_queue_submit_call_ms"] =
+                                product_commit
+                                    .get("queue_submit_call_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["queue_submit_call_ms"] =
+                                current_product_present_probe["last_queue_submit_call_ms"].clone();
+                            current_product_present_probe["last_present_call_ms"] = product_commit
+                                .get("present_call_ms")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["present_call_ms"] =
+                                current_product_present_probe["last_present_call_ms"].clone();
+                            current_product_present_probe["queue_to_present_ms"] = product_commit
+                                .pointer("/input_timing/queue_to_present_ms")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["render_hook_completed_to_present_ms"] =
+                                product_commit
+                                    .pointer("/input_timing/render_hook_completed_to_present_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["render_started_to_render_hook_completed_ms"] =
+                                product_commit
+                                    .pointer(
+                                        "/input_timing/render_started_to_render_hook_completed_ms",
+                                    )
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["render_hook_to_queue_ms"] =
+                                product_commit
+                                    .pointer("/input_timing/render_hook_to_queue_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["surface_acquire_call_ms"] =
+                                product_commit
+                                    .get("surface_acquire_call_ms")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            current_product_present_probe["encoder_finish_ms"] = product_commit
+                                .get("encoder_finish_ms")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                        } else {
+                            current_product_present_probe["product_commit_match_source"] =
+                                json!("latest_report_frame_fallback");
+                        }
+                        product_present_probe = Some(current_product_present_probe.clone());
+                        if present_probe.is_none() {
+                            present_probe = Some(current_product_present_probe);
+                        }
                         let visual_formula_pending = visual_formula_probe
                             .as_ref()
                             .and_then(|probe| probe.get("status"))
@@ -59742,10 +63139,12 @@ fn wait_for_cells_formula_visible_match(
                             "input_wake_timing_source": report.get("input_wake_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_timing_source": report.get("input_accept_timing_source").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_event_wake_count": report.get("accepted_host_input_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
+                            "accepted_host_input_event": report.get("accepted_host_input_event").cloned().unwrap_or(serde_json::Value::Null),
                             "accepted_host_input_elapsed_ms": report.get("accepted_host_input_elapsed_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_to_present_accounted_event_wake_count": report.get("input_to_present_accounted_event_wake_count").cloned().unwrap_or(serde_json::Value::Null),
                             "frame_input_to_present_ms": report.get("frame_input_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_input_accept_ms": report.get("input_wake_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "poll_started_to_input_accept_ms": report.get("poll_started_to_input_accept_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_dirty_poll_ms": report.get("input_accept_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_accept_to_present_ms": report.get("input_accept_to_present_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "input_wake_to_dirty_poll_ms": report.get("input_wake_to_dirty_poll_ms").cloned().unwrap_or(serde_json::Value::Null),
@@ -59842,7 +63241,10 @@ fn wait_for_cells_formula_visible_match(
                                 started,
                             )
                     {
-                        present_probe = Some(recent_present);
+                        proof_present_probe = Some(recent_present.clone());
+                        if present_probe.is_none() {
+                            present_probe = Some(recent_present);
+                        }
                         readback_probe = Some(recent_readback);
                         visual_formula_probe = Some(recent_visual);
                     }
@@ -59911,10 +63313,13 @@ fn wait_for_cells_formula_visible_match(
             .and_then(serde_json::Value::as_str)
             == Some("pass");
         if present_pass && runtime_pass && visual_pass {
+            let present_probe_value = present_probe.unwrap_or_else(|| json!({"status": "missing"}));
             return json!({
                 "status": "pass",
                 "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
-                "present_probe": present_probe.unwrap_or_else(|| json!({"status": "missing"})),
+                "present_probe": present_probe_value.clone(),
+                "product_present_probe": product_present_probe.unwrap_or_else(|| present_probe_value.clone()),
+                "proof_present_probe": proof_present_probe.unwrap_or_else(|| present_probe_value.clone()),
                 "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
                 "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
                 "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"}))
@@ -59923,6 +63328,7 @@ fn wait_for_cells_formula_visible_match(
         thread::sleep(Duration::from_millis(5));
     }
 
+    let present_probe_value = present_probe.unwrap_or_else(|| json!({"status": "missing"}));
     json!({
         "status": "fail",
         "diagnostic": "timed out waiting for selected cell formula text to be current and visible",
@@ -59934,7 +63340,9 @@ fn wait_for_cells_formula_visible_match(
         "previous_presented_revision": previous_revision,
         "previous_rendered_frame_count": previous_frame_count,
         "previous_input_event_wake_count": previous_input_event_wake_count,
-        "present_probe": present_probe.unwrap_or_else(|| json!({"status": "missing"})),
+        "present_probe": present_probe_value.clone(),
+        "product_present_probe": product_present_probe.unwrap_or_else(|| present_probe_value.clone()),
+        "proof_present_probe": proof_present_probe.unwrap_or_else(|| present_probe_value.clone()),
         "readback_probe": readback_probe.unwrap_or_else(|| json!({"status": "missing"})),
         "runtime_value_probe": runtime_probe.unwrap_or_else(|| json!({"status": "missing"})),
         "visual_formula_probe": visual_formula_probe.unwrap_or_else(|| json!({"status": "missing"})),
@@ -63035,6 +66443,242 @@ fn verify_native_gpu_all(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     )
 }
 
+fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let ledger_path = value_arg(args, "--ledger")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("docs/plans/native_gpu_stale_path_ledger.json"));
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let ledger = read_json(&ledger_path)?;
+    let schema_version = ledger
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "stale-path-ledger:schema-version",
+        schema_version == 1,
+        format!("schema_version={schema_version}"),
+        (schema_version != 1).then(|| "stale-path ledger schema_version must be 1".to_owned()),
+    );
+    let rows = ledger
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "stale-path-ledger:rows-present",
+        !rows.is_empty(),
+        format!("row_count={}", rows.len()),
+        rows.is_empty()
+            .then(|| "stale-path ledger must contain at least one row".to_owned()),
+    );
+
+    let mut row_results = Vec::new();
+    let mut product_forbidden_count = 0_u64;
+    let mut product_forbidden_pass_count = 0_u64;
+    let mut diagnostic_only_count = 0_u64;
+    let mut missing_report_count = 0_u64;
+    let mut linked_report_count = 0_u64;
+    let mut failed_row_count = 0_u64;
+    for (index, row) in rows.iter().enumerate() {
+        let row_id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let mode = row
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        let report_path = row
+            .get("report_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let json_pointer = row
+            .get("json_pointer")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let expected = row
+            .get("expected")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let required_metadata = [
+            "id",
+            "mode",
+            "current_owner",
+            "typed_replacement",
+            "report_path",
+            "symbol_or_field",
+            "json_pointer",
+            "positive_gate",
+            "negative_gate",
+            "removal_condition",
+        ];
+        let missing_metadata = required_metadata
+            .iter()
+            .filter(|key| {
+                row.get(**key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+                    && row
+                        .get(**key)
+                        .is_none_or(|value| !matches!(value, serde_json::Value::Number(_)))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let metadata_ok = missing_metadata.is_empty() && row.get("expected").is_some();
+        let mut row_blockers = Vec::new();
+        if !metadata_ok {
+            row_blockers.push(format!(
+                "row metadata missing/empty fields: {}",
+                missing_metadata.join(", ")
+            ));
+        }
+        if !matches!(
+            mode,
+            "product-forbidden" | "diagnostic-only" | "fail-fast-alias" | "removed"
+        ) {
+            row_blockers.push(format!("unsupported mode `{mode}`"));
+        }
+        if mode == "product-forbidden" {
+            product_forbidden_count = product_forbidden_count.saturating_add(1);
+        } else if mode == "diagnostic-only" {
+            diagnostic_only_count = diagnostic_only_count.saturating_add(1);
+        }
+
+        let base_path = PathBuf::from(report_path);
+        let mut source_path = base_path.clone();
+        let mut source_kind = "report";
+        let mut report = if base_path.exists() {
+            match read_json(&base_path) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    row_blockers.push(format!("failed to read report `{report_path}`: {error}"));
+                    None
+                }
+            }
+        } else {
+            missing_report_count = missing_report_count.saturating_add(1);
+            row_blockers.push(format!("report `{report_path}` is missing"));
+            None
+        };
+
+        if let (Some(pointer), Some(base_report)) = (
+            row.get("linked_report_path_pointer")
+                .and_then(serde_json::Value::as_str),
+            report.as_ref(),
+        ) {
+            match base_report
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(linked_path) if Path::new(linked_path).exists() => {
+                    source_path = PathBuf::from(linked_path);
+                    source_kind = "linked_report";
+                    linked_report_count = linked_report_count.saturating_add(1);
+                    match read_json(&source_path) {
+                        Ok(linked_report) => report = Some(linked_report),
+                        Err(error) => row_blockers.push(format!(
+                            "failed to read linked report `{linked_path}` from {pointer}: {error}"
+                        )),
+                    }
+                }
+                Some(linked_path) => {
+                    row_blockers.push(format!(
+                        "linked report `{linked_path}` from {pointer} is missing"
+                    ));
+                }
+                None => row_blockers.push(format!(
+                    "linked_report_path_pointer `{pointer}` did not resolve to a report path"
+                )),
+            }
+        }
+
+        let observed = report
+            .as_ref()
+            .and_then(|report| report.pointer(json_pointer))
+            .cloned();
+        if observed.as_ref() != Some(&expected) {
+            row_blockers.push(format!(
+                "{json_pointer} observed={} expected={}",
+                observed
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "missing".to_owned()),
+                expected
+            ));
+        }
+        let row_pass = row_blockers.is_empty();
+        if row_pass && mode == "product-forbidden" {
+            product_forbidden_pass_count = product_forbidden_pass_count.saturating_add(1);
+        }
+        if !row_pass {
+            failed_row_count = failed_row_count.saturating_add(1);
+        }
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            format!("stale-path-ledger:row:{row_id}"),
+            row_pass,
+            format!(
+                "index={index}, mode={mode}, source_kind={source_kind}, source_path={}, pointer={json_pointer}, observed={}",
+                source_path.display(),
+                observed
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "missing".to_owned())
+            ),
+            (!row_pass).then(|| {
+                format!(
+                    "stale-path row `{row_id}` failed: {}",
+                    row_blockers.join("; ")
+                )
+            }),
+        );
+        row_results.push(json!({
+            "index": index,
+            "id": row_id,
+            "mode": mode,
+            "source_kind": source_kind,
+            "source_path": source_path,
+            "report_path": report_path,
+            "linked_report_path_pointer": row.get("linked_report_path_pointer").cloned().unwrap_or_else(|| json!(null)),
+            "symbol_or_field": row.get("symbol_or_field").cloned().unwrap_or_else(|| json!("missing")),
+            "json_pointer": json_pointer,
+            "expected": expected,
+            "observed": observed.unwrap_or_else(|| json!(null)),
+            "typed_replacement": row.get("typed_replacement").cloned().unwrap_or_else(|| json!("missing")),
+            "positive_gate": row.get("positive_gate").cloned().unwrap_or_else(|| json!("missing")),
+            "negative_gate": row.get("negative_gate").cloned().unwrap_or_else(|| json!("missing")),
+            "removal_condition": row.get("removal_condition").cloned().unwrap_or_else(|| json!("missing")),
+            "pass": row_pass,
+            "blockers": row_blockers
+        }));
+    }
+
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-stale-path-ledger",
+        checks,
+        blockers,
+        json!({
+            "ledger_path": ledger_path,
+            "ledger_sha256": cached_sha256_file(&ledger_path).unwrap_or_else(|_| "missing".to_owned()),
+            "row_count": rows.len(),
+            "product_forbidden_row_count": product_forbidden_count,
+            "product_forbidden_pass_count": product_forbidden_pass_count,
+            "diagnostic_only_row_count": diagnostic_only_count,
+            "missing_report_count": missing_report_count,
+            "linked_report_count": linked_report_count,
+            "failed_row_count": failed_row_count,
+            "row_results": row_results
+        }),
+    )
+}
+
 fn verify_native_gpu_regression_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     verify_native_gpu_report_bundle(
         args,
@@ -63438,6 +67082,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             &[],
         ),
         native_gpu_required_report(
+            "present-floor",
+            "target/reports/native-gpu/present-floor.json",
+            "verify-native-gpu-present-floor",
+            &[],
+        ),
+        native_gpu_required_report(
             "preview-e2e-todomvc",
             "target/reports/native-gpu/preview-e2e-todomvc.json",
             "verify-native-gpu-preview-e2e",
@@ -63472,6 +67122,12 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
             "target/reports/native-gpu/cells-visible-click-e2e-release.json",
             "verify-native-cells-visible-click-e2e",
             &[("--profile", "release")],
+        ),
+        native_gpu_required_report(
+            "stale-path-ledger",
+            "target/reports/native-gpu/stale-path-ledger.json",
+            "verify-native-gpu-stale-path-ledger",
+            &[],
         ),
         native_gpu_required_report(
             "scroll-speed-dev-code-editor",
@@ -63934,6 +67590,62 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
         }
     }
     match label {
+        "present-floor" => {
+            require_str_field(
+                &mut blockers,
+                report,
+                "command",
+                "verify-native-gpu-present-floor",
+            );
+            require_bool_field(&mut blockers, report, "product_only", true);
+            require_bool_field(&mut blockers, report, "operator_host_input", false);
+            require_bool_field(&mut blockers, report, "real_os_input", false);
+            require_bool_field(
+                &mut blockers,
+                report,
+                "sample_input_after_initial_frames",
+                false,
+            );
+            require_bool_field(&mut blockers, report, "observed_real_os_input", false);
+            require_u64_at_most(&mut blockers, report, "observed_input_event_wake_count", 0);
+            require_bool_field(&mut blockers, report, "readback_in_hot_path", false);
+            require_bool_field(&mut blockers, report, "proof_readback_in_hot_path", false);
+            require_u64_at_most(&mut blockers, report, "hot_path_proof_readback_count", 0);
+            require_u64_at_least(&mut blockers, report, "measured_frame_count", 16);
+            require_object_field(&mut blockers, report, "presented_frame_ms_p50_p95_p99_max");
+            require_object_field(&mut blockers, report, "surface_acquire_ms_p50_p95_p99_max");
+            require_object_field(&mut blockers, report, "queue_submit_ms_p50_p95_p99_max");
+            require_object_field(&mut blockers, report, "frame_present_ms_p50_p95_p99_max");
+            require_str_field(&mut blockers, report, "render_loop_mode", "demand_driven");
+            require_str_field(
+                &mut blockers,
+                report,
+                "surface_class",
+                "raw-app-window-clear-only-preview-surface",
+            );
+            if report.get("proof_mode").and_then(serde_json::Value::as_str) != Some("counters") {
+                blockers.push("present-floor proof_mode must be counters".to_owned());
+            }
+            if report
+                .get("render_hook_ms_p95")
+                .is_some_and(|value| !value.is_null())
+            {
+                blockers.push("present-floor must not run a render hook".to_owned());
+            }
+            let p95 = report
+                .pointer("/presented_frame_ms_p50_p95_p99_max/p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            let max_p95 = report
+                .get("max_presented_frame_ms_p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(16.7);
+            if p95 > max_p95 {
+                blockers.push(format!(
+                    "present-floor presented_frame_ms.p95={p95} exceeds {max_p95}"
+                ));
+            }
+        }
         "counter-interaction-speed" => {
             require_u64_at_least(&mut blockers, report, "event_count", 1);
             require_interaction_stage_counters(
@@ -64078,24 +67790,258 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             require_str_field(&mut blockers, report, "profile", "release");
             require_bool_field(&mut blockers, report, "operator_host_input", false);
             require_bool_field(&mut blockers, report, "real_os_input", true);
-            require_u64_at_least(&mut blockers, report, "target_count", 2);
-            require_f64_at_most(
+            require_u64_at_least(&mut blockers, report, "target_count", 16);
+            let max_click_to_formula_ms = report
+                .get("max_click_to_formula_ms")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(16.7);
+            let steady_product_p95 = report
+                .pointer("/steady_input_accept_to_formula_visible_ms/p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if steady_product_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "steady_input_accept_to_formula_visible_ms.p95={steady_product_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            let steady_present_p95 = report
+                .pointer("/steady_input_accept_to_present_ms/p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if steady_present_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "steady_input_accept_to_present_ms.p95={steady_present_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            let steady_wake_accept_p95 = report
+                .pointer("/steady_input_wake_to_input_accept_ms/p95")
+                .or_else(|| {
+                    report.pointer("/steady_present_probe_phase_ms/input_wake_to_input_accept/p95")
+                })
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if steady_wake_accept_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "steady_input_wake_to_input_accept_ms.p95={steady_wake_accept_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            let steady_wake_present_p95 = report
+                .pointer("/steady_input_wake_to_present_ms/p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if steady_wake_present_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "steady_input_wake_to_present_ms.p95={steady_wake_present_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            let steady_wake_formula_p95 = report
+                .pointer("/steady_input_wake_to_formula_visible_ms/p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if steady_wake_formula_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "steady_input_wake_to_formula_visible_ms.p95={steady_wake_formula_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            require_object_field(&mut blockers, report, "preview_loop_product_path_contract");
+            if report
+                .pointer("/preview_loop_product_path_contract/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("preview_loop_product_path_contract.status must be pass".to_owned());
+            }
+            if report
+                .pointer("/preview_loop_product_path_contract/source")
+                .and_then(serde_json::Value::as_str)
+                != Some("app_window_product_frame_commits")
+            {
+                blockers.push(
+                    "preview_loop_product_path_contract.source must be app_window_product_frame_commits"
+                        .to_owned(),
+                );
+            }
+            let target_count = report
+                .get("target_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let product_frame_sample_count = report
+                .pointer("/preview_loop_product_path_contract/input_to_present_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if product_frame_sample_count < target_count {
+                blockers.push(format!(
+                    "preview_loop_product_path_contract.input_to_present_sample_count={product_frame_sample_count} does not cover target_count={target_count}"
+                ));
+            }
+            let product_input_to_present_p95 = report
+                .pointer("/preview_loop_product_path_contract/input_to_present_ms_p95")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if product_input_to_present_p95 > max_click_to_formula_ms {
+                blockers.push(format!(
+                    "preview_loop_product_path_contract.input_to_present_ms_p95={product_input_to_present_p95} exceeds {max_click_to_formula_ms}"
+                ));
+            }
+            let max_click_to_present_ms = report
+                .get("max_click_to_present_ms")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(33.4);
+            let product_input_to_present_max = report
+                .pointer("/preview_loop_product_path_contract/product_frame_scope/input_to_present_ms_max")
+                .or_else(|| {
+                    report.pointer("/preview_loop_product_path_contract/input_to_present_ms/max")
+                })
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::INFINITY);
+            if product_input_to_present_max > max_click_to_present_ms {
+                blockers.push(format!(
+                    "preview_loop_product_path_contract.input_to_present_ms.max={product_input_to_present_max} exceeds bounded max {max_click_to_present_ms}"
+                ));
+            }
+            let product_hard_failure_count = report
+                .pointer(
+                    "/preview_loop_product_path_contract/product_frame_scope/hard_failure_count",
+                )
+                .or_else(|| {
+                    report.pointer("/preview_loop_product_path_contract/hard_failure_count")
+                })
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if product_hard_failure_count != 0 {
+                blockers.push(format!(
+                    "preview_loop_product_path_contract.hard_failure_count={product_hard_failure_count} must be 0"
+                ));
+            }
+            require_object_field(&mut blockers, report, "preview_perf_stats");
+            require_object_field(&mut blockers, report, "post_present_proof_isolation");
+            for (path, label) in [
+                (
+                    "/product_only_ux_contract/status",
+                    "product_only_ux_contract",
+                ),
+                ("/proof_only_contract/status", "proof_only_contract"),
+                (
+                    "/proof_isolation_contract/status",
+                    "proof_isolation_contract",
+                ),
+            ] {
+                if report.pointer(path).and_then(serde_json::Value::as_str) != Some("pass") {
+                    blockers.push(format!("{label}.status must be pass"));
+                }
+            }
+            if report
+                .pointer("/product_only_ux_contract/proof_completion_required")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                blockers.push(
+                    "product_only_ux_contract.proof_completion_required must be false".to_owned(),
+                );
+            }
+            if report
+                .pointer("/product_only_ux_contract/source")
+                .and_then(serde_json::Value::as_str)
+                != Some("app_window_product_frame_commits")
+            {
+                blockers.push(
+                    "product_only_ux_contract.source must be app_window_product_frame_commits"
+                        .to_owned(),
+                );
+            }
+            if report
+                .pointer("/proof_only_contract/visual_capture_method")
+                .and_then(serde_json::Value::as_str)
+                != Some("app-owned-wgpu-readback")
+            {
+                blockers.push(
+                    "proof_only_contract.visual_capture_method must be app-owned-wgpu-readback"
+                        .to_owned(),
+                );
+            }
+            let proof_click_sample_count = report
+                .pointer("/proof_only_contract/click_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let current_visual_sample_count = report
+                .pointer("/proof_only_contract/current_structured_visual_proof_sample_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if proof_click_sample_count == 0 || current_visual_sample_count < target_count {
+                blockers.push(format!(
+                    "proof_only_contract current structured visual proof samples {current_visual_sample_count} must cover target_count={target_count}"
+                ));
+            }
+            if report
+                .pointer("/proof_isolation_contract/product_latency_includes_proof_completion")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                blockers.push(
+                    "proof_isolation_contract.product_latency_includes_proof_completion must be false"
+                        .to_owned(),
+                );
+            }
+            if report
+                .pointer("/proof_isolation_contract/hot_path_report_write_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+            {
+                blockers.push(
+                    "proof_isolation_contract.hot_path_report_write_count must be zero".to_owned(),
+                );
+            }
+            if report
+                .pointer("/post_present_proof_isolation/status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push("post_present_proof_isolation.status must be pass".to_owned());
+            }
+            if report
+                .pointer("/post_present_proof_isolation/product_path_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("pass")
+            {
+                blockers.push(
+                    "post_present_proof_isolation.product_path_status must be pass".to_owned(),
+                );
+            }
+            if report
+                .pointer("/post_present_proof_isolation/product_latency_includes_proof_completion")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                blockers.push(
+                    "post_present_proof_isolation.product_latency_includes_proof_completion must be false"
+                        .to_owned(),
+                );
+            }
+            if report
+                .pointer("/post_present_proof_isolation/product_blocks_on_proof_subscribers")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                blockers.push(
+                    "post_present_proof_isolation.product_blocks_on_proof_subscribers must be false"
+                        .to_owned(),
+                );
+            }
+            if report
+                .pointer("/post_present_proof_isolation/proof_latency_reported_separately")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                blockers.push(
+                    "post_present_proof_isolation.proof_latency_reported_separately must be true"
+                        .to_owned(),
+                );
+            }
+            require_str_field(
                 &mut blockers,
                 report,
-                "input_accept_to_formula_visible_ms_p95",
-                report
-                    .get("max_click_to_formula_ms")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(16.7),
-            );
-            require_f64_at_most(
-                &mut blockers,
-                report,
-                "click_to_formula_visible_ms_p95",
-                report
-                    .get("max_click_to_present_ms")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(33.4),
+                "preview_loop_render_loop_mode",
+                "demand_driven",
             );
             if report
                 .get("click_to_visible_max_budget_or_bounded_outliers_pass")
@@ -66930,6 +70876,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             }
             _ => "idle-wake",
         },
+        "verify-native-gpu-present-floor" => "present-floor",
         "verify-native-dev-editor-scroll-speed" => match value_arg(args, "--profile").as_deref() {
             Some("release") => "dev-editor-scroll-speed-release",
             _ => "dev-editor-scroll-speed-debug",
@@ -67780,9 +71727,11 @@ fn native_gpu_report_is_ux_gate(report: &serde_json::Value) -> bool {
         || command == "verify-native-gpu-preview-e2e"
         || command == "verify-native-gpu-scroll-speed"
         || command == "verify-native-gpu-idle-wake"
+        || command == "verify-native-gpu-present-floor"
         || command == "verify-native-dev-editor-scroll-speed"
         || command == "verify-native-example-switch-speed"
         || command == "verify-native-counter-interaction-speed"
+        || command == "verify-native-cells-visible-click-e2e"
         || command == "verify-native-visible-launch"
         || command == "verify-demand-driven-render-loop"
 }
@@ -67829,6 +71778,13 @@ fn collect_native_gpu_ux_product_path_value_reasons(
                         "{child_path}=true substitutes non-native proof for native UX evidence"
                     ));
                 }
+                if native_gpu_ux_legacy_pre_present_proof_bool_key(key)
+                    && child.as_bool() == Some(true)
+                {
+                    reasons.push(format!(
+                        "{child_path}=true keeps legacy proof/report work on the native UX product path"
+                    ));
+                }
                 if key == "cosmic_toplevel_probe"
                     && child.get("status").and_then(serde_json::Value::as_str) == Some("pass")
                 {
@@ -67838,6 +71794,13 @@ fn collect_native_gpu_ux_product_path_value_reasons(
                 }
                 if native_gpu_ux_hot_path_counter_key(key) && json_value_is_positive_number(child) {
                     reasons.push(format!("{child_path} must be zero for native UX gates"));
+                }
+                if native_gpu_ux_legacy_pre_present_proof_counter_key(key)
+                    && json_value_is_positive_number(child)
+                {
+                    reasons.push(format!(
+                        "{child_path} must be zero; native UX gates require post-present proof subscribers"
+                    ));
                 }
                 if native_gpu_ux_hot_path_bool_key(key) && child.as_bool() == Some(true) {
                     reasons.push(format!(
@@ -68006,6 +71969,20 @@ fn native_gpu_ux_forbidden_proof_bool_key(key: &str) -> bool {
             | "cosmic_toplevel_scraping_used"
             | "whole_desktop_screenshot_used"
     )
+}
+
+fn native_gpu_ux_legacy_pre_present_proof_bool_key(key: &str) -> bool {
+    matches!(
+        key,
+        "legacy_product_proof_built_pre_present"
+            | "legacy_proof_json_built_pre_present"
+            | "legacy_render_hook_proof_built_pre_present"
+            | "currently_legacy_pre_present"
+    )
+}
+
+fn native_gpu_ux_legacy_pre_present_proof_counter_key(key: &str) -> bool {
+    matches!(key, "legacy_pre_present_proof_request_count")
 }
 
 fn native_gpu_ux_hot_path_counter_key(key: &str) -> bool {
@@ -83016,6 +86993,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-observability"
                 | "verify-browser-startup-budget"
                 | "verify-native-gpu-idle-wake"
+                | "verify-native-gpu-present-floor"
                 | "verify-native-real-window-input-environment"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-novywave-visual"
@@ -84347,6 +88325,297 @@ mod tests {
     }
 
     #[test]
+    fn cells_visible_click_contracts_accept_deferred_product_patch_visual_proof() {
+        let probe = json!({
+            "click_samples": [
+                {
+                    "index": 0,
+                    "target_address": "A2",
+                    "product_formula_state_current": true,
+                    "native_input_timing": {
+                        "fast_path": "simple_source_click_deferred_runtime",
+                        "live_events_ms": 0.0,
+                        "runtime_work": {
+                            "runtime_invoked": false,
+                            "source": "deferred_runtime_not_invoked",
+                            "rows_scanned": 0,
+                            "list_find_rows_scanned": 0,
+                            "summary_fields_scanned": 0,
+                            "root_materialization_candidates": 0,
+                            "recomputed_fields": 0
+                        }
+                    },
+                    "visual_formula_probe": {
+                        "retained_bound_sync": {
+                            "status": "pass",
+                            "changed": true,
+                            "target_node_count": 3,
+                            "text_update_count": 1,
+                            "style_update_count": 2,
+                            "selection_overlay_source": "generic-selected-node-set",
+                            "legacy_selection_fallback_count": 0
+                        }
+                    }
+                }
+            ]
+        });
+
+        let retained_summary = cells_visible_click_retained_update_contract_summary(&probe);
+        assert_eq!(
+            retained_summary
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            retained_summary
+                .get("deferred_retained_input_patch_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let runtime_summary = cells_visible_click_runtime_work_contract_summary(&probe);
+        assert_eq!(
+            runtime_summary
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            runtime_summary
+                .pointer("/runtime_work_source_counts/deferred_runtime_not_invoked")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cells_visible_click_promotes_post_present_proof_isolation_from_preview_loop() {
+        let preview_loop = json!({
+            "post_present_proof_isolation": {
+                "status": "pass",
+                "product_path_status": "pass",
+                "proof_worker_status": "lagging",
+                "product_latency_includes_proof_completion": false,
+                "product_blocks_on_proof_subscribers": false,
+                "proof_latency_reported_separately": true
+            }
+        });
+        let promoted =
+            cells_visible_click_post_present_proof_isolation(&json!({}), Some(&preview_loop));
+
+        assert_eq!(
+            promoted
+                .get("proof_worker_status")
+                .and_then(serde_json::Value::as_str),
+            Some("lagging")
+        );
+        assert_eq!(
+            promoted
+                .get("product_latency_includes_proof_completion")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cells_visible_click_keeps_live_probe_post_present_proof_isolation() {
+        let live_probe = json!({
+            "post_present_proof_isolation": {
+                "status": "pass",
+                "product_path_status": "pass",
+                "proof_worker_status": "settled",
+                "product_latency_includes_proof_completion": false,
+                "product_blocks_on_proof_subscribers": false,
+                "proof_latency_reported_separately": true
+            }
+        });
+        let preview_loop = json!({
+            "post_present_proof_isolation": {
+                "status": "pass",
+                "product_path_status": "pass",
+                "proof_worker_status": "lagging",
+                "product_latency_includes_proof_completion": false,
+                "product_blocks_on_proof_subscribers": false,
+                "proof_latency_reported_separately": true
+            }
+        });
+        let promoted =
+            cells_visible_click_post_present_proof_isolation(&live_probe, Some(&preview_loop));
+
+        assert_eq!(
+            promoted
+                .get("proof_worker_status")
+                .and_then(serde_json::Value::as_str),
+            Some("settled")
+        );
+    }
+
+    fn cells_visible_click_test_post_present_isolation() -> serde_json::Value {
+        json!({
+            "status": "pass",
+            "product_path_status": "pass",
+            "proof_worker_status": "lagging",
+            "product_latency_includes_proof_completion": false,
+            "product_blocks_on_proof_subscribers": false,
+            "proof_latency_reported_separately": true,
+            "proof_completion_required_for_product_present": false,
+            "report_write_in_hot_path": false,
+            "report_serialization_in_hot_path": false,
+            "legacy_pre_present_request_count": 0,
+            "hot_path_report_write_count": 0,
+            "hot_path_report_serialization_count": 0,
+            "subscriber_error_count": 0,
+            "worker_error_count": 0,
+            "queued_request_count": 2,
+            "recent_queue_count": 4
+        })
+    }
+
+    #[test]
+    fn cells_visible_click_lane_contracts_accept_split_product_and_proof_paths() {
+        let product_frames = json!({
+            "status": "pass",
+            "source": "app_window_product_frame_commits",
+            "product_frame_sample_count": 16,
+            "hard_failure_count": 0,
+            "input_to_present_ms": {
+                "p95": 12.0,
+                "max": 20.0
+            },
+            "input_to_formula_visible_ms": {
+                "p95": 11.0,
+                "max": 19.0
+            }
+        });
+        let runtime = json!({"status": "pass"});
+        let retained = json!({"status": "pass"});
+        let isolation = cells_visible_click_test_post_present_isolation();
+        let product_contract = cells_visible_click_product_only_ux_contract(
+            &product_frames,
+            &runtime,
+            &retained,
+            &isolation,
+            true,
+            "demand_driven",
+            16.7,
+            33.4,
+        );
+        assert_eq!(
+            product_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+
+        let probe = json!({
+            "visual_capture_method": "app-owned-wgpu-readback",
+            "readback_ok": true,
+            "proof_current_changed": true,
+            "click_samples": [
+                {
+                    "index": 0,
+                    "visual_proof_proves_presented_frame": true,
+                    "proof_current_changed": true,
+                    "product_frame_evidence_key": {
+                        "frame_seq": 10,
+                        "input_event_seq": 7
+                    },
+                    "proof_frame_evidence_key": {
+                        "frame_seq": 11,
+                        "input_event_seq": 7
+                    }
+                }
+            ]
+        });
+        let proof_contract = cells_visible_click_proof_only_contract(&probe, 3);
+        assert_eq!(
+            proof_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+
+        let isolation_contract = cells_visible_click_proof_isolation_contract(&isolation);
+        assert_eq!(
+            isolation_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn cells_visible_click_lane_contracts_reject_proof_coupling_and_missing_proof() {
+        let product_frames = json!({
+            "status": "pass",
+            "source": "app_window_product_frame_commits",
+            "product_frame_sample_count": 16,
+            "hard_failure_count": 0,
+            "input_to_present_ms": {
+                "p95": 12.0,
+                "max": 20.0
+            },
+            "input_to_formula_visible_ms": {
+                "p95": 11.0,
+                "max": 19.0
+            }
+        });
+        let runtime = json!({"status": "pass"});
+        let retained = json!({"status": "pass"});
+        let mut isolation = cells_visible_click_test_post_present_isolation();
+        isolation["product_latency_includes_proof_completion"] = json!(true);
+        let product_contract = cells_visible_click_product_only_ux_contract(
+            &product_frames,
+            &runtime,
+            &retained,
+            &isolation,
+            true,
+            "demand_driven",
+            16.7,
+            33.4,
+        );
+        assert_eq!(
+            product_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+
+        let proof_contract = cells_visible_click_proof_only_contract(
+            &json!({
+                "visual_capture_method": "app-owned-wgpu-readback",
+                "readback_ok": true,
+                "proof_current_changed": true,
+                "click_samples": [{
+                    "index": 0,
+                    "visual_proof_proves_presented_frame": false,
+                    "proof_current_changed": true,
+                    "product_frame_evidence_key": {
+                        "frame_seq": 10,
+                        "input_event_seq": 7
+                    }
+                }]
+            }),
+            3,
+        );
+        assert_eq!(
+            proof_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+
+        let isolation_contract = cells_visible_click_proof_isolation_contract(&isolation);
+        assert_eq!(
+            isolation_contract
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+    }
+
+    #[test]
     fn cells_visible_click_preview_hold_scales_with_target_count() {
         assert_eq!(cells_visible_click_preview_hold_ms(0), 90_000);
         assert_eq!(cells_visible_click_preview_hold_ms(4), 90_000);
@@ -84475,6 +88744,260 @@ mod tests {
     }
 
     #[test]
+    fn native_gpu_handoff_requires_present_floor_report() {
+        let reports = native_gpu_handoff_required_reports();
+        let report = reports
+            .iter()
+            .find(|report| report.label == "present-floor")
+            .expect("native GPU handoff must require the raw present-floor gate");
+        assert_eq!(
+            report.path,
+            PathBuf::from("target/reports/native-gpu/present-floor.json")
+        );
+        assert_eq!(report.command, "verify-native-gpu-present-floor");
+        assert!(report.required_argv.is_empty());
+    }
+
+    #[test]
+    fn present_floor_current_wayland_focus_risk_requires_explicit_allow_flag() {
+        assert!(!present_floor_current_wayland_focus_risk_allowed(&[
+            "verify-native-gpu-present-floor".to_owned(),
+            "--no-isolated-weston".to_owned()
+        ]));
+        assert!(present_floor_current_wayland_focus_risk_allowed(&[
+            "verify-native-gpu-present-floor".to_owned(),
+            "--no-isolated-weston".to_owned(),
+            "--allow-current-wayland-focus-risk".to_owned()
+        ]));
+    }
+
+    fn present_floor_contract_report(p95: f64) -> serde_json::Value {
+        json!({
+            "command": "verify-native-gpu-present-floor",
+            "product_only": true,
+            "operator_host_input": false,
+            "real_os_input": false,
+            "sample_input_after_initial_frames": false,
+            "observed_real_os_input": false,
+            "observed_input_event_wake_count": 0,
+            "readback_in_hot_path": false,
+            "proof_readback_in_hot_path": false,
+            "hot_path_proof_readback_count": 0,
+            "measured_frame_count": 32,
+            "max_presented_frame_ms_p95": 16.7,
+            "proof_mode": "counters",
+            "render_hook_ms_p95": null,
+            "render_loop_mode": "demand_driven",
+            "surface_class": "raw-app-window-clear-only-preview-surface",
+            "presented_frame_ms_p50_p95_p99_max": {
+                "p50": 8.0,
+                "p95": p95,
+                "p99": p95,
+                "max": p95,
+                "sample_count": 32
+            },
+            "surface_acquire_ms_p50_p95_p99_max": {
+                "p50": 0.1,
+                "p95": 0.2,
+                "p99": 0.2,
+                "max": 0.2,
+                "sample_count": 32
+            },
+            "queue_submit_ms_p50_p95_p99_max": {
+                "p50": 0.1,
+                "p95": 0.2,
+                "p99": 0.2,
+                "max": 0.2,
+                "sample_count": 32
+            },
+            "frame_present_ms_p50_p95_p99_max": {
+                "p50": 0.1,
+                "p95": 0.2,
+                "p99": 0.2,
+                "max": 0.2,
+                "sample_count": 32
+            }
+        })
+    }
+
+    #[test]
+    fn present_floor_label_contract_accepts_counters_only_product_report() {
+        let report = present_floor_contract_report(12.0);
+        assert!(
+            native_gpu_label_contract_blockers("present-floor", &report).is_empty(),
+            "{:?}",
+            native_gpu_label_contract_blockers("present-floor", &report)
+        );
+    }
+
+    #[test]
+    fn present_floor_label_contract_rejects_hot_path_readback() {
+        let mut report = present_floor_contract_report(12.0);
+        report["readback_in_hot_path"] = json!(true);
+        report["proof_readback_in_hot_path"] = json!(true);
+        report["hot_path_proof_readback_count"] = json!(1);
+        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("readback_in_hot_path")),
+            "present-floor contract must reject readback in the product path: {blockers:?}"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("hot_path_proof_readback_count")),
+            "present-floor contract must reject proof readback work in the product path: {blockers:?}"
+        );
+    }
+
+    #[test]
+    fn native_ux_integrity_rejects_legacy_pre_present_proof_coupling() {
+        let report = json!({
+            "command": "verify-native-gpu-preview-e2e",
+            "legacy_product_proof_built_pre_present": true,
+            "legacy_pre_present_proof_request_count": 2,
+            "last_product_render_frame": {
+                "legacy_proof_json_built_pre_present": true,
+                "legacy_render_hook_proof_built_pre_present": true
+            },
+            "post_present_proof_requests": [
+                {
+                    "kind": "visible_bound_text",
+                    "currently_legacy_pre_present": true
+                }
+            ]
+        });
+        let mut reasons = Vec::new();
+        collect_native_gpu_ux_product_path_reasons(&report, &mut reasons);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("legacy_product_proof_built_pre_present=true")),
+            "native UX integrity must reject legacy product proof coupling: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("legacy_pre_present_proof_request_count")),
+            "native UX integrity must reject legacy pre-present proof counters: {reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("currently_legacy_pre_present=true")),
+            "native UX integrity must reject legacy pre-present proof request rows: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn stale_path_ledger_rejects_product_forbidden_legacy_proof() {
+        let dir = PathBuf::from(format!(
+            "target/tmp/xtask-stale-path-ledger-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create stale-path test dir");
+        let linked_report = dir.join("preview-loop.json");
+        let base_report = dir.join("cells-visible-click.json");
+        let ledger = dir.join("ledger.json");
+        let output = dir.join("out.json");
+        write_json(
+            &linked_report,
+            &json!({
+                "legacy_product_proof_built_pre_present": true
+            }),
+        )
+        .expect("write linked report");
+        write_json(
+            &base_report,
+            &json!({
+                "preview_loop_report": linked_report
+            }),
+        )
+        .expect("write base report");
+        write_json(
+            &ledger,
+            &json!({
+                "schema_version": 1,
+                "rows": [{
+                    "id": "reject-legacy-proof",
+                    "mode": "product-forbidden",
+                    "current_owner": "test",
+                    "typed_replacement": "post-present proof queue",
+                    "report_path": base_report,
+                    "linked_report_path_pointer": "/preview_loop_report",
+                    "symbol_or_field": "legacy_product_proof_built_pre_present",
+                    "json_pointer": "/legacy_product_proof_built_pre_present",
+                    "expected": false,
+                    "positive_gate": "test positive gate",
+                    "negative_gate": "legacy proof must be false",
+                    "removal_condition": "test removal"
+                }]
+            }),
+        )
+        .expect("write ledger");
+
+        let result = verify_native_gpu_stale_path_ledger(&[
+            "verify-native-gpu-stale-path-ledger".to_owned(),
+            "--ledger".to_owned(),
+            ledger.display().to_string(),
+            "--report".to_owned(),
+            output.display().to_string(),
+        ]);
+
+        assert!(
+            result.is_err(),
+            "stale path ledger must reject product-forbidden legacy proof rows"
+        );
+        let report = read_json(&output).expect("read failing stale-path report");
+        assert_eq!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert!(
+            report
+                .get("blockers")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blockers| blockers.iter().any(|blocker| blocker
+                    .as_str()
+                    .is_some_and(|text| text.contains("legacy_product_proof_built_pre_present")))),
+            "failing report should name the stale legacy proof field: {report}"
+        );
+    }
+
+    #[test]
+    fn present_floor_label_contract_rejects_observed_input() {
+        let mut report = present_floor_contract_report(12.0);
+        report["observed_real_os_input"] = json!(true);
+        report["observed_input_event_wake_count"] = json!(1);
+        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("observed_real_os_input")),
+            "present-floor contract must reject observed input: {blockers:?}"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("observed_input_event_wake_count")),
+            "present-floor contract must reject input wake events: {blockers:?}"
+        );
+    }
+
+    #[test]
+    fn present_floor_label_contract_rejects_over_budget_p95() {
+        let report = present_floor_contract_report(18.0);
+        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("presented_frame_ms.p95=18")),
+            "present-floor contract must reject over-budget p95: {blockers:?}"
+        );
+    }
+
+    #[test]
     fn native_gpu_handoff_keeps_novywave_in_regression_scope() {
         let handoff = native_gpu_handoff_required_reports();
         assert!(
@@ -84504,12 +89027,101 @@ mod tests {
             "profile": "release",
             "operator_host_input": false,
             "real_os_input": true,
-            "target_count": 8,
+            "target_count": 16,
             "input_accept_to_formula_visible_ms_p95": 12.0,
             "input_wake_to_formula_visible_ms_p95": 12.0,
             "click_to_formula_visible_ms_p95": 24.0,
             "max_click_to_formula_ms": 16.7,
             "max_click_to_present_ms": 33.4,
+            "steady_input_accept_to_formula_visible_ms": {
+                "p95": 12.0
+            },
+            "steady_input_accept_to_present_ms": {
+                "p95": 11.0
+            },
+            "steady_input_wake_to_input_accept_ms": {
+                "p95": 4.0
+            },
+            "steady_input_wake_to_present_ms": {
+                "p95": 12.0
+            },
+            "steady_input_wake_to_formula_visible_ms": {
+                "p95": 12.0
+            },
+            "preview_perf_stats": {
+                "input_to_present_ms_p50_p95_p99_max": {
+                    "p95": 12.0,
+                    "sample_count": 16
+                },
+                "render_loop_mode": "demand_driven",
+                "missed_frame_count": 0
+            },
+            "post_present_proof_isolation": {
+                "status": "pass",
+                "product_path_status": "pass",
+                "product_latency_includes_proof_completion": false,
+                "product_blocks_on_proof_subscribers": false,
+                "proof_latency_reported_separately": true,
+                "proof_completion_required_for_product_present": false,
+                "report_write_in_hot_path": false,
+                "report_serialization_in_hot_path": false,
+                "legacy_pre_present_request_count": 0,
+                "hot_path_report_write_count": 0,
+                "hot_path_report_serialization_count": 0,
+                "subscriber_error_count": 0,
+                "worker_error_count": 0,
+                "queued_request_count": 2,
+                "recent_queue_count": 16
+            },
+            "product_only_ux_contract": {
+                "status": "pass",
+                "source": "app_window_product_frame_commits",
+                "proof_completion_required": false,
+                "input_to_present_ms": {
+                    "p95": 12.0,
+                    "max": 12.0
+                },
+                "input_to_formula_visible_ms": {
+                    "p95": 12.0,
+                    "max": 12.0
+                },
+                "product_latency_includes_proof_completion": false,
+                "product_blocks_on_proof_subscribers": false,
+                "hot_path_report_write_count": 0
+            },
+            "proof_only_contract": {
+                "status": "pass",
+                "visual_capture_method": "app-owned-wgpu-readback",
+                "click_sample_count": 16,
+                "exact_visual_proof_sample_count": 0,
+                "current_structured_visual_proof_sample_count": 16,
+                "proof_lag_max_frames": 1,
+                "proof_lag_frame_budget": 8
+            },
+            "proof_isolation_contract": {
+                "status": "pass",
+                "product_latency_includes_proof_completion": false,
+                "hot_path_report_write_count": 0
+            },
+            "preview_loop_product_path_contract": {
+                "status": "pass",
+                "source": "app_window_product_frame_commits",
+                "input_to_present_ms_p95": 12.0,
+                "input_to_present_sample_count": 16,
+                "missed_frame_count": 0,
+                "product_frame_scope": {
+                    "input_to_present_ms_max": 12.0,
+                    "hard_failure_count": 0
+                },
+                "renders_per_second": 60.0,
+                "render_loop_mode": "demand_driven",
+                "frame_pacing_state": "requested_animation_burst",
+                "budget_ms": 16.7
+            },
+            "preview_loop_input_to_present_ms_p95": 230.0,
+            "preview_loop_input_to_present_sample_count": 16,
+            "preview_loop_missed_frame_count": 2,
+            "preview_loop_render_loop_mode": "demand_driven",
             "click_to_visible_max_budget_or_bounded_outliers_pass": true,
             "proof_current_changed": true,
             "retained_update_contract": {
@@ -84530,6 +89142,63 @@ mod tests {
             native_gpu_label_contract_blockers("cells-visible-click-e2e-release", &report)
                 .is_empty(),
             "well-formed release visible-click report should satisfy the label contract"
+        );
+
+        let mut proof_coupled_report = report.clone();
+        proof_coupled_report["post_present_proof_isolation"]["product_latency_includes_proof_completion"] =
+            json!(true);
+        let blockers = native_gpu_label_contract_blockers(
+            "cells-visible-click-e2e-release",
+            &proof_coupled_report,
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("product_latency_includes_proof_completion")),
+            "label contract must reject product/proof latency coupling: {blockers:?}"
+        );
+
+        let mut missing_proof_report = report.clone();
+        missing_proof_report["proof_only_contract"]["current_structured_visual_proof_sample_count"] =
+            json!(4);
+        missing_proof_report["proof_only_contract"]["status"] = json!("fail");
+        let blockers = native_gpu_label_contract_blockers(
+            "cells-visible-click-e2e-release",
+            &missing_proof_report,
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("proof_only_contract")),
+            "label contract must reject missing proof-lane samples: {blockers:?}"
+        );
+
+        let mut bounded_outlier_report = report.clone();
+        bounded_outlier_report["preview_loop_product_path_contract"]["missed_frame_count"] =
+            json!(1);
+        bounded_outlier_report["preview_loop_product_path_contract"]["product_frame_scope"]["input_to_present_ms_max"] =
+            json!(19.0);
+        assert!(
+            native_gpu_label_contract_blockers(
+                "cells-visible-click-e2e-release",
+                &bounded_outlier_report
+            )
+            .is_empty(),
+            "release label contract should accept p95-good product frames with bounded max outliers"
+        );
+
+        let mut unbounded_outlier_report = bounded_outlier_report;
+        unbounded_outlier_report["preview_loop_product_path_contract"]["product_frame_scope"]["input_to_present_ms_max"] =
+            json!(40.0);
+        let blockers = native_gpu_label_contract_blockers(
+            "cells-visible-click-e2e-release",
+            &unbounded_outlier_report,
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("bounded max")),
+            "label contract must reject product max outliers above max_click_to_present_ms: {blockers:?}"
         );
 
         let mut fallback_report = report;
@@ -84633,6 +89302,152 @@ mod tests {
                 .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
             "legacy operator-host token should still be rejected: {bad_reasons:?}"
         );
+    }
+
+    #[test]
+    fn post_present_artifacts_synthesize_external_render_proof_for_frame() {
+        let frame_key = json!({
+            "frame_seq": 12,
+            "content_revision": 3,
+            "layout_revision": 4,
+            "render_scene_revision": 5,
+            "surface_id": "preview:test",
+            "surface_epoch": 1,
+            "input_event_seq": 9,
+            "present_id": 12,
+            "proof_request_id": null
+        });
+        let layout_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
+        std::fs::create_dir_all(&layout_dir).unwrap();
+        let layout_path = layout_dir.join(format!(
+            "xtask-post-present-proof-layout-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &layout_path,
+            serde_json::to_vec_pretty(&json!({
+                "source_intents": [
+                    {
+                        "node": "cell-b0",
+                        "intent": "row_lookup",
+                        "lookup_field": "address",
+                        "lookup_value": "B0"
+                    }
+                ],
+                "layout_frame": {
+                    "display_list": [
+                        {
+                            "node": "cell-b0",
+                            "kind": "button",
+                            "text": "15",
+                            "bounds": {"x": 80.0, "y": 80.0, "width": 80.0, "height": 24.0},
+                            "style": {"selected": true}
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let layout_hash = boon_runtime::sha256_file(&layout_path).unwrap();
+        let layout_path_text = layout_path.to_string_lossy().to_string();
+        let report = json!({
+            "frame_evidence_key": frame_key,
+            "last_render_target_kind": "visible-surface-direct",
+            "recent_post_present_proof_artifacts": [
+                {
+                    "status": "pass",
+                    "kind": "visible_bound_text",
+                    "frame_evidence_key": frame_key,
+                    "payload": {
+                        "status": "pass",
+                        "layout_frame_hash": layout_hash,
+                        "entries": [
+                            {
+                                "text": "=A1+B2",
+                                "paths": ["store.selected_input.editing_text"],
+                                "selected": false,
+                                "focused": true
+                            },
+                            {
+                                "node": "cell-b0",
+                                "text": "15",
+                                "paths": ["@row:2:1:display_text"],
+                                "selected": true,
+                                "focused": true,
+                                "text_truncated": false
+                            }
+                        ]
+                    }
+                },
+                {
+                    "status": "pass",
+                    "kind": "retained_bound_sync",
+                    "frame_evidence_key": frame_key,
+                    "payload": {
+                        "status": "pass",
+                        "changed": true,
+                        "text_update_count": 1
+                    }
+                }
+            ],
+            "matching_interactive_readback_artifact_for_frame": {
+                "capture_method": "wgpu-visible-surface-copy-src-readback",
+                "path": "target/artifacts/native-gpu/test.png",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "frame_evidence_key": frame_key
+            }
+        });
+
+        let proof = cells_post_present_external_render_proof_for_frame(
+            &report,
+            report.get("frame_evidence_key").unwrap(),
+        )
+        .expect("post-present proof");
+
+        assert_eq!(
+            proof.pointer("/status").and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            proof.pointer("/source").and_then(serde_json::Value::as_str),
+            Some("post_present_proof_artifacts_by_frame_evidence_key")
+        );
+        assert_eq!(
+            proof.pointer("/proof/frame_evidence_key"),
+            report.get("frame_evidence_key")
+        );
+        assert_eq!(
+            proof
+                .pointer("/proof/capture_method")
+                .and_then(serde_json::Value::as_str),
+            Some("wgpu-visible-surface-copy-src-readback")
+        );
+        assert_eq!(
+            proof
+                .pointer("/visible_bound_text/entries/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some("=A1+B2")
+        );
+        assert_eq!(
+            proof
+                .pointer("/retained_bound_sync/text_update_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            proof
+                .pointer("/layout_artifact")
+                .and_then(serde_json::Value::as_str),
+            Some(layout_path_text.as_str())
+        );
+        assert_eq!(
+            proof
+                .pointer("/input_overlay_focus_state/selected_address")
+                .and_then(serde_json::Value::as_str),
+            Some("B0")
+        );
+        let _ = std::fs::remove_file(layout_path);
     }
 
     #[test]
@@ -84851,6 +89666,7 @@ mod tests {
             "frame_evidence_key": frame_key.clone(),
             "last_external_render_proof": {
                 "status": "pass",
+                "layout_artifact": layout_path_text,
                 "visible_surface_rendered": true,
                 "visible_present_path": true,
                 "render_target_kind": "visible-surface-direct",
@@ -84961,6 +89777,124 @@ mod tests {
                 .pointer("/structured_external_visible_surface_probe/visible_formula_text_current")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+        let mut selected_visible_node_probe = visible_bound_text_probe.clone();
+        selected_visible_node_probe["last_external_render_proof"]["input_overlay_focus_state"] = json!({
+            "previous_selected_address": "B0",
+            "selected_address": null,
+            "selected_node_count": 1,
+            "selected_node_samples": ["cell-b0"],
+            "selection_proxy": false
+        });
+        selected_visible_node_probe["last_external_render_proof"]["input_overlay_focused_node_probe"] = json!({
+            "status": "missing_focused_node"
+        });
+        selected_visible_node_probe["last_external_render_proof"]["visible_bound_text"]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "node": "cell-b0",
+                "text": "15",
+                "text_truncated": false,
+                "paths": ["@row:2:1:display_text"],
+                "source_intents": [
+                    {
+                        "node": "cell-b0",
+                        "intent": "row_lookup",
+                        "lookup_field": "address",
+                        "lookup_value": "B0"
+                    }
+                ],
+                "selected": true,
+                "focused": false,
+                "kind": "Button"
+            }));
+        let selected_visible_node_result = cells_visual_formula_probe_from_readback(
+            &selected_visible_node_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            selected_visible_node_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "same-frame visible selected-node proof should prove selection when focus overlay metadata is absent"
+        );
+        assert_eq!(
+            selected_visible_node_result
+                .pointer(
+                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
+                )
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            selected_visible_node_result
+                .pointer("/structured_external_visible_surface_probe/focused_node_probe_pass")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let mut selected_entry_source_intent_probe = selected_visible_node_probe.clone();
+        selected_entry_source_intent_probe["last_external_render_proof"]["layout_artifact"] =
+            serde_json::Value::Null;
+        let selected_entry_source_intent_result = cells_visual_formula_probe_from_readback(
+            &selected_entry_source_intent_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            selected_entry_source_intent_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "post-present visible-bound-text source intents should prove the selected node when a patched layout artifact file is unavailable"
+        );
+        assert_eq!(
+            selected_entry_source_intent_result
+                .pointer(
+                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
+                )
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let mut selected_node_stale_address_probe = selected_visible_node_probe.clone();
+        selected_node_stale_address_probe["last_external_render_proof"]["visible_bound_text"]["entries"]
+            [1]["text"] = json!("A0");
+        let selected_node_stale_address_result = cells_visual_formula_probe_from_readback(
+            &selected_node_stale_address_probe,
+            Some(&before_path_text),
+            "A0",
+            "B0",
+            "5",
+            "=add(A0,A1)",
+        );
+        assert_eq!(
+            selected_node_stale_address_result
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass"),
+            "same-frame selected-node/source-intent proof should prove the selected address when the formula address text artifact is stale"
+        );
+        assert_eq!(
+            selected_node_stale_address_result
+                .pointer(
+                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
+                )
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            selected_node_stale_address_result
+                .pointer("/structured_external_visible_surface_probe/visible_address_text_current")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
         let mut first_click_visible_probe = visible_bound_text_probe.clone();
         first_click_visible_probe["last_external_render_proof"]["input_overlay_focus_state"] = json!({

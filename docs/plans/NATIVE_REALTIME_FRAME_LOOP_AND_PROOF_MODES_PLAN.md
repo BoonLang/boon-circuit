@@ -12439,3 +12439,168 @@ host-input follow-up cut:
     `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene`, direct retained
     selection/formula-bar patching, quick submit, and bounded post-present proof
     services.
+
+2026-07-02 adapter inventory and headed-path checkpoint:
+
+- Added generic WGPU adapter inventory/candidate evidence to the Cells
+  visible-click verifier reports, without Cells/runtime/compiler special-casing:
+  - reports now include `wgpu_adapter_inventory` from
+    `Instance::enumerate_adapters(Backends::all())`;
+  - reports include no-surface `HighPerformance` and `LowPower` request
+    candidates;
+  - reports include `adapter_selection_diagnosis`, which classifies whether the
+    selected product/surface adapter is hardware, software with no hardware
+    present, or software despite hardware being available.
+- Fresh hardware-required diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-adapter-inventory-current.json`
+    still reports `status=fail`, as intended;
+  - the new diagnosis is
+    `hardware-adapter-present-but-selected-surface-adapter-is-software`;
+  - WGPU inventory sees three adapters: two hardware adapters and one software
+    adapter;
+  - the no-surface high-performance candidate is `NVIDIA GeForce RTX 2070`,
+    backend `Vulkan`, device type `DiscreteGpu`, driver `NVIDIA 580.126.09`;
+  - the isolated Weston compatible-surface adapter selected by the preview is
+    still `llvmpipe (LLVM 20.1.2, 256 bits)`, device type `Cpu`,
+    `adapter_is_software=true`.
+- Fresh software diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug --address A2 --expected-formula 15 --repeat-count 1 --allow-software-adapter-diagnostic --report target/reports/native-gpu/cells-visible-click-e2e-a2-adapter-inventory-software-diagnostic-current.json`
+    still reports top-level `status=fail`, because software evidence is
+    diagnostic-only;
+  - the interaction itself still works: selected address `A2`, formula bar text
+    `15`, `proof_only_contract.status=pass`;
+  - the product lane remains rejected because the selected product adapter is
+    software, even though the one-click diagnostic product p95 was about
+    `16.281856 ms`.
+- Focused checks for this slice:
+  - `cargo fmt --check`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-adapter-inventory-current.json`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-adapter-inventory-software-diagnostic-current.json`;
+  - `git diff --check`.
+- Subagent read-only architecture review:
+  - there is no complete existing hardware-backed Cells visible-click
+    performance verifier;
+  - the existing isolated-Weston Cells gate is the path selecting llvmpipe;
+  - the smallest generic hardware-backed path to adapt is the current headed
+    native scenario route: `verify-native-gpu-headed-scenario` already launches
+    the preview role directly, uses app-owned host/operator input, supports
+    app-owned WGPU readback, and can run on the current Wayland hardware
+    surface;
+  - the next implementation should reuse the Cells layout-derived target
+    resolution and product/proof-lane checks, but replace Weston launch and
+    `weston-test-driver` with a generic headed/operator host-event sequence;
+  - clean up the lower-level `NativeInputAdapterProof` terminology so operator
+    host input is not reported as real OS input inside the proof object.
+- Next implementation step:
+  - implement a generic hardware-backed headed Cells visible-click verifier path
+    using app-owned host events and WGPU proof, preserving strict product
+    adapter policy;
+  - keep isolated Weston as a smoke/diagnostic path until it can prove hardware;
+  - after hardware-backed multi-sample evidence is real, continue with the
+    `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` product-frame
+    cut rather than doing more Cells runtime/list/formula tuning.
+
+2026-07-02 headed hardware scenario checkpoint:
+
+- Added strict hardware-adapter evidence to `verify-native-gpu-headed-scenario`
+  without changing the generic preview contract:
+  - default headed scenario runs now pass `--require-hardware-adapter` to the
+    preview role;
+  - `--allow-software-adapter-diagnostic` remains available for diagnostic runs
+    and maps to `--adapter-policy allow_software_diagnostic`;
+  - reports include the selected surface `adapter_identity`, `adapter_status`,
+    `adapter_selection_diagnosis`, and full `wgpu_adapter_inventory`;
+  - the headed scenario audit now fails if product mode selects a software or
+    missing adapter.
+- Fresh hardware-backed headed evidence:
+  - `cargo xtask verify-native-gpu-headed-scenario --example cells --report target/reports/native-gpu/headed-scenario-cells-hardware-current.json`
+    reports `status=pass`;
+  - `adapter_status=hardware`;
+  - selected surface adapter is `NVIDIA GeForce RTX 2070`, backend `Vulkan`,
+    device type `DiscreteGpu`, `adapter_is_software=false`;
+  - `adapter_selection_diagnosis.status=selected-surface-adapter-is-hardware`;
+  - `operator_host_input=true` and `real_os_input=false`, so this is app-owned
+    verifier input, not OS input spoofing;
+  - the role and scenario reports both pass, including WGPU present/readback
+    evidence on the current headed Wayland surface.
+- Focused checks for this checkpoint:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_playground -p xtask`;
+  - `cargo test -q -p xtask headed_visual -- --test-threads=1`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo test -q -p boon_native_playground headed_scenario -- --test-threads=1`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/headed-scenario-cells-hardware-current.json`.
+- This is not yet the completed Cells performance gate:
+ - `verify-native-gpu-headed-scenario` proves the hardware-backed, app-owned
+    input/proof substrate;
+  - the next implementation must merge that substrate with the existing Cells
+    visible-click assertions: layout-derived target selection, formula-bar
+    correctness, product-frame commit timing, exact `FrameEvidenceKey` proof,
+    multi-sample budgets, stale-proof rejection, and no-hacks audit.
+
+2026-07-03 COSMIC background-launch repair checkpoint:
+
+- Root cause of the headed-background launch failure was outside Boon runtime:
+  `/usr/bin/cosmic-background-launch` was already from the fork, but the
+  installed/running compositor did not expose
+  `com.system76.CosmicComp.BackgroundLaunch`, so launcher smoke failed with
+  `org.freedesktop.DBus.Error.ServiceUnknown`.
+- Built and installed the matching forked compositor/launcher pair from
+  `~/repos/cosmic-comp`:
+  - `cargo check --manifest-path ~/repos/cosmic-comp/Cargo.toml --bin cosmic-background-launch --bin cosmic-comp`;
+  - `cargo build --release --manifest-path ~/repos/cosmic-comp/Cargo.toml --bin cosmic-comp --bin cosmic-background-launch`;
+  - installed `/usr/bin/cosmic-comp` and `/usr/bin/cosmic-background-launch`
+    with matching source/installed hashes.
+- Current-session caveat:
+  - `pgrep -a cosmic-comp` still reports the already-running compositor, and
+    `/proc/<pid>/exe` points at `/usr/bin/cosmic-comp (deleted)`;
+  - background-launch smoke still fails in this live session until COSMIC starts
+    the newly installed compositor binary;
+  - do not restart or kill the user's compositor from the verifier. The user can
+    log out/in or otherwise restart COSMIC when ready.
+- Boon verifier guardrail added:
+  - `run_headed_host_cells_visible_click_e2e` no longer opens a direct headed
+    fallback window in the current workspace when `cosmic-background-launch`
+    fails;
+  - launcher failure is now a structured verifier failure with
+    `operator_host_input=true`, `real_os_input=false`, and
+    `human_observation=false`.
+- Focused Boon checks:
+  - `cargo fmt --check`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`.
+- Next step after the compositor session is restarted:
+  - rerun the headed Cells visible-click verifier through
+    `cosmic-background-launch --workspace boon-circuit`;
+  - if DBus launch passes, continue merging headed hardware substrate with the
+    full Cells visible-click product/proof/budget assertions.
+
+2026-07-03 post-restart background-launch verification checkpoint:
+
+- After reboot, the running compositor is the installed forked binary:
+  - `/proc/<cosmic-comp-pid>/exe` resolves to `/usr/bin/cosmic-comp`;
+  - the running binary exposes
+    `com.system76.CosmicComp.BackgroundLaunch1`;
+  - installed `/usr/bin/cosmic-comp` and `/usr/bin/cosmic-background-launch`
+    hashes still match the fork release binaries.
+- `cosmic-background-launch --workspace boon-circuit -- bash -lc 'echo ...'`
+  succeeds and returns a `background-launch-*` launch id.
+- Fresh headed Cells smoke:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug
+    --headed-host-input --address A2 --expected-formula 15 --repeat-count 1
+    --report target/reports/native-gpu/cells-visible-click-headed-host-a2-after-restart.json`;
+  - report `status=pass`;
+  - launcher is `cosmic-background-launch --workspace boon-circuit`;
+  - selected adapter is hardware:
+    `NVIDIA GeForce RTX 2070`, Vulkan, `DiscreteGpu`;
+  - app-owned input selected `A2` and formula-bar text became `15`;
+  - schema check passes and no `boon_native_playground` process remains.
+- This is still not 60 FPS acceptance:
+  - the headed-host path currently proves background launch, hardware adapter,
+    app-owned input, and functional formula-bar update;
+  - it must still be merged with the full visible-click product/proof/budget
+    assertions, because the debug smoke reported a large
+    `input_accept_to_present_ms` sample and the headed path does not yet enforce
+    the full product-only UX/proof-only contract.

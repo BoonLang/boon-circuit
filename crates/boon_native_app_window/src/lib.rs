@@ -1050,6 +1050,8 @@ impl NativeSurfaceLifecycleState {
 pub struct NativeAcceptedInputFrameTiming {
     pub timing_scope: String,
     pub frame_lane: NativeFrameLane,
+    pub input_event_seq: u64,
+    pub input_event_source: String,
     pub input_event_wake_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_input_event: Option<NativeHostInputEventSummary>,
@@ -1088,13 +1090,20 @@ pub struct NativeAcceptedInputFrameTiming {
 impl NativeAcceptedInputFrameTiming {
     fn from_state(
         state: &NativeRenderLoopState,
-        input_event_wake_count: u64,
+        input_event_seq: u64,
         input_to_present_ms: f64,
     ) -> Self {
+        let timing_scope = if state.last_accepted_host_input_source == "operator_host" {
+            "accepted_operator_host_input_frame"
+        } else {
+            "accepted_visible_host_input_frame"
+        };
         Self {
-            timing_scope: "accepted_visible_host_input_frame".to_owned(),
+            timing_scope: timing_scope.to_owned(),
             frame_lane: NativeFrameLane::ProductInteraction,
-            input_event_wake_count,
+            input_event_seq,
+            input_event_source: state.last_accepted_host_input_source.clone(),
+            input_event_wake_count: state.last_accepted_host_input_event_wake_count,
             host_input_event: state.last_accepted_host_input_event.clone(),
             input_wake_elapsed_ms: state
                 .last_accepted_host_input_event
@@ -1228,11 +1237,14 @@ pub struct NativeRenderLoopState {
     pub last_present_path_readback_enabled: bool,
     pub last_poll_started_elapsed_ms: Option<f64>,
     pub last_dirty_poll_elapsed_ms: Option<f64>,
+    pub last_accepted_host_input_seq: u64,
     pub last_accepted_host_input_event_wake_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accepted_host_input_event: Option<NativeHostInputEventSummary>,
+    pub last_accepted_host_input_source: String,
     pub last_accepted_host_input_elapsed_ms: Option<f64>,
     pub last_accepted_host_input_press_only: bool,
+    pub last_input_to_present_accounted_input_seq: u64,
     pub last_input_to_present_accounted_event_wake_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accounted_input_frame_timing: Option<NativeAcceptedInputFrameTiming>,
@@ -1399,10 +1411,13 @@ impl NativeRenderLoopState {
             last_present_path_readback_enabled: false,
             last_poll_started_elapsed_ms: None,
             last_dirty_poll_elapsed_ms: None,
+            last_accepted_host_input_seq: 0,
             last_accepted_host_input_event_wake_count: 0,
             last_accepted_host_input_event: None,
+            last_accepted_host_input_source: "none".to_owned(),
             last_accepted_host_input_elapsed_ms: None,
             last_accepted_host_input_press_only: false,
+            last_input_to_present_accounted_input_seq: 0,
             last_input_to_present_accounted_event_wake_count: 0,
             last_accounted_input_frame_timing: None,
             last_external_wake_generation: 0,
@@ -1635,6 +1650,12 @@ impl NativeRenderLoopState {
         self.last_dirty_poll_elapsed_ms = Some(elapsed_ms);
     }
 
+    fn next_accepted_host_input_seq(&self) -> u64 {
+        self.last_accepted_host_input_seq
+            .max(self.last_input_to_present_accounted_input_seq)
+            .saturating_add(1)
+    }
+
     pub fn note_accepted_host_input(
         &mut self,
         input_event_wake_count: u64,
@@ -1642,8 +1663,47 @@ impl NativeRenderLoopState {
         press_only: bool,
         host_input_event: Option<NativeHostInputEventSummary>,
     ) {
+        let input_event_seq = self.next_accepted_host_input_seq();
+        self.note_accepted_host_input_with_source(
+            input_event_seq,
+            input_event_wake_count,
+            "real_os",
+            elapsed_ms,
+            press_only,
+            host_input_event,
+        );
+    }
+
+    pub fn note_accepted_operator_host_input(
+        &mut self,
+        elapsed_ms: f64,
+        press_only: bool,
+        host_input_event: Option<NativeHostInputEventSummary>,
+    ) {
+        let input_event_seq = self.next_accepted_host_input_seq();
+        self.note_accepted_host_input_with_source(
+            input_event_seq,
+            0,
+            "operator_host",
+            elapsed_ms,
+            press_only,
+            host_input_event,
+        );
+    }
+
+    fn note_accepted_host_input_with_source(
+        &mut self,
+        input_event_seq: u64,
+        input_event_wake_count: u64,
+        source: &str,
+        elapsed_ms: f64,
+        press_only: bool,
+        host_input_event: Option<NativeHostInputEventSummary>,
+    ) {
+        self.last_accepted_host_input_seq = input_event_seq;
         self.last_accepted_host_input_event_wake_count = input_event_wake_count;
         self.last_accepted_host_input_event = host_input_event;
+        self.last_accepted_host_input_source = source.to_owned();
         self.last_accepted_host_input_elapsed_ms = Some(elapsed_ms);
         self.last_accepted_host_input_press_only = press_only;
         if self.armed_frame_pending || self.armed_frame_started_elapsed_ms.is_some() {
@@ -1659,21 +1719,21 @@ impl NativeRenderLoopState {
 
     pub fn take_frame_accepted_input_to_present_ms(
         &mut self,
-        presented_input_event_wake_count: u64,
+        presented_input_event_seq: Option<u64>,
     ) -> Option<f64> {
-        self.take_frame_accepted_input_timing(presented_input_event_wake_count)
+        self.take_frame_accepted_input_timing(presented_input_event_seq)
             .map(|timing| timing.input_to_present_ms)
     }
 
     pub fn take_frame_accepted_input_timing(
         &mut self,
-        presented_input_event_wake_count: u64,
+        presented_input_event_seq: Option<u64>,
     ) -> Option<NativeAcceptedInputFrameTiming> {
-        if presented_input_event_wake_count == 0
-            || self.last_accepted_host_input_event_wake_count == 0
-            || self.last_accepted_host_input_event_wake_count
-                <= self.last_input_to_present_accounted_event_wake_count
-            || self.last_accepted_host_input_event_wake_count != presented_input_event_wake_count
+        let presented_input_event_seq = presented_input_event_seq?;
+        if presented_input_event_seq == 0
+            || self.last_accepted_host_input_seq == 0
+            || self.last_accepted_host_input_seq <= self.last_input_to_present_accounted_input_seq
+            || self.last_accepted_host_input_seq != presented_input_event_seq
         {
             return None;
         }
@@ -1683,9 +1743,10 @@ impl NativeRenderLoopState {
         )?;
         let timing = NativeAcceptedInputFrameTiming::from_state(
             self,
-            self.last_accepted_host_input_event_wake_count,
+            self.last_accepted_host_input_seq,
             latency_ms,
         );
+        self.last_input_to_present_accounted_input_seq = self.last_accepted_host_input_seq;
         self.last_input_to_present_accounted_event_wake_count =
             self.last_accepted_host_input_event_wake_count;
         self.last_accounted_input_frame_timing = Some(timing.clone());
@@ -1698,8 +1759,23 @@ impl NativeRenderLoopState {
     ) -> bool {
         presented_input_event_wake_count != 0
             && self.last_accepted_host_input_event_wake_count == presented_input_event_wake_count
-            && self.last_accepted_host_input_event_wake_count
-                > self.last_input_to_present_accounted_event_wake_count
+            && self.last_accepted_host_input_seq > self.last_input_to_present_accounted_input_seq
+    }
+
+    pub fn current_frame_input_event_seq(
+        &self,
+        presented_input_event_wake_count: u64,
+    ) -> Option<u64> {
+        if self.last_accepted_host_input_seq <= self.last_input_to_present_accounted_input_seq {
+            return None;
+        }
+        if self.last_accepted_host_input_event_wake_count == 0
+            || self.last_accepted_host_input_event_wake_count == presented_input_event_wake_count
+        {
+            Some(self.last_accepted_host_input_seq)
+        } else {
+            None
+        }
     }
 
     pub fn note_external_wake_observed(&mut self, generation: u64, elapsed_ms: f64) {
@@ -2129,9 +2205,7 @@ impl NativeRenderLoopState {
     pub fn consume_due_wake_after_poll(&mut self, now: Instant) -> bool {
         if self.next_wake_at.is_some_and(|wake_at| now >= wake_at)
             && self.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
-            && self.last_accepted_host_input_event_wake_count > 0
-            && self.last_accepted_host_input_event_wake_count
-                > self.last_input_to_present_accounted_event_wake_count
+            && self.last_accepted_host_input_seq > self.last_input_to_present_accounted_input_seq
         {
             self.next_wake_at = None;
             self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
@@ -5739,10 +5813,21 @@ async fn run_surface_probe_inner(
                 poll_result.clone(),
                 reportable_host_input_this_turn,
             );
+            let operator_host_input_this_turn = !reportable_host_input_this_turn
+                && !input.real_os_events_observed
+                && effective_poll_result.dirty
+                && effective_poll_result.scheduler_reason == Some(NativeSchedulerReason::HostInput)
+                && effective_poll_result.frame_lane == Some(NativeFrameLane::ProductInteraction);
             render_loop_state
                 .apply_poll_result(&effective_poll_result, host_input_observed_this_turn);
             dirty_poll_result_this_turn |= effective_poll_result.dirty;
-            if reportable_host_input_this_turn
+            if operator_host_input_this_turn {
+                render_loop_state.request_animation_burst(
+                    poll_started_at,
+                    hold_started.elapsed().as_secs_f64() * 1000.0,
+                    NativeSchedulerReason::HostInput,
+                );
+            } else if reportable_host_input_this_turn
                 && effective_poll_result.dirty
                 && native_input_delta_is_pointer_motion_only(&input)
             {
@@ -5785,6 +5870,22 @@ async fn run_surface_probe_inner(
                         &input,
                         sampled_input_event_wake_count,
                         sampled_input_wake_elapsed_ms,
+                        role_poll_completed_elapsed_ms,
+                        effective_poll_result
+                            .accepted_host_input_event_hint
+                            .as_ref(),
+                    )),
+                );
+            } else if operator_host_input_this_turn {
+                render_loop_state.note_accepted_operator_host_input(
+                    role_poll_completed_elapsed_ms,
+                    effective_poll_result
+                        .accepted_host_input_event_hint
+                        .as_ref()
+                        .is_some_and(|hint| {
+                            hint.kind == "mouse_button" && hint.pressed == Some(true)
+                        }),
+                    Some(accepted_operator_host_input_event_summary(
                         role_poll_completed_elapsed_ms,
                         effective_poll_result
                             .accepted_host_input_event_hint
@@ -6276,11 +6377,16 @@ async fn run_surface_probe_inner(
             }
             frame
         };
+        let pending_input_event_seq = render_loop_state
+            .current_frame_input_event_seq(sampled_input_event_wake_count)
+            .or_else(|| {
+                (sampled_input_event_wake_count > 0).then_some(sampled_input_event_wake_count)
+            });
         let pending_frame_evidence_key = frame_evidence_key_for_next_presented_frame_with_revisions(
             &render_loop_state,
             &surface_id,
             surface_lifecycle.epoch(),
-            (sampled_input_event_wake_count > 0).then_some(sampled_input_event_wake_count),
+            pending_input_event_seq,
             None,
             rendered_content_revision,
             rendered_layout_revision,
@@ -6451,8 +6557,14 @@ async fn run_surface_probe_inner(
             queue_submit_call_ms,
             present_call_ms,
         );
-        let stats_input_timing = render_loop_state
-            .take_frame_accepted_input_timing(last_presented_input_event_wake_count);
+        let presented_input_event_seq = render_loop_state
+            .current_frame_input_event_seq(last_presented_input_event_wake_count)
+            .or_else(|| {
+                (last_presented_input_event_wake_count > 0)
+                    .then_some(last_presented_input_event_wake_count)
+            });
+        let stats_input_timing =
+            render_loop_state.take_frame_accepted_input_timing(presented_input_event_seq);
         let stats_input_to_present_ms = stats_input_timing
             .as_ref()
             .map(|timing| timing.input_to_present_ms);
@@ -6481,8 +6593,7 @@ async fn run_surface_probe_inner(
                 &render_loop_state,
                 &surface_id,
                 surface_lifecycle.epoch(),
-                (last_presented_input_event_wake_count > 0)
-                    .then_some(last_presented_input_event_wake_count),
+                presented_input_event_seq,
                 None,
             ),
             pending_frame_evidence_key
@@ -8243,6 +8354,9 @@ fn recent_frame_evidence_entry(
         "surface_epoch": key.surface_epoch,
         "input_event_wake_count": presented_input_event_wake_count,
         "input_event_seq": key.input_event_seq,
+        "accepted_host_input_source": state.last_accepted_host_input_source,
+        "accepted_host_input_seq": state.last_accepted_host_input_seq,
+        "input_to_present_accounted_input_seq": state.last_input_to_present_accounted_input_seq,
         "accepted_host_input_event": accepted_input_frame_timing
             .and_then(|timing| timing.host_input_event.clone())
             .or_else(|| state.last_accepted_host_input_event.clone()),
@@ -8259,7 +8373,13 @@ fn recent_frame_evidence_entry(
             .map(|timing| timing.frame_lane)
             .or(state.last_frame_lane),
         "accepted_input_frame_timing": accepted_input_frame_timing,
-        "input_accept_timing_source": input_accept_to_present_ms.map(|_| "role_poll_hook_accepted_visible_host_input"),
+        "input_accept_timing_source": input_accept_to_present_ms.map(|_| {
+            if state.last_accepted_host_input_source == "operator_host" {
+                "role_poll_hook_accepted_operator_host_input"
+            } else {
+                "role_poll_hook_accepted_visible_host_input"
+            }
+        }),
         "input_wake_timing_source": input_wake_to_present_ms.map(|_| "recent_presented_input_generation"),
         "last_poll_started_elapsed_ms": state.last_poll_started_elapsed_ms,
         "poll_started_to_input_accept_ms": poll_started_to_input_accept_ms,
@@ -9252,6 +9372,18 @@ fn write_render_loop_state_report(
         "last_interactive_readback_artifact": last_interactive_readback_artifact
     });
     if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "accepted_host_input_seq".to_owned(),
+            serde_json::json!(state.last_accepted_host_input_seq),
+        );
+        object.insert(
+            "accepted_host_input_source".to_owned(),
+            serde_json::json!(state.last_accepted_host_input_source),
+        );
+        object.insert(
+            "input_to_present_accounted_input_seq".to_owned(),
+            serde_json::json!(state.last_input_to_present_accounted_input_seq),
+        );
         object.insert(
             "non_product_presented_frame_count".to_owned(),
             serde_json::json!(state.non_product_presented_frame_count),
@@ -10375,6 +10507,41 @@ fn accepted_host_input_event_summary(
     }
 }
 
+fn accepted_operator_host_input_event_summary(
+    accepted_elapsed_ms: f64,
+    semantic_hint: Option<&NativeHostInputEventHint>,
+) -> NativeHostInputEventSummary {
+    let kind = semantic_hint
+        .map(|hint| hint.kind.clone())
+        .unwrap_or_else(|| "operator_host_input".to_owned());
+    NativeHostInputEventSummary {
+        scope: "accepted_operator_host_input_delta".to_owned(),
+        kind,
+        source_intent: semantic_hint.and_then(|hint| hint.source_intent.clone()),
+        sequence: semantic_hint.and_then(|hint| hint.sequence),
+        input_event_wake_count: 0,
+        wake_elapsed_ms: None,
+        raw_wake_elapsed_ms: None,
+        event_elapsed_ms: semantic_hint.and_then(|hint| hint.event_elapsed_ms),
+        accepted_elapsed_ms: Some(accepted_elapsed_ms),
+        wake_to_accept_ms: None,
+        event_to_accept_ms: semantic_hint
+            .and_then(|hint| elapsed_delta_ms(hint.event_elapsed_ms, Some(accepted_elapsed_ms))),
+        window_protocol_id: semantic_hint.and_then(|hint| hint.window_protocol_id),
+        button: semantic_hint.and_then(|hint| hint.button.clone()),
+        pressed: semantic_hint.and_then(|hint| hint.pressed),
+        key: semantic_hint.and_then(|hint| hint.key.clone()),
+        mouse_button_delta_count: usize::from(
+            semantic_hint.is_some_and(|hint| hint.kind == "mouse_button"),
+        ),
+        keyboard_delta_count: usize::from(
+            semantic_hint.is_some_and(|hint| hint.kind == "keyboard_key"),
+        ),
+        has_scroll_delta: semantic_hint.is_some_and(|hint| hint.kind == "mouse_scroll"),
+        has_motion_delta: semantic_hint.is_some_and(|hint| hint.kind == "mouse_motion"),
+    }
+}
+
 fn native_input_delta_is_button_press_only(input: &NativeInputAdapterProof) -> bool {
     let has_press = input.mouse_button_events.iter().any(|event| event.pressed);
     let has_release = input.mouse_button_events.iter().any(|event| !event.pressed);
@@ -11258,7 +11425,7 @@ mod tests {
             }],
             ..NativeRenderFrameMetrics::default()
         }));
-        let input_timing = state.take_frame_accepted_input_timing(1);
+        let input_timing = state.take_frame_accepted_input_timing(Some(1));
         let key = frame_evidence_key_for_presented_frame(
             &state,
             &SurfaceId("preview:proof-isolation".to_owned()),
@@ -11887,7 +12054,8 @@ mod tests {
         state.note_present_completed(27.5);
         state.mark_presented_with_revisions(1, 2, 3, 4);
         state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
-        let frame_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
+        let frame_input_to_present_ms =
+            state.take_frame_accepted_input_to_present_ms(state.current_frame_input_event_seq(3));
         state.note_dirty_poll(140.0);
         state.note_render_started(150.0);
         state.note_surface_acquired(151.0);
@@ -13378,7 +13546,8 @@ mod tests {
         let raw_wake_to_present_ms =
             elapsed_delta_ms(raw_wake_elapsed_ms, state.last_present_completed_elapsed_ms);
         state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
-        let accepted_input_to_present_ms = state.take_frame_accepted_input_to_present_ms(3);
+        let accepted_input_to_present_ms =
+            state.take_frame_accepted_input_to_present_ms(state.current_frame_input_event_seq(3));
         let mut accumulator = NativePreviewPerfAccumulator::default();
         accumulator.record(
             None,
@@ -13416,10 +13585,13 @@ mod tests {
         assert_eq!(stats.input_to_present_ms_p50_p95_p99_max.p95, Some(8.0));
         assert_eq!(state.last_accepted_host_input_event_wake_count, 3);
         assert_eq!(state.last_input_to_present_accounted_event_wake_count, 3);
+        assert_eq!(state.last_input_to_present_accounted_input_seq, 1);
         let accepted_timing = state
             .last_accounted_input_frame_timing
             .as_ref()
             .expect("accepted input timing should be captured once");
+        assert_eq!(accepted_timing.input_event_seq, 1);
+        assert_eq!(accepted_timing.input_event_source, "real_os");
         assert_eq!(accepted_timing.input_event_wake_count, 3);
         assert_eq!(
             accepted_timing.host_input_event.as_ref(),
@@ -13447,7 +13619,7 @@ mod tests {
             &state,
             &SurfaceId("surface-test".to_owned()),
             1,
-            Some(3),
+            Some(accepted_timing.input_event_seq),
             None,
         );
         let commit = product_frame_commit_for_presented_frame(
@@ -13467,6 +13639,61 @@ mod tests {
                 .and_then(|timing| timing.input_wake_to_present_ms),
             Some(20.0)
         );
+    }
+
+    #[test]
+    fn accepted_operator_host_input_publishes_product_timing_without_real_os_wake() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let hint = NativeHostInputEventHint {
+            kind: "mouse_button".to_owned(),
+            source_intent: Some("press".to_owned()),
+            sequence: Some(1),
+            window_protocol_id: Some(101),
+            button: Some("left".to_owned()),
+            pressed: Some(true),
+            key: None,
+            event_elapsed_ms: None,
+        };
+        let summary = accepted_operator_host_input_event_summary(12.0, Some(&hint));
+        state.current_scheduler_reason = Some(NativeSchedulerReason::HostInput);
+        state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
+        state.note_accepted_operator_host_input(12.0, true, Some(summary.clone()));
+        state.note_dirty_poll(12.2);
+        state.note_render_started(12.4);
+        state.note_surface_acquired(12.7);
+        state.note_render_hook_completed(13.1);
+        state.note_queue_submitted(13.7);
+        state.note_present_completed(14.3);
+
+        let input_event_seq = state.current_frame_input_event_seq(0);
+        assert_eq!(input_event_seq, Some(1));
+        let timing = state
+            .take_frame_accepted_input_timing(input_event_seq)
+            .expect("operator host input should define product timing");
+
+        assert_eq!(timing.timing_scope, "accepted_operator_host_input_frame");
+        assert_eq!(timing.input_event_seq, 1);
+        assert_eq!(timing.input_event_source, "operator_host");
+        assert_eq!(timing.input_event_wake_count, 0);
+        assert!((timing.input_to_present_ms - 2.3).abs() < 1.0e-9);
+        assert_eq!(timing.host_input_event.as_ref(), Some(&summary));
+        assert_eq!(state.last_input_to_present_accounted_input_seq, 1);
+        assert_eq!(state.last_input_to_present_accounted_event_wake_count, 0);
+
+        let key = frame_evidence_key_for_presented_frame(
+            &state,
+            &SurfaceId("surface-test".to_owned()),
+            1,
+            Some(timing.input_event_seq),
+            None,
+        );
+        assert_eq!(key.input_event_seq, Some(1));
+        let policy = NativeFrameClock::product_commit_policy(
+            NativeFrameLane::ProductInteraction,
+            true,
+            Some(&timing),
+        );
+        assert!(policy.publish_product_commit);
     }
 
     #[test]
@@ -13519,20 +13746,26 @@ mod tests {
         state.note_accepted_host_input(3, 20.0, false, None);
         state.note_present_completed(27.5);
 
-        assert_eq!(state.take_frame_accepted_input_to_present_ms(2), None);
-        assert_eq!(state.take_frame_accepted_input_to_present_ms(3), Some(7.5));
-        assert_eq!(state.take_frame_accepted_input_to_present_ms(3), None);
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(Some(2)), None);
+        assert_eq!(
+            state.take_frame_accepted_input_to_present_ms(Some(1)),
+            Some(7.5)
+        );
+        assert_eq!(state.take_frame_accepted_input_to_present_ms(Some(1)), None);
 
         state.note_present_completed(44.0);
         assert_eq!(
-            state.take_frame_accepted_input_to_present_ms(3),
+            state.take_frame_accepted_input_to_present_ms(Some(1)),
             None,
             "later frames must not keep reusing the old accepted input timestamp"
         );
 
         state.note_accepted_host_input(4, 45.0, false, None);
         state.note_present_completed(50.0);
-        assert_eq!(state.take_frame_accepted_input_to_present_ms(4), Some(5.0));
+        assert_eq!(
+            state.take_frame_accepted_input_to_present_ms(Some(2)),
+            Some(5.0)
+        );
         assert_eq!(state.last_input_to_present_accounted_event_wake_count, 4);
     }
 
@@ -13550,7 +13783,7 @@ mod tests {
         state.note_present_completed(14.0);
 
         let timing = state
-            .take_frame_accepted_input_timing(7)
+            .take_frame_accepted_input_timing(Some(1))
             .expect("accepted host input should define product timing");
 
         assert_eq!(timing.frame_lane, NativeFrameLane::ProductInteraction);
@@ -13584,7 +13817,7 @@ mod tests {
         state.note_present_completed(106.0);
 
         let timing = state
-            .take_frame_accepted_input_timing(7)
+            .take_frame_accepted_input_timing(Some(1))
             .expect("input frame should be accounted");
         assert_eq!(timing.input_to_present_ms, 6.0);
         assert_eq!(timing.input_accept_to_dirty_poll_ms, Some(1.0));
@@ -13626,7 +13859,7 @@ mod tests {
         });
         state.note_present_completed(144.0);
 
-        assert_eq!(state.take_frame_accepted_input_timing(7), None);
+        assert_eq!(state.take_frame_accepted_input_timing(Some(1)), None);
         let stored = state
             .last_accounted_input_frame_timing
             .as_ref()
@@ -13892,7 +14125,7 @@ mod tests {
         state.note_present_completed(16.0);
         state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
         let timing = state
-            .take_frame_accepted_input_timing(7)
+            .take_frame_accepted_input_timing(Some(1))
             .expect("accepted input timing");
 
         let product_policy = NativeFrameClock::product_commit_policy(
@@ -14290,7 +14523,7 @@ mod tests {
         assert!(state.current_frame_carries_unaccounted_host_input(5));
         assert!(!state.current_frame_carries_unaccounted_host_input(4));
 
-        assert!(state.take_frame_accepted_input_timing(5).is_some());
+        assert!(state.take_frame_accepted_input_timing(Some(1)).is_some());
         assert!(!state.current_frame_carries_unaccounted_host_input(5));
     }
 

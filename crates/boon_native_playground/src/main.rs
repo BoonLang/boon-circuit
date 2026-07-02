@@ -1511,7 +1511,7 @@ fn deterministic_keyboard_input_from_keys(
         per_window_event_provenance_api:
             "app_window::input::keyboard::KeyboardEventProvenance::recent_key_events".to_owned(),
         sampled_after_visible_window: true,
-        real_os_events_observed: true,
+        real_os_events_observed: false,
         input_injection_method: "deterministic_app_owned_keyboard_event_batch".to_owned(),
         synthetic_input_probe: false,
         mouse_last_window_protocol_id: None,
@@ -5422,7 +5422,7 @@ fn deterministic_motion_input_from_counts(
     input.mouse_button_event_count = button_event_count;
     input.mouse_motion_event_count = motion_event_count;
     input.mouse_total_event_count = button_event_count.saturating_add(motion_event_count);
-    input.real_os_events_observed = true;
+    input.real_os_events_observed = false;
     set_input_window_size(&mut input, viewport);
     input
 }
@@ -6063,6 +6063,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         replace_worker: PreviewReplaceWorkerQueue::default(),
         ipc_counters: PreviewIpcCounterState::default(),
         verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+        verifier_host_input: PreviewVerifierHostInputQueue::default(),
         shutdown: PreviewShutdownState::default(),
     }));
     let preview_shutdown = preview_ipc_state
@@ -6425,6 +6426,16 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             );
             note_poll_phase!("input_delta_projection_ms", phase_started);
             let phase_started = Instant::now();
+            let verifier_host_input_queue = poll_preview_ipc_state
+                .lock()
+                .map_err(|_| "preview IPC state mutex poisoned".to_owned())?
+                .verifier_host_input
+                .clone();
+            let verifier_host_click_request = verifier_host_input_queue.take_click()?;
+            note_poll_phase!("verifier_host_input_take_ms", phase_started);
+            let mut verifier_host_input_report = serde_json::Value::Null;
+            let mut verifier_host_input_applied = false;
+            let phase_started = Instant::now();
             if !preview_has_world_scene {
                 match preview_try_apply_passive_hover_input(
                     &input_delta,
@@ -6450,6 +6461,52 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             note_poll_phase!("passive_hover_ms", phase_started);
+            let phase_started = Instant::now();
+            if let Some(request) = verifier_host_click_request.as_ref() {
+                match preview_apply_verifier_host_click_request(
+                    &poll_shared_render_state,
+                    &mut input_state,
+                    &input_context,
+                    context.width,
+                    context.height,
+                    request,
+                ) {
+                    Ok((applied, report)) => {
+                        verifier_host_input_applied = applied;
+                        if applied && role_dirty_reason.is_none() {
+                            role_dirty_reason = Some(
+                                boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied,
+                            );
+                        }
+                        verifier_host_input_queue.record_completed(report.clone());
+                        verifier_host_input_report = report;
+                    }
+                    Err(error) => {
+                        let report = json!({
+                            "kind": "verifier-host-click-result",
+                            "status": "fail",
+                            "request_id": request.request_id,
+                            "source": request.source,
+                            "target_text": request.target_text,
+                            "label": request.label,
+                            "diagnostic": error.to_string(),
+                            "operator_host_input": true,
+                            "real_os_input": false,
+                            "direct_runtime_state_mutation": false
+                        });
+                        verifier_host_input_queue.record_completed(report.clone());
+                        verifier_host_input_report = report;
+                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                            .map_err(|error| error.to_string())?
+                        {
+                            role_dirty_reason = Some(
+                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                            );
+                        }
+                    }
+                }
+            }
+            note_poll_phase!("verifier_host_input_ms", phase_started);
             let phase_started = Instant::now();
             if !context.accessibility_actions.is_empty() {
                 match preview_apply_accessibility_actions_with_units(
@@ -6684,6 +6741,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let dirty = after_update_count != before_update_count
                 || after_content_revision != last_poll_revision
+                || verifier_host_input_applied
                 || context.forced_frame
                 || verifier_frame_requested
                 || headed_scenario_poll.dirty;
@@ -6692,6 +6750,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let phase_started = Instant::now();
             let scheduler_reason = if verifier_frame_requested || context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
+            } else if verifier_host_input_applied {
+                Some(boon_native_app_window::NativeSchedulerReason::HostInput)
             } else if context.input_delta.real_os_events_observed {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
             } else if headed_scenario_poll.dirty {
@@ -6730,7 +6790,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let accessibility_refresh_pending_before = pending_accessibility_refresh;
             let defer_accessibility_snapshot =
                 preview_should_defer_accessibility_snapshot_for_product_input(
-                    input_delta.real_os_events_observed,
+                    input_delta.real_os_events_observed || verifier_host_input_applied,
                     dirty,
                     !context.accessibility_actions.is_empty(),
                     context.forced_frame,
@@ -6778,6 +6838,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
             let frame_lane_hint = if verifier_frame_requested {
                 Some(boon_native_app_window::NativeFrameLane::ProofOrHarness)
+            } else if verifier_host_input_applied {
+                Some(boon_native_app_window::NativeFrameLane::ProductInteraction)
             } else {
                 preview_frame_lane_hint_for_current_interaction_scope()
             };
@@ -6804,6 +6866,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "after_content_revision": after_content_revision,
                 "headed_scenario_dirty": headed_scenario_poll.dirty,
                 "headed_scenario_active": headed_scenario_poll.active,
+                "verifier_host_input_applied": verifier_host_input_applied,
+                "verifier_host_input_report": verifier_host_input_report,
                 "focus_changed": focus_changed,
                 "text_input_caret_active": preview_text_input_caret_active,
                 "accessibility_snapshot_status": accessibility_snapshot_status,
@@ -6841,7 +6905,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .flatten()
                 .min(),
-                wants_animation_frame: headed_scenario_poll.active,
+                wants_animation_frame: headed_scenario_poll.active || verifier_host_input_applied,
                 cursor_icon,
                 diagnostics: Some(poll_diagnostics),
                 accessibility_update,
@@ -13537,6 +13601,8 @@ fn preview_frame_with_viewport_background(
     if width <= 0.0 || height <= 0.0 {
         return frame;
     }
+    const PREVIEW_VIEWPORT_BACKGROUND_NODE: &str = "__boon_preview_viewport_background";
+    const PREVIEW_VIEWPORT_BACKGROUND_COLOR: &str = "#f8fafc";
     if let Some(background) = frame.display_list.iter_mut().find(|item| {
         item.bounds.x.abs() <= f32::EPSILON
             && item.bounds.y.abs() <= f32::EPSILON
@@ -13545,7 +13611,34 @@ fn preview_frame_with_viewport_background(
     }) {
         background.bounds.width = background.bounds.width.max(width);
         background.bounds.height = background.bounds.height.max(height);
+    } else {
+        let mut style = BTreeMap::new();
+        style.insert(
+            "background".to_owned(),
+            boon_document_model::StyleValue::Text(PREVIEW_VIEWPORT_BACKGROUND_COLOR.to_owned()),
+        );
+        let style_identity = boon_document::ComputedStyleIdentity::from_style(&style);
+        frame.display_list.insert(
+            0,
+            boon_document::DisplayItem {
+                node: boon_document_model::DocumentNodeId(
+                    PREVIEW_VIEWPORT_BACKGROUND_NODE.to_owned(),
+                ),
+                kind: boon_document_model::DocumentNodeKind::Text,
+                bounds: boon_document::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height,
+                },
+                text: Some(String::new()),
+                style_identity,
+                style,
+                focused: false,
+            },
+        );
     }
+    frame.metrics.display_item_count = frame.display_list.len();
     frame
 }
 
@@ -37466,6 +37559,92 @@ fn unix_now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+fn preview_apply_verifier_host_click_request(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &mut PreviewNativeInputState,
+    input_context: &PreviewInputRuntimeContext,
+    width: u32,
+    height: u32,
+    request: &PreviewVerifierHostClickRequest,
+) -> Result<(bool, serde_json::Value), Box<dyn std::error::Error>> {
+    let (target_x, target_y, route) = if let (Some(x), Some(y)) = (request.x, request.y) {
+        (
+            x,
+            y,
+            json!({
+                "kind": "fixed-window-coordinate",
+                "x": x,
+                "y": y
+            }),
+        )
+    } else {
+        let (x, y, node) = preview_headed_source_target(
+            shared_render_state,
+            &request.source,
+            request.target_text.as_deref(),
+        )?;
+        (
+            x,
+            y,
+            json!({
+                "kind": "layout-source-intent-hit-center",
+                "source": request.source,
+                "target_text": request.target_text,
+                "node": node
+            }),
+        )
+    };
+    let start_index = input_state.last_mouse_button_event_count / 2;
+    let mut input = deterministic_click_input_from_start_index(start_index, 1, target_x, target_y);
+    input.capture_scope = "verifier_host_click".to_owned();
+    input.input_injection_method = "preview_verifier_app_owned_native_input_adapter".to_owned();
+    input.mouse_motion_event_count = input_state.last_mouse_motion_event_count.saturating_add(1);
+    input.mouse_total_event_count = input
+        .mouse_button_event_count
+        .saturating_add(input.mouse_motion_event_count);
+    set_input_window_size(&mut input, (width as f32, height as f32));
+    preview_set_interaction_timing_scope(PREVIEW_TIMING_SCOPE_CLICK);
+    let applied = if let Some(live_runtime) = input_context.live_runtime.as_ref() {
+        preview_apply_real_window_input_with_units(
+            &input,
+            &input_context.source_path,
+            &input_context.source_text,
+            &input_context.runtime_units,
+            Some(live_runtime),
+            shared_render_state,
+            input_state,
+        )?
+    } else {
+        return Err("preview live runtime is not available for verifier host click".into());
+    };
+    Ok((
+        applied,
+        json!({
+            "kind": "verifier-host-click-result",
+            "status": if applied { "pass" } else { "no-op" },
+            "request_id": request.request_id,
+            "source": request.source,
+            "target_text": request.target_text,
+            "label": request.label,
+            "cursor": {"x": target_x, "y": target_y},
+            "route": route,
+            "input_route_contract": "queued app-owned NativeInputAdapterProof -> preview poll hook -> preview_apply_real_window_input_with_units",
+            "operator_host_input": true,
+            "real_os_input": false,
+            "direct_runtime_state_mutation": false,
+            "accepted_host_input_event_hint": input_state.accepted_host_input_event_hint,
+            "native_input_adapter": {
+                "capture_scope": input.capture_scope,
+                "input_injection_method": input.input_injection_method,
+                "real_os_events_observed": input.real_os_events_observed,
+                "mouse_button_event_count": input.mouse_button_event_count,
+                "mouse_motion_event_count": input.mouse_motion_event_count,
+                "mouse_total_event_count": input.mouse_total_event_count
+            }
+        }),
+    ))
+}
+
 #[derive(Clone, Debug, Default)]
 struct PreviewRetainedBoundSyncStats {
     status: &'static str,
@@ -38715,7 +38894,7 @@ fn deterministic_click_input_from_start_index(
         per_window_event_provenance_api:
             "app_window::input::mouse::MouseEventProvenance::recent_button_events".to_owned(),
         sampled_after_visible_window: true,
-        real_os_events_observed: true,
+        real_os_events_observed: false,
         input_injection_method: "deterministic_app_owned_mouse_event_batch".to_owned(),
         synthetic_input_probe: false,
         mouse_last_window_protocol_id: Some(1),
@@ -54078,6 +54257,7 @@ struct PreviewIpcState {
     replace_worker: PreviewReplaceWorkerQueue,
     ipc_counters: PreviewIpcCounterState,
     verifier_frame_requests: PreviewVerifierFrameRequestState,
+    verifier_host_input: PreviewVerifierHostInputQueue,
     shutdown: PreviewShutdownState,
 }
 
@@ -54086,6 +54266,91 @@ struct PreviewVerifierFrameRequestState {
     request_count: u64,
     consumed_count: u64,
     last_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewVerifierHostClickRequest {
+    request_id: u64,
+    source: String,
+    target_text: Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+    label: String,
+    enqueued_at_unix_ms: u128,
+}
+
+#[derive(Clone, Default)]
+struct PreviewVerifierHostInputQueue {
+    next_request_id: Arc<AtomicU64>,
+    pending: Arc<Mutex<VecDeque<PreviewVerifierHostClickRequest>>>,
+    completed: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+impl PreviewVerifierHostInputQueue {
+    fn enqueue_click(
+        &self,
+        source: String,
+        target_text: Option<String>,
+        x: Option<f64>,
+        y: Option<f64>,
+        label: String,
+    ) -> Result<PreviewVerifierHostClickRequest, Box<dyn std::error::Error>> {
+        if source.trim().is_empty() && (x.is_none() || y.is_none()) {
+            return Err("verifier-host-click requires source/target or x/y coordinates".into());
+        }
+        if x.is_some() != y.is_some() {
+            return Err("verifier-host-click x and y must be provided together".into());
+        }
+        let request = PreviewVerifierHostClickRequest {
+            request_id: self.next_request_id.fetch_add(1, Ordering::SeqCst) + 1,
+            source,
+            target_text,
+            x,
+            y,
+            label,
+            enqueued_at_unix_ms: unix_now_ms(),
+        };
+        self.pending
+            .lock()
+            .map_err(|_| "preview verifier host input queue mutex poisoned")?
+            .push_back(request.clone());
+        Ok(request)
+    }
+
+    fn take_click(&self) -> Result<Option<PreviewVerifierHostClickRequest>, String> {
+        self.pending
+            .lock()
+            .map_err(|_| "preview verifier host input queue mutex poisoned".to_owned())
+            .map(|mut pending| pending.pop_front())
+    }
+
+    fn record_completed(&self, report: serde_json::Value) {
+        if let Ok(mut completed) = self.completed.lock() {
+            completed.push_back(report);
+            while completed.len() > 64 {
+                completed.pop_front();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let pending_count = self
+            .pending
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(0);
+        let completed = self
+            .completed
+            .lock()
+            .map(|completed| completed.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        json!({
+            "kind": "verifier-host-input-queue",
+            "pending_count": pending_count,
+            "completed_count": completed.len(),
+            "recent_completed": completed
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -54189,6 +54454,67 @@ fn preview_take_verifier_frame_request(
         state.verifier_frame_requests.consumed_count,
         state.verifier_frame_requests.last_reason.clone(),
     )))
+}
+
+fn preview_verifier_host_click_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let source = request
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let target_text = request
+        .get("target_text")
+        .or_else(|| request.get("address"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let x = request.get("x").and_then(serde_json::Value::as_f64);
+    let y = request.get("y").and_then(serde_json::Value::as_f64);
+    let label = request
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .or(target_text.as_deref())
+        .unwrap_or("verifier host click")
+        .to_owned();
+    let queue = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?
+        .verifier_host_input
+        .clone();
+    let queued = queue.enqueue_click(source, target_text, x, y, label)?;
+    Ok(json!({
+        "kind": "verifier-host-click-ack",
+        "status": "pass",
+        "request_id": queued.request_id,
+        "source": queued.source,
+        "target_text": queued.target_text,
+        "x": queued.x,
+        "y": queued.y,
+        "label": queued.label,
+        "enqueued_at_unix_ms": queued.enqueued_at_unix_ms,
+        "operator_host_input": true,
+        "real_os_input": false,
+        "input_injection_method": "queued_app_owned_native_input_adapter",
+        "preview_pid": std::process::id()
+    }))
+}
+
+fn preview_verifier_host_input_status_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let queue = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?
+        .verifier_host_input
+        .clone();
+    Ok(json!({
+        "kind": "verifier-host-input-status",
+        "status": "pass",
+        "queue": queue.snapshot(),
+        "preview_pid": std::process::id()
+    }))
 }
 
 #[derive(Clone, Default)]
@@ -60293,6 +60619,48 @@ fn handle_preview_ipc_client(
         )?;
         return Ok(());
     }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("verifier-host-click") {
+        let response =
+            preview_verifier_host_click_response(&state, &request).unwrap_or_else(|error| {
+                json!({
+                    "kind": "verifier-host-click-ack",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
+        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            wake_handle.wake();
+        }
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
+    if request.get("kind").and_then(serde_json::Value::as_str) == Some("verifier-host-input-status")
+    {
+        let response =
+            preview_verifier_host_input_status_response(&state).unwrap_or_else(|error| {
+                json!({
+                    "kind": "verifier-host-input-status",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("runtime-summary") {
         let (runtime_summary, shared_render_state) =
             preview_fresh_runtime_summary_for_state(&state)?;
@@ -65621,6 +65989,7 @@ mod tests {
             role: boon_native_app_window::NativeWindowRole::Preview,
             frame_seq: frame_evidence_key.frame_seq,
             adapter_identity: boon_native_app_window::NativeAdapterIdentity::default(),
+            adapter_policy: boon_native_app_window::NativeAdapterPolicy::AllowSoftwareDiagnostic,
             sample_elapsed_ms: 20.0,
             render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
             frame_pacing: boon_native_app_window::NativeFramePacing {
@@ -66168,6 +66537,58 @@ mod tests {
         assert!(nodes.contains("headed-scenario-click-pulse"));
         assert!(nodes.contains("headed-scenario-key-hud-keys"));
         assert_eq!(frame.metrics.display_item_count, frame.display_list.len());
+    }
+
+    #[test]
+    fn preview_viewport_background_fills_empty_document_area() {
+        let mut text_style = BTreeMap::new();
+        text_style.insert(
+            "color".to_owned(),
+            boon_document_model::StyleValue::Text("#111827".to_owned()),
+        );
+        let frame = boon_document::LayoutFrame {
+            display_list: vec![boon_document::DisplayItem {
+                node: boon_document_model::DocumentNodeId("small-content".to_owned()),
+                kind: boon_document_model::DocumentNodeKind::Text,
+                bounds: boon_document::Rect {
+                    x: 24.0,
+                    y: 24.0,
+                    width: 120.0,
+                    height: 32.0,
+                },
+                text: Some("Cell".to_owned()),
+                style_identity: boon_document::ComputedStyleIdentity::from_style(&text_style),
+                style: text_style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let expanded = preview_frame_with_viewport_background(&frame, 920.0, 720.0);
+        let background = expanded
+            .display_list
+            .first()
+            .expect("preview fallback background should be inserted before content");
+        assert_eq!(
+            background.node.0, "__boon_preview_viewport_background",
+            "preview fallback background should render behind document content"
+        );
+        assert_eq!(background.bounds.x, 0.0);
+        assert_eq!(background.bounds.y, 0.0);
+        assert!(background.bounds.width >= 920.0);
+        assert!(background.bounds.height >= 720.0);
+        assert_eq!(
+            background.style.get("background"),
+            Some(&boon_document_model::StyleValue::Text("#f8fafc".to_owned()))
+        );
+        assert_eq!(
+            expanded.metrics.display_item_count,
+            expanded.display_list.len()
+        );
     }
 
     #[test]
@@ -77959,6 +78380,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -78035,6 +78457,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -78193,6 +78616,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         start_preview_ipc_server(
@@ -78505,6 +78929,8 @@ label:
                 role: boon_native_app_window::NativeWindowRole::Preview,
                 frame_seq: 3,
                 adapter_identity: boon_native_app_window::NativeAdapterIdentity::default(),
+                adapter_policy:
+                    boon_native_app_window::NativeAdapterPolicy::AllowSoftwareDiagnostic,
                 sample_elapsed_ms: 20.0,
                 render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
                 frame_pacing: boon_native_app_window::NativeFramePacing {
@@ -78580,6 +79006,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
 
@@ -81800,6 +82227,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -82520,6 +82948,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let todomvc_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
@@ -82873,6 +83302,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let stale_source = std::fs::read_to_string(repo_path("examples/todomvc.bn")).unwrap();
@@ -82971,6 +83401,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let result = PreviewReplaceBuildResult {
@@ -83083,6 +83514,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -83154,6 +83586,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
 
@@ -83219,6 +83652,7 @@ label:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         }));
         let payload = SourceProjectPayload::single_unit(
@@ -88103,6 +88537,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let base = json!({
@@ -88165,6 +88600,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let request = json!({
@@ -89170,6 +89606,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let decrement_source_event = operator_host_input_probe_requests(&source_path, &source)
@@ -89340,6 +89777,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)
@@ -89433,6 +89871,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)
@@ -89534,6 +89973,7 @@ document:
             replace_worker: PreviewReplaceWorkerQueue::default(),
             ipc_counters: PreviewIpcCounterState::default(),
             verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
+            verifier_host_input: PreviewVerifierHostInputQueue::default(),
             shutdown: PreviewShutdownState::default(),
         };
         let requests = operator_host_input_probe_requests(&source_path, &source)

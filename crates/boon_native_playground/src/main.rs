@@ -6860,7 +6860,12 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 || lightweight_product_render_report
                 || context.input.real_os_events_observed;
             let emit_deferred_post_present_proof = defer_product_render_report
-                && context.frame_lane == boon_native_app_window::NativeFrameLane::ProofOrHarness;
+                && proof_mode == boon_native_app_window::NativeProofMode::Readback
+                && matches!(
+                    context.frame_lane,
+                    boon_native_app_window::NativeFrameLane::ProductInteraction
+                        | boon_native_app_window::NativeFrameLane::ProofOrHarness
+                );
             let render_output = native_gpu_app_owned_render_hook(
                 context,
                 render_world_scene.as_ref(),
@@ -12235,11 +12240,9 @@ fn native_gpu_app_owned_render_hook(
         preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
     let visible_bound_text_proof_snapshot =
         emit_deferred_post_present_proof.then(|| PreviewVisibleBoundTextProofSnapshot {
-            payload: preview_visible_bound_text_compact_report_from_retained_sync(
-                visible_state.layout_frame_hash.as_deref(),
-                Some(visible_state.layout_artifact.as_str()),
-                visible_state.retained_bound_sync_stats.as_ref(),
-            ),
+            layout_frame_hash: visible_state.layout_frame_hash.clone(),
+            layout_artifact: Some(visible_state.layout_artifact.clone()),
+            retained_bound_sync_stats: visible_state.retained_bound_sync_stats.clone(),
         });
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
@@ -12388,35 +12391,42 @@ fn preview_post_present_proof_request_summaries_for_mode(
     if defer_product_render_report && !emit_deferred_post_present_proof {
         return Vec::new();
     }
-    let request = if defer_product_render_report {
-        deferred_post_present_proof_request
-    } else {
-        legacy_pre_present_proof_request
-    };
+    if defer_product_render_report {
+        return vec![
+            deferred_post_present_proof_request(
+                boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText,
+                true,
+            ),
+            deferred_post_present_proof_request(
+                boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync,
+                true,
+            ),
+        ];
+    }
     let mut requests = vec![
-        request(
+        legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText,
             true,
         ),
-        request(
+        legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync,
             true,
         ),
-        request(
+        legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::RenderHookReportJson,
             true,
         ),
-        request(
+        legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::ProofHistory,
             true,
         ),
-        request(
+        legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::ArtifactHash,
             true,
         ),
     ];
     if !skip_app_owned_scene_proof && !defer_product_render_report {
-        requests.push(request(
+        requests.push(legacy_pre_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback,
             true,
         ));
@@ -37454,7 +37464,9 @@ fn preview_retained_bound_sync_text_update_nodes_for(
 
 #[derive(Clone, Debug)]
 struct PreviewVisibleBoundTextProofSnapshot {
-    payload: serde_json::Value,
+    layout_frame_hash: Option<String>,
+    layout_artifact: Option<String>,
+    retained_bound_sync_stats: Option<PreviewRetainedBoundSyncStats>,
 }
 
 fn preview_visible_bound_text_report(
@@ -37483,7 +37495,11 @@ fn preview_visible_bound_text_post_present_payload(
     snapshot: Option<&PreviewVisibleBoundTextProofSnapshot>,
 ) -> serde_json::Value {
     match snapshot {
-        Some(snapshot) => snapshot.payload.clone(),
+        Some(snapshot) => preview_visible_bound_text_compact_report_from_retained_sync(
+            snapshot.layout_frame_hash.as_deref(),
+            snapshot.layout_artifact.as_deref(),
+            snapshot.retained_bound_sync_stats.as_ref(),
+        ),
         None => json!({
             "status": "skipped",
             "reason": "missing-visible-bound-text-snapshot",
@@ -65344,6 +65360,7 @@ mod tests {
             status: "pass".to_owned(),
             role: boon_native_app_window::NativeWindowRole::Preview,
             frame_seq: frame_evidence_key.frame_seq,
+            adapter_identity: boon_native_app_window::NativeAdapterIdentity::default(),
             sample_elapsed_ms: 20.0,
             render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
             frame_pacing: boon_native_app_window::NativeFramePacing {
@@ -65421,6 +65438,14 @@ mod tests {
                 != boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback),
             "deferred product mode skips render-hook app-owned readback"
         );
+        assert!(
+            counters_requests.iter().all(|request| matches!(
+                request.kind,
+                boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText
+                    | boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync
+            )),
+            "deferred product proof requests stay limited to exact retained visual proof"
+        );
 
         let readback_requests =
             preview_post_present_proof_request_summaries_for_mode(false, true, true);
@@ -65452,24 +65477,27 @@ mod tests {
     }
 
     #[test]
-    fn product_counters_mode_creates_retained_sync_post_present_subscriber() {
+    fn readback_proof_mode_creates_retained_sync_post_present_subscriber() {
         let layout_hash = "post-present-visible-bound-text-test";
         let _layout_proof =
             cache_test_document_snapshot(layout_hash, &[], &["store.formula_bar.text"]);
-        let mut layout_frame = test_text_input_layout_frame("test-node", "=A1+B2");
-        layout_frame.display_list[0].focused = true;
-        let visible_bound_text_snapshot = PreviewVisibleBoundTextProofSnapshot {
-            payload: preview_visible_bound_text_report_for_layout_hash(
-                Some(layout_hash),
-                &layout_frame,
-                VisibleBoundTextReportMode::InteractionProof,
-            ),
-        };
         let retained_stats = PreviewRetainedBoundSyncStats {
             status: "pass",
             changed: true,
             text_update_count: 1,
+            text_update_values: vec![(
+                "test-node".to_owned(),
+                "=A1+B2".to_owned(),
+                vec!["store.formula_bar.text".to_owned()],
+            )],
             ..Default::default()
+        };
+        let visible_bound_text_snapshot = PreviewVisibleBoundTextProofSnapshot {
+            layout_frame_hash: Some(layout_hash.to_owned()),
+            layout_artifact: Some(
+                "target/artifacts/native-gpu/document-layout/test.json".to_owned(),
+            ),
+            retained_bound_sync_stats: Some(retained_stats.clone()),
         };
         let subscribers = preview_post_present_proof_subscribers_for_mode(
             true,
@@ -78144,6 +78172,7 @@ label:
                 status: "pass".to_owned(),
                 role: boon_native_app_window::NativeWindowRole::Preview,
                 frame_seq: 3,
+                adapter_identity: boon_native_app_window::NativeAdapterIdentity::default(),
                 sample_elapsed_ms: 20.0,
                 render_loop_mode: boon_native_app_window::NativeRenderLoopMode::DemandDriven,
                 frame_pacing: boon_native_app_window::NativeFramePacing {

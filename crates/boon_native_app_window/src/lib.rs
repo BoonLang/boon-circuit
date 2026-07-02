@@ -765,6 +765,16 @@ pub struct NativeFrameClockPolicy {
     pub post_present_background_telemetry_allowed: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductCommitPolicy {
+    pub owner: String,
+    pub frame_lane: NativeFrameLane,
+    pub product_input_frame: bool,
+    pub has_accepted_input_timing: bool,
+    pub publish_product_commit: bool,
+    pub reason: String,
+}
+
 struct NativeFrameClock;
 
 impl NativeFrameClock {
@@ -890,6 +900,34 @@ impl NativeFrameClock {
             state.interaction_burst_active(elapsed_ms),
             post_present_subscriber_allowed,
         )
+    }
+
+    fn product_commit_policy(
+        frame_lane: NativeFrameLane,
+        product_input_frame: bool,
+        input_timing: Option<&NativeAcceptedInputFrameTiming>,
+    ) -> NativeProductCommitPolicy {
+        let has_accepted_input_timing = input_timing.is_some();
+        let publish_product_commit = frame_lane == NativeFrameLane::ProductInteraction
+            && product_input_frame
+            && has_accepted_input_timing;
+        let reason = if publish_product_commit {
+            "accepted_product_interaction_frame"
+        } else if frame_lane != NativeFrameLane::ProductInteraction {
+            "non_product_frame_lane"
+        } else if !product_input_frame {
+            "not_product_input_frame"
+        } else {
+            "missing_accepted_input_timing"
+        };
+        NativeProductCommitPolicy {
+            owner: "native_frame_clock".to_owned(),
+            frame_lane,
+            product_input_frame,
+            has_accepted_input_timing,
+            publish_product_commit,
+            reason: reason.to_owned(),
+        }
     }
 }
 
@@ -1190,6 +1228,13 @@ pub struct NativeRenderLoopState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_product_frame_commit: Option<NativeProductFrameCommit>,
     pub product_frame_commit_count: u64,
+    pub non_product_presented_frame_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_non_product_presented_frame_lane: Option<NativeFrameLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_non_product_presented_frame_key: Option<FrameEvidenceKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_non_product_presented_frame_reason: Option<String>,
     #[serde(default)]
     pub recent_post_present_proof_queue: VecDeque<NativePostPresentProofQueueEntry>,
     #[serde(default)]
@@ -1350,6 +1395,10 @@ impl NativeRenderLoopState {
             last_render_frame_metrics: None,
             last_product_frame_commit: None,
             product_frame_commit_count: 0,
+            non_product_presented_frame_count: 0,
+            last_non_product_presented_frame_lane: None,
+            last_non_product_presented_frame_key: None,
+            last_non_product_presented_frame_reason: None,
             recent_post_present_proof_queue: VecDeque::new(),
             post_present_proof_queue_enqueued_count: 0,
             post_present_proof_queue_deferred_count: 0,
@@ -1668,6 +1717,26 @@ impl NativeRenderLoopState {
         );
         self.product_frame_commit_count = self.product_frame_commit_count.saturating_add(1);
         self.last_product_frame_commit = Some(commit);
+    }
+
+    pub fn note_non_product_presented_frame(
+        &mut self,
+        frame_evidence_key: &FrameEvidenceKey,
+        frame_lane: NativeFrameLane,
+        reason: &str,
+        post_present_proof_requests: &[NativePostPresentProofRequestSummary],
+        enqueued_elapsed_ms: Option<f64>,
+    ) {
+        self.enqueue_post_present_proof_requests(
+            frame_evidence_key,
+            post_present_proof_requests,
+            enqueued_elapsed_ms,
+        );
+        self.non_product_presented_frame_count =
+            self.non_product_presented_frame_count.saturating_add(1);
+        self.last_non_product_presented_frame_lane = Some(frame_lane);
+        self.last_non_product_presented_frame_key = Some(frame_evidence_key.clone());
+        self.last_non_product_presented_frame_reason = Some(reason.to_owned());
     }
 
     pub fn enqueue_post_present_proof_requests(
@@ -3445,6 +3514,32 @@ pub struct NativeRenderedProductFrame {
     pub legacy_proof_json_built_pre_present: bool,
     pub legacy_render_hook_proof_built_pre_present: bool,
     pub post_present_proof_request_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_patch: Option<NativeProductPatchSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductPatchSummary {
+    pub schema_version: u32,
+    pub status: String,
+    pub owner: String,
+    pub patch_kind: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_scene_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_identity: Option<String>,
+    pub touched_node_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_node_samples: Vec<String>,
+    pub retained_text_update_count: u64,
+    pub retained_style_update_count: u64,
+    pub hover_node_count: u64,
+    pub focus_node_count: u64,
+    pub direct_render_scene_patch: bool,
+    pub full_scene_build_before_present: bool,
+    pub proof_json_required: bool,
+    pub latest_report_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -6280,8 +6375,26 @@ async fn run_surface_probe_inner(
                 visible_surface_readback_post_present_request(),
             );
         }
-        render_loop_state.note_product_frame_commit(product_frame_commit.clone());
-        push_recent_product_frame_commit(&mut recent_product_frame_commits, &product_frame_commit);
+        let product_commit_policy = NativeFrameClock::product_commit_policy(
+            product_commit_frame_lane,
+            product_input_frame,
+            stats_input_timing.as_ref(),
+        );
+        if product_commit_policy.publish_product_commit {
+            render_loop_state.note_product_frame_commit(product_frame_commit.clone());
+            push_recent_product_frame_commit(
+                &mut recent_product_frame_commits,
+                &product_frame_commit,
+            );
+        } else {
+            render_loop_state.note_non_product_presented_frame(
+                &current_frame_evidence_key,
+                product_commit_policy.frame_lane,
+                &product_commit_policy.reason,
+                &product_frame_commit.post_present_proof_requests,
+                product_frame_commit.present_completed_elapsed_ms,
+            );
+        }
         render_loop_state.schedule_requested_animation_followup(
             Instant::now(),
             hold_started.elapsed().as_secs_f64() * 1000.0,
@@ -8956,6 +9069,22 @@ fn write_render_loop_state_report(
     });
     if let Some(object) = report.as_object_mut() {
         object.insert(
+            "non_product_presented_frame_count".to_owned(),
+            serde_json::json!(state.non_product_presented_frame_count),
+        );
+        object.insert(
+            "last_non_product_presented_frame_lane".to_owned(),
+            serde_json::json!(state.last_non_product_presented_frame_lane),
+        );
+        object.insert(
+            "last_non_product_presented_frame_key".to_owned(),
+            serde_json::json!(state.last_non_product_presented_frame_key),
+        );
+        object.insert(
+            "last_non_product_presented_frame_reason".to_owned(),
+            serde_json::json!(state.last_non_product_presented_frame_reason),
+        );
+        object.insert(
             "requested_animation_burst_count".to_owned(),
             serde_json::json!(state.requested_animation_burst_count),
         );
@@ -10444,6 +10573,7 @@ mod tests {
                 legacy_proof_json_built_pre_present: false,
                 legacy_render_hook_proof_built_pre_present: false,
                 post_present_proof_request_count: 1,
+                product_patch: None,
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
@@ -10822,6 +10952,7 @@ mod tests {
                 legacy_proof_json_built_pre_present: false,
                 legacy_render_hook_proof_built_pre_present: false,
                 post_present_proof_request_count: 1,
+                product_patch: None,
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
@@ -11480,6 +11611,7 @@ mod tests {
                 legacy_proof_json_built_pre_present: true,
                 legacy_render_hook_proof_built_pre_present: true,
                 post_present_proof_request_count: 2,
+                product_patch: None,
             }),
             post_present_proof_requests: vec![
                 NativePostPresentProofRequestSummary {
@@ -13400,6 +13532,100 @@ mod tests {
         assert!(!policy.product_input_frame);
         assert!(policy.pre_submit_proof_poll_allowed);
         assert_eq!(policy.post_present_background_telemetry_allowed, Some(true));
+    }
+
+    #[test]
+    fn native_frame_clock_product_commit_policy_requires_accepted_product_input() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_accepted_host_input(7, 10.0, false, None);
+        state.note_dirty_poll(11.0);
+        state.note_render_started(12.0);
+        state.note_surface_acquired(13.0);
+        state.note_render_hook_completed(14.0);
+        state.note_queue_submitted(15.0);
+        state.note_present_completed(16.0);
+        state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
+        let timing = state
+            .take_frame_accepted_input_timing(7)
+            .expect("accepted input timing");
+
+        let product_policy = NativeFrameClock::product_commit_policy(
+            NativeFrameLane::ProductInteraction,
+            true,
+            Some(&timing),
+        );
+        assert!(product_policy.publish_product_commit);
+        assert_eq!(product_policy.reason, "accepted_product_interaction_frame");
+
+        let animation_policy = NativeFrameClock::product_commit_policy(
+            NativeFrameLane::AnimationFollowup,
+            false,
+            Some(&timing),
+        );
+        assert!(!animation_policy.publish_product_commit);
+        assert_eq!(animation_policy.reason, "non_product_frame_lane");
+
+        let missing_timing_policy = NativeFrameClock::product_commit_policy(
+            NativeFrameLane::ProductInteraction,
+            true,
+            None,
+        );
+        assert!(!missing_timing_policy.publish_product_commit);
+        assert_eq!(
+            missing_timing_policy.reason,
+            "missing_accepted_input_timing"
+        );
+    }
+
+    #[test]
+    fn non_product_presented_frame_enqueues_proof_without_product_commit() {
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let key = FrameEvidenceKey {
+            frame_seq: 3,
+            content_revision: 4,
+            layout_revision: 5,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("surface-test".to_owned()),
+            surface_epoch: 7,
+            input_event_seq: None,
+            present_id: 3,
+            proof_request_id: None,
+        };
+        let requests = vec![NativePostPresentProofRequestSummary {
+            kind: NativePostPresentProofRequestKind::VisibleBoundText,
+            currently_legacy_pre_present: false,
+            frame_local_snapshot_required: true,
+        }];
+
+        state.note_non_product_presented_frame(
+            &key,
+            NativeFrameLane::AnimationFollowup,
+            "non_product_frame_lane",
+            &requests,
+            Some(42.0),
+        );
+
+        assert_eq!(state.product_frame_commit_count, 0);
+        assert!(state.last_product_frame_commit.is_none());
+        assert_eq!(state.non_product_presented_frame_count, 1);
+        assert_eq!(
+            state.last_non_product_presented_frame_lane,
+            Some(NativeFrameLane::AnimationFollowup)
+        );
+        assert_eq!(
+            state.last_non_product_presented_frame_key,
+            Some(key.clone())
+        );
+        assert_eq!(
+            state.last_non_product_presented_frame_reason.as_deref(),
+            Some("non_product_frame_lane")
+        );
+        assert_eq!(state.post_present_proof_queue_enqueued_count, 1);
+        assert_eq!(state.post_present_proof_queue_deferred_count, 1);
+        assert_eq!(
+            state.recent_post_present_proof_queue[0].frame_evidence_key,
+            key
+        );
     }
 
     #[test]

@@ -10582,9 +10582,19 @@ Performance is the main goal. Implement the native preview architecture so norma
 
 Prefer strategy over tactics when the same gate keeps failing. Do not spend the run making a slow path merely more measurable or slightly less wrong. Cut the product interaction path down to a hot native loop: accept input at the start of an already scheduled frame, patch retained runtime/layout/render state directly, submit quickly, move proof/readback/reporting off the UX frame, and keep product latency separate from verifier proof latency while linking both with FrameEvidenceKey.
 
-Start from the current 2026-07-02 checkpoint, not from older stale report text. The current WIP has already moved background proof telemetry out of product/burst frames, kept product commits and async report refresh available, split proof/harness work from product work, fixed armed-prewarm accounting, added hardware adapter identity to product evidence, started a generic `NativeFrameClockPolicy` owner for product/proof frame decisions, moved retained visible-bound-text proof payload construction behind post-present subscribers, and kept `List/find` / runtime / formula work clean in Cells interaction reports. Focused Rust checks pass for the changed app-window/playground/xtask slice, but the release Cells visible-click gate is still not complete.
+Start from the current 2026-07-02 product-commit lane split checkpoint, not from older stale report text. The current WIP has already moved background proof telemetry out of product/burst frames, kept product commits and async report refresh available, split proof/harness work from product work, fixed armed-prewarm accounting, added hardware adapter identity to product evidence, started a generic `NativeFrameClockPolicy` owner for product/proof frame decisions, moved retained visible-bound-text proof payload construction behind post-present subscribers, separated product timing status from hardware-adapter status, and kept `List/find` / runtime / formula work clean in Cells interaction reports. Product commits are now published only for accepted product-interaction frames with accepted input timing; non-product presented frames may enqueue exact post-present proof work, but they must not enter `recent_product_frame_commits`. Focused Rust checks pass for the changed app-window/playground/xtask slice, but the release Cells visible-click gate is still not complete on hardware-backed evidence.
 
 Current evidence to respect:
+- Latest one-click release diagnostic after the product-commit lane split:
+  `target/reports/native-gpu/cells-visible-click-e2e-a2-product-commit-lane-split-current.json`
+  is schema-valid but `status=fail` because this run selected software Vulkan
+  llvmpipe. The exact product timing lane passed: `timing_status=pass`,
+  input-accept-to-present/formula p95/max `11.100808 ms`, missed frames `0`,
+  hard failures `0`, legacy pre-present request count `0`, product did not
+  block on proof, proof-only passed, post-present proof isolation passed, and
+  proof lag max was `2` frames. The remaining blockers in that diagnostic were
+  hardware evidence only: `hardware-product-adapter` and the hardware-backed
+  `product-only-ux-contract`.
 - Best fresh release run after the background-proof split: all 64 Cells clicks passed visually and functionally, `/product_only_ux_contract.status=pass`, `/proof_only_contract.status=pass`, accepted product p95 was `16.062596 ms`, proof lag p95 was `6` frames and max `8`; the remaining failure was raw wake-to-formula p95 `20.567028 ms`.
 - Latest release run after enabling real armed-prewarm counters: status `fail`, accepted product p95 `18.442151 ms`, max `19.244245 ms`, product missed frames `9`, product-commit wake-to-formula p95 `22.724245 ms`, wake-to-accept p95 `5.562695 ms`, and `input_waited_for_already_armed_frame_count=65`. Proof-only still passes and background worker load is much lower than the earlier overloaded proof/readback reports.
 - Latest one-click release smoke after the deferred retained proof subscriber cut:
@@ -10600,9 +10610,9 @@ Current evidence to respect:
   separation.
 - The remaining p95 misses are dominated by product-frame scheduling, queue submit, present, and render-result ownership. Cells runtime/list/formula is not the current blocker: reported interaction samples have one dirty key, zero list scans, no full-grid recompute, no root materialization, and no full relower.
 - The same-surface present-floor diagnostic currently selected llvmpipe software Vulkan. Do not use that as hardware/product evidence. Add adapter identity to all relevant product/perf reports and fail fast when a performance gate runs on a software adapter unless the verifier explicitly opts into diagnostic mode.
-- The current code checkpoints add a hardware-adapter product gate, expose `native_frame_clock_policy` / `native_frame_clock_owner` in render-loop reports, and limit deferred product proof requests to exact retained visual proof after present. These are guardrails and ABI seams, not the final 60 FPS architecture. Continue by making that frame clock the real product-frame owner instead of treating it as another diagnostic wrapper.
+- The current code checkpoints add a hardware-adapter product gate, expose `native_frame_clock_policy` / `native_frame_clock_owner` in render-loop reports, limit deferred product proof requests to exact retained visual proof after present, split product commit publication from non-product presented frames, and introduce a `product_patch` metadata slot on rendered product-frame evidence. These are guardrails and ABI seams, not the final 60 FPS architecture. Continue by making that frame clock and an `ActivePreviewScene` the real product-frame owner instead of treating them as diagnostic wrappers.
 
-Treat the next phase as architecture cutting, not micro-optimization. Pick the largest simple boundary that removes product-frame work, then verify once with focused tests and one fresh release report. The preferred cut is a real `PreviewHotLoop` / `NativeFrameClock` product owner with `ActivePreviewScene`:
+Treat the next phase as architecture cutting, not micro-optimization. The main mistake to avoid is spending another long run making the current legacy render-hook path more measurable and less wrong while the product frame still travels through proof-shaped ownership. Pick the largest simple boundary that removes product-frame work, then verify once with focused tests and one fresh release report. The preferred cut is a real `PreviewHotLoop` / `NativeFrameClock` product owner with `ActivePreviewScene`:
 - sample visible-changing input at the start of an already scheduled demand-driven burst frame;
 - patch retained selection/focus/formula-bar visual state directly in the active retained scene;
 - submit the product frame quickly with a small typed `PresentedProductFrame` / `RenderFrameResult`;
@@ -12030,3 +12040,48 @@ host-input follow-up cut:
   exact retained proof subscribers reduce proof-lag failures, and the larger
   remaining cut is still the real `PreviewHotLoop` / `ActivePreviewScene`
   transaction with product-frame scheduling and present ownership.
+
+2026-07-02 product-commit lane split checkpoint:
+
+- Tightened the native app-window product-frame boundary without adding
+  example-specific code:
+  - added `NativeProductCommitPolicy` owned by `NativeFrameClock`;
+  - product commits are now published only for accepted product-interaction
+    frames with accepted input timing;
+  - animation/proof/runtime presented frames still enqueue exact
+    post-present proof requests, but they are counted as non-product presented
+    frames and no longer enter `recent_product_frame_commits`;
+  - render-loop reports expose `non_product_presented_frame_count`,
+    `last_non_product_presented_frame_lane`, key, and reason so verifier
+    evidence can prove lane separation.
+- Tightened Cells verifier classification:
+  - product timing status is now separate from hardware-adapter status;
+  - llvmpipe/software adapter runs may show `timing_status=pass`, while the
+    overall product contract still fails as diagnostic-only hardware evidence.
+- Verification for this slice:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`;
+  - `cargo test -q -p boon_native_app_window native_frame_clock -- --test-threads=1`;
+  - `cargo test -q -p boon_native_app_window non_product_presented_frame_enqueues_proof_without_product_commit -- --test-threads=1`;
+  - `cargo test -q -p boon_native_app_window product_frame_commit -- --test-threads=1`;
+  - `cargo test -q -p boon_native_app_window post_present_proof -- --test-threads=1`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`.
+- Fresh release diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-product-commit-lane-split-current.json`
+    still reports `status=fail`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-product-commit-lane-split-current.json`
+    passes;
+  - product timing lane is healthy in this diagnostic run:
+    `timing_status=pass`, input-accept-to-present/formula p95/max
+    `11.100808 ms`, missed frames `0`, hard failures `0`,
+    legacy pre-present request count `0`, product does not block on proof;
+  - proof-only and post-present proof isolation pass, with app-owned WGPU
+    readback and proof lag max `2` frames;
+  - remaining blockers are hardware evidence only on this machine:
+    adapter is software Vulkan llvmpipe, so `hardware-product-adapter` and the
+    hardware-backed `product-only-ux-contract` fail by design.
+- This still is not the completed architecture. Next useful cut is to make
+  `PreviewHotLoop` / `ActivePreviewScene` own the first-frame retained visual
+  patch and WGPU submit path directly, then run a multi-sample hardware-backed
+  release report. Do not spend the next pass tuning Cells runtime/list/formula
+  unless a fresh report shows that as the dominant boundary again.

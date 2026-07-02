@@ -12329,6 +12329,7 @@ fn preview_attach_product_proof_boundary(
         legacy_proof_json_built_pre_present,
         legacy_render_hook_proof_built_pre_present,
         post_present_proof_request_count,
+        product_patch: None,
     });
     metrics.post_present_proof_requests = post_present_proof_requests;
 }

@@ -6183,6 +6183,9 @@ async fn run_surface_probe_inner(
             None,
         );
         let product_input_frame = frame_clock_policy.product_input_frame;
+        let exact_product_readback_required = readback_enabled
+            && product_input_frame
+            && options.proof_mode == NativeProofMode::Readback;
         let allow_pre_submit_proof_poll = frame_clock_policy.pre_submit_proof_poll_allowed;
         render_loop_state.note_frame_clock_policy(frame_clock_policy);
         if allow_pre_submit_proof_poll
@@ -6228,6 +6231,7 @@ async fn run_surface_probe_inner(
             skip_interactive_surface_readback,
             readback_job_in_flight,
             product_input_frame,
+            exact_product_readback_required,
             product_lane_proof_deferred,
         );
         if interactive_readback_decision == InteractiveSurfaceReadbackDecision::SkipBackpressure {
@@ -6369,6 +6373,7 @@ async fn run_surface_probe_inner(
         );
         let post_present_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let skip_interactive_surface_readback_for_stale_input = interactive_readback_requested
+            && !exact_product_readback_required
             && post_present_input_event_wake_count > sampled_input_event_wake_count;
         if skip_interactive_surface_readback_for_stale_input {
             render_loop_state.note_input_post_present_stale_readback_skip(
@@ -6416,7 +6421,21 @@ async fn run_surface_probe_inner(
             Instant::now(),
             hold_started.elapsed().as_secs_f64() * 1000.0,
         );
-        if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count {
+        let post_present_completed_elapsed_ms = Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(enqueue_report) = async_post_present_proof_worker.enqueue(
+            required_post_present_proof_subscribers,
+            current_frame_evidence_key.clone(),
+            post_present_completed_elapsed_ms,
+            Instant::now(),
+            AsyncPostPresentProofBatchPriority::RequiredFrameProof,
+        ) {
+            render_loop_state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+        }
+        let exact_product_readback_pending =
+            exact_product_readback_required && interactive_readback_requested;
+        if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count
+            && !exact_product_readback_pending
+        {
             render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
             render_loop_state.scheduled_wake_count =
@@ -6620,16 +6639,6 @@ async fn run_surface_probe_inner(
                 Some(current_frame_evidence_key.clone()),
             ),
         );
-        let post_present_completed_elapsed_ms = Some(hold_started.elapsed().as_secs_f64() * 1000.0);
-        if let Some(enqueue_report) = async_post_present_proof_worker.enqueue(
-            required_post_present_proof_subscribers,
-            current_frame_evidence_key.clone(),
-            post_present_completed_elapsed_ms,
-            Instant::now(),
-            AsyncPostPresentProofBatchPriority::RequiredFrameProof,
-        ) {
-            render_loop_state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
-        }
         if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count {
             render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
@@ -7327,18 +7336,19 @@ fn interactive_surface_readback_decision(
     external_proof_replaces_readback: bool,
     readback_job_in_flight: bool,
     product_input_frame: bool,
+    exact_product_readback_required: bool,
     interaction_burst_active: bool,
 ) -> InteractiveSurfaceReadbackDecision {
     if !matches!(role, NativeWindowRole::Preview | NativeWindowRole::Dev) || !readback_enabled {
         return InteractiveSurfaceReadbackDecision::Off;
     }
-    if external_proof_replaces_readback {
+    if external_proof_replaces_readback && !exact_product_readback_required {
         return InteractiveSurfaceReadbackDecision::SkipExternalProof;
     }
-    if product_input_frame {
+    if product_input_frame && !exact_product_readback_required {
         return InteractiveSurfaceReadbackDecision::DeferProductInput;
     }
-    if interaction_burst_active {
+    if interaction_burst_active && !exact_product_readback_required {
         return InteractiveSurfaceReadbackDecision::DeferInteractionBurst;
     }
     if readback_job_in_flight {
@@ -12686,6 +12696,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             InteractiveSurfaceReadbackDecision::Queue
         );
@@ -12694,6 +12705,7 @@ mod tests {
                 NativeWindowRole::Preview,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -12708,6 +12720,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             ),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
@@ -12715,6 +12728,7 @@ mod tests {
             interactive_surface_readback_decision(
                 NativeWindowRole::Dev,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -12729,6 +12743,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 false
             ),
             InteractiveSurfaceReadbackDecision::SkipBackpressure
@@ -12740,6 +12755,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 true,
             ),
             InteractiveSurfaceReadbackDecision::DeferInteractionBurst
@@ -12747,6 +12763,7 @@ mod tests {
         assert_eq!(
             interactive_surface_readback_decision(
                 NativeWindowRole::Preview,
+                false,
                 false,
                 false,
                 false,
@@ -12762,6 +12779,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 true,
             ),
             InteractiveSurfaceReadbackDecision::DeferProductInput
@@ -12773,9 +12791,46 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 true
             ),
             InteractiveSurfaceReadbackDecision::DeferProductInput
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+            ),
+            InteractiveSurfaceReadbackDecision::Queue
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+            ),
+            InteractiveSurfaceReadbackDecision::Queue
+        );
+        assert_eq!(
+            interactive_surface_readback_decision(
+                NativeWindowRole::Preview,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+            ),
+            InteractiveSurfaceReadbackDecision::SkipBackpressure
         );
     }
 

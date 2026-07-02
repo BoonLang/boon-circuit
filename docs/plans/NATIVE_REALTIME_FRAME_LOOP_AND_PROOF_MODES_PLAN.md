@@ -12283,3 +12283,42 @@ host-input follow-up cut:
   - keep product frames free of readback/report/dev IPC/accessibility work;
   - keep no-hacks audits across compiler, runtime, document, renderer,
     app-window, playground, and xtask verifier code.
+
+2026-07-02 exact product readback checkpoint:
+
+- App-window proof plumbing was tightened without adding a Cells-specific path:
+  - required post-present proof subscribers are now enqueued immediately after
+    the product/non-product frame is recorded, before the loop yields to pending
+    input;
+  - Readback proof mode can request a visible-surface WGPU readback for the
+    exact product-input frame instead of always deferring product-frame readback
+    behind the interaction burst;
+  - exact product readback is allowed to ignore external-proof replacement, but
+    still respects in-flight readback backpressure;
+  - stale-input readback skipping no longer discards this explicit exact-product
+    proof request.
+- Focused checks for the app-window slice passed before this checkpoint:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_app_window`;
+  - `cargo test -q -p boon_native_app_window interactive_surface_readback -- --test-threads=1`;
+  - `cargo test -q -p boon_native_app_window post_present_proof -- --test-threads=1`.
+- Fresh release diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-exact-product-readback-job.json`
+    still reports `status=fail`;
+  - important improvement: the product frame's post-present queue now completed
+    `visible_bound_text`, `retained_bound_sync`, and
+    `visible_surface_readback`, and the app-owned WGPU readback artifact exists
+    for the exact product frame;
+  - remaining blocker: the xtask verifier still selected a later frame/input
+    proof from recent/latest frame probing instead of preferring the exact
+    product-frame proof artifact, so the proof-only contract failed even though
+    exact product artifacts were present;
+  - the run also used software Vulkan llvmpipe, so hardware-backed performance
+    acceptance still must fail until a hardware adapter report passes.
+- Next implementation step:
+  - fix the verifier/proof selection to prefer exact product-frame
+    `FrameEvidenceKey` artifacts before any recent-frame fallback;
+  - make later-frame proof acceptable only as explicitly reported proof lag, not
+    as product UX proof;
+  - then continue with the larger `PreviewHotLoop` / `NativeFrameClock` /
+    `ActivePreviewScene` cut and hardware-backed multi-sample release gates.

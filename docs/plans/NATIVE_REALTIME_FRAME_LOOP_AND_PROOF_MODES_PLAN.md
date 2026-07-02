@@ -12241,3 +12241,45 @@ host-input follow-up cut:
   verifier shortcut from making the product lane look more exact than it is, so
   the next implementation can cut the actual `PreviewHotLoop` /
   `ActivePreviewScene` / proof-subscriber boundary.
+
+2026-07-02 interaction-scoped product commit checkpoint:
+
+- Tightened the visible-click verifier around click press/release identity
+  without adding compiler/runtime/document/renderer special cases:
+  - product-present probing now prefers the accepted/accounted host input event
+    when finding the product commit, because a click release or follow-up frame
+    can advance the presented input generation without being the accepted
+    product interaction;
+  - the probe reports whether the commit came from the accepted input event,
+    the presented input event, or a fallback, plus the input event sequence used
+    for that match;
+  - this keeps the product lane tied to the actual accepted visible change
+    instead of misclassifying a later release/proof frame as product latency.
+- Verification for this slice:
+  - `cargo fmt --check`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo check -q -p xtask`;
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-interaction-commit-current.json`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-interaction-commit-current.json`.
+- Fresh release diagnostic after this change still reports `status=fail`, but
+  for the right reasons:
+  - product timing and identity pass in the one-click diagnostic:
+    `timing_status=pass`, exact product commit matches `1`,
+    input-latency fallbacks `0`, typed product patch/result counts `1`,
+    input-accept-to-present/formula p95/max about `10.62 ms`, missed frames
+    `0`, hard failures `0`;
+  - the product adapter is still software Vulkan llvmpipe on this machine, so
+    hardware-backed performance acceptance must continue to fail;
+  - proof remains a separate blocker: the product frame was the accepted press
+    frame/input event, while the app-owned WGPU proof still completed for a
+    later release/follow-up frame, with proof lag around `3` frames. This must
+    be fixed in the bounded proof subscriber service, not by counting a later
+    proof frame as product UX.
+- Next architectural cut:
+  - introduce or finish a generic product-frame/proof identity service so
+    accepted input, product commit, requested proof key, completed proof, and
+    report sample all carry the same `FrameEvidenceKey` unless proof lag is
+    explicitly reported as proof latency;
+  - keep product frames free of readback/report/dev IPC/accessibility work;
+  - keep no-hacks audits across compiler, runtime, document, renderer,
+    app-window, playground, and xtask verifier code.

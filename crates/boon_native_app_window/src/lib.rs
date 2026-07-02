@@ -753,6 +753,146 @@ pub enum NativeFrameLane {
     SurfaceLifecycle,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeFrameClockPolicy {
+    pub owner: String,
+    pub frame_lane: Option<NativeFrameLane>,
+    pub scheduler_reason: Option<NativeSchedulerReason>,
+    pub product_input_frame: bool,
+    pub interaction_burst_active: bool,
+    pub post_present_subscriber_allowed: Option<bool>,
+    pub pre_submit_proof_poll_allowed: bool,
+    pub post_present_background_telemetry_allowed: Option<bool>,
+}
+
+struct NativeFrameClock;
+
+impl NativeFrameClock {
+    fn frame_lane_for_scheduler(
+        scheduler_reason: Option<NativeSchedulerReason>,
+        role_dirty_reason: Option<NativeRoleDirtyReason>,
+        real_os_input: bool,
+        wants_animation_frame: bool,
+    ) -> NativeFrameLane {
+        if matches!(scheduler_reason, Some(NativeSchedulerReason::VerifierFrame))
+            || matches!(
+                role_dirty_reason,
+                Some(NativeRoleDirtyReason::VerifierFrame)
+            )
+        {
+            return NativeFrameLane::ProofOrHarness;
+        }
+        if real_os_input || matches!(scheduler_reason, Some(NativeSchedulerReason::HostInput)) {
+            return NativeFrameLane::ProductInteraction;
+        }
+        if matches!(
+            scheduler_reason,
+            Some(NativeSchedulerReason::RequestedAnimation)
+        ) || wants_animation_frame
+        {
+            return NativeFrameLane::AnimationFollowup;
+        }
+        if matches!(
+            scheduler_reason,
+            Some(NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle)
+        ) {
+            return NativeFrameLane::SurfaceLifecycle;
+        }
+        if matches!(
+            role_dirty_reason,
+            Some(NativeRoleDirtyReason::TelemetrySummaryChanged)
+        ) {
+            return NativeFrameLane::DevTelemetry;
+        }
+        if matches!(
+            role_dirty_reason,
+            Some(
+                NativeRoleDirtyReason::RuntimeTurnApplied
+                    | NativeRoleDirtyReason::DocumentPatchApplied
+                    | NativeRoleDirtyReason::LayoutChanged
+                    | NativeRoleDirtyReason::ScrollChanged
+                    | NativeRoleDirtyReason::FocusChanged
+                    | NativeRoleDirtyReason::SourcePayloadAccepted
+                    | NativeRoleDirtyReason::WorkspaceSelectionChanged
+                    | NativeRoleDirtyReason::ErrorOverlayChanged
+            )
+        ) {
+            return NativeFrameLane::RuntimeOrLayout;
+        }
+        NativeFrameLane::RuntimeOrLayout
+    }
+
+    fn product_input_frame(
+        state: &NativeRenderLoopState,
+        host_input_observed_this_turn: bool,
+        sampled_input_event_wake_count: u64,
+    ) -> bool {
+        host_input_observed_this_turn
+            || state.current_frame_lane == Some(NativeFrameLane::ProductInteraction)
+            || state.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
+            || state.current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count)
+    }
+
+    fn policy(
+        frame_lane: Option<NativeFrameLane>,
+        scheduler_reason: Option<NativeSchedulerReason>,
+        product_input_frame: bool,
+        interaction_burst_active: bool,
+        post_present_subscriber_allowed: Option<bool>,
+    ) -> NativeFrameClockPolicy {
+        let proof_or_harness = frame_lane == Some(NativeFrameLane::ProofOrHarness)
+            || scheduler_reason == Some(NativeSchedulerReason::VerifierFrame);
+        let pre_submit_proof_poll_allowed = if product_input_frame {
+            false
+        } else if proof_or_harness {
+            true
+        } else {
+            !interaction_burst_active
+        };
+        let post_present_background_telemetry_allowed =
+            post_present_subscriber_allowed.map(|subscriber_allowed| {
+                subscriber_allowed
+                    && (proof_or_harness || (!product_input_frame && !interaction_burst_active))
+            });
+        NativeFrameClockPolicy {
+            owner: "native_frame_clock".to_owned(),
+            frame_lane,
+            scheduler_reason,
+            product_input_frame,
+            interaction_burst_active,
+            post_present_subscriber_allowed,
+            pre_submit_proof_poll_allowed,
+            post_present_background_telemetry_allowed,
+        }
+    }
+
+    fn policy_for_state(
+        state: &NativeRenderLoopState,
+        host_input_observed_this_turn: bool,
+        sampled_input_event_wake_count: u64,
+        elapsed_ms: f64,
+        frame_lane_override: Option<NativeFrameLane>,
+        scheduler_reason_override: Option<NativeSchedulerReason>,
+        post_present_subscriber_allowed: Option<bool>,
+    ) -> NativeFrameClockPolicy {
+        let frame_lane = frame_lane_override.or(state.current_frame_lane);
+        let scheduler_reason = scheduler_reason_override.or(state.current_scheduler_reason);
+        let product_input_frame = Self::product_input_frame(
+            state,
+            host_input_observed_this_turn,
+            sampled_input_event_wake_count,
+        ) || frame_lane == Some(NativeFrameLane::ProductInteraction)
+            || scheduler_reason == Some(NativeSchedulerReason::HostInput);
+        Self::policy(
+            frame_lane,
+            scheduler_reason,
+            product_input_frame,
+            state.interaction_burst_active(elapsed_ms),
+            post_present_subscriber_allowed,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NativeSurfaceLifecycleReport {
     pub surface_epoch: u64,
@@ -1021,6 +1161,8 @@ pub struct NativeRenderLoopState {
     pub last_role_revision: u64,
     pub last_frame_lane: Option<NativeFrameLane>,
     pub current_frame_lane: Option<NativeFrameLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_frame_clock_policy: Option<NativeFrameClockPolicy>,
     pub last_render_target_kind: Option<String>,
     pub last_present_path_requested_mode: Option<NativePresentPathMode>,
     pub last_present_path_mode: Option<NativePresentPathMode>,
@@ -1184,6 +1326,7 @@ impl NativeRenderLoopState {
             last_role_revision: 0,
             last_frame_lane: None,
             current_frame_lane: None,
+            last_frame_clock_policy: None,
             last_render_target_kind: None,
             last_present_path_requested_mode: None,
             last_present_path_mode: None,
@@ -2130,6 +2273,10 @@ impl NativeRenderLoopState {
             self.dirty_revision
         }
     }
+
+    fn note_frame_clock_policy(&mut self, policy: NativeFrameClockPolicy) {
+        self.last_frame_clock_policy = Some(policy);
+    }
 }
 
 fn native_frame_lane_for_scheduler(
@@ -2138,52 +2285,12 @@ fn native_frame_lane_for_scheduler(
     real_os_input: bool,
     wants_animation_frame: bool,
 ) -> NativeFrameLane {
-    if matches!(scheduler_reason, Some(NativeSchedulerReason::VerifierFrame))
-        || matches!(
-            role_dirty_reason,
-            Some(NativeRoleDirtyReason::VerifierFrame)
-        )
-    {
-        return NativeFrameLane::ProofOrHarness;
-    }
-    if real_os_input || matches!(scheduler_reason, Some(NativeSchedulerReason::HostInput)) {
-        return NativeFrameLane::ProductInteraction;
-    }
-    if matches!(
+    NativeFrameClock::frame_lane_for_scheduler(
         scheduler_reason,
-        Some(NativeSchedulerReason::RequestedAnimation)
-    ) || wants_animation_frame
-    {
-        return NativeFrameLane::AnimationFollowup;
-    }
-    if matches!(
-        scheduler_reason,
-        Some(NativeSchedulerReason::SurfaceChanged | NativeSchedulerReason::SurfaceLifecycle)
-    ) {
-        return NativeFrameLane::SurfaceLifecycle;
-    }
-    if matches!(
         role_dirty_reason,
-        Some(NativeRoleDirtyReason::TelemetrySummaryChanged)
-    ) {
-        return NativeFrameLane::DevTelemetry;
-    }
-    if matches!(
-        role_dirty_reason,
-        Some(
-            NativeRoleDirtyReason::RuntimeTurnApplied
-                | NativeRoleDirtyReason::DocumentPatchApplied
-                | NativeRoleDirtyReason::LayoutChanged
-                | NativeRoleDirtyReason::ScrollChanged
-                | NativeRoleDirtyReason::FocusChanged
-                | NativeRoleDirtyReason::SourcePayloadAccepted
-                | NativeRoleDirtyReason::WorkspaceSelectionChanged
-                | NativeRoleDirtyReason::ErrorOverlayChanged
-        )
-    ) {
-        return NativeFrameLane::RuntimeOrLayout;
-    }
-    NativeFrameLane::RuntimeOrLayout
+        real_os_input,
+        wants_animation_frame,
+    )
 }
 
 fn native_target_frame_interval_duration() -> Duration {
@@ -2197,6 +2304,7 @@ fn post_present_subscriber_drain_allowed(
     current_input_event_wake_count <= presented_input_event_wake_count
 }
 
+#[cfg(test)]
 fn post_present_background_telemetry_allowed(
     post_present_subscriber_allowed: bool,
     product_input_frame: bool,
@@ -2204,35 +2312,32 @@ fn post_present_background_telemetry_allowed(
     frame_lane: Option<NativeFrameLane>,
     scheduler_reason: Option<NativeSchedulerReason>,
 ) -> bool {
-    if !post_present_subscriber_allowed {
-        return false;
-    }
-    if frame_lane == Some(NativeFrameLane::ProofOrHarness)
-        || scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
-    {
-        return true;
-    }
-    if product_input_frame || interaction_burst_active {
-        return false;
-    }
-    true
+    NativeFrameClock::policy(
+        frame_lane,
+        scheduler_reason,
+        product_input_frame,
+        interaction_burst_active,
+        Some(post_present_subscriber_allowed),
+    )
+    .post_present_background_telemetry_allowed
+    .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn pre_submit_proof_poll_allowed(
     product_input_frame: bool,
     interaction_burst_active: bool,
     frame_lane: Option<NativeFrameLane>,
     scheduler_reason: Option<NativeSchedulerReason>,
 ) -> bool {
-    if product_input_frame {
-        return false;
-    }
-    if frame_lane == Some(NativeFrameLane::ProofOrHarness)
-        || scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
-    {
-        return true;
-    }
-    !interaction_burst_active
+    NativeFrameClock::policy(
+        frame_lane,
+        scheduler_reason,
+        product_input_frame,
+        interaction_burst_active,
+        None,
+    )
+    .pre_submit_proof_poll_allowed
 }
 
 #[cfg(test)]
@@ -2754,6 +2859,42 @@ impl Default for NativeWakeHandle {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeAdapterIdentity {
+    pub adapter_name: String,
+    pub adapter_backend: String,
+    pub adapter_device: u32,
+    pub adapter_vendor: u32,
+    pub adapter_device_type: String,
+    pub adapter_is_software: bool,
+}
+
+impl NativeAdapterIdentity {
+    fn from_adapter_info(info: &wgpu::AdapterInfo) -> Self {
+        Self {
+            adapter_name: info.name.clone(),
+            adapter_backend: format!("{:?}", info.backend),
+            adapter_device: info.device,
+            adapter_vendor: info.vendor,
+            adapter_device_type: format!("{:?}", info.device_type),
+            adapter_is_software: matches!(info.device_type, wgpu::DeviceType::Cpu),
+        }
+    }
+}
+
+impl Default for NativeAdapterIdentity {
+    fn default() -> Self {
+        Self {
+            adapter_name: "missing".to_owned(),
+            adapter_backend: "missing".to_owned(),
+            adapter_device: 0,
+            adapter_vendor: 0,
+            adapter_device_type: "missing".to_owned(),
+            adapter_is_software: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppWindowSurfaceProof {
     pub role: String,
@@ -2771,6 +2912,7 @@ pub struct AppWindowSurfaceProof {
     pub frame_evidence_key: Option<FrameEvidenceKey>,
     pub wgpu_strategy: String,
     pub wgpu_surface_strategy: String,
+    pub adapter_identity: NativeAdapterIdentity,
     pub adapter_name: String,
     pub adapter_backend: String,
     pub adapter_device: u32,
@@ -3310,6 +3452,8 @@ pub struct NativeProductFrameCommit {
     pub schema_version: u32,
     pub commit_source: String,
     pub frame_evidence_key: FrameEvidenceKey,
+    #[serde(default)]
+    pub adapter_identity: NativeAdapterIdentity,
     pub frame_lane: NativeFrameLane,
     pub scheduler_reason: Option<NativeSchedulerReason>,
     pub role_dirty_reason: Option<NativeRoleDirtyReason>,
@@ -3568,6 +3712,8 @@ pub struct NativePreviewPerfStats {
     pub status: String,
     pub role: NativeWindowRole,
     pub frame_seq: u64,
+    #[serde(default)]
+    pub adapter_identity: NativeAdapterIdentity,
     pub sample_elapsed_ms: f64,
     pub render_loop_mode: NativeRenderLoopMode,
     pub frame_pacing: NativeFramePacing,
@@ -4131,6 +4277,7 @@ async fn run_surface_probe_inner(
         .await
         .map_err(|error| NativeWindowError::Failed(format!("request_adapter: {error}")))?;
     let adapter_info = adapter.get_info();
+    let adapter_identity = NativeAdapterIdentity::from_adapter_info(&adapter_info);
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("boon-native-app-window-probe-device"),
@@ -4332,6 +4479,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                adapter_identity.clone(),
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -4453,6 +4601,7 @@ async fn run_surface_probe_inner(
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
+                    adapter_identity.clone(),
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
@@ -4729,6 +4878,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                adapter_identity.clone(),
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -4969,12 +5119,13 @@ async fn run_surface_probe_inner(
         frame_evidence_key: proof_frame_evidence_key,
         wgpu_strategy: format!("{:?}", app_window::WGPU_STRATEGY),
         wgpu_surface_strategy: format!("{:?}", app_window::WGPU_SURFACE_STRATEGY),
-        adapter_name: adapter_info.name,
-        adapter_backend: format!("{:?}", adapter_info.backend),
-        adapter_device: adapter_info.device,
-        adapter_vendor: adapter_info.vendor,
-        adapter_device_type: format!("{:?}", adapter_info.device_type),
-        adapter_is_software: matches!(adapter_info.device_type, wgpu::DeviceType::Cpu),
+        adapter_identity: adapter_identity.clone(),
+        adapter_name: adapter_identity.adapter_name.clone(),
+        adapter_backend: adapter_identity.adapter_backend.clone(),
+        adapter_device: adapter_identity.adapter_device,
+        adapter_vendor: adapter_identity.adapter_vendor,
+        adapter_device_type: adapter_identity.adapter_device_type.clone(),
+        adapter_is_software: adapter_identity.adapter_is_software,
         surface_format: surface_format.clone(),
         present_mode: present_mode.clone(),
         supported_present_modes,
@@ -5127,6 +5278,7 @@ async fn run_surface_probe_inner(
                         render_loop_report_extras(
                             resize_wake_count.load(Ordering::Relaxed),
                             input_event_wake_count.load(Ordering::Relaxed),
+                            adapter_identity.clone(),
                             present_mode.as_str(),
                             surface_format.as_str(),
                             desired_maximum_frame_latency,
@@ -5666,6 +5818,7 @@ async fn run_surface_probe_inner(
                             render_loop_report_extras(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
+                                adapter_identity.clone(),
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -5826,6 +5979,7 @@ async fn run_surface_probe_inner(
                                 render_loop_report_extras(
                                     resize_wake_count.load(Ordering::Relaxed),
                                     input_event_wake_count.load(Ordering::Relaxed),
+                                    adapter_identity.clone(),
                                     present_mode.as_str(),
                                     surface_format.as_str(),
                                     desired_maximum_frame_latency,
@@ -5906,18 +6060,19 @@ async fn run_surface_probe_inner(
             && external_render_proof_replaces_interactive_readback(
                 external_render_proof.as_deref(),
             );
-        let product_input_frame = host_input_observed_this_turn
-            || render_loop_state.current_frame_lane == Some(NativeFrameLane::ProductInteraction)
-            || render_loop_state.current_scheduler_reason == Some(NativeSchedulerReason::HostInput)
-            || render_loop_state
-                .current_frame_carries_unaccounted_host_input(sampled_input_event_wake_count);
         let loop_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
-        let allow_pre_submit_proof_poll = pre_submit_proof_poll_allowed(
-            product_input_frame,
-            render_loop_state.interaction_burst_active(loop_elapsed_ms),
-            render_loop_state.current_frame_lane,
-            render_loop_state.current_scheduler_reason,
+        let frame_clock_policy = NativeFrameClock::policy_for_state(
+            &render_loop_state,
+            host_input_observed_this_turn,
+            sampled_input_event_wake_count,
+            loop_elapsed_ms,
+            None,
+            None,
+            None,
         );
+        let product_input_frame = frame_clock_policy.product_input_frame;
+        let allow_pre_submit_proof_poll = frame_clock_policy.pre_submit_proof_poll_allowed;
+        render_loop_state.note_frame_clock_policy(frame_clock_policy);
         if allow_pre_submit_proof_poll
             && let Some(result) = poll_interactive_readback_job(&mut interactive_readback_job)
         {
@@ -6094,6 +6249,7 @@ async fn run_surface_probe_inner(
         let mut product_frame_commit = product_frame_commit_for_presented_frame(
             &render_loop_state,
             pending_frame_evidence_key.clone(),
+            adapter_identity.clone(),
             product_commit_frame_lane,
             product_commit_scheduler_reason,
             product_commit_role_dirty_reason,
@@ -6272,14 +6428,19 @@ async fn run_surface_probe_inner(
             input_event_wake_count.load(Ordering::Relaxed),
             last_presented_input_event_wake_count,
         );
-        let background_telemetry_allowed = post_present_background_telemetry_allowed(
-            post_present_subscriber_allowed,
-            product_input_frame,
-            render_loop_state
-                .interaction_burst_active(hold_started.elapsed().as_secs_f64() * 1000.0),
+        let frame_clock_policy = NativeFrameClock::policy_for_state(
+            &render_loop_state,
+            host_input_observed_this_turn,
+            sampled_input_event_wake_count,
+            hold_started.elapsed().as_secs_f64() * 1000.0,
             Some(product_commit_frame_lane),
             product_commit_scheduler_reason,
+            Some(post_present_subscriber_allowed),
         );
+        let background_telemetry_allowed = frame_clock_policy
+            .post_present_background_telemetry_allowed
+            .unwrap_or(false);
+        render_loop_state.note_frame_clock_policy(frame_clock_policy);
         if background_telemetry_allowed {
             let proof_history_entry_count = recent_frame_evidence.len().saturating_add(1);
             push_recent_frame_evidence(
@@ -6318,6 +6479,7 @@ async fn run_surface_probe_inner(
             native_preview_perf_stats_snapshot(
                 options.role,
                 &render_loop_state,
+                adapter_identity.clone(),
                 stats_elapsed,
                 render_loop_state.rendered_frame_count as f64 / stats_elapsed_seconds,
                 &preview_perf_accumulator,
@@ -6372,6 +6534,7 @@ async fn run_surface_probe_inner(
                 render_loop_report_extras(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
+                    adapter_identity.clone(),
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
@@ -6529,6 +6692,7 @@ async fn run_surface_probe_inner(
             render_loop_report_extras(
                 resize_wake_count.load(Ordering::Relaxed),
                 input_event_wake_count.load(Ordering::Relaxed),
+                adapter_identity.clone(),
                 present_mode.as_str(),
                 surface_format.as_str(),
                 desired_maximum_frame_latency,
@@ -6751,6 +6915,7 @@ fn acquire_surface_texture_for_present(
 struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
     input_event_wake_count: u64,
+    adapter_identity: NativeAdapterIdentity,
     present_mode: String,
     surface_format: String,
     desired_maximum_frame_latency: u32,
@@ -6871,6 +7036,7 @@ impl NativeRenderLoopReportExtras {
 fn render_loop_report_extras(
     resize_wake_count: u64,
     input_event_wake_count: u64,
+    adapter_identity: NativeAdapterIdentity,
     present_mode: &str,
     surface_format: &str,
     desired_maximum_frame_latency: u32,
@@ -6883,6 +7049,7 @@ fn render_loop_report_extras(
     NativeRenderLoopReportExtras {
         resize_wake_count,
         input_event_wake_count,
+        adapter_identity,
         present_mode: present_mode.to_owned(),
         surface_format: surface_format.to_owned(),
         desired_maximum_frame_latency,
@@ -7248,6 +7415,7 @@ fn frame_evidence_key_for_next_presented_frame_with_revisions(
 fn product_frame_commit_for_presented_frame(
     state: &NativeRenderLoopState,
     frame_evidence_key: FrameEvidenceKey,
+    adapter_identity: NativeAdapterIdentity,
     frame_lane: NativeFrameLane,
     scheduler_reason: Option<NativeSchedulerReason>,
     role_dirty_reason: Option<NativeRoleDirtyReason>,
@@ -7269,6 +7437,7 @@ fn product_frame_commit_for_presented_frame(
     NativeProductFrameCommit {
         schema_version: 1,
         commit_source: "app_window_product_frame_commit".to_owned(),
+        adapter_identity,
         input_event_seq: frame_evidence_key.input_event_seq,
         content_revision: frame_evidence_key.content_revision,
         layout_revision: frame_evidence_key.layout_revision,
@@ -7842,6 +8011,7 @@ fn recent_frame_evidence_entry(
 fn native_preview_perf_stats_snapshot(
     role: NativeWindowRole,
     state: &NativeRenderLoopState,
+    adapter_identity: NativeAdapterIdentity,
     elapsed: Duration,
     renders_per_second: f64,
     accumulator: &NativePreviewPerfAccumulator,
@@ -7856,6 +8026,7 @@ fn native_preview_perf_stats_snapshot(
         status: "pass".to_owned(),
         role,
         frame_seq: state.rendered_frame_count,
+        adapter_identity,
         sample_elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         render_loop_mode: state.mode,
         frame_pacing: native_frame_pacing_snapshot(state),
@@ -8492,6 +8663,7 @@ fn write_render_loop_state_report(
     let preview_perf_stats = native_preview_perf_stats_snapshot(
         role,
         state,
+        extras.adapter_identity.clone(),
         elapsed,
         renders_per_second,
         &report_perf_accumulator,
@@ -8866,6 +9038,48 @@ fn write_render_loop_state_report(
         object.insert(
             "accepted_host_input_event".to_owned(),
             serde_json::json!(state.last_accepted_host_input_event),
+        );
+        object.insert(
+            "native_frame_clock_policy".to_owned(),
+            serde_json::json!(&state.last_frame_clock_policy),
+        );
+        object.insert(
+            "native_frame_clock_owner".to_owned(),
+            serde_json::json!(
+                state
+                    .last_frame_clock_policy
+                    .as_ref()
+                    .map(|policy| policy.owner.as_str())
+                    .unwrap_or("missing")
+            ),
+        );
+        object.insert(
+            "adapter_identity".to_owned(),
+            serde_json::json!(&extras.adapter_identity),
+        );
+        object.insert(
+            "adapter_name".to_owned(),
+            serde_json::json!(&extras.adapter_identity.adapter_name),
+        );
+        object.insert(
+            "adapter_backend".to_owned(),
+            serde_json::json!(&extras.adapter_identity.adapter_backend),
+        );
+        object.insert(
+            "adapter_device".to_owned(),
+            serde_json::json!(extras.adapter_identity.adapter_device),
+        );
+        object.insert(
+            "adapter_vendor".to_owned(),
+            serde_json::json!(extras.adapter_identity.adapter_vendor),
+        );
+        object.insert(
+            "adapter_device_type".to_owned(),
+            serde_json::json!(&extras.adapter_identity.adapter_device_type),
+        );
+        object.insert(
+            "adapter_is_software".to_owned(),
+            serde_json::json!(extras.adapter_identity.adapter_is_software),
         );
         object.insert(
             "present_mode".to_owned(),
@@ -10242,6 +10456,7 @@ mod tests {
         let mut commit = product_frame_commit_for_presented_frame(
             &state,
             key.clone(),
+            NativeAdapterIdentity::default(),
             NativeFrameLane::ProductInteraction,
             Some(NativeSchedulerReason::HostInput),
             None,
@@ -10626,6 +10841,7 @@ mod tests {
         state.note_product_frame_commit(product_frame_commit_for_presented_frame(
             &state,
             key.clone(),
+            NativeAdapterIdentity::default(),
             NativeFrameLane::ProductInteraction,
             Some(NativeSchedulerReason::HostInput),
             None,
@@ -11289,10 +11505,18 @@ mod tests {
         state.note_product_frame_commit(product_frame_commit_for_presented_frame(
             &state,
             product_commit_key.clone(),
+            NativeAdapterIdentity::default(),
             NativeFrameLane::ProductInteraction,
             Some(NativeSchedulerReason::HostInput),
             None,
             state.last_accounted_input_frame_timing.clone(),
+        ));
+        state.note_frame_clock_policy(NativeFrameClock::policy(
+            Some(NativeFrameLane::ProductInteraction),
+            Some(NativeSchedulerReason::HostInput),
+            true,
+            true,
+            Some(false),
         ));
         let mut recent_product_frame_commits = VecDeque::new();
         if let Some(commit) = state.last_product_frame_commit.as_ref() {
@@ -11361,6 +11585,18 @@ mod tests {
         assert_eq!(
             report["accepted_input_frame_timing"]["timing_scope"],
             serde_json::json!("accepted_visible_host_input_frame")
+        );
+        assert_eq!(
+            report["native_frame_clock_owner"],
+            serde_json::json!("native_frame_clock")
+        );
+        assert_eq!(
+            report["native_frame_clock_policy"]["frame_lane"],
+            serde_json::json!("product_interaction")
+        );
+        assert_eq!(
+            report["native_frame_clock_policy"]["pre_submit_proof_poll_allowed"],
+            serde_json::json!(false)
         );
         assert_eq!(
             report["poll_started_to_input_accept_ms"],
@@ -12569,10 +12805,19 @@ mod tests {
             Some(NativeFrameLane::ProductInteraction),
             Some(24.0),
         );
+        let adapter_identity = NativeAdapterIdentity {
+            adapter_name: "test-gpu".to_owned(),
+            adapter_backend: "Vulkan".to_owned(),
+            adapter_device: 1,
+            adapter_vendor: 2,
+            adapter_device_type: "DiscreteGpu".to_owned(),
+            adapter_is_software: false,
+        };
 
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
+            adapter_identity.clone(),
             Duration::from_millis(120),
             60.0,
             &accumulator,
@@ -12584,6 +12829,7 @@ mod tests {
         );
 
         assert_eq!(stats.render_loop_mode, NativeRenderLoopMode::DemandDriven);
+        assert_eq!(stats.adapter_identity, adapter_identity);
         assert_eq!(stats.input_to_present_ms, Some(8.0));
         assert_eq!(stats.frame_lane, Some(NativeFrameLane::ProductInteraction));
         assert_eq!(stats.product_input_to_present_ms, Some(8.0));
@@ -12672,6 +12918,7 @@ mod tests {
         let stats = native_preview_perf_stats_snapshot(
             NativeWindowRole::Preview,
             &state,
+            NativeAdapterIdentity::default(),
             Duration::from_millis(64),
             60.0,
             &accumulator,
@@ -12729,6 +12976,7 @@ mod tests {
         let commit = product_frame_commit_for_presented_frame(
             &state,
             key,
+            NativeAdapterIdentity::default(),
             NativeFrameLane::ProductInteraction,
             Some(NativeSchedulerReason::HostInput),
             None,
@@ -13115,6 +13363,43 @@ mod tests {
             Some(NativeFrameLane::RuntimeOrLayout),
             Some(NativeSchedulerReason::ExternalWake),
         ));
+    }
+
+    #[test]
+    fn native_frame_clock_product_frame_forbids_proof_and_background_telemetry() {
+        let policy = NativeFrameClock::policy(
+            Some(NativeFrameLane::ProductInteraction),
+            Some(NativeSchedulerReason::HostInput),
+            true,
+            true,
+            Some(true),
+        );
+
+        assert_eq!(policy.owner, "native_frame_clock");
+        assert_eq!(policy.frame_lane, Some(NativeFrameLane::ProductInteraction));
+        assert!(policy.product_input_frame);
+        assert!(!policy.pre_submit_proof_poll_allowed);
+        assert_eq!(
+            policy.post_present_background_telemetry_allowed,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn native_frame_clock_proof_frame_allows_required_proof_without_background_guessing() {
+        let policy = NativeFrameClock::policy(
+            Some(NativeFrameLane::ProofOrHarness),
+            Some(NativeSchedulerReason::VerifierFrame),
+            false,
+            true,
+            Some(true),
+        );
+
+        assert_eq!(policy.owner, "native_frame_clock");
+        assert_eq!(policy.frame_lane, Some(NativeFrameLane::ProofOrHarness));
+        assert!(!policy.product_input_frame);
+        assert!(policy.pre_submit_proof_poll_allowed);
+        assert_eq!(policy.post_present_background_telemetry_allowed, Some(true));
     }
 
     #[test]

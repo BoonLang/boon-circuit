@@ -3552,8 +3552,13 @@ pub fn native_post_present_json_proof_artifact(
     kind: NativePostPresentProofRequestKind,
     frame_evidence_key: FrameEvidenceKey,
     completed_elapsed_ms: Option<f64>,
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
 ) -> NativePostPresentProofArtifact {
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("frame_evidence_key".to_owned())
+            .or_insert_with(|| serde_json::json!(frame_evidence_key.clone()));
+    }
     NativePostPresentProofArtifact {
         schema_version: 1,
         frame_evidence_key,
@@ -12777,6 +12782,10 @@ mod tests {
         assert_eq!(post_present_artifact.payload["frame_seq"], 42);
         assert_eq!(post_present_artifact.payload["input_event_seq"], 7);
         assert_eq!(post_present_artifact.payload["present_id"], 42);
+        assert_eq!(
+            post_present_artifact.payload["frame_evidence_key"],
+            serde_json::json!(key)
+        );
     }
 
     #[test]

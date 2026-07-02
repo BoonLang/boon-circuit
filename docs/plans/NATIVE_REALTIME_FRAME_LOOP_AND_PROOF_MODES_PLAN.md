@@ -12374,3 +12374,68 @@ host-input follow-up cut:
     `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` product-frame
     cut and multi-sample release gates, not more Cells runtime/list/formula
     micro-tuning.
+
+2026-07-02 hardware adapter policy checkpoint:
+
+- Added a generic native adapter policy, without Cells/runtime/compiler
+  special-casing:
+  - `NativeWindowOptions.adapter_policy`;
+  - `NativeAdapterPolicy::{AllowSoftwareDiagnostic, RequireHardwareProduct}`;
+  - structured `NativeAdapterRequestEvidence` with selected adapter identity,
+    request power preference, `force_fallback_adapter`, compatible-surface
+    status, and relevant WGPU/Vulkan/Mesa/Prime/Wayland environment;
+  - app-window returns a typed adapter-policy error before device creation when
+    product hardware is required and WGPU selects a software adapter;
+  - app-window success proof and preview perf stats now carry adapter policy
+    beside adapter identity;
+  - playground preview/dev roles accept `--require-hardware-adapter` and
+    `--adapter-policy allow_software_diagnostic|require_hardware_product`;
+  - role failure reports include structured native-window error details;
+  - Cells visible-click product verifier requires hardware by default, supports
+    `--allow-software-adapter-diagnostic`, and stops cleanly on native-window
+    first-frame prerequisite failures instead of emitting fake `inf` interaction
+    blockers.
+- Focused checks for this slice:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-hardware-policy-current.json`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-software-diagnostic-current.json`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-nvidia-icd-probe-current.json`.
+- Fresh hardware-required diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-hardware-policy-current.json`
+    reports `status=fail`, as intended;
+  - blocker list is now clean and specific:
+    `Cells product performance gate requires a hardware WGPU adapter; software adapters are diagnostic-only`;
+  - `adapter_policy=require_hardware_product`,
+    `product_measurement_status=not-run-after-native-window-prerequisite-failure`;
+  - WGPU selected `llvmpipe (LLVM 20.1.2, 256 bits)`, backend `Vulkan`,
+    device type `Cpu`, `adapter_is_software=true`;
+  - request evidence shows `HighPerformance`, `force_fallback_adapter=false`,
+    and `request_compatible_surface=true`.
+- Fresh software diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug --address A2 --expected-formula 15 --repeat-count 1 --allow-software-adapter-diagnostic --report target/reports/native-gpu/cells-visible-click-e2e-a2-software-diagnostic-current.json`
+    still reports top-level `status=fail` because software evidence must not
+    satisfy product acceptance;
+  - the diagnostic lane runs instead of failing fast:
+    `live_probe.status=pass`, selected address `A2`, formula bar text `15`,
+    `proof_only_contract.status=pass`, adapter status `software`, and product
+    input-to-formula p95 about `14.139854 ms`.
+- Hardware-environment probe:
+  - running the same verifier with
+    `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json`,
+    `VK_LAYER_NV_optimus=NVIDIA_only`, `__NV_PRIME_RENDER_OFFLOAD=1`, and
+    `__GLX_VENDOR_LIBRARY_NAME=nvidia` did not produce a hardware-backed
+    isolated Weston product surface; it failed before first frame and now
+    reports that prerequisite failure cleanly.
+- Next implementation step:
+  - implement a generic hardware-backed verifier surface path instead of
+    weakening the gate. Good candidates are adapter inventory/candidate reports,
+    a hardware-compatible isolated native surface, or a current-Wayland
+    host-event path that still uses app-owned events/proof and does not rely on
+    COSMIC scraping, desktop screenshots, or human observation;
+  - after hardware evidence is real, continue the product-frame cut:
+    `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene`, direct retained
+    selection/formula-bar patching, quick submit, and bounded post-present proof
+    services.

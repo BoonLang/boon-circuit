@@ -622,6 +622,7 @@ pub struct NativeWindowOptions {
     pub render_loop_state_report: Option<String>,
     pub demand_driven_loop: bool,
     pub proof_mode: NativeProofMode,
+    pub adapter_policy: NativeAdapterPolicy,
     pub skip_interactive_surface_readback_when_external_proof: bool,
 }
 
@@ -651,6 +652,23 @@ impl NativeProofMode {
         match self {
             Self::Counters => "counters",
             Self::Readback => "readback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAdapterPolicy {
+    #[default]
+    AllowSoftwareDiagnostic,
+    RequireHardwareProduct,
+}
+
+impl NativeAdapterPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowSoftwareDiagnostic => "allow_software_diagnostic",
+            Self::RequireHardwareProduct => "require_hardware_product",
         }
     }
 }
@@ -2964,6 +2982,65 @@ impl Default for NativeAdapterIdentity {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeAdapterRequestEvidence {
+    pub adapter_policy: NativeAdapterPolicy,
+    pub adapter_identity: NativeAdapterIdentity,
+    pub request_power_preference: String,
+    pub request_force_fallback_adapter: bool,
+    pub request_compatible_surface: bool,
+    pub relevant_environment: BTreeMap<String, Option<String>>,
+}
+
+impl NativeAdapterRequestEvidence {
+    fn new(adapter_policy: NativeAdapterPolicy, adapter_identity: NativeAdapterIdentity) -> Self {
+        Self {
+            adapter_policy,
+            adapter_identity,
+            request_power_preference: "HighPerformance".to_owned(),
+            request_force_fallback_adapter: false,
+            request_compatible_surface: true,
+            relevant_environment: native_adapter_relevant_environment(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeAdapterPolicyFailure {
+    pub reason: String,
+    pub evidence: NativeAdapterRequestEvidence,
+}
+
+impl NativeAdapterPolicyFailure {
+    fn require_hardware_product(evidence: NativeAdapterRequestEvidence) -> Self {
+        Self {
+            reason: "native product verifier requires a hardware WGPU adapter; selected adapter is software-only diagnostic evidence".to_owned(),
+            evidence,
+        }
+    }
+}
+
+fn native_adapter_relevant_environment() -> BTreeMap<String, Option<String>> {
+    [
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "XDG_SESSION_TYPE",
+        "WGPU_BACKEND",
+        "WGPU_POWER_PREF",
+        "VK_ICD_FILENAMES",
+        "VK_DRIVER_FILES",
+        "VK_LAYER_NV_optimus",
+        "MESA_VK_DEVICE_SELECT",
+        "DRI_PRIME",
+        "__NV_PRIME_RENDER_OFFLOAD",
+        "__GLX_VENDOR_LIBRARY_NAME",
+        "LIBGL_ALWAYS_SOFTWARE",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), std::env::var(name).ok()))
+    .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppWindowSurfaceProof {
     pub role: String,
@@ -2988,6 +3065,8 @@ pub struct AppWindowSurfaceProof {
     pub adapter_vendor: u32,
     pub adapter_device_type: String,
     pub adapter_is_software: bool,
+    pub adapter_policy: NativeAdapterPolicy,
+    pub adapter_request_evidence: NativeAdapterRequestEvidence,
     pub surface_format: String,
     pub present_mode: String,
     pub supported_present_modes: Vec<String>,
@@ -3826,6 +3905,8 @@ pub struct NativePreviewPerfStats {
     pub frame_seq: u64,
     #[serde(default)]
     pub adapter_identity: NativeAdapterIdentity,
+    #[serde(default)]
+    pub adapter_policy: NativeAdapterPolicy,
     pub sample_elapsed_ms: f64,
     pub render_loop_mode: NativeRenderLoopMode,
     pub frame_pacing: NativeFramePacing,
@@ -4163,6 +4244,7 @@ fn poll_native_window_hooks(
 #[derive(Debug)]
 pub enum NativeWindowError {
     MissingProof,
+    AdapterPolicy(NativeAdapterPolicyFailure),
     Failed(String),
 }
 
@@ -4172,12 +4254,38 @@ impl std::fmt::Display for NativeWindowError {
             Self::MissingProof => {
                 formatter.write_str("app_window role thread did not produce a proof before exiting")
             }
+            Self::AdapterPolicy(failure) => write!(
+                formatter,
+                "app_window adapter policy failed: {}",
+                failure.reason
+            ),
             Self::Failed(message) => write!(formatter, "app_window role failed: {message}"),
         }
     }
 }
 
 impl std::error::Error for NativeWindowError {}
+
+impl NativeWindowError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingProof => "missing_proof",
+            Self::AdapterPolicy(_) => "adapter_policy",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    pub fn report_details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::AdapterPolicy(failure) => Some(serde_json::json!({
+                "kind": self.kind(),
+                "reason": failure.reason,
+                "adapter_policy_failure": failure
+            })),
+            Self::MissingProof | Self::Failed(_) => None,
+        }
+    }
+}
 
 pub fn run_visible_surface_probe<F>(options: NativeWindowOptions, on_ready: F)
 where
@@ -4390,6 +4498,15 @@ async fn run_surface_probe_inner(
         .map_err(|error| NativeWindowError::Failed(format!("request_adapter: {error}")))?;
     let adapter_info = adapter.get_info();
     let adapter_identity = NativeAdapterIdentity::from_adapter_info(&adapter_info);
+    let adapter_request_evidence =
+        NativeAdapterRequestEvidence::new(options.adapter_policy, adapter_identity.clone());
+    if options.adapter_policy == NativeAdapterPolicy::RequireHardwareProduct
+        && adapter_identity.adapter_is_software
+    {
+        return Err(NativeWindowError::AdapterPolicy(
+            NativeAdapterPolicyFailure::require_hardware_product(adapter_request_evidence),
+        ));
+    }
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("boon-native-app-window-probe-device"),
@@ -4592,6 +4709,7 @@ async fn run_surface_probe_inner(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
                                 adapter_identity.clone(),
+                                options.adapter_policy,
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -4714,6 +4832,7 @@ async fn run_surface_probe_inner(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
                     adapter_identity.clone(),
+                    options.adapter_policy,
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
@@ -4991,6 +5110,7 @@ async fn run_surface_probe_inner(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
                                 adapter_identity.clone(),
+                                options.adapter_policy,
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -5238,6 +5358,8 @@ async fn run_surface_probe_inner(
         adapter_vendor: adapter_identity.adapter_vendor,
         adapter_device_type: adapter_identity.adapter_device_type.clone(),
         adapter_is_software: adapter_identity.adapter_is_software,
+        adapter_policy: options.adapter_policy,
+        adapter_request_evidence: adapter_request_evidence.clone(),
         surface_format: surface_format.clone(),
         present_mode: present_mode.clone(),
         supported_present_modes,
@@ -5391,6 +5513,7 @@ async fn run_surface_probe_inner(
                             resize_wake_count.load(Ordering::Relaxed),
                             input_event_wake_count.load(Ordering::Relaxed),
                             adapter_identity.clone(),
+                            options.adapter_policy,
                             present_mode.as_str(),
                             surface_format.as_str(),
                             desired_maximum_frame_latency,
@@ -5931,6 +6054,7 @@ async fn run_surface_probe_inner(
                                 resize_wake_count.load(Ordering::Relaxed),
                                 input_event_wake_count.load(Ordering::Relaxed),
                                 adapter_identity.clone(),
+                                options.adapter_policy,
                                 present_mode.as_str(),
                                 surface_format.as_str(),
                                 desired_maximum_frame_latency,
@@ -6092,6 +6216,7 @@ async fn run_surface_probe_inner(
                                     resize_wake_count.load(Ordering::Relaxed),
                                     input_event_wake_count.load(Ordering::Relaxed),
                                     adapter_identity.clone(),
+                                    options.adapter_policy,
                                     present_mode.as_str(),
                                     surface_format.as_str(),
                                     desired_maximum_frame_latency,
@@ -6629,6 +6754,7 @@ async fn run_surface_probe_inner(
                 options.role,
                 &render_loop_state,
                 adapter_identity.clone(),
+                options.adapter_policy,
                 stats_elapsed,
                 render_loop_state.rendered_frame_count as f64 / stats_elapsed_seconds,
                 &preview_perf_accumulator,
@@ -6674,6 +6800,7 @@ async fn run_surface_probe_inner(
                     resize_wake_count.load(Ordering::Relaxed),
                     input_event_wake_count.load(Ordering::Relaxed),
                     adapter_identity.clone(),
+                    options.adapter_policy,
                     present_mode.as_str(),
                     surface_format.as_str(),
                     desired_maximum_frame_latency,
@@ -6832,6 +6959,7 @@ async fn run_surface_probe_inner(
                 resize_wake_count.load(Ordering::Relaxed),
                 input_event_wake_count.load(Ordering::Relaxed),
                 adapter_identity.clone(),
+                options.adapter_policy,
                 present_mode.as_str(),
                 surface_format.as_str(),
                 desired_maximum_frame_latency,
@@ -7055,6 +7183,7 @@ struct NativeRenderLoopReportExtras {
     resize_wake_count: u64,
     input_event_wake_count: u64,
     adapter_identity: NativeAdapterIdentity,
+    adapter_policy: NativeAdapterPolicy,
     present_mode: String,
     surface_format: String,
     desired_maximum_frame_latency: u32,
@@ -7176,6 +7305,7 @@ fn render_loop_report_extras(
     resize_wake_count: u64,
     input_event_wake_count: u64,
     adapter_identity: NativeAdapterIdentity,
+    adapter_policy: NativeAdapterPolicy,
     present_mode: &str,
     surface_format: &str,
     desired_maximum_frame_latency: u32,
@@ -7189,6 +7319,7 @@ fn render_loop_report_extras(
         resize_wake_count,
         input_event_wake_count,
         adapter_identity,
+        adapter_policy,
         present_mode: present_mode.to_owned(),
         surface_format: surface_format.to_owned(),
         desired_maximum_frame_latency,
@@ -8175,6 +8306,7 @@ fn native_preview_perf_stats_snapshot(
     role: NativeWindowRole,
     state: &NativeRenderLoopState,
     adapter_identity: NativeAdapterIdentity,
+    adapter_policy: NativeAdapterPolicy,
     elapsed: Duration,
     renders_per_second: f64,
     accumulator: &NativePreviewPerfAccumulator,
@@ -8190,6 +8322,7 @@ fn native_preview_perf_stats_snapshot(
         role,
         frame_seq: state.rendered_frame_count,
         adapter_identity,
+        adapter_policy,
         sample_elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         render_loop_mode: state.mode,
         frame_pacing: native_frame_pacing_snapshot(state),
@@ -8827,6 +8960,7 @@ fn write_render_loop_state_report(
         role,
         state,
         extras.adapter_identity.clone(),
+        extras.adapter_policy,
         elapsed,
         renders_per_second,
         &report_perf_accumulator,
@@ -9235,6 +9369,17 @@ fn write_render_loop_state_report(
         object.insert(
             "adapter_identity".to_owned(),
             serde_json::json!(&extras.adapter_identity),
+        );
+        object.insert(
+            "adapter_policy".to_owned(),
+            serde_json::json!(extras.adapter_policy),
+        );
+        object.insert(
+            "adapter_request_evidence".to_owned(),
+            serde_json::json!(NativeAdapterRequestEvidence::new(
+                extras.adapter_policy,
+                extras.adapter_identity.clone()
+            )),
         );
         object.insert(
             "adapter_name".to_owned(),
@@ -13148,6 +13293,7 @@ mod tests {
             NativeWindowRole::Preview,
             &state,
             adapter_identity.clone(),
+            NativeAdapterPolicy::AllowSoftwareDiagnostic,
             Duration::from_millis(120),
             60.0,
             &accumulator,
@@ -13249,6 +13395,7 @@ mod tests {
             NativeWindowRole::Preview,
             &state,
             NativeAdapterIdentity::default(),
+            NativeAdapterPolicy::AllowSoftwareDiagnostic,
             Duration::from_millis(64),
             60.0,
             &accumulator,

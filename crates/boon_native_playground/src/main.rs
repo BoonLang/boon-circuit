@@ -5882,6 +5882,32 @@ fn native_proof_mode_arg(
     }
 }
 
+fn native_adapter_policy_arg(
+    args: &[String],
+) -> Result<boon_native_app_window::NativeAdapterPolicy, Box<dyn std::error::Error>> {
+    let require_hardware = args.iter().any(|arg| arg == "--require-hardware-adapter");
+    match value_arg(args, "--adapter-policy").as_deref() {
+        Some("allow_software_diagnostic" | "allow-software-diagnostic" | "diagnostic") => {
+            if require_hardware {
+                Err("--require-hardware-adapter conflicts with --adapter-policy allow_software_diagnostic".into())
+            } else {
+                Ok(boon_native_app_window::NativeAdapterPolicy::AllowSoftwareDiagnostic)
+            }
+        }
+        Some("require_hardware_product" | "require-hardware-product" | "hardware") => {
+            Ok(boon_native_app_window::NativeAdapterPolicy::RequireHardwareProduct)
+        }
+        Some(value) => Err(format!(
+            "unsupported --adapter-policy `{value}`; expected allow_software_diagnostic|require_hardware_product"
+        )
+        .into()),
+        None if require_hardware => {
+            Ok(boon_native_app_window::NativeAdapterPolicy::RequireHardwareProduct)
+        }
+        None => Ok(boon_native_app_window::NativeAdapterPolicy::AllowSoftwareDiagnostic),
+    }
+}
+
 fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if value_arg(args, "--example").is_some() {
         return Err(
@@ -5968,6 +5994,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         || args.iter().any(|arg| arg == "--frame-readback");
     let proof_mode = native_proof_mode_arg(args, frame_readback_requested)?;
     let frame_readback = proof_mode == boon_native_app_window::NativeProofMode::Readback;
+    let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_interactive_surface_readback_when_external_proof = args
         .iter()
         .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
@@ -6963,6 +6990,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             render_loop_state_report,
             demand_driven_loop,
             proof_mode,
+            adapter_policy,
             skip_interactive_surface_readback_when_external_proof,
         },
         hooks,
@@ -6996,9 +7024,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .transpose(),
                 Err(error) => report
                     .as_deref()
-                    .map(|report| {
-                        write_role_failure_report(report, "preview", &role_args, error.to_string())
-                    })
+                    .map(|report| write_role_failure_report(report, "preview", &role_args, &error))
                     .transpose(),
             };
             if let Err(error) = result {
@@ -7034,6 +7060,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         probe || synthetic_input_probe || args.iter().any(|arg| arg == "--frame-readback");
     let proof_mode = native_proof_mode_arg(args, frame_readback_requested)?;
     let frame_readback = proof_mode == boon_native_app_window::NativeProofMode::Readback;
+    let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_interactive_surface_readback_when_external_proof = args
         .iter()
         .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
@@ -7383,6 +7410,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             render_loop_state_report,
             demand_driven_loop,
             proof_mode,
+            adapter_policy,
             skip_interactive_surface_readback_when_external_proof,
         },
         hooks,
@@ -7465,7 +7493,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .transpose(),
                 Err(error) => report
                     .as_deref()
-                    .map(|report| write_role_failure_report(report, "dev", &role_args, error.to_string()))
+                    .map(|report| write_role_failure_report(report, "dev", &role_args, &error))
                     .transpose(),
             };
             if let Err(error) = result {
@@ -7511,6 +7539,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
     let dev_app_owned_input_probe = args.iter().any(|arg| arg == "--dev-app-owned-input-probe");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
+    let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_render_hook_app_owned_proof = args
         .iter()
         .any(|arg| arg == "--skip-render-hook-app-owned-proof");
@@ -7605,6 +7634,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if demand_driven_loop {
         preview_args.push("--demand-driven-loop".to_owned());
+    }
+    if adapter_policy == boon_native_app_window::NativeAdapterPolicy::RequireHardwareProduct {
+        preview_args.push("--require-hardware-adapter".to_owned());
+    } else if value_arg(args, "--adapter-policy").is_some() {
+        preview_args.push("--adapter-policy".to_owned());
+        preview_args.push(adapter_policy.as_str().to_owned());
     }
     if skip_render_hook_app_owned_proof {
         preview_args.push("--skip-render-hook-app-owned-proof".to_owned());
@@ -7728,6 +7763,12 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if demand_driven_loop {
         dev_args.push("--demand-driven-loop".to_owned());
+    }
+    if adapter_policy == boon_native_app_window::NativeAdapterPolicy::RequireHardwareProduct {
+        dev_args.push("--require-hardware-adapter".to_owned());
+    } else if value_arg(args, "--adapter-policy").is_some() {
+        dev_args.push("--adapter-policy".to_owned());
+        dev_args.push(adapter_policy.as_str().to_owned());
     }
     if probe {
         dev_args.push("--probe".to_owned());
@@ -65046,8 +65087,9 @@ fn write_role_failure_report(
     path: &Path,
     role: &str,
     args: &[String],
-    blocker: String,
+    error: &boon_native_app_window::NativeWindowError,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let blocker = error.to_string();
     let mut report = base_report("boon-native-playground-role", args, "fail");
     report["exit_status"] = json!(1);
     report["per_step_pass_fail"] = json!([
@@ -65055,6 +65097,10 @@ fn write_role_failure_report(
     ]);
     report["native_role"] = json!(role);
     report["native_gpu_contract"] = json!(true);
+    report["native_window_error_kind"] = json!(error.kind());
+    if let Some(details) = error.report_details() {
+        report["native_window_error_details"] = details;
+    }
     report["blockers"] = json!([blocker]);
     boon_runtime::write_json(path, &report)?;
     Ok(())

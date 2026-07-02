@@ -12028,6 +12028,30 @@ fn native_gpu_app_owned_render_hook(
         .clone()
         .unwrap_or_else(|| layout_cache_key.clone());
     let product_render_scene_identity = render_scene_identity.clone();
+    let active_scene_identity = preview_active_scene_identity(
+        &layout_cache_key,
+        render_frame_hash_value,
+        &product_render_scene_identity,
+        context.width,
+        context.height,
+        render_scene_lowering_mode,
+        &render_scene_patch_hash,
+    );
+    let product_patch_summary = preview_product_patch_summary(PreviewProductPatchSummaryInput {
+        active_scene_identity: Some(active_scene_identity.clone()),
+        route_identity: Some(visible_state.overlay_route_identity.clone()),
+        retained_bound_sync_stats: visible_state.retained_bound_sync_stats.as_ref(),
+        hover_overlay,
+        focus_overlay,
+        touched_nodes: &input_overlay_touched_nodes,
+        input_overlay_render_scene_patch_enabled,
+        direct_input_overlay_render_scene_patch_enabled,
+        layout_render_scene_patch_applied: layout_render_scene_patch.is_some(),
+        direct_layout_render_scene_patch_enabled,
+        render_scene_cache_hit,
+        proof_json_required: !defer_product_render_report,
+        latest_report_required: false,
+    });
     let proof_started = Instant::now();
     let render_identity_hash = render_scene_identity
         .strip_prefix("render-scene:")
@@ -12131,6 +12155,13 @@ fn native_gpu_app_owned_render_hook(
             "render_scene_hash_status": render_scene_hash_status,
             "render_scene_identity": render_scene_identity,
             "scroll_transform": visible_state.scroll_transform.clone(),
+            "active_preview_scene": {
+                "identity": active_scene_identity.clone(),
+                "route_identity": visible_state.overlay_route_identity.clone(),
+                "layout_identity": layout_identity.clone(),
+                "render_scene_identity": product_render_scene_identity.clone()
+            },
+            "product_patch": product_patch_summary.clone(),
             "surface_id": context.surface_id,
             "surface_epoch": context.surface_epoch,
             "surface_format": context.surface_format,
@@ -12251,6 +12282,7 @@ fn native_gpu_app_owned_render_hook(
         Some(product_render_scene_identity.clone()),
         !defer_product_render_report,
         !defer_product_render_report,
+        Some(product_patch_summary.clone()),
         preview_post_present_proof_request_summaries_for_mode(
             skip_app_owned_scene_proof,
             defer_product_render_report,
@@ -12309,6 +12341,161 @@ fn preview_native_render_frame_metrics(
     }
 }
 
+fn preview_active_scene_identity(
+    layout_cache_key: &str,
+    render_frame_hash: &str,
+    render_scene_identity: &str,
+    width: u32,
+    height: u32,
+    render_scene_lowering_mode: &str,
+    render_scene_patch_hash: &str,
+) -> String {
+    let fingerprint = format!(
+        "active-preview-scene:{layout_cache_key}:{render_frame_hash}:{render_scene_identity}:{width}:{height}:{render_scene_lowering_mode}:{render_scene_patch_hash}"
+    );
+    format!(
+        "active-preview-scene:{}",
+        boon_runtime::sha256_bytes(fingerprint.as_bytes())
+    )
+}
+
+fn preview_focus_overlay_node_count(focus_overlay: &PreviewFocusOverlayState) -> u64 {
+    let mut nodes = BTreeSet::new();
+    if let Some(focused_node) = focus_overlay.focused_node.as_ref() {
+        nodes.insert(focused_node.clone());
+    }
+    nodes.extend(focus_overlay.previous_selected_nodes.iter().cloned());
+    nodes.extend(focus_overlay.selected_nodes.iter().cloned());
+    nodes.len() as u64
+}
+
+fn preview_hover_overlay_node_count(hover_overlay: &PreviewHoverOverlayState) -> u64 {
+    let mut nodes = BTreeSet::new();
+    nodes.extend(hover_overlay.hover_nodes.iter().cloned());
+    nodes.extend(hover_overlay.paint_nodes.iter().cloned());
+    nodes.len() as u64
+}
+
+fn preview_product_patch_source(
+    retained_bound_sync_stats: Option<&PreviewRetainedBoundSyncStats>,
+    hover_overlay: &PreviewHoverOverlayState,
+    focus_overlay: &PreviewFocusOverlayState,
+    input_overlay_render_scene_patch_enabled: bool,
+    layout_render_scene_patch_applied: bool,
+    render_scene_cache_hit: bool,
+) -> &'static str {
+    if retained_bound_sync_stats.is_some_and(|stats| {
+        stats.status == "pass"
+            && stats.changed
+            && (stats.text_update_count > 0 || stats.style_update_count > 0)
+    }) {
+        "retained_bound_sync"
+    } else if input_overlay_render_scene_patch_enabled
+        || !hover_overlay.is_empty()
+        || !focus_overlay.is_empty()
+    {
+        "input_overlay"
+    } else if layout_render_scene_patch_applied {
+        "layout_sidecar"
+    } else if render_scene_cache_hit {
+        "cached_scene"
+    } else {
+        "full_scene_build"
+    }
+}
+
+fn preview_product_patch_kind(
+    input_overlay_render_scene_patch_enabled: bool,
+    direct_input_overlay_render_scene_patch_enabled: bool,
+    layout_render_scene_patch_applied: bool,
+    direct_layout_render_scene_patch_enabled: bool,
+    render_scene_cache_hit: bool,
+) -> &'static str {
+    if direct_input_overlay_render_scene_patch_enabled {
+        "direct_input_overlay_render_scene_patch"
+    } else if input_overlay_render_scene_patch_enabled {
+        "input_overlay_render_scene_patch"
+    } else if direct_layout_render_scene_patch_enabled {
+        "direct_layout_render_scene_patch"
+    } else if layout_render_scene_patch_applied {
+        "layout_render_scene_patch"
+    } else if render_scene_cache_hit {
+        "retained_cached_scene"
+    } else {
+        "full_render_scene_build"
+    }
+}
+
+struct PreviewProductPatchSummaryInput<'a> {
+    active_scene_identity: Option<String>,
+    route_identity: Option<String>,
+    retained_bound_sync_stats: Option<&'a PreviewRetainedBoundSyncStats>,
+    hover_overlay: &'a PreviewHoverOverlayState,
+    focus_overlay: &'a PreviewFocusOverlayState,
+    touched_nodes: &'a BTreeSet<boon_document_model::DocumentNodeId>,
+    input_overlay_render_scene_patch_enabled: bool,
+    direct_input_overlay_render_scene_patch_enabled: bool,
+    layout_render_scene_patch_applied: bool,
+    direct_layout_render_scene_patch_enabled: bool,
+    render_scene_cache_hit: bool,
+    proof_json_required: bool,
+    latest_report_required: bool,
+}
+
+fn preview_product_patch_summary(
+    input: PreviewProductPatchSummaryInput<'_>,
+) -> boon_native_app_window::NativeProductPatchSummary {
+    let direct_render_scene_patch = input.direct_input_overlay_render_scene_patch_enabled
+        || input.direct_layout_render_scene_patch_enabled;
+    let full_scene_build_before_present =
+        !input.render_scene_cache_hit && !direct_render_scene_patch;
+    boon_native_app_window::NativeProductPatchSummary {
+        schema_version: 1,
+        status: "pass".to_owned(),
+        owner: "preview_active_scene".to_owned(),
+        patch_kind: preview_product_patch_kind(
+            input.input_overlay_render_scene_patch_enabled,
+            input.direct_input_overlay_render_scene_patch_enabled,
+            input.layout_render_scene_patch_applied,
+            input.direct_layout_render_scene_patch_enabled,
+            input.render_scene_cache_hit,
+        )
+        .to_owned(),
+        source: preview_product_patch_source(
+            input.retained_bound_sync_stats,
+            input.hover_overlay,
+            input.focus_overlay,
+            input.input_overlay_render_scene_patch_enabled,
+            input.layout_render_scene_patch_applied,
+            input.render_scene_cache_hit,
+        )
+        .to_owned(),
+        active_scene_identity: input.active_scene_identity,
+        route_identity: input.route_identity,
+        touched_node_count: input.touched_nodes.len() as u64,
+        touched_node_samples: input
+            .touched_nodes
+            .iter()
+            .take(16)
+            .map(|node| node.0.clone())
+            .collect(),
+        retained_text_update_count: input
+            .retained_bound_sync_stats
+            .map(|stats| stats.text_update_count as u64)
+            .unwrap_or(0),
+        retained_style_update_count: input
+            .retained_bound_sync_stats
+            .map(|stats| stats.style_update_count as u64)
+            .unwrap_or(0),
+        hover_node_count: preview_hover_overlay_node_count(input.hover_overlay),
+        focus_node_count: preview_focus_overlay_node_count(input.focus_overlay),
+        direct_render_scene_patch,
+        full_scene_build_before_present,
+        proof_json_required: input.proof_json_required,
+        latest_report_required: input.latest_report_required,
+    }
+}
+
 fn preview_attach_product_proof_boundary(
     metrics: &mut boon_native_app_window::NativeRenderFrameMetrics,
     render_target_kind: &str,
@@ -12316,6 +12503,7 @@ fn preview_attach_product_proof_boundary(
     render_scene_identity: Option<String>,
     legacy_proof_json_built_pre_present: bool,
     legacy_render_hook_proof_built_pre_present: bool,
+    product_patch: Option<boon_native_app_window::NativeProductPatchSummary>,
     post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
 ) {
     let post_present_proof_request_count = post_present_proof_requests.len() as u32;
@@ -12329,7 +12517,7 @@ fn preview_attach_product_proof_boundary(
         legacy_proof_json_built_pre_present,
         legacy_render_hook_proof_built_pre_present,
         post_present_proof_request_count,
-        product_patch: None,
+        product_patch,
     });
     metrics.post_present_proof_requests = post_present_proof_requests;
 }
@@ -13784,6 +13972,7 @@ fn native_gpu_dev_visible_render_hook(
                 Some(cache.render_scene_identity.clone()),
                 true,
                 true,
+                None,
                 dev_post_present_proof_request_summaries(),
             );
             return Ok(PreviewNativeGpuRenderHookOutput {
@@ -13898,6 +14087,7 @@ fn native_gpu_dev_visible_render_hook(
         Some(cache.render_scene_identity.clone()),
         true,
         true,
+        None,
         dev_post_present_proof_request_summaries(),
     );
     Ok(PreviewNativeGpuRenderHookOutput {
@@ -51083,6 +51273,7 @@ struct PreviewWorldEditorLayoutSnapshot {
 struct PreviewVisibleRenderState {
     status: Option<String>,
     overlay_lookup: PreviewRenderOverlayLookup,
+    overlay_route_identity: String,
     layout_artifact: String,
     layout_artifact_sha256: Value,
     layout_frame_hash: Option<String>,
@@ -51289,6 +51480,7 @@ impl PreviewVisibleRenderState {
                     .as_deref()
                     .map(render_frame_hash)
             });
+        let overlay_route_identity = preview_render_overlay_lookup_cache_key(&shared.layout_proof);
         Self {
             status: shared
                 .layout_proof
@@ -51296,6 +51488,7 @@ impl PreviewVisibleRenderState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
             overlay_lookup: cached_preview_render_overlay_lookup(&shared.layout_proof),
+            overlay_route_identity,
             layout_artifact,
             layout_artifact_sha256: shared
                 .layout_proof
@@ -65582,6 +65775,78 @@ mod tests {
                 .pointer("/text_update_count")
                 .and_then(|value| value.as_u64()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn product_patch_summary_reports_generic_active_scene_patch() {
+        let retained_stats = PreviewRetainedBoundSyncStats {
+            status: "pass",
+            changed: true,
+            text_update_count: 1,
+            style_update_count: 2,
+            text_update_nodes: vec!["input-alpha".to_owned()],
+            style_update_nodes: vec!["choice-alpha".to_owned(), "choice-beta".to_owned()],
+            ..Default::default()
+        };
+        let hover_overlay = PreviewHoverOverlayState {
+            hover_nodes: BTreeSet::from(["choice-alpha".to_owned()]),
+            paint_nodes: BTreeSet::from(["choice-beta".to_owned()]),
+        };
+        let focus_overlay = PreviewFocusOverlayState {
+            focused_node: Some("input-alpha".to_owned()),
+            previous_selected_nodes: BTreeSet::from(["choice-beta".to_owned()]),
+            selected_nodes: BTreeSet::from(["choice-alpha".to_owned()]),
+            ..Default::default()
+        };
+        let touched_nodes = BTreeSet::from([
+            boon_document_model::DocumentNodeId("choice-alpha".to_owned()),
+            boon_document_model::DocumentNodeId("choice-beta".to_owned()),
+            boon_document_model::DocumentNodeId("input-alpha".to_owned()),
+        ]);
+
+        let summary = preview_product_patch_summary(PreviewProductPatchSummaryInput {
+            active_scene_identity: Some("active-preview-scene:test".to_owned()),
+            route_identity: Some("route:test".to_owned()),
+            retained_bound_sync_stats: Some(&retained_stats),
+            hover_overlay: &hover_overlay,
+            focus_overlay: &focus_overlay,
+            touched_nodes: &touched_nodes,
+            input_overlay_render_scene_patch_enabled: true,
+            direct_input_overlay_render_scene_patch_enabled: true,
+            layout_render_scene_patch_applied: false,
+            direct_layout_render_scene_patch_enabled: false,
+            render_scene_cache_hit: true,
+            proof_json_required: false,
+            latest_report_required: false,
+        });
+
+        assert_eq!(summary.owner, "preview_active_scene");
+        assert_eq!(
+            summary.patch_kind,
+            "direct_input_overlay_render_scene_patch"
+        );
+        assert_eq!(summary.source, "retained_bound_sync");
+        assert_eq!(
+            summary.active_scene_identity.as_deref(),
+            Some("active-preview-scene:test")
+        );
+        assert_eq!(summary.route_identity.as_deref(), Some("route:test"));
+        assert_eq!(summary.touched_node_count, 3);
+        assert_eq!(summary.retained_text_update_count, 1);
+        assert_eq!(summary.retained_style_update_count, 2);
+        assert_eq!(summary.hover_node_count, 2);
+        assert_eq!(summary.focus_node_count, 3);
+        assert!(summary.direct_render_scene_patch);
+        assert!(!summary.full_scene_build_before_present);
+        assert!(!summary.proof_json_required);
+        assert!(!summary.latest_report_required);
+        assert!(
+            summary
+                .touched_node_samples
+                .iter()
+                .any(|node| node == "input-alpha"),
+            "product patch evidence should expose generic touched node ids"
         );
     }
 

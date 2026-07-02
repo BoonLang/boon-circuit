@@ -10582,9 +10582,20 @@ Performance is the main goal. Implement the native preview architecture so norma
 
 Prefer strategy over tactics when the same gate keeps failing. Do not spend the run making a slow path merely more measurable or slightly less wrong. Cut the product interaction path down to a hot native loop: accept input at the start of an already scheduled frame, patch retained runtime/layout/render state directly, submit quickly, move proof/readback/reporting off the UX frame, and keep product latency separate from verifier proof latency while linking both with FrameEvidenceKey.
 
-Start from the current 2026-07-02 product-commit lane split checkpoint, not from older stale report text. The current WIP has already moved background proof telemetry out of product/burst frames, kept product commits and async report refresh available, split proof/harness work from product work, fixed armed-prewarm accounting, added hardware adapter identity to product evidence, started a generic `NativeFrameClockPolicy` owner for product/proof frame decisions, moved retained visible-bound-text proof payload construction behind post-present subscribers, separated product timing status from hardware-adapter status, and kept `List/find` / runtime / formula work clean in Cells interaction reports. Product commits are now published only for accepted product-interaction frames with accepted input timing; non-product presented frames may enqueue exact post-present proof work, but they must not enter `recent_product_frame_commits`. Focused Rust checks pass for the changed app-window/playground/xtask slice, but the release Cells visible-click gate is still not complete on hardware-backed evidence.
+Start from the current 2026-07-02 typed product patch checkpoint, not from older stale report text. The current WIP has already moved background proof telemetry out of product/burst frames, kept product commits and async report refresh available, split proof/harness work from product work, fixed armed-prewarm accounting, added hardware adapter identity to product evidence, started a generic `NativeFrameClockPolicy` owner for product/proof frame decisions, moved retained visible-bound-text proof payload construction behind post-present subscribers, separated product timing status from hardware-adapter status, and kept `List/find` / runtime / formula work clean in Cells interaction reports. Product commits are now published only for accepted product-interaction frames with accepted input timing; non-product presented frames may enqueue exact post-present proof work, but they must not enter `recent_product_frame_commits`. Product frame evidence now carries typed `product_patch` metadata from the active preview scene: active scene identity, route identity, patch kind/source, touched node counts, retained text/style update counts, direct patch/full-scene flags, and proof/latest-report dependency flags. The visible-click product lane now fails unless every sample joins to an exact product commit and a typed active-scene product patch; proof-frame fallback and input-latency fallback are diagnostics only. Focused Rust checks pass for the changed playground/xtask slice, but the release Cells visible-click gate is still not complete on hardware-backed evidence.
 
 Current evidence to respect:
+- Latest one-click release diagnostic after typed product patch evidence:
+  `target/reports/native-gpu/cells-visible-click-e2e-a2-product-patch-exact-current.json`
+  is schema-valid and still `status=fail`. The product timing slice is clean:
+  `timing_status=pass`, exact product commit matches `1`, proof-frame commit
+  fallbacks `0`, input-latency fallbacks `0`, typed product patch count `1`,
+  product patch missing/full-scene/proof-JSON/latest-report counts all `0`,
+  input-accept-to-present/formula p95/max `11.754082 ms`, missed frames `0`,
+  and hard failures `0`. The product contract still fails because the run used
+  software Vulkan llvmpipe (`adapter_status=software`), and the proof lane
+  still fails separately with proof lag reported at `3` frames. Treat this as a
+  good diagnostic checkpoint, not final acceptance.
 - Latest one-click release diagnostic after the product-commit lane split:
   `target/reports/native-gpu/cells-visible-click-e2e-a2-product-commit-lane-split-current.json`
   is schema-valid but `status=fail` because this run selected software Vulkan
@@ -10610,7 +10621,7 @@ Current evidence to respect:
   separation.
 - The remaining p95 misses are dominated by product-frame scheduling, queue submit, present, and render-result ownership. Cells runtime/list/formula is not the current blocker: reported interaction samples have one dirty key, zero list scans, no full-grid recompute, no root materialization, and no full relower.
 - The same-surface present-floor diagnostic currently selected llvmpipe software Vulkan. Do not use that as hardware/product evidence. Add adapter identity to all relevant product/perf reports and fail fast when a performance gate runs on a software adapter unless the verifier explicitly opts into diagnostic mode.
-- The current code checkpoints add a hardware-adapter product gate, expose `native_frame_clock_policy` / `native_frame_clock_owner` in render-loop reports, limit deferred product proof requests to exact retained visual proof after present, split product commit publication from non-product presented frames, and introduce a `product_patch` metadata slot on rendered product-frame evidence. These are guardrails and ABI seams, not the final 60 FPS architecture. Continue by making that frame clock and an `ActivePreviewScene` the real product-frame owner instead of treating them as diagnostic wrappers.
+- The current code checkpoints add a hardware-adapter product gate, expose `native_frame_clock_policy` / `native_frame_clock_owner` in render-loop reports, limit deferred product proof requests to exact retained visual proof after present, split product commit publication from non-product presented frames, and require typed active-scene `product_patch` evidence on rendered product-frame commits. These are guardrails and ABI seams, not the final 60 FPS architecture. Continue by making that frame clock and an `ActivePreviewScene` the real product-frame owner instead of treating them as diagnostic wrappers.
 
 Treat the next phase as architecture cutting, not micro-optimization. The main mistake to avoid is spending another long run making the current legacy render-hook path more measurable and less wrong while the product frame still travels through proof-shaped ownership. Pick the largest simple boundary that removes product-frame work, then verify once with focused tests and one fresh release report. The preferred cut is a real `PreviewHotLoop` / `NativeFrameClock` product owner with `ActivePreviewScene`:
 - sample visible-changing input at the start of an already scheduled demand-driven burst frame;
@@ -10622,7 +10633,7 @@ Treat the next phase as architecture cutting, not micro-optimization. The main m
 Implementation priorities:
 1. Expand the existing `NativeFrameClockPolicy` into one product-frame owner: `PreviewHotLoop` / `NativeFrameClock`. DemandDriven remains the product mode; requested animation is only a bounded burst pacing substate with quiet-frame and hard-cap exits; ContinuousProbe is diagnostic/verifier only.
 2. Introduce `ActivePreviewScene`, `PendingPreviewScene`, and `RecyclePreviewScene`. The active scene must be directly presentable and own retained layout/render chunks, text runs, selection/focus/caret overlays, hit-test indexes, and GPU resource references.
-3. Replace product render-hook proof/report construction with a small typed product result. Product frames must not build proof JSON, visible-bound-text proof, retained-bound-sync proof, report JSON, proof history, artifact hashes, broad state summaries, or latest-report fallbacks.
+3. Replace product render-hook proof/report construction with a small typed product result. Product frames must publish a `PresentedProductFrame` / `RenderFrameResult` with `FrameEvidenceKey`, timing scalars, adapter identity, and typed active-scene product patch evidence. They must not build proof JSON, visible-bound-text proof, retained-bound-sync proof, report JSON, proof history, artifact hashes, broad state summaries, or latest-report fallbacks.
 4. Move WGPU ownership toward a render actor: keep pipelines, bind groups, buffers, glyph atlas, prepared quads, and command resources hot; acquire late; encode from immutable active-scene snapshots; submit quickly; report acquire, encode, queue submit, present, post-present dispatch, and driver/compositor floor separately.
 5. Make retained patching property/component based with stable semantic identity from compiler/document through layout/render. Product clicks should touch only changed nodes and overlays. Add negative gates for full-state fallback, geometry/string/path matching, proof JSON dependency, dev IPC dependency, and product-frame report parsing.
 6. Make proof/readback a bounded service keyed by `FrameEvidenceKey`, with required-frame proof, background telemetry, stale-key rejection, coalescing, lag/drop counters, and proof-isolation stress gates.
@@ -12077,7 +12088,7 @@ host-input follow-up cut:
     legacy pre-present request count `0`, product does not block on proof;
   - proof-only and post-present proof isolation pass, with app-owned WGPU
     readback and proof lag max `2` frames;
-  - remaining blockers are hardware evidence only on this machine:
+ - remaining blockers are hardware evidence only on this machine:
     adapter is software Vulkan llvmpipe, so `hardware-product-adapter` and the
     hardware-backed `product-only-ux-contract` fail by design.
 - This still is not the completed architecture. Next useful cut is to make
@@ -12085,3 +12096,53 @@ host-input follow-up cut:
   patch and WGPU submit path directly, then run a multi-sample hardware-backed
   release report. Do not spend the next pass tuning Cells runtime/list/formula
   unless a fresh report shows that as the dominant boundary again.
+
+2026-07-02 typed product patch and exact product commit evidence checkpoint:
+
+- Tightened the native product-frame evidence boundary without adding
+  example-specific code:
+  - preview product frames now report an `active_preview_scene` identity with
+    route, layout, and render-scene identity;
+  - rendered product frames now carry typed `product_patch` metadata from the
+    active preview scene: owner, patch kind/source, active scene identity, route
+    identity, touched node count/samples, retained text/style update counts,
+    hover/focus counts, direct patch flag, full-scene-before-present flag,
+    proof JSON dependency flag, and latest-report dependency flag;
+  - dev-window render hooks pass no product patch evidence, so the new contract
+    is scoped to preview product frames instead of faking product evidence for
+    non-product surfaces.
+- Tightened Cells visible-click verifier classification:
+  - product UX now requires exact product-frame commit matches for every sample;
+  - proof-frame exact matches and input-latency fallback matches are reported as
+    diagnostics and cannot satisfy the product UX gate;
+  - product UX now requires typed active-scene `product_patch` evidence and
+    rejects full render-scene builds, proof JSON dependencies, latest-report
+    dependencies, or missing product patch summaries.
+- Verification for this slice:
+  - `cargo fmt --check`;
+  - `cargo check -q -p boon_native_playground -p boon_native_app_window -p xtask`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo test -q -p boon_native_playground product_patch_summary_reports_generic_active_scene_patch -- --test-threads=1`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-product-patch-exact-current.json`.
+- Fresh release diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-product-patch-exact-current.json`
+    still reports `status=fail`;
+  - product timing is healthy in this diagnostic run:
+    `timing_status=pass`, exact product commit matches `1`,
+    proof-frame commit fallbacks `0`, input-latency fallbacks `0`,
+    typed product patch count `1`, product patch missing/full-scene/proof-JSON/
+    latest-report counts all `0`, input-accept-to-present/formula p95/max
+    `11.754082 ms`, missed frames `0`, hard failures `0`;
+  - remaining product blocker is hardware evidence: the run selected software
+    Vulkan llvmpipe (`adapter_status=software`), so hardware performance
+    acceptance must still fail;
+  - proof remains a separate blocker in this one-click run:
+    `proof_only_contract.status=fail` with proof lag reported at `3` frames,
+    while post-present proof isolation still reports `status=pass` and
+    `product_path_status=pass`.
+- This is still not the completed 60 FPS architecture. The checkpoint proves
+  the product lane can now be measured by exact product commits and typed active
+  scene patches instead of proof/readback fallbacks. The next cut should make
+  `PreviewHotLoop` / `ActivePreviewScene` own the product frame transaction
+  directly, then run hardware-backed multi-sample release reports with product,
+  proof, and proof-isolation lanes separated.

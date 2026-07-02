@@ -151,6 +151,15 @@ more instrumentation.
     of rebuilding render-scene/proof structures;
   - reports expose upload bytes, command encode time, queue submit time,
     present time, draw calls, cache hits, and hot-frame allocations.
+- [ ] Compile product frames through a render graph:
+  - `ActivePreviewScene + ProductPatch` compiles to a `ProductRenderGraph` /
+    `PresentPlan` before product submit;
+  - product passes are explicit, cacheable, and keyed by scene/layout/surface
+    epochs, while proof/readback/report passes are post-present subscribers;
+  - product plans report pass count, dirty chunks, upload bytes, cache hits,
+    encode time, and zero full-scene/proof/report fallback work;
+  - stale graph pass, mismatched epoch, or proof-on-product-frame evidence
+    fails the product gate even if raw latency happens to pass.
 - [ ] Measure the real product present floor before chasing app micro-costs:
   - add a focus-safe hardware/product-surface baseline for the same app-window,
     adapter, surface, present mode, and frame clock;
@@ -171,6 +180,116 @@ more instrumentation.
     on the product path;
   - if a fix needs per-example branches or many local exceptions, replace the
     architecture boundary instead.
+
+## Product Render Graph Architecture Cut
+
+Render graphs are now an explicit candidate for the next large native-preview
+cut. They should not replace `PreviewHotLoop`, `NativeFrameClock`, or
+`ActivePreviewScene`; they are the renderer-side mechanism that makes
+`ActivePreviewScene -> ProductRenderGraph -> PresentPlan -> submit` explicit.
+
+External research supports this shape:
+
+- Bevy's render graph is a retained graph of nodes, edges, and slots executed by
+  a graph runner in dependency order:
+  https://docs.rs/bevy_render/latest/bevy_render/render_graph/struct.RenderGraph.html
+- Unreal RDG records commands into a graph that is compiled/executed, validates
+  dependencies, culls unused passes, and keeps external resources explicit:
+  https://dev.epicgames.com/documentation/unreal-engine/render-dependency-graph-in-unreal-engine
+- Vulkan render-graph tutorials model passes as declared inputs, outputs, and
+  deferred execute callbacks so the whole frame can be analyzed before resource
+  allocation and scheduling:
+  https://docs.vulkan.org/tutorial/latest/Building_a_Simple_Engine/Engine_Architecture/05_rendering_pipeline.html
+- Granite's render-graph writeup emphasizes local module reasoning plus global
+  frame knowledge for barriers, layouts, semaphores, and scheduling:
+  https://themaister.net/blog/2017/08/15/render-graphs-and-vulkan-a-deep-dive/
+- AMD RPS frames render-graph edges as dataflow/order dependencies and access
+  attributes as the way to derive transitions:
+  https://gpuopen.com/learn/rps-tutorial/rps-tutorial-part2/
+- wgpu is the portable GPU layer, not a render graph; Boon should build this
+  graph above wgpu and keep it replaceable:
+  https://wgpu.rs/
+
+Adopt a render graph only as a generic renderer architecture, not as a Cells
+shortcut. Runtime/dataflow, document/layout, render-scene, and GPU-resource
+graphs stay separate:
+
+```text
+Runtime graph -> SemanticDelta / DocumentPatch
+Document/UI graph -> Layout demand / invalidation class
+Layout graph -> LayoutPatch / RenderScenePatch
+Retained render graph -> ProductRenderGraph / PresentPlan
+GPU resource graph -> WGPU uploads, passes, submit, post-present proof
+```
+
+Runtime IDs, list keys, field IDs, and currentness state must never contain GPU
+resource IDs. Render graph nodes may carry dependency metadata pointing back to
+document/layout/list identity, but GPU handles and allocation IDs are private to
+the renderer and must be rebuildable from the retained `RenderScene`.
+
+Implementation shape:
+
+- `PreviewHotLoop` samples input, chooses the product/proof lane, and mints the
+  `FrameEvidenceKey`.
+- `ActivePreviewScene` owns retained route identity, layout/render identities,
+  property state, dirty chunks, hit regions, text mirrors, and stable render
+  scene revisions.
+- `ProductRenderGraph` compiles from `ActivePreviewScene + ProductPatch` into
+  phases such as `ExtractDirty`, `PrepareResources`, `BuildPassPlan`,
+  `EncodeProductPasses`, `SubmitPresent`, and
+  `PostPresentProofSubscribers`.
+- Product passes include clear/background, clips, primitives, text, overlays,
+  cursor/caret, and present. Proof copies, WGPU readback, proof-history,
+  artifact hashing, JSON reports, accessibility snapshots, and dev IPC are not
+  product passes.
+- `RenderScene` remains the pending-scene/import compatibility format while hot
+  interactions patch retained graph state directly.
+- Device loss or surface epoch changes discard GPU resource graph state and
+  replay from current retained render-scene state without runtime redispatch.
+
+Required product-frame/report fields:
+
+- `renderer_architecture="render_graph"`;
+- `render_graph_revision`, `render_graph_plan_hash`, and schema version;
+- product graph pass count, plan compile count, plan/pass cache hit rates;
+- product graph encode p95, upload bytes p95, draw calls p95, dirty chunk p95;
+- `product_graph_full_rebuild_fallback_count=0`;
+- `full_render_scene_build_before_present_count=0`;
+- `stale_product_graph_pass_used_count=0`;
+- `proof_pass_count_on_product_frame=0`;
+- `readback_copy_count_on_product_frame=0`;
+- `product_latency_includes_proof_completion=false`.
+
+Per-pass evidence records both reusable plan identity and per-frame execution
+identity: pass id/kind/lane, plan key hash, content/layout/render-scene/render
+graph/surface/resource epochs, `FrameEvidenceKey`, cache status, stale check
+status, and whether it encoded before product present.
+
+Verifier and negative gates:
+
+- extend the headed Cells visible-click, scroll-speed, present-floor, and
+  `verify-native-gpu-negative` gates instead of adding a separate proof path;
+- product UX fails when graph fields are missing from product commits;
+- product UX fails on stale graph revision, surface epoch, resource epoch, or
+  pass-plan hash;
+- product UX fails on full render-scene build fallback, layout-proof/latest
+  report read, or proof/readback pass before product present;
+- proof artifacts include product/proof frame keys plus product/proof pass plan
+  hashes; proof may lag only with explicit bounded `proof_lag_frames`;
+- same-run improvement reports compare baseline/candidate only when adapter,
+  surface, present mode, binary hash, source hash, and worktree fingerprint
+  match.
+
+Focused tests to add when implementing:
+
+- `product_render_graph_compiles_active_scene_patch_without_full_scene_build`;
+- `product_render_graph_proof_mode_does_not_change_product_plan`;
+- `active_preview_scene_rejects_stale_pending_scene_epochs`;
+- `visible_renderer_graph_patch_reuses_prepared_quads_and_upload_ring`;
+- `passive_scroll_render_graph_only`;
+- `render_scene_patch_rejects_stale_base`;
+- `device_loss_replay_from_retained_scene`;
+- `negative_no_example_render_branches`.
 
 ## 2026-07-02 Architecture Cuts Not To Lose
 
@@ -10633,7 +10752,7 @@ If the full headed gate fails, fix only the failing lane. Product pass plus proo
 
 Hard loop stop: after two fresh reports from the same gate show the same dominant blocker class, stop local optimizations. Record report paths, blocker class, rejected tactic, selected architecture boundary, old path to delete/quarantine, and the next gate that will prove it.
 
-If product latency remains the blocker, implement the generic hot-loop architecture cut: make `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` the product-frame owner; sample input at the start of an already scheduled demand-driven burst frame; patch retained selection/focus/formula-bar state directly; submit quickly; move proof/readback/reporting/accessibility/HUD/dev IPC behind bounded post-present services keyed by exact `FrameEvidenceKey`.
+If product latency remains the blocker, implement the generic hot-loop architecture cut: make `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` the product-frame owner, and make `ProductRenderGraph` / `PresentPlan` the renderer-side mechanism for turning `ActivePreviewScene + ProductPatch` into product passes. Sample input at the start of an already scheduled demand-driven burst frame; patch retained selection/focus/formula-bar state directly; compile/cache explicit product graph passes; submit quickly; move proof/readback/reporting/accessibility/HUD/dev IPC behind bounded post-present services keyed by exact `FrameEvidenceKey`.
 
 Do not add Cells/example-specific hacks anywhere in compiler, runtime, document, renderer, app-window, playground, or verifier code. Use subagents only for independent reads that validate the selected architecture cut or blocker classification. End the goal when the Cells-first gates pass on fresh hardware-backed reports for the current worktree/binary, or when a fresh schema-valid report identifies the next blocker and the repo is coherent.
 ```

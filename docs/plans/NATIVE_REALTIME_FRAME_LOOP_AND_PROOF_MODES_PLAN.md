@@ -12316,9 +12316,61 @@ host-input follow-up cut:
   - the run also used software Vulkan llvmpipe, so hardware-backed performance
     acceptance still must fail until a hardware adapter report passes.
 - Next implementation step:
-  - fix the verifier/proof selection to prefer exact product-frame
-    `FrameEvidenceKey` artifacts before any recent-frame fallback;
-  - make later-frame proof acceptable only as explicitly reported proof lag, not
-    as product UX proof;
+ - fix the verifier/proof selection to prefer exact product-frame
+   `FrameEvidenceKey` artifacts before any recent-frame fallback;
+ - make later-frame proof acceptable only as explicitly reported proof lag, not
+   as product UX proof;
   - then continue with the larger `PreviewHotLoop` / `NativeFrameClock` /
     `ActivePreviewScene` cut and hardware-backed multi-sample release gates.
+
+2026-07-02 exact product proof join checkpoint:
+
+- The visible-click verifier now rejects later-frame visual proof as product
+  sample proof when an exact product `FrameEvidenceKey` is known:
+  - added a generic exact-product post-present visual probe helper keyed by
+    `FrameEvidenceKey`;
+  - the polling loop tries exact product-frame post-present artifacts before
+    falling back to recent-frame probes;
+  - a visual probe is considered complete for product UX only when the readback
+    root key and structured proof key match the product frame key;
+  - final sample assembly also rechecks exact product-frame artifacts so a
+    later proof discovered during polling cannot overwrite product/proof
+    identity;
+  - added a unit regression that a later-frame visual proof requires exact
+    product replacement.
+- Verification for this slice:
+  - `cargo fmt --check`;
+  - `cargo check -q -p xtask`;
+  - `cargo test -q -p xtask cells_visible_click -- --test-threads=1`;
+  - `cargo test -q -p boon_native_app_window interactive_surface_readback -- --test-threads=1`;
+  - `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-a2-exact-product-proof-join-current.json`.
+- Fresh release diagnostic:
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile release --address A2 --expected-formula 15 --repeat-count 1 --report target/reports/native-gpu/cells-visible-click-e2e-a2-exact-product-proof-join-current.json`
+    still reports `status=fail`;
+  - product/proof identity is now fixed in the one-click diagnostic:
+    `proof_only_contract.status=pass`, exact visual proof sample count `1`,
+    input-event match count `1`, proof lag max `0`, and the click sample's
+    product/proof `FrameEvidenceKey` both point to frame `7`, input event `4`;
+  - product timing is healthy for this diagnostic sample:
+    accepted input-to-formula/present p95/max is about `12.218707 ms`, exact
+    product commit matches `1`, typed product patch count `1`, typed product
+    result count `1`, hard failures `0`;
+  - post-present proof isolation remains `status=pass`, with product path
+    status `pass`, no hot-path report writes/serialization, and no product
+    blocking on proof subscribers.
+- Remaining blocker:
+  - this machine/run selected software Vulkan llvmpipe, so the hardware-backed
+    product performance gate still fails by design;
+  - a parallel adapter-selection review confirmed this is not an app-window
+    request bug: the preview path requests `HighPerformance`,
+    `force_fallback_adapter: false`, and a compatible Wayland surface. The
+    isolated Weston headless surface appears to expose only llvmpipe as
+    WGPU-compatible, while the current COSMIC Wayland present-floor diagnostic
+    can select the NVIDIA RTX hardware adapter. The next implementation should
+    add a generic product-verifier adapter policy/fail-fast path with full
+    adapter/request/environment evidence, and keep software-surface runs
+    diagnostic-only instead of allowing them to satisfy product UX gates;
+  - next useful work is hardware-adapter selection/verification plus the larger
+    `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` product-frame
+    cut and multi-sample release gates, not more Cells runtime/list/formula
+    micro-tuning.

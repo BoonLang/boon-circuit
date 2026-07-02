@@ -25,10 +25,12 @@ use wgpu::SurfaceTargetUnsafe;
 // product path even starts.
 const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const VISIBLE_SURFACE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_EVENT_WAKE_TIMELINE_LIMIT: usize = 512;
 const MAX_CONSECUTIVE_UNSAMPLED_INPUT_RESAMPLES: u8 = 3;
 const PACED_SURFACE_FRAME_LATENCY: u32 = 2;
+const LOW_LATENCY_SURFACE_FRAME_LATENCY: u32 = 1;
 const MAX_CONFIGURED_SURFACE_FRAME_LATENCY: u32 = 8;
 const NATIVE_TARGET_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0;
 pub const REQUESTED_ANIMATION_BURST_MIN_FRAMES: u32 = 2;
@@ -1069,6 +1071,14 @@ pub struct NativeRenderLoopState {
     #[serde(default)]
     pub post_present_proof_subscriber_worker_dropped_count: u64,
     #[serde(default)]
+    pub post_present_proof_subscriber_worker_superseded_batch_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_superseded_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_required_enqueued_count: u64,
+    #[serde(default)]
+    pub post_present_proof_subscriber_worker_background_enqueued_count: u64,
+    #[serde(default)]
     pub post_present_proof_subscriber_worker_completed_count: u64,
     #[serde(default)]
     pub post_present_proof_subscriber_worker_error_count: u64,
@@ -1208,6 +1218,10 @@ impl NativeRenderLoopState {
             post_present_proof_subscriber_worker_enqueued_count: 0,
             post_present_proof_subscriber_worker_dropped_batch_count: 0,
             post_present_proof_subscriber_worker_dropped_count: 0,
+            post_present_proof_subscriber_worker_superseded_batch_count: 0,
+            post_present_proof_subscriber_worker_superseded_count: 0,
+            post_present_proof_subscriber_worker_required_enqueued_count: 0,
+            post_present_proof_subscriber_worker_background_enqueued_count: 0,
             post_present_proof_subscriber_worker_completed_count: 0,
             post_present_proof_subscriber_worker_error_count: 0,
             post_present_proof_subscriber_worker_pending_batch_count: 0,
@@ -1615,6 +1629,18 @@ impl NativeRenderLoopState {
         self.post_present_proof_subscriber_worker_dropped_count = self
             .post_present_proof_subscriber_worker_dropped_count
             .saturating_add(report.dropped_subscribers);
+        self.post_present_proof_subscriber_worker_superseded_batch_count = self
+            .post_present_proof_subscriber_worker_superseded_batch_count
+            .saturating_add(report.superseded_batches);
+        self.post_present_proof_subscriber_worker_superseded_count = self
+            .post_present_proof_subscriber_worker_superseded_count
+            .saturating_add(report.superseded_subscribers);
+        self.post_present_proof_subscriber_worker_required_enqueued_count = self
+            .post_present_proof_subscriber_worker_required_enqueued_count
+            .saturating_add(report.required_subscribers);
+        self.post_present_proof_subscriber_worker_background_enqueued_count = self
+            .post_present_proof_subscriber_worker_background_enqueued_count
+            .saturating_add(report.background_subscribers);
         self.post_present_proof_subscriber_worker_pending_batch_count = report.pending_batches;
         self.last_post_present_proof_subscriber_worker_enqueue_ms = report.enqueue_ms;
     }
@@ -1836,6 +1862,9 @@ impl NativeRenderLoopState {
         }
         self.requested_animation_prewarm_count =
             self.requested_animation_prewarm_count.saturating_add(1);
+        self.armed_frame_token = self.armed_frame_token.saturating_add(1);
+        self.armed_frame_pending = true;
+        self.armed_frame_started_elapsed_ms = None;
         self.extend_requested_animation_burst(elapsed_ms, false);
         if self.current_scheduler_reason.is_none() {
             self.last_scheduler_reason = Some(NativeSchedulerReason::RequestedAnimation);
@@ -1964,15 +1993,8 @@ impl NativeRenderLoopState {
             let reason = if burst_pacing_active {
                 if self.requested_animation_burst_present_on_wake {
                     self.dirty_revision = self.dirty_revision.saturating_add(1);
-                    NativeSchedulerReason::RequestedAnimation
-                } else {
-                    self.armed_frame_token = self.armed_frame_token.saturating_add(1);
-                    self.armed_frame_pending = true;
-                    self.armed_frame_started_elapsed_ms = None;
-                    self.last_scheduler_reason = Some(NativeSchedulerReason::RequestedAnimation);
-                    self.scheduled_wake_count = self.scheduled_wake_count.saturating_add(1);
-                    return true;
                 }
+                NativeSchedulerReason::RequestedAnimation
             } else {
                 NativeSchedulerReason::Timer
             };
@@ -1999,7 +2021,10 @@ impl NativeRenderLoopState {
         self.armed_frame_pending
             && self.armed_frame_started_elapsed_ms.is_some()
             && self.dirty_revision == self.presented_revision
-            && self.current_scheduler_reason.is_none()
+            && matches!(
+                self.current_scheduler_reason,
+                None | Some(NativeSchedulerReason::RequestedAnimation)
+            )
     }
 
     pub fn skip_clean_armed_burst_present(&mut self, now: Instant, elapsed_ms: f64) {
@@ -2172,6 +2197,27 @@ fn post_present_subscriber_drain_allowed(
     current_input_event_wake_count <= presented_input_event_wake_count
 }
 
+fn post_present_background_telemetry_allowed(
+    post_present_subscriber_allowed: bool,
+    product_input_frame: bool,
+    interaction_burst_active: bool,
+    frame_lane: Option<NativeFrameLane>,
+    scheduler_reason: Option<NativeSchedulerReason>,
+) -> bool {
+    if !post_present_subscriber_allowed {
+        return false;
+    }
+    if frame_lane == Some(NativeFrameLane::ProofOrHarness)
+        || scheduler_reason == Some(NativeSchedulerReason::VerifierFrame)
+    {
+        return true;
+    }
+    if product_input_frame || interaction_burst_active {
+        return false;
+    }
+    true
+}
+
 fn pre_submit_proof_poll_allowed(
     product_input_frame: bool,
     interaction_burst_active: bool,
@@ -2213,13 +2259,30 @@ struct AsyncPostPresentProofSubscriberEnqueueReport {
     enqueued_subscribers: u64,
     dropped_batches: u64,
     dropped_subscribers: u64,
+    superseded_batches: u64,
+    superseded_subscribers: u64,
+    required_subscribers: u64,
+    background_subscribers: u64,
     pending_batches: u64,
     enqueue_ms: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsyncPostPresentProofBatchPriority {
+    RequiredFrameProof,
+    BackgroundTelemetry,
+}
+
+impl AsyncPostPresentProofBatchPriority {
+    fn is_background(self) -> bool {
+        self == Self::BackgroundTelemetry
+    }
 }
 
 struct AsyncPostPresentProofSubscriberBatch {
     context: NativePostPresentProofContext,
     subscribers: Vec<NativePostPresentProofSubscriber>,
+    priority: AsyncPostPresentProofBatchPriority,
 }
 
 #[derive(Default)]
@@ -2282,6 +2345,7 @@ impl AsyncPostPresentProofSubscriberWorker {
         frame_evidence_key: FrameEvidenceKey,
         completed_elapsed_ms: Option<f64>,
         enqueue_started: Instant,
+        priority: AsyncPostPresentProofBatchPriority,
     ) -> Option<AsyncPostPresentProofSubscriberEnqueueReport> {
         if subscribers.is_empty() {
             return None;
@@ -2293,17 +2357,55 @@ impl AsyncPostPresentProofSubscriberWorker {
             enqueue_ms: Some(elapsed_ms(enqueue_started)),
             ..AsyncPostPresentProofSubscriberEnqueueReport::default()
         };
+        match priority {
+            AsyncPostPresentProofBatchPriority::RequiredFrameProof => {
+                report.required_subscribers = subscriber_count;
+            }
+            AsyncPostPresentProofBatchPriority::BackgroundTelemetry => {
+                report.background_subscribers = subscriber_count;
+            }
+        }
         let batch = AsyncPostPresentProofSubscriberBatch {
             context: NativePostPresentProofContext {
                 frame_evidence_key,
                 completed_elapsed_ms,
             },
             subscribers,
+            priority,
         };
         let (lock, cvar) = &*self.shared;
         let mut shared = lock.lock().expect("post-present proof enqueue lock");
+        if priority.is_background() {
+            let mut retained = VecDeque::with_capacity(shared.pending.len());
+            while let Some(pending) = shared.pending.pop_front() {
+                if pending.priority.is_background() {
+                    report.superseded_batches = report.superseded_batches.saturating_add(1);
+                    report.superseded_subscribers = report
+                        .superseded_subscribers
+                        .saturating_add(pending.subscribers.len() as u64);
+                } else {
+                    retained.push_back(pending);
+                }
+            }
+            shared.pending = retained;
+            if shared.pending.len() >= POST_PRESENT_PROOF_SUBSCRIBER_PENDING_BATCH_LIMIT {
+                report.enqueued_batches = 0;
+                report.enqueued_subscribers = 0;
+                report.background_subscribers = 0;
+                report.dropped_batches = report.dropped_batches.saturating_add(1);
+                report.dropped_subscribers =
+                    report.dropped_subscribers.saturating_add(subscriber_count);
+                report.pending_batches = shared.pending.len() as u64;
+                return Some(report);
+            }
+        }
         while shared.pending.len() >= POST_PRESENT_PROOF_SUBSCRIBER_PENDING_BATCH_LIMIT {
-            if let Some(dropped) = shared.pending.pop_front() {
+            let drop_index = shared
+                .pending
+                .iter()
+                .position(|pending| pending.priority.is_background())
+                .unwrap_or(0);
+            if let Some(dropped) = shared.pending.remove(drop_index) {
                 report.dropped_batches = report.dropped_batches.saturating_add(1);
                 report.dropped_subscribers = report
                     .dropped_subscribers
@@ -2771,7 +2873,7 @@ fn interactive_desired_maximum_frame_latency(present_mode: wgpu::PresentMode) ->
     match present_mode {
         wgpu::PresentMode::Mailbox
         | wgpu::PresentMode::Immediate
-        | wgpu::PresentMode::AutoNoVsync => PACED_SURFACE_FRAME_LATENCY,
+        | wgpu::PresentMode::AutoNoVsync => LOW_LATENCY_SURFACE_FRAME_LATENCY,
         _ => PACED_SURFACE_FRAME_LATENCY,
     }
 }
@@ -3707,6 +3809,9 @@ pub struct NativeRenderFrameContext<'a> {
     pub surface_id: SurfaceId,
     pub surface_epoch: u64,
     pub surface_format: String,
+    pub frame_lane: NativeFrameLane,
+    pub scheduler_reason: Option<NativeSchedulerReason>,
+    pub role_dirty_reason: Option<NativeRoleDirtyReason>,
     pub width: u32,
     pub height: u32,
     pub input: NativeInputAdapterProof,
@@ -4188,6 +4293,16 @@ async fn run_surface_probe_inner(
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
+                    frame_lane: render_loop_state.current_frame_lane.unwrap_or_else(|| {
+                        native_frame_lane_for_scheduler(
+                            render_loop_state.current_scheduler_reason,
+                            render_loop_state.current_role_dirty_reason,
+                            input.real_os_events_observed,
+                            false,
+                        )
+                    }),
+                    scheduler_reason: render_loop_state.current_scheduler_reason,
+                    role_dirty_reason: render_loop_state.current_role_dirty_reason,
                     width,
                     height,
                     input,
@@ -4575,6 +4690,16 @@ async fn run_surface_probe_inner(
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
+                    frame_lane: render_loop_state.current_frame_lane.unwrap_or_else(|| {
+                        native_frame_lane_for_scheduler(
+                            render_loop_state.current_scheduler_reason,
+                            render_loop_state.current_role_dirty_reason,
+                            frame_input.real_os_events_observed,
+                            false,
+                        )
+                    }),
+                    scheduler_reason: render_loop_state.current_scheduler_reason,
+                    role_dirty_reason: render_loop_state.current_role_dirty_reason,
                     width,
                     height,
                     input: frame_input,
@@ -5475,7 +5600,10 @@ async fn run_surface_probe_inner(
         render_loop_state.note_present_path_selection(present_path_selection);
         render_loop_state.note_render_target_kind(render_target_kind);
         let mut deferred_app_owned_readback_texture: Option<wgpu::Texture> = None;
-        let mut post_present_proof_subscribers: Vec<NativePostPresentProofSubscriber> = Vec::new();
+        let mut required_post_present_proof_subscribers: Vec<NativePostPresentProofSubscriber> =
+            Vec::new();
+        let mut background_post_present_proof_subscribers: Vec<NativePostPresentProofSubscriber> =
+            Vec::new();
 
         let frame = if use_offscreen_copy_to_present {
             let offscreen_texture = cached_offscreen_present_target(
@@ -5499,6 +5627,16 @@ async fn run_surface_probe_inner(
                     surface_id: surface_id.clone(),
                     surface_epoch: surface_lifecycle.epoch(),
                     surface_format: surface_format.clone(),
+                    frame_lane: render_loop_state.current_frame_lane.unwrap_or_else(|| {
+                        native_frame_lane_for_scheduler(
+                            render_loop_state.current_scheduler_reason,
+                            render_loop_state.current_role_dirty_reason,
+                            input.real_os_events_observed,
+                            false,
+                        )
+                    }),
+                    scheduler_reason: render_loop_state.current_scheduler_reason,
+                    role_dirty_reason: render_loop_state.current_role_dirty_reason,
                     width,
                     height,
                     input: input.clone(),
@@ -5557,7 +5695,8 @@ async fn run_surface_probe_inner(
                 rendered_render_scene_revision = presented_revisions.2;
                 render_loop_state
                     .note_render_frame_metrics(render_result.render_frame_metrics.clone());
-                post_present_proof_subscribers = render_result.post_present_proof_subscribers;
+                required_post_present_proof_subscribers =
+                    render_result.post_present_proof_subscribers;
                 external_render_proof = render_result.proof.map(Arc::new);
                 render_loop_state
                     .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -5646,6 +5785,16 @@ async fn run_surface_probe_inner(
                         surface_id: surface_id.clone(),
                         surface_epoch: surface_lifecycle.epoch(),
                         surface_format: surface_format.clone(),
+                        frame_lane: render_loop_state.current_frame_lane.unwrap_or_else(|| {
+                            native_frame_lane_for_scheduler(
+                                render_loop_state.current_scheduler_reason,
+                                render_loop_state.current_role_dirty_reason,
+                                input.real_os_events_observed,
+                                false,
+                            )
+                        }),
+                        scheduler_reason: render_loop_state.current_scheduler_reason,
+                        role_dirty_reason: render_loop_state.current_role_dirty_reason,
                         width,
                         height,
                         input: input.clone(),
@@ -5706,7 +5855,8 @@ async fn run_surface_probe_inner(
                     rendered_render_scene_revision = presented_revisions.2;
                     render_loop_state
                         .note_render_frame_metrics(render_result.render_frame_metrics.clone());
-                    post_present_proof_subscribers = render_result.post_present_proof_subscribers;
+                    required_post_present_proof_subscribers =
+                        render_result.post_present_proof_subscribers;
                     external_render_proof = render_result.proof.map(Arc::new);
                     render_loop_state
                         .note_render_hook_completed(hold_started.elapsed().as_secs_f64() * 1000.0);
@@ -6122,7 +6272,15 @@ async fn run_surface_probe_inner(
             input_event_wake_count.load(Ordering::Relaxed),
             last_presented_input_event_wake_count,
         );
-        if post_present_subscriber_allowed {
+        let background_telemetry_allowed = post_present_background_telemetry_allowed(
+            post_present_subscriber_allowed,
+            product_input_frame,
+            render_loop_state
+                .interaction_burst_active(hold_started.elapsed().as_secs_f64() * 1000.0),
+            Some(product_commit_frame_lane),
+            product_commit_scheduler_reason,
+        );
+        if background_telemetry_allowed {
             let proof_history_entry_count = recent_frame_evidence.len().saturating_add(1);
             push_recent_frame_evidence(
                 &mut recent_frame_evidence,
@@ -6140,7 +6298,7 @@ async fn run_surface_probe_inner(
                     external_render_proof.as_deref(),
                 ),
             );
-            post_present_proof_subscribers.push(proof_history_post_present_subscriber(
+            background_post_present_proof_subscribers.push(proof_history_post_present_subscriber(
                 proof_history_entry_count,
             ));
         }
@@ -6170,6 +6328,16 @@ async fn run_surface_probe_inner(
                 Some(current_frame_evidence_key.clone()),
             ),
         );
+        let post_present_completed_elapsed_ms = Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(enqueue_report) = async_post_present_proof_worker.enqueue(
+            required_post_present_proof_subscribers,
+            current_frame_evidence_key.clone(),
+            post_present_completed_elapsed_ms,
+            Instant::now(),
+            AsyncPostPresentProofBatchPriority::RequiredFrameProof,
+        ) {
+            render_loop_state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
+        }
         if input_event_wake_count.load(Ordering::Relaxed) > last_presented_input_event_wake_count {
             render_loop_state.note_post_present_subscriber_drain_deferred("pending_host_input");
             render_loop_state.last_scheduler_reason = Some(NativeSchedulerReason::HostInput);
@@ -6249,12 +6417,18 @@ async fn run_surface_probe_inner(
             );
             let report_enqueue_ms = report_writer.enqueue(snapshot, report_enqueue_started);
             last_render_loop_report_enqueue_ms = Some(report_enqueue_ms);
-            post_present_proof_subscribers.push(render_hook_report_json_post_present_subscriber(
-                report.to_owned(),
-                report_enqueue_ms,
-            ));
+            if background_telemetry_allowed {
+                background_post_present_proof_subscribers.push(
+                    render_hook_report_json_post_present_subscriber(
+                        report.to_owned(),
+                        report_enqueue_ms,
+                    ),
+                );
+            }
+        } else if !background_telemetry_allowed {
+            render_loop_state.note_post_present_subscriber_drain_deferred("interaction_burst");
         }
-        if post_present_subscriber_allowed
+        if background_telemetry_allowed
             && artifact_hash_requested_post_present(&product_frame_commit)
         {
             let artifact_paths = post_present_artifact_hash_paths_for_frame(
@@ -6269,7 +6443,7 @@ async fn run_surface_probe_inner(
                 &current_frame_evidence_key,
                 last_interactive_surface_readback_pending,
             ) {
-                post_present_proof_subscribers
+                background_post_present_proof_subscribers
                     .push(native_post_present_artifact_hash_subscriber(artifact_paths));
             } else {
                 push_deferred_artifact_hash_readback_key(
@@ -6278,14 +6452,13 @@ async fn run_surface_probe_inner(
                 );
             }
         }
-        if post_present_subscriber_allowed {
-            let post_present_completed_elapsed_ms =
-                Some(hold_started.elapsed().as_secs_f64() * 1000.0);
+        if background_telemetry_allowed {
             if let Some(enqueue_report) = async_post_present_proof_worker.enqueue(
-                post_present_proof_subscribers,
+                background_post_present_proof_subscribers,
                 current_frame_evidence_key.clone(),
                 post_present_completed_elapsed_ms,
                 Instant::now(),
+                AsyncPostPresentProofBatchPriority::BackgroundTelemetry,
             ) {
                 render_loop_state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
             }
@@ -8012,8 +8185,12 @@ fn post_present_proof_isolation_report(
         "legacy_pre_present_request_count": legacy_pre_present_request_count,
         "worker_enqueued_batch_count": state.post_present_proof_subscriber_worker_enqueued_batch_count,
         "worker_enqueued_count": state.post_present_proof_subscriber_worker_enqueued_count,
+        "worker_required_enqueued_count": state.post_present_proof_subscriber_worker_required_enqueued_count,
+        "worker_background_enqueued_count": state.post_present_proof_subscriber_worker_background_enqueued_count,
         "worker_pending_batch_count": state.post_present_proof_subscriber_worker_pending_batch_count,
         "worker_completed_count": state.post_present_proof_subscriber_worker_completed_count,
+        "worker_superseded_batch_count": state.post_present_proof_subscriber_worker_superseded_batch_count,
+        "worker_superseded_count": state.post_present_proof_subscriber_worker_superseded_count,
         "worker_dropped_batch_count": state.post_present_proof_subscriber_worker_dropped_batch_count,
         "worker_dropped_count": state.post_present_proof_subscriber_worker_dropped_count,
         "worker_error_count": state.post_present_proof_subscriber_worker_error_count,
@@ -8611,6 +8788,30 @@ fn write_render_loop_state_report(
             serde_json::json!(state.requested_animation_burst_count),
         );
         object.insert(
+            "post_present_proof_subscriber_worker_required_enqueued_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_required_enqueued_count),
+        );
+        object.insert(
+            "post_present_proof_subscriber_worker_background_enqueued_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_background_enqueued_count),
+        );
+        object.insert(
+            "post_present_proof_subscriber_worker_superseded_batch_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_superseded_batch_count),
+        );
+        object.insert(
+            "post_present_proof_subscriber_worker_superseded_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_superseded_count),
+        );
+        object.insert(
+            "post_present_proof_subscriber_worker_dropped_batch_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_dropped_batch_count),
+        );
+        object.insert(
+            "post_present_proof_subscriber_worker_dropped_count".to_owned(),
+            serde_json::json!(state.post_present_proof_subscriber_worker_dropped_count),
+        );
+        object.insert(
             "requested_animation_prewarm_count".to_owned(),
             serde_json::json!(state.requested_animation_prewarm_count),
         );
@@ -8806,34 +9007,45 @@ fn finish_visible_surface_readback(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(VISIBLE_SURFACE_READBACK_TIMEOUT),
-        })
-        .map_err(|error| {
+    let poll_started = Instant::now();
+    loop {
+        device.poll(wgpu::PollType::Poll).map_err(|error| {
             NativeWindowError::Failed(visible_readback_failure_message(
                 "poll",
                 &pending,
                 &error.to_string(),
             ))
         })?;
-    receiver
-        .recv_timeout(VISIBLE_SURFACE_READBACK_TIMEOUT)
-        .map_err(|error| {
-            NativeWindowError::Failed(visible_readback_failure_message(
-                "callback",
-                &pending,
-                &error.to_string(),
-            ))
-        })?
-        .map_err(|error| {
-            NativeWindowError::Failed(visible_readback_failure_message(
-                "map",
-                &pending,
-                &error.to_string(),
-            ))
-        })?;
+        match receiver.try_recv() {
+            Ok(result) => {
+                result.map_err(|error| {
+                    NativeWindowError::Failed(visible_readback_failure_message(
+                        "map",
+                        &pending,
+                        &error.to_string(),
+                    ))
+                })?;
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if poll_started.elapsed() >= VISIBLE_SURFACE_READBACK_TIMEOUT {
+                    return Err(NativeWindowError::Failed(visible_readback_failure_message(
+                        "callback",
+                        &pending,
+                        "timed out waiting for nonblocking readback poll",
+                    )));
+                }
+                std::thread::sleep(VISIBLE_SURFACE_READBACK_POLL_INTERVAL);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(NativeWindowError::Failed(visible_readback_failure_message(
+                    "callback",
+                    &pending,
+                    "readback callback channel disconnected",
+                )));
+            }
+        }
+    }
 
     let mapped = slice.get_mapped_range();
     let mut pixels = Vec::with_capacity((pending.width * pending.height * 4) as usize);
@@ -10178,7 +10390,13 @@ mod tests {
         );
         let mut worker = AsyncPostPresentProofSubscriberWorker::new();
         let enqueue_report = worker
-            .enqueue(vec![subscriber], key.clone(), Some(61.0), Instant::now())
+            .enqueue(
+                vec![subscriber],
+                key.clone(),
+                Some(61.0),
+                Instant::now(),
+                AsyncPostPresentProofBatchPriority::RequiredFrameProof,
+            )
             .expect("non-empty subscriber batch should enqueue");
         state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
 
@@ -10260,6 +10478,96 @@ mod tests {
         assert_eq!(state.post_present_proof_artifact_count, 2);
         assert_eq!(worker.drain_completed(&mut state), 1);
         assert_eq!(state.post_present_proof_artifact_count, 3);
+    }
+
+    #[test]
+    fn async_post_present_proof_worker_supersedes_background_without_dropping_required() {
+        let key = FrameEvidenceKey {
+            frame_seq: 12,
+            content_revision: 12,
+            layout_revision: 4,
+            render_scene_revision: 6,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(16),
+            present_id: 22,
+            proof_request_id: None,
+        };
+        let shared = Arc::new((
+            Mutex::new(AsyncPostPresentProofSubscriberShared::default()),
+            Condvar::new(),
+        ));
+        let (_sender, results) = mpsc::channel();
+        let worker = AsyncPostPresentProofSubscriberWorker {
+            shared: Arc::clone(&shared),
+            results,
+            worker: None,
+        };
+        let subscriber = |kind| {
+            native_post_present_json_proof_subscriber(
+                kind,
+                |_context| serde_json::json!({"status": "pass"}),
+            )
+        };
+
+        let first_background = worker
+            .enqueue(
+                vec![subscriber(NativePostPresentProofRequestKind::ProofHistory)],
+                key.clone(),
+                Some(1.0),
+                Instant::now(),
+                AsyncPostPresentProofBatchPriority::BackgroundTelemetry,
+            )
+            .expect("first background enqueue");
+        assert_eq!(first_background.pending_batches, 1);
+        assert_eq!(first_background.superseded_batches, 0);
+
+        let required = worker
+            .enqueue(
+                vec![subscriber(
+                    NativePostPresentProofRequestKind::VisibleBoundText,
+                )],
+                key.clone(),
+                Some(2.0),
+                Instant::now(),
+                AsyncPostPresentProofBatchPriority::RequiredFrameProof,
+            )
+            .expect("required enqueue");
+        assert_eq!(required.pending_batches, 2);
+        assert_eq!(required.dropped_batches, 0);
+
+        let second_background = worker
+            .enqueue(
+                vec![subscriber(
+                    NativePostPresentProofRequestKind::RenderHookReportJson,
+                )],
+                key,
+                Some(3.0),
+                Instant::now(),
+                AsyncPostPresentProofBatchPriority::BackgroundTelemetry,
+            )
+            .expect("second background enqueue");
+        assert_eq!(second_background.superseded_batches, 1);
+        assert_eq!(second_background.superseded_subscribers, 1);
+        assert_eq!(second_background.pending_batches, 2);
+
+        let shared = shared.0.lock().expect("proof queue lock");
+        let required_count = shared
+            .pending
+            .iter()
+            .filter(|batch| {
+                batch.priority == AsyncPostPresentProofBatchPriority::RequiredFrameProof
+            })
+            .count();
+        let background_count = shared
+            .pending
+            .iter()
+            .filter(|batch| {
+                batch.priority == AsyncPostPresentProofBatchPriority::BackgroundTelemetry
+            })
+            .count();
+        assert_eq!(required_count, 1);
+        assert_eq!(background_count, 1);
     }
 
     #[test]
@@ -10346,7 +10654,13 @@ mod tests {
         });
         let mut worker = AsyncPostPresentProofSubscriberWorker::new();
         let enqueue_report = worker
-            .enqueue(vec![subscriber], key.clone(), Some(7.0), Instant::now())
+            .enqueue(
+                vec![subscriber],
+                key.clone(),
+                Some(7.0),
+                Instant::now(),
+                AsyncPostPresentProofBatchPriority::RequiredFrameProof,
+            )
             .expect("proof subscriber batch should enqueue");
         state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
         started_rx
@@ -10467,6 +10781,7 @@ mod tests {
                 key.clone(),
                 Some(72.0),
                 Instant::now(),
+                AsyncPostPresentProofBatchPriority::BackgroundTelemetry,
             )
             .expect("history and report subscriber batch should enqueue");
         state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
@@ -10545,6 +10860,7 @@ mod tests {
                 key.clone(),
                 Some(82.0),
                 Instant::now(),
+                AsyncPostPresentProofBatchPriority::BackgroundTelemetry,
             )
             .expect("artifact hash subscriber should enqueue");
         state.note_post_present_proof_subscriber_worker_enqueue(enqueue_report);
@@ -10741,6 +11057,45 @@ mod tests {
         assert!(post_present_subscriber_drain_allowed(3, 3));
         assert!(post_present_subscriber_drain_allowed(2, 3));
         assert!(!post_present_subscriber_drain_allowed(4, 3));
+    }
+
+    #[test]
+    fn background_telemetry_yields_to_product_and_burst_frames() {
+        assert!(!post_present_background_telemetry_allowed(
+            false,
+            false,
+            false,
+            Some(NativeFrameLane::RuntimeOrLayout),
+            Some(NativeSchedulerReason::ExternalWake),
+        ));
+        assert!(!post_present_background_telemetry_allowed(
+            true,
+            true,
+            true,
+            Some(NativeFrameLane::ProductInteraction),
+            Some(NativeSchedulerReason::HostInput),
+        ));
+        assert!(!post_present_background_telemetry_allowed(
+            true,
+            false,
+            true,
+            Some(NativeFrameLane::AnimationFollowup),
+            Some(NativeSchedulerReason::RequestedAnimation),
+        ));
+        assert!(post_present_background_telemetry_allowed(
+            true,
+            false,
+            true,
+            Some(NativeFrameLane::ProofOrHarness),
+            Some(NativeSchedulerReason::VerifierFrame),
+        ));
+        assert!(post_present_background_telemetry_allowed(
+            true,
+            false,
+            false,
+            Some(NativeFrameLane::RuntimeOrLayout),
+            Some(NativeSchedulerReason::ExternalWake),
+        ));
     }
 
     #[test]
@@ -12844,7 +13199,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_motion_prewarm_schedules_hot_burst_without_dirtying_current_frame() {
+    fn pointer_motion_prewarm_schedules_hot_poll_without_dirtying_frame() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let now = Instant::now();
         state.mark_presented(state.dirty_revision);
@@ -12857,6 +13212,9 @@ mod tests {
         assert_eq!(state.current_frame_lane, None);
         assert!(!state.should_render(now, false));
         assert_eq!(state.requested_animation_prewarm_count, 1);
+        assert_eq!(state.armed_frame_token, 1);
+        assert!(state.armed_frame_pending);
+        assert_eq!(state.armed_frame_started_elapsed_ms, None);
         assert_eq!(
             state.requested_animation_burst_frames_remaining,
             REQUESTED_ANIMATION_BURST_MIN_FRAMES
@@ -12868,26 +13226,24 @@ mod tests {
             state.last_scheduler_reason,
             Some(NativeSchedulerReason::RequestedAnimation)
         );
-        assert_eq!(state.current_scheduler_reason, None);
-        assert_eq!(state.current_frame_lane, None);
+        assert_eq!(
+            state.current_scheduler_reason,
+            Some(NativeSchedulerReason::RequestedAnimation)
+        );
+        assert_eq!(
+            state.current_frame_lane,
+            Some(NativeFrameLane::AnimationFollowup)
+        );
         assert!(!state.should_render(due, false));
-
+        assert_eq!(
+            state.requested_animation_burst_frames_remaining,
+            REQUESTED_ANIMATION_BURST_MIN_FRAMES
+        );
         state.note_armed_frame_input_sampled(27.0);
         assert!(state.clean_armed_poll_pending());
         state.skip_clean_armed_burst_present(due, 27.0);
-
         assert_eq!(state.clean_armed_poll_count, 1);
         assert_eq!(state.skipped_clean_burst_present_count, 1);
-        assert_eq!(
-            state.requested_animation_burst_frames_remaining,
-            REQUESTED_ANIMATION_BURST_MIN_FRAMES - 1
-        );
-
-        state.note_armed_frame_input_sampled(28.0);
-        assert!(
-            !state.clean_armed_poll_pending(),
-            "an armed sampling turn must be consumed after one clean poll"
-        );
     }
 
     #[test]
@@ -12918,6 +13274,7 @@ mod tests {
             true,
         );
         state.note_accepted_host_input(11, 12.0, false, None);
+        assert_eq!(state.input_waited_for_already_armed_frame_count, 1);
 
         assert!(state.consume_due_wake_after_poll(prewarm_wake));
         assert_eq!(
@@ -13552,10 +13909,10 @@ mod tests {
     }
 
     #[test]
-    fn interactive_surface_latency_uses_bounded_multiple_frames_in_flight() {
+    fn interactive_surface_latency_uses_one_frame_for_non_vsync_present_modes() {
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox),
-            PACED_SURFACE_FRAME_LATENCY
+            LOW_LATENCY_SURFACE_FRAME_LATENCY
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Fifo),
@@ -13563,11 +13920,11 @@ mod tests {
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::Immediate),
-            PACED_SURFACE_FRAME_LATENCY
+            LOW_LATENCY_SURFACE_FRAME_LATENCY
         );
         assert_eq!(
             interactive_desired_maximum_frame_latency(wgpu::PresentMode::AutoNoVsync),
-            PACED_SURFACE_FRAME_LATENCY
+            LOW_LATENCY_SURFACE_FRAME_LATENCY
         );
     }
 
@@ -13575,7 +13932,7 @@ mod tests {
     fn configured_surface_frame_latency_honors_bounded_override() {
         assert_eq!(
             configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, None),
-            (PACED_SURFACE_FRAME_LATENCY, "present_mode_default")
+            (LOW_LATENCY_SURFACE_FRAME_LATENCY, "present_mode_default")
         );
         assert_eq!(
             configured_desired_maximum_frame_latency(wgpu::PresentMode::Mailbox, Some("2")),

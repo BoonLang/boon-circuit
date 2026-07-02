@@ -6859,6 +6859,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let defer_product_render_report = !preview_legacy_pre_present_render_proof_enabled()
                 || lightweight_product_render_report
                 || context.input.real_os_events_observed;
+            let emit_deferred_post_present_proof = defer_product_render_report
+                && context.frame_lane == boon_native_app_window::NativeFrameLane::ProofOrHarness;
             let render_output = native_gpu_app_owned_render_hook(
                 context,
                 render_world_scene.as_ref(),
@@ -6876,6 +6878,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &mut render_scene_cache,
                 skip_render_hook_app_owned_proof,
                 defer_product_render_report,
+                emit_deferred_post_present_proof,
             )
             .map_err(|error| error.to_string())?;
             let render_hook_outer_core_ms = elapsed_ms(core_started);
@@ -11378,6 +11381,7 @@ fn native_gpu_app_owned_render_hook(
     >,
     skip_app_owned_scene_proof: bool,
     defer_product_render_report: bool,
+    emit_deferred_post_present_proof: bool,
 ) -> Result<PreviewNativeGpuRenderHookOutput, Box<dyn std::error::Error>> {
     if let Some(world_scene) = world_scene {
         let proof = native_gpu_world_scene_visible_render_hook(
@@ -12230,13 +12234,12 @@ fn native_gpu_app_owned_render_hook(
     let mut render_frame_metrics =
         preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
     let visible_bound_text_proof_snapshot =
-        defer_product_render_report.then(|| PreviewVisibleBoundTextProofSnapshot {
-            layout_frame_hash: visible_state.layout_frame_hash.clone(),
-            layout_frame: visible_state
-                .layout_frame_override
-                .clone()
-                .unwrap_or_else(|| Arc::new(layout_frame.clone())),
-            mode: VisibleBoundTextReportMode::InteractionProof,
+        emit_deferred_post_present_proof.then(|| PreviewVisibleBoundTextProofSnapshot {
+            payload: preview_visible_bound_text_compact_report_from_retained_sync(
+                visible_state.layout_frame_hash.as_deref(),
+                Some(visible_state.layout_artifact.as_str()),
+                visible_state.retained_bound_sync_stats.as_ref(),
+            ),
         });
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
@@ -12248,11 +12251,12 @@ fn native_gpu_app_owned_render_hook(
         preview_post_present_proof_request_summaries_for_mode(
             skip_app_owned_scene_proof,
             defer_product_render_report,
+            emit_deferred_post_present_proof,
         ),
     );
     render_frame_metrics.render_hook_phase_timings = Some(render_hook_phase_timings_ms.clone());
     let post_present_proof_subscribers = preview_post_present_proof_subscribers_for_mode(
-        defer_product_render_report,
+        emit_deferred_post_present_proof,
         visible_bound_text_proof_snapshot,
         visible_state.retained_bound_sync_stats.clone(),
     );
@@ -12327,11 +12331,11 @@ fn preview_attach_product_proof_boundary(
 }
 
 fn preview_post_present_proof_subscribers_for_mode(
-    defer_product_render_report: bool,
+    emit_deferred_post_present_proof: bool,
     visible_bound_text_snapshot: Option<PreviewVisibleBoundTextProofSnapshot>,
     retained_bound_sync_stats: Option<PreviewRetainedBoundSyncStats>,
 ) -> Vec<boon_native_app_window::NativePostPresentProofSubscriber> {
-    if !defer_product_render_report {
+    if !emit_deferred_post_present_proof {
         return Vec::new();
     }
     vec![
@@ -12379,7 +12383,11 @@ fn proof_request_summary(
 fn preview_post_present_proof_request_summaries_for_mode(
     skip_app_owned_scene_proof: bool,
     defer_product_render_report: bool,
+    emit_deferred_post_present_proof: bool,
 ) -> Vec<boon_native_app_window::NativePostPresentProofRequestSummary> {
+    if defer_product_render_report && !emit_deferred_post_present_proof {
+        return Vec::new();
+    }
     let request = if defer_product_render_report {
         deferred_post_present_proof_request
     } else {
@@ -37209,6 +37217,8 @@ struct PreviewRetainedBoundSyncStats {
     source_intent_index_update_count: usize,
     style_update_count: usize,
     style_update_nodes: Vec<String>,
+    selected_style_nodes: Vec<String>,
+    selected_row_lookup_values: Vec<(String, String)>,
     text_update_count: usize,
     text_update_nodes: Vec<String>,
     text_update_binding_paths: Vec<(String, Vec<String>)>,
@@ -37293,6 +37303,28 @@ fn merge_preview_retained_bound_sync_stats(
             existing.style_update_nodes.push(node);
         }
     }
+    for node in next.selected_style_nodes {
+        if !existing
+            .selected_style_nodes
+            .iter()
+            .any(|seen| seen == &node)
+        {
+            existing.selected_style_nodes.push(node);
+        }
+    }
+    for (node, lookup_value) in next.selected_row_lookup_values {
+        if let Some((_, existing_value)) = existing
+            .selected_row_lookup_values
+            .iter_mut()
+            .find(|(existing_node, _)| existing_node == &node)
+        {
+            *existing_value = lookup_value;
+        } else {
+            existing
+                .selected_row_lookup_values
+                .push((node, lookup_value));
+        }
+    }
     existing.text_update_count = existing
         .text_update_count
         .saturating_add(next.text_update_count);
@@ -37358,6 +37390,14 @@ fn preview_retained_bound_sync_stats_json_for(
             "source_intent_index_update_count": stats.source_intent_index_update_count,
             "style_update_count": stats.style_update_count,
             "style_update_nodes": stats.style_update_nodes,
+            "selected_style_nodes": stats.selected_style_nodes,
+            "selected_row_lookup_values": stats.selected_row_lookup_values
+                .into_iter()
+                .map(|(node, lookup_value)| json!({
+                    "node": node,
+                    "lookup_value": lookup_value
+                }))
+                .collect::<Vec<_>>(),
             "text_update_count": stats.text_update_count,
             "text_update_nodes": stats.text_update_nodes,
             "text_update_binding_paths": stats.text_update_binding_paths
@@ -37414,9 +37454,7 @@ fn preview_retained_bound_sync_text_update_nodes_for(
 
 #[derive(Clone, Debug)]
 struct PreviewVisibleBoundTextProofSnapshot {
-    layout_frame_hash: Option<String>,
-    layout_frame: Arc<boon_document::LayoutFrame>,
-    mode: VisibleBoundTextReportMode,
+    payload: serde_json::Value,
 }
 
 fn preview_visible_bound_text_report(
@@ -37445,17 +37483,146 @@ fn preview_visible_bound_text_post_present_payload(
     snapshot: Option<&PreviewVisibleBoundTextProofSnapshot>,
 ) -> serde_json::Value {
     match snapshot {
-        Some(snapshot) => preview_visible_bound_text_report_for_layout_hash(
-            snapshot.layout_frame_hash.as_deref(),
-            snapshot.layout_frame.as_ref(),
-            snapshot.mode,
-        ),
+        Some(snapshot) => snapshot.payload.clone(),
         None => json!({
             "status": "skipped",
             "reason": "missing-visible-bound-text-snapshot",
             "entries": []
         }),
     }
+}
+
+fn preview_visible_bound_text_compact_report_from_retained_sync(
+    layout_frame_hash: Option<&str>,
+    layout_artifact: Option<&str>,
+    stats: Option<&PreviewRetainedBoundSyncStats>,
+) -> serde_json::Value {
+    const ENTRY_LIMIT: usize = 512;
+    const INTERACTION_ENTRY_LIMIT: usize = 64;
+    const TEXT_LIMIT_BYTES: usize = 512;
+    let Some(layout_hash) = layout_frame_hash else {
+        return json!({
+            "status": "skipped",
+            "reason": "missing-layout-frame-hash",
+            "entry_limit": INTERACTION_ENTRY_LIMIT,
+            "entries": []
+        });
+    };
+    let Some(stats) = stats else {
+        return json!({
+            "status": "skipped",
+            "reason": "missing-retained-bound-sync-stats",
+            "layout_frame_hash": layout_hash,
+            "entry_limit": INTERACTION_ENTRY_LIMIT,
+            "entries": []
+        });
+    };
+    if stats.status != "pass" {
+        return json!({
+            "status": "skipped",
+            "reason": "retained-bound-sync-not-pass",
+            "retained_bound_sync_status": stats.status,
+            "layout_frame_hash": layout_hash,
+            "entry_limit": INTERACTION_ENTRY_LIMIT,
+            "entries": []
+        });
+    }
+
+    let selected_nodes = stats
+        .selected_style_nodes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let selected_lookup_values = stats
+        .selected_row_lookup_values
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = Vec::new();
+    let mut included_nodes = BTreeSet::<String>::new();
+    for (node, text, paths) in &stats.text_update_values {
+        if entries.len() >= INTERACTION_ENTRY_LIMIT {
+            break;
+        }
+        let (text, text_truncated) = truncate_utf8_for_report(text, TEXT_LIMIT_BYTES);
+        let selected = selected_nodes.contains(node);
+        let source_intents = selected_lookup_values
+            .get(node)
+            .map(|lookup_value| {
+                vec![json!({
+                    "node": node,
+                    "intent": ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_field": LEGACY_ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_value": lookup_value
+                })]
+            })
+            .unwrap_or_default();
+        entries.push(json!({
+            "node": node,
+            "kind": "RetainedBoundText",
+            "text": text,
+            "text_truncated": text_truncated,
+            "paths": paths,
+            "bounds": serde_json::Value::Null,
+            "focused": false,
+            "selected": selected,
+            "source_intents": source_intents,
+            "source_intent_count": source_intents.len()
+        }));
+        included_nodes.insert(node.clone());
+    }
+    for node in &stats.selected_style_nodes {
+        if entries.len() >= INTERACTION_ENTRY_LIMIT {
+            break;
+        }
+        if !included_nodes.insert(node.clone()) {
+            continue;
+        }
+        let source_intents = selected_lookup_values
+            .get(node)
+            .map(|lookup_value| {
+                vec![json!({
+                    "node": node,
+                    "intent": ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_field": LEGACY_ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_value": lookup_value
+                })]
+            })
+            .unwrap_or_default();
+        entries.push(json!({
+            "node": node,
+            "kind": "RetainedSelectedNode",
+            "text": "",
+            "text_truncated": false,
+            "paths": Vec::<String>::new(),
+            "bounds": serde_json::Value::Null,
+            "focused": false,
+            "selected": true,
+            "source_intents": source_intents,
+            "source_intent_count": source_intents.len()
+        }));
+    }
+
+    let candidate_count = stats
+        .text_update_values
+        .len()
+        .saturating_add(stats.selected_style_nodes.len());
+    let selected_or_focused_entry_count = stats.selected_style_nodes.len();
+    json!({
+        "status": "pass",
+        "source": "retained-bound-sync-hot-path-snapshot",
+        "layout_frame_hash": layout_hash,
+        "layout_artifact": layout_artifact,
+        "entry_count": candidate_count,
+        "entry_limit": INTERACTION_ENTRY_LIMIT,
+        "truncated": candidate_count > INTERACTION_ENTRY_LIMIT,
+        "entries": entries,
+        "recent_history_compacted": true,
+        "interaction_proof_compacted": true,
+        "selected_or_focused_entry_count": selected_or_focused_entry_count,
+        "compact_entry_count": entries.len(),
+        "original_entry_limit": ENTRY_LIMIT
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39352,12 +39519,21 @@ fn retained_text_input_text_for_selection_proxy_nodes(
         return None;
     }
     let frame = shared.layout_frame_override.as_deref()?;
-    frame
-        .display_list
-        .iter()
-        .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
-        .find(|item| candidate_nodes.contains(&item.node.0))
-        .and_then(|item| item.text.clone())
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
+    preview_display_item_indexes_for_nodes_from_snapshot(
+        snapshot.as_deref(),
+        frame,
+        &candidate_nodes,
+    )
+    .into_iter()
+    .filter_map(|index| frame.display_list.get(index))
+    .filter(|item| candidate_nodes.contains(&item.node.0))
+    .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
+    .find_map(|item| item.text.clone())
 }
 
 fn selection_proxy_text_input_candidate_nodes(
@@ -39372,6 +39548,12 @@ fn selection_proxy_text_input_candidate_nodes(
     let Some(frame) = shared.layout_frame_override.as_deref() else {
         return nodes;
     };
+    let indexed_nodes =
+        selection_proxy_text_input_candidate_nodes_from_source_indexes(shared, frame, input_state);
+    if !indexed_nodes.is_empty() {
+        nodes.extend(indexed_nodes);
+        return nodes;
+    }
     for item in frame
         .display_list
         .iter()
@@ -39383,6 +39565,65 @@ fn selection_proxy_text_input_candidate_nodes(
         }
     }
     nodes
+}
+
+fn selection_proxy_text_input_candidate_nodes_from_source_indexes(
+    shared: &PreviewSharedRenderState,
+    frame: &boon_document::LayoutFrame,
+    input_state: &PreviewNativeInputState,
+) -> BTreeSet<String> {
+    let Some(value_index) = shared.layout_proof.get("source_intent_value_index") else {
+        return BTreeSet::new();
+    };
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
+    let mut nodes = BTreeSet::<String>::new();
+    for (intent, source) in [
+        ("change", input_state.focused_change_source.as_ref()),
+        ("submit", input_state.focused_submit_source.as_ref()),
+        ("key_down", input_state.focused_key_down_source.as_ref()),
+    ] {
+        let Some(source) = source else {
+            continue;
+        };
+        let Some(indexed_nodes) = value_index
+            .get(intent)
+            .and_then(|intent_index| intent_index.get(source))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        nodes.extend(
+            indexed_nodes
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|node| preview_display_node_is_text_input(snapshot.as_deref(), frame, node))
+                .map(str::to_owned),
+        );
+    }
+    nodes
+}
+
+fn preview_display_node_is_text_input(
+    snapshot: Option<&DocumentRenderSnapshot>,
+    frame: &boon_document::LayoutFrame,
+    node: &str,
+) -> bool {
+    if let Some(indexes) = snapshot.and_then(|snapshot| snapshot.display_items_by_node.get(node))
+        && !indexes.is_empty()
+    {
+        return indexes.iter().any(|index| {
+            frame.display_list.get(*index).is_some_and(|item| {
+                matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+            })
+        });
+    }
+    frame.display_list.iter().any(|item| {
+        item.node.0 == node && matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+    })
 }
 
 fn extend_bound_sync_nodes_for_selection_proxy_text_inputs(
@@ -44160,6 +44401,7 @@ fn preview_patch_retained_selected_nodes_overlay(
         return Ok(false);
     };
     let mut style_patch_nodes = Vec::new();
+    let mut selected_style_nodes = Vec::new();
     let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
         snapshot.as_deref(),
         frame,
@@ -44173,6 +44415,9 @@ fn preview_patch_retained_selected_nodes_overlay(
             continue;
         }
         let selected = selected_nodes.contains(&item.node.0);
+        if selected {
+            selected_style_nodes.push(item.node.0.clone());
+        }
         if set_display_style_value(
             &mut item.style,
             "selected",
@@ -44200,6 +44445,8 @@ fn preview_patch_retained_selected_nodes_overlay(
         source_intent_index_update_count: 0,
         style_update_count: style_patch_nodes.len(),
         style_update_nodes: style_patch_nodes,
+        selected_style_nodes,
+        selected_row_lookup_values: Vec::new(),
         text_update_count: 0,
         text_update_nodes: Vec::new(),
         text_update_binding_paths: Vec::new(),
@@ -44286,6 +44533,8 @@ fn preview_patch_retained_selected_row_lookup_overlay(
     };
     let mut changed_nodes = Vec::new();
     let mut style_patch_nodes = Vec::new();
+    let mut selected_style_nodes = Vec::new();
+    let mut selected_row_lookup_values = Vec::new();
     let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
         snapshot.as_deref(),
         frame,
@@ -44342,6 +44591,15 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         } else {
             item_address.as_deref() == Some(selected_row_lookup_value)
         };
+        if selected {
+            selected_style_nodes.push(item.node.0.clone());
+            let lookup_value = overlay_lookup
+                .row_lookup_value_for_node(&item.node.0)
+                .map(str::to_owned)
+                .or_else(|| item_address.clone())
+                .unwrap_or_else(|| selected_row_lookup_value.to_owned());
+            selected_row_lookup_values.push((item.node.0.clone(), lookup_value));
+        }
         if set_display_style_value(
             &mut item.style,
             "selected",
@@ -44375,6 +44633,8 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         source_intent_index_update_count: 0,
         style_update_count: style_patch_nodes.len(),
         style_update_nodes: style_patch_nodes,
+        selected_style_nodes,
+        selected_row_lookup_values,
         text_update_count: 0,
         text_update_nodes: Vec::new(),
         text_update_binding_paths: Vec::new(),
@@ -44592,6 +44852,8 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         }
     }
     let mut style_updates = Vec::<(usize, String, boon_document_model::StyleValue, String)>::new();
+    let mut selected_style_nodes = Vec::<String>::new();
+    let mut selected_row_lookup_values = Vec::<(String, String)>::new();
     let mut text_updates = Vec::<(usize, String, String, Vec<String>)>::new();
     let mut text_update_indexes = BTreeSet::<usize>::new();
     let scoped_to_target_nodes = target_nodes.is_some();
@@ -44672,6 +44934,30 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
                 }
                 let style_value = document_style_value_from_state_value(&patch_value);
                 if item.style.get(&patch_target.attr) != Some(&style_value) {
+                    let selected_true = match &style_value {
+                        boon_document_model::StyleValue::Bool(value) => *value,
+                        boon_document_model::StyleValue::Text(value) => {
+                            value.eq_ignore_ascii_case("true")
+                        }
+                        _ => false,
+                    };
+                    if patch_target.attr == "selected" && selected_true {
+                        selected_style_nodes.push(node.to_owned());
+                        if let Some(lookup_value) =
+                            focused_row_lookup_value(&shared.layout_proof, node).or_else(|| {
+                                focused_raw_row_lookup_value_from_snapshot(&snapshot, node).map(
+                                    |value| {
+                                        resolve_source_intent_payload_value(
+                                            &shared.layout_proof,
+                                            value,
+                                        )
+                                    },
+                                )
+                            })
+                        {
+                            selected_row_lookup_values.push((node.to_owned(), lookup_value));
+                        }
+                    }
                     style_updates.push((index, patch_target.attr, style_value, node.to_owned()));
                 }
             }
@@ -44724,6 +45010,8 @@ fn preview_sync_bound_text_inputs_in_shared_state_for_nodes(
         .iter()
         .map(|(_, _, _, node)| node.clone())
         .collect();
+    stats.selected_style_nodes = selected_style_nodes;
+    stats.selected_row_lookup_values = selected_row_lookup_values;
     stats.text_update_count = text_updates.len();
     stats.text_update_nodes = text_updates
         .iter()
@@ -44982,6 +45270,11 @@ fn preview_patch_selection_proxy_text_inputs(
         });
         return Ok(false);
     }
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
             status: "skipped",
@@ -44993,12 +45286,20 @@ fn preview_patch_selection_proxy_text_inputs(
     };
     let mut changed = false;
     let mut text_update_nodes = Vec::new();
-    for item in frame
-        .display_list
-        .iter_mut()
-        .filter(|item| target_nodes.contains(&item.node.0))
-        .filter(|item| matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput))
-    {
+    let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
+        snapshot.as_deref(),
+        frame,
+        &target_nodes,
+    );
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
+        if !target_nodes.contains(&item.node.0)
+            || !matches!(item.kind, boon_document_model::DocumentNodeKind::TextInput)
+        {
+            continue;
+        }
         if item.text.as_deref() != Some(text) {
             item.text = Some(text.to_owned());
             changed = true;
@@ -65099,7 +65400,15 @@ mod tests {
 
     #[test]
     fn deferred_product_proof_requests_are_not_legacy() {
-        let counters_requests = preview_post_present_proof_request_summaries_for_mode(true, true);
+        let product_requests =
+            preview_post_present_proof_request_summaries_for_mode(true, true, false);
+        assert!(
+            product_requests.is_empty(),
+            "deferred product frames should not enqueue proof requests on the UX path"
+        );
+
+        let counters_requests =
+            preview_post_present_proof_request_summaries_for_mode(true, true, true);
         assert!(!counters_requests.is_empty());
         assert!(
             counters_requests
@@ -65113,7 +65422,8 @@ mod tests {
             "deferred product mode skips render-hook app-owned readback"
         );
 
-        let readback_requests = preview_post_present_proof_request_summaries_for_mode(false, true);
+        let readback_requests =
+            preview_post_present_proof_request_summaries_for_mode(false, true, true);
         assert!(!readback_requests.is_empty());
         assert!(
             readback_requests
@@ -65128,7 +65438,7 @@ mod tests {
         );
 
         let full_proof_requests =
-            preview_post_present_proof_request_summaries_for_mode(false, false);
+            preview_post_present_proof_request_summaries_for_mode(false, false, false);
         assert!(
             full_proof_requests
                 .iter()
@@ -65149,9 +65459,11 @@ mod tests {
         let mut layout_frame = test_text_input_layout_frame("test-node", "=A1+B2");
         layout_frame.display_list[0].focused = true;
         let visible_bound_text_snapshot = PreviewVisibleBoundTextProofSnapshot {
-            layout_frame_hash: Some(layout_hash.to_owned()),
-            layout_frame: Arc::new(layout_frame),
-            mode: VisibleBoundTextReportMode::InteractionProof,
+            payload: preview_visible_bound_text_report_for_layout_hash(
+                Some(layout_hash),
+                &layout_frame,
+                VisibleBoundTextReportMode::InteractionProof,
+            ),
         };
         let retained_stats = PreviewRetainedBoundSyncStats {
             status: "pass",
@@ -65241,6 +65553,54 @@ mod tests {
                 .pointer("/text_update_count")
                 .and_then(|value| value.as_u64()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn compact_visible_bound_text_snapshot_uses_retained_sync_without_layout_scan() {
+        let retained_stats = PreviewRetainedBoundSyncStats {
+            status: "pass",
+            changed: true,
+            selected_style_nodes: vec!["cell-b0".to_owned()],
+            selected_row_lookup_values: vec![("cell-b0".to_owned(), "B0".to_owned())],
+            text_update_values: vec![
+                (
+                    "formula-input".to_owned(),
+                    "=add(A0,A1)".to_owned(),
+                    vec!["store.selected_input.editing_text".to_owned()],
+                ),
+                (
+                    "formula-address".to_owned(),
+                    "B0".to_owned(),
+                    vec!["store.selected_address".to_owned()],
+                ),
+            ],
+            text_update_count: 2,
+            ..Default::default()
+        };
+        let payload = preview_visible_bound_text_compact_report_from_retained_sync(
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            Some("target/artifacts/native-gpu/document-layout/test.json"),
+            Some(&retained_stats),
+        );
+
+        assert_eq!(
+            payload.get("source").and_then(Value::as_str),
+            Some("retained-bound-sync-hot-path-snapshot")
+        );
+        assert_eq!(
+            payload
+                .get("entries")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries
+                    .iter()
+                    .find(|entry| { entry.get("node").and_then(Value::as_str) == Some("cell-b0") }))
+                .and_then(|entry| entry.get("source_intents"))
+                .and_then(Value::as_array)
+                .and_then(|intents| intents.first())
+                .and_then(|intent| intent.get("lookup_value"))
+                .and_then(Value::as_str),
+            Some("B0")
         );
     }
 

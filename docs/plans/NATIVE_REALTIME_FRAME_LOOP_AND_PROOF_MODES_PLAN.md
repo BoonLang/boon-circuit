@@ -10582,162 +10582,33 @@ Performance is the main goal. Implement the native preview architecture so norma
 
 Prefer strategy over tactics when the same gate keeps failing. Do not spend the run making a slow path merely more measurable or slightly less wrong. Cut the product interaction path down to a hot native loop: accept input at the start of an already scheduled frame, patch retained runtime/layout/render state directly, submit quickly, move proof/readback/reporting off the UX frame, and keep product latency separate from verifier proof latency while linking both with FrameEvidenceKey.
 
-Start from the latest evidence in this plan. Report/proof-history payload size was already cut substantially, compact interaction proof reduced visible-bound-text proof to selected/focused evidence, targeted no-op currentness now fixes stale selection-bound text inputs, the broad no-op runtime-summary fallback was replaced by direct runtime-values sync, supplied render-scene identities now skip the internal scene-key walk, same-frame timing now prevents later burst frames from rewriting accepted-input timings, recent interactive readback artifacts are keyed by exact FrameEvidenceKey, native playground selection routing now uses generic row-lookup metadata instead of production selected-address probes, simple source clicks now defer duplicate visible-state sync to retained caller-side patches, generated focus/caret overlay state no longer invalidates the generic hit-route cache, DemandDriven missed-frame accounting no longer counts healthy idle gaps before host input, and active route-cache identity ignores volatile update counters/text payloads. The latest fresh release Cells visible-click report `target/reports/native-gpu/cells-visible-click-e2e-release.json` is schema-valid but still fails: `preview_loop_missed_frame_count=0`, but `preview_loop_input_to_present_ms.p95=18.703218 ms`, `steady_input_accept_to_formula_visible_ms.p95=17.072380 ms`, and `preview_loop_frame_pacing_state=requested_animation_burst` do not satisfy the realtime product-loop contract. Runtime and retained contracts pass with zero scans/root materialization/full relower, route lookup outliers are reduced to about 1.8-2.0 ms, and the dominant remaining p95 costs are queue/present/frame-prep variance: `queue_submit_call_ms.p95=9.929829 ms`, `present_call_ms.p95=10.152587 ms`, `present_path_ms.p95=10.791067 ms`, and `render_hook_ms.p95=2.956772 ms`. Treat the remaining blocker as present-floor/product-loop/proof-report architecture, not Cells formula logic, JSON size alone, bound-text scans, route-table lookup alone, or renderer scene-key lookup. Immediate present mode, automatic offscreen copy-to-present, naive non-dirty pointer burst priming, and per-leaf path-driven retained sync were tried and failed or were reverted; do not repeat those as defaults.
+Start from the current 2026-07-02 checkpoint, not from older stale report text. The current WIP has already moved background proof telemetry out of product/burst frames, kept product commits and async report refresh available, split proof/harness work from product work, fixed armed-prewarm accounting, and kept `List/find` / runtime / formula work clean in Cells interaction reports. Focused Rust checks pass for the changed app-window/playground/xtask slice, but the release Cells visible-click gate is still not complete.
 
-The newest local post-projected-sync checkpoint is the current `target/reports/native-gpu/cells-visible-click-e2e-release.json` with `target/artifacts/native-gpu/cells-visible-click-e2e-2853227-1782973489/preview-loop.json`. Projected retained text/style sync and geometry-base render-scene lookup fix the old C0 miss: C0 is about `12.029 ms` input-to-present with a `2.63 ms` render hook and a `9.03 ms` present call. The gate still fails because A0 is about `33.881 ms`: the product commit still says `scheduler_reason="requested_animation"` for an accepted host-input event, the render-hook outer path spends about `7.017 ms` in state snapshot and `17.399 ms` in core work, and the inner render proof says `render_scene_cache_hit=false` with about `15.454 ms` `render_scene_cache_ms` even though only three nodes are touched. Treat the next cut as accepted-host-input ownership plus explicit `ActivePreviewScene` product patching and route/overlay cache reuse across retained-only hashes. Do not return to runtime/List/formula, upload-cache, route-cache micro-tuning, or JSON size unless a fresh matching product-frame report names them as the dominant boundary again.
+Current evidence to respect:
+- Best fresh release run after the background-proof split: all 64 Cells clicks passed visually and functionally, `/product_only_ux_contract.status=pass`, `/proof_only_contract.status=pass`, accepted product p95 was `16.062596 ms`, proof lag p95 was `6` frames and max `8`; the remaining failure was raw wake-to-formula p95 `20.567028 ms`.
+- Latest release run after enabling real armed-prewarm counters: status `fail`, accepted product p95 `18.442151 ms`, max `19.244245 ms`, product missed frames `9`, product-commit wake-to-formula p95 `22.724245 ms`, wake-to-accept p95 `5.562695 ms`, and `input_waited_for_already_armed_frame_count=65`. Proof-only still passes and background worker load is much lower than the earlier overloaded proof/readback reports.
+- The remaining p95 misses are dominated by product-frame scheduling, queue submit, present, and render-result ownership. Cells runtime/list/formula is not the current blocker: reported interaction samples have one dirty key, zero list scans, no full-grid recompute, no root materialization, and no full relower.
+- The same-surface present-floor diagnostic currently selected llvmpipe software Vulkan. Do not use that as hardware/product evidence. Add adapter identity to all relevant product/perf reports and fail fast when a performance gate runs on a software adapter unless the verifier explicitly opts into diagnostic mode.
 
-Also start from the present-floor slice in this plan. `verify-native-gpu-present-floor` now measures an empty app-window product surface with counters-only mode, no render hook, no readback, no host input, and no initial input sampling. The refreshed isolated-headless run measured 32 frames with `presented_frame_ms.p95=0.998328 ms`, no observed input, and no proof/readback hot-path work, but it fails honestly because Weston selected llvmpipe software rendering. The current-Wayland hardware path is guarded behind `--allow-current-wayland-focus-risk` or `BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK=1` and otherwise writes a failing focus-risk report without opening a visible window. Do not use software/headless present-floor numbers as product proof; make a focus-safe hardware/product-surface baseline and align `docs/architecture/NATIVE_GPU_PIPELINE.md` once the report contract is stable.
+Treat the next phase as architecture cutting, not micro-optimization. Pick the largest simple boundary that removes product-frame work, then verify once with focused tests and one fresh release report. The preferred cut is a real `PreviewHotLoop` / `NativeFrameClock` product owner with `ActivePreviewScene`:
+- sample visible-changing input at the start of an already scheduled demand-driven burst frame;
+- patch retained selection/focus/formula-bar visual state directly in the active retained scene;
+- submit the product frame quickly with a small typed `PresentedProductFrame` / `RenderFrameResult`;
+- run source/runtime cleanup, proof/readback/report serialization, artifact hashing, accessibility snapshots, HUD formatting, and dev IPC after product present under exact `FrameEvidenceKey`;
+- keep proof latency, proof lag, and report generation separate from UX latency, while proving they correspond to the measured presented frame.
 
-The latest product-poll subscriber split already moved accessibility tree snapshot publication out of accepted host-input product polls. A one-sample release Cells visible-click smoke confirmed `accessibility_snapshot_status=\"deferred_product_input\"` on product input, deferred snapshot max about `0.000179 ms`, and deferred publication on follow-up polls, but the gate still failed with product `input_accept_to_formula_visible_ms_p95=17.432444 ms` and preview-loop `input_to_present_p95=30.784 ms`. Do not spend more time on accessibility as the main blocker; the next cut should target the still-heavy `source_input_ms` / `world_or_source_input_ms` poll boundary, typed route snapshots, product render result boundary, or queue/present/frame-pacing architecture.
+Implementation priorities:
+1. Build one product-frame owner: `PreviewHotLoop` / `NativeFrameClock`. DemandDriven remains the product mode; requested animation is only a bounded burst pacing substate with quiet-frame and hard-cap exits; ContinuousProbe is diagnostic/verifier only.
+2. Introduce `ActivePreviewScene`, `PendingPreviewScene`, and `RecyclePreviewScene`. The active scene must be directly presentable and own retained layout/render chunks, text runs, selection/focus/caret overlays, hit-test indexes, and GPU resource references.
+3. Replace product render-hook proof/report construction with a small typed product result. Product frames must not build proof JSON, visible-bound-text proof, retained-bound-sync proof, report JSON, proof history, artifact hashes, broad state summaries, or latest-report fallbacks.
+4. Move WGPU ownership toward a render actor: keep pipelines, bind groups, buffers, glyph atlas, prepared quads, and command resources hot; acquire late; encode from immutable active-scene snapshots; submit quickly; report acquire, encode, queue submit, present, post-present dispatch, and driver/compositor floor separately.
+5. Make retained patching property/component based with stable semantic identity from compiler/document through layout/render. Product clicks should touch only changed nodes and overlays. Add negative gates for full-state fallback, geometry/string/path matching, proof JSON dependency, dev IPC dependency, and product-frame report parsing.
+6. Make proof/readback a bounded service keyed by `FrameEvidenceKey`, with required-frame proof, background telemetry, stale-key rejection, coalescing, lag/drop counters, and proof-isolation stress gates.
+7. Add same-surface hardware present-floor evidence before changing present mode, frame-latency, or frames-in-flight policy. Keep `BOON_NATIVE_DESIRED_MAXIMUM_FRAME_LATENCY` and alternate present modes diagnostic until hardware evidence proves a product benefit.
 
-The latest cached-input route slice removed the missing-click-edge fallback and made some click samples fast (`0.227836 ms` and `0.646697 ms` cached source input with zero route-table lookup), but `target/reports/native-gpu/cells-visible-click-e2e-cached-blur.json` is still schema-valid fail: `input_accept_to_formula_visible_ms_p95=17.051826 ms`, `preview_loop_input_to_present_ms_p95=17.051826 ms`, `preview_loop_missed_frame_count=0`, `generic_fallback_count=0`. The remaining failing frames combine about `5.600883 ms` input-accept-to-dirty work, about `2.656745 ms` retained render hook, and about `8.614051 ms` present call. A cached focusable-node candidate experiment was tried and removed because it worsened the gate to `18.779420 ms` product p95 and `19.586570 ms` preview-loop p95. Do not continue with local route-cache branch experiments as the main strategy; switch to a larger frame scheduling, present/queue, product/proof split, typed input/source-intent, or active/pending retained-state architecture cut.
+Do not repeat failed tactics as defaults: offscreen copy-to-present, desired frame latency `2`, naive non-dirty pointer burst priming without exact keyed proof selection, per-leaf path-driven retained sync, route-cache branch experiments, upload-cache tuning, JSON size trimming, or formula/list/runtime tuning. Revisit those only if a fresh product-frame report names them as the dominant current boundary.
 
-The newest 2026-07-02 first-frame source transaction checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-first-frame-defer-drain.json`. It is schema-valid but still fails. The useful result is that the first two click samples used `simple_source_click_deferred_runtime`, ran with `live_events_ms=0.0`, and proved formula-bar text changed in the product frame: `15.087591 ms` for `15` and `12.466218 ms` for `=add(A0,A1)`. The bad result is that later click samples lost app-owned formula-bar proof/runtime timing (`formula_bar_text=\"missing\"`), steady metrics became null, and the report still shows `preview_loop_missed_frame_count=1`, `preview_loop_input_to_present_ms_p95=15.744827 ms`, proof-currentness failures, and present/queue variance (`present_call_ms.p95=28.195144 ms`, `present_path_ms.p95=28.534091 ms`). Treat this as evidence that direct retained first-frame patching is the right product path, but the verifier/product coupling, frame-proof identity, later-click harness completion, queued-runtime cleanup attribution, and present-floor/frame-pacing architecture still need to be cut. Do not go back to route/binding/JSON micro-tuning unless a fresh report names those as the dominant boundary again.
-
-The latest 2026-07-02 frame/content revision split removed the stale render-loop crash by keeping frame/present revisions separate from actual content revisions. A fresh release report `target/reports/native-gpu/cells-visible-click-e2e-frame-content-split.json` is schema-valid and all four clicks reach the correct selected address/formula text, but it still fails: A2 shows the intended fast first-frame path (`simple_source_click_deferred_runtime`, `live_events_ms=0.0`, product `12.924756 ms`), while later clicks fall back into proof/runtime cleanup accounting and produce enormous measured proof-coupled latencies (`input_accept_to_formula_visible_ms` around `5002.216369 ms` for B0 and `4957.367341 ms` for C0), `preview_loop_missed_frame_count=2`, `preview_loop_input_to_present_ms_p95=225.112497 ms`, and `render_hook_ms.p95=33.462318 ms`. A verifier classification patch now treats `simple_source_click_deferred_runtime` as a simple source-click fast path, but the architecture blocker remains: product interaction frames, runtime cleanup frames, requested-animation followups, and proof/readback frames are not yet separated by interaction-scoped `FrameEvidenceKey` in the report/gates. The next cut should build that interaction-scoped ledger and typed active/pending preview scene split, then delete/quarantine proof-JSON/latest-report/full-state fallback paths.
-
-The freshest 2026-07-02 direct node-set retained selection report is `target/reports/native-gpu/cells-visible-click-e2e-direct-node-selection.json`. It is schema-valid and still fails, but it changes the diagnosis: all four clicks pass app-owned visual proof and formula-bar text, use `simple_source_click_deferred_runtime`, avoid generic fallback, use generic selected-node-set retained patches with zero legacy selection fallback, and have product `input_accept_to_formula_visible_ms_p95=13.538215 ms`. The remaining blockers are not selection overlay speed: aggregate `preview_loop_input_to_present_ms_p95=230.348859 ms`, `preview_loop_missed_frame_count=1`, missing/null retained committed-update render-patch counters, and missing runtime/list no-scan/root-materialization counters. Treat the next cut as interaction-scoped product-frame ledger plus required counters and proof/report queue separation. Do not optimize selected overlay, route-cache, or target/address metadata again unless a fresh report names them.
-
-The latest subagent architecture review confirmed that the current report mismatch is unscoped accounting, not Cells logic. `NativePreviewPerfAccumulator` still stores all accepted host-input presents in one `input_to_present_ms` ring and one global missed-frame counter, while the visible-click verifier mixes product clicks, calibration/preposition, focus/caret, runtime cleanup, proof/readback, and harness/report frames. The handoff label also still had old aggregate checks even after an interaction-scoped product contract was added. The next architecture slice must make product-frame evidence app-produced and keyed: lane-split preview stats, a `FrameEvidenceKey`/input-event product ledger, explicit `runtime_invoked=false` records for deferred-runtime first frames, and xtask matching by key instead of latest/last diagnostics. Aggregate preview stats may stay diagnostic, but product UX gates must use only matching product interaction frames and must fail on missing keyed evidence rather than inferring success from retained proof.
-
-The newest interaction-ledger bridge report `target/reports/native-gpu/cells-visible-click-e2e-interaction-ledger.json` is schema-valid and passes the focused release visible-click verifier with `--repeat-count 1`: product `input_accept_to_formula_visible_ms_p95=16.071860 ms`, interaction-scoped product input-to-present p95 `16.071860 ms`, sample count `4`, product missed-frame count `0`, exact visual proof for all four clicks, zero runtime list/root/recompute work, and four retained render-scene patches. The aggregate preview bucket still reports diagnostic failure (`preview_loop_input_to_present_ms_p95=230.123505 ms`, `preview_loop_missed_frame_count=2`) because app-window stats are not lane-scoped yet. Treat this as a checkpoint, not completion: implement app-produced lane-scoped product frame rows and run the default repeated release path before claiming aggregate native GPU readiness.
-
-The latest 2026-07-02 repeated release checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-upload-ring-grown-default.json`. It is schema-valid and still fails, but it narrows the current blocker. App-produced product-lane timing is now the acceptance source (`source=\"app_window_product_interaction_frames\"`), exact visual proof passes for all 64 clicks, `simple_source_click_count=64`, `generic_fallback_count=0`, `retained_render_scene_patches=64`, and the runtime/list contract passes with `zero_scan_sample_count=64`, `zero_root_materialization_sample_count=64`, `zero_recompute_sample_count=64`, `total_rows_scanned=0`, `total_list_find_rows_scanned=0`, and `total_recomputed_fields=0`. The gate still fails because product `input_to_present_ms_p95=22.928110999997443 ms`, click-sample product p95 is `21.877683999999135 ms`, max is `44.5069739999999 ms`, and `product_missed_frame_count=30`. The upload-ring cache-preservation change removed the earlier upload churn in slow samples (`quad_cache_eviction_count=0`, `upload_bytes=0`, `queue_write_count=0` on averaged slow samples), so do not restart with formula/list/runtime or upload-cache micro-fixes. The remaining dominant costs are product-loop present/queue variance and pre-present render work: slow frames average about `9.282 ms` in `present_call_ms`, about `3.135 ms` in `queue_submit_call_ms`, and about `4.945 ms` in render-start-to-hook-complete, with one `present_call_ms` outlier around `37.482 ms`. The next cut should be the larger `PreviewHotLoop + ActivePreviewScene + post-present proof subscribers` architecture, including late acquire / frames-in-flight / hardware present-floor measurement and a smaller pre-present render result.
-
-The newest renderer-cache slice improved the best direct-present report but still does not pass. `target/reports/native-gpu/cells-visible-click-e2e-stable-patch-identity-default.json` is schema-valid and uses stable actual `RenderScenePatch` identity for direct retained overlay patches. It improves product p95 to `19.705062999999427 ms`, click-sample product p95 to `19.507323999998334 ms`, and max to `27.510569999998552 ms`; `document_scene_convert_ms.p95` drops to about `1.516 ms`, `encode_scene_ms.p95` to about `2.579 ms`, and the report shows `22` exact click scene-cache hits. It still fails because submit/present dominates (`present_call_ms.p95` about `12.440 ms`, `queue_submit_call_ms.p95` about `11.426 ms`, hook-to-present p95 about `13.509 ms`). A keyed prepared-quad cache was added and tested with `renderer_reuses_prepared_quad_cache_across_alternating_scene_identities`, but the repeated release report `target/reports/native-gpu/cells-visible-click-e2e-prepared-quad-cache-default.json` still fails and is not the acceptance checkpoint (`input_to_present_ms_p95=24.89105599999857 ms`) because present/submit outliers dominate. An explicit `BOON_NATIVE_OFFSCREEN_COPY_TO_PRESENT=1` diagnostic report `target/reports/native-gpu/cells-visible-click-e2e-offscreen-copy-diagnostic-default.json` is schema-valid but much worse: product-loop p95 `31.242193999991287 ms`, click-sample p95 about `316.0232080000278 ms`, only `32/64` exact visual proof samples, and selection/formula proof failures. Do not switch offscreen-copy to the default product path. The next implementation should target frame scheduling/present ownership, not more renderer-cache tuning.
-
-The latest pre-input proof/report subscriber guard slice added a generic app-window counter and skip path so interactive readback/report subscriber draining cannot run before an already-pending unsampled host-input wake. Focused checks passed (`cargo fmt --check`, `cargo test -q -p boon_native_app_window pre_input_subscriber_drain_skip_is_counted -- --test-threads=1`, and `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`). The fresh release report `target/reports/native-gpu/cells-visible-click-e2e-pre-input-subscriber-guard-default.json` is schema-valid but still fails: product-scoped p95 is close but over budget (`interaction_scoped_product_input_to_present_ms_p95=17.541203000000678 ms`, `interaction_scoped_product_missed_frame_count=8`, click-sample `input_accept_to_formula_visible_ms_p95=17.098119000002043 ms`, max `17.87061900000117 ms`). Runtime/list and retained contracts remain clean (`simple_source_click_count=64`, `generic_fallback_count=0`, `retained_render_scene_patches=64`, zero rows/list scans, zero root materialization, zero recomputed fields). The new guard did not fire in this scenario (`pre_input_subscriber_drain_skip_count=0` in `target/artifacts/native-gpu/cells-visible-click-e2e-4154370-1782953732/preview-loop.json`), so keep it as product-path hygiene, not as the p95 solution. The measured blocker remains frame/present ownership: product frames still lose time to alternating queue-submit and present blocking around `8-12 ms`, with some render-hook work around `2-5 ms` on slow click samples. The next slice should cut scheduler/present ownership, hardware present-floor/late-acquire/frame-in-flight policy, or a smaller typed product render result boundary.
-
-The latest frame-latency override slice added `BOON_NATIVE_DESIRED_MAXIMUM_FRAME_LATENCY` as a bounded, reported diagnostic knob with unchanged defaults. Focused checks passed (`cargo fmt --check`, `cargo test -q -p boon_native_app_window configured_surface_frame_latency_honors_bounded_override -- --test-threads=1`, `cargo test -q -p boon_native_app_window pre_input_subscriber_drain_skip_is_counted -- --test-threads=1`, and `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`). The diagnostic run `target/reports/native-gpu/cells-visible-click-e2e-frame-latency-2-diagnostic-default.json` used `BOON_NATIVE_DESIRED_MAXIMUM_FRAME_LATENCY=2`; its preview-loop report proves `desired_maximum_frame_latency=2`, `desired_maximum_frame_latency_source=\"env_override\"`, and `present_mode=\"Mailbox\"`. It is schema-valid but worse: product p95 `23.865326999999525 ms`, product missed frames `16`, click-sample p95 `27.416173999999955 ms`, and product max `54.39362799999799 ms`. Do not make frame latency `2` the default or use extra frames in flight as a hidden acceptance shortcut. Keep the override as a diagnostic knob; the next cut still needs real scheduler/present/render-result architecture.
-
-The newest accepted-input timing and typed render identity checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-accepted-timing-typed-render-identity.json`. It is schema-valid but still fails: product p95 `18.1187940000018 ms`, product missed frames `6`, steady accepted input-to-formula p95 `18.50278099999923 ms`, product max `40.28195699999924 ms`, and harness p95 `173.322 ms`. The patch makes `input_accept_to_dirty_poll_ms=0.0` because accepted-input timing now starts when the role poll hook has produced a visible-changing dirty result, and it returns typed layout/render identities from `PreviewNativeGpuRenderHookOutput` instead of parsing them back out of proof JSON. This is a measurement and product-result-boundary cleanup, not the 60 FPS fix: `input_wake_to_input_accept.p95` remains high (`107.13211700000464 ms` steady), and failing frames are still dominated by present/queue (`present_call.p95=12.729381 ms`, `queue_to_present.p95=12.729762000000846 ms`, one `37.902366 ms` present stall). Do not treat accepted-frame relabeling as the fix.
-
-The newest preissued `FrameEvidenceKey` checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-preissued-frame-evidence.json`. It is schema-valid and proves the safe generic key cut: `target/artifacts/native-gpu/cells-visible-click-e2e-353333-1782956394/preview-loop.json` reports `frame_evidence_key_issued_before_present=true`, `preissued_frame_evidence_matches_presented_frame=true`, and matching frame seq `34` for the final and preissued keys. It still fails the product gate narrowly: product p95 `16.865923999999723 ms`, product sample count `7`, product missed-frame count `1`, click accepted p95/max `12.535805999999866 ms`, `present_call_ms.p95=10.660442 ms`, `queue_submit_call_ms.p95=9.278028 ms`, and `render_hook_ms.p95=4.181787 ms`. This is proof-identity cleanup, not the 60 FPS fix. Do not add a fake finalized key to `NativeRenderFrameContext` before revisions are known. Next implement a small typed `PresentedProductFrame`/`RenderFrameResult` and post-present proof subscribers for visible-bound-text proof, retained-sync proof, readback completion, report JSON, proof history, and artifact hashes; then decide late-acquire/frame-in-flight from hardware present-floor evidence.
-
-The newest product frame commit checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-product-frame-commit.json`. It is schema-valid and proves that app-window now emits `NativeProductFrameCommit` rows after present with exact `FrameEvidenceKey`, lane, scheduler/dirty reasons, input event seq, accepted input timing, revisions, present path, phase timings, typed product-frame summary, and post-present proof requests. The matching preview-loop artifact `target/artifacts/native-gpu/cells-visible-click-e2e-557938-1782957820/preview-loop.json` reports `product_frame_commit_count=26`, `product_frame_commit_matches_frame_evidence_key=true`, last commit source `app_window_product_frame_commit`, lane `product_interaction`, input event seq `13`, and an exact commit/frame key match. It still fails the product gate: p95 `19.67812700000013 ms`, missed-frame count `1`, `present_call_ms.p95=14.244147 ms`, `queue_submit_call_ms.p95=8.087333000000001 ms`, and `render_hook_ms.p95=3.3827859999992143 ms`. This is the typed product commit boundary, not the 60 FPS fix. Next make proof/report/readback subscribers consume product commits by key after present, then cut `PreviewHotLoop` / active scene / present-floor ownership rather than tuning Cells runtime or renderer caches.
-
-The freshest keyed product-commit verifier checkpoint is `target/reports/native-gpu/cells-visible-click-e2e-keyed-product-commits.json`: a one-repeat release run is schema-valid and passes from app-window-owned product commits with four matched click samples, p95 `13.839931 ms`, zero missed product frames, zero runtime/list scans, zero root materialization, zero recomputed fields, four retained render patches, no full lower, and no legacy fallback. The default repeated release report `target/reports/native-gpu/cells-visible-click-e2e-keyed-product-proof-split-default.json` is schema-valid but still fails: app-window product commit matching is now the acceptance source, product p95 is narrowly over budget around `16.866963 ms`, true product outliers remain around `30.740820 ms` and `26.252360 ms`, and late samples lose matching proof/currentness evidence. Treat this as a product/proof ownership and frame scheduling blocker, not a Cells formula/list/runtime blocker. Next record product frame keys directly in every UX sample, replace fallback proof-key matching with exact `product_frame_evidence_key` joins, make proof/currentness/readback/report work bounded post-present subscribers, add product-only and proof-isolation repeated gates, and then cut the larger `PreviewHotLoop`/`ActivePreviewScene` product-present path.
-
-The newest async post-present proof worker checkpoint moves render-hook
-post-present proof subscribers out of inline after-present execution and into a
-bounded worker queue. App-window now enqueues subscriber batches by exact
-`FrameEvidenceKey`, drains completed artifacts/errors back into the keyed
-artifact ledger, exposes worker enqueue/drop/complete/error/pending counters,
-drains the worker before final report shutdown, and now completes proof-history
-and render-hook report-json requests through worker subscribers instead of inline
-render-loop artifact calls. Artifact-hash requests also have a reusable worker
-subscriber, and the follow-up app-window-owned artifact-hash slice removed the
-empty playground `ArtifactHash(Vec::new())` subscriber. App-window now creates
-artifact-hash subscribers after present, by exact `FrameEvidenceKey`, from
-matching visible readback artifacts and external app-owned render-proof
-`artifact_path`/`path` entries that already exist on disk. Empty artifact-hash
-subscribers are deferred when an exact-frame visible readback is pending, and
-readback completion now completes the queued `ArtifactHash` from the app-owned
-readback artifact metadata only when that key was explicitly deferred, avoiding
-non-deferred subscriber races. Focused tests pass, but this is still proof
-isolation scaffolding, not the 60 FPS fix. Continue by unifying visible
-readback, external render proof, artifact path registration, screenshots, diffs,
-report artifacts, and future immutable artifact registration behind one bounded
-`PostPresentProofQueue` with mode allowlists, lag/drop counters, stale-key
-rejection, and proof-isolation stress gates.
-
-The newest proof-isolation report slice adds a generic app-window
-`post_present_proof_isolation` snapshot. It records that product latency does
-not include proof completion, product frames do not block on post-present proof
-subscribers, proof latency is reported separately, and the proof worker state is
-`unused`, `lagging`, `settled`, `dropped`, or `error` from exact queue/worker
-counters. A focused app-window test keeps a post-present proof subscriber
-blocked while writing the product render-loop report; the report still contains
-the product frame commit and marks proof work as lagging instead of charging it
-to product latency. The Cells release label contract now requires this
-proof-isolation field and rejects reports that claim product latency includes
-proof completion. This is still not the 60 FPS fix; it is a gate that prevents
-future reports from hiding proof coupling inside UX timing.
-
-The freshest release Cells visible-click evidence after proof isolation is
-`target/reports/native-gpu/cells-visible-click-e2e-release.json` with
-`target/artifacts/native-gpu/cells-visible-click-e2e-2575123-1782971605/preview-loop.json`.
-It still fails even though runtime/list work is clean: zero rows scanned, zero
-list-find scans, zero root materialization, and zero recomputed fields. The
-click reaches `selected_address=\"A2\"` and `formula_bar_text=\"15\"`, but
-product input-to-present is about `46.840 ms`. The dominant current blocker is
-not Cells formula logic; the render hook is still using full-state/proof-shaped
-retained sync: about `37.2 ms` render-hook work, about `11.3 ms`
-`input_overlay_render_scene_patch_build_ms`, about `25.6 ms`
-`render_scene_cache_ms`, `retained_bound_sync.reason=\"full_state\"`,
-`item_index_count=331`, and `input_overlay_render_scene_patch_touched_node_count=239`.
-Cut that boundary before doing more micro-tuning. Product interaction frames
-must use a typed bounded `ProductPatch`/`ActivePreviewScene` path that touches
-only changed retained nodes; full retained-bound sync, proof JSON, render-hook
-report JSON, visible-bound-text proof, retained-sync proof, proof history, and
-artifact/hash discovery must be proof/diagnostic or post-present subscriber
-work keyed by `FrameEvidenceKey`. Also propagate
-`post_present_proof_isolation` into the top-level visible-click report, because
-the preview-loop artifact has it and the final report currently loses it.
-
-Before doing another local timing tweak, inspect the Architecture TODO Backlog and choose the largest simple cut that removes a boundary from the product path: event-loop ownership, state-aware frame pacing, present/queue strategy, typed input/source intents, active/pending retained snapshots, GPU resource lifetime, typed runtime deltas, proof/report workers, or deletion of stale slow paths. Naive non-dirty pointer-input burst priming was tried and reverted because it broke proof matching and caused 5s verifier timeouts. Do not repeat that tactic unless you first implement exact keyed frame-history/proof selection and can prove product frames, warm-up frames, and proof frames are not being mixed. The next implementation slice should add a keyed FrameEvidenceRegistry, remove proof/readback backpressure from product rendering, make interaction run on an already-active burst frame, patch retained state directly, submit quickly, and let verifiers wait for matching proof/readback/report artifacts later against the exact FrameEvidenceKey.
-
-Also use the 2026-07-02 strategy-pass TODOs, `Maximal Architecture Improvement TODO Capture`, `additional architecture improvements to preserve`, `2026-07-02 Final No-Loss Architecture TODO Addendum`, `2026-07-02 Final No-Loss Implementation Backlog`, and the stale-path ledger as mandatory steering when the run starts to loop. Prefer a single `PreviewHotLoop` / `NativeFrameClock` state machine, typed priority lanes, product transaction ABI, product protocol split, immutable active-snapshot publication, a short extract/cache boundary, `ActivePreviewScene` / `PendingPreviewScene`, retained UI controls, render-owned GPU resources, same-surface present-floor evidence, interaction-scoped evidence, product-only/proof-only verifier modes, proof-isolation stress gates, deterministic scheduler simulation, hot-path lock/allocation budgets, and explicit old-path deletion gates over adding more compatibility branches. If a product frame still depends on proof JSON, latest reports, full state summaries, geometry/string route lookup, broad runtime currentness, dev IPC, or verifier-shaped fallbacks, cut that architecture boundary and add a negative test instead of optimizing around it.
-
-Also use `2026-07-02 Maximal Architecture TODO Addendum From Review` as the
-latest no-loss list. It requires one exclusive product WGPU present contract, a
-single `NativeFrameClock` product-frame owner, a small typed product frame ABI, a
-render-loop-owned `FrameEvidenceRegistry`, explicit `MainScene`/`PendingScene`/
-`ActiveScene`/`RecycleScene` ownership, retained property trees, Bevy-style
-extraction/render phases, dirty component indexes, sparse indexed runtime
-currentness, virtualized materialization, deletion of layout/proof JSON from the
-product path, a machine-readable stale-path deletion ledger, product/proof/
-baseline/HUD verifier split, proof-isolation stress tests, dev-window
-separation, hot-path lock/allocation budgets, and non-Cells sparse fixtures.
-Prefer removing a product-frame boundary and adding a negative stale-path gate
-over another local timing tweak.
-
-Also consult `2026-07-02 Additional Architecture Improvement Radar` before any
-new micro-optimization loop. Keep render-actor ownership, deadline-aware frame
-budgeting, first-class retained controls, stable semantic identity, columnar
-sparse runtime storage, incremental layout, renderer resource residency,
-present-strategy evidence, product/proof protocol separation, scheduler
-simulation, hot-path allocation/lock firewalls, verifier reset, optional
-Rust/Zig/Wasm hot kernels, external-library lessons, and explicit stale-path
-deletion rules available as architecture options. Pick the largest simple cut
-that removes a measured product-frame boundary; do not use any option as a
-Cells-specific shortcut.
-
-The freshest local route/sidecar smoke checkpoint is
-`target/reports/native-gpu/cells-visible-click-e2e-release-smoke-route-key.json`.
-It is schema-valid and still fails, but it changes the next cut. The three
-completed app-window product samples are fast: p95/max about `11.636 ms`, zero
-missed frames, exact `HostInput` product commits, render-hook state snapshot
-about `0.049-0.105 ms`, zero runtime/list scans, zero recomputed fields, no
-full lower, and retained render-scene patches. The failure is now proof/harness
-completion and selected/formula visual evidence: only three of four required
-samples completed, the C0 sample timed out in visual formula proof, selected-cell
-crop proof lacked baseline app-owned readback, and structured visible-surface
-proof did not prove selected-cell render state even though retained text sync
-matched the expected formula. Product frames still report legacy proof built
-pre-present. Treat the next cut as proof/verifier ownership and exact retained
-visual evidence by `FrameEvidenceKey`, plus removal of remaining legacy
-pre-present proof work, then rerun the default repeated release path before
-claiming stability. Do not restart with Cells formula/runtime/list or route-cache
-micro-fixes unless a fresh default repeated report names them again.
-
-The freshest local selected-node proof smoke checkpoint is
-`target/reports/native-gpu/cells-visible-click-e2e-release-smoke-selected-node-proof.json`.
-It is schema-valid and still fails, but the failure moved again. All four click
-samples now complete and pass app-owned visual formula proof; selected visual
-state is proved generically from retained visible-bound-text entries plus
-source-intent metadata with `visible_selected_node_matches_address=true`.
-Formula and selected-cell transition contracts pass. Runtime/list work remains
-clean with zero scans and zero recompute in the product click path. The blocker
-is the C0 product frame: input-to-present is about `28.441 ms`, native input is
-only about `0.290 ms`, queue submit is about `0.121 ms`, present is about
-`9.920 ms`, and render-hook outer core is about `17.486 ms` while
-`legacy_product_proof_built_pre_present=true`. Treat the next cut as removing
-proof/layout/report construction from the product render hook, moving all visual
-proof/readback/report artifacts to exact-key post-present subscribers, and
-making `ActivePreviewScene` + typed `ProductPatch` the product boundary. Do not
-go back to Cells formula/list/currentness, route-cache, or selected-node visual
-proof unless a fresh default repeated report names them again.
+Use the plan's architecture TODO backlog, stale-path ledger, maximal architecture addenda, and external-library notes as mandatory steering. Prefer deleting or quarantining stale slow paths over adding compatibility branches. If a product frame still depends on proof JSON, latest reports, full state summaries, geometry/string route lookup, broad runtime currentness, dev IPC, or verifier-shaped fallbacks, cut that architecture boundary and add a negative test.
 
 Use subagents whenever useful for independent architecture, runtime/compiler, WGPU/rendering, testing, or external-library research. If the path starts becoming too complex, too hacky, or circular, stop micro-tuning and choose a simpler generic architecture that matches the source-of-truth docs.
 
@@ -11989,3 +11860,63 @@ host-input follow-up cut:
     unavoidable WGPU/compositor floor on the current adapter/session;
   - only after that, revisit retained layout/render patching if product p95 is
     still above 16.7ms.
+
+2026-07-02 post-background-proof cut status:
+
+- Implemented the generic app-window split that keeps background proof
+  telemetry out of product/burst frames:
+  - product and burst frames still publish product commits and refresh the
+    async latest-wins report;
+  - proof-history, report-json proof artifacts, and artifact hashing are only
+    enqueued when background telemetry is allowed;
+  - proof/harness frames remain allowed to enqueue required proof subscribers.
+- Fixed the prewarm implementation bug: `armed_frame_pending` is now set by
+  pointer prewarm, clean armed polls can be counted and skipped without
+  presenting, and host input arriving after prewarm increments
+  `input_waited_for_already_armed_frame_count`.
+- Best fresh release result after the background-proof split:
+  - all 64 Cells clicks passed visually and functionally;
+  - `/product_only_ux_contract.status=pass`;
+  - `/proof_only_contract.status=pass`;
+  - accepted product p95 was `16.062596 ms`, max `27.659174 ms`;
+  - proof lag p95 was `6` frames, max `8`;
+  - remaining failure was raw product-commit wake-to-formula p95
+    `20.567028 ms`, with wake-to-accept p95 `5.742499 ms`.
+- Fresh release result after enabling real armed prewarm counters is still
+  `fail` and slightly worse on this run:
+  - accepted product p95 `18.442151 ms`, max `19.244245 ms`;
+  - product missed frames `9`;
+  - product-commit wake-to-formula p95 `22.724245 ms`;
+  - wake-to-accept p95 `5.562695 ms`;
+  - `input_waited_for_already_armed_frame_count=65`, proving the prewarm path is
+    active but not sufficient;
+  - background proof worker load dropped substantially compared with the old
+    overloaded reports (`required=138`, `background=238`, `completed=376` in the
+    fresh loop report).
+- The remaining p95 misses are dominated by product-frame submit/present floor,
+  not Cells runtime/list/formula work:
+  - slow samples spend about `14-17 ms` after the render hook in
+    `queue.submit()` / `frame.present()`;
+  - render hook is usually `1-2 ms`, with patch build/cache/encode substeps
+    still paid every product interaction;
+  - Cells runtime work remains targeted: one dirty key, zero list scans, no
+    full-grid recompute in the reported interaction samples.
+- A same-surface present-floor run currently fails as diagnostic evidence
+  because it selected software Vulkan llvmpipe:
+  - `adapter_name="llvmpipe (LLVM 20.1.2, 256 bits)"`;
+  - `adapter_is_software=true`;
+  - its frame floor is low, but it cannot be used as product hardware evidence.
+- Next cut should not be Cells-specific and should not be more measurement-only
+  work:
+  - add adapter identity to all preview-loop/product reports and fail fast if a
+    performance gate runs on a software adapter unless explicitly requested;
+  - implement a real `PreviewHotLoop` / active frame clock that samples input at
+    the start of an already scheduled frame, not after demand wake bookkeeping;
+  - split first-frame retained visual feedback from runtime/source cleanup:
+    apply the selection/formula-bar visual patch, submit, then run follow-up
+    source/runtime cleanup under a separate frame identity;
+  - replace per-interaction render-scene patch construction with a retained GPU
+    buffer patch path for style/text deltas, keyed by stable document node IDs;
+  - keep proof/readback/report artifacts in a bounded proof service keyed by
+    `FrameEvidenceKey`, with product UX latency and proof lag reported
+    separately.

@@ -30047,7 +30047,7 @@ fn sha256_combined_source_file_digests(paths: &[&str]) -> RuntimeResult<String> 
 
 fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let Some(artifacts) = report.get("artifact_sha256s").and_then(JsonValue::as_array) else {
-        return Ok(());
+        return verify_report_json_sidecars(report, report_path);
     };
     for artifact in artifacts {
         let Some(path) = artifact.get("path").and_then(JsonValue::as_str) else {
@@ -30065,7 +30065,239 @@ fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResu
             .into());
         }
     }
+    verify_report_json_sidecars(report, report_path)
+}
+
+fn verify_report_json_sidecars(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let sidecars = report
+        .get("report_json_sidecars")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let declared_count = report
+        .get("report_json_sidecar_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(sidecars.len() as u64);
+    if declared_count != sidecars.len() as u64 {
+        return Err(format!(
+            "{} report_json_sidecar_count does not match report_json_sidecars length",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut refs = Vec::new();
+    collect_report_json_sidecar_refs(report, "", &mut refs);
+    if sidecars.is_empty() && refs.is_empty() {
+        return Ok(());
+    }
+    if sidecars.is_empty() && !refs.is_empty() {
+        return Err(format!(
+            "{} contains json-sidecar-ref objects without report_json_sidecars",
+            report_path.display()
+        )
+        .into());
+    }
+    let artifacts = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut artifact_by_path = BTreeMap::<String, String>::new();
+    for artifact in artifacts {
+        if let (Some(path), Some(sha256)) = (
+            artifact.get("path").and_then(JsonValue::as_str),
+            artifact.get("sha256").and_then(JsonValue::as_str),
+        ) {
+            artifact_by_path.insert(path.to_owned(), sha256.to_owned());
+        }
+    }
+    let mut sidecar_by_pointer = BTreeMap::<String, &JsonValue>::new();
+    let mut paths_by_digest = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut unique_bytes_by_path = BTreeMap::<String, u64>::new();
+    let mut ref_bytes = 0_u64;
+    for sidecar in &sidecars {
+        let Some(pointer) = sidecar
+            .get("json_pointer_replaced")
+            .and_then(JsonValue::as_str)
+        else {
+            return Err(format!(
+                "{} report_json_sidecars entry missing json_pointer_replaced",
+                report_path.display()
+            )
+            .into());
+        };
+        if sidecar_by_pointer
+            .insert(pointer.to_owned(), sidecar)
+            .is_some()
+        {
+            return Err(format!(
+                "{} has duplicate report_json_sidecars pointer `{pointer}`",
+                report_path.display()
+            )
+            .into());
+        }
+        let Some(path) = sidecar.get("path").and_then(JsonValue::as_str) else {
+            return Err(format!(
+                "{} report_json_sidecars entry `{pointer}` missing path",
+                report_path.display()
+            )
+            .into());
+        };
+        let Some(expected) = sidecar.get("sha256").and_then(JsonValue::as_str) else {
+            return Err(format!(
+                "{} report_json_sidecars entry `{pointer}` missing sha256",
+                report_path.display()
+            )
+            .into());
+        };
+        let byte_len = sidecar
+            .get("byte_len")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} report_json_sidecars entry `{pointer}` missing byte_len",
+                    report_path.display()
+                )
+            })?;
+        if artifact_by_path.get(path).map(String::as_str) != Some(expected) {
+            return Err(format!(
+                "{} sidecar `{path}` is not bound by artifact_sha256s with the same hash",
+                report_path.display()
+            )
+            .into());
+        }
+        let metadata_len = fs::metadata(path)?.len();
+        if metadata_len != byte_len {
+            return Err(format!(
+                "{} sidecar `{path}` byte_len is stale: report={byte_len}, fs={metadata_len}",
+                report_path.display()
+            )
+            .into());
+        }
+        let actual = sha256_file(Path::new(path))?;
+        if actual != expected {
+            return Err(
+                format!("{} sidecar `{path}` sha256 is stale", report_path.display()).into(),
+            );
+        }
+        ref_bytes = ref_bytes.saturating_add(byte_len);
+        unique_bytes_by_path
+            .entry(path.to_owned())
+            .or_insert(byte_len);
+        paths_by_digest
+            .entry(format!("{expected}:{byte_len}"))
+            .or_default()
+            .insert(path.to_owned());
+    }
+    for (digest, paths) in paths_by_digest {
+        if paths.len() > 1 {
+            return Err(format!(
+                "{} sidecar payload `{digest}` is duplicated across multiple paths",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for (pointer, sidecar_ref) in &refs {
+        let Some(sidecar) = sidecar_by_pointer.get(pointer) else {
+            return Err(format!(
+                "{} sidecar ref `{pointer}` has no matching report_json_sidecars entry",
+                report_path.display()
+            )
+            .into());
+        };
+        for key in ["path", "sha256", "byte_len"] {
+            if sidecar_ref.get(key) != sidecar.get(key) {
+                return Err(format!(
+                    "{} sidecar ref `{pointer}` does not match report_json_sidecars.{key}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    for pointer in sidecar_by_pointer.keys() {
+        if !refs.iter().any(|(ref_pointer, _)| ref_pointer == pointer) {
+            return Err(format!(
+                "{} report_json_sidecars entry `{pointer}` has no matching json-sidecar-ref",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let unique_bytes = unique_bytes_by_path.values().copied().sum::<u64>();
+    if report
+        .get("report_json_sidecar_total_raw_bytes")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|declared| declared != unique_bytes)
+    {
+        return Err(format!(
+            "{} report_json_sidecar_total_raw_bytes does not match unique sidecar bytes",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("report_json_sidecar_total_ref_bytes")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|declared| declared != ref_bytes)
+    {
+        return Err(format!(
+            "{} report_json_sidecar_total_ref_bytes does not match sidecar refs",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("report_json_sidecar_unique_artifact_count")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|declared| declared != unique_bytes_by_path.len() as u64)
+    {
+        return Err(format!(
+            "{} report_json_sidecar_unique_artifact_count does not match unique sidecars",
+            report_path.display()
+        )
+        .into());
+    }
     Ok(())
+}
+
+fn collect_report_json_sidecar_refs<'a>(
+    value: &'a JsonValue,
+    pointer: &str,
+    refs: &mut Vec<(String, &'a JsonValue)>,
+) {
+    match value {
+        JsonValue::Object(object) => {
+            if object.get("kind").and_then(JsonValue::as_str) == Some("json-sidecar-ref")
+                && object.get("sidecar").and_then(JsonValue::as_bool) == Some(true)
+            {
+                if let Some(replaced) = object
+                    .get("json_pointer_replaced")
+                    .and_then(JsonValue::as_str)
+                {
+                    refs.push((replaced.to_owned(), value));
+                } else {
+                    refs.push((pointer.to_owned(), value));
+                }
+                return;
+            }
+            for (key, child) in object {
+                let child_pointer = format!("{pointer}/{}", json_pointer_escape(key));
+                collect_report_json_sidecar_refs(child, &child_pointer, refs);
+            }
+        }
+        JsonValue::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_report_json_sidecar_refs(child, &format!("{pointer}/{index}"), refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn verify_headed_artifacts(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {

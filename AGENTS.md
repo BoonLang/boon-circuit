@@ -78,24 +78,17 @@ direct COSMIC toplevel probing, or browser windows as evidence for the native
 GPU path. Use app-owned WGPU readback screenshots, native GPU reports, and the
 host-event verifier route described in `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 
-Before claiming native GPU handoff readiness, run only the native GPU gates:
+Before claiming native GPU handoff readiness, run only the native GPU handoff
+reports listed in `docs/architecture/native_gpu_handoff_manifest.json`, then run
+the manifest-backed aggregate:
 
 ```bash
-cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
-cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
-cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json
-cargo xtask verify-native-gpu-layout-contract --report target/reports/native-gpu/layout-contract.json
-cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json
-cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
-cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
-cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
-cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
-cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
-cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
-cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
-cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
+
+The manifest is the single source of truth for handoff report labels, paths,
+commands, required arguments, inline JSON byte budgets, and JSON sidecar byte
+budgets. Do not maintain a second handoff list in AGENTS.md.
 
 If human observation is still needed after the native gates pass, tell the user
 to continue with human testing as a separate follow-up. Do not weaken native GPU

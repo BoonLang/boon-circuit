@@ -993,26 +993,11 @@ visible text run.
 
 ## Verification Gates
 
-The architecture is not accepted until these gates exist and pass in release
-mode on this Wayland machine.
+The architecture is not accepted until the handoff reports listed in
+`docs/architecture/native_gpu_handoff_manifest.json` exist and pass in release
+mode on this Wayland machine, followed by the manifest-backed aggregate:
 
 ```text
-cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
-cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
-cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json
-cargo xtask verify-native-gpu-layout-contract --report target/reports/native-gpu/layout-contract.json
-cargo xtask verify-native-gpu-shaders --check --report target/reports/native-gpu/shaders.json
-cargo xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json
-cargo xtask verify-native-gpu-ipc-backpressure --report target/reports/native-gpu/ipc-backpressure.json
-cargo xtask verify-native-gpu-observability --report target/reports/native-gpu/observability.json
-cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json
-cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
-cargo xtask verify-native-gpu-preview-e2e --example todo_mvc_physical --report target/reports/native-gpu/preview-e2e-todo_mvc_physical.json
-cargo xtask verify-native-todomvc-physical-reference-parity --report target/reports/native-gpu/todomvc-physical-reference-parity.json
-cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
-cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json
-cargo xtask verify-native-gpu-scroll-speed --surface dev-code-editor --report target/reports/native-gpu/scroll-speed-dev-code-editor.json
-cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negative.json
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
@@ -1020,7 +1005,9 @@ Every native GPU gate must overwrite or remove any prior passing report before
 execution and write a schema-valid pass/fail report. `verify-native-gpu-all`
 must link every required native GPU report by path and sha256, and it is the
 native GPU acceptance aggregate for this architecture. Its required report list
-must match the handoff list above.
+comes from the manifest, which is the single source of truth for handoff report
+labels, paths, commands, required arguments, inline JSON byte budgets, and JSON
+sidecar byte budgets.
 
 The broader product/regression gates remain required before claiming the
 dev-editor/example-switch recovery complete, but they are not part of the

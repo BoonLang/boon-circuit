@@ -26,41 +26,51 @@ renderer resources, sparse runtime/layout work, and retained render state. Proof
 readback remains mandatory for verifier evidence, but proof latency is measured
 separately from UX latency.
 
-## Current Cells-First Goal Contract
+## Completed Cells Gate Evidence And Current Goal Contract
 
-The next unattended goal is **Cells first**, not the entire historical backlog.
-Use the backlog as steering only. The run is complete when the canonical Cells
-hardware product/proof gates pass for the current worktree and binary, or when
-a fresh schema-valid report identifies the next blocker and the repo is left
-coherent.
+The headed Cells visible-click release gate is no longer the next blocker. It
+passed on commit `8117094 Pass headed Cells visible click gate` with fresh
+hardware-backed evidence in
+`target/reports/native-gpu/cells-visible-click-e2e-release.json`.
 
-Canonical Cells acceptance is
-`verify-native-cells-visible-click-e2e --profile release --headed-host-input`.
-The headed path must run the full visible-click product/proof/budget contract,
-not a smoke-only shortcut. `verify-native-gpu-headed-scenario --example cells`
-is prerequisite substrate only: it proves hardware adapter, app-owned host
-input, and WGPU readback, but not 60 FPS Cells acceptance. `idle-wake` remains
-a demand-driven liveness smoke gate only.
+Recorded acceptance evidence:
 
-Completion requires:
+- `verify-native-cells-visible-click-e2e --profile release --headed-host-input`
+  wrote `status=pass`;
+- hardware WGPU adapter: NVIDIA GeForce RTX 2070, Vulkan;
+- app-owned host input through the native input adapter and app-owned WGPU
+  readback proof;
+- `product_only_ux_contract.status=pass` with product p95 `9.903322ms`, max
+  `10.352470ms`, `60` measured product samples, `60` typed product patches,
+  and `60` typed product results;
+- `proof_only_contract.status=pass` with `64/64` exact visual proofs, current
+  structured WGPU proof, and proof lag max `0`;
+- preview product path `status=pass`, zero missed frames, zero full-scene
+  product fallback, and schema validation passing.
 
-- hardware WGPU adapter evidence on the product surface;
-- app-owned host input and app-owned WGPU readback evidence;
-- multi-sample release coverage with at least 16 product click samples;
-- product p95 `<= 16.7ms`, bounded max `<= 33.4ms`, and zero missed product
-  frames;
-- `product_only_ux_contract`, `proof_only_contract`, proof isolation, exact
-  `FrameEvidenceKey`, typed product patch/result, and schema gates passing;
-- no full relower, full scene rebuild, full-grid recompute, proof JSON/report
-  dependency, dev IPC dependency, or Cells-specific production branch.
+This evidence closes the focused Cells visible-click performance slice only.
+It does not complete the unified runtime/rendering plan, the BYTES/MachinePlan
+default-engine switch, broader Cells semantic-delta parity, passive scroll, or
+the retained WGPU architecture.
 
-Diagnostic-only evidence cannot complete the goal: A2 one-click debug smoke,
-isolated Weston llvmpipe/software-adapter reports, human observation, COSMIC
-scraping, desktop screenshots, `xdotool`/`ydotool`, browser/Ply/Xvfb paths,
-direct `SourceBatch` injection, and software-adapter product evidence are all
-non-acceptance evidence unless a verifier explicitly opts into diagnostic mode.
+Future Cells/native regressions must still use the same acceptance contract:
+multi-sample release coverage, hardware product adapter, app-owned host input,
+app-owned WGPU readback, exact or explicitly lagged `FrameEvidenceKey`, typed
+product patch/result evidence, p95 `<= 16.7ms`, bounded max `<= 33.4ms`, zero
+missed product frames, and schema-valid reports. Diagnostic evidence such as
+A2 one-click smoke, software adapters, human observation, COSMIC scraping,
+desktop screenshots, `xdotool`/`ydotool`, browser/Ply/Xvfb, direct
+`SourceBatch`, or example-specific shortcuts remains non-acceptance evidence.
 
-Use lane-specific stops:
+The next native architecture slice must try the render graph instead of leaving
+it as optional backlog. Implement and measure a generic
+`ProductRenderGraph` / `PresentPlan` path for native product frames, then keep
+it only if it improves performance or removes/quarantines legacy product
+hot-path coupling without budget regressions. If the render graph worsens
+performance and does not simplify code, revert or quarantine it and record an
+evidence-based ADR/progress entry.
+
+Lane-specific stops remain:
 
 - if product UX passes and proof fails, work only the proof registry,
   subscriber, and verifier join lane;
@@ -151,7 +161,7 @@ more instrumentation.
     of rebuilding render-scene/proof structures;
   - reports expose upload bytes, command encode time, queue submit time,
     present time, draw calls, cache hits, and hot-frame allocations.
-- [ ] Compile product frames through a render graph:
+- [ ] Mandatory render graph trial:
   - `ActivePreviewScene + ProductPatch` compiles to a `ProductRenderGraph` /
     `PresentPlan` before product submit;
   - product passes are explicit, cacheable, and keyed by scene/layout/surface
@@ -160,6 +170,9 @@ more instrumentation.
     encode time, and zero full-scene/proof/report fallback work;
   - stale graph pass, mismatched epoch, or proof-on-product-frame evidence
     fails the product gate even if raw latency happens to pass.
+  - keep the graph only if it improves performance or removes/quarantines
+    legacy product hot-path coupling without regression; otherwise revert or
+    quarantine it and record the measured reason.
 - [ ] Measure the real product present floor before chasing app micro-costs:
   - add a focus-safe hardware/product-surface baseline for the same app-window,
     adapter, surface, present mode, and frame clock;
@@ -10744,17 +10757,13 @@ No-loss TODOs from this checkpoint:
 Use this later as:
 
 ```text
-/goal Execute the Cells-first native performance slice from docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md. Use the long backlog as steering, not mandatory scope. Start from the 2026-07-03 post-restart checkpoint: COSMIC background-launch works and the headed A2 Cells smoke proves hardware, app-owned host input, WGPU readback, and formula-bar functionality, but it is not 60 FPS acceptance.
+/goal follow docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md from the current HEAD. First inspect current git status, recent commits, readiness reports, and native GPU reports. Treat commit 8117094 and target/reports/native-gpu/cells-visible-click-e2e-release.json as latest known evidence that headed Cells visible-click passed on hardware, but verify freshness before relying on it.
 
-First make `verify-native-cells-visible-click-e2e --profile release --headed-host-input` the canonical full Cells gate: remove any smoke-only headed shortcut, keep strict hardware adapter policy, use app-owned host events and WGPU readback, preserve layout-derived target selection, require exact product commits, typed active-scene product patch/result evidence, exact or explicitly lagged `FrameEvidenceKey` proof, multi-sample release coverage, p95 <= 16.7ms, bounded max <= 33.4ms, zero missed product frames, and schema-valid reports. Do not accept A2 one-click debug smoke, isolated Weston llvmpipe, human observation, COSMIC scraping, desktop screenshots, xdotool/ydotool, browser/Ply/Xvfb paths, direct SourceBatch injection, or software-adapter product evidence.
+Continue remaining BYTES/MachinePlan/default-engine readiness work, but do not leave the native WGPU render graph as optional backlog. Implement and measure a generic ProductRenderGraph / PresentPlan slice for native product frames: ActivePreviewScene + ProductPatch must compile into explicit product passes, while proof/readback/reporting stay post-present subscribers keyed by FrameEvidenceKey.
 
-If the full headed gate fails, fix only the failing lane. Product pass plus proof fail means work the proof registry/subscriber/verifier join, not product timing. Hardware fail means fix launcher/adapter evidence, not Cells. Queue/present dominance means add same-surface hardware present-floor evidence before touching runtime/layout. Clean runtime/list/formula counters mean no formula micro-tuning.
+Measure before and after on Cells and TodoMVC. Keep the render graph if it improves performance or removes/quarantines legacy product hot-path coupling without budget regressions. If it worsens performance and does not simplify code, revert or quarantine it and record an evidence-based ADR/progress entry. Do not add Cells/example-specific hacks anywhere in compiler, runtime, document, renderer, app-window, playground, or verifier code.
 
-Hard loop stop: after two fresh reports from the same gate show the same dominant blocker class, stop local optimizations. Record report paths, blocker class, rejected tactic, selected architecture boundary, old path to delete/quarantine, and the next gate that will prove it.
-
-If product latency remains the blocker, implement the generic hot-loop architecture cut: make `PreviewHotLoop` / `NativeFrameClock` / `ActivePreviewScene` the product-frame owner, and make `ProductRenderGraph` / `PresentPlan` the renderer-side mechanism for turning `ActivePreviewScene + ProductPatch` into product passes. Sample input at the start of an already scheduled demand-driven burst frame; patch retained selection/focus/formula-bar state directly; compile/cache explicit product graph passes; submit quickly; move proof/readback/reporting/accessibility/HUD/dev IPC behind bounded post-present services keyed by exact `FrameEvidenceKey`.
-
-Do not add Cells/example-specific hacks anywhere in compiler, runtime, document, renderer, app-window, playground, or verifier code. Use subagents only for independent reads that validate the selected architecture cut or blocker classification. End the goal when the Cells-first gates pass on fresh hardware-backed reports for the current worktree/binary, or when a fresh schema-valid report identifies the next blocker and the repo is coherent.
+Mark the goal achieved only when one of these is true: (1) ProductRenderGraph / PresentPlan is implemented and kept, with fresh schema-valid before/after Cells and TodoMVC reports proving required budgets still pass, proof/readback/reporting stay post-present, no product-frame proof/readback coupling exists, and the render graph either improves performance or removes/quarantines legacy hot-path coupling without regression; or (2) ProductRenderGraph / PresentPlan was implemented, measured, found worse or not simplifying, then reverted or quarantined with an ADR/progress entry and fresh schema-valid reports proving the old path still passes. Do not mark the goal achieved for an honest blocker handoff; a blocker handoff may end the current work turn, but the goal remains active unless the strict blocked-audit rule is satisfied. Do not commit or push unless explicitly asked.
 ```
 
 ## 2026-07-02 Fresh Post-Present Smoke And Maximum Architecture TODOs
@@ -12685,7 +12694,11 @@ host-input follow-up cut:
     `NVIDIA GeForce RTX 2070`, Vulkan, `DiscreteGpu`;
   - app-owned input selected `A2` and formula-bar text became `15`;
   - schema check passes and no `boon_native_playground` process remains.
-- This is still not 60 FPS acceptance:
+- Superseded by commit `8117094` and
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json`: the later
+  headed release gate now runs the full product/proof/budget assertions and
+  passes on hardware.
+- At this historical checkpoint this was still not 60 FPS acceptance:
   - the headed-host path currently proves background launch, hardware adapter,
     app-owned input, and functional formula-bar update;
   - it must still be merged with the full visible-click product/proof/budget

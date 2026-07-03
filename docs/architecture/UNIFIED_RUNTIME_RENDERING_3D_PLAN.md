@@ -147,6 +147,16 @@ Visual accuracy and manufacturing accuracy must never be conflated.
 
 The current runtime direction is good: static plans, keyed memories, semantic deltas, typed routes, and no runtime graph cloning. The rendering side does not yet preserve those benefits end to end.
 
+2026-07-03 update: the headed Cells visible-click release gate now passes on
+hardware (`8117094`, `target/reports/native-gpu/cells-visible-click-e2e-release.json`;
+product p95 `9.903322ms`, max `10.352470ms`, zero missed frames, exact
+app-owned WGPU proof). This proves the current retained product/proof split can
+hit 60 FPS-class click latency for Cells. It does not make the renderer final:
+the next native WGPU architecture slice must still implement and measure a
+generic `ProductRenderGraph` / `PresentPlan` path, and keep it only if it
+improves performance or removes/quarantines legacy hot-path coupling without
+budget regression.
+
 ### 4.1 Snapshot collapse after semantic deltas
 
 The current effective path is approximately:
@@ -1999,13 +2009,24 @@ Deliverables:
 
 - persistent GPU arenas;
 - coalesced dirty writes;
+- mandatory `ProductRenderGraph` / `PresentPlan` implementation trial where
+  `ActivePreviewScene + ProductPatch` compiles into explicit product passes;
+- before/after Cells and TodoMVC reports that prove whether the render graph
+  improves latency or removes legacy product hot-path coupling without
+  regression;
+- product graph counters for pass count, plan hash, dirty chunks, upload bytes,
+  encode time, cache hits, full-rebuild fallback count, proof-on-product-frame
+  count, and stale epoch rejection;
 - app-owned color/depth/pick targets;
 - asynchronous screenshot/pick readback;
 - demand-driven frame scheduler and wake handle;
 - device-loss replay;
 - production/proof metrics separation.
 
-Exit gate: no-op/hover/text/scroll upload and frame-acquisition gates pass; existing native GPU proof requirements are not weakened.
+Exit gate: no-op/hover/text/scroll upload and frame-acquisition gates pass;
+render-graph trial evidence is recorded; kept render-graph code either improves
+performance or removes/quarantines legacy product hot-path coupling without
+budget regression; existing native GPU proof requirements are not weakened.
 
 ### Phase 6 — Shared native/browser renderer and semantics
 

@@ -152,7 +152,11 @@ Required outcomes:
 - complete MachinePlan lowering coverage;
 - finish typed/columnar hot runtime storage and dense route indexes;
 - close remaining row/function BYTES operation gaps;
-- diagnose and attempt to close the current release Cells benchmark/speed-budget work, including the actual successor of TASK-0804A if IDs changed;
+- treat commit `8117094` and
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json` as the
+  latest known evidence that the headed Cells visible-click release gate passed
+  on hardware, but refresh that evidence before relying on it in a dirty or new
+  worktree;
 - prove parity across TodoMVC, full Cells, BYTES, keyed LIST behavior, negative cases, and reports;
 - ensure runtime output is typed semantic change batches;
 - switch normal boon_cli run to PlanExecutor only after parity, performance, and readiness gates permit it;
@@ -162,8 +166,11 @@ Required outcomes:
 Do not describe the runtime as final while audit-goal-readiness reports runtime implementation blockers.
 
 TASK-0804A and related Cells benchmark blockers are not permission to loop
-forever. Run a bounded investigation, preserve the best measurements and
-root-cause notes, and make one of these decisions:
+forever. The headed Cells visible-click gate is currently closed by commit
+`8117094`; do not redo solved Cells click micro-optimization unless a fresh
+current-worktree report regresses. When a Cells/native performance gate fails,
+run a bounded investigation, preserve the best measurements and root-cause
+notes, and make one of these decisions:
 
 - fixed: update the BYTES/MachinePlan progress ledger, rerun aggregate and
   readiness gates, and continue toward the default switch;
@@ -174,12 +181,12 @@ root-cause notes, and make one of these decisions:
 - invalid/stale task: supersede it with replacement evidence, an explicit ADR,
   and a new tracked task/report.
 
-Do not relabel TASK-0804A as solved merely because later phases are planned.
-Also do not prevent later runtime, retained document/layout/render, or WGPU
-work from starting solely because TASK-0804A remains open; those changes may be
-the real fix. The unified goal is only complete when the final readiness and
-performance gates prove the blocker is fixed, superseded, or no longer relevant
-to the default path.
+Do not relabel any remaining TASK-0804A-family blocker as solved merely because
+later phases are planned. Also do not prevent later runtime, retained
+document/layout/render, or WGPU work from starting solely because an older
+Cells task remains open; those changes may be the real fix. The unified goal is
+only complete when final readiness and performance gates prove each blocker is
+fixed, superseded, or no longer relevant to the default path.
 
 PHASE 2 — TRANSACTIONAL DOCUMENT CHANGES AND HOT RETAINED MODEL
 
@@ -268,6 +275,12 @@ Required outcomes:
 - transient ring only for per-frame/scratch data;
 - ring wrap/growth never invalidates all retained geometry;
 - coalesced dirty GPU writes/copies;
+- mandatory `ProductRenderGraph` / `PresentPlan` trial for native product
+  frames, where `ActivePreviewScene + ProductPatch` compiles into explicit
+  product passes before submit;
+- render-graph reporting for pass count, plan hash, dirty chunk count, upload
+  bytes, encode time, cache hits, full-rebuild fallback count, proof pass count
+  on product frames, and stale-epoch rejection;
 - app-owned scene color, depth, and integer pick-ID targets;
 - asynchronous screenshot and small-region/pixel pick readback;
 - frame graph that renders world, UI/text, selection/focus, and final composite;
@@ -279,6 +292,13 @@ Required outcomes:
 - preserve and complete the native desktop supervisor contract: `boon_native_playground` starts independent preview and dev/debug child processes with independent native surfaces; preview receives Boon source only through `--code-file`/`ReplaceCode`, never example identity; dev may resolve examples to source; telemetry/query IPC is bounded and must not mirror full runtime/document/layout/render state; preview rendering remains responsive under dev/debug overload.
 
 Keep actual WESL/WGSL/generated-binding verification. Do not allow marker strings or copied shader text to count as proof.
+
+The render graph is mandatory to try, but not mandatory to keep blindly. Keep it
+only if fresh before/after Cells and TodoMVC reports show a performance benefit
+or show removal/quarantine of legacy product hot-path coupling without budget
+regression. If it worsens performance and does not simplify code, revert or
+quarantine it and record an evidence-based ADR/progress entry with report
+paths.
 
 PHASE 6 — SHARED NATIVE/WEB VISUAL PATH AND SEMANTIC ACCESSIBILITY
 
@@ -659,5 +679,11 @@ Do not substitute a persuasive narrative for failed or missing gates.
 ## Short slash command
 
 ```text
-/goal follow docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md and continue the existing BYTES/MachinePlan half-migration through the unified retained UI/WGPU, native-web, accessibility, 3D SolidGraph, and manufacturing architecture. Preserve all existing honesty and verification gates; do not commit or push unless explicitly asked.
+/goal follow docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md from the current HEAD. First inspect current git status, recent commits, readiness reports, and native GPU reports. Treat commit 8117094 and target/reports/native-gpu/cells-visible-click-e2e-release.json as latest known evidence that headed Cells visible-click passed on hardware, but verify freshness before relying on it.
+
+Continue remaining BYTES/MachinePlan/default-engine readiness work, but do not leave the native WGPU render graph as optional backlog. Implement and measure a generic ProductRenderGraph / PresentPlan slice for native product frames: ActivePreviewScene + ProductPatch must compile into explicit product passes, while proof/readback/reporting stay post-present subscribers keyed by FrameEvidenceKey.
+
+Measure before and after on Cells and TodoMVC. Keep the render graph if it improves performance or removes/quarantines legacy product hot-path coupling without budget regressions. If it worsens performance and does not simplify code, revert or quarantine it and record an evidence-based ADR/progress entry. Do not add Cells/example-specific hacks anywhere in compiler, runtime, document, renderer, app-window, playground, or verifier code.
+
+Mark the goal achieved only when one of these is true: (1) ProductRenderGraph / PresentPlan is implemented and kept, with fresh schema-valid before/after Cells and TodoMVC reports proving required budgets still pass, proof/readback/reporting stay post-present, no product-frame proof/readback coupling exists, and the render graph either improves performance or removes/quarantines legacy hot-path coupling without regression; or (2) ProductRenderGraph / PresentPlan was implemented, measured, found worse or not simplifying, then reverted or quarantined with an ADR/progress entry and fresh schema-valid reports proving the old path still passes. Do not mark the goal achieved for an honest blocker handoff; a blocker handoff may end the current work turn, but the goal remains active unless the strict blocked-audit rule is satisfied. Do not commit or push unless explicitly asked.
 ```

@@ -32955,6 +32955,53 @@ Remaining blockers:
   UI blocker, including the selected-cell/formula-bar desynchronization noted
   during manual testing.
 
+## 2026-07-03 - Headed Cells Visible-Click Gate Passed And Render Graph Made Mandatory
+
+Status: continued unified native WGPU/performance planning after commit
+`8117094 Pass headed Cells visible click gate`. The focused headed Cells
+visible-click release gate is now verified on hardware and should no longer be
+treated as the next blocker unless a fresh current-worktree report regresses.
+The next native architecture slice must actually implement and measure a
+generic `ProductRenderGraph` / `PresentPlan` path rather than leaving render
+graph work as optional backlog.
+
+What changed:
+
+- `GOAL_PROMPT.md` now points the next unattended pass at the unified prompt,
+  records the Cells gate as latest known passed evidence, and requires a
+  render-graph implementation/measurement slice.
+- `NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md` now records the passed
+  Cells evidence and reclassifies render graph as a mandatory trial with
+  keep/revert criteria.
+- `UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md` now keeps Phase 1 focused on real
+  BYTES/MachinePlan/default-engine blockers, but requires Phase 5 to implement
+  and measure `ProductRenderGraph` / `PresentPlan`.
+- `UNIFIED_RUNTIME_RENDERING_3D_PLAN.md` now states that the passed Cells gate
+  proves the retained product/proof split can hit 60 FPS-class click latency,
+  but does not complete retained WGPU architecture.
+
+Evidence:
+
+- Latest committed code evidence: `8117094 Pass headed Cells visible click gate`.
+- `target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  `status=pass`, hardware adapter NVIDIA GeForce RTX 2070/Vulkan,
+  `product_only_ux_contract.status=pass`, product p95 `9.903322ms`, product max
+  `10.352470ms`, `60` measured product samples, `60` typed product patches,
+  `60` typed product results, `proof_only_contract.status=pass`, `64/64` exact
+  visual proofs, proof lag max `0`, and missed product frames `0`.
+
+Remaining blockers:
+
+- The unified goal remains incomplete: BYTES/MachinePlan partial phases and the
+  default legacy `boon_cli run` switch still need fresh readiness evidence.
+- Broader Cells obligations still require current evidence when relevant:
+  semantic-delta parity, passive scroll, virtualization, aggregate native GPU
+  gates, and readiness audits.
+- Render graph is now a required trial, not an optional TODO. It must be kept
+  only if it improves performance or removes/quarantines legacy product
+  hot-path coupling without budget regression; otherwise it must be reverted or
+  quarantined with an ADR/progress entry and measured report paths.
+
 ## 2026-06-30 - U1 Cells Formula-Bar Retained Binding Proof
 
 Status: continued U1/TASK-0804A native retained UI work. The selected

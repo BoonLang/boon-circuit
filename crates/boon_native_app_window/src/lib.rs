@@ -3701,11 +3701,122 @@ pub struct NativeProductPatchSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductRenderGraphPassSummary {
+    pub schema_version: u32,
+    pub pass_id: String,
+    pub pass_kind: String,
+    pub source: String,
+    pub target: String,
+    pub product_visible: bool,
+    pub proof_or_readback: bool,
+    pub post_present_subscriber: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductRenderGraphSummary {
+    pub schema_version: u32,
+    pub status: String,
+    pub owner: String,
+    pub graph_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_execution_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_plan_hash: Option<String>,
+    #[serde(default)]
+    pub renderer_graph_pass_count: u32,
+    #[serde(default)]
+    pub renderer_graph_product_pass_count: u32,
+    #[serde(default)]
+    pub renderer_graph_proof_pass_count: u32,
+    #[serde(default)]
+    pub renderer_graph_resource_count: u32,
+    #[serde(default)]
+    pub renderer_graph_product_resource_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_resource_lifetime_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_scene_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_scene_identity: Option<String>,
+    pub pass_count: u32,
+    pub product_pass_count: u32,
+    pub proof_pass_count: u32,
+    pub post_present_subscriber_count: u32,
+    pub dirty_chunk_count: u64,
+    pub upload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_time_ms: Option<f64>,
+    pub cache_hit: bool,
+    pub full_rebuild_fallback_count: u64,
+    pub proof_readback_in_product_graph: bool,
+    pub stale_epoch_rejection_count: u64,
+    pub plan_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passes: Vec<NativeProductRenderGraphPassSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativePresentPlanSummary {
+    pub schema_version: u32,
+    pub status: String,
+    pub owner: String,
+    pub plan_kind: String,
+    pub render_target_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_path_mode: Option<NativePresentPathMode>,
+    pub pass_count: u32,
+    pub product_pass_count: u32,
+    pub proof_pass_count: u32,
+    pub post_present_subscriber_count: u32,
+    pub proof_readback_in_product_passes: bool,
+    pub proof_readback_post_present_subscriber: bool,
+    pub plan_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeProductRenderGraphExecutionSummary {
+    pub schema_version: u32,
+    pub status: String,
+    pub owner: String,
+    pub execution_kind: String,
+    pub frame_evidence_key: FrameEvidenceKey,
+    pub render_graph_plan_hash: String,
+    pub present_plan_hash: String,
+    pub product_pass_count: u32,
+    pub proof_pass_count: u32,
+    pub post_present_subscriber_count: u32,
+    pub proof_readback_in_product_graph: bool,
+    pub proof_readback_post_present_subscriber: bool,
+    pub legacy_pre_present_proof_request_count: u32,
+    pub legacy_product_proof_built_pre_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_acquire_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_time_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_finish_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_submit_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_call_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_path_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeProductFrameResult {
     pub schema_version: u32,
     pub owner: String,
     pub result_kind: String,
     pub product_frame: NativeRenderedProductFrame,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph: Option<NativeProductRenderGraphSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_plan: Option<NativePresentPlanSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph_execution: Option<NativeProductRenderGraphExecutionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
 }
@@ -3770,6 +3881,12 @@ pub struct NativeProductFrameCommit {
     pub render_hook_phase_timings: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_frame: Option<NativeRenderedProductFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph: Option<NativeProductRenderGraphSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_plan: Option<NativePresentPlanSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph_execution: Option<NativeProductRenderGraphExecutionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
     pub post_present_proof_request_count: u32,
@@ -3818,6 +3935,12 @@ pub struct NativeRenderFrameMetrics {
     pub product_frame: Option<NativeRenderedProductFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_result: Option<NativeProductFrameResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph: Option<NativeProductRenderGraphSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_plan: Option<NativePresentPlanSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_graph_execution: Option<NativeProductRenderGraphExecutionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
 }
@@ -7824,6 +7947,14 @@ fn product_frame_commit_for_presented_frame(
     let product_result_kind = product_result
         .as_ref()
         .map(|result| result.result_kind.clone());
+    let render_graph = product_result
+        .as_ref()
+        .and_then(|result| result.render_graph.clone())
+        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.render_graph.clone()));
+    let present_plan = product_result
+        .as_ref()
+        .and_then(|result| result.present_plan.clone())
+        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.present_plan.clone()));
     let product_frame = product_result
         .as_ref()
         .map(|result| result.product_frame.clone())
@@ -7841,6 +7972,15 @@ fn product_frame_commit_for_presented_frame(
         frame.legacy_proof_json_built_pre_present
             || frame.legacy_render_hook_proof_built_pre_present
     });
+    let render_graph_execution = product_render_graph_execution_for_commit(
+        state,
+        &frame_evidence_key,
+        render_graph.as_ref(),
+        present_plan.as_ref(),
+        post_present_proof_requests.len() as u32,
+        legacy_pre_present_proof_request_count,
+        legacy_product_proof_built_pre_present,
+    );
     NativeProductFrameCommit {
         schema_version: 1,
         commit_source: "app_window_product_frame_commit".to_owned(),
@@ -7894,7 +8034,45 @@ fn product_frame_commit_for_presented_frame(
         product_result_owner,
         product_result_kind,
         product_frame,
+        render_graph,
+        present_plan,
+        render_graph_execution,
     }
+}
+
+fn product_render_graph_execution_for_commit(
+    state: &NativeRenderLoopState,
+    frame_evidence_key: &FrameEvidenceKey,
+    render_graph: Option<&NativeProductRenderGraphSummary>,
+    present_plan: Option<&NativePresentPlanSummary>,
+    post_present_subscriber_count: u32,
+    legacy_pre_present_proof_request_count: u32,
+    legacy_product_proof_built_pre_present: bool,
+) -> Option<NativeProductRenderGraphExecutionSummary> {
+    let render_graph = render_graph?;
+    let present_plan = present_plan?;
+    Some(NativeProductRenderGraphExecutionSummary {
+        schema_version: 1,
+        status: "pass".to_owned(),
+        owner: "app_window_product_frame_commit".to_owned(),
+        execution_kind: "product_render_graph_execution".to_owned(),
+        frame_evidence_key: frame_evidence_key.clone(),
+        render_graph_plan_hash: render_graph.plan_hash.clone(),
+        present_plan_hash: present_plan.plan_hash.clone(),
+        product_pass_count: render_graph.product_pass_count,
+        proof_pass_count: render_graph.proof_pass_count,
+        post_present_subscriber_count,
+        proof_readback_in_product_graph: render_graph.proof_readback_in_product_graph,
+        proof_readback_post_present_subscriber: present_plan.proof_readback_post_present_subscriber,
+        legacy_pre_present_proof_request_count,
+        legacy_product_proof_built_pre_present,
+        surface_acquire_call_ms: state.last_surface_acquire_call_ms,
+        encode_time_ms: render_graph.encode_time_ms,
+        encoder_finish_ms: state.last_encoder_finish_ms,
+        queue_submit_call_ms: state.last_queue_submit_call_ms,
+        present_call_ms: state.last_present_call_ms,
+        present_path_ms: state.last_present_path_ms,
+    })
 }
 
 fn visible_surface_readback_post_present_request() -> NativePostPresentProofRequestSummary {
@@ -7925,6 +8103,22 @@ fn add_post_present_proof_request_to_commit(
     commit.post_present_proof_request_count = commit.post_present_proof_requests.len() as u32;
     if let Some(product_frame) = commit.product_frame.as_mut() {
         product_frame.post_present_proof_request_count = commit.post_present_proof_request_count;
+    }
+    if let Some(render_graph) = commit.render_graph.as_mut() {
+        render_graph.post_present_subscriber_count = commit.post_present_proof_request_count;
+        render_graph.pass_count = render_graph
+            .product_pass_count
+            .saturating_add(render_graph.proof_pass_count);
+    }
+    if let Some(present_plan) = commit.present_plan.as_mut() {
+        present_plan.post_present_subscriber_count = commit.post_present_proof_request_count;
+    }
+    if let Some(execution) = commit.render_graph_execution.as_mut() {
+        execution.post_present_subscriber_count = commit.post_present_proof_request_count;
+        execution.legacy_pre_present_proof_request_count =
+            commit.legacy_pre_present_proof_request_count;
+        execution.legacy_product_proof_built_pre_present =
+            commit.legacy_product_proof_built_pre_present;
     }
 }
 
@@ -11061,6 +11255,9 @@ mod tests {
                 owner: "preview_active_scene".to_owned(),
                 result_kind: "active_preview_scene_patch".to_owned(),
                 product_frame: typed_frame,
+                render_graph: None,
+                present_plan: None,
+                render_graph_execution: None,
                 post_present_proof_requests: typed_requests,
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
@@ -13435,6 +13632,9 @@ mod tests {
             render_hook_phase_timings: None,
             product_frame: None,
             product_result: None,
+            render_graph: None,
+            present_plan: None,
+            render_graph_execution: None,
             post_present_proof_requests: Vec::new(),
         };
         state.note_render_frame_metrics(Some(render_metrics.clone()));
@@ -13927,6 +14127,9 @@ mod tests {
                 render_hook_phase_timings: None,
                 product_frame: None,
                 product_result: None,
+                render_graph: None,
+                present_plan: None,
+                render_graph_execution: None,
                 post_present_proof_requests: Vec::new(),
             };
             accumulator.record(

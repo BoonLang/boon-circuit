@@ -22199,6 +22199,94 @@ Latest speed facts:
   `target/reports/bytes-plan/cells-release-benchmark-speed.json`.
 - Wrapper report:
   `target/reports/bytes-plan/cells-release-benchmark.json`.
+
+## 2026-07-03 - Phase 10 Default-Engine Guard Made Transition-Aware
+
+Status: implemented a Phase 10 readiness-guard correction, not a default-engine
+switch. The previous `verify-bytes-default-engine-readiness` gate could only
+prove the pre-switch legacy default state, while `audit-goal-readiness` requires
+the eventual default to be PlanExecutor. The guard now supports both states:
+pre-switch `legacy` remains valid today, and post-switch `plan` has an explicit
+contract ready for the future default change.
+
+What changed:
+
+- `verify-bytes-default-engine-readiness` now detects whether
+  `boon_cli run` defaults to `legacy` or `plan`.
+- In pre-switch mode it preserves the old proof:
+  - no-`--engine` TodoMVC run must use `semantic`;
+  - explicit TodoMVC and Cells `--engine compare` runs must use
+    `run-plan-scenario-events`;
+  - `default_switch_allowed=false`.
+- In post-switch mode it will require:
+  - no-`--engine` TodoMVC and Cells runs to use
+    `run-plan-scenario-events`;
+  - explicit `--engine legacy` to remain available as a semantic fallback
+    smoke;
+  - explicit TodoMVC and Cells `--engine compare` differential checks;
+  - `default_switch_allowed=true`.
+- `boon_report_schema` now validates either the pre-switch or post-switch
+  default-engine readiness contract instead of hard-coding legacy forever.
+- `boon_cli run` still defaults to legacy. This entry intentionally does not
+  close Phase 10.
+
+Independent review:
+
+- Default-engine explorer found that `audit-goal-readiness` requires
+  `let mut engine = "plan".to_owned()` in `crates/boon_cli/src/main.rs`, while
+  the old default-engine guard required the opposite legacy source text. The
+  recommended next slice was exactly this transition-aware guard.
+- Phase-closure explorer recommended that Phases 4 and 5 may be promotable
+  after fresh current-worktree regeneration, but Phases 6-9 remain genuinely
+  partial: Cells still uses accepted demand-current/coalesced semantic deltas,
+  BYTES storage/warm-tick coverage is focused rather than complete, example
+  asset-descriptor parity is not fully proven, and broader performance policy
+  remains open.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass with existing unrelated
+  warnings.
+- `cargo xtask verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass. The refreshed report has
+  `readiness_mode=pre-switch-legacy-default`, `default_engine=legacy`,
+  `default_switch_allowed=false`, `explicit_compare_case_count=2`, and passing
+  child reports for `default-run-semantic`, `todomvc-compare`, and
+  `cells-compare`.
+- `cargo xtask verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `boon_report_schema` row-resolution replay was corrected to match the
+  current generic PlanExecutor report shapes:
+  - indexed updates include `row_lookup_field` and `row_lookup_payload`, with
+    the field populated from the source route when available;
+  - scoped list-removal rows preserve the existing smaller row-resolution
+    shape without those nullable lookup fields.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass after refreshing stale child reports against the rebuilt binaries. The
+  current aggregate checks `63/63` required reports, `52` proof reports, `11`
+  diagnostic reports, `42` PlanExecutor reports, and `42` no-fallback
+  PlanExecutor reports.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json target/reports/bytes-plan/bytes-goal-readiness.json target/reports/bytes-plan/bytes-default-engine-readiness.json target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `cargo xtask audit-goal-readiness --report target/reports/bytes-plan/bytes-goal-readiness.json`:
+  expected fail. Current blockers are seven partial phases, stale
+  non-BYTES readiness reports
+  (`target/reports/runtime-production-hardening.json`,
+  `target/reports/runtime-finality.json`,
+  `target/reports/debug/machine-readiness.json`, and
+  `target/reports/schema.json`), and the intentionally unswitched legacy
+  default.
+- `git diff --check`: pass.
+
+Remaining blockers:
+
+- Do not switch `boon_cli run` default yet. Phase 10 remains blocked while
+  Phases 6-9 have honest remaining scope.
+- A later default-switch slice should first close or explicitly supersede the
+  remaining phase gaps, refresh the stale non-BYTES readiness reports, then
+  flip the CLI default and run the post-switch default-engine readiness
+  contract.
 - `status="pass"`.
 - `source_hash="9a8725d2d9cde3f8c648d92d417b3724289b7fde953632c34643cffe8df37dc6"` in both reports.
 - `input_to_idle_ms_p95=3.905211` against the `4.0ms` budget.
@@ -35311,9 +35399,9 @@ Remaining blockers:
 
 - Seven BYTES/MachinePlan phases remain partial.
 - The default engine remains legacy.
-- Cells visible-interaction speed/correctness remains open; formula-bar
-  synchronization after cell focus must be measured and fixed by the native
-  retained/runtime path, not hidden with a Cells-specific workaround.
+- The latest focused native Cells visible-click release report is now handled
+  in the native/runtime rendering ledger, with the reminder that broad native
+  readiness is still separate from BYTES/MachinePlan default-engine readiness.
 
 ## 2026-06-30 - Cells Demand-Current Semantic-Delta Readiness Contract
 

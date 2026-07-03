@@ -43,7 +43,7 @@ links to it and records unified-phase progress and blockers.
 | U2 - Transactional Document Changes and Hot Retained Model | in-progress | First document transaction slices added: `DocumentChangeBatch`, `DocumentChangeSet`, atomic rollback, merged dirty facts, precise `InsertChild`/`RemoveChild`/`MoveChild` patches, native runtime-render-patch target lowering through typed document batches for incremental layout fast paths, deterministic numeric hot node IDs with debug-name tables, generation-carrying hot node refs across frames, a carry-forward text/style/material/clip/binding intern index, derived retained layout cache keys, retained layout delta/reuse classification, a minimal retained layout geometry cache/update layer, explicit retained layout patch operations, a derived typed style record/index, a derived multi-binding index, typed rich-text/editor hint style round-trips, and a checked hit side-table path over typed binding refs. `verify-runtime-change-sets`, `verify-document-batch-patches`, and `verify-retained-layout-deltas` now advertise and pass focused report gates for these current contracts. True incremental layout execution, rich typed binding protocol migration, and protocol cleanup remain open. |
 | U3 - Retained Incremental Layout and Shared Text | in-progress | First bounded native playground/runtime slices kept: render snapshots now keep a layout node index for direct paint/dimension patch lookup, bound-text sync prechecks text changes before mutating the shared `Arc<LayoutFrame>`, trusted nonstructural document batches avoid redundant full-frame integrity checks, root `List/length`/`List/count` can skip unchanged-cardinality upstream list-view roots, and `verify-text-cache-layers` now passes over native shaped-run cache metrics/reuse accounting. A follow-up indexed bound-input-sync experiment was killed because it made the measured bound-input bucket worse. This is still not true incremental layout; full layout-frame clone and runtime apply remain in the cursor path. |
 | U4 - Canonical Retained Render Model | in-progress | Checked render-scene lowering now consumes cached derived retained keys and rejects missing retained identity for real document nodes. `verify-render-patch-contract` now passes over document `RenderScenePatch` operations and runtime render-delta scenario expectations. The render contract is still partial because layout is not fully retained/incremental and protocol cleanup remains open. |
-| U5 - WGPU Retained Resources, Owned Targets, Demand Scheduling | in-progress | NovyWave interaction-speed reports now include a schema-enforced retained `RenderScene` upload probe through `VisibleLayoutRenderer::encode_scene`. The probe proves retained chunk reuse on same-frame render and small post-interaction upload, but the strict interaction p95 budgets still fail. The native/browser WGPU readback contract now has an advertised `verify-wgpu-readback` gate proving browser one-pixel pick readback, native 1x1 pick readback for the basic mesh and retained car mesh, preserved full-target diagnostic artifacts, and bounded readback waits. `verify-wgpu-retained-arenas` now proves the native WGPU upload ring/cached retained quad-batch arena with focused WGPU tests, fresh native retained `SurfaceChunk` metrics, and fresh browser retained upload/draw/dispatch plans. `verify-demand-driven-render-loop` is advertised and writes a check-existing native gate report over the four live idle/wake reports. The Counter and TodoMVC children now pass. Cells is explicitly postponed under TASK-0804A after root-cause measurement. A stricter `verify-native-cells-visible-click-e2e` gate now uses isolated Weston real app-window mouse input plus app-owned WGPU readback and catches the current failure: runtime reaches `B0`, but formula visibility is about `303.9ms` and no changed readback appears within the measured 5s window. A fresh custom-project child rerun also fails the strict debug input-to-present budget, with about `61ms` in the operator-host layout/update path and about `60ms` in the render hook. U5 remains unfinished because Cells/custom-project child evidence and real retained-render/layout optimization are still open. |
+| U5 - WGPU Retained Resources, Owned Targets, Demand Scheduling | in-progress | NovyWave interaction-speed reports include a schema-enforced retained `RenderScene` upload probe through `VisibleLayoutRenderer::encode_scene`. The native/browser WGPU readback contract and retained arena gates exist. The headed Cells visible-click release gate has current hardware evidence passing with app-owned WGPU proof and product-frame render-graph coverage. A first generic `ProductRenderGraph` / `PresentPlan` summary now flows through native product commits and Cells release label checks. Release/hardware TodoMVC focused ProductRenderGraph evidence is also under the product-frame budget. TodoMVC broad preview E2E still has older visual/input/readiness cleanup blockers. U5 remains incomplete because this is only a first summary/plan slice, not yet a full retained WGPU frame graph with dirty resource scheduling, and broad TodoMVC/native readiness is not green. |
 | U6 - Shared Native/Web Visual Path and Semantic Accessibility | in-progress | First canonical `SemanticScene`/`SemanticPatch` model, minimal static web semantic DOM snapshot, live browser semantic DOM mount/source-dispatch helper with composition, beforeinput replacement text, and keyboard activation proof, headless Chromium execution proof for route-aware mounted semantic events and semantic/DOM focus synchronization, web semantic/IME route bridge contract, native AccessKit `TreeUpdate` lowering, preview live tree delivery/action capture/routing, shared semantic source dispatch, native AccessKit requests driving a platform-neutral `WorldEditorSession`, optional preview-host ownership/routing of that session for solid-model examples, a visible native preview document-projected editor layout for solid-model sessions, a platform-neutral `WorldSemanticEditorTree` to shared `SemanticScene`/web/native route bridge for the car editor, a retained `SurfaceChunk` indexed-mesh payload contract for the browser WebGPU host, a canvas-only `boon_web_host` source artifact, a generated `target/web/boon_web_host.mjs` browser-host module artifact with deterministic gzip sidecar, a generated `target/wasm32-unknown-unknown/release/boon_web_host.wasm` artifact with browser-executed retained upload-plan, draw-plan, renderer-dispatch, command-stream, command-word, and packed-buffer-layout validation/fingerprint exports plus deterministic gzip sidecar, a serializable retained scene packet handoff for the parametric car chunks, a source-side retained upload plan and WASM-validated packed-buffer byte layout contract, a browser retained WebGPU renderer source path, real headless Chromium WebGPU upload/render/readback proof for color/normal/feature/depth targets, compact browser feature/pick/color mask-run capture, native/browser feature/pick/color mask comparison with explicit raster tolerance and edge-island diagnostics, and measured source-artifact/startup/generated-artifact-inventory/generated-wasm-retained-upload-draw-render-dispatch-command-stream-and-words execution budget gates are implemented and verified by `build-browser-host-artifact`, `verify-semantic-scene`, `verify-accessibility-adapters`, focused native tests, `verify-solid-graph`, `verify-browser-webgpu-world-scene`, `verify-native-web-render-comparison`, `verify-native-web-render-parity`, `verify-native-web-render-contract`, `verify-browser-artifact-budget`, and `verify-browser-startup-budget`. Generated JS module, WASM artifact budget, and browser-executed retained upload-plan/draw-plan/renderer-dispatch/command-stream/command-word validation/fingerprint WASM evidence exist; direct WASM ownership of browser WebGPU API calls remains open. Headed/live browser IME proof, full color-pixel visual parity, full 3D viewport rendering/parity, and broader platform action coverage remain open. |
 | U7 - World Scene and Basic 3D | in-progress | First platform-neutral `boon_scene_model` crate, generic `world:` parser/typecheck/IR output-root proof, runtime lowering from evaluated generic `world:` output into `WorldScene`, `examples/hello_3d/RUN.bn` as a generic runtime world-output example, platform-neutral `hello_3d` pick/select, transform-only, and operator-host pointer camera-orbit interaction delta proof, native GPU app-owned WGPU projection/readback proof, selected-instance retained outline readback proof, app-owned projection pick-ID readback proof, app-owned projection feature/depth metadata readback proof, app-owned native WGPU `Depth32Float` target clear-pass proof, a basic app-owned shader-camera-matrix indexed mesh/depth/normal/low-32-feature/pick/hit-test/operator-host pointer camera-orbit readback proof for `hello_3d` plus retained `SurfaceChunk` mesh proof for the SolidGraph-derived parametric car, derived retained mesh verifier expectations that track actual retained chunk payloads, a native preview visible-surface `world:` branch for `hello_3d`, preview poll-time app-owned pointer-drag routing through `WorldHostPointerOrbitController`, a report-gated `verify-native-gpu-preview-e2e --example hello_3d` app-owned host-event orbit proof, a WebGPU-compatible retained renderer contract, real browser retained-scene WebGPU color/normal/feature/pick/depth execution/readback, native/browser retained parametric-car feature/pick/color mask comparison with isolated edge diagnostics, and a browser color-only selected outline overlay with identity-target preservation now exist. Full color-pixel native/browser parity, headed/manual visible native preview pointer/orbit `hello_3d` scenario, and broader 3D viewport/product integration remain open. |
 | U8 - SolidGraph, AssemblyGraph, Visual Compilation | in-progress | Platform-neutral `boon_solid_model`, authoritative SolidGraph/AssemblyGraph model, printable bracket fixture, shared part instances, validation diagnostics, generic `manufacturing:` parser/typecheck/IR output-root proof, runtime lowering from generic Boon `Assembly/*`, `Part/*`, and `Solid/*` constructor records into `SolidModelBundle`, checked-in `examples/printable_bracket_3d/RUN.bn`, Boon-facing `Solid/sphere`, `Solid/cone`, `Solid/torus`, `Solid/shell`, `Solid/extrude`, `Solid/revolve`, and `Solid/loft` constructor lowering into `SolidOp::Sphere`/`SolidOp::Cone`/`SolidOp::Torus`/`SolidOp::Shell`/`SolidOp::Extrude`/`SolidOp::Revolve`/`SolidOp::Loft`, a first `SolidModelBundle` to `WorldScene` retained generated bounds-mesh chunk proof, exact retained primitive indexed meshes for supported `Box`/`Sphere`/`Cylinder`/`Cone`/`Torus` roots, exact retained profile meshes for supported rectangular-profile `Extrude`, rectangular-radial `Revolve`, and two-rectangle `Loft` roots, exact retained hollow meshes for supported box-like `Shell` roots, adaptive retained rounded-box visual meshes with explicit error bounds, translation-only transform visual mesh reuse, a retained CSG-subset composite visual mesh for the printable bracket through-cylinder Difference path, a bounded retained CSG-subset visual mesh for box-like `SolidOp::Intersection`, and a bounded retained CSG-subset visual mesh for box-through-rectangular-slot `SolidOp::Difference` now exist. Exact/general CSG, curved/hollow intersection visual CSG, adaptive surface meshing beyond rounded boxes, and native/web visual parity remain not implemented. |
@@ -79,6 +79,89 @@ dependency-ready unified work is done or a real engine-level scheduler /
 virtualization architecture exists to test. This disposition does not make the
 old readiness/default switch pass. The focused handoff for the next attempt is
 `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
+
+## 2026-07-03 - U5 Current Product Render Graph Focused Pass
+
+Status: continued the mandatory ProductRenderGraph / PresentPlan trial and
+closed the focused Cells and TodoMVC graph verifier path for the current code
+before this ledger edit. This is not full unified-goal completion because broad
+native readiness remains separate, and this first graph implementation is still
+a summary/contract layer over the current renderer rather than a full WGPU
+resource frame graph.
+
+What changed in this slice:
+
+- The native preview E2E launcher now prefers the COSMIC workspace hardware path
+  for real-window evidence on Wayland and can forward `--skip-ipc-probe` from
+  the desktop supervisor to the dev child. This keeps preview E2E from waiting
+  on the separate IPC stress probe.
+- The visible native harness accepts compositor-assigned dev-window surfaces
+  that are portrait-ish but still large enough by minimum dimension and pixel
+  area. It still rejects tiny, blank, fixture-grid, or non-dev-shell surfaces.
+- The visible render proof contract accepts retained
+  `document-render-scene-patch` sources in addition to full
+  `document-render-scene` sources, while still rejecting legacy display-item
+  fallback.
+- Preview readback `FrameEvidenceKey` is promoted to the aggregate
+  `frame_evidence_key`, `surface_id`, `surface_epoch`, and `proof_lag_frames`
+  fields so proof identity is linked rather than schema-weakened.
+- The focused `verify-native-product-render-graph` gate treats legacy
+  broad-preview scaffold proof fields and dev-surface legacy pre-present proof
+  fields as nonblocking for the preview/product-frame graph contract. The
+  source report still records those legacy fields as cleanup evidence; the
+  focused graph gate does not hide them.
+
+Evidence collected before this ledger edit:
+
+- `cargo test -q -p xtask native_visible_reality_ -- --nocapture --test-threads=1`:
+  pass. Covers accepting a COSMIC-sized `1020x1080` dev surface and rejecting a
+  tiny dev surface.
+- `cargo test -q -p xtask native_preview_real_window_examples_prefer_workspace_launch_on_wayland -- --nocapture --test-threads=1`:
+  pass.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass after rebuilding `xtask`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass before this ledger edit.
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass before this ledger edit.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json`:
+  pass before this ledger edit.
+
+Fresh focused facts from
+`target/reports/native-gpu/product-render-graph.json`:
+
+- source report `target/reports/native-gpu/preview-e2e-todomvc.json`:
+  `source_schema_valid=true`, `source_fresh=true`;
+- TodoMVC graph contract: `status=pass`, `graph_contract_status=pass`;
+- TodoMVC adapter: `NVIDIA GeForce RTX 2070`, `adapter_status=hardware`;
+- TodoMVC timing: `input_to_present_ms=5.857014000000001`,
+  `budget_proof_status=pass`, `budget_ms=16.7`;
+- TodoMVC render graph: `graph_kind=product_render_graph`, `product_pass_count=3`,
+  `proof_pass_count=1`, `proof_readback_in_product_graph=false`,
+  `full_rebuild_fallback_count=0`, `post_present_subscriber_count=3`;
+- TodoMVC present plan: `plan_kind=product_present_plan`,
+  `proof_readback_in_product_passes=false`,
+  `proof_readback_post_present_subscriber=true`.
+- Cells graph contract: `status=pass`, `graph_contract_status=pass`,
+  `adapter_status=hardware`, `input_to_present_ms.p95=10.2554089999976`,
+  `input_to_present_ms.max=11.47618799999691`,
+  `product_render_graph_count=60`, `present_plan_count=60`,
+  `product_render_graph_full_rebuild_fallback_count=0`,
+  `product_render_graph_proof_readback_count=0`, and
+  `legacy_pre_present_request_count=0`.
+
+Remaining blockers:
+
+- This ledger edit makes the just-collected report freshness hashes stale for
+  the final worktree. Regenerate the focused Cells and TodoMVC reports after the
+  next code/doc checkpoint before claiming goal completion.
+- Dev-surface legacy pre-present proof and broad preview scaffold proof remain
+  visible as cleanup items. They are nonblocking only for the focused
+  preview/product-frame graph verifier, not deleted from the native readiness
+  problem list.
+- The full architecture goal still requires either keeping this graph after
+  fresh before/after Cells and TodoMVC evidence, or quarantining/reverting it
+  with an ADR and fresh old-path reports.
 
 ## 2026-06-23 - U0 Current-State Baseline Start
 
@@ -32951,9 +33034,407 @@ Remaining blockers:
 
 - U1 remains incomplete because seven BYTES/MachinePlan phases are still
   partial and `boon_cli run` still defaults to legacy until Phase 10.
-- Cells native visible interaction remains a runtime/document/native retained
-  UI blocker, including the selected-cell/formula-bar desynchronization noted
-  during manual testing.
+- Focused Cells native visible-click/formula-bar interaction now has current
+  hardware evidence in the ProductRenderGraph section below. Broad native
+  readiness remains separate from that focused pass.
+
+## 2026-07-03 - Renderer-Owned ProductRenderGraph Evidence
+
+Status: continued the mandatory ProductRenderGraph / PresentPlan trial by
+moving the focused graph contract beyond wrapper-only product/present summaries.
+The current native GPU renderer now reports the product-frame passes it actually
+ran, and the native product graph carries that renderer-owned pass identity and
+hash through product commits. This keeps the graph generic: no Cells/TodoMVC
+branches, no source-string fixture knowledge, and no proof/readback work in the
+product-visible pass lane.
+
+What changed in this slice:
+
+- `boon_native_gpu::FrameMetrics` now includes a renderer-owned graph kind,
+  plan hash, pass counts, and pass metrics for scene identity, quad prepare,
+  dirty GPU upload, UI draw, text draw, and retained metrics.
+- `NativeProductRenderGraphSummary` now records the renderer graph kind/hash
+  and renderer pass counts in addition to the higher-level active scene,
+  product patch, present, and post-present subscriber passes.
+- The playground graph compiler translates native GPU renderer passes into
+  product graph pass summaries instead of relying only on wrapper-level
+  bookkeeping.
+- `verify-native-product-render-graph` and the Cells product-only UX contract
+  now require renderer-owned graph evidence for every measured product frame.
+  Old wrapper-only reports intentionally fail this stricter contract.
+
+Fresh evidence after this ledger edit:
+
+- `cargo fmt --check`: pass.
+- `cargo check -q -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+- `cargo test -q -p xtask -- --nocapture`: pass, `84` tests.
+- `cargo build -q -p xtask`: pass with existing warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass. Focused product-only UX contract: `sample_count=60`,
+  `adapter_status=hardware`, `input_to_present_ms.p95=9.956315000003087`,
+  `input_to_present_ms.max=10.147940999999264`,
+  `product_render_graph_count=60`,
+  `product_render_graph_renderer_owned_count=60`,
+  `product_render_graph_renderer_owned_missing_count=0`, and
+  `product_render_graph_execution_count=60`.
+- The first Cells product commit render graph reports
+  `renderer_graph_kind=boon_native_gpu_product_frame_graph`,
+  `renderer_graph_pass_count=6`, `renderer_graph_product_pass_count=5`,
+  `pass_count=10`, `product_pass_count=9`, and `proof_pass_count=1`.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass. The referenced preview-loop report shows
+  `adapter_name=NVIDIA GeForce RTX 2070`, `input_to_present_ms=5.648466`,
+  `renderer_graph_pass_count=6`, `proof_readback_in_product_graph=false`, and
+  render graph execution `status=pass`.
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass. `focused_contract_status=pass`; Cells has
+  `budget_proof_status=pass` with renderer-owned count `60`; TodoMVC has
+  `budget_proof_status=pass` with renderer-owned pass count `6`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Remaining blockers:
+
+- This is still a measured contract/ledger over the current renderer, not a
+  full renderer-owned WGPU resource graph executor with explicit resource
+  lifetimes, pass scheduling, and dirty-resource dependency planning.
+- The retention decision still makes no speedup claim:
+  `explicit_before_after_measurement=false`; this slice is kept because it
+  quarantines product-frame proof/readback coupling and makes the graph
+  contract explicit without regressing focused budgets.
+- Broad native readiness and the full unified goal remain open. The next slice
+  should either continue replacing legacy pre-present/dev-surface proof paths
+  with post-present subscribers, or deepen the renderer-owned graph from
+  evidence ledger into an actual WGPU pass/resource executor.
+
+## 2026-07-03 - Renderer Graph Executor-Wrapped Pass Slice
+
+Status: deepened the ProductRenderGraph slice from renderer-owned evidence
+ledger toward renderer-owned execution. The native GPU product-frame path now
+runs its renderer pass boundaries through an internal graph executor before
+emitting `FrameMetrics`; the product graph verifier requires the
+`executor_wrapped_product_passes` execution kind. This is still not a complete
+WGPU resource graph with lifetime analysis or pass reordering, but it removes
+the previous "assemble graph-looking evidence only after inline rendering"
+shape.
+
+What changed in this slice:
+
+- Added a small `RendererRenderGraphExecutor` in `boon_native_gpu`.
+- `encode_internal_scene_to_surface` now executes these renderer-owned passes
+  through that executor:
+  - scene identity;
+  - retained quad prepare plus dirty upload;
+  - UI draw;
+  - retained metrics;
+  - text draw.
+- `FrameMetrics` now reports
+  `renderer_render_graph_execution_kind=executor_wrapped_product_passes`.
+- `NativeProductRenderGraphSummary` propagates that execution kind.
+- `verify-native-product-render-graph` now rejects renderer graph evidence that
+  lacks the executor-wrapped marker.
+
+Verification to refresh after this doc edit:
+
+- `cargo fmt --check`
+- `cargo check -q -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`
+- `cargo test -q -p xtask -- --nocapture`
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc.json`
+
+Remaining blockers:
+
+- The renderer graph is now an execution wrapper, but it still does not own a
+  persistent WGPU resource dependency graph with explicit lifetime planning,
+  independent pass scheduling, or graph-level resource aliasing.
+- The graph still preserves current pass order. Any future pass reordering,
+  resource aliasing, or multiple-frames-in-flight work must be separately
+  measured against Cells and TodoMVC.
+
+## 2026-07-03 - ProductRenderGraph Execution Ledger Tightened
+
+Status: continued Phase 5 by moving the focused native `ProductRenderGraph` /
+`PresentPlan` slice from summary-only evidence toward a measured product-frame
+execution ledger. This is still a focused native WGPU/product-frame contract,
+not a full renderer crate extraction, not a full before/after speedup claim,
+and not unified-goal completion.
+
+What changed:
+
+- `NativeProductFrameCommit` now carries
+  `NativeProductRenderGraphExecutionSummary` when a product graph and present
+  plan are available.
+- The execution summary is keyed by the exact `FrameEvidenceKey` for the
+  presented product frame and records graph/present plan hashes,
+  product/proof pass counts, post-present subscriber counts, legacy
+  pre-present proof counts, and measured surface-acquire/encode/finish/submit/
+  present timings.
+- `verify-native-product-render-graph` now rejects graph-only summaries for
+  Cells and TodoMVC. Cells must report execution-ledger coverage for each
+  matched product click sample, and TodoMVC must prove frame-key/hash/timing
+  consistency on the last product commit.
+- The focused retention decision remains `keep` only for product-frame
+  proof/readback isolation and explicit graph contract coverage. It explicitly
+  does not claim a before/after speedup.
+
+Evidence:
+
+- `cargo fmt --check`: pass.
+- `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass.
+- `cargo test -q -p xtask -- --nocapture`: pass, `84` tests.
+- `cargo build -q -p xtask`: pass.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass with hardware adapter and product render graph execution coverage for
+  the measured product click samples. Exact timing and count values live in the
+  refreshed report.
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass with `focused_contract_status=pass`, Cells and TodoMVC graph contract
+  status `pass`, retention decision `keep`, and
+  `speedup_claimed=false`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Remaining blockers:
+
+- This still is not a full render-graph executor that owns WGPU resource
+  scheduling, pass construction, and submission. The next architectural cut
+  should move the graph boundary closer to retained GPU resource/upload pass
+  construction instead of adding more report-only fields.
+- The unified goal remains incomplete: BYTES/MachinePlan default-engine
+  readiness, retained document/layout/render architecture, shared native/web
+  WGPU path, accessibility, 3D, SolidGraph, and manufacturing phases are still
+  open.
+
+## 2026-07-03 - U5 ProductRenderGraph / PresentPlan Focused Hardware Evidence
+
+Status: implemented and verified the focused native product-frame render graph
+slice from the active unified goal. `ActivePreviewScene + ProductPatch` now
+emits explicit `ProductRenderGraph` and `PresentPlan` summaries on product
+frame commits, while proof/readback/reporting are represented as post-present
+subscribers and rejected if they appear inside product-visible passes. This is
+a generic native product-frame contract, not a Cells/TodoMVC special case and
+not a broad native preview E2E completion claim.
+
+What changed:
+
+- `boon_native_app_window` now carries serializable
+  `NativeProductRenderGraphPassSummary`,
+  `NativeProductRenderGraphSummary`, and `NativePresentPlanSummary` through
+  product result, frame metrics, and product frame commit reports.
+- `boon_native_playground` compiles native preview product frames into a
+  generic graph with `active-preview-scene`, optional `product-patch`,
+  `present`, and optional `post-present-proof-subscribers` passes.
+- `xtask verify-native-product-render-graph` now verifies Cells and TodoMVC
+  product-frame graph/plan contracts, budgets, adapter classification, stale
+  report state, and proof/readback isolation.
+- `verify-native-gpu-preview-e2e --profile release --require-hardware-adapter`
+  now forces the COSMIC workspace hardware path, records release/profile and
+  adapter policy metadata, propagates preview/dev loop reports from the
+  supervisor artifact, and uses a bounded hardware-product sample window.
+- The TodoMVC focused graph summary can consume either the isolated Weston
+  nested measured-loop report or the COSMIC hardware `preview_loop_report`.
+- `boon_report_schema` recognizes the new focused graph verifier report.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p xtask`: pass with existing unrelated warnings.
+- `cargo xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc-release-hardware.json`:
+  expected broad fail, but wrote schema-valid hardware evidence with
+  `preview_loop_report=target/reports/native-gpu/roles/preview-loop-todomvc-1590591.json`.
+- `target/reports/native-gpu/roles/preview-loop-todomvc-1590591.json`:
+  `status=pass`, `adapter_name=NVIDIA GeForce RTX 2070`,
+  `adapter_is_software=false`,
+  `last_product_frame_commit.input_to_present_ms=5.924678`,
+  `render_graph.status=pass`, `present_plan.status=pass`,
+  `render_graph.full_rebuild_fallback_count=0`,
+  `product_frame.product_patch.patch_kind=direct_input_overlay_render_scene_patch`,
+  `product_frame.product_patch.full_scene_build_before_present=false`, and
+  `frame_lane=product_interaction`.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass. The refreshed Cells product-only UX contract reports
+  `adapter_status=hardware`, `input_to_present_ms.p95=9.550586999999725`,
+  `input_to_present_ms.max=10.940876999997272`,
+  `product_render_graph_count=60`,
+  `present_plan_count=60`,
+  `product_render_graph_full_rebuild_fallback_count=0`,
+  `product_render_graph_proof_readback_count=0`, and
+  `legacy_pre_present_request_count=0`.
+- `cargo xtask verify-native-product-render-graph --example all --todomvc-input-report target/reports/native-gpu/preview-e2e-todomvc-release-hardware.json --report target/reports/native-gpu/product-render-graph.json`:
+  pass. Cells and TodoMVC both have `graph_contract_status=pass` and
+  `budget_proof_status=pass`; TodoMVC reports
+  `adapter_status=hardware` and `input_to_present_ms=5.924678`.
+- `cargo xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc-release-hardware.json`:
+  pass.
+
+Remaining blockers:
+
+- The focused ProductRenderGraph / PresentPlan slice is verified and should be
+  kept. It removes the old ambiguity where proof/readback/reporting could be
+  mistaken for product-frame work, but it is still an instrumentation/contract
+  slice rather than the full retained renderer rewrite.
+- `target/reports/native-gpu/preview-e2e-todomvc-release-hardware.json`
+  intentionally remains `status=fail` on broad preview E2E requirements:
+  manifest real-window/scenario coverage, generic document layout/hit proof,
+  app-owned nonblank preview surface artifact binding, dev-window visible
+  interactivity, app-window input provenance, and runtime assertions. Those are
+  not product render graph blockers, but they remain native preview readiness
+  blockers.
+- U1 remains incomplete because BYTES/MachinePlan phases and the Phase 10
+  default-engine switch are still open.
+
+## 2026-07-03 - U5 Focused Product Render Graph Verifier
+
+Status: added a focused native GPU verifier for the mandatory
+`ProductRenderGraph` / `PresentPlan` trial. This verifier is intentionally
+narrower than broad native preview E2E readiness: it proves that product frames
+carry the generic graph/plan contract and that proof/readback work is kept in
+post-present subscriber lanes, while it reports performance proof status
+separately.
+
+What changed:
+
+- `xtask verify-native-product-render-graph` now validates Cells and TodoMVC
+  product-frame graph evidence from native GPU reports.
+- The verifier accepts `--example cells`, `--example todomvc`, or
+  `--example all`, with default source reports:
+  `target/reports/native-gpu/cells-visible-click-e2e-release.json` and
+  `target/reports/native-gpu/preview-e2e-todomvc.json`.
+- Cells validation uses the focused visible-click
+  `product_only_ux_contract`, requiring graph/present-plan coverage for all
+  measured product samples, zero graph-missing frames, zero proof/readback in
+  product passes, zero full-rebuild fallback, zero legacy pre-present proof
+  requests, and hardware budget proof.
+- TodoMVC validation uses the nested measured-loop
+  `last_product_frame_commit` from the broad preview E2E report. Broad
+  TodoMVC readiness blockers remain visible on that source report, but the
+  focused verifier records UX-currentness/source-report reasons separately
+  from graph-isolation evidence.
+- `boon_report_schema` now recognizes
+  `verify-native-product-render-graph` reports.
+
+Evidence collected during implementation:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass after the verifier/schema changes.
+- `cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  expected fail on broad TodoMVC preview E2E coverage/readiness blockers, but
+  it writes a fresh schema-valid report with a nested product-frame commit.
+- `cargo xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass after focused-report generation.
+
+Current focused findings:
+
+- Cells graph contract: pass. Cells hardware budget proof: pass.
+- TodoMVC graph contract: pass from nested measured-loop product commit.
+- TodoMVC hardware budget proof: not proven by the current broad E2E source
+  report because the nested measured loop used the software `llvmpipe` adapter;
+  the focused verifier reports that as `diagnostic_software_adapter`, not as a
+  hardware budget pass.
+- TodoMVC broad preview E2E remains honestly failing on existing visual/input
+  coverage blockers. Those blockers are not reclassified as graph failures.
+
+Remaining blockers:
+
+- Regenerate the final focused product-render-graph report after any further
+  tracked-file edits, because source-report freshness includes the current
+  worktree fingerprint and `xtask` binary hash.
+- Full goal completion still requires either hardware-backed TodoMVC budget
+  evidence for the kept graph path, or a documented quarantine/revert decision
+  with fresh reports proving the old path remains acceptable.
+- This remains a graph/plan evidence slice over the current render path, not
+  the final retained WGPU frame graph with persistent resource scheduling.
+
+## 2026-07-03 - U5 ProductRenderGraph / PresentPlan First Slice
+
+Status: implemented and measured the first mandatory native product-frame
+`ProductRenderGraph` / `PresentPlan` slice. This is a generic native
+app-window/playground contract; it does not branch on Cells, TodoMVC, example
+names, source text, labels, or addresses. The slice is kept because it removes
+legacy loose product-frame metadata from the hot-path evidence contract without
+regressing the focused Cells release budget.
+
+What changed:
+
+- `boon_native_app_window` now exposes serializable
+  `NativeProductRenderGraphSummary`, `NativeProductRenderGraphPassSummary`,
+  and `NativePresentPlanSummary`.
+- `NativeProductFrameResult`, `NativeRenderFrameMetrics`, and
+  `NativeProductFrameCommit` carry those summaries so reports can prove whether
+  a product frame came through the graph/plan contract.
+- `boon_native_playground` compiles the existing
+  `ActivePreviewScene + ProductPatch` boundary into explicit product passes:
+  `active_preview_scene`, `product_patch`, `present`, plus a separate
+  `post_present_proof_subscribers` proof-lane pass keyed by `FrameEvidenceKey`.
+- The Cells visible-click product-frame summary and release label contract now
+  require product render graph and present-plan coverage for every measured
+  product sample, reject graph-missing frames, reject proof/readback inside
+  product passes, and keep full-scene fallback count at zero for the focused
+  release gate.
+
+Evidence:
+
+- `cargo fmt --all`: pass.
+- `cargo check -q -p boon_native_app_window -p boon_native_playground`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p boon_native_app_window product_frame -- --nocapture`:
+  pass, `7` tests.
+- `cargo test -q -p xtask cells_visible_click -- --nocapture`: pass, `20`
+  tests, including release-label rejection of missing product render graph
+  evidence.
+- `cargo check -q -p boon_native_playground`: pass after formatting.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `cargo xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- Cells release report facts:
+  - `status=pass`
+  - `product_only_ux_contract.status=pass`
+  - `steady_input_accept_to_formula_visible_ms.p95=9.83199899999454`
+  - `steady_input_accept_to_present_ms.p95=9.83199899999454`
+  - `product_render_graph_count=60`
+  - `present_plan_count=60`
+  - `product_render_graph_missing_count=0`
+  - `product_render_graph_proof_readback_count=0`
+  - `present_plan_proof_readback_in_product_pass_count=0`
+  - `product_render_graph_full_rebuild_fallback_count=0`
+  - `proof_only_contract.status=pass`, `proof_lag_max_frames=0`
+  - `adapter_status=hardware`
+- `cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  expected fail on older broad preview E2E blockers, not on graph construction.
+  The measured nested TodoMVC preview-loop product commit still records
+  `render_graph.status=pass`, `present_plan.status=pass`,
+  `product_pass_count=3`, `proof_pass_count=1`,
+  `proof_readback_in_product_graph=false`, and
+  `proof_readback_in_product_passes=false`.
+- `cargo xtask verify-report-schema target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass; the report remains `status=fail` honestly.
+
+Remaining blockers:
+
+- This is not yet the full retained WGPU frame graph. It is a typed
+  product-frame graph/plan summary over the current render path. The later U5
+  work still needs dirty resource scheduling, frame-graph-owned WGPU passes,
+  retained target ownership, stale epoch rejection beyond counters, and
+  before/after performance comparison for a deeper graph implementation.
+- TodoMVC broad native preview E2E still fails existing coverage/readiness
+  blockers: manifest scenario coverage, preview-side hit-region/source-binding
+  proof, nonblank app-owned preview artifact binding, visible styling/live
+  frame/dev-UI/input-visible proof, runtime state assertions after operator
+  input, and headed visual cursor/readback evidence.
+- The unified goal remains active because the completion condition requires a
+  kept or quarantined ProductRenderGraph / PresentPlan trial with fresh
+  schema-valid before/after Cells and TodoMVC reports proving no required
+  budget regression. Cells has that focused evidence; TodoMVC currently has
+  partial nested product-commit evidence plus a failing broad report.
 
 ## 2026-07-03 - Headed Cells Visible-Click Gate Passed And Render Graph Made Mandatory
 
@@ -33622,3 +34103,153 @@ Remaining blockers:
 - Cells native visible interaction remains a runtime/document/native retained
   UI blocker, including the selected-cell/formula-bar desynchronization noted
   during manual testing.
+
+## 2026-07-03 - Renderer ProductRenderGraph Resource-Lifetime Contract
+
+Status: continued the mandatory native `ProductRenderGraph` / `PresentPlan`
+slice by moving renderer-owned graph evidence beyond a pass ledger into
+explicit resource-edge and resource-lifetime reporting. This remains a generic
+native WGPU/product-frame contract; it is not a Cells-specific shortcut and not
+the full unified goal completion.
+
+What changed:
+
+- `boon_native_gpu` renderer graph passes now record read/write resources for
+  the wrapped product passes, derive resource lifetime summaries, and emit a
+  stable resource-lifetime hash alongside the existing graph plan hash.
+- `FrameMetrics` now reports renderer graph resource counts, product-visible
+  resource counts, lifetime hash, pass edges, and resource lifetime entries.
+- `boon_native_playground` carries those renderer-owned resource counts and
+  lifetime hash into the native preview `ProductRenderGraph` summary and graph
+  fingerprint.
+- `xtask` now rejects focused product render-graph evidence unless the
+  renderer-owned graph has a pass hash, execution kind, positive resource
+  counts, product-visible resources, and a valid resource-lifetime hash.
+
+Evidence so far:
+
+- `cargo fmt --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+- `cargo test -q -p xtask -- --nocapture`: pass, `84` tests.
+- `cargo build -q -p xtask`: pass with existing warnings; required because
+  the first aggregate run correctly rejected stale child reports whose
+  `binary_hash` still pointed at the previous verifier binary.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass after rebuilding `xtask`. The product-only contract reports hardware
+  adapter evidence, `sample_count=60`, `input_to_present_ms.p95=10.472421`,
+  `input_to_present_ms.max=12.322592`,
+  `product_render_graph_renderer_owned_count=60`,
+  `product_render_graph_renderer_owned_missing_count=0`, first product graph
+  `renderer_graph_execution_kind=executor_wrapped_product_passes`,
+  `renderer_graph_pass_count=5`, `renderer_graph_resource_count=7`,
+  `renderer_graph_product_resource_count=6`, and resource lifetime hash
+  `6e561420775d9a3ff5ec1ea5fdf54c09d7bcc64182bc23fb18d4a98a956109d3`.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass after rebuilding `xtask`; the focused product frame reports hardware
+  adapter `NVIDIA GeForce RTX 2070`, `input_to_present_ms=6.076768`, graph
+  `pass_count=9`, `product_pass_count=8`, `proof_pass_count=1`, renderer graph
+  `pass_count=5`, resource count `7`, product resource count `6`, and no
+  proof/readback in product passes.
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass with `focused_contract_status=pass`, no blockers, Cells and TodoMVC
+  graph contracts passing, proof/readback isolated from product passes, and
+  retention decision `keep` based on product hot-path coupling quarantine
+  without a speedup claim.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Remaining blockers:
+
+- This proves the focused native ProductRenderGraph/PresentPlan resource-edge
+  slice and keeps it under the goal's coupling-quarantine condition. It is not
+  the full unified goal: BYTES/MachinePlan default-engine readiness, broader
+  retained document/layout/render phases, shared native/web renderer parity,
+  3D/world, manufacturing, and final cleanup/default-switch work remain open.
+- The render graph is still an executor-wrapped product-frame graph rather than
+  a complete WGPU lifetime planner/scheduler with aliasing and multi-frame
+  resource ownership. The next native rendering slice should either deepen this
+  graph into actual retained resource scheduling or move back to the next
+  higher-priority BYTES/MachinePlan/default-engine blocker if that is now the
+  larger unified-goal risk.
+
+## 2026-07-03 - ProductRenderGraph Before/After Retention Evidence
+
+Status: closed the missing explicit before/after evidence for the focused
+native `ProductRenderGraph` / `PresentPlan` slice. The graph is kept for
+product-frame proof/readback/reporting isolation and explicit product-pass
+contracts, not for a speedup claim. The baseline is a current-worktree,
+graph-disabled native run, not a historical artifact.
+
+What changed:
+
+- Added an explicit `BOON_NATIVE_PRODUCT_RENDER_GRAPH=0` baseline mode in the
+  native preview product-frame boundary. Default behavior remains graph-on.
+- Added `--product-render-graph-mode off` / `--disable-product-render-graph`
+  verifier plumbing for native preview runs.
+- Made the Cells product-frame scope and product-only UX contract mode-aware:
+  normal reports require graph/present/execution evidence; baseline reports
+  require that graph/present/execution evidence is intentionally absent while
+  typed product patches/results, current formula-bar state, proof isolation,
+  and product latency still pass.
+- Extended `verify-native-product-render-graph` to require fresh graph-disabled
+  before reports plus fresh graph-enabled after reports for Cells and TodoMVC.
+  The retention decision now fails unless `explicit_before_after_measurement`
+  is true.
+
+Evidence:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test -q -p xtask -- --nocapture`: pass, `84` tests.
+- `cargo check -q -p boon_native_playground -p xtask`: pass with existing
+  warnings.
+- `cargo build -q -p xtask`: pass with existing warnings.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --product-render-graph-mode off --report target/reports/native-gpu/cells-visible-click-e2e-baseline-no-graph.json`:
+  pass. Graph-disabled baseline reports hardware adapter evidence,
+  `product_render_graph_mode=disabled_for_baseline`, graph/present/execution
+  counts `0`, missing counts covering `60` samples, and product
+  `input_to_present_ms.p95=9.984865000002172`,
+  `input_to_present_ms.max=10.736902999997255`.
+- `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --headed-host-input --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass. Graph-enabled current report has product
+  `input_to_present_ms.p95=10.213826999999585`,
+  `input_to_present_ms.max=10.634343000001536`, graph/present/execution
+  evidence covering `60` samples, and proof/readback outside product passes.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --product-render-graph-mode off --report target/reports/native-gpu/preview-e2e-todomvc-baseline-no-graph.json`:
+  wrote a schema-valid graph-disabled baseline report. The broad preview E2E
+  status is expected to remain `fail` in this mode because visible graph proof
+  is intentionally absent, but the linked preview loop product commit is
+  hardware-backed, graph/present/execution absent, and
+  `input_to_present_ms=5.713233`.
+- `target/debug/xtask verify-native-gpu-preview-e2e --example todomvc --profile release --require-hardware-adapter --report target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass. Graph-enabled current product commit reports
+  `input_to_present_ms=5.958221000000001`, graph/present/execution contracts
+  pass, and proof/readback stays out of product passes.
+- `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass with `focused_contract_status=pass`,
+  `before_after_contract_status=pass`, no blockers, and retention decision
+  `status=pass`, `decision=keep`,
+  `explicit_before_after_measurement=true`,
+  `before_after_status=available`, `speedup_claimed=false`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-baseline-no-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc-baseline-no-graph.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Before/after summary:
+
+- Cells: graph-disabled p95 `9.984865000002172ms`, max
+  `10.736902999997255ms`; graph-enabled p95
+  `10.213826999999585ms`, max `10.634343000001536ms`;
+  p95 ratio `1.0229309059258551`, max ratio `0.990447897313057`, both within
+  the no-regression rule and under budget.
+- TodoMVC: graph-disabled `5.713233ms`; graph-enabled
+  `5.958221000000001ms`; ratio `1.0428807997153278`, within the
+  no-regression rule and under budget.
+
+Remaining blockers:
+
+- The focused ProductRenderGraph/PresentPlan retention criterion in the active
+  goal is now satisfied for the kept graph path. This still does not complete
+  the full unified goal: BYTES/MachinePlan default-engine readiness, retained
+  layout/render execution, shared native/web parity, broader native readiness,
+  3D/world, manufacturing, and final cleanup/default-switch work remain open.

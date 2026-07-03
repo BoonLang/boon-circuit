@@ -100,10 +100,67 @@ pub enum RenderProofArtifact {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RendererRenderGraphPassMetric {
+    pub schema_version: u32,
+    pub pass_id: String,
+    pub pass_kind: String,
+    pub input: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_resources: Vec<String>,
+    pub product_visible: bool,
+    pub proof_or_readback: bool,
+    pub duration_ms: f64,
+    pub upload_bytes: u64,
+    pub dirty_chunk_count: u32,
+    pub queue_write_count: u32,
+    pub draw_call_count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RendererRenderGraphResourceMetric {
+    pub schema_version: u32,
+    pub resource_id: String,
+    pub resource_kind: String,
+    pub first_pass_index: u32,
+    pub last_pass_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_pass_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_pass_ids: Vec<String>,
+    pub product_visible: bool,
+    pub proof_or_readback: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameMetrics {
     pub frame_seq: u64,
     #[serde(default)]
     pub render_scene_source: String,
+    #[serde(default)]
+    pub renderer_render_graph_kind: String,
+    #[serde(default)]
+    pub renderer_render_graph_execution_kind: String,
+    #[serde(default)]
+    pub renderer_render_graph_plan_hash: String,
+    #[serde(default)]
+    pub renderer_render_graph_pass_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_product_pass_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_proof_pass_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_resource_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_product_resource_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_resource_lifetime_hash: String,
+    #[serde(default)]
+    pub renderer_render_graph_passes: Vec<RendererRenderGraphPassMetric>,
+    #[serde(default)]
+    pub renderer_render_graph_resources: Vec<RendererRenderGraphResourceMetric>,
     #[serde(default)]
     pub document_scene_convert_ms: f64,
     #[serde(default)]
@@ -668,6 +725,17 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
             metrics: FrameMetrics {
                 frame_seq: self.frame_seq,
                 render_scene_source: RENDER_SCENE_SOURCE_COPY_TO_PRESENT_SCAFFOLD.to_owned(),
+                renderer_render_graph_kind: String::new(),
+                renderer_render_graph_execution_kind: String::new(),
+                renderer_render_graph_plan_hash: String::new(),
+                renderer_render_graph_pass_count: 0,
+                renderer_render_graph_product_pass_count: 0,
+                renderer_render_graph_proof_pass_count: 0,
+                renderer_render_graph_resource_count: 0,
+                renderer_render_graph_product_resource_count: 0,
+                renderer_render_graph_resource_lifetime_hash: String::new(),
+                renderer_render_graph_passes: Vec::new(),
+                renderer_render_graph_resources: Vec::new(),
                 document_scene_convert_ms: 0.0,
                 document_scene_cache_hit: false,
                 document_scene_cache_entry_count: 0,
@@ -2313,6 +2381,85 @@ struct SceneEncodeRequest<'a> {
     height: u32,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RendererRenderGraphPassStats {
+    upload_bytes: u64,
+    dirty_chunk_count: u32,
+    queue_write_count: u32,
+    draw_call_count: u32,
+}
+
+#[derive(Debug, Default)]
+struct RendererRenderGraphExecutor {
+    passes: Vec<RendererRenderGraphPassMetric>,
+}
+
+impl RendererRenderGraphExecutor {
+    fn run_product_pass<T>(
+        &mut self,
+        pass_id: &'static str,
+        pass_kind: &'static str,
+        input: &'static str,
+        output: &'static str,
+        run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
+    ) -> Result<(T, f64), RenderError> {
+        let started = Instant::now();
+        let (value, stats) = run()?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.passes.push(RendererRenderGraphPassMetric {
+            schema_version: 1,
+            pass_id: pass_id.to_owned(),
+            pass_kind: pass_kind.to_owned(),
+            input: input.to_owned(),
+            output: output.to_owned(),
+            read_resources: vec![input.to_owned()],
+            write_resources: vec![output.to_owned()],
+            product_visible: true,
+            proof_or_readback: false,
+            duration_ms,
+            upload_bytes: stats.upload_bytes,
+            dirty_chunk_count: stats.dirty_chunk_count,
+            queue_write_count: stats.queue_write_count,
+            draw_call_count: stats.draw_call_count,
+        });
+        Ok((value, duration_ms))
+    }
+
+    fn run_metrics_pass<T>(
+        &mut self,
+        pass_id: &'static str,
+        pass_kind: &'static str,
+        input: &'static str,
+        output: &'static str,
+        run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
+    ) -> Result<(T, f64), RenderError> {
+        let started = Instant::now();
+        let (value, stats) = run()?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.passes.push(RendererRenderGraphPassMetric {
+            schema_version: 1,
+            pass_id: pass_id.to_owned(),
+            pass_kind: pass_kind.to_owned(),
+            input: input.to_owned(),
+            output: output.to_owned(),
+            read_resources: vec![input.to_owned()],
+            write_resources: vec![output.to_owned()],
+            product_visible: false,
+            proof_or_readback: false,
+            duration_ms,
+            upload_bytes: stats.upload_bytes,
+            dirty_chunk_count: stats.dirty_chunk_count,
+            queue_write_count: stats.queue_write_count,
+            draw_call_count: stats.draw_call_count,
+        });
+        Ok((value, duration_ms))
+    }
+
+    fn into_passes(self) -> Vec<RendererRenderGraphPassMetric> {
+        self.passes
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_internal_scene_to_surface(
     request: SceneEncodeRequest<'_>,
@@ -2330,9 +2477,19 @@ fn encode_internal_scene_to_surface(
     let width = request.width;
     let height = request.height;
     let text_runs_shaped = scene.text_runs.len() as u32;
-    let scene_key_started = Instant::now();
-    let scene_key = scene_key_override.unwrap_or_else(|| render_scene_cache_key(scene));
-    let scene_key_ms = scene_key_started.elapsed().as_secs_f64() * 1000.0;
+    let mut render_graph = RendererRenderGraphExecutor::default();
+    let (scene_key, scene_key_ms) = render_graph.run_product_pass(
+        "renderer-scene-key",
+        "scene_identity",
+        "RenderScene",
+        "SceneCacheKey",
+        || {
+            Ok((
+                scene_key_override.unwrap_or_else(|| render_scene_cache_key(scene)),
+                RendererRenderGraphPassStats::default(),
+            ))
+        },
+    )?;
     let mut upload_bytes = 0u64;
     let mut allocated_gpu_bytes = 0u64;
     let mut dirty_upload_ranges = Vec::new();
@@ -2354,249 +2511,309 @@ fn encode_internal_scene_to_surface(
         quad_cache_eviction_count = quad_cache_eviction_count
             .saturating_add(before.saturating_sub(quad_buffers.len()) as u32);
     }
-    let prepared_key = PreparedQuadCacheKey {
-        scene_key,
-        width,
-        height,
-    };
-    let prepared_hit = prepared_quads.as_deref_mut().and_then(|cache| {
-        if cache
-            .get(&prepared_key)
-            .is_some_and(|entry| !upload_ring.prepared_cache_is_valid(entry))
-        {
-            cache.remove(&prepared_key);
-        }
-        cache.get(&prepared_key).and_then(|entry| {
-            let asset_prepare_started = Instant::now();
-            let asset_metrics =
-                textures.cached_asset_metrics(entry.gpu_batches.iter().map(|batch| &batch.texture));
-            asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
-            asset_metrics
-                .failure_diagnostics
-                .is_empty()
-                .then(|| (entry.gpu_batches.clone(), entry.rect_metrics, asset_metrics))
-        })
-    });
-    let quad_cache_hit = prepared_hit.is_some();
-    let (gpu_batches, rect_metrics, asset_metrics) =
-        if let Some((gpu_batches, rect_metrics, asset_metrics)) = prepared_hit {
-            buffer_reuse_count = gpu_batches.len() as u32;
-            (gpu_batches, rect_metrics, asset_metrics)
-        } else {
-            let rect_vertices_started = Instant::now();
-            let (quad_batches, rect_metrics) =
-                rect_vertices_from_scene(&scene, width as f32, height as f32);
-            rect_vertices_ms += rect_vertices_started.elapsed().as_secs_f64() * 1000.0;
-            let asset_prepare_started = Instant::now();
-            let asset_metrics =
-                textures.prepare_assets(request.device, request.queue, &quad_batches)?;
-            asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
-            struct QuadUploadCandidate {
-                batch: QuadBatch,
-                vertex_count: u32,
-                cache_key: QuadBatchCacheKey,
-                reservation_size: u64,
-            }
-            let mut candidates = Vec::new();
-            let mut frame_reservation_size = 0u64;
-            let mut dirty_reservation_size = 0u64;
-            let quad_batch_key_started = Instant::now();
-            for batch in quad_batches {
-                let vertex_count = batch.vertices.len() as u32;
-                if vertex_count == 0 {
-                    continue;
-                }
-                let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
-                let reservation_size = quad_upload_reservation_size(vertex_bytes.len() as u64);
-                let cache_key = QuadBatchCacheKey {
-                    retained_chunk_id: batch.retained_chunk_id.clone(),
-                    texture: batch.texture.clone(),
-                    vertex_count,
-                    content_key: quad_batch_content_key(vertex_bytes),
+    let upload_bytes_before_quads = upload_bytes;
+    let queue_write_count_before_quads = queue_write_count;
+    let dirty_upload_range_count_before_quads = dirty_upload_ranges.len();
+    let mut quad_cache_hit = false;
+    let ((gpu_batches, rect_metrics, asset_metrics), _quad_prepare_upload_ms) = render_graph
+        .run_product_pass(
+            "renderer-quad-prepare-upload",
+            "retained_quad_prepare_and_dirty_upload",
+            "RenderSceneItems",
+            "RetainedGpuBuffers",
+            || {
+                let prepared_key = PreparedQuadCacheKey {
+                    scene_key,
+                    width,
+                    height,
                 };
-                frame_reservation_size = frame_reservation_size.saturating_add(reservation_size);
-                let cache_hit = quad_buffers
-                    .as_deref()
-                    .and_then(|quad_buffers| quad_buffers.get(&cache_key))
-                    .is_some_and(|cached| upload_ring.cached_batch_is_valid(cached));
-                if !cache_hit {
-                    dirty_reservation_size =
-                        dirty_reservation_size.saturating_add(reservation_size);
-                }
-                candidates.push(QuadUploadCandidate {
-                    batch,
-                    vertex_count,
-                    cache_key,
-                    reservation_size,
-                });
-            }
-            quad_batch_key_ms += quad_batch_key_started.elapsed().as_secs_f64() * 1000.0;
-            let quad_upload_started = Instant::now();
-            let begin_stats = upload_ring.begin_frame(
-                request.device,
-                frame_reservation_size,
-                dirty_reservation_size,
-                quad_buffers.as_deref_mut(),
-            )?;
-            upload_bytes = upload_bytes.saturating_add(begin_stats.upload_bytes);
-            allocated_gpu_bytes =
-                allocated_gpu_bytes.saturating_add(begin_stats.allocated_gpu_bytes);
-            staging_wrap_count = staging_wrap_count.saturating_add(begin_stats.staging_wrap_count);
-            queue_write_count = queue_write_count.saturating_add(begin_stats.queue_write_count);
-            quad_cache_eviction_count =
-                quad_cache_eviction_count.saturating_add(begin_stats.cache_eviction_count);
-            let invalidated_cached_ranges = begin_stats.invalidated_cached_ranges;
-            dirty_upload_ranges.extend(begin_stats.dirty_upload_ranges);
-
-            let mut gpu_batches = Vec::new();
-            for candidate in candidates {
-                let QuadUploadCandidate {
-                    batch,
-                    vertex_count,
-                    cache_key,
-                    reservation_size: _reservation_size,
-                } = candidate;
-                let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
-                let gpu_batch = if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
-                    if !invalidated_cached_ranges
-                        && let Some(cached) = quad_buffers
-                            .get(&cache_key)
-                            .filter(|cached| upload_ring.cached_batch_is_valid(cached))
+                let prepared_hit = prepared_quads.as_deref_mut().and_then(|cache| {
+                    if cache
+                        .get(&prepared_key)
+                        .is_some_and(|entry| !upload_ring.prepared_cache_is_valid(entry))
                     {
-                        buffer_reuse_count = buffer_reuse_count.saturating_add(1);
-                        GpuQuadBatch {
-                            texture: batch.texture,
-                            vertex_count: cached.vertex_count,
-                            vertex_buffer: cached.vertex_buffer.clone(),
-                            byte_range: cached.byte_range.clone(),
-                            ring_generation: cached.ring_generation,
-                        }
+                        cache.remove(&prepared_key);
+                    }
+                    cache.get(&prepared_key).and_then(|entry| {
+                        let asset_prepare_started = Instant::now();
+                        let asset_metrics = textures.cached_asset_metrics(
+                            entry.gpu_batches.iter().map(|batch| &batch.texture),
+                        );
+                        asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
+                        asset_metrics
+                            .failure_diagnostics
+                            .is_empty()
+                            .then(|| (entry.gpu_batches.clone(), entry.rect_metrics, asset_metrics))
+                    })
+                });
+                quad_cache_hit = prepared_hit.is_some();
+                let (gpu_batches, rect_metrics, asset_metrics) =
+                    if let Some((gpu_batches, rect_metrics, asset_metrics)) = prepared_hit {
+                        buffer_reuse_count = gpu_batches.len() as u32;
+                        (gpu_batches, rect_metrics, asset_metrics)
                     } else {
-                        if quad_buffers.len() >= MAX_CACHED_QUAD_BATCHES {
-                            quad_cache_eviction_count =
-                                quad_cache_eviction_count.saturating_add(quad_buffers.len() as u32);
-                            quad_buffers.clear();
-                        }
-                        let (uploaded, stats) = upload_ring.upload_reserved(
+                        let rect_vertices_started = Instant::now();
+                        let (quad_batches, rect_metrics) =
+                            rect_vertices_from_scene(&scene, width as f32, height as f32);
+                        rect_vertices_ms += rect_vertices_started.elapsed().as_secs_f64() * 1000.0;
+                        let asset_prepare_started = Instant::now();
+                        let asset_metrics = textures.prepare_assets(
+                            request.device,
                             request.queue,
-                            vertex_bytes,
-                            vertex_count,
-                            Some(batch.retained_chunk_id.clone()),
+                            &quad_batches,
                         )?;
-                        upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
+                        asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
+                        struct QuadUploadCandidate {
+                            batch: QuadBatch,
+                            vertex_count: u32,
+                            cache_key: QuadBatchCacheKey,
+                            reservation_size: u64,
+                        }
+                        let mut candidates = Vec::new();
+                        let mut frame_reservation_size = 0u64;
+                        let mut dirty_reservation_size = 0u64;
+                        let quad_batch_key_started = Instant::now();
+                        for batch in quad_batches {
+                            let vertex_count = batch.vertices.len() as u32;
+                            if vertex_count == 0 {
+                                continue;
+                            }
+                            let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
+                            let reservation_size =
+                                quad_upload_reservation_size(vertex_bytes.len() as u64);
+                            let cache_key = QuadBatchCacheKey {
+                                retained_chunk_id: batch.retained_chunk_id.clone(),
+                                texture: batch.texture.clone(),
+                                vertex_count,
+                                content_key: quad_batch_content_key(vertex_bytes),
+                            };
+                            frame_reservation_size =
+                                frame_reservation_size.saturating_add(reservation_size);
+                            let cache_hit = quad_buffers
+                                .as_deref()
+                                .and_then(|quad_buffers| quad_buffers.get(&cache_key))
+                                .is_some_and(|cached| upload_ring.cached_batch_is_valid(cached));
+                            if !cache_hit {
+                                dirty_reservation_size =
+                                    dirty_reservation_size.saturating_add(reservation_size);
+                            }
+                            candidates.push(QuadUploadCandidate {
+                                batch,
+                                vertex_count,
+                                cache_key,
+                                reservation_size,
+                            });
+                        }
+                        quad_batch_key_ms +=
+                            quad_batch_key_started.elapsed().as_secs_f64() * 1000.0;
+                        let quad_upload_started = Instant::now();
+                        let begin_stats = upload_ring.begin_frame(
+                            request.device,
+                            frame_reservation_size,
+                            dirty_reservation_size,
+                            quad_buffers.as_deref_mut(),
+                        )?;
+                        upload_bytes = upload_bytes.saturating_add(begin_stats.upload_bytes);
                         allocated_gpu_bytes =
-                            allocated_gpu_bytes.saturating_add(stats.allocated_gpu_bytes);
+                            allocated_gpu_bytes.saturating_add(begin_stats.allocated_gpu_bytes);
                         staging_wrap_count =
-                            staging_wrap_count.saturating_add(stats.staging_wrap_count);
+                            staging_wrap_count.saturating_add(begin_stats.staging_wrap_count);
                         queue_write_count =
-                            queue_write_count.saturating_add(stats.queue_write_count);
-                        quad_cache_eviction_count =
-                            quad_cache_eviction_count.saturating_add(stats.cache_eviction_count);
-                        dirty_upload_ranges.extend(stats.dirty_upload_ranges);
-                        let gpu_batch = GpuQuadBatch {
-                            texture: batch.texture,
-                            vertex_count: uploaded.vertex_count,
-                            vertex_buffer: uploaded.vertex_buffer.clone(),
-                            byte_range: uploaded.byte_range.clone(),
-                            ring_generation: uploaded.ring_generation,
-                        };
-                        quad_buffers.insert(cache_key.clone(), uploaded);
-                        gpu_batch
-                    }
-                } else {
-                    let (uploaded, stats) = upload_ring.upload_reserved(
-                        request.queue,
-                        vertex_bytes,
-                        vertex_count,
-                        Some(batch.retained_chunk_id.clone()),
-                    )?;
-                    upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
-                    allocated_gpu_bytes =
-                        allocated_gpu_bytes.saturating_add(stats.allocated_gpu_bytes);
-                    staging_wrap_count =
-                        staging_wrap_count.saturating_add(stats.staging_wrap_count);
-                    queue_write_count = queue_write_count.saturating_add(stats.queue_write_count);
-                    quad_cache_eviction_count =
-                        quad_cache_eviction_count.saturating_add(stats.cache_eviction_count);
-                    dirty_upload_ranges.extend(stats.dirty_upload_ranges);
-                    GpuQuadBatch {
-                        texture: batch.texture,
-                        vertex_count: uploaded.vertex_count,
-                        vertex_buffer: uploaded.vertex_buffer,
-                        byte_range: uploaded.byte_range,
-                        ring_generation: uploaded.ring_generation,
-                    }
-                };
-                gpu_batches.push(gpu_batch);
-            }
-            quad_upload_ms += quad_upload_started.elapsed().as_secs_f64() * 1000.0;
-            if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
-                if prepared_quads.len() >= PREPARED_QUAD_CACHE_CAP
-                    && !prepared_quads.contains_key(&prepared_key)
-                    && let Some(oldest_key) = prepared_quads.keys().next().copied()
-                {
-                    prepared_quads.remove(&oldest_key);
-                }
-                prepared_quads.insert(
-                    prepared_key,
-                    PreparedQuadCache {
-                        ring_generation: upload_ring.generation,
-                        gpu_batches: gpu_batches.clone(),
-                        rect_metrics,
+                            queue_write_count.saturating_add(begin_stats.queue_write_count);
+                        quad_cache_eviction_count = quad_cache_eviction_count
+                            .saturating_add(begin_stats.cache_eviction_count);
+                        let invalidated_cached_ranges = begin_stats.invalidated_cached_ranges;
+                        dirty_upload_ranges.extend(begin_stats.dirty_upload_ranges);
+
+                        let mut gpu_batches = Vec::new();
+                        for candidate in candidates {
+                            let QuadUploadCandidate {
+                                batch,
+                                vertex_count,
+                                cache_key,
+                                reservation_size: _reservation_size,
+                            } = candidate;
+                            let vertex_bytes = bytemuck::cast_slice(&batch.vertices);
+                            let gpu_batch = if let Some(quad_buffers) = quad_buffers.as_deref_mut()
+                            {
+                                if !invalidated_cached_ranges
+                                    && let Some(cached) = quad_buffers
+                                        .get(&cache_key)
+                                        .filter(|cached| upload_ring.cached_batch_is_valid(cached))
+                                {
+                                    buffer_reuse_count = buffer_reuse_count.saturating_add(1);
+                                    GpuQuadBatch {
+                                        texture: batch.texture,
+                                        vertex_count: cached.vertex_count,
+                                        vertex_buffer: cached.vertex_buffer.clone(),
+                                        byte_range: cached.byte_range.clone(),
+                                        ring_generation: cached.ring_generation,
+                                    }
+                                } else {
+                                    if quad_buffers.len() >= MAX_CACHED_QUAD_BATCHES {
+                                        quad_cache_eviction_count = quad_cache_eviction_count
+                                            .saturating_add(quad_buffers.len() as u32);
+                                        quad_buffers.clear();
+                                    }
+                                    let (uploaded, stats) = upload_ring.upload_reserved(
+                                        request.queue,
+                                        vertex_bytes,
+                                        vertex_count,
+                                        Some(batch.retained_chunk_id.clone()),
+                                    )?;
+                                    upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
+                                    allocated_gpu_bytes = allocated_gpu_bytes
+                                        .saturating_add(stats.allocated_gpu_bytes);
+                                    staging_wrap_count =
+                                        staging_wrap_count.saturating_add(stats.staging_wrap_count);
+                                    queue_write_count =
+                                        queue_write_count.saturating_add(stats.queue_write_count);
+                                    quad_cache_eviction_count = quad_cache_eviction_count
+                                        .saturating_add(stats.cache_eviction_count);
+                                    dirty_upload_ranges.extend(stats.dirty_upload_ranges);
+                                    let gpu_batch = GpuQuadBatch {
+                                        texture: batch.texture,
+                                        vertex_count: uploaded.vertex_count,
+                                        vertex_buffer: uploaded.vertex_buffer.clone(),
+                                        byte_range: uploaded.byte_range.clone(),
+                                        ring_generation: uploaded.ring_generation,
+                                    };
+                                    quad_buffers.insert(cache_key.clone(), uploaded);
+                                    gpu_batch
+                                }
+                            } else {
+                                let (uploaded, stats) = upload_ring.upload_reserved(
+                                    request.queue,
+                                    vertex_bytes,
+                                    vertex_count,
+                                    Some(batch.retained_chunk_id.clone()),
+                                )?;
+                                upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
+                                allocated_gpu_bytes =
+                                    allocated_gpu_bytes.saturating_add(stats.allocated_gpu_bytes);
+                                staging_wrap_count =
+                                    staging_wrap_count.saturating_add(stats.staging_wrap_count);
+                                queue_write_count =
+                                    queue_write_count.saturating_add(stats.queue_write_count);
+                                quad_cache_eviction_count = quad_cache_eviction_count
+                                    .saturating_add(stats.cache_eviction_count);
+                                dirty_upload_ranges.extend(stats.dirty_upload_ranges);
+                                GpuQuadBatch {
+                                    texture: batch.texture,
+                                    vertex_count: uploaded.vertex_count,
+                                    vertex_buffer: uploaded.vertex_buffer,
+                                    byte_range: uploaded.byte_range,
+                                    ring_generation: uploaded.ring_generation,
+                                }
+                            };
+                            gpu_batches.push(gpu_batch);
+                        }
+                        quad_upload_ms += quad_upload_started.elapsed().as_secs_f64() * 1000.0;
+                        if let Some(prepared_quads) = prepared_quads.as_deref_mut() {
+                            if prepared_quads.len() >= PREPARED_QUAD_CACHE_CAP
+                                && !prepared_quads.contains_key(&prepared_key)
+                                && let Some(oldest_key) = prepared_quads.keys().next().copied()
+                            {
+                                prepared_quads.remove(&oldest_key);
+                            }
+                            prepared_quads.insert(
+                                prepared_key,
+                                PreparedQuadCache {
+                                    ring_generation: upload_ring.generation,
+                                    gpu_batches: gpu_batches.clone(),
+                                    rect_metrics,
+                                },
+                            );
+                        }
+                        (gpu_batches, rect_metrics, asset_metrics)
+                    };
+                let dirty_chunk_count = dirty_upload_ranges
+                    .iter()
+                    .skip(dirty_upload_range_count_before_quads)
+                    .filter_map(|range| range.retained_chunk_id.as_ref())
+                    .collect::<BTreeSet<_>>()
+                    .len() as u32;
+                Ok((
+                    (gpu_batches, rect_metrics, asset_metrics),
+                    RendererRenderGraphPassStats {
+                        upload_bytes: upload_bytes.saturating_sub(upload_bytes_before_quads),
+                        dirty_chunk_count,
+                        queue_write_count: queue_write_count
+                            .saturating_sub(queue_write_count_before_quads),
+                        draw_call_count: 0,
                     },
-                );
-            }
-            (gpu_batches, rect_metrics, asset_metrics)
-        };
+                ))
+            },
+        )?;
     let draw_ranges = coalesced_gpu_quad_draw_ranges(&gpu_batches);
-    let draw_pass_started = Instant::now();
-    {
-        let mut pass = request
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("boon-native-gpu-visible-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: request.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.05,
-                            b: 0.06,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        pass.set_pipeline(pipeline);
-        for range in &draw_ranges {
-            let batch = &gpu_batches[range.first_batch_index];
-            let bind_group =
-                textures
-                    .bind_group_for(&range.texture)
-                    .ok_or_else(|| RenderError {
-                        message: "native GPU asset texture was not prepared before draw".to_owned(),
-                    })?;
-            bind_group.set(&mut pass);
-            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(range.byte_range.clone()));
-            pass.draw(0..range.vertex_count, 0..1);
-        }
-    }
-    let draw_pass_ms = draw_pass_started.elapsed().as_secs_f64() * 1000.0;
     let draw_range_count = draw_ranges.len() as u32;
-    let retained_metrics_started = Instant::now();
-    let retained_chunk_metrics = sampled_retained_render_chunks(
-        &scene,
-        frame_seq,
-        previous_chunk_ids.as_deref(),
-        RETAINED_CHUNK_METRIC_SAMPLE_LIMIT,
-    );
+    let ((), draw_pass_ms) = render_graph.run_product_pass(
+        "renderer-ui-draw",
+        "ui_draw_pass",
+        "RetainedGpuBuffers",
+        "ColorTarget",
+        || {
+            let mut pass = request
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("boon-native-gpu-visible-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: request.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.04,
+                                g: 0.05,
+                                b: 0.06,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            pass.set_pipeline(pipeline);
+            for range in &draw_ranges {
+                let batch = &gpu_batches[range.first_batch_index];
+                let bind_group =
+                    textures
+                        .bind_group_for(&range.texture)
+                        .ok_or_else(|| RenderError {
+                            message: "native GPU asset texture was not prepared before draw"
+                                .to_owned(),
+                        })?;
+                bind_group.set(&mut pass);
+                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(range.byte_range.clone()));
+                pass.draw(0..range.vertex_count, 0..1);
+            }
+            Ok((
+                (),
+                RendererRenderGraphPassStats {
+                    draw_call_count: draw_range_count,
+                    ..RendererRenderGraphPassStats::default()
+                },
+            ))
+        },
+    )?;
+    let (retained_chunk_metrics, retained_metrics_ms) = render_graph.run_metrics_pass(
+        "renderer-retained-metrics",
+        "retained_metrics",
+        "RenderScene",
+        "FrameMetrics",
+        || {
+            let metrics = sampled_retained_render_chunks(
+                scene,
+                frame_seq,
+                previous_chunk_ids.as_deref(),
+                RETAINED_CHUNK_METRIC_SAMPLE_LIMIT,
+            );
+            Ok((metrics, RendererRenderGraphPassStats::default()))
+        },
+    )?;
     if let Some(previous_chunk_ids) = previous_chunk_ids.as_deref_mut() {
         *previous_chunk_ids = retained_chunk_metrics.current_chunk_ids.clone();
     }
@@ -2615,32 +2832,76 @@ fn encode_internal_scene_to_surface(
         }
     }
     let dirty_upload_chunk_count = dirty_upload_chunk_ids.len() as u32;
-    let retained_metrics_ms = retained_metrics_started.elapsed().as_secs_f64() * 1000.0;
-    let text_render_started = Instant::now();
-    let (rendered_text_runs, text_cache_metrics) = match text.as_mut() {
-        Some(text) => {
-            let glyphon_text_runs = scene
-                .text_runs
-                .iter()
-                .cloned()
-                .map(TextRun::from)
-                .collect::<Vec<_>>();
-            text.render(
-                request.device,
-                request.queue,
-                request.encoder,
-                request.view,
-                glyphon_text_runs,
-                width,
-                height,
-            )?
-        }
-        None => (0, TextFrameCacheMetrics::default()),
-    };
-    let text_render_ms = text_render_started.elapsed().as_secs_f64() * 1000.0;
+    let ((rendered_text_runs, text_cache_metrics), text_render_ms) = render_graph
+        .run_product_pass(
+            "renderer-text-draw",
+            "text_draw_pass",
+            if scene.text_runs.is_empty() {
+                "NoTextRuns"
+            } else {
+                "TextRuns"
+            },
+            "ColorTarget",
+            || {
+                let result = match text.as_mut() {
+                    Some(text) => {
+                        let glyphon_text_runs = scene
+                            .text_runs
+                            .iter()
+                            .cloned()
+                            .map(TextRun::from)
+                            .collect::<Vec<_>>();
+                        text.render(
+                            request.device,
+                            request.queue,
+                            request.encoder,
+                            request.view,
+                            glyphon_text_runs,
+                            width,
+                            height,
+                        )?
+                    }
+                    None => (0, TextFrameCacheMetrics::default()),
+                };
+                Ok((
+                    result,
+                    RendererRenderGraphPassStats {
+                        draw_call_count: u32::from(result.0 > 0),
+                        ..RendererRenderGraphPassStats::default()
+                    },
+                ))
+            },
+        )?;
+    let renderer_render_graph_passes = render_graph.into_passes();
+    let renderer_render_graph_resources =
+        renderer_render_graph_resources_for_passes(&renderer_render_graph_passes);
+    let renderer_render_graph_plan_hash =
+        renderer_render_graph_plan_hash(&renderer_render_graph_passes);
+    let renderer_render_graph_resource_lifetime_hash =
+        renderer_render_graph_resource_lifetime_hash(&renderer_render_graph_resources);
     Ok(FrameMetrics {
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
+        renderer_render_graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
+        renderer_render_graph_execution_kind: "executor_wrapped_product_passes".to_owned(),
+        renderer_render_graph_plan_hash,
+        renderer_render_graph_pass_count: renderer_render_graph_passes.len() as u32,
+        renderer_render_graph_product_pass_count: renderer_render_graph_passes
+            .iter()
+            .filter(|pass| pass.product_visible)
+            .count() as u32,
+        renderer_render_graph_proof_pass_count: renderer_render_graph_passes
+            .iter()
+            .filter(|pass| pass.proof_or_readback)
+            .count() as u32,
+        renderer_render_graph_resource_count: renderer_render_graph_resources.len() as u32,
+        renderer_render_graph_product_resource_count: renderer_render_graph_resources
+            .iter()
+            .filter(|resource| resource.product_visible)
+            .count() as u32,
+        renderer_render_graph_resource_lifetime_hash,
+        renderer_render_graph_passes,
+        renderer_render_graph_resources,
         document_scene_convert_ms: 0.0,
         document_scene_cache_hit: false,
         document_scene_cache_entry_count: 0,
@@ -2711,6 +2972,137 @@ fn encode_internal_scene_to_surface(
             > retained_chunk_metrics.retained_chunks.len(),
         retained_chunks: retained_chunk_metrics.retained_chunks,
     })
+}
+
+fn renderer_render_graph_plan_hash(passes: &[RendererRenderGraphPassMetric]) -> String {
+    let mut hasher = Sha256::new();
+    for pass in passes {
+        hasher.update(pass.pass_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(pass.pass_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(pass.input.as_bytes());
+        hasher.update([0]);
+        hasher.update(pass.output.as_bytes());
+        hasher.update([0]);
+        for resource in &pass.read_resources {
+            hasher.update(resource.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([1]);
+        for resource in &pass.write_resources {
+            hasher.update(resource.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([
+            u8::from(pass.product_visible),
+            u8::from(pass.proof_or_readback),
+        ]);
+        hasher.update(pass.upload_bytes.to_le_bytes());
+        hasher.update(pass.dirty_chunk_count.to_le_bytes());
+        hasher.update(pass.queue_write_count.to_le_bytes());
+        hasher.update(pass.draw_call_count.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Debug, Default)]
+struct RendererResourceLifetimeBuilder {
+    first_pass_index: u32,
+    last_pass_index: u32,
+    producer_pass_id: Option<String>,
+    consumer_pass_ids: BTreeSet<String>,
+    product_visible: bool,
+    proof_or_readback: bool,
+}
+
+fn renderer_render_graph_resources_for_passes(
+    passes: &[RendererRenderGraphPassMetric],
+) -> Vec<RendererRenderGraphResourceMetric> {
+    let mut resources = BTreeMap::<String, RendererResourceLifetimeBuilder>::new();
+    for (index, pass) in passes.iter().enumerate() {
+        let pass_index = index as u32;
+        for resource_id in &pass.read_resources {
+            let entry = resources.entry(resource_id.clone()).or_insert_with(|| {
+                RendererResourceLifetimeBuilder {
+                    first_pass_index: pass_index,
+                    last_pass_index: pass_index,
+                    ..RendererResourceLifetimeBuilder::default()
+                }
+            });
+            entry.first_pass_index = entry.first_pass_index.min(pass_index);
+            entry.last_pass_index = entry.last_pass_index.max(pass_index);
+            entry.consumer_pass_ids.insert(pass.pass_id.clone());
+            entry.product_visible |= pass.product_visible;
+            entry.proof_or_readback |= pass.proof_or_readback;
+        }
+        for resource_id in &pass.write_resources {
+            let entry = resources.entry(resource_id.clone()).or_insert_with(|| {
+                RendererResourceLifetimeBuilder {
+                    first_pass_index: pass_index,
+                    last_pass_index: pass_index,
+                    ..RendererResourceLifetimeBuilder::default()
+                }
+            });
+            entry.first_pass_index = entry.first_pass_index.min(pass_index);
+            entry.last_pass_index = entry.last_pass_index.max(pass_index);
+            entry.producer_pass_id = Some(pass.pass_id.clone());
+            entry.product_visible |= pass.product_visible;
+            entry.proof_or_readback |= pass.proof_or_readback;
+        }
+    }
+    resources
+        .into_iter()
+        .map(|(resource_id, entry)| RendererRenderGraphResourceMetric {
+            schema_version: 1,
+            resource_kind: renderer_render_graph_resource_kind(&resource_id).to_owned(),
+            resource_id,
+            first_pass_index: entry.first_pass_index,
+            last_pass_index: entry.last_pass_index,
+            producer_pass_id: entry.producer_pass_id,
+            consumer_pass_ids: entry.consumer_pass_ids.into_iter().collect(),
+            product_visible: entry.product_visible,
+            proof_or_readback: entry.proof_or_readback,
+        })
+        .collect()
+}
+
+fn renderer_render_graph_resource_kind(resource_id: &str) -> &'static str {
+    match resource_id {
+        "RenderScene" | "RenderSceneItems" | "TextRuns" | "NoTextRuns" => "cpu_scene",
+        "SceneCacheKey" => "cpu_identity",
+        "RetainedGpuBuffers" => "gpu_buffer",
+        "ColorTarget" => "gpu_color_target",
+        "FrameMetrics" => "cpu_metrics",
+        _ => "generic_resource",
+    }
+}
+
+fn renderer_render_graph_resource_lifetime_hash(
+    resources: &[RendererRenderGraphResourceMetric],
+) -> String {
+    let mut hasher = Sha256::new();
+    for resource in resources {
+        hasher.update(resource.resource_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(resource.resource_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(resource.first_pass_index.to_le_bytes());
+        hasher.update(resource.last_pass_index.to_le_bytes());
+        if let Some(producer) = resource.producer_pass_id.as_ref() {
+            hasher.update(producer.as_bytes());
+        }
+        hasher.update([0]);
+        for consumer in &resource.consumer_pass_ids {
+            hasher.update(consumer.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([
+            u8::from(resource.product_visible),
+            u8::from(resource.proof_or_readback),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn quad_batch_content_key(vertex_bytes: &[u8]) -> u64 {

@@ -7608,7 +7608,9 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|arg| arg == "--skip-render-hook-app-owned-proof");
     let skip_preview_shutdown = args.iter().any(|arg| arg == "--skip-preview-shutdown");
-    let skip_dev_ipc_probe = args.iter().any(|arg| arg == "--skip-dev-ipc-probe");
+    let skip_dev_ipc_probe = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--skip-dev-ipc-probe" | "--skip-ipc-probe"));
     let skip_dev_visible_input_probe = args
         .iter()
         .any(|arg| arg == "--skip-dev-visible-input-probe");
@@ -12389,6 +12391,7 @@ fn native_gpu_app_owned_render_hook(
         Some(product_render_scene_identity.clone()),
         !defer_product_render_report,
         !defer_product_render_report,
+        Some(&visible_metrics),
         Some(product_patch_summary.clone()),
         preview_post_present_proof_request_summaries_for_mode(
             skip_app_owned_scene_proof,
@@ -12397,6 +12400,12 @@ fn native_gpu_app_owned_render_hook(
         ),
     );
     render_frame_metrics.render_hook_phase_timings = Some(render_hook_phase_timings_ms.clone());
+    preview_set_product_render_graph_encode_time_ms(
+        &mut render_frame_metrics,
+        render_hook_phase_timings_ms
+            .get("encode_scene_ms")
+            .and_then(serde_json::Value::as_f64),
+    );
     let post_present_proof_subscribers = preview_post_present_proof_subscribers_for_mode(
         emit_deferred_post_present_proof,
         visible_bound_text_proof_snapshot,
@@ -12445,6 +12454,9 @@ fn preview_native_render_frame_metrics(
         render_hook_phase_timings: None,
         product_frame: None,
         product_result: None,
+        render_graph: None,
+        present_plan: None,
+        render_graph_execution: None,
         post_present_proof_requests: Vec::new(),
     }
 }
@@ -12613,10 +12625,12 @@ fn preview_attach_product_proof_boundary(
     render_scene_identity: Option<String>,
     legacy_proof_json_built_pre_present: bool,
     legacy_render_hook_proof_built_pre_present: bool,
+    renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
     product_patch: Option<boon_native_app_window::NativeProductPatchSummary>,
     post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
 ) {
     let post_present_proof_request_count = post_present_proof_requests.len() as u32;
+    let product_render_graph_enabled = preview_product_render_graph_enabled();
     let product_frame = boon_native_app_window::NativeRenderedProductFrame {
         schema_version: 1,
         render_target_kind: render_target_kind.to_owned(),
@@ -12630,6 +12644,27 @@ fn preview_attach_product_proof_boundary(
         product_patch,
     };
     metrics.product_frame = Some(product_frame.clone());
+    let (render_graph, present_plan) = if product_render_graph_enabled {
+        let (render_graph, present_plan) = preview_compile_product_render_graph(
+            render_target_kind,
+            product_frame
+                .product_patch
+                .as_ref()
+                .and_then(|patch| patch.active_scene_identity.clone()),
+            product_frame.render_scene_identity.clone(),
+            product_frame.product_patch.as_ref(),
+            post_present_proof_request_count,
+            metrics.upload_bytes.unwrap_or(0),
+            renderer_metrics,
+        );
+        metrics.render_graph = Some(render_graph.clone());
+        metrics.present_plan = Some(present_plan.clone());
+        (Some(render_graph), Some(present_plan))
+    } else {
+        metrics.render_graph = None;
+        metrics.present_plan = None;
+        (None, None)
+    };
     metrics.product_result =
         product_result_owner.map(|owner| boon_native_app_window::NativeProductFrameResult {
             schema_version: 1,
@@ -12638,9 +12673,214 @@ fn preview_attach_product_proof_boundary(
                 .unwrap_or("presented_product_frame")
                 .to_owned(),
             product_frame: product_frame.clone(),
+            render_graph: render_graph.clone(),
+            present_plan: present_plan.clone(),
+            render_graph_execution: None,
             post_present_proof_requests: post_present_proof_requests.clone(),
         });
     metrics.post_present_proof_requests = post_present_proof_requests;
+}
+
+fn preview_product_render_graph_enabled() -> bool {
+    std::env::var("BOON_NATIVE_PRODUCT_RENDER_GRAPH")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "disabled" | "baseline-off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn preview_set_product_render_graph_encode_time_ms(
+    metrics: &mut boon_native_app_window::NativeRenderFrameMetrics,
+    encode_time_ms: Option<f64>,
+) {
+    let Some(encode_time_ms) = encode_time_ms else {
+        return;
+    };
+    if let Some(render_graph) = metrics.render_graph.as_mut() {
+        render_graph.encode_time_ms = Some(encode_time_ms);
+    }
+    if let Some(product_result) = metrics.product_result.as_mut()
+        && let Some(render_graph) = product_result.render_graph.as_mut()
+    {
+        render_graph.encode_time_ms = Some(encode_time_ms);
+    }
+}
+
+fn preview_compile_product_render_graph(
+    render_target_kind: &str,
+    active_scene_identity: Option<String>,
+    render_scene_identity: Option<String>,
+    product_patch: Option<&boon_native_app_window::NativeProductPatchSummary>,
+    post_present_proof_request_count: u32,
+    upload_bytes: u64,
+    renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
+) -> (
+    boon_native_app_window::NativeProductRenderGraphSummary,
+    boon_native_app_window::NativePresentPlanSummary,
+) {
+    let mut passes = vec![
+        boon_native_app_window::NativeProductRenderGraphPassSummary {
+            schema_version: 1,
+            pass_id: "active-preview-scene".to_owned(),
+            pass_kind: "active_preview_scene".to_owned(),
+            source: "ActivePreviewScene".to_owned(),
+            target: render_target_kind.to_owned(),
+            product_visible: true,
+            proof_or_readback: false,
+            post_present_subscriber: false,
+        },
+    ];
+    if let Some(renderer_metrics) = renderer_metrics {
+        passes.extend(
+            renderer_metrics
+                .renderer_render_graph_passes
+                .iter()
+                .map(
+                    |pass| boon_native_app_window::NativeProductRenderGraphPassSummary {
+                        schema_version: 1,
+                        pass_id: format!("native-gpu:{}", pass.pass_id),
+                        pass_kind: pass.pass_kind.clone(),
+                        source: pass.input.clone(),
+                        target: pass.output.clone(),
+                        product_visible: pass.product_visible,
+                        proof_or_readback: pass.proof_or_readback,
+                        post_present_subscriber: false,
+                    },
+                ),
+        );
+    }
+    if product_patch.is_some() {
+        passes.push(
+            boon_native_app_window::NativeProductRenderGraphPassSummary {
+                schema_version: 1,
+                pass_id: "product-patch".to_owned(),
+                pass_kind: "product_patch".to_owned(),
+                source: "ProductPatch".to_owned(),
+                target: render_target_kind.to_owned(),
+                product_visible: true,
+                proof_or_readback: false,
+                post_present_subscriber: false,
+            },
+        );
+    }
+    passes.push(
+        boon_native_app_window::NativeProductRenderGraphPassSummary {
+            schema_version: 1,
+            pass_id: "present".to_owned(),
+            pass_kind: "present".to_owned(),
+            source: render_target_kind.to_owned(),
+            target: "visible_surface".to_owned(),
+            product_visible: true,
+            proof_or_readback: false,
+            post_present_subscriber: false,
+        },
+    );
+    if post_present_proof_request_count > 0 {
+        passes.push(
+            boon_native_app_window::NativeProductRenderGraphPassSummary {
+                schema_version: 1,
+                pass_id: "post-present-proof-subscribers".to_owned(),
+                pass_kind: "post_present_proof_subscribers".to_owned(),
+                source: "FrameEvidenceKey".to_owned(),
+                target: "proof_lane".to_owned(),
+                product_visible: false,
+                proof_or_readback: true,
+                post_present_subscriber: true,
+            },
+        );
+    }
+    let proof_pass_count = passes
+        .iter()
+        .filter(|pass| pass.proof_or_readback || pass.post_present_subscriber)
+        .count() as u32;
+    let product_pass_count = passes.len() as u32 - proof_pass_count;
+    let full_rebuild_fallback_count = product_patch
+        .filter(|patch| patch.full_scene_build_before_present)
+        .map(|_| 1)
+        .unwrap_or(0);
+    let cache_hit = product_patch.is_some_and(|patch| patch.source == "cached_scene");
+    let dirty_chunk_count = product_patch
+        .map(|patch| patch.touched_node_count)
+        .unwrap_or(0);
+    let graph_fingerprint = format!(
+        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{proof_pass_count}|{post_present_proof_request_count}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{:?}|{:?}|{}|{:?}|{}",
+        active_scene_identity,
+        render_scene_identity,
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_kind.as_str()),
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_plan_hash.as_str()),
+        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
+        renderer_metrics.map(|metrics| {
+            metrics
+                .renderer_render_graph_resource_lifetime_hash
+                .as_str()
+        }),
+        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_resource_count)
+    );
+    let plan_hash = boon_runtime::sha256_bytes(graph_fingerprint.as_bytes());
+    let render_graph = boon_native_app_window::NativeProductRenderGraphSummary {
+        schema_version: 1,
+        status: "pass".to_owned(),
+        owner: "preview_active_scene".to_owned(),
+        graph_kind: "product_render_graph".to_owned(),
+        renderer_graph_kind: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_kind.clone())
+            .filter(|kind| !kind.is_empty()),
+        renderer_graph_execution_kind: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_execution_kind.clone())
+            .filter(|kind| !kind.is_empty()),
+        renderer_graph_plan_hash: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_plan_hash.clone())
+            .filter(|hash| !hash.is_empty()),
+        renderer_graph_pass_count: renderer_metrics
+            .map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
+        renderer_graph_product_pass_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_product_pass_count
+        }),
+        renderer_graph_proof_pass_count: renderer_metrics
+            .map_or(0, |metrics| metrics.renderer_render_graph_proof_pass_count),
+        renderer_graph_resource_count: renderer_metrics
+            .map_or(0, |metrics| metrics.renderer_render_graph_resource_count),
+        renderer_graph_product_resource_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_product_resource_count
+        }),
+        renderer_graph_resource_lifetime_hash: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_resource_lifetime_hash.clone())
+            .filter(|hash| !hash.is_empty()),
+        active_scene_identity,
+        render_scene_identity,
+        pass_count: passes.len() as u32,
+        product_pass_count,
+        proof_pass_count,
+        post_present_subscriber_count: post_present_proof_request_count,
+        dirty_chunk_count,
+        upload_bytes,
+        encode_time_ms: None,
+        cache_hit,
+        full_rebuild_fallback_count,
+        proof_readback_in_product_graph: false,
+        stale_epoch_rejection_count: 0,
+        plan_hash: plan_hash.clone(),
+        passes,
+    };
+    let present_plan = boon_native_app_window::NativePresentPlanSummary {
+        schema_version: 1,
+        status: "pass".to_owned(),
+        owner: "preview_active_scene".to_owned(),
+        plan_kind: "product_present_plan".to_owned(),
+        render_target_kind: render_target_kind.to_owned(),
+        present_path_mode: None,
+        pass_count: render_graph.pass_count,
+        product_pass_count,
+        proof_pass_count,
+        post_present_subscriber_count: post_present_proof_request_count,
+        proof_readback_in_product_passes: false,
+        proof_readback_post_present_subscriber: post_present_proof_request_count > 0,
+        plan_hash,
+    };
+    (render_graph, present_plan)
 }
 
 fn preview_post_present_proof_subscribers_for_mode(
@@ -14124,8 +14364,13 @@ fn native_gpu_dev_visible_render_hook(
                 Some(cache.render_scene_identity.clone()),
                 true,
                 true,
+                Some(&visible_metrics),
                 None,
                 dev_post_present_proof_request_summaries(),
+            );
+            preview_set_product_render_graph_encode_time_ms(
+                &mut render_frame_metrics,
+                Some(encode_scene_ms),
             );
             return Ok(PreviewNativeGpuRenderHookOutput {
                 proof: Some(report),
@@ -14241,8 +14486,13 @@ fn native_gpu_dev_visible_render_hook(
         Some(cache.render_scene_identity.clone()),
         true,
         true,
+        Some(&visible_metrics),
         None,
         dev_post_present_proof_request_summaries(),
+    );
+    preview_set_product_render_graph_encode_time_ms(
+        &mut render_frame_metrics,
+        Some(encode_scene_ms),
     );
     Ok(PreviewNativeGpuRenderHookOutput {
         proof: Some(report),
@@ -38386,7 +38636,6 @@ fn preview_headed_generic_visual_scenario_definition(
                 label: "secondary viewport".to_owned(),
                 duration_ms: 420,
             },
-            PreviewHeadedScenarioStep::Wait { duration_ms: 240 },
         ],
     }
 }
@@ -66502,6 +66751,13 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
             "generic headed scenario should render the mouse/key HUD"
+        );
+        assert!(
+            matches!(
+                definition.steps.last(),
+                Some(PreviewHeadedScenarioStep::MoveToPoint { .. })
+            ),
+            "generic headed scenario should complete on the last visible cursor action"
         );
     }
 

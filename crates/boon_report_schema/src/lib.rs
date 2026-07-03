@@ -763,6 +763,19 @@ fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
     ]
 }
 
+fn expected_bytes_default_engine_post_switch_check_ids() -> &'static [&'static str] {
+    &[
+        "bytes-default-engine:cli-build",
+        "bytes-default-engine:source-default-plan",
+        "bytes-default-engine:todomvc-default-plan",
+        "bytes-default-engine:cells-default-plan",
+        "bytes-default-engine:explicit-legacy-semantic",
+        "bytes-default-engine:todomvc-compare",
+        "bytes-default-engine:cells-compare",
+        "bytes-default-engine:phase10-switch-ready",
+    ]
+}
+
 fn verify_bytes_type_system_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let expected = expected_bytes_type_system_check_ids();
     let required_ids = report
@@ -927,7 +940,16 @@ fn verify_bytes_default_engine_readiness_report(
     report: &JsonValue,
     report_path: &Path,
 ) -> RuntimeResult<()> {
-    let expected = expected_bytes_default_engine_check_ids();
+    let readiness_mode = report
+        .get("readiness_mode")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("pre-switch-legacy-default");
+    let post_switch = readiness_mode == "post-switch-plan-default";
+    let expected = if post_switch {
+        expected_bytes_default_engine_post_switch_check_ids()
+    } else {
+        expected_bytes_default_engine_check_ids()
+    };
     let required = report
         .get("required_check_ids")
         .and_then(JsonValue::as_array)
@@ -1008,33 +1030,41 @@ fn verify_bytes_default_engine_readiness_report(
         .into());
     }
 
-    if report.get("default_engine").and_then(JsonValue::as_str) != Some("legacy") {
+    let expected_default_engine = if post_switch { "plan" } else { "legacy" };
+    if report.get("default_engine").and_then(JsonValue::as_str) != Some(expected_default_engine) {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_engine must remain legacy before Phase 10",
-            report_path.display()
+            "{} verify-bytes-default-engine-readiness default_engine must be `{expected_default_engine}` for readiness_mode `{readiness_mode}`",
+            report_path.display(),
         )
         .into());
     }
+    let expected_switch_allowed = post_switch;
     if report
         .get("default_switch_allowed")
         .and_then(JsonValue::as_bool)
-        != Some(false)
+        != Some(expected_switch_allowed)
     {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_switch_allowed must be false",
+            "{} verify-bytes-default-engine-readiness default_switch_allowed must be {expected_switch_allowed}",
             report_path.display()
         )
         .into());
     }
-    if report
-        .get("default_switch_blocker")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default()
-        .is_empty()
-    {
+    let blocker_valid = if post_switch {
+        report
+            .get("default_switch_blocker")
+            .is_none_or(JsonValue::is_null)
+    } else {
+        !report
+            .get("default_switch_blocker")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .is_empty()
+    };
+    if !blocker_valid {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_switch_blocker is missing",
-            report_path.display()
+            "{} verify-bytes-default-engine-readiness default_switch_blocker is invalid for readiness_mode `{readiness_mode}`",
+            report_path.display(),
         )
         .into());
     }
@@ -1059,11 +1089,25 @@ fn verify_bytes_default_engine_readiness_report(
                 report_path.display()
             )
         })?;
-    let expected_children = [
-        ("default-run-semantic", "default", "semantic"),
-        ("todomvc-compare", "compare", "run-plan-scenario-events"),
-        ("cells-compare", "compare", "run-plan-scenario-events"),
-    ];
+    let expected_children = if post_switch {
+        vec![
+            (
+                "todomvc-default-plan",
+                "default",
+                "run-plan-scenario-events",
+            ),
+            ("cells-default-plan", "default", "run-plan-scenario-events"),
+            ("explicit-legacy-semantic", "legacy", "semantic"),
+            ("todomvc-compare", "compare", "run-plan-scenario-events"),
+            ("cells-compare", "compare", "run-plan-scenario-events"),
+        ]
+    } else {
+        vec![
+            ("default-run-semantic", "default", "semantic"),
+            ("todomvc-compare", "compare", "run-plan-scenario-events"),
+            ("cells-compare", "compare", "run-plan-scenario-events"),
+        ]
+    };
     if children.len() != expected_children.len() {
         return Err(format!(
             "{} verify-bytes-default-engine-readiness child_reports length is wrong",
@@ -2898,6 +2942,10 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
+                | "verify-native-product-render-graph"
+                | "verify-native-todomvc-reference-parity"
+                | "verify-native-todomvc-physical-reference-parity"
+                | "verify-native-todomvc-input-parity"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-interaction-speed"
                 | "verify-native-cells-visible-click-e2e"
@@ -14328,6 +14376,7 @@ fn expected_remove_list_rows_for_source(
                     row_index,
                     &row,
                     source_binding_id,
+                    None,
                 );
                 vec![ExpectedListRemoveTarget {
                     row_index,
@@ -16296,7 +16345,13 @@ fn expected_indexed_update_branch(
             "generation": row.generation,
             "source_binding_id": source_binding_id,
             "bind_epoch": source_binding_id,
-            "row_resolution": expected_row_resolution_report(source_event, row_index, row, source_binding_id),
+            "row_resolution": expected_row_resolution_report(
+                source_event,
+                row_index,
+                row,
+                source_binding_id,
+                Some(source_route_slot.payload_schema.row_lookup_field_name()),
+            ),
             "field_path": local_field_name(&plan_state_label(plan, output_state_id.0)),
             "value": value,
             "changed": changed,
@@ -19118,8 +19173,9 @@ fn expected_row_resolution_report(
     row_index: usize,
     row: &ExpectedPlanListRowState,
     source_binding_id: Option<u64>,
+    row_lookup_field: Option<Option<&str>>,
 ) -> JsonValue {
-    json!({
+    let mut resolution = json!({
         "method": if expected_event_u64(source_event, "target_key").is_some() {
             "key_generation"
         } else if expected_event_str(source_event, "address").is_some() {
@@ -19136,7 +19192,30 @@ fn expected_row_resolution_report(
         "key": row.key,
         "generation": row.generation,
         "source_binding_id": source_binding_id,
-    })
+    });
+    if let Some(row_lookup_field) = row_lookup_field {
+        if let Some(object) = resolution.as_object_mut() {
+            object.insert(
+                "row_lookup_field".to_owned(),
+                row_lookup_field
+                    .map(|field| JsonValue::String(field.to_owned()))
+                    .unwrap_or(JsonValue::Null),
+            );
+            object.insert(
+                "row_lookup_payload".to_owned(),
+                row_lookup_field
+                    .and_then(|field| {
+                        source_event
+                            .get("payload")
+                            .and_then(JsonValue::as_object)
+                            .and_then(|payload| payload.get(field))
+                            .cloned()
+                    })
+                    .unwrap_or(JsonValue::Null),
+            );
+        }
+    }
+    resolution
 }
 
 fn expected_refresh_row_bool_not_fields(
@@ -26081,6 +26160,10 @@ fn report_is_native_gpu_command(report: &JsonValue) -> bool {
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
                 | "verify-native-example-speed"
+                | "verify-native-product-render-graph"
+                | "verify-native-todomvc-reference-parity"
+                | "verify-native-todomvc-physical-reference-parity"
+                | "verify-native-todomvc-input-parity"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-visible-click-e2e"
         )

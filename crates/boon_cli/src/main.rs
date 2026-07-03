@@ -64,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("missing source path")?;
     let mut scenario = None;
-    let mut engine = "legacy".to_owned();
+    let mut engine = "plan".to_owned();
     let mut target = "software_default".to_owned();
     let mut report = None;
     let mut index = 1;
@@ -515,6 +515,7 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "measurement_mode": "diagnostic",
         "exit_status": if verification_error_count == 0 { 0 } else { 1 },
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source,
@@ -560,9 +561,9 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             {
-                "id": "legacy-runtime-default-preserved",
+                "id": "dump-plan-does-not-execute-program",
                 "pass": true,
-                "detail": "dump-plan is a developer command and does not switch default execution"
+                "detail": "dump-plan is a developer inspection command and does not execute the runtime"
             }
         ],
         "artifact_sha256s": [],
@@ -604,6 +605,7 @@ fn explain_hardware(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "measurement_mode": "diagnostic",
         "exit_status": 0,
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source,
@@ -1000,6 +1002,22 @@ fn git_commit() -> String {
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn worktree_fingerprint() -> String {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    boon_runtime::sha256_bytes(&[status, diff].concat())
 }
 
 fn current_unix_seconds() -> u64 {

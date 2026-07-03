@@ -156,6 +156,7 @@ pub struct SourceRouteCommandReportInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -191,6 +192,7 @@ pub struct SourceRouteCommandOutputInput {
     pub current_args: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -559,6 +561,7 @@ pub fn assemble_source_route_command_output(
         command_argv: command_argv.clone(),
         generated_at_utc: input.generated_at_utc,
         git_commit: input.git_commit,
+        worktree_fingerprint: input.worktree_fingerprint,
         binary_hash: input.binary_hash,
         binary_path: input.binary_path,
         source_path: input.source_path,
@@ -619,6 +622,7 @@ pub struct RootScenarioCommandReportInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -654,6 +658,7 @@ pub struct RootScenarioCommandOutputInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -691,6 +696,7 @@ pub struct ScenarioEventsCommandReportInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -728,6 +734,7 @@ pub struct ScenarioEventsCommandOutputInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
     pub git_commit: String,
+    pub worktree_fingerprint: String,
     pub binary_hash: String,
     pub binary_path: String,
     pub source_path: String,
@@ -1344,6 +1351,7 @@ pub fn refresh_list_row_bool_not_deltas(
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(PlanDerivedExpression::BoolNot { input }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -1416,6 +1424,7 @@ pub fn refresh_list_row_bool_not_fields(
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(PlanDerivedExpression::BoolNot { input }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -2847,6 +2856,7 @@ pub fn row_expression_output_field_names(
             let PlanOpKind::DerivedValue {
                 derived_kind: boon_plan::PlanDerivedKind::Pure,
                 expression: Some(PlanDerivedExpression::RowExpression { .. }),
+                ..
             } = &op.kind
             else {
                 return None;
@@ -2901,6 +2911,57 @@ where
         &PlanRowExpression,
     ) -> PlanExecutorResult<JsonValue>,
 {
+    refresh_list_row_expression_fields_with_startup_filter(
+        plan,
+        list_slot,
+        list_state,
+        row,
+        false,
+        &mut evaluator,
+    )
+}
+
+pub fn refresh_startup_list_row_expression_fields_with<E>(
+    plan: &MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &mut PlanExecutorListRowState,
+    mut evaluator: E,
+) -> PlanExecutorResult<()>
+where
+    E: FnMut(
+        &MachinePlan,
+        &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+        &PlanExecutorListRowState,
+        &PlanRowExpression,
+    ) -> PlanExecutorResult<JsonValue>,
+{
+    refresh_list_row_expression_fields_with_startup_filter(
+        plan,
+        list_slot,
+        list_state,
+        row,
+        true,
+        &mut evaluator,
+    )
+}
+
+fn refresh_list_row_expression_fields_with_startup_filter<E>(
+    plan: &MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &mut PlanExecutorListRowState,
+    startup_only: bool,
+    evaluator: &mut E,
+) -> PlanExecutorResult<()>
+where
+    E: FnMut(
+        &MachinePlan,
+        &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+        &PlanExecutorListRowState,
+        &PlanRowExpression,
+    ) -> PlanExecutorResult<JsonValue>,
+{
     for op in plan
         .regions
         .iter()
@@ -2915,11 +2976,19 @@ where
         };
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
+            startup_recompute,
             expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
         };
+        if startup_only
+            && !*startup_recompute
+            && row_expression_reads_list(expression, list_slot.list_id)
+        {
+            continue;
+        }
         if !row_expression_applies_to_list(plan, list_slot, output_id) {
             continue;
         }
@@ -2944,6 +3013,55 @@ pub fn refresh_list_row_expression_fields_best_effort_with<E>(
         &PlanRowExpression,
     ) -> PlanExecutorResult<JsonValue>,
 {
+    refresh_list_row_expression_fields_best_effort_with_startup_filter(
+        plan,
+        list_slot,
+        list_state,
+        row,
+        false,
+        &mut evaluator,
+    );
+}
+
+pub fn refresh_startup_list_row_expression_fields_best_effort_with<E>(
+    plan: &MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &mut PlanExecutorListRowState,
+    mut evaluator: E,
+) where
+    E: FnMut(
+        &MachinePlan,
+        &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+        &PlanExecutorListRowState,
+        &PlanRowExpression,
+    ) -> PlanExecutorResult<JsonValue>,
+{
+    refresh_list_row_expression_fields_best_effort_with_startup_filter(
+        plan,
+        list_slot,
+        list_state,
+        row,
+        true,
+        &mut evaluator,
+    );
+}
+
+fn refresh_list_row_expression_fields_best_effort_with_startup_filter<E>(
+    plan: &MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &mut PlanExecutorListRowState,
+    startup_only: bool,
+    evaluator: &mut E,
+) where
+    E: FnMut(
+        &MachinePlan,
+        &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+        &PlanExecutorListRowState,
+        &PlanRowExpression,
+    ) -> PlanExecutorResult<JsonValue>,
+{
     for op in plan
         .regions
         .iter()
@@ -2958,11 +3076,19 @@ pub fn refresh_list_row_expression_fields_best_effort_with<E>(
         };
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
+            startup_recompute,
             expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
         };
+        if startup_only
+            && !*startup_recompute
+            && row_expression_reads_list(expression, list_slot.list_id)
+        {
+            continue;
+        }
         if !row_expression_applies_to_list(plan, list_slot, output_id) {
             continue;
         }
@@ -2971,6 +3097,169 @@ pub fn refresh_list_row_expression_fields_best_effort_with<E>(
         };
         let field_name = local_field_name(&semantic_field_label(plan, output_id.0));
         row.fields.insert(field_name, value);
+    }
+}
+
+fn row_expression_reads_list(expression: &PlanRowExpression, list_id: boon_plan::ListId) -> bool {
+    match expression {
+        PlanRowExpression::ListGetField {
+            list_id: expression_list_id,
+            index,
+            ..
+        } => *expression_list_id == list_id || row_expression_reads_list(index, list_id),
+        PlanRowExpression::ListRef {
+            list_id: expression_list_id,
+        } => *expression_list_id == list_id,
+        PlanRowExpression::ListFindValue {
+            list_id: expression_list_id,
+            value,
+            fallback,
+            ..
+        } => {
+            *expression_list_id == list_id
+                || row_expression_reads_list(value, list_id)
+                || fallback
+                    .as_deref()
+                    .is_some_and(|fallback| row_expression_reads_list(fallback, list_id))
+        }
+        PlanRowExpression::ListRange { from, to } => {
+            row_expression_reads_list(from, list_id) || row_expression_reads_list(to, list_id)
+        }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            row_expression_reads_list(input, list_id) || row_expression_reads_list(value, list_id)
+        }
+        PlanRowExpression::Object { fields } => fields
+            .iter()
+            .any(|field| row_expression_reads_list(&field.value, list_id)),
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input }
+        | PlanRowExpression::ObjectField { object: input, .. }
+        | PlanRowExpression::ListSum { input } => row_expression_reads_list(input, list_id),
+        PlanRowExpression::TextStartsWith { input, prefix } => {
+            row_expression_reads_list(input, list_id) || row_expression_reads_list(prefix, list_id)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        }
+        | PlanRowExpression::BytesSlice {
+            input,
+            offset: start,
+            byte_count: length,
+        } => {
+            row_expression_reads_list(input, list_id)
+                || row_expression_reads_list(start, list_id)
+                || row_expression_reads_list(length, list_id)
+        }
+        PlanRowExpression::TextToBytes { input, encoding }
+        | PlanRowExpression::BytesToText { input, encoding } => {
+            row_expression_reads_list(input, list_id)
+                || encoding
+                    .as_deref()
+                    .is_some_and(|encoding| row_expression_reads_list(encoding, list_id))
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            row_expression_reads_list(input, list_id) || row_expression_reads_list(index, list_id)
+        }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            row_expression_reads_list(input, list_id)
+                || row_expression_reads_list(byte_count, list_id)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => {
+            row_expression_reads_list(byte_count, list_id)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_reads_list(input, list_id)
+                || row_expression_reads_list(offset, list_id)
+                || row_expression_reads_list(byte_count, list_id)
+                || row_expression_reads_list(endian, list_id)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_reads_list(input, list_id)
+                || row_expression_reads_list(index, list_id)
+                || row_expression_reads_list(value, list_id)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_reads_list(input, list_id)
+                || row_expression_reads_list(offset, list_id)
+                || row_expression_reads_list(byte_count, list_id)
+                || row_expression_reads_list(endian, list_id)
+                || row_expression_reads_list(value, list_id)
+        }
+        PlanRowExpression::BytesFind { input, needle }
+        | PlanRowExpression::BytesStartsWith {
+            input,
+            prefix: needle,
+        }
+        | PlanRowExpression::BytesEndsWith {
+            input,
+            suffix: needle,
+        } => {
+            row_expression_reads_list(input, list_id) || row_expression_reads_list(needle, list_id)
+        }
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right }
+        | PlanRowExpression::NumberInfix { left, right, .. } => {
+            row_expression_reads_list(left, list_id) || row_expression_reads_list(right, list_id)
+        }
+        PlanRowExpression::TextConcat { parts } => parts
+            .iter()
+            .any(|part| row_expression_reads_list(part, list_id)),
+        PlanRowExpression::BuiltinCall { input, args, .. } => {
+            input
+                .as_deref()
+                .is_some_and(|input| row_expression_reads_list(input, list_id))
+                || args
+                    .iter()
+                    .any(|arg| row_expression_reads_list(&arg.value, list_id))
+        }
+        PlanRowExpression::Select { input, arms } => {
+            row_expression_reads_list(input, list_id)
+                || arms
+                    .iter()
+                    .any(|arm| row_expression_reads_list(&arm.value, list_id))
+        }
+        PlanRowExpression::Field { .. }
+        | PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListMapItem { .. } => false,
     }
 }
 
@@ -3036,6 +3325,7 @@ pub fn evaluate_root_pure_number_compare_values(
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(expression),
+            ..
         } = &op.kind
         else {
             continue;
@@ -9819,6 +10109,7 @@ pub fn assemble_source_route_command_report(
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
+        "worktree_fingerprint": input.worktree_fingerprint,
         "binary_hash": input.binary_hash,
         "binary_path": input.binary_path,
         "source_path": input.source_path,
@@ -9901,6 +10192,7 @@ pub fn assemble_root_scenario_command_output(
         command_argv: command_argv.clone(),
         generated_at_utc: input.generated_at_utc,
         git_commit: input.git_commit,
+        worktree_fingerprint: input.worktree_fingerprint,
         binary_hash: input.binary_hash,
         binary_path: input.binary_path,
         source_path: input.source_path,
@@ -9963,6 +10255,7 @@ pub fn assemble_root_scenario_command_report(
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
+        "worktree_fingerprint": input.worktree_fingerprint,
         "binary_hash": input.binary_hash,
         "binary_path": input.binary_path,
         "source_path": input.source_path,
@@ -10044,6 +10337,7 @@ pub fn assemble_scenario_events_command_output(
         command_argv: command_argv.clone(),
         generated_at_utc: input.generated_at_utc,
         git_commit: input.git_commit,
+        worktree_fingerprint: input.worktree_fingerprint,
         binary_hash: input.binary_hash,
         binary_path: input.binary_path,
         source_path: input.source_path,
@@ -10122,6 +10416,7 @@ pub fn assemble_scenario_events_command_report(
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
+        "worktree_fingerprint": input.worktree_fingerprint,
         "binary_hash": input.binary_hash,
         "binary_path": input.binary_path,
         "source_path": input.source_path,
@@ -10343,7 +10638,42 @@ pub fn assemble_root_scenario_step_report(
     RootScenarioStepReportAssembly { step_report }
 }
 
-pub fn demand_current_semantic_delta_acceptance_policy(legacy_comparison: &JsonValue) -> JsonValue {
+pub fn demand_current_field_paths(plan: &MachinePlan) -> BTreeSet<String> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .flat_map(|op| {
+            let PlanOpKind::DerivedValue {
+                derived_kind: _,
+                startup_recompute,
+                expression: _,
+            } = &op.kind
+            else {
+                return Vec::new();
+            };
+            if *startup_recompute {
+                return Vec::new();
+            }
+            let Some(ValueRef::Field(field_id)) = op.output else {
+                return Vec::new();
+            };
+            let label = field_label(plan, field_id.0);
+            let mut labels = vec![label.clone()];
+            if op.indexed
+                && let Some((_, local_field)) = label.rsplit_once('.')
+            {
+                labels.push(local_field.to_owned());
+            }
+            labels
+        })
+        .collect()
+}
+
+pub fn demand_current_semantic_delta_acceptance_policy(
+    legacy_comparison: &JsonValue,
+    demand_current_field_paths: &BTreeSet<String>,
+) -> JsonValue {
     if legacy_comparison
         .get("enabled")
         .and_then(JsonValue::as_bool)
@@ -10451,7 +10781,7 @@ pub fn demand_current_semantic_delta_acceptance_policy(legacy_comparison: &JsonV
                 .to_owned();
             missing_delta_field_paths.insert(field_path.clone());
             let kind_ok = missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
-            let field_ok = matches!(field_path.as_str(), "display_text" | "value" | "error");
+            let field_ok = demand_current_field_paths.contains(&field_path);
             if !(kind_ok && field_ok) {
                 rejected_missing_deltas.push(json!({
                     "step_id": step_id,
@@ -10474,6 +10804,7 @@ pub fn demand_current_semantic_delta_acceptance_policy(legacy_comparison: &JsonV
         },
         "mismatched_step_ids": mismatched_step_ids,
         "missing_delta_field_paths": missing_delta_field_paths.into_iter().collect::<Vec<_>>(),
+        "accepted_demand_current_field_paths": demand_current_field_paths.iter().cloned().collect::<Vec<_>>(),
         "missing_delta_count": missing_delta_count,
         "extra_plan_delta_count": extra_plan_delta_count,
         "rejected_missing_deltas": rejected_missing_deltas,
@@ -15655,6 +15986,7 @@ mod tests {
             current_args: vec!["xtask".to_owned()],
             generated_at_utc: "2026-06-28T00:00:00Z".to_owned(),
             git_commit: "abc123".to_owned(),
+            worktree_fingerprint: "worktreehash".to_owned(),
             binary_hash: "binhash".to_owned(),
             binary_path: "target/debug/boon_cli".to_owned(),
             source_path: "examples/bytes.bn".to_owned(),
@@ -15788,6 +16120,7 @@ mod tests {
             ],
             generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
             git_commit: "abc123".to_owned(),
+            worktree_fingerprint: "worktreehash".to_owned(),
             binary_hash: "binhash".to_owned(),
             binary_path: "target/debug/boon_cli".to_owned(),
             source_path: "examples/counter.bn".to_owned(),
@@ -15845,6 +16178,7 @@ mod tests {
             ],
             generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
             git_commit: "abc123".to_owned(),
+            worktree_fingerprint: "worktreehash".to_owned(),
             binary_hash: "binhash".to_owned(),
             binary_path: "target/debug/boon_cli".to_owned(),
             source_path: "examples/counter.bn".to_owned(),
@@ -16921,6 +17255,7 @@ mod tests {
                 id: PlanOpId(12),
                 kind: PlanOpKind::DerivedValue {
                     derived_kind: boon_plan::PlanDerivedKind::Pure,
+                    startup_recompute: true,
                     expression: Some(PlanDerivedExpression::BoolNot {
                         input: ValueRef::State(done_state_id),
                     }),
@@ -18283,6 +18618,7 @@ mod tests {
                         id: PlanOpId(11),
                         kind: PlanOpKind::DerivedValue {
                             derived_kind: boon_plan::PlanDerivedKind::Pure,
+                            startup_recompute: true,
                             expression: Some(PlanDerivedExpression::RowExpression {
                                 expression: boon_plan::PlanRowExpression::Field {
                                     input: ValueRef::State(StateId(30)),
@@ -18432,6 +18768,7 @@ mod tests {
                 id: PlanOpId(11),
                 kind: PlanOpKind::DerivedValue {
                     derived_kind: boon_plan::PlanDerivedKind::Pure,
+                    startup_recompute: true,
                     expression: Some(PlanDerivedExpression::RowExpression {
                         expression: PlanRowExpression::Field {
                             input: ValueRef::State(StateId(30)),
@@ -18560,6 +18897,7 @@ mod tests {
                 id: PlanOpId(11),
                 kind: PlanOpKind::DerivedValue {
                     derived_kind: boon_plan::PlanDerivedKind::Pure,
+                    startup_recompute: true,
                     expression: Some(PlanDerivedExpression::RowExpression {
                         expression: PlanRowExpression::Field {
                             input: ValueRef::State(StateId(30)),
@@ -18713,6 +19051,7 @@ mod tests {
                     id: PlanOpId(11),
                     kind: PlanOpKind::DerivedValue {
                         derived_kind: boon_plan::PlanDerivedKind::Pure,
+                        startup_recompute: true,
                         expression: Some(PlanDerivedExpression::RowExpression {
                             expression: PlanRowExpression::Field {
                                 input: ValueRef::State(StateId(30)),
@@ -19351,6 +19690,7 @@ mod tests {
             id: PlanOpId(20),
             kind: PlanOpKind::DerivedValue {
                 derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                startup_recompute: true,
                 expression: Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
                     source_id: SourceId(1),
                     key_field: SourcePayloadField::Key,
@@ -19536,6 +19876,7 @@ mod tests {
                     id: PlanOpId(10),
                     kind: PlanOpKind::DerivedValue {
                         derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                        startup_recompute: true,
                         expression: Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
                             source_id: SourceId(2),
                             key_field: SourcePayloadField::Key,
@@ -20548,6 +20889,7 @@ mod tests {
                         id: PlanOpId(11),
                         kind: PlanOpKind::DerivedValue {
                             derived_kind: boon_plan::PlanDerivedKind::Pure,
+                            startup_recompute: true,
                             expression: Some(PlanDerivedExpression::NumberCompareConst {
                                 left: ValueRef::Field(FieldId(20)),
                                 op: ">".to_owned(),

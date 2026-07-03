@@ -375,6 +375,8 @@ pub enum PlanOpKind {
     },
     DerivedValue {
         derived_kind: PlanDerivedKind,
+        #[serde(default = "default_derived_startup_recompute")]
+        startup_recompute: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expression: Option<PlanDerivedExpression>,
     },
@@ -404,6 +406,10 @@ pub enum PlanOpKind {
         projection: PlanListProjection,
     },
     DependencyEdge,
+}
+
+fn default_derived_startup_recompute() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1690,6 +1696,7 @@ fn cpu_plan_executor_supports_derived_value_op(
     let PlanOpKind::DerivedValue {
         derived_kind,
         expression,
+        ..
     } = &op.kind
     else {
         return false;

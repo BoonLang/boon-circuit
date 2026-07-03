@@ -4736,6 +4736,7 @@ fn verify_run_plan_scenario_events_report(
         )
         .into());
     }
+    verify_run_plan_scenario_events_top_level_deltas(report_path, report, executor_steps)?;
     let assertion_checkpoints = executor
         .get("assertion_checkpoints")
         .and_then(JsonValue::as_array)
@@ -4795,7 +4796,51 @@ fn verify_run_plan_scenario_events_report(
                 report_path.display()
             )
         })?;
-    for key in ["enabled", "state_match"] {
+    let legacy_enabled = legacy.get("enabled").and_then(JsonValue::as_bool) == Some(true);
+    if !legacy_enabled {
+        let command_argv = report
+            .get("command_argv")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} run-plan-scenario-events command_argv is not an array",
+                    report_path.display()
+                )
+            })?;
+        if command_argv_value_after(command_argv, "--engine") == Some("compare") {
+            return Err(format!(
+                "{} run-plan-scenario-events compare-mode report must enable legacy comparison",
+                report_path.display()
+            )
+            .into());
+        }
+        let legacy_acceptance = report
+            .get("legacy_comparison_acceptance")
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "{} run-plan-scenario-events legacy_comparison_acceptance is not an object",
+                    report_path.display()
+                )
+            })?;
+        if legacy.get("passed").and_then(JsonValue::as_bool) != Some(true)
+            || legacy.get("reason").and_then(JsonValue::as_str)
+                != Some("legacy comparison was not requested")
+            || legacy_acceptance
+                .get("accepted")
+                .and_then(JsonValue::as_bool)
+                != Some(false)
+            || legacy_acceptance.get("kind").and_then(JsonValue::as_str) != Some("not-applicable")
+        {
+            return Err(format!(
+                "{} run-plan-scenario-events disabled legacy comparison has invalid proof shape",
+                report_path.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    for key in ["state_match"] {
         if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!(
                 "{} run-plan-scenario-events legacy_comparison.{key} must be true",
@@ -4827,6 +4872,17 @@ fn verify_run_plan_scenario_events_report(
         )
         .into());
     }
+    let accepted_demand_current_field_paths = legacy_acceptance
+        .and_then(|acceptance| acceptance.get("accepted_demand_current_field_paths"))
+        .and_then(JsonValue::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     if legacy.get("plan_state_summary") != report.get("state_summary")
         || legacy.get("legacy_state_summary") != report.get("state_summary")
     {
@@ -4852,8 +4908,6 @@ fn verify_run_plan_scenario_events_report(
         )
         .into());
     }
-    let mut concatenated_signatures = Vec::new();
-    let mut concatenated_deltas = Vec::new();
     for ((legacy_step, executor_step), expected_step_id) in legacy_steps
         .iter()
         .zip(executor_steps)
@@ -4890,7 +4944,10 @@ fn verify_run_plan_scenario_events_report(
                 .into());
             }
         } else if !legacy_demand_current_coalesced
-            || !run_plan_step_matches_demand_current_delta_policy(legacy_step)
+            || !run_plan_step_matches_demand_current_delta_policy(
+                legacy_step,
+                &accepted_demand_current_field_paths,
+            )
         {
             return Err(format!(
                 "{} run-plan-scenario-events legacy step `{}` does not satisfy demand-current coalescing policy",
@@ -4899,6 +4956,18 @@ fn verify_run_plan_scenario_events_report(
             )
             .into());
         }
+    }
+    Ok(())
+}
+
+fn verify_run_plan_scenario_events_top_level_deltas(
+    report_path: &Path,
+    report: &JsonValue,
+    executor_steps: &[JsonValue],
+) -> RuntimeResult<()> {
+    let mut concatenated_signatures = Vec::new();
+    let mut concatenated_deltas = Vec::new();
+    for executor_step in executor_steps {
         if let Some(values) = executor_step
             .get("semantic_delta_signatures")
             .and_then(JsonValue::as_array)
@@ -4924,7 +4993,10 @@ fn verify_run_plan_scenario_events_report(
     Ok(())
 }
 
-fn run_plan_step_matches_demand_current_delta_policy(step: &JsonValue) -> bool {
+fn run_plan_step_matches_demand_current_delta_policy(
+    step: &JsonValue,
+    accepted_demand_current_field_paths: &BTreeSet<String>,
+) -> bool {
     if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
         return false;
     }
@@ -4955,10 +5027,10 @@ fn run_plan_step_matches_demand_current_delta_policy(step: &JsonValue) -> bool {
     }
     remaining_legacy.iter().all(|missing_delta| {
         missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet")
-            && matches!(
-                missing_delta.get("field_path").and_then(JsonValue::as_str),
-                Some("display_text" | "value" | "error")
-            )
+            && missing_delta
+                .get("field_path")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|field_path| accepted_demand_current_field_paths.contains(field_path))
     })
 }
 
@@ -8262,7 +8334,7 @@ fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachine
         ExpectedBytesMachinePlanChildReport {
             label: "cells-ascii-formula",
             path: "target/reports/bytes-plan/cells-ascii-formula-run.json",
-            command: "semantic",
+            command: "run-plan-scenario-events",
             measurement_mode: "proof",
         },
     ]
@@ -8304,6 +8376,10 @@ fn verify_bytes_machine_plan_all_report(
         .get("git_commit")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| format!("{} missing git_commit", report_path.display()))?;
+    let aggregate_worktree_fingerprint = report
+        .get("worktree_fingerprint")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing worktree_fingerprint", report_path.display()))?;
     let required_count = report
         .get("required_report_count")
         .and_then(JsonValue::as_u64)
@@ -8509,6 +8585,33 @@ fn verify_bytes_machine_plan_all_report(
         if label != "phase0-baseline" && child_git_commit != aggregate_git_commit {
             return Err(format!(
                 "{} child report `{label}` git_commit `{child_git_commit}` does not match aggregate `{aggregate_git_commit}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if label != "phase0-baseline" {
+            let child_worktree_fingerprint = child
+                .get("worktree_fingerprint")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "{} child report `{label}` missing `worktree_fingerprint`",
+                        report_path.display()
+                    )
+                })?;
+            if child_worktree_fingerprint != aggregate_worktree_fingerprint {
+                return Err(format!(
+                    "{} child report `{label}` worktree_fingerprint `{child_worktree_fingerprint}` does not match aggregate `{aggregate_worktree_fingerprint}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if label != "phase0-baseline"
+            && child.get("worktree_fresh").and_then(JsonValue::as_bool) != Some(true)
+        {
+            return Err(format!(
+                "{} child report `{label}` was not generated for the aggregate worktree fingerprint",
                 report_path.display()
             )
             .into());
@@ -14609,6 +14712,7 @@ fn expected_root_pure_number_compare_values(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(expression),
+            ..
         } = &op.kind
         else {
             continue;
@@ -19243,6 +19347,7 @@ fn expected_refresh_row_bool_not_fields(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(boon_plan::PlanDerivedExpression::BoolNot { input }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -19435,6 +19540,7 @@ fn expected_stale_empty_text_indexed_derived_deltas(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -19792,6 +19898,7 @@ fn expected_eval_indexed_derived_row_value(
     let boon_plan::PlanOpKind::DerivedValue {
         derived_kind: boon_plan::PlanDerivedKind::Pure,
         expression: Some(expression),
+        ..
     } = &op.kind
     else {
         return Ok(None);
@@ -19883,6 +19990,7 @@ fn expected_row_bool_not_deltas(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(boon_plan::PlanDerivedExpression::BoolNot { input }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -21732,6 +21840,7 @@ fn expected_refresh_row_expression_fields_best_effort(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -21771,6 +21880,7 @@ fn expected_refresh_row_expression_fields(
         let boon_plan::PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -21833,6 +21943,7 @@ fn expected_row_expression_output_field_names(
             let boon_plan::PlanOpKind::DerivedValue {
                 derived_kind: boon_plan::PlanDerivedKind::Pure,
                 expression: Some(boon_plan::PlanDerivedExpression::RowExpression { .. }),
+                ..
             } = &op.kind
             else {
                 return None;
@@ -23197,6 +23308,7 @@ fn expected_plan_indexed_row_expression_for_field(
             let boon_plan::PlanOpKind::DerivedValue {
                 derived_kind: boon_plan::PlanDerivedKind::Pure,
                 expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+                ..
             } = &op.kind
             else {
                 return None;
@@ -31319,7 +31431,10 @@ fn child_command_argv_proves_expected_command(command_argv: &[JsonValue], expect
     match expected {
         "run-plan-scenario-events" => {
             command_argv_has_arg(command_argv, "run")
-                && command_argv_value_after(command_argv, "--engine") == Some("compare")
+                && matches!(
+                    command_argv_value_after(command_argv, "--engine"),
+                    Some("compare") | None
+                )
         }
         "semantic" => {
             command_argv_has_arg(command_argv, "run")
@@ -31575,7 +31690,7 @@ mod tests {
             semantic_argv,
             "semantic"
         ));
-        assert!(!child_command_argv_proves_expected_command(
+        assert!(child_command_argv_proves_expected_command(
             semantic_argv,
             "run-plan-scenario-events"
         ));
@@ -32242,7 +32357,7 @@ mod tests {
                     "id": "machine-plan-typed-lowering-executable",
                     "pass": typed_lowering_executable
                 },
-                {"id": "legacy-runtime-default-preserved", "pass": true}
+                {"id": "dump-plan-does-not-execute-program", "pass": true}
             ],
             "artifact_sha256s": [],
             "machine_plan": plan
@@ -32716,7 +32831,7 @@ mod tests {
             {"id": "machine-plan-constructed", "pass": true},
             {"id": "machine-plan-verified", "pass": true},
             {"id": "machine-plan-typed-lowering-executable", "pass": true},
-            {"id": "legacy-runtime-default-preserved", "pass": true}
+            {"id": "dump-plan-does-not-execute-program", "pass": true}
         ]);
         assert!(!schema_accepts(
             cross_source_machine_plan,

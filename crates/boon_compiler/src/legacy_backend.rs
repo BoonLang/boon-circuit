@@ -306,6 +306,7 @@ pub fn compile_typed_program(
             &mut next_op,
             PlanOpKind::DerivedValue {
                 derived_kind: plan_derived_kind_from_ir(&derived.kind),
+                startup_recompute: derived.startup_recompute,
                 expression,
             },
             inputs,
@@ -1665,12 +1666,11 @@ fn row_expression_for_value(
     if derived.kind != DerivedValueKind::Pure || !derived.indexed {
         return None;
     }
-    let expr_id = direct_statement_value_expr_id(&derived.statement)?;
     let mut local_constants = constants.clone();
     let mut local_inputs = inputs.clone();
     let mut env = BTreeMap::new();
     let expr_value_types = expression_value_type_lookup(program);
-    let value = lower_row_expr(
+    let value = lower_row_statement_value(
         program,
         derived,
         index,
@@ -1678,7 +1678,7 @@ fn row_expression_for_value(
         &mut local_inputs,
         &mut env,
         &expr_value_types,
-        expr_id,
+        &derived.statement,
     )?;
     let LoweredRowValue::Scalar(expression) = value else {
         return None;
@@ -2262,12 +2262,11 @@ fn lower_row_while_statement(
     expr_id: usize,
 ) -> Option<LoweredRowValue> {
     let expr = expr_by_id(program, expr_id)?;
-    let AstExprKind::Pipe { input, op, args: _ } = &expr.kind else {
-        return None;
+    let input_id = match &expr.kind {
+        AstExprKind::Pipe { input, op, args: _ } if op == "WHILE" => *input,
+        AstExprKind::When { input } => *input,
+        _ => return None,
     };
-    if op != "WHILE" {
-        return None;
-    }
     let input = lower_row_expr(
         program,
         derived,
@@ -2276,7 +2275,7 @@ fn lower_row_while_statement(
         inputs,
         env,
         expr_value_types,
-        *input,
+        input_id,
     )?;
     let input_expression = lowered_scalar(input)?;
     let mut arms = Vec::new();
@@ -7373,7 +7372,7 @@ payload:
     }
 
     #[test]
-    fn verify_plan_rejects_bytes_source_payload_guards_in_v1() {
+    fn verify_plan_accepts_bytes_source_payload_guards() {
         let parsed = boon_parser::parse_source(
             "examples/bytes_source_payload_plan_ops.bn",
             include_str!("../../../examples/bytes_source_payload_plan_ops.bn").to_owned(),
@@ -7405,10 +7404,14 @@ payload:
         });
 
         let verification = verify_plan(&plan).unwrap();
-        assert_eq!(verification.status, "fail");
-        assert!(verification.checks.iter().any(|check| check.id
-            == "constant-refs-resolve-and-match-storage-types"
-            && !check.pass));
+        assert_eq!(verification.status, "pass");
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|check| check.id == "capability-summary-derived-counts" && check.pass),
+            "BYTES source payload guard should remain executable in the CPU PlanExecutor capability summary: {verification:#?}"
+        );
     }
 
     #[test]
@@ -7839,6 +7842,7 @@ payload:
                     op,
                     right: 0,
                 }),
+                ..
             } if field_id.0 == completed_count_id && op == ">"
         ));
 
@@ -7875,6 +7879,7 @@ payload:
             .filter(|op| {
                 !cpu_plan_executor_supports_whole_plan_op(
                     &plan.storage_layout.scalar_slots,
+                    &plan.storage_layout.list_slots,
                     &plan.constants,
                     op,
                     &BTreeSet::new(),
@@ -8034,6 +8039,7 @@ payload:
 
         assert!(cpu_plan_executor_supports_whole_plan_op(
             &plan.storage_layout.scalar_slots,
+            &plan.storage_layout.list_slots,
             &plan.constants,
             has_completed,
             &BTreeSet::new(),
@@ -8089,6 +8095,7 @@ payload:
             PlanOpKind::DerivedValue {
                 derived_kind: PlanDerivedKind::Pure,
                 expression: Some(PlanDerivedExpression::BoolNotExpression { input }),
+                ..
             } if matches!(input.as_ref(), PlanDerivedExpression::BoolAnd { .. })
         ));
 
@@ -8100,6 +8107,7 @@ payload:
             PlanOpKind::DerivedValue {
                 derived_kind: PlanDerivedKind::Pure,
                 expression: Some(PlanDerivedExpression::BoolAnd { .. }),
+                ..
             }
         ));
 
@@ -8150,6 +8158,7 @@ payload:
             PlanOpKind::DerivedValue {
                 derived_kind: PlanDerivedKind::Aggregate,
                 expression: None,
+                ..
             }
         )));
         assert_eq!(
@@ -8197,6 +8206,7 @@ payload:
 
         assert!(cpu_plan_executor_supports_whole_plan_op(
             &plan.storage_layout.scalar_slots,
+            &plan.storage_layout.list_slots,
             &plan.constants,
             guarded_clear,
             &BTreeSet::new(),
@@ -8281,6 +8291,7 @@ payload:
                 .iter()
                 .all(|op| cpu_plan_executor_supports_whole_plan_op(
                     &plan.storage_layout.scalar_slots,
+                    &plan.storage_layout.list_slots,
                     &plan.constants,
                     op,
                     &BTreeSet::new(),
@@ -8401,6 +8412,62 @@ payload:
                 .iter()
                 .any(|check| check.id == "list-range-bounds-resolve" && check.pass),
             "Cells range bounds should verify"
+        );
+    }
+
+    #[test]
+    fn cells_display_text_when_lowers_to_cpu_supported_row_select() {
+        let parsed = parse_cells_project_for_plan_test();
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+
+        let display_text_id = debug_entry_id(&plan.debug_map.fields, "field", "cell.display_text");
+        let display_text = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+            .flat_map(|region| region.ops.iter())
+            .find(|op| {
+                matches!(
+                    op.output,
+                    Some(ValueRef::Field(field_id)) if field_id.0 == display_text_id
+                )
+            })
+            .expect("cell.display_text derived op should lower");
+
+        assert!(
+            matches!(
+                &display_text.kind,
+                PlanOpKind::DerivedValue {
+                    derived_kind: PlanDerivedKind::Pure,
+                    expression: Some(PlanDerivedExpression::RowExpression {
+                        expression: PlanRowExpression::Select { .. }
+                    }),
+                    ..
+                }
+            ),
+            "cell.display_text WHEN expression should lower as a generic row select"
+        );
+        assert!(
+            cpu_plan_executor_supports_whole_plan_op(
+                &plan.storage_layout.scalar_slots,
+                &plan.storage_layout.list_slots,
+                &plan.constants,
+                display_text,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            ),
+            "cell.display_text row select should be executable by the generic CPU PlanExecutor"
+        );
+        assert!(
+            plan.capability_summary.cpu_plan_executor_complete,
+            "Cells MachinePlan should be CPU-complete once row WHEN expressions lower generically"
+        );
+        assert_eq!(
+            plan.capability_summary
+                .cpu_plan_executor_unsupported_op_count,
+            0
         );
     }
 
@@ -11147,6 +11214,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     state,
                     skip_empty,
                 }),
+            ..
         } = &op.kind
         else {
             panic!("title_to_add should lower to a typed source-key trim expression: {op:#?}");
@@ -11213,6 +11281,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     expression: Some(PlanDerivedExpression::BoolNot {
                         input: ValueRef::State(state_id)
                     }),
+                    ..
                 } if state_id.0 == input_state_id
             ));
             assert!(

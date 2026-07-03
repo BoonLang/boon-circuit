@@ -95,6 +95,7 @@ use boon_plan_executor::{
     collect_root_update_candidate_for_step as collect_plan_root_update_candidate_for_step,
     commit_ordered_root_update_candidates as commit_plan_ordered_root_update_candidates,
     decode_expected_source_event as decode_plan_expected_source_event,
+    demand_current_field_paths as plan_demand_current_field_paths,
     demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
     evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
@@ -121,9 +122,9 @@ use boon_plan_executor::{
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
     refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
-    refresh_list_row_expression_fields_best_effort_with as refresh_plan_list_row_expression_fields_best_effort_with,
-    refresh_list_row_expression_fields_with as refresh_plan_list_row_expression_fields_with,
     refresh_list_row_initial_state_fields as refresh_plan_list_row_initial_state_fields,
+    refresh_startup_list_row_expression_fields_best_effort_with as refresh_plan_startup_list_row_expression_fields_best_effort_with,
+    refresh_startup_list_row_expression_fields_with as refresh_plan_startup_list_row_expression_fields_with,
     remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
@@ -3309,6 +3310,7 @@ pub fn emit_compiled_artifact(
         "exit_status": 0,
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source_path.display().to_string(),
@@ -3387,6 +3389,7 @@ pub fn inspect_compiled_artifact_report(
         "exit_status": 0,
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "artifact_path": artifact_path.display().to_string(),
@@ -3508,6 +3511,7 @@ pub fn verify_expression_bytecode_report(
         "exit_status": if passed { 0 } else { 1 },
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source_path.display().to_string(),
@@ -3630,6 +3634,7 @@ pub fn run_plan_initial_state(
         "exit_status": 0,
         "generated_at_utc": now_string(),
         "git_commit": git_commit(),
+        "worktree_fingerprint": worktree_fingerprint(),
         "binary_hash": current_binary_hash(),
         "binary_path": current_binary_path(),
         "source_path": source_path.display().to_string(),
@@ -3807,6 +3812,7 @@ pub fn run_plan_source_route(
             current_args: std::env::args().collect::<Vec<_>>(),
             generated_at_utc: now_string(),
             git_commit: git_commit(),
+            worktree_fingerprint: worktree_fingerprint(),
             binary_hash: current_binary_hash(),
             binary_path: current_binary_path(),
             source_path: source_path.display().to_string(),
@@ -3944,6 +3950,7 @@ pub fn run_plan_root_scalar_scenario(
             command_argv: std::env::args().collect::<Vec<_>>(),
             generated_at_utc: now_string(),
             git_commit: git_commit(),
+            worktree_fingerprint: worktree_fingerprint(),
             binary_hash: current_binary_hash(),
             binary_path: current_binary_path(),
             source_path: source_path.display().to_string(),
@@ -4019,8 +4026,11 @@ pub fn run_plan_scenario_events(
             "reason": "legacy comparison was not requested"
         })
     };
-    let legacy_comparison_acceptance =
-        plan_demand_current_semantic_delta_acceptance_policy(&legacy_comparison);
+    let demand_current_field_paths = plan_demand_current_field_paths(&plan);
+    let legacy_comparison_acceptance = plan_demand_current_semantic_delta_acceptance_policy(
+        &legacy_comparison,
+        &demand_current_field_paths,
+    );
     let coverage_report = assemble_plan_root_scenario_coverage_report(
         scenario.step.len(),
         selected_steps.len(),
@@ -4035,6 +4045,7 @@ pub fn run_plan_scenario_events(
             command_argv: std::env::args().collect::<Vec<_>>(),
             generated_at_utc: now_string(),
             git_commit: git_commit(),
+            worktree_fingerprint: worktree_fingerprint(),
             binary_hash: current_binary_hash(),
             binary_path: current_binary_path(),
             source_path: source_path.display().to_string(),
@@ -4395,9 +4406,15 @@ fn execute_machine_plan_root_scenario_inner(
             semantic_deltas.push(delta.clone());
             step_deltas.push(delta);
         }
+        let changed_root_state_ids =
+            changed_root_state_ids_from_update_reports(&root_update_commit_batch.update_reports);
         updates.extend(root_update_commit_batch.update_reports);
         executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
-        pending_indexed_deltas.extend(refresh_all_indexed_derived_fields(plan, &mut list_state)?);
+        pending_indexed_deltas.extend(refresh_indexed_derived_fields_after_root_state_changes(
+            plan,
+            &mut list_state,
+            &changed_root_state_ids,
+        )?);
         let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
         for delta in &pending_indexed_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -4507,7 +4524,11 @@ fn assert_plan_executor_scenario_checkpoint(
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
     step: &ScenarioStep,
 ) -> RuntimeResult<JsonValue> {
-    let list_state = plan_executor_list_state_for_materialization(list_state);
+    let mut checkpoint_list_state = list_state.clone();
+    if step.expect_cell.is_some() || step.expect_error.is_some() {
+        let _ = refresh_all_indexed_derived_fields(plan, &mut checkpoint_list_state)?;
+    }
+    let list_state = plan_executor_list_state_for_materialization(&checkpoint_list_state);
     let report = assert_plan_scenario_checkpoint(
         plan,
         root_state,
@@ -5009,14 +5030,19 @@ fn execute_indexed_update_branch(
                 row_index,
             )?
         } else {
-            refresh_indexed_derived_fields_for_row(
+            refresh_indexed_derived_fields_for_row_with_options(
                 plan,
                 list_slot,
                 &plan_list_label(plan, list_slot.list_id.0),
                 list_state,
                 row_index,
-                false,
-                true,
+                IndexedDerivedRefreshOptions {
+                    suppress_recursive_cycle_values: false,
+                    sort_cycle_error_first: true,
+                    evaluate_demand_current_ops: true,
+                    emit_demand_current_deltas: false,
+                    changed_root_states: None,
+                },
             )?
         }
     } else if changed && source_has_later_indexed_state_feeding_derived(plan, source_id, op.id.0) {
@@ -6805,14 +6831,19 @@ fn refresh_indexed_derived_fields_after_state_change(
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     changed_row_index: usize,
 ) -> RuntimeResult<Vec<JsonValue>> {
-    let mut deltas = refresh_indexed_derived_fields_for_row(
+    let mut deltas = refresh_indexed_derived_fields_for_row_with_options(
         plan,
         changed_list_slot,
         changed_list_label,
         list_state,
         changed_row_index,
-        false,
-        true,
+        IndexedDerivedRefreshOptions {
+            suppress_recursive_cycle_values: false,
+            sort_cycle_error_first: true,
+            evaluate_demand_current_ops: true,
+            emit_demand_current_deltas: false,
+            changed_root_states: None,
+        },
     )?;
     if deltas
         .iter()
@@ -6838,6 +6869,39 @@ fn refresh_indexed_derived_fields_for_row(
     suppress_recursive_cycle_values: bool,
     sort_cycle_error_first: bool,
 ) -> RuntimeResult<Vec<JsonValue>> {
+    refresh_indexed_derived_fields_for_row_with_options(
+        plan,
+        list_slot,
+        list_label,
+        list_state,
+        row_index,
+        IndexedDerivedRefreshOptions {
+            suppress_recursive_cycle_values,
+            sort_cycle_error_first,
+            evaluate_demand_current_ops: true,
+            emit_demand_current_deltas: true,
+            changed_root_states: None,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct IndexedDerivedRefreshOptions<'a> {
+    suppress_recursive_cycle_values: bool,
+    sort_cycle_error_first: bool,
+    evaluate_demand_current_ops: bool,
+    emit_demand_current_deltas: bool,
+    changed_root_states: Option<&'a BTreeSet<StateId>>,
+}
+
+fn refresh_indexed_derived_fields_for_row_with_options(
+    plan: &MachinePlan,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    row_index: usize,
+    options: IndexedDerivedRefreshOptions<'_>,
+) -> RuntimeResult<Vec<JsonValue>> {
     let mut row_eval = list_state
         .get(&list_slot.list_id.0)
         .and_then(|rows| rows.get(row_index))
@@ -6853,6 +6917,21 @@ fn refresh_indexed_derived_fields_for_row(
         if !op.indexed {
             continue;
         }
+        let demand_current = plan_indexed_derived_op_is_demand_current(op);
+        if demand_current && !options.evaluate_demand_current_ops {
+            continue;
+        }
+        if let Some(changed_root_states) = options.changed_root_states {
+            let Some(expression) = plan_op_derived_expression(op) else {
+                continue;
+            };
+            if !changed_root_states
+                .iter()
+                .any(|state_id| plan_derived_expression_contains_state(expression, *state_id))
+            {
+                continue;
+            }
+        }
         let Some(ValueRef::Field(output_id)) = op.output else {
             continue;
         };
@@ -6861,7 +6940,7 @@ fn refresh_indexed_derived_fields_for_row(
         else {
             continue;
         };
-        if suppress_recursive_cycle_values
+        if options.suppress_recursive_cycle_values
             && row_value_is_cycle_error(&value)
             && !plan_op_is_error_text_row_expression(op)
         {
@@ -6872,13 +6951,17 @@ fn refresh_indexed_derived_fields_for_row(
             continue;
         }
         row_eval.fields.insert(output_name.clone(), value.clone());
-        changed_fields.push((output_name, value));
+        changed_fields.push((
+            output_name,
+            value,
+            !demand_current || options.emit_demand_current_deltas,
+        ));
     }
     if changed_fields.is_empty() {
         return Ok(Vec::new());
     }
-    if sort_cycle_error_first {
-        changed_fields.sort_by_key(|(field_name, _)| {
+    if options.sort_cycle_error_first {
+        changed_fields.sort_by_key(|(field_name, _, _)| {
             if field_name == "error" {
                 0
             } else if field_name == "value" {
@@ -6893,18 +6976,20 @@ fn refresh_indexed_derived_fields_for_row(
         .and_then(|rows| rows.get_mut(row_index))
         .ok_or_else(|| format!("row index {row_index} missing in `{list_label}`"))?;
     let mut deltas = Vec::new();
-    for (field_name, value) in changed_fields {
+    for (field_name, value, emit_delta) in changed_fields {
         row.fields.insert(field_name.clone(), value.clone());
-        deltas.push(json!({
-            "kind": "FieldSet",
-            "list_id": list_label,
-            "key": row.key,
-            "generation": row.generation,
-            "source_id": null,
-            "bind_epoch": null,
-            "field_path": field_name,
-            "value": value,
-        }));
+        if emit_delta {
+            deltas.push(json!({
+                "kind": "FieldSet",
+                "list_id": list_label,
+                "key": row.key,
+                "generation": row.generation,
+                "source_id": null,
+                "bind_epoch": null,
+                "field_path": field_name,
+                "value": value,
+            }));
+        }
     }
     Ok(deltas)
 }
@@ -6943,6 +7028,7 @@ fn stale_empty_text_indexed_derived_deltas(
         let PlanOpKind::DerivedValue {
             derived_kind: boon_plan::PlanDerivedKind::Pure,
             expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
         } = &op.kind
         else {
             continue;
@@ -6990,14 +7076,54 @@ fn refresh_other_indexed_derived_fields(
             if list_slot.list_id.0 == skipped_list_id && row_index == skipped_row_index {
                 continue;
             }
-            deltas.extend(refresh_indexed_derived_fields_for_row(
+            deltas.extend(refresh_indexed_derived_fields_for_row_with_options(
                 plan,
                 list_slot,
                 &list_label,
                 list_state,
                 row_index,
-                true,
-                true,
+                IndexedDerivedRefreshOptions {
+                    suppress_recursive_cycle_values: true,
+                    sort_cycle_error_first: true,
+                    evaluate_demand_current_ops: true,
+                    emit_demand_current_deltas: false,
+                    changed_root_states: None,
+                },
+            )?);
+        }
+    }
+    Ok(deltas)
+}
+
+fn refresh_indexed_derived_fields_after_root_state_changes(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    changed_root_state_ids: &BTreeSet<StateId>,
+) -> RuntimeResult<Vec<JsonValue>> {
+    if changed_root_state_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut deltas = Vec::new();
+    for list_slot in &plan.storage_layout.list_slots {
+        let row_count = list_state
+            .get(&list_slot.list_id.0)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let list_label = plan_list_label(plan, list_slot.list_id.0);
+        for row_index in 0..row_count {
+            deltas.extend(refresh_indexed_derived_fields_for_row_with_options(
+                plan,
+                list_slot,
+                &list_label,
+                list_state,
+                row_index,
+                IndexedDerivedRefreshOptions {
+                    suppress_recursive_cycle_values: true,
+                    sort_cycle_error_first: true,
+                    evaluate_demand_current_ops: false,
+                    emit_demand_current_deltas: true,
+                    changed_root_states: Some(changed_root_state_ids),
+                },
             )?);
         }
     }
@@ -7042,6 +7168,36 @@ fn refresh_all_indexed_derived_fields_with_options(
         }
     }
     Ok(deltas)
+}
+
+fn changed_root_state_ids_from_update_reports(update_reports: &[JsonValue]) -> BTreeSet<StateId> {
+    update_reports
+        .iter()
+        .filter(|report| report.get("changed").and_then(JsonValue::as_bool) == Some(true))
+        .filter_map(|report| report.get("target_state_id").and_then(JsonValue::as_u64))
+        .map(|state_id| StateId(state_id as usize))
+        .collect()
+}
+
+fn plan_indexed_derived_op_is_demand_current(op: &boon_plan::PlanOp) -> bool {
+    matches!(
+        &op.kind,
+        PlanOpKind::DerivedValue {
+            startup_recompute: false,
+            expression: Some(PlanDerivedExpression::RowExpression { .. }),
+            ..
+        } if op.indexed
+    )
+}
+
+fn plan_op_derived_expression(op: &boon_plan::PlanOp) -> Option<&PlanDerivedExpression> {
+    match &op.kind {
+        PlanOpKind::DerivedValue {
+            expression: Some(expression),
+            ..
+        } => Some(expression),
+        _ => None,
+    }
 }
 
 fn plan_op_is_error_text_row_expression(op: &boon_plan::PlanOp) -> bool {
@@ -7328,6 +7484,7 @@ fn eval_indexed_derived_row_value(
     let PlanOpKind::DerivedValue {
         derived_kind: boon_plan::PlanDerivedKind::Pure,
         expression: Some(expression),
+        ..
     } = &op.kind
     else {
         return Ok(None);
@@ -7976,7 +8133,7 @@ fn plan_initial_list_state(
         let mut row_expression_list_state = lists.clone();
         row_expression_list_state.insert(list_id, rows.clone());
         for row in &mut rows {
-            refresh_plan_list_row_expression_fields_best_effort_with(
+            refresh_plan_startup_list_row_expression_fields_best_effort_with(
                 plan,
                 slot,
                 &row_expression_list_state,
@@ -7996,7 +8153,7 @@ fn plan_initial_list_state(
         let mut row_expression_list_state = lists.clone();
         row_expression_list_state.insert(list_id, rows.clone());
         for row in &mut rows {
-            refresh_plan_list_row_expression_fields_with(
+            refresh_plan_startup_list_row_expression_fields_with(
                 plan,
                 slot,
                 &row_expression_list_state,
@@ -8628,6 +8785,7 @@ fn plan_indexed_row_expression_for_field(
             let PlanOpKind::DerivedValue {
                 derived_kind: boon_plan::PlanDerivedKind::Pure,
                 expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                ..
             } = &op.kind
             else {
                 return None;
@@ -21898,6 +22056,10 @@ fn enrich_report(
         json!(layer.measurement_mode()),
     );
     object.insert("git_commit".to_owned(), json!(git_commit()));
+    object.insert(
+        "worktree_fingerprint".to_owned(),
+        json!(worktree_fingerprint()),
+    );
     object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
     object.insert("binary_path".to_owned(), json!(current_binary_path()));
     object.insert("source_path".to_owned(), json!(source_path));
@@ -63265,6 +63427,27 @@ fn git_commit() -> String {
         .clone()
 }
 
+fn worktree_fingerprint() -> String {
+    static WORKTREE_FINGERPRINT: OnceLock<String> = OnceLock::new();
+    WORKTREE_FINGERPRINT
+        .get_or_init(|| {
+            let status = std::process::Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .output()
+                .ok()
+                .map(|output| output.stdout)
+                .unwrap_or_default();
+            let diff = std::process::Command::new("git")
+                .args(["diff", "--binary", "HEAD", "--"])
+                .output()
+                .ok()
+                .map(|output| output.stdout)
+                .unwrap_or_default();
+            sha256_bytes(&[status, diff].concat())
+        })
+        .clone()
+}
+
 fn current_binary_hash() -> String {
     static BINARY_HASH: OnceLock<String> = OnceLock::new();
     BINARY_HASH
@@ -65898,6 +66081,7 @@ FUNCTION decorate(value) {
             "measurement_mode": "proof",
             "exit_status": 1,
             "git_commit": git_commit(),
+            "worktree_fingerprint": worktree_fingerprint(),
             "binary_hash": current_binary_hash(),
             "binary_path": current_binary_path(),
             "source_hash": "n/a",
@@ -84118,6 +84302,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     .collect::<Vec<_>>();
                 let expected_demand_current_delta_mismatches = vec![
                     "type-a3-literal-20".to_owned(),
+                    "commit-a3-literal-20".to_owned(),
                     "commit-c0-formula-bar-sum-through-a3".to_owned(),
                     "edit-a0-literal".to_owned(),
                     "commit-a0-literal".to_owned(),
@@ -84138,37 +84323,19 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     expected_demand_current_delta_mismatches,
                     "Cells PlanExecutor should preserve state/assertion parity; demand-current evaluation no longer promises eager legacy semantic-delta parity"
                 );
-
-                let steps = output.report["legacy_comparison"]["step_comparisons"]
-                    .as_array()
-                    .expect("Cells compare report should expose per-step comparisons");
-                for (step_id, key, final_value) in [
-                    ("commit-d0-fanout-formula", 4_u64, json!(12)),
-                    ("commit-j0-visible-grid-edge", 10_u64, json!("7")),
-                ] {
-                    let step = steps
-                        .iter()
-                        .find(|step| step["step_id"] == step_id)
-                        .unwrap_or_else(|| panic!("missing comparison step `{step_id}`"));
-
-                    let value_deltas = step["plan_semantic_deltas"]
-                        .as_array()
-                        .expect("step semantic deltas should be an array")
-                        .iter()
-                        .filter(|delta| {
-                            delta["kind"] == "FieldSet"
-                                && delta["list_id"] == "cells"
-                                && delta["key"] == json!(key)
-                                && delta["field_path"] == "value"
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(
-                        value_deltas.len(),
-                        1,
-                        "PlanExecutor must publish only the committed value delta for `{step_id}`"
-                    );
-                    assert_eq!(value_deltas[0]["value"], final_value);
-                }
+                assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
+                    0,
+                    "demand-current coalescing may omit transient indexed deltas but must not publish extras"
+                );
+                assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["missing_delta_field_paths"],
+                    json!(["display_text", "error", "value"])
+                );
+                assert_eq!(
+                    output.report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
+                    json!([])
+                );
             })
             .expect("Cells compare regression thread should start")
             .join()

@@ -6561,8 +6561,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-            } else if preview_input_has_unhandled_source_events(&input_delta, &input_state)
-                || preview_input_has_pending_source_work(&input_state)
+            } else if !verifier_host_input_applied
+                && (preview_input_has_unhandled_source_events(&input_delta, &input_state)
+                    || preview_input_has_pending_source_work(&input_state))
             {
                 let source_input_started = Instant::now();
                 let world_editor_input_result = if let Some(world_editor_session) =

@@ -1,0 +1,148 @@
+{
+  "manifest_id": "native-gpu-handoff",
+  "manifest_version": 1,
+  "aggregate_command": "verify-native-gpu-all",
+  "aggregate_report_path": "target/reports/native-gpu-all.json",
+  "reports": [
+    {
+      "label": "platform-contract",
+      "path": "target/reports/native-gpu/platform-contract.json",
+      "command": "verify-platform-contract",
+      "required_argv": [],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "dependency-graph",
+      "path": "target/reports/native-gpu/dependency-graph.json",
+      "command": "verify-native-gpu-dependency-graph",
+      "required_argv": [],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "architecture",
+      "path": "target/reports/native-gpu/architecture.json",
+      "command": "verify-native-gpu-architecture",
+      "required_argv": [],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "layout-contract",
+      "path": "target/reports/native-gpu/layout-contract.json",
+      "command": "verify-native-gpu-layout-contract",
+      "required_argv": [],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "shaders",
+      "path": "target/reports/native-gpu/shaders.json",
+      "command": "verify-native-gpu-shaders",
+      "required_argv": [
+        ["--check", ""]
+      ],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "multiwindow",
+      "path": "target/reports/native-gpu/multiwindow.json",
+      "command": "verify-native-gpu-multiwindow",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    },
+    {
+      "label": "ipc-backpressure",
+      "path": "target/reports/native-gpu/ipc-backpressure.json",
+      "command": "verify-native-gpu-ipc-backpressure",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    },
+    {
+      "label": "observability",
+      "path": "target/reports/native-gpu/observability.json",
+      "command": "verify-native-gpu-observability",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    },
+    {
+      "label": "present-floor",
+      "path": "target/reports/native-gpu/present-floor.json",
+      "command": "verify-native-gpu-present-floor",
+      "required_argv": [],
+      "max_report_bytes": 1048576
+    },
+    {
+      "label": "preview-e2e-todomvc",
+      "path": "target/reports/native-gpu/preview-e2e-todomvc.json",
+      "command": "verify-native-gpu-preview-e2e",
+      "required_argv": [
+        ["--example", "todomvc"]
+      ],
+      "max_report_bytes": 4194304
+    },
+    {
+      "label": "preview-e2e-cells",
+      "path": "target/reports/native-gpu/preview-e2e-cells.json",
+      "command": "verify-native-gpu-preview-e2e",
+      "required_argv": [
+        ["--example", "cells"]
+      ],
+      "max_report_bytes": 4194304
+    },
+    {
+      "label": "preview-e2e-todo_mvc_physical",
+      "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
+      "command": "verify-native-gpu-preview-e2e",
+      "required_argv": [
+        ["--example", "todo_mvc_physical"]
+      ],
+      "max_report_bytes": 4194304
+    },
+    {
+      "label": "todomvc-physical-reference-parity",
+      "path": "target/reports/native-gpu/todomvc-physical-reference-parity.json",
+      "command": "verify-native-todomvc-physical-reference-parity",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    },
+    {
+      "label": "scroll-speed-cells",
+      "path": "target/reports/native-gpu/scroll-speed-cells.json",
+      "command": "verify-native-gpu-scroll-speed",
+      "required_argv": [
+        ["--example", "cells"]
+      ],
+      "max_report_bytes": 4194304
+    },
+    {
+      "label": "cells-visible-click-e2e-release",
+      "path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
+      "command": "verify-native-cells-visible-click-e2e",
+      "required_argv": [
+        ["--profile", "release"]
+      ],
+      "max_report_bytes": 8388608
+    },
+    {
+      "label": "stale-path-ledger",
+      "path": "target/reports/native-gpu/stale-path-ledger.json",
+      "command": "verify-native-gpu-stale-path-ledger",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    },
+    {
+      "label": "scroll-speed-dev-code-editor",
+      "path": "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
+      "command": "verify-native-gpu-scroll-speed",
+      "required_argv": [
+        ["--surface", "dev-code-editor"]
+      ],
+      "max_report_bytes": 4194304
+    },
+    {
+      "label": "negative",
+      "path": "target/reports/native-gpu/negative.json",
+      "command": "verify-native-gpu-negative",
+      "required_argv": [],
+      "max_report_bytes": 2097152
+    }
+  ]
+}

@@ -615,6 +615,7 @@ pub struct NativeWindowOptions {
     pub hold_ms: u64,
     pub input_sample_delay_ms: u64,
     pub synthetic_input_probe: bool,
+    pub synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
     pub sample_input_after_initial_frames: bool,
     pub warmup_frame_count: u32,
     pub sample_frame_count: u32,
@@ -629,6 +630,24 @@ pub struct NativeWindowOptions {
 impl NativeWindowOptions {
     fn readback_enabled(&self) -> bool {
         self.proof_mode == NativeProofMode::Readback && self.readback_artifact_dir.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NativeSyntheticInputProbeKind {
+    Full,
+    InteractiveScroll,
+}
+
+impl NativeSyntheticInputProbeKind {
+    fn input_injection_method(self, enabled: bool) -> &'static str {
+        if !enabled {
+            return "none-observation-only";
+        }
+        match self {
+            Self::Full => "app_window_per_window_synthetic_input_harness",
+            Self::InteractiveScroll => "app_window_per_window_interactive_synthetic_scroll_harness",
+        }
     }
 }
 
@@ -4804,7 +4823,7 @@ async fn run_surface_probe_inner(
             &mut next_forced_sample_frame_start,
             frame_index > 0,
         );
-        let input = empty_input_adapter_proof(false);
+        let input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
         );
@@ -5159,12 +5178,22 @@ async fn run_surface_probe_inner(
         if options.input_sample_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(options.input_sample_delay_ms));
         }
-        if options.synthetic_input_probe {
+        if options.synthetic_input_probe
+            && options.synthetic_input_probe_kind == NativeSyntheticInputProbeKind::Full
+        {
             inject_synthetic_input_probe(&mut mouse, &keyboard, &window_id, width, height);
         }
-        sample_input_adapter(&mut mouse, &keyboard, options.synthetic_input_probe)
+        sample_input_adapter(
+            &mut mouse,
+            &keyboard,
+            options.synthetic_input_probe,
+            options.synthetic_input_probe_kind,
+        )
     } else {
-        let mut input_adapter = empty_input_adapter_proof(options.synthetic_input_probe);
+        let mut input_adapter = empty_input_adapter_proof(
+            options.synthetic_input_probe,
+            options.synthetic_input_probe_kind,
+        );
         input_adapter.real_os_events_observed = input_event_wake_count.load(Ordering::Relaxed) > 0;
         input_adapter.sampled_after_visible_window = false;
         input_adapter.input_injection_method = "none-no-input-floor-observation".to_owned();
@@ -5200,7 +5229,12 @@ async fn run_surface_probe_inner(
             let frame_input = if frame_index == 0 {
                 input_adapter.clone()
             } else {
-                sample_input_adapter(&mut mouse, &keyboard, false)
+                sample_input_adapter(
+                    &mut mouse,
+                    &keyboard,
+                    false,
+                    options.synthetic_input_probe_kind,
+                )
             };
             let accessibility_actions = native_accessibility_action_requests_from_accesskit(
                 app_surface.take_accessibility_action_requests(),
@@ -5640,6 +5674,14 @@ async fn run_surface_probe_inner(
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
+    let synthetic_interactive_scroll_target_count = if options.synthetic_input_probe
+        && options.synthetic_input_probe_kind == NativeSyntheticInputProbeKind::InteractiveScroll
+    {
+        options.sample_frame_count.max(4)
+    } else {
+        0
+    };
+    let mut synthetic_interactive_scroll_sent_count = 0_u32;
     loop {
         let pre_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let loop_start_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
@@ -5829,6 +5871,17 @@ async fn run_surface_probe_inner(
             surface_lifecycle.reconfigured("suboptimal", width, height);
             render_loop_state.mark_dirty(NativeSchedulerReason::SurfaceLifecycle, None);
         }
+        if synthetic_interactive_scroll_sent_count < synthetic_interactive_scroll_target_count {
+            inject_synthetic_scroll_probe(
+                &mut mouse,
+                &window_id,
+                width,
+                height,
+                u64::from(synthetic_interactive_scroll_sent_count),
+            );
+            synthetic_interactive_scroll_sent_count =
+                synthetic_interactive_scroll_sent_count.saturating_add(1);
+        }
         let poll_started_at = Instant::now();
         let poll_started_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
         render_loop_state.note_poll_started(poll_started_elapsed_ms);
@@ -5839,8 +5892,14 @@ async fn run_surface_probe_inner(
         let input_sample_started = Instant::now();
         let mut sampled_input_event_wake_count_before =
             input_event_wake_count.load(Ordering::Relaxed);
-        let mut input =
-            sample_input_adapter_delta(&mut mouse, &keyboard, &input_cursor, false, hold_started);
+        let mut input = sample_input_adapter_delta(
+            &mut mouse,
+            &keyboard,
+            &input_cursor,
+            options.synthetic_input_probe,
+            options.synthetic_input_probe_kind,
+            hold_started,
+        );
         let mut sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         for _ in 0..2 {
             if sampled_input_event_wake_count <= sampled_input_event_wake_count_before {
@@ -5854,7 +5913,8 @@ async fn run_surface_probe_inner(
                 &mut mouse,
                 &keyboard,
                 &input_cursor,
-                false,
+                options.synthetic_input_probe,
+                options.synthetic_input_probe_kind,
                 hold_started,
             );
             sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
@@ -10152,6 +10212,12 @@ fn sha256_file(path: &Path) -> Result<String, NativeWindowError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn synthetic_probe_protocol_id(window_id: &WindowId) -> u64 {
+    u64::from_str_radix(&stable_debug_hash(window_id), 16)
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn inject_synthetic_input_probe(
     mouse: &mut Mouse,
     keyboard: &Keyboard,
@@ -10159,9 +10225,7 @@ fn inject_synthetic_input_probe(
     width: u32,
     height: u32,
 ) {
-    let protocol_id = u64::from_str_radix(&stable_debug_hash(window_id), 16)
-        .unwrap_or(1)
-        .max(1);
+    let protocol_id = synthetic_probe_protocol_id(window_id);
     mouse.inject_test_motion(
         f64::from(width) / 2.0,
         f64::from(height) / 2.0,
@@ -10176,10 +10240,30 @@ fn inject_synthetic_input_probe(
     keyboard.inject_test_key(KeyboardKey::A, false, protocol_id);
 }
 
+fn inject_synthetic_scroll_probe(
+    mouse: &mut Mouse,
+    window_id: &WindowId,
+    width: u32,
+    height: u32,
+    sequence: u64,
+) {
+    let protocol_id = synthetic_probe_protocol_id(window_id).saturating_add(sequence);
+    let offset = (sequence % 5) as f64;
+    mouse.inject_test_motion(
+        f64::from(width) / 2.0 + offset,
+        f64::from(height) / 2.0 + offset,
+        f64::from(width),
+        f64::from(height),
+        protocol_id,
+    );
+    mouse.inject_test_scroll(320.0, 640.0, protocol_id);
+}
+
 fn sample_input_adapter(
     mouse: &mut Mouse,
     keyboard: &Keyboard,
     synthetic_input_probe: bool,
+    synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
 ) -> NativeInputAdapterProof {
     let mouse_window_pos = mouse
         .window_pos()
@@ -10240,11 +10324,9 @@ fn sample_input_adapter(
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed,
-        input_injection_method: if synthetic_input_probe {
-            "app_window_per_window_synthetic_input_harness".to_owned()
-        } else {
-            "none-observation-only".to_owned()
-        },
+        input_injection_method: synthetic_input_probe_kind
+            .input_injection_method(synthetic_input_probe)
+            .to_owned(),
         synthetic_input_probe,
         mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
         keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
@@ -10268,6 +10350,7 @@ fn sample_input_adapter_delta(
     keyboard: &Keyboard,
     cursor: &NativeInputCursor,
     synthetic_input_probe: bool,
+    synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
     hold_started: Instant,
 ) -> NativeInputAdapterProof {
     let mouse_window_pos = mouse
@@ -10340,11 +10423,9 @@ fn sample_input_adapter_delta(
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed,
-        input_injection_method: if synthetic_input_probe {
-            "app_window_per_window_synthetic_input_harness".to_owned()
-        } else {
-            "none-observation-only".to_owned()
-        },
+        input_injection_method: synthetic_input_probe_kind
+            .input_injection_method(synthetic_input_probe)
+            .to_owned(),
         synthetic_input_probe,
         mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
         keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
@@ -10779,7 +10860,10 @@ fn mouse_button_label(button: u8) -> &'static str {
     }
 }
 
-fn empty_input_adapter_proof(synthetic_input_probe: bool) -> NativeInputAdapterProof {
+fn empty_input_adapter_proof(
+    synthetic_input_probe: bool,
+    synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+) -> NativeInputAdapterProof {
     NativeInputAdapterProof {
         installed: true,
         capture_scope: "app_window_coalesced_input_with_per_window_event_provenance".to_owned(),
@@ -10790,11 +10874,9 @@ fn empty_input_adapter_proof(synthetic_input_probe: bool) -> NativeInputAdapterP
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed: false,
-        input_injection_method: if synthetic_input_probe {
-            "app_window_per_window_synthetic_input_harness".to_owned()
-        } else {
-            "none-observation-only".to_owned()
-        },
+        input_injection_method: synthetic_input_probe_kind
+            .input_injection_method(synthetic_input_probe)
+            .to_owned(),
         synthetic_input_probe,
         mouse_last_window_protocol_id: None,
         keyboard_last_window_protocol_id: None,
@@ -10888,9 +10970,9 @@ mod tests {
 
     #[test]
     fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
-        let mut base = empty_input_adapter_proof(false);
+        let mut base = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
 
-        let mut pressed = empty_input_adapter_proof(false);
+        let mut pressed = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
         pressed.real_os_events_observed = true;
         pressed.mouse_button_event_count = 2;
         pressed.keyboard_key_event_count = 3;
@@ -10903,7 +10985,7 @@ mod tests {
         assert_eq!(base.mouse_buttons_down, vec!["left".to_owned()]);
         assert_eq!(base.pressed_keys, vec!["KeyA".to_owned()]);
 
-        let mut released = empty_input_adapter_proof(false);
+        let mut released = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
         released.mouse_button_event_count = 4;
         released.keyboard_key_event_count = 5;
         merge_input_adapter_proof(&mut base, &released);
@@ -13907,7 +13989,7 @@ mod tests {
 
     #[test]
     fn accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch() {
-        let mut input = empty_input_adapter_proof(false);
+        let mut input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
         input.real_os_events_observed = true;
         input.mouse_button_event_count = 2;
         input.mouse_button_events = vec![
@@ -15937,7 +16019,7 @@ mod tests {
             mouse_scroll_event_count: 3,
             scroll_delta_x: 4.0,
             scroll_delta_y: 8.0,
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
 
         assert_eq!(cursor.last_mouse_button_sequence, 0);
@@ -15958,7 +16040,7 @@ mod tests {
                 window_protocol_id: Some(42),
                 event_elapsed_ms: None,
             }],
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let click_pair = NativeInputAdapterProof {
             mouse_button_events: vec![
@@ -15977,7 +16059,7 @@ mod tests {
                     event_elapsed_ms: None,
                 },
             ],
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
 
         assert!(native_input_delta_is_button_press_only(&press_only));
@@ -15995,7 +16077,7 @@ mod tests {
                 window_protocol_id: Some(42),
                 event_elapsed_ms: None,
             }],
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let clean_poll = NativePollResult::clean(0);
 
@@ -16016,7 +16098,7 @@ mod tests {
                 window_protocol_id: Some(42),
                 event_elapsed_ms: None,
             }],
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let dirty_poll = NativePollResult {
             dirty: true,
@@ -16034,7 +16116,7 @@ mod tests {
     fn raw_wake_without_input_delta_is_not_reportable_host_input() {
         let raw_wake = NativeInputAdapterProof {
             real_os_events_observed: false,
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let press = NativeInputAdapterProof {
             real_os_events_observed: true,
@@ -16045,7 +16127,7 @@ mod tests {
                 window_protocol_id: Some(42),
                 event_elapsed_ms: None,
             }],
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let motion = NativeInputAdapterProof {
             real_os_events_observed: true,
@@ -16056,7 +16138,7 @@ mod tests {
                 window_width: 640.0,
                 window_height: 480.0,
             }),
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
 
         assert!(!native_input_delta_has_reportable_host_event(&raw_wake));
@@ -16075,7 +16157,7 @@ mod tests {
                 window_width: 640.0,
                 window_height: 480.0,
             }),
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let button_delta = NativeInputAdapterProof {
             real_os_events_observed: true,
@@ -16087,13 +16169,13 @@ mod tests {
                 event_elapsed_ms: None,
             }],
             mouse_window_pos: motion_only.mouse_window_pos.clone(),
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
         let scroll_delta = NativeInputAdapterProof {
             real_os_events_observed: true,
             mouse_window_pos: motion_only.mouse_window_pos.clone(),
             scroll_delta_y: 120.0,
-            ..empty_input_adapter_proof(false)
+            ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
         };
 
         assert!(native_input_delta_is_pointer_motion_only(&motion_only));

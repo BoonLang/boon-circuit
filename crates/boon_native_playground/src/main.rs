@@ -5981,7 +5981,14 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
-    let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let synthetic_scroll_probe = args.iter().any(|arg| arg == "--synthetic-scroll-probe");
+    let synthetic_input_probe =
+        synthetic_scroll_probe || args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let synthetic_input_probe_kind = if synthetic_scroll_probe {
+        boon_native_app_window::NativeSyntheticInputProbeKind::InteractiveScroll
+    } else {
+        boon_native_app_window::NativeSyntheticInputProbeKind::Full
+    };
     let world_scene_orbit_probe = args.iter().any(|arg| arg == "--world-scene-orbit-probe");
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
@@ -7047,6 +7054,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             hold_ms,
             input_sample_delay_ms,
             synthetic_input_probe,
+            synthetic_input_probe_kind,
             sample_input_after_initial_frames: true,
             warmup_frame_count,
             sample_frame_count,
@@ -7118,7 +7126,14 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = value_arg(args, "--report").map(PathBuf::from);
     let hold_ms = numeric_arg(args, "--hold-ms").unwrap_or(0);
     let input_sample_delay_ms = numeric_arg(args, "--input-sample-delay-ms").unwrap_or(0);
-    let synthetic_input_probe = args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let synthetic_scroll_probe = args.iter().any(|arg| arg == "--synthetic-scroll-probe");
+    let synthetic_input_probe =
+        synthetic_scroll_probe || args.iter().any(|arg| arg == "--synthetic-input-probe");
+    let synthetic_input_probe_kind = if synthetic_scroll_probe {
+        boon_native_app_window::NativeSyntheticInputProbeKind::InteractiveScroll
+    } else {
+        boon_native_app_window::NativeSyntheticInputProbeKind::Full
+    };
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let probe = args.iter().any(|arg| arg == "--probe");
     let frame_readback_requested =
@@ -7467,6 +7482,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             hold_ms,
             input_sample_delay_ms,
             synthetic_input_probe,
+            synthetic_input_probe_kind,
             sample_input_after_initial_frames: true,
             warmup_frame_count,
             sample_frame_count,
@@ -7603,6 +7619,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
     let dev_app_owned_input_probe = args.iter().any(|arg| arg == "--dev-app-owned-input-probe");
+    let synthetic_scroll_probe = args.iter().any(|arg| arg == "--synthetic-scroll-probe");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_render_hook_app_owned_proof = args
@@ -7694,7 +7711,11 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .to_owned(),
     ];
     if probe && !real_window_input_probe {
-        preview_args.push("--synthetic-input-probe".to_owned());
+        preview_args.push(if synthetic_scroll_probe {
+            "--synthetic-scroll-probe".to_owned()
+        } else {
+            "--synthetic-input-probe".to_owned()
+        });
     }
     if probe {
         preview_args.push("--frame-readback".to_owned());
@@ -47936,7 +47957,7 @@ fn preview_apply_scroll_input_with_units(
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if input.synthetic_input_probe {
+    if input.synthetic_input_probe && !preview_input_is_interactive_scroll_probe(input) {
         return Ok(false);
     }
     if input.scroll_delta_x.abs() <= f64::EPSILON && input.scroll_delta_y.abs() <= f64::EPSILON {
@@ -48042,6 +48063,12 @@ fn preview_apply_scroll_input_with_units(
     shared.update_count = shared.update_count.saturating_add(1);
     shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
     Ok(true)
+}
+
+fn preview_input_is_interactive_scroll_probe(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+) -> bool {
+    input.input_injection_method == "app_window_per_window_interactive_synthetic_scroll_harness"
 }
 
 fn preview_scroll_deltas(input: &boon_native_app_window::NativeInputAdapterProof) -> (f64, f64) {

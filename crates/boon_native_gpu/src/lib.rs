@@ -254,108 +254,6 @@ const RENDER_SCENE_SOURCE_APP_OWNED_DOCUMENT_RENDER_SCENE: &str = "app-owned-doc
 const RENDER_SCENE_SOURCE_APP_OWNED_WORLD_SCENE_PROJECTION: &str =
     "app-owned-world-scene-projection";
 const RETAINED_CHUNK_METRIC_SAMPLE_LIMIT: usize = 16;
-const WORLD_SCENE_SURFACE_MESH_SHADER_WGSL: &str = r#"
-struct CameraUniform {
-    clip_from_world_row0: vec4<f32>,
-    clip_from_world_row1: vec4<f32>,
-    clip_from_world_row2: vec4<f32>,
-    clip_from_world_row3: vec4<f32>,
-};
-
-@group(0) @binding(0)
-var<uniform> camera: CameraUniform;
-
-struct VertexInput {
-    @location(0) world_position: vec4<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) normal_color: vec4<f32>,
-    @location(3) feature_color: vec4<f32>,
-    @location(4) pick_color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.position = vec4<f32>(
-        dot(camera.clip_from_world_row0, input.world_position),
-        dot(camera.clip_from_world_row1, input.world_position),
-        dot(camera.clip_from_world_row2, input.world_position),
-        dot(camera.clip_from_world_row3, input.world_position),
-    );
-    out.color = input.color;
-    return out;
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return input.color;
-}
-"#;
-const WORLD_SCENE_APP_OWNED_MESH_SHADER_WGSL: &str = r#"
-struct CameraUniform {
-    clip_from_world_row0: vec4<f32>,
-    clip_from_world_row1: vec4<f32>,
-    clip_from_world_row2: vec4<f32>,
-    clip_from_world_row3: vec4<f32>,
-};
-
-@group(0) @binding(0)
-var<uniform> camera: CameraUniform;
-
-struct VertexInput {
-    @location(0) world_position: vec4<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) normal_color: vec4<f32>,
-    @location(3) feature_color: vec4<f32>,
-    @location(4) pick_color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) normal_color: vec4<f32>,
-    @location(2) feature_color: vec4<f32>,
-    @location(3) pick_color: vec4<f32>,
-};
-
-struct FragmentOutput {
-    @location(0) color: vec4<f32>,
-    @location(1) normal_color: vec4<f32>,
-    @location(2) feature_color: vec4<f32>,
-    @location(3) pick_color: vec4<f32>,
-};
-
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.position = vec4<f32>(
-        dot(camera.clip_from_world_row0, input.world_position),
-        dot(camera.clip_from_world_row1, input.world_position),
-        dot(camera.clip_from_world_row2, input.world_position),
-        dot(camera.clip_from_world_row3, input.world_position),
-    );
-    out.color = input.color;
-    out.normal_color = input.normal_color;
-    out.feature_color = input.feature_color;
-    out.pick_color = input.pick_color;
-    return out;
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> FragmentOutput {
-    var out: FragmentOutput;
-    out.color = input.color;
-    out.normal_color = input.normal_color;
-    out.feature_color = input.feature_color;
-    out.pick_color = input.pick_color;
-    return out;
-}
-"#;
 
 pub type AssetRef = RenderAssetRef;
 
@@ -1139,16 +1037,29 @@ pub struct WorldSceneWebGpuRenderContract {
 }
 
 pub fn world_scene_webgpu_render_contract() -> WorldSceneWebGpuRenderContract {
+    let surface_vertex_entry = generated::shader_bindings::world_scene_surface_mesh::vs_main_entry(
+        wgpu::VertexStepMode::Vertex,
+    );
+    let surface_fragment_entry =
+        generated::shader_bindings::world_scene_surface_mesh::fs_main_entry([Some(
+            wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            },
+        )]);
     WorldSceneWebGpuRenderContract {
         status: "pass".to_owned(),
         wgpu_version: REQUIRED_WGPU_VERSION.to_owned(),
         shader_language: "WGSL".to_owned(),
         required_features: "empty".to_owned(),
         required_limits_profile: "downlevel_webgl2_defaults".to_owned(),
-        surface_shader_sha256: shader_source_hash(WORLD_SCENE_SURFACE_MESH_SHADER_WGSL),
-        app_owned_shader_sha256: shader_source_hash(WORLD_SCENE_APP_OWNED_MESH_SHADER_WGSL),
-        vertex_entry_point: "vs_main".to_owned(),
-        fragment_entry_point: "fs_main".to_owned(),
+        surface_shader_sha256: generated_shader_wesl_hash("shaders/world_scene_surface_mesh.wesl"),
+        app_owned_shader_sha256: generated_shader_wesl_hash(
+            "shaders/world_scene_app_owned_mesh.wesl",
+        ),
+        vertex_entry_point: surface_vertex_entry.entry_point.to_owned(),
+        fragment_entry_point: surface_fragment_entry.entry_point.to_owned(),
         vertex_stride_bytes: std::mem::size_of::<NativeGpuWorldMeshVertex>(),
         vertex_attributes: vec![
             "location0:Float32x4@0:world_position".to_owned(),
@@ -4982,90 +4893,40 @@ pub fn encode_world_scene_mesh_pipeline_to_surface(
     request
         .queue
         .write_buffer(&camera_uniform_buffer, 0, camera_uniform_bytes);
-    let camera_bind_group_layout =
-        request
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("boon-native-gpu-world-scene-surface-camera-bind-group-layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
-                            NativeGpuWorldCameraUniform,
-                        >() as u64),
-                    },
-                    count: None,
-                }],
-            });
-    let camera_bind_group = request
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("boon-native-gpu-world-scene-surface-camera-bind-group"),
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_uniform_buffer.as_entire_binding(),
-            }],
-        });
+    let camera_bind_group =
+        generated::shader_bindings::world_scene_surface_mesh::WgpuBindGroup0::from_bindings(
+            request.device,
+            generated::shader_bindings::world_scene_surface_mesh::WgpuBindGroup0Entries::new(
+                generated::shader_bindings::world_scene_surface_mesh::WgpuBindGroup0EntriesParams {
+                    camera: camera_uniform_buffer.as_entire_buffer_binding(),
+                },
+            ),
+        );
 
-    let shader = request
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("boon-native-gpu-world-scene-surface-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WORLD_SCENE_SURFACE_MESH_SHADER_WGSL)),
-        });
-    let pipeline_layout = request
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("boon-native-gpu-world-scene-surface-pipeline-layout"),
-            bind_group_layouts: &[Some(&camera_bind_group_layout)],
-            immediate_size: 0,
-        });
+    let shader = generated::shader_bindings::ShaderEntry::WorldSceneSurfaceMesh
+        .create_shader_module_embed_source(request.device);
+    let pipeline_layout = generated::shader_bindings::ShaderEntry::WorldSceneSurfaceMesh
+        .create_pipeline_layout(request.device);
+    let vertex_entry = generated::shader_bindings::world_scene_surface_mesh::vs_main_entry(
+        wgpu::VertexStepMode::Vertex,
+    );
+    let fragment_entry =
+        generated::shader_bindings::world_scene_surface_mesh::fs_main_entry([Some(
+            wgpu::ColorTargetState {
+                format: request.format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            },
+        )]);
     let pipeline = request
         .device
         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("boon-native-gpu-world-scene-surface-pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<NativeGpuWorldMeshVertex>()
-                        as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 16,
-                            shader_location: 1,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 32,
-                            shader_location: 2,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 48,
-                            shader_location: 3,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 64,
-                            shader_location: 4,
-                        },
-                    ],
-                }],
-            },
+            vertex: generated::shader_bindings::world_scene_surface_mesh::vertex_state(
+                &shader,
+                &vertex_entry,
+            ),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None,
@@ -5079,16 +4940,12 @@ pub fn encode_world_scene_mesh_pipeline_to_surface(
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: request.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
+            fragment: Some(
+                generated::shader_bindings::world_scene_surface_mesh::fragment_state(
+                    &shader,
+                    &fragment_entry,
+                ),
+            ),
             multiview_mask: None,
             cache: None,
         });
@@ -5125,7 +4982,7 @@ pub fn encode_world_scene_mesh_pipeline_to_surface(
                 multiview_mask: None,
             });
         pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &camera_bind_group, &[]);
+        camera_bind_group.set(&mut pass);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
@@ -5325,80 +5182,52 @@ fn render_app_owned_world_scene_mesh_pipeline_inner(
         mapped_at_creation: false,
     });
     queue.write_buffer(&camera_uniform_buffer, 0, camera_uniform_bytes);
-    let camera_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("boon-native-gpu-world-scene-camera-bind-group-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
-                        NativeGpuWorldCameraUniform,
-                    >() as u64),
+    let camera_bind_group =
+        generated::shader_bindings::world_scene_app_owned_mesh::WgpuBindGroup0::from_bindings(
+            device,
+            generated::shader_bindings::world_scene_app_owned_mesh::WgpuBindGroup0Entries::new(
+                generated::shader_bindings::world_scene_app_owned_mesh::WgpuBindGroup0EntriesParams {
+                    camera: camera_uniform_buffer.as_entire_buffer_binding(),
                 },
-                count: None,
-            }],
-        });
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("boon-native-gpu-world-scene-camera-bind-group"),
-        layout: &camera_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_uniform_buffer.as_entire_binding(),
-        }],
-    });
+            ),
+        );
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("boon-native-gpu-world-scene-mesh-shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WORLD_SCENE_APP_OWNED_MESH_SHADER_WGSL)),
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("boon-native-gpu-world-scene-mesh-pipeline-layout"),
-        bind_group_layouts: &[Some(&camera_bind_group_layout)],
-        immediate_size: 0,
-    });
+    let shader = generated::shader_bindings::ShaderEntry::WorldSceneAppOwnedMesh
+        .create_shader_module_embed_source(device);
+    let pipeline_layout = generated::shader_bindings::ShaderEntry::WorldSceneAppOwnedMesh
+        .create_pipeline_layout(device);
+    let vertex_entry = generated::shader_bindings::world_scene_app_owned_mesh::vs_main_entry(
+        wgpu::VertexStepMode::Vertex,
+    );
+    let fragment_entry = generated::shader_bindings::world_scene_app_owned_mesh::fs_main_entry([
+        Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: normal_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: feature_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: feature_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+    ]);
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("boon-native-gpu-world-scene-mesh-pipeline"),
         layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<NativeGpuWorldMeshVertex>()
-                    as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 16,
-                        shader_location: 1,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 32,
-                        shader_location: 2,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 48,
-                        shader_location: 3,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 64,
-                        shader_location: 4,
-                    },
-                ],
-            }],
-        },
+        vertex: generated::shader_bindings::world_scene_app_owned_mesh::vertex_state(
+            &shader,
+            &vertex_entry,
+        ),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: None,
@@ -5412,33 +5241,12 @@ fn render_app_owned_world_scene_mesh_pipeline_inner(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: normal_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: feature_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: feature_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
-        }),
+        fragment: Some(
+            generated::shader_bindings::world_scene_app_owned_mesh::fragment_state(
+                &shader,
+                &fragment_entry,
+            ),
+        ),
         multiview_mask: None,
         cache: None,
     });
@@ -5553,7 +5361,7 @@ fn render_app_owned_world_scene_mesh_pipeline_inner(
             multiview_mask: None,
         });
         pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &camera_bind_group, &[]);
+        camera_bind_group.set(&mut pass);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         if use_chunk_draw_ranges && !mesh_counts.draw_ranges.is_empty() {
@@ -7008,10 +6816,11 @@ fn world_scene_identity_hash(scene: &boon_scene_model::WorldScene) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn shader_source_hash(source: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(source.as_bytes());
-    format!("{:x}", hasher.finalize())
+fn generated_shader_wesl_hash(path: &str) -> String {
+    generated::shader_bindings::NATIVE_GPU_SHADER_WESL_SHA256S
+        .iter()
+        .find_map(|(shader_path, hash)| (*shader_path == path).then_some((*hash).to_owned()))
+        .unwrap_or_default()
 }
 
 fn world_scene_projection_render_scene(

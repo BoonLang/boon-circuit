@@ -70,6 +70,7 @@ earcutr = "0.5"
 bitvec = "1.0"
 bytes = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
+encase = "0.12"
 ropey = "1.6"
 unicode-segmentation = "1.13"
 arboard = "3.6"

@@ -30097,6 +30097,21 @@ fn verify_report_json_sidecars(report: &JsonValue, report_path: &Path) -> Runtim
         )
         .into());
     }
+    for key in [
+        "report_json_sidecar_count",
+        "report_json_sidecar_total_raw_bytes",
+        "report_json_sidecar_total_ref_bytes",
+        "report_json_sidecar_unique_artifact_count",
+        "report_json_sidecar_duplicate_ref_count",
+    ] {
+        if report.get(key).and_then(JsonValue::as_u64).is_none() {
+            return Err(format!(
+                "{} contains JSON sidecars but is missing numeric `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
     let artifacts = report
         .get("artifact_sha256s")
         .and_then(JsonValue::as_array)
@@ -30115,6 +30130,7 @@ fn verify_report_json_sidecars(report: &JsonValue, report_path: &Path) -> Runtim
     let mut paths_by_digest = BTreeMap::<String, BTreeSet<String>>::new();
     let mut unique_bytes_by_path = BTreeMap::<String, u64>::new();
     let mut ref_bytes = 0_u64;
+    let mut duplicate_ref_count = 0_u64;
     for sidecar in &sidecars {
         let Some(pointer) = sidecar
             .get("json_pointer_replaced")
@@ -30181,6 +30197,13 @@ fn verify_report_json_sidecars(report: &JsonValue, report_path: &Path) -> Runtim
             );
         }
         ref_bytes = ref_bytes.saturating_add(byte_len);
+        if sidecar
+            .get("deduplicated_ref")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            duplicate_ref_count = duplicate_ref_count.saturating_add(1);
+        }
         unique_bytes_by_path
             .entry(path.to_owned())
             .or_insert(byte_len);
@@ -30255,6 +30278,17 @@ fn verify_report_json_sidecars(report: &JsonValue, report_path: &Path) -> Runtim
     {
         return Err(format!(
             "{} report_json_sidecar_unique_artifact_count does not match unique sidecars",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("report_json_sidecar_duplicate_ref_count")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|declared| declared != duplicate_ref_count)
+    {
+        return Err(format!(
+            "{} report_json_sidecar_duplicate_ref_count does not match deduplicated sidecar refs",
             report_path.display()
         )
         .into());

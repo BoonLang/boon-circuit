@@ -39,11 +39,11 @@ links to it and records unified-phase progress and blockers.
 | Phase | Status | Current Evidence |
 | --- | --- | --- |
 | U0 - Baselines and Task Graph | in-progress | This ledger exists and records the first current-state probes. Full release/debug baselines for TodoMVC, Cells, native idle, interaction paths, GPU bytes/writes/cache behavior, and browser/WASM artifacts are not yet complete. |
-| U1 - Complete BYTES/MachinePlan Half-Migration | in-progress | The current `verify-bytes-machine-plan-all --check-existing` aggregate passes with `63/63` required reports checked, including direct indexed source-payload `run-plan-route` coverage, aggregate-required append-row refresh coverage, indexed BYTES search/text-conversion coverage, and the aggregate-required `verify-bytes-default-engine-readiness` proof. `audit-goal-readiness` still fails honestly because `7` BYTES/MachinePlan ledger phases remain partial and the Phase 10 default switch has not happened; `boon_cli run` still defaults to the legacy engine until the remaining parity/performance/readiness blockers are closed. |
+| U1 - Complete BYTES/MachinePlan Half-Migration | in-progress | `boon_cli run` now defaults to PlanExecutor/default-engine mode in current code. A persistent PlanExecutor live-session slice now exists: MachinePlan can compile from source units, the old whole-scenario PlanExecutor runner goes through a reusable step state, focused tests prove TodoMVC live `LiveSourceEvent` execution matches the existing PlanExecutor scenario runner with zero generic fallback counters, and `LiveRuntime` now uses an explicit `LiveRuntimeEngine::{Legacy, PlanExecutor}` boundary with no-fallback PlanExecutor constructors plus a PlanExecutor-backed `apply_source_batch_turn` equivalence test. Native document-summary/layout-proof helpers use profiled PlanExecutor project construction, and native preview runtime construction now selects PlanExecutor for document-only projects while keeping `world:` / `manufacturing:` output roots on explicit legacy diagnostics. U1 remains incomplete until native reports assert the runtime that actually handled input, source-free artifacts and remaining equivalence cases are covered, and fresh readiness evidence covers that boundary rather than only focused constructor tests. |
 | U2 - Transactional Document Changes and Hot Retained Model | in-progress | First document transaction slices added: `DocumentChangeBatch`, `DocumentChangeSet`, atomic rollback, merged dirty facts, precise `InsertChild`/`RemoveChild`/`MoveChild` patches, native runtime-render-patch target lowering through typed document batches for incremental layout fast paths, deterministic numeric hot node IDs with debug-name tables, generation-carrying hot node refs across frames, a carry-forward text/style/material/clip/binding intern index, derived retained layout cache keys, retained layout delta/reuse classification, a minimal retained layout geometry cache/update layer, explicit retained layout patch operations, a derived typed style record/index, a derived multi-binding index, typed rich-text/editor hint style round-trips, and a checked hit side-table path over typed binding refs. `verify-runtime-change-sets`, `verify-document-batch-patches`, and `verify-retained-layout-deltas` now advertise and pass focused report gates for these current contracts. True incremental layout execution, rich typed binding protocol migration, and protocol cleanup remain open. |
 | U3 - Retained Incremental Layout and Shared Text | in-progress | First bounded native playground/runtime slices kept: render snapshots now keep a layout node index for direct paint/dimension patch lookup, bound-text sync prechecks text changes before mutating the shared `Arc<LayoutFrame>`, trusted nonstructural document batches avoid redundant full-frame integrity checks, root `List/length`/`List/count` can skip unchanged-cardinality upstream list-view roots, and `verify-text-cache-layers` now passes over native shaped-run cache metrics/reuse accounting. A follow-up indexed bound-input-sync experiment was killed because it made the measured bound-input bucket worse. This is still not true incremental layout; full layout-frame clone and runtime apply remain in the cursor path. |
 | U4 - Canonical Retained Render Model | in-progress | Checked render-scene lowering now consumes cached derived retained keys and rejects missing retained identity for real document nodes. `verify-render-patch-contract` now passes over document `RenderScenePatch` operations and runtime render-delta scenario expectations. The render contract is still partial because layout is not fully retained/incremental and protocol cleanup remains open. |
-| U5 - WGPU Retained Resources, Owned Targets, Demand Scheduling | in-progress | NovyWave interaction-speed reports include a schema-enforced retained `RenderScene` upload probe through `VisibleLayoutRenderer::encode_scene`. The native/browser WGPU readback contract and retained arena gates exist. The headed Cells visible-click release gate has current hardware evidence passing with app-owned WGPU proof and product-frame render-graph coverage. A first generic `ProductRenderGraph` / `PresentPlan` summary now flows through native product commits and Cells release label checks. Release/hardware TodoMVC focused ProductRenderGraph evidence is also under the product-frame budget. TodoMVC broad preview E2E still has older visual/input/readiness cleanup blockers. U5 remains incomplete because this is only a first summary/plan slice, not yet a full retained WGPU frame graph with dirty resource scheduling, and broad TodoMVC/native readiness is not green. |
+| U5 - WGPU Retained Resources, Owned Targets, Demand Scheduling | in-progress | NovyWave interaction-speed reports include a schema-enforced retained `RenderScene` upload probe through `VisibleLayoutRenderer::encode_scene`. The native/browser WGPU readback contract and retained arena gates exist. The headed Cells visible-click release gate previously had hardware evidence passing with app-owned WGPU proof and product-frame render-graph coverage, but current target reports are stale after the latest commit and must be regenerated. The generic `ProductRenderGraph` / `PresentPlan` summary now separates stable plan identity from workload/proof-subscriber hashes, but U5 remains incomplete because the graph is still not a full renderer-owned retained WGPU resource/pass graph with dirty resource scheduling, and broad native readiness is not freshly green. |
 | U6 - Shared Native/Web Visual Path and Semantic Accessibility | in-progress | First canonical `SemanticScene`/`SemanticPatch` model, minimal static web semantic DOM snapshot, live browser semantic DOM mount/source-dispatch helper with composition, beforeinput replacement text, and keyboard activation proof, headless Chromium execution proof for route-aware mounted semantic events and semantic/DOM focus synchronization, web semantic/IME route bridge contract, native AccessKit `TreeUpdate` lowering, preview live tree delivery/action capture/routing, shared semantic source dispatch, native AccessKit requests driving a platform-neutral `WorldEditorSession`, optional preview-host ownership/routing of that session for solid-model examples, a visible native preview document-projected editor layout for solid-model sessions, a platform-neutral `WorldSemanticEditorTree` to shared `SemanticScene`/web/native route bridge for the car editor, a retained `SurfaceChunk` indexed-mesh payload contract for the browser WebGPU host, a canvas-only `boon_web_host` source artifact, a generated `target/web/boon_web_host.mjs` browser-host module artifact with deterministic gzip sidecar, a generated `target/wasm32-unknown-unknown/release/boon_web_host.wasm` artifact with browser-executed retained upload-plan, draw-plan, renderer-dispatch, command-stream, command-word, and packed-buffer-layout validation/fingerprint exports plus deterministic gzip sidecar, a serializable retained scene packet handoff for the parametric car chunks, a source-side retained upload plan and WASM-validated packed-buffer byte layout contract, a browser retained WebGPU renderer source path, real headless Chromium WebGPU upload/render/readback proof for color/normal/feature/depth targets, compact browser feature/pick/color mask-run capture, native/browser feature/pick/color mask comparison with explicit raster tolerance and edge-island diagnostics, and measured source-artifact/startup/generated-artifact-inventory/generated-wasm-retained-upload-draw-render-dispatch-command-stream-and-words execution budget gates are implemented and verified by `build-browser-host-artifact`, `verify-semantic-scene`, `verify-accessibility-adapters`, focused native tests, `verify-solid-graph`, `verify-browser-webgpu-world-scene`, `verify-native-web-render-comparison`, `verify-native-web-render-parity`, `verify-native-web-render-contract`, `verify-browser-artifact-budget`, and `verify-browser-startup-budget`. Generated JS module, WASM artifact budget, and browser-executed retained upload-plan/draw-plan/renderer-dispatch/command-stream/command-word validation/fingerprint WASM evidence exist; direct WASM ownership of browser WebGPU API calls remains open. Headed/live browser IME proof, full color-pixel visual parity, full 3D viewport rendering/parity, and broader platform action coverage remain open. |
 | U7 - World Scene and Basic 3D | in-progress | First platform-neutral `boon_scene_model` crate, generic `world:` parser/typecheck/IR output-root proof, runtime lowering from evaluated generic `world:` output into `WorldScene`, `examples/hello_3d/RUN.bn` as a generic runtime world-output example, platform-neutral `hello_3d` pick/select, transform-only, and operator-host pointer camera-orbit interaction delta proof, native GPU app-owned WGPU projection/readback proof, selected-instance retained outline readback proof, app-owned projection pick-ID readback proof, app-owned projection feature/depth metadata readback proof, app-owned native WGPU `Depth32Float` target clear-pass proof, a basic app-owned shader-camera-matrix indexed mesh/depth/normal/low-32-feature/pick/hit-test/operator-host pointer camera-orbit readback proof for `hello_3d` plus retained `SurfaceChunk` mesh proof for the SolidGraph-derived parametric car, derived retained mesh verifier expectations that track actual retained chunk payloads, a native preview visible-surface `world:` branch for `hello_3d`, preview poll-time app-owned pointer-drag routing through `WorldHostPointerOrbitController`, a report-gated `verify-native-gpu-preview-e2e --example hello_3d` app-owned host-event orbit proof, a WebGPU-compatible retained renderer contract, real browser retained-scene WebGPU color/normal/feature/pick/depth execution/readback, native/browser retained parametric-car feature/pick/color mask comparison with isolated edge diagnostics, and a browser color-only selected outline overlay with identity-target preservation now exist. Full color-pixel native/browser parity, headed/manual visible native preview pointer/orbit `hello_3d` scenario, and broader 3D viewport/product integration remain open. |
 | U8 - SolidGraph, AssemblyGraph, Visual Compilation | in-progress | Platform-neutral `boon_solid_model`, authoritative SolidGraph/AssemblyGraph model, printable bracket fixture, shared part instances, validation diagnostics, generic `manufacturing:` parser/typecheck/IR output-root proof, runtime lowering from generic Boon `Assembly/*`, `Part/*`, and `Solid/*` constructor records into `SolidModelBundle`, checked-in `examples/printable_bracket_3d/RUN.bn`, Boon-facing `Solid/sphere`, `Solid/cone`, `Solid/torus`, `Solid/shell`, `Solid/extrude`, `Solid/revolve`, and `Solid/loft` constructor lowering into `SolidOp::Sphere`/`SolidOp::Cone`/`SolidOp::Torus`/`SolidOp::Shell`/`SolidOp::Extrude`/`SolidOp::Revolve`/`SolidOp::Loft`, a first `SolidModelBundle` to `WorldScene` retained generated bounds-mesh chunk proof, exact retained primitive indexed meshes for supported `Box`/`Sphere`/`Cylinder`/`Cone`/`Torus` roots, exact retained profile meshes for supported rectangular-profile `Extrude`, rectangular-radial `Revolve`, and two-rectangle `Loft` roots, exact retained hollow meshes for supported box-like `Shell` roots, adaptive retained rounded-box visual meshes with explicit error bounds, translation-only transform visual mesh reuse, a retained CSG-subset composite visual mesh for the printable bracket through-cylinder Difference path, a bounded retained CSG-subset visual mesh for box-like `SolidOp::Intersection`, and a bounded retained CSG-subset visual mesh for box-through-rectangular-slot `SolidOp::Difference` now exist. Exact/general CSG, curved/hollow intersection visual CSG, adaptive surface meshing beyond rounded boxes, and native/web visual parity remain not implemented. |
@@ -79,6 +79,413 @@ dependency-ready unified work is done or a real engine-level scheduler /
 virtualization architecture exists to test. This disposition does not make the
 old readiness/default switch pass. The focused handoff for the next attempt is
 `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
+
+## 2026-07-04 - U1 Persistent PlanExecutor Live Session Slice
+
+Status: implemented a focused prerequisite for PlanExecutor-backed
+`LiveRuntime`, but did not yet switch the default/native runtime path.
+
+Subagent read-only reviews were used before implementation:
+
+- Native GPU/report freshness review found the native handoff aggregate still
+  failing mostly on stale manifest reports, with broad TodoMVC preview E2E as
+  the current true product/verifier blocker. The focused Cells product metric is
+  not the immediate blocker in the current reports.
+- PlanExecutor/LiveRuntime review identified the smallest correct next slice:
+  extract the whole-scenario PlanExecutor loop into a persistent session before
+  wiring native or `LiveRuntime` callers to it.
+- ProductRenderGraph review confirmed the current graph is still partly a
+  report/contract wrapper around existing renderer caches; the next renderer
+  architecture slice should move active scene/resource ownership into
+  `VisibleLayoutRenderer`.
+
+Code changes in this slice:
+
+- `crates/boon_compiler/src/lib.rs`
+  - Added `compile_source_text_to_machine_plan`,
+    `compile_source_units_to_machine_plan`, and
+    `compile_parsed_program_to_machine_plan`.
+  - Refactored `compile_source_path_to_machine_plan` through the shared
+    parsed-program helper so path/text/source-unit MachinePlan compilation uses
+    the same provenance surface.
+- `crates/boon_runtime/src/lib.rs`
+  - Extracted the local state from `execute_machine_plan_root_scenario_inner`
+    into `PlanExecutorRuntimeState`.
+  - Added `apply_live_source_event` so a persistent PlanExecutor state can
+    execute `LiveSourceEvent` inputs instead of only scenario-selected steps.
+  - Added `PlanExecutorLiveSession`, which owns an `Arc<MachinePlan>`,
+    persistent PlanExecutor state, host root, and step sequence, and reports
+    explicit `plan_executor` provenance with `generic_fallback_enabled=false`.
+
+Evidence:
+
+- `cargo test -p boon_compiler compiler_facade_loads_machine_plan_from_source_units --quiet`:
+  pass.
+- `cargo test -p boon_runtime persistent_plan_executor_runtime_matches_whole_todomvc_scenario_runner --quiet`:
+  pass.
+- `cargo test -p boon_runtime persistent_plan_executor_runtime_accepts_live_source_events --quiet`:
+  pass.
+- `cargo test -p boon_runtime plan_executor_live_session_from_project_accepts_live_source_events --quiet`:
+  pass.
+- `cargo check -p boon_compiler -p boon_runtime -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+- `target/debug/xtask verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass for git commit `f57da86` and worktree fingerprint
+  `cc789551c5ea5ec1992ed457ccc6b628c46e5d99a7af7ed7f1f16eb8081cfc34`;
+  `default_engine=plan`, `default_switch_allowed=true`, and `blocker_count=0`.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+
+Important non-claims:
+
+- `LiveRuntime::apply_source_event_turn` still calls the existing
+  `LoadedRuntime` / `GenericScheduledRuntime` path. The new
+  `PlanExecutorLiveSession` is the explicit no-fallback execution surface that
+  should be wired next.
+- Native preview is not yet PlanExecutor-backed by default.
+- Native GPU manifest reports were not refreshed after this code change, so
+  native handoff readiness remains unproven.
+- ProductRenderGraph remains incomplete as a real renderer-owned retained WGPU
+  resource/pass graph.
+
+Next code steps:
+
+1. Add a `LiveRuntime` engine mode that owns `PlanExecutorLiveSession` and an
+   explicit compare/legacy mode, without silently falling back to
+   `GenericScheduledRuntime`.
+2. Route focused TodoMVC and Cells live-runtime tests through the PlanExecutor
+   mode and compare state/delta/provenance with current scenario reports.
+3. Then move native preview runtime initialization to the PlanExecutor-backed
+   mode where supported, keeping unsupported surfaces as explicit blockers.
+4. Continue the U5 renderer slice by moving active render-scene/resource
+   ownership into `VisibleLayoutRenderer` rather than only reporting graph
+   summaries.
+
+## 2026-07-04 - U1 Explicit LiveRuntime PlanExecutor Mode Slice
+
+Status: implemented the next focused U1 runtime-boundary slice, but did not
+yet switch all default/native runtime clients.
+
+What changed:
+
+- `LiveRuntime` can now carry an explicit `PlanExecutorLiveSession` alongside
+  the existing loaded runtime state.
+- Added explicit no-fallback constructors:
+  `LiveRuntime::from_source_plan_executor` and
+  `LiveRuntime::from_project_plan_executor`.
+- Added `LiveRuntime::engine_provenance_report`, which reports
+  `engine=plan_executor` and `generic_fallback_enabled=false` for the explicit
+  PlanExecutor live mode.
+- In explicit PlanExecutor mode, `LiveRuntime::apply_source_event_turn` and
+  `LiveRuntime::apply_source_batch_turn` dispatch source events through
+  `PlanExecutorLiveSession` instead of the `LoadedRuntime` /
+  `GenericScheduledRuntime` turn path.
+- Added a typed bridge from PlanExecutor semantic-delta JSON to the existing
+  `SemanticDelta` protocol. This slice intentionally does not synthesize legacy
+  render patches from PlanExecutor output.
+- Added non-consuming PlanExecutor state snapshots so live state can be read
+  after inputs without consuming the session.
+- Added PlanExecutor-backed `document_state_summary` and
+  `document_state_summary_for_window` for explicit PlanExecutor `LiveRuntime`
+  mode. The adapter normalizes flat executor root state into nested document
+  JSON, exposes direct and retained list rows with `$boon` row identity, derives
+  row-scoped source binding summaries from PlanExecutor source routes, and
+  windows chunk projections by row/column instead of forcing full chunk output.
+- Added a focused TodoMVC equivalence test proving
+  `LiveRuntime::from_project_plan_executor(...).apply_source_batch_turn(...)`
+  matches the whole PlanExecutor scenario runner for state summary and semantic
+  deltas, while preserving no-fallback provenance.
+- Added focused document-summary tests proving explicit PlanExecutor
+  `LiveRuntime` exposes current TodoMVC rows/source bindings and current,
+  bounded Cells `selected_input` / `sheet_rows` window summaries without
+  falling back to the loaded generic runtime.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner --quiet`:
+  pass.
+- `cargo test -p boon_runtime live_runtime_plan_executor_ --quiet`: pass for
+  the focused PlanExecutor live batch/document-summary test group.
+- `cargo test -p boon_runtime plan_executor_live_session_from_project_accepts_live_source_events --quiet`:
+  pass.
+- `cargo check -p boon_compiler -p boon_runtime -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+
+Important non-claims:
+
+- The ordinary `LiveRuntime::from_source`, `LiveRuntime::from_project`, and
+  native preview construction paths are still legacy/generic by default.
+- Native preview is not yet PlanExecutor-backed by default.
+- World/solid outputs, source-value query helpers, and render patch generation
+  still need explicit PlanExecutor equivalents or explicit unsupported blockers
+  before the default switch can be honest.
+- This is not a Cells-specific speed patch and does not claim native handoff
+  readiness.
+
+Next code steps:
+
+1. Extend PlanExecutor live mode with source-value query helpers and any
+   remaining source inventory surfaces needed by native preview.
+2. Switch default/native `LiveRuntime` construction to PlanExecutor only after
+   unsupported surfaces fail explicitly instead of falling back silently.
+3. Add Cells, BYTES/indexed, demand-current/list-find, and source-free
+   equivalence tests for the same `LiveRuntime::apply_source_batch_turn`
+   contract.
+4. Continue U5 by moving active scene/resource ownership into
+   `VisibleLayoutRenderer`.
+
+## 2026-07-04 - U1 PlanExecutor Query Surface Slice
+
+Status: implemented another focused U1 runtime-boundary slice, but still did
+not switch default/native runtime construction or replace the remaining
+split-brain `LiveRuntime` storage shape.
+
+Subagent read-only reviews before this slice converged on the same problem:
+explicit PlanExecutor mode was real for live turns and document summaries, but
+several native-facing `LiveRuntime` methods could still consult or mutate the
+legacy `LoadedRuntime` state. That made the `generic_fallback_enabled=false`
+provenance too weak for default/native handoff.
+
+What changed:
+
+- `PlanExecutorLiveSession` now owns source inventory queries over
+  `MachinePlan.source_routes`: canonical source path lookup, source ID lookup,
+  `has_source_path`, and text-payload detection.
+- `PlanExecutorLiveSession` now provides PlanExecutor-backed
+  `document_state_values` and `runtime_value_summaries`. These read current
+  PlanExecutor document summaries instead of stale generic runtime state.
+- `LiveRuntime::normalize_live_source_event` now resolves source path aliases
+  and source IDs from the PlanExecutor session when explicit PlanExecutor mode
+  is active.
+- `LiveRuntime::runtime_value_summaries`, `document_state_values`,
+  `source_payload_has_text`, and `has_source_path` now branch to PlanExecutor
+  helpers in explicit PlanExecutor mode.
+- `LiveRuntime::apply_source_event`, `apply_source_event_for_document`, and
+  `apply_source_event_for_document_window` now dispatch through
+  `PlanExecutorLiveSession` in explicit PlanExecutor mode instead of mutating
+  the legacy `LoadedRuntime`.
+- The scenario-step helper surfaces
+  `apply_source_event_for_step`, `apply_source_event_for_step_value_summaries`,
+  `apply_source_event_for_step_projected_value_summaries`, and
+  `apply_source_event_for_step_with_document_window` now use the PlanExecutor
+  live path when explicit PlanExecutor mode is active.
+- `world_scene_output` and `solid_model_output` now fail explicitly in
+  PlanExecutor mode with a no-fallback error instead of silently reading the
+  legacy `LoadedRuntime` output surface.
+- Focused tests now prove TodoMVC `.events.` source aliases resolve through the
+  MachinePlan route table without an input `source_id`, PlanExecutor-targeted
+  values and inspector summaries are current after a source event, and Cells
+  PlanExecutor window/value summaries stay current after selecting `B0`.
+- Focused tests also prove scenario-step sparse value helpers stay on current
+  PlanExecutor state and legacy-only world/solid output calls reject
+  PlanExecutor mode instead of falling back.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_plan_executor_ --quiet`: pass for
+  the focused PlanExecutor live batch/document-summary/query/helper/unsupported
+  output test group.
+
+Important non-claims:
+
+- The optional `PlanExecutorLiveSession` split has been replaced by an explicit
+  `LiveRuntimeEngine::{Legacy, PlanExecutor}` boundary, but ordinary
+  `LiveRuntime::from_source`, `LiveRuntime::from_project`,
+  `from_project_profiled`, and native preview construction are still not
+  switched to PlanExecutor by default.
+- PlanExecutor world/solid output lowering remains unimplemented; those calls
+  now fail honestly instead of falling back. Render patch generation,
+  source-free artifact loading, and broader BYTES/indexed/demand-current
+  equivalence coverage remain open.
+- Native GPU manifest reports were not refreshed for this dirty worktree.
+  Native handoff readiness remains unproven.
+
+Next code steps:
+
+1. Switch default/native `LiveRuntime` construction only after the unsupported
+   surfaces below are honest and focused equivalence tests prove the supported
+   document/runtime surface.
+2. Add explicit unsupported handling or PlanExecutor implementations for
+   world/solid outputs, render patches, and artifact replay.
+3. Continue the U5 renderer-owned ProductFrameGraph cut.
+
+## 2026-07-04 - U1 Explicit LiveRuntime Engine Boundary
+
+Status: completed the interrupted enum-boundary refactor as a focused U1
+checkpoint. This does not complete U1 because default/native construction is
+still legacy unless explicit PlanExecutor constructors are used.
+
+What changed:
+
+- `LiveRuntime` now stores `engine: LiveRuntimeEngine`, where the variants are
+  `Legacy(LoadedRuntime)` and `PlanExecutor(PlanExecutorLiveSession)`.
+- Explicit PlanExecutor constructors no longer build or retain a hidden
+  `LoadedRuntime`.
+- Production helpers that need legacy state go through `legacy_runtime()` /
+  `legacy_runtime_mut()`, which reject PlanExecutor mode with a no-hidden-
+  fallback error.
+- Legacy-specific tests now use explicit test-only legacy accessors instead of
+  reaching through a public `runtime` field.
+- The no-fallback world/solid guard test now asserts the new error contract:
+  PlanExecutor mode has no `LoadedRuntime` and refuses hidden fallback.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_plan_executor_ --quiet`: pass for
+  the focused PlanExecutor live batch/document-summary/query/helper/unsupported
+  output test group after the enum-boundary cleanup.
+
+Important non-claims:
+
+- Ordinary `LiveRuntime::from_source`, `from_project`, `from_project_profiled`,
+  and native preview construction still create legacy/generic runtimes.
+- Source-free artifact replay, world/solid PlanExecutor outputs, render patch
+  generation, and broad BYTES/native readiness reports remain unfinished.
+- Native GPU manifest reports have not been refreshed for this dirty worktree.
+
+Next code steps:
+
+1. Add an explicit constructor policy for document/live default PlanExecutor
+   mode versus named legacy diagnostic/compare mode.
+2. Switch supported document/native preview paths to PlanExecutor provenance and
+   keep unsupported surfaces as explicit errors.
+3. Refresh BYTES/default-engine/readiness and native-focused evidence only after
+   the default/native construction cut is in place.
+
+## 2026-07-04 - U1 Profiled PlanExecutor Document Constructor
+
+Status: continued the U1 default/native boundary work with a narrow native
+document-summary cut. This still does not switch all native preview runtime
+state to PlanExecutor.
+
+What changed:
+
+- Added `LiveRuntime::from_project_plan_executor_profiled`, which creates a
+  profiled PlanExecutor live session and reports `engine=plan_executor` with
+  `generic_fallback_enabled=false`.
+- Added focused provenance coverage for the profiled PlanExecutor constructor.
+- Switched native playground document-summary/layout-proof helpers to use the
+  profiled PlanExecutor project constructor for document summaries.
+- Switched the source-text document helper used by synchronous ReplaceCode
+  runtime summaries to explicit PlanExecutor project construction.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_plan_executor_ --quiet`: pass for
+  the focused six-test PlanExecutor group, including profiled constructor
+  provenance.
+- `cargo check -p boon_native_playground`: pass with existing warnings.
+
+Important non-claims:
+
+- The main preview shared `live_runtime` construction still uses the legacy
+  profiled constructor so world/solid output paths do not silently lose their
+  current explicit legacy support.
+- Operator-host fallback runtime construction and broad native preview E2E
+  evidence are not yet switched to PlanExecutor.
+- Native GPU manifest reports were not refreshed for this dirty worktree.
+
+Next code steps:
+
+1. Add native-focused provenance assertions so preview E2E reports prove
+   document interaction used PlanExecutor, not only document summaries.
+2. Refresh BYTES/default-engine/readiness and native manifest evidence after the
+   broader native runtime construction switch.
+
+## 2026-07-04 - U1 Native Preview Runtime Selector
+
+Status: continued the U1 default/native boundary work by making native preview
+runtime construction choose the supported engine from compiler output-root
+metadata. This is a real native construction cut, but it still does not
+complete U1 because the broad native reports do not yet assert the provenance
+of the runtime that handled input.
+
+Subagent read-only reviews before implementation found:
+
+- Native GPU readiness is still unproven. Current `target/reports` evidence is
+  stale for this dirty worktree, and the current broad native blocker is
+  TodoMVC preview E2E/report debt rather than Cells product latency.
+- `ProductRenderGraph` remains an executor/reporting wrapper around retained
+  renderer caches, not a full renderer-owned `ProductFrameGraph` yet.
+- The safest runtime slice was to split native construction by supported
+  surface instead of globally flipping `LiveRuntime::from_project`, because
+  `world:` and `manufacturing:` outputs still depend on explicit legacy
+  lowering.
+
+What changed:
+
+- `CompilerStaticProgramAnalysis` now includes typed output-root metadata:
+  root name, output kind, typed-contract flag, and generic-output-port flag.
+- `boon_runtime` exposes
+  `project_requires_legacy_output_runtime(...)`, which classifies projects with
+  `world` or `manufacturing` output roots as requiring explicit legacy output
+  runtime for now. The classifier is generic output-root metadata, not example
+  names or source-string matching.
+- `LiveRuntime` now has explicit `from_source_legacy`,
+  `from_project_legacy`, and `from_project_legacy_profiled` constructors. The
+  old default constructor names still delegate to these legacy constructors for
+  compatibility, but profiles now report `engine=legacy_generic_runtime` and
+  `generic_fallback_enabled=true`.
+- Native preview shared runtime construction, ReplaceCode runtime reinstall,
+  and operator-host request-local fallback now call a single native selector:
+  document-only projects use profiled PlanExecutor sessions, while `world:` /
+  `manufacturing:` projects use explicit legacy diagnostics with
+  `legacy_runtime_fallback_hidden=false`.
+- Operator-host input ACKs now expose `runtime_provenance`,
+  `runtime_engine`, and `runtime_generic_fallback_enabled`, and the native E2E
+  schema/contract requires document-preview reports to prove
+  `engine=plan_executor` with `generic_fallback_enabled=false`.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_plan_executor_ --quiet`: pass, six
+  focused PlanExecutor live/runtime tests.
+- `cargo test -p boon_native_playground native_preview_runtime_selector_ --quiet`:
+  pass. The document fixture reports `engine=plan_executor` and
+  `generic_fallback_enabled=false`; the `hello_3d` `world:` fixture reports
+  `native_preview_runtime_selection=explicit_legacy_output_runtime` and keeps
+  `world_scene_output()` working.
+- `cargo test -p boon_native_playground todomvc_operator_host_input_keeps_layout_current_after_structural_events --quiet`:
+  pass with preview-side operator-host ACK provenance assertions for
+  `engine=plan_executor` and `generic_fallback_enabled=false`.
+- `cargo test -p boon_native_playground compact_operator_host_input_skips_pre_event_summary_when_layout_identity_exists --quiet`:
+  pass on the existing legacy Counter setup. A temporary PlanExecutor run of
+  that Counter source event failed honestly with
+  `CPU root-scenario PlanExecutor requires typed_lowering_executable=true`,
+  so Counter/default-event PlanExecutor parity remains a real U1 coverage gap
+  rather than something hidden by the native selector.
+- `cargo check -p boon_compiler -p boon_runtime -p boon_native_playground`:
+  pass with existing warnings.
+
+Important non-claims:
+
+- Default `LiveRuntime::from_source` / `from_project` still delegate to legacy
+  constructors for compatibility. The native selector is the normal native
+  document path; full default switch remains open.
+- Native GPU manifest reports were not regenerated after this dirty-tree code
+  cut, so handoff readiness remains unproven.
+- TodoMVC broad preview E2E is still the current native handoff blocker until
+  its evidence tier, scenario coverage, runtime assertions, and visible-reality
+  harness are repaired/refreshed.
+- Source-free artifact loading and `world:` / `manufacturing:` PlanExecutor
+  output lowering remain open.
+- Counter-style document source events are not yet all PlanExecutor-executable;
+  the observed blocker is the MachinePlan typed-lowering executable flag for
+  that path.
+- `ProductRenderGraph` still needs the non-optional retained renderer-owned
+  graph implementation; the current graph evidence remains a useful wrapper,
+  not the final architecture.
+
+Next code steps:
+
+1. Refresh focused TodoMVC preview E2E so the new runtime-provenance report
+   assertion is exercised by a native report, not only unit tests.
+2. Repair TodoMVC preview E2E/report debt: resolve the evidence-tier mismatch
+   against the native GPU contract, add real runtime assertions, complete
+   scenario/visible-reality coverage, and rerun the focused report.
+3. Continue U1 coverage for Cells source-event equivalence, BYTES, indexed
+   source payloads, demand-current/list-find cases, Counter typed-lowering
+   executable parity, and source-free artifact loading.
 
 ## 2026-07-03 - U5 Current Product Render Graph Focused Pass
 
@@ -34253,3 +34660,208 @@ Remaining blockers:
   the full unified goal: BYTES/MachinePlan default-engine readiness, retained
   layout/render execution, shared native/web parity, broader native readiness,
   3D/world, manufacturing, and final cleanup/default-switch work remain open.
+
+## 2026-07-04 - ProductRenderGraph Identity Split
+
+Status: continued U5 by removing a false identity claim from the native product
+graph path. This is a generic renderer/reporting architecture slice, not a
+Cells-specific speed patch and not full ProductFrameGraph completion.
+
+What changed:
+
+- `boon_native_gpu::FrameMetrics` now reports
+  `renderer_render_graph_workload_hash` separately from
+  `renderer_render_graph_plan_hash`.
+- `renderer_render_graph_plan_hash` now hashes pass topology/resources and no
+  longer includes upload bytes, dirty chunk count, queue writes, or draw calls.
+- Native product graph summaries now expose `workload_hash` and
+  `proof_subscriber_hash`, so proof/readback subscribers and frame workload are
+  accounted separately from product plan identity.
+- `verify-native-product-render-graph` now requires the new renderer workload,
+  product workload, and proof-subscriber hashes in graph-enabled reports.
+
+Evidence:
+
+- `cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail because every native GPU handoff child report is stale for the
+  current commit/worktree. The failure is freshness-only; it does not prove a
+  product regression.
+- `cargo test -p boon_native_gpu renderer_graph_plan_hash_ignores_workload_metrics --quiet`:
+  pass.
+- `cargo test -p boon_native_playground product_render_graph_plan_hash_ignores_workload_and_proof_subscribers --quiet`:
+  pass.
+- `cargo check -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+- Refreshed graph-disabled/graph-enabled Cells and TodoMVC source reports and
+  reran `target/debug/xtask verify-native-product-render-graph --example all --report target/reports/native-gpu/product-render-graph.json`:
+  pass with `focused_contract_status=pass`,
+  `before_after_contract_status=pass`, `retention_decision.decision=keep`,
+  `explicit_before_after_measurement=true`, and no blockers.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/product-render-graph.json target/reports/native-gpu/cells-visible-click-e2e-baseline-no-graph.json target/reports/native-gpu/cells-visible-click-e2e-release.json target/reports/native-gpu/preview-e2e-todomvc-baseline-no-graph.json target/reports/native-gpu/preview-e2e-todomvc.json`:
+  pass.
+
+Before/after summary:
+
+- Cells: graph-disabled p95 `12.064353000001574ms`, max
+  `12.505708000000595ms`; graph-enabled p95 `13.715681000001496ms`, max
+  `17.854503999998997ms`. Both remain under the product budgets; the graph is
+  not a speedup and is kept for contract/proof-lane isolation.
+- TodoMVC: graph-disabled `6.561126000000001ms`; graph-enabled
+  `5.821832ms`; both remain under budget.
+
+Remaining blockers:
+
+- The focused ProductRenderGraph gate is refreshed and passing, but the broad
+  TodoMVC preview E2E report still has its known real-window/scenario/visible
+  assertion blockers outside the focused product-frame graph contract.
+- Replace the remaining `executor_wrapped_product_passes` path with a real
+  renderer-owned retained `ProductFrameGraph` / execution object. The current
+  slice only makes plan/workload/proof identity honest.
+- Extract a PlanExecutor-backed persistent runtime state before switching
+  `LiveRuntime`; the current public `LiveRuntime` still wraps
+  `LoadedRuntime`/`GenericScheduledRuntime`, so normal runtime unification is
+  still open.
+
+## 2026-07-04 - LiveRuntime Default PlanExecutor Boundary
+
+Status: continued U1/U5 by cutting the public document-runtime constructor
+boundary toward PlanExecutor without claiming the full default-engine switch is
+done. This is a runtime architecture slice, not a Cells-specific performance
+patch.
+
+What changed:
+
+- `LiveRuntime::from_source`, `LiveRuntime::from_project`, and
+  `LiveRuntime::from_project_profiled` now select PlanExecutor for document
+  projects by default.
+- `world:` and `manufacturing:` output roots remain on explicit legacy output
+  runtime selection until those outputs are supported by PlanExecutor.
+- Legacy comparison code paths now request
+  `LiveRuntime::{from_source_legacy,from_project_legacy}` explicitly instead
+  of relying on the old unqualified constructors.
+- Runtime tests that inspect legacy internals were mechanically moved to
+  explicit legacy constructors, while new focused tests prove the default
+  document constructor provenance.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_default_ --quiet`: pass, `4`
+  focused default-constructor tests.
+- `cargo check -p boon_runtime -p boon_native_playground -p xtask`: pass with
+  existing warnings.
+- `cargo test -p boon_runtime --lib --quiet`: failed after `324` passed and
+  `32` failed. This was used as a migration audit, not completion evidence.
+  A follow-up targeted fixture fix made
+  `runtime_generic_user_functions_execute_without_ast_bodies` pass, so the
+  remaining full-suite blocker count needs a fresh rerun before being quoted as
+  final. The remaining failure classes are not Cells-click micro-optimizations:
+  - the NovyWave cluster fails during typecheck with
+    `NoElement can only be used as a render value`;
+  - two list-view dirty/read-key tests still disagree with current legacy
+    invalidation evidence;
+  - two PlanExecutor BYTES no-copy assertions fail.
+- `cargo test -p boon_runtime runtime_generic_user_functions_execute_without_ast_bodies --quiet`:
+  pass after replacing the invalid bare `HOLD` test fixture with normal prelude
+  marker constructs.
+
+Remaining blockers:
+
+- This proves only the focused default `LiveRuntime` constructor boundary for
+  supported document programs. It does not prove Phase 10 default-engine
+  readiness.
+- Before calling U1 complete, fix or explicitly classify the remaining full
+  `boon_runtime` failures above, refresh BYTES/default-engine/readiness
+  reports, and rerun the native GPU manifest aggregate on the current worktree.
+- Keep the next runtime work on broad PlanExecutor/default-engine blockers and
+  source-free/equivalence coverage. Do not return to Cells-specific timing
+  patches unless fresh native reports show a real Cells product-latency
+  regression.
+
+## 2026-07-04 - Runtime Dependency Semantics and Full-Suite Green
+
+Status: continued U1 by clearing the runtime blockers from the previous
+default-constructor slice. This is a generic runtime/dependency-currentness
+step, not a Cells-specific workaround and not a native GPU handoff completion.
+
+What changed:
+
+- Public scenario-style document constructors now choose PlanExecutor for
+  supported document programs, with explicit legacy constructors for old
+  internals, output-root diagnostics, and comparison paths.
+- Generic user-function calls are routed before the large builtin dispatcher.
+  This reduced stack pressure enough for the Cells cycle scenario to pass on
+  the default stack.
+- Exact list lookup dependencies are precise: cached `ListLookupText` reads are
+  invalidated by matching old/new lookup values or list-structure changes, not
+  by unrelated same-column values.
+- `List` dependency keys are now treated as structure/order membership keys.
+  Row data changes stay on `ListColumn`, `ListField`, and `ListLookupText`.
+  This stopped row-field-only Cells edits from rematerializing the chunked
+  `store.sheet_rows` root.
+- Stable source-identity root-list views can remain on the field-only patch
+  path when source fields change, while same-count reorder still falls back on
+  `source_identity_mismatch`.
+- Projected document summaries carry row-scoped source bindings from the source
+  row identity under local `sources/...` paths.
+- Runtime BYTES storage counters are thread-local so PlanExecutor no-copy proof
+  reports are deterministic under parallel Rust tests.
+
+Evidence:
+
+- `cargo test -p boon_runtime --lib --quiet`: pass, `358` tests, `0` failed,
+  finished in `351.47s`.
+- `cargo check -p boon_native_playground`: pass with existing warnings.
+- The focused ProductRenderGraph report from the previous slice remains the
+  latest graph-specific evidence, but broad native handoff reports have not yet
+  been refreshed on this final runtime worktree.
+
+Remaining blockers:
+
+- Refresh BYTES/default-engine/readiness reports and native GPU manifest child
+  reports on the current worktree; stale reports are still non-proof.
+- Finish the real retained renderer-owned `ProductFrameGraph` execution object.
+  The current graph path has honest identity separation but still contains a
+  wrapper/executor bridge.
+- Continue PlanExecutor equivalence/source-free coverage before removing
+  legacy runtime paths from normal execution.
+
+## 2026-07-04 - Current BYTES Evidence Refreshed After Schema Drift
+
+Status: continued U1 by clearing the current BYTES/MachinePlan report-schema
+blocker. This does not complete the unified goal because native handoff and the
+retained renderer-owned graph are still open.
+
+What changed:
+
+- `boon_report_schema` now replays source-derived root commits and current
+  PlanExecutor retain predicate proof fields. The previous aggregate failures
+  were report-contract drift, not runtime or Cells speed regressions.
+- Stale unrecognized target-report debris was quarantined outside
+  `target/reports`, allowing the recursive schema sweep to describe current
+  evidence instead of old ad hoc artifacts.
+
+Evidence:
+
+- `cargo check -p boon_report_schema -p xtask`: pass with existing warnings.
+- `cargo fmt -p boon_report_schema -- --check`: pass.
+- `cargo build -p boon_cli -p xtask`: pass with existing warnings.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass, `63/63` required reports.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass with `default_engine=plan` and `default_switch_allowed=true`.
+- `target/debug/xtask verify-report-schema`: pass after target-report
+  quarantine.
+
+Fresh blockers:
+
+- `audit-machine-readiness` still fails on stale runtime production/finality
+  reports, a failing TodoMVC preview E2E report, and stale TodoMVC/native
+  genericity reports.
+- `audit-goal-readiness` still fails on stale Cells release benchmark evidence,
+  stale runtime production/finality reports, and the failing machine-readiness
+  report.
+- Native GPU handoff reports still need a current manifest refresh.
+- U5 still needs the real retained renderer-owned `ProductFrameGraph`, not more
+  ProductRenderGraph wrapper metrics.

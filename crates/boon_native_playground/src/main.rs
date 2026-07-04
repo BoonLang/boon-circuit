@@ -7822,11 +7822,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "--ipc-probe-timeout-ms".to_owned(),
         dev_ipc_probe_timeout_ms.to_string(),
         "--operator-host-input-source-event-limit".to_owned(),
-        if example == "novywave" {
-            DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT.to_string()
-        } else {
-            "0".to_owned()
-        },
+        OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST.to_string(),
         "--title-token".to_owned(),
         title_token.clone(),
         "--input-sample-delay-ms".to_owned(),
@@ -8242,10 +8238,55 @@ fn live_runtime_from_source_text(
     source: &str,
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
     let units = project_units_for_source_text(source_path, source);
-    Ok(boon_runtime::LiveRuntime::from_project(
+    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
         source_label,
         &units,
     )?)
+}
+
+fn native_preview_live_runtime_from_project(
+    source_label: &str,
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
+    if boon_runtime::project_requires_legacy_output_runtime(source_label, units)? {
+        return Ok(boon_runtime::LiveRuntime::from_project_legacy(
+            source_label,
+            units,
+        )?);
+    }
+    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
+        source_label,
+        units,
+    )?)
+}
+
+fn native_preview_live_runtime_from_project_profiled(
+    source_label: &str,
+    units: &[boon_runtime::RuntimeSourceUnit],
+) -> Result<(boon_runtime::LiveRuntime, Value), Box<dyn std::error::Error>> {
+    let requires_legacy_output_runtime =
+        boon_runtime::project_requires_legacy_output_runtime(source_label, units)?;
+    let (runtime, mut profile) = if requires_legacy_output_runtime {
+        boon_runtime::LiveRuntime::from_project_legacy_profiled(source_label, units)?
+    } else {
+        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(source_label, units)?
+    };
+    if let Some(object) = profile.as_object_mut() {
+        object.insert(
+            "native_preview_runtime_selection".to_owned(),
+            json!(if requires_legacy_output_runtime {
+                "explicit_legacy_output_runtime"
+            } else {
+                "plan_executor_document_runtime"
+            }),
+        );
+        object.insert(
+            "requires_legacy_output_runtime".to_owned(),
+            json!(requires_legacy_output_runtime),
+        );
+        object.insert("legacy_runtime_fallback_hidden".to_owned(), json!(false));
+    }
+    Ok((runtime, profile))
 }
 
 fn live_runtime_from_source_text_with_scenario(
@@ -11230,7 +11271,7 @@ fn runtime_document_state_summary_for_project(
     source_path: &Path,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<Value, String> {
-    let mut runtime = boon_runtime::LiveRuntime::from_project(
+    let mut runtime = boon_runtime::LiveRuntime::from_project_plan_executor(
         &format!("native-preview-document:{}", source_path.display()),
         units,
     )
@@ -11250,11 +11291,12 @@ fn runtime_document_state_summary_for_project_profiled(
             "source_unit_count": units.len()
         }),
     );
-    let (mut runtime, init_profile) = boon_runtime::LiveRuntime::from_project_profiled(
-        &format!("native-preview-document:{}", source_path.display()),
-        units,
-    )
-    .map_err(|error| error.to_string())?;
+    let (mut runtime, init_profile) =
+        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(
+            &format!("native-preview-document:{}", source_path.display()),
+            units,
+        )
+        .map_err(|error| error.to_string())?;
     let init_ms = elapsed_ms(total_started);
     write_layout_proof_progress(
         "runtime-state-init-finished",
@@ -12828,9 +12870,12 @@ fn preview_compile_product_render_graph(
         .map(|patch| patch.touched_node_count)
         .unwrap_or(0);
     let graph_fingerprint = format!(
-        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{proof_pass_count}|{post_present_proof_request_count}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{:?}|{:?}|{}|{:?}|{}",
+        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}",
         active_scene_identity,
         render_scene_identity,
+        product_patch.map(|patch| patch.patch_kind.as_str()),
+        product_patch.map(|patch| patch.source.as_str()),
+        product_patch.map(|patch| patch.direct_render_scene_patch),
         renderer_metrics.map(|metrics| metrics.renderer_render_graph_kind.as_str()),
         renderer_metrics.map(|metrics| metrics.renderer_render_graph_plan_hash.as_str()),
         renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
@@ -12842,6 +12887,17 @@ fn preview_compile_product_render_graph(
         renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_resource_count)
     );
     let plan_hash = boon_runtime::sha256_bytes(graph_fingerprint.as_bytes());
+    let workload_fingerprint = format!(
+        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{}|{:?}",
+        active_scene_identity,
+        render_scene_identity,
+        u8::from(cache_hit),
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_workload_hash.as_str())
+    );
+    let workload_hash = boon_runtime::sha256_bytes(workload_fingerprint.as_bytes());
+    let proof_subscriber_fingerprint =
+        format!("{post_present_proof_request_count}|{proof_pass_count}");
+    let proof_subscriber_hash = boon_runtime::sha256_bytes(proof_subscriber_fingerprint.as_bytes());
     let render_graph = boon_native_app_window::NativeProductRenderGraphSummary {
         schema_version: 1,
         status: "pass".to_owned(),
@@ -12855,6 +12911,9 @@ fn preview_compile_product_render_graph(
             .filter(|kind| !kind.is_empty()),
         renderer_graph_plan_hash: renderer_metrics
             .map(|metrics| metrics.renderer_render_graph_plan_hash.clone())
+            .filter(|hash| !hash.is_empty()),
+        renderer_graph_workload_hash: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_workload_hash.clone())
             .filter(|hash| !hash.is_empty()),
         renderer_graph_pass_count: renderer_metrics
             .map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
@@ -12885,6 +12944,8 @@ fn preview_compile_product_render_graph(
         proof_readback_in_product_graph: false,
         stale_epoch_rejection_count: 0,
         plan_hash: plan_hash.clone(),
+        workload_hash: Some(workload_hash),
+        proof_subscriber_hash: Some(proof_subscriber_hash),
         passes,
     };
     let present_plan = boon_native_app_window::NativePresentPlanSummary {
@@ -62128,7 +62189,7 @@ where
     let runtime_source_label = format!("native-preview-live:{}", entrypoint.virtual_uri);
     let live_runtime_started = Instant::now();
     let live_runtime_result =
-        boon_runtime::LiveRuntime::from_project_profiled(&runtime_source_label, &runtime_units);
+        native_preview_live_runtime_from_project_profiled(&runtime_source_label, &runtime_units);
     let live_runtime_ms = elapsed_ms(live_runtime_started);
     let parsed_project_for_layout = live_runtime_result
         .is_ok()
@@ -62147,6 +62208,7 @@ where
                     Path::new(&entrypoint.virtual_uri),
                     &mut runtime,
                 );
+                let runtime_provenance = runtime.engine_provenance_report();
                 let document_state_summary = runtime.document_state_summary();
                 let mut summary = preview_runtime_summary_from_state_summary(
                     Path::new(&entrypoint.virtual_uri),
@@ -62154,6 +62216,19 @@ where
                     document_state_summary.clone(),
                 );
                 summary["restored_ui_state"] = json!(restored_ui_state.is_some());
+                summary["live_runtime_provenance"] = runtime_provenance;
+                summary["native_preview_runtime_selection"] = profile
+                    .get("native_preview_runtime_selection")
+                    .cloned()
+                    .unwrap_or_else(|| json!("unknown"));
+                summary["requires_legacy_output_runtime"] = profile
+                    .get("requires_legacy_output_runtime")
+                    .cloned()
+                    .unwrap_or_else(|| json!(false));
+                summary["legacy_runtime_fallback_hidden"] = profile
+                    .get("legacy_runtime_fallback_hidden")
+                    .cloned()
+                    .unwrap_or_else(|| json!(false));
                 (
                     summary,
                     Some(document_state_summary),
@@ -62541,7 +62616,7 @@ fn preview_apply_replace_code_to_state(
         .get("preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    state.live_runtime = match boon_runtime::LiveRuntime::from_project(
+    state.live_runtime = match native_preview_live_runtime_from_project(
         &format!("native-preview-live:{source_path}"),
         &runtime_units,
     ) {
@@ -62851,7 +62926,7 @@ fn preview_operator_host_input_response_for_state(
         })
         .transpose()?;
     let mut owned_runtime = if runtime_guard.is_none() {
-        Some(boon_runtime::LiveRuntime::from_project(
+        Some(native_preview_live_runtime_from_project(
             &format!("native-preview-ipc:{}", state.source_path.display()),
             &state.runtime_units,
         )?)
@@ -62863,6 +62938,24 @@ fn preview_operator_host_input_response_for_state(
     } else {
         "request-local-live-runtime"
     };
+    let runtime_provenance = if let Some(runtime) = runtime_guard.as_ref() {
+        runtime.engine_provenance_report()
+    } else if let Some(runtime) = owned_runtime.as_ref() {
+        runtime.engine_provenance_report()
+    } else {
+        json!({
+            "engine": "missing",
+            "generic_fallback_enabled": serde_json::Value::Null
+        })
+    };
+    let runtime_engine = runtime_provenance
+        .get("engine")
+        .cloned()
+        .unwrap_or_else(|| json!("missing"));
+    let runtime_generic_fallback_enabled = runtime_provenance
+        .get("generic_fallback_enabled")
+        .cloned()
+        .unwrap_or_else(|| json!(null));
     let mut outputs = Vec::new();
     let mut assertions = Vec::new();
     let mut route_assertions = Vec::new();
@@ -63515,6 +63608,9 @@ fn preview_operator_host_input_response_for_state(
         "real_os_input": false,
         "input_injection_method": "operator_host_event_harness",
         "runtime_origin": runtime_origin,
+        "runtime_provenance": runtime_provenance,
+        "runtime_engine": runtime_engine,
+        "runtime_generic_fallback_enabled": runtime_generic_fallback_enabled,
         "route_contract": "HostInputEvent -> document hit region -> SourceIntent -> preview LiveRuntime::apply_source_event",
         "public_runtime_api": if compact_response { "boon_runtime::LiveRuntime::apply_source_event_turn" } else { "boon_runtime::LiveRuntime::apply_source_event_for_document_window" },
         "private_runtime_dispatch_used": false,
@@ -66319,6 +66415,97 @@ mod tests {
             last_missed_frame_cause: None,
             frame_evidence_key: Some(frame_evidence_key),
         }
+    }
+
+    #[test]
+    fn product_render_graph_plan_hash_ignores_workload_and_proof_subscribers() {
+        let (low_work_graph, low_work_present) = preview_compile_product_render_graph(
+            "surface-target",
+            Some("active-scene".to_owned()),
+            Some("render-scene".to_owned()),
+            None,
+            0,
+            128,
+            None,
+        );
+        let (high_work_graph, high_work_present) = preview_compile_product_render_graph(
+            "surface-target",
+            Some("active-scene".to_owned()),
+            Some("render-scene".to_owned()),
+            None,
+            3,
+            8192,
+            None,
+        );
+
+        assert_eq!(low_work_graph.plan_hash, high_work_graph.plan_hash);
+        assert_eq!(low_work_present.plan_hash, high_work_present.plan_hash);
+        assert_ne!(low_work_graph.workload_hash, high_work_graph.workload_hash);
+        assert_ne!(
+            low_work_graph.proof_subscriber_hash,
+            high_work_graph.proof_subscriber_hash
+        );
+    }
+
+    #[test]
+    fn native_preview_runtime_selector_uses_plan_executor_for_document_projects() {
+        let source_path = repo_path("examples/counter.bn");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let units = project_units_for_source_text(&source_path, &source);
+        assert!(
+            !boon_runtime::project_requires_legacy_output_runtime(
+                "native-counter-document",
+                &units
+            )
+            .unwrap()
+        );
+
+        let (runtime, profile) =
+            native_preview_live_runtime_from_project_profiled("native-counter-document", &units)
+                .unwrap();
+        assert_eq!(profile["engine"], "plan_executor");
+        assert_eq!(
+            profile["native_preview_runtime_selection"],
+            "plan_executor_document_runtime"
+        );
+        assert_eq!(profile["generic_fallback_enabled"], false);
+        assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn native_preview_runtime_selector_keeps_world_outputs_on_explicit_legacy() {
+        let source_path = repo_path("examples/hello_3d/RUN.bn");
+        let units = boon_runtime::source_units_for_path(&source_path).unwrap();
+        assert!(
+            boon_runtime::project_requires_legacy_output_runtime("native-hello-3d-world", &units)
+                .unwrap()
+        );
+
+        let (mut runtime, profile) =
+            native_preview_live_runtime_from_project_profiled("native-hello-3d-world", &units)
+                .unwrap();
+        assert_eq!(profile["engine"], "legacy_generic_runtime");
+        assert_eq!(
+            profile["native_preview_runtime_selection"],
+            "explicit_legacy_output_runtime"
+        );
+        assert_eq!(profile["requires_legacy_output_runtime"], true);
+        assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "legacy_generic_runtime"
+        );
+        runtime
+            .world_scene_output()
+            .expect("world output remains available through explicit legacy runtime");
     }
 
     #[test]
@@ -88864,7 +89051,7 @@ document:
         let state = PreviewIpcState {
             source_path: source_path.clone(),
             source_text: source.clone(),
-            runtime_units,
+            runtime_units: runtime_units.clone(),
             source_bytes: source.len() as u64,
             source_sha256: source_hash.clone(),
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
@@ -90138,7 +90325,7 @@ document:
             runtime_summary: preview_runtime_summary(&source_path, &source, &source_hash),
             preview_perf_stats: None,
             shared_render_state,
-            live_runtime: boon_runtime::LiveRuntime::from_project(
+            live_runtime: native_preview_live_runtime_from_project(
                 "test-todomvc-preview",
                 &runtime_units,
             )
@@ -90166,6 +90353,15 @@ document:
         for request in requests {
             let response = preview_operator_host_input_response(&state, &request).unwrap();
             assert_eq!(response["status"], "pass", "{response}");
+            assert_eq!(response["runtime_engine"], "plan_executor", "{response}");
+            assert_eq!(
+                response["runtime_generic_fallback_enabled"], false,
+                "{response}"
+            );
+            assert_eq!(
+                response["runtime_provenance"]["engine"], "plan_executor",
+                "{response}"
+            );
             for output in response["outputs"]
                 .as_array()
                 .expect("operator host input response should expose output proofs")

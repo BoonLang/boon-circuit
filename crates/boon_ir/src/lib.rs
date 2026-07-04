@@ -6860,6 +6860,11 @@ fn list_operations(
             let canonical_row_scope = row_scope_for_list(program, &list);
             let row_scope = ast_call_argument(field, "List/retain")
                 .or_else(|| canonical_row_scope.map(str::to_owned));
+            if field_is_derived_list_memory_view(field, program) {
+                continue;
+            }
+            let retain_predicate =
+                list_retain_predicate(field, row_scope.as_deref(), canonical_row_scope);
             for source in
                 retain_remove_sources(field, program, row_scope.as_deref(), canonical_row_scope)
             {
@@ -6882,11 +6887,7 @@ fn list_operations(
                 list,
                 kind: ListOperationKind::Retain {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(
-                        field,
-                        row_scope.as_deref(),
-                        canonical_row_scope,
-                    ),
+                    predicate: retain_predicate,
                 },
             });
         }
@@ -7351,7 +7352,12 @@ fn list_initializer_has_dynamic_fields(rows: &[ListInitialRecord]) -> bool {
     rows.iter().any(|row| {
         row.fields
             .iter()
-            .any(|field| matches!(field.value, InitialValue::Unknown { .. }))
+        .any(|field| {
+            matches!(
+                field.value,
+                InitialValue::Unknown { .. } | InitialValue::RootInitialField { .. }
+            )
+        })
     })
 }
 
@@ -7755,10 +7761,19 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
         value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
             value: value.to_owned(),
         },
+        value if value_is_root_initial_field_ref(value) => InitialValue::RootInitialField {
+            path: value.to_owned(),
+        },
         value => InitialValue::Unknown {
             summary: value.to_owned(),
         },
     }
+}
+
+fn value_is_root_initial_field_ref(value: &str) -> bool {
+    !value.is_empty()
+        && !value_starts_uppercase_identifier(value)
+        && value.split('.').all(is_name)
 }
 
 fn signed_integer_literal_value(tokens: &[String]) -> Option<i64> {
@@ -15030,6 +15045,34 @@ FUNCTION wrapped_button(source) {
                 value: "none".to_owned()
             }
         );
+        let external_fallback = ir
+            .lists
+            .iter()
+            .find(|list| list.name == "external_fallback_file_tree_rows")
+            .expect("NovyWave external fallback list should lower as a list memory");
+        let ListInitializer::RecordLiteral { rows } = &external_fallback.initializer else {
+            panic!(
+                "external fallback rows should be a record literal: {:?}",
+                external_fallback.initializer
+            );
+        };
+        let first_row = rows
+            .first()
+            .expect("external fallback rows should include the fallback entry");
+        for field_name in ["file", "selected_file"] {
+            let field = first_row
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .expect("external fallback row should expose root-backed file fields");
+            assert_eq!(
+                field.value,
+                InitialValue::RootInitialField {
+                    path: "external_file_tree_file".to_owned()
+                },
+                "list literal field `{field_name}` should keep a generic root-state initializer reference"
+            );
+        }
         assert!(
             ir.state_cells
                 .iter()
@@ -18408,6 +18451,68 @@ document:
                     )
             }),
             "derived retain/map views should stay derived values, not scheduled list memory operations"
+        );
+        assert!(ir.derived_values.iter().any(|value| {
+            value.path == "store.selected_waveform_segments"
+                && value.kind == DerivedValueKind::ListView
+        }));
+    }
+
+    #[test]
+    fn derived_retain_view_with_helper_predicate_stays_derived_value() {
+        let source = r#"
+SOURCE
+HOLD
+LATEST
+store:
+    active_file:
+        TEXT { simple.vcd }
+    viewport_label_start:
+        0
+    viewport_label_end:
+        100
+    waveform_segment_records:
+        [
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, state: High, start_time_value: 0, end_time_value: 50, label: TEXT { 0xa }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, state: CursorLine, start_time_value: 50, end_time_value: 150, label: TEXT { cursor }]
+            [file: TEXT { simple.vcd }, signal_id: TEXT { clk }, state: MarkerLine, start_time_value: 75, end_time_value: 125, label: TEXT { marker }]
+        ]
+    selected_waveform_segments:
+        waveform_segment_records
+        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/filter_field_not_equal(field: "state", value: CursorLine)
+        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
+        |> List/retain(segment, if: waveform_segment_is_visible(segment: segment))
+        |> List/map(segment, new: segment)
+
+FUNCTION waveform_segment_is_visible(segment) {
+    segment.state |> WHEN {
+        CursorLine => False
+        MarkerLine => False
+        __ => segment.end_time_value > store.viewport_label_start |> WHEN {
+            True => segment.start_time_value < store.viewport_label_end
+            False => False
+        }
+    }
+}
+
+document:
+    children:
+        []
+"#;
+        let parsed =
+            boon_parser::parse_source("derived-retain-view-helper-predicate.bn", source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        verify_static_schedule(&ir).unwrap();
+        assert!(
+            ir.list_operations.iter().all(|operation| {
+                !matches!(
+                    operation.kind,
+                    ListOperationKind::Retain { ref target, .. }
+                        if target == "store.selected_waveform_segments"
+                )
+            }),
+            "helper-predicate derived views should stay derived values, not unsupported scheduled predicates"
         );
         assert!(ir.derived_values.iter().any(|value| {
             value.path == "store.selected_waveform_segments"

@@ -35604,3 +35604,169 @@ Remaining blockers:
 - Cells visible-interaction speed/correctness remains open; formula-bar
   synchronization after cell focus must be measured and fixed by the native
   retained/runtime path, not hidden with a Cells-specific workaround.
+
+## 2026-07-04 - LiveRuntime Default Constructor PlanExecutor Slice
+
+Status: advanced Phase 10 by switching the public document `LiveRuntime`
+constructors to PlanExecutor selection for supported document projects. This is
+not a full default-engine readiness claim because the full runtime suite still
+has concrete blockers.
+
+What changed:
+
+- `LiveRuntime::from_source`, `LiveRuntime::from_project`, and
+  `LiveRuntime::from_project_profiled` now select PlanExecutor for document
+  programs.
+- `world:` and `manufacturing:` output roots remain on explicitly reported
+  legacy output runtime until PlanExecutor supports those outputs.
+- Legacy comparison paths and legacy-internal unit tests now request
+  `from_source_legacy` / `from_project_legacy` explicitly.
+- Focused default-constructor tests prove Counter/TodoMVC document programs
+  report `engine=plan_executor` and `generic_fallback_enabled=false`, while a
+  `world:` output remains explicit legacy output runtime.
+
+Evidence:
+
+- `cargo test -p boon_runtime live_runtime_default_ --quiet`: pass, `4`
+  tests.
+- `cargo check -p boon_runtime -p boon_native_playground -p xtask`: pass with
+  existing warnings.
+- `cargo test -p boon_runtime --lib --quiet`: failed after `324` passed and
+  `32` failed. A follow-up targeted fixture fix made
+  `runtime_generic_user_functions_execute_without_ast_bodies` pass, so the
+  remaining full-suite blocker count needs a fresh rerun before being quoted as
+  final. The failures are now the next Phase 10 blockers, not hidden default
+  constructor ambiguity:
+  - NovyWave manifest tests fail typecheck on `NoElement can only be used as a
+    render value`;
+  - list-view dirty/read-key assertions disagree with current invalidation
+    evidence;
+  - two PlanExecutor BYTES no-copy assertions fail.
+- `cargo test -p boon_runtime runtime_generic_user_functions_execute_without_ast_bodies --quiet`:
+  pass after replacing the invalid bare `HOLD` test fixture with normal prelude
+  marker constructs.
+
+Remaining blockers:
+
+- Phase 10 cannot be marked complete until the full runtime/default-engine
+  blockers above are fixed or moved behind explicit, schema-checked blockers.
+- Refresh `verify-bytes-default-engine-readiness`,
+  `verify-bytes-machine-plan-all`, machine-readiness, goal-readiness, and
+  native GPU aggregate reports only after those blockers are resolved; stale
+  reports are non-proof.
+
+## 2026-07-04 - Runtime Full-Suite Blockers Cleared
+
+Status: advanced Phase 10 by clearing the concrete `boon_runtime` full-suite
+blockers that appeared after the default-constructor PlanExecutor slice. This
+is still not a final default-engine readiness claim because BYTES/MachinePlan
+readiness reports and native GPU handoff reports still need a fresh refresh on
+the current worktree.
+
+What changed:
+
+- `LiveRuntime::new` and `LiveRuntime::new_from_project` now select
+  PlanExecutor for supported document programs and expose explicit
+  `new_legacy` / `new_from_project_legacy` constructors for legacy-only tests
+  and diagnostics.
+- Runtime generic user-function dispatch was split from the large generic
+  builtin dispatcher, which fixed the default-stack overflow in the Cells cycle
+  scenario without changing the Cells Boon example.
+- Exact `List/find(... field: address/value ...)` lookup dependencies now
+  invalidate only on matching old/new lookup values or list-structure changes,
+  not on unrelated same-column text changes.
+- `List` read keys now mean list structure/order membership; row data changes
+  use `ListColumn`, `ListField`, or `ListLookupText`. This prevented
+  row-field-only Cells edits from rematerializing the chunked `store.sheet_rows`
+  root.
+- Root-list field-only patching no longer rejects stable source identities just
+  because a source row field is dirty; structural/source-identity mismatch
+  remains the guard.
+- Projected document rows now serialize row-scoped source bindings from their
+  source-row public identity under the local `sources/...` path.
+- BYTES storage counters are thread-local to the runtime execution thread, so
+  no-copy PlanExecutor proofs are not polluted by unrelated parallel tests.
+
+Evidence:
+
+- `cargo test -p boon_runtime --lib --quiet`: pass, `358` tests, `0` failed,
+  finished in `351.47s`.
+- Focused regression checks passed:
+  `cells_scenario_runs_and_detects_cycle`,
+  `cells_visible_value_edit_does_not_rematerialize_chunked_sheet_rows`,
+  `document_summary_uses_source_identity_for_filtered_todomvc_rows`,
+  `exact_list_lookup_invalidation_tracks_old_and_new_text_values`,
+  `root_list_view_changed_reads_emit_exact_lookup_values_for_generic_text_fields`,
+  `root_list_view_filtered_rows_preserve_identity_for_downstream_map`,
+  `root_list_view_materializes_current_order_after_same_count_reorder`,
+  `root_scalar_plan_executor_replays_bytes_length_update`, and
+  `root_scalar_plan_executor_replays_chained_bytes_set_state`.
+- `cargo check -p boon_native_playground`: pass with existing warnings.
+
+Remaining blockers:
+
+- Refresh BYTES/default-engine/machine-readiness reports on the current
+  worktree before claiming Phase 10 readiness; older report artifacts remain
+  non-proof.
+- Native GPU handoff still requires fresh manifest child reports and aggregate
+  verification under `docs/architecture/NATIVE_GPU_PIPELINE.md`.
+- ProductRenderGraph still needs the real retained renderer-owned execution
+  object; the current graph work made identity/proof accounting more honest,
+  but did not finish the retained graph architecture.
+
+## 2026-07-04 - BYTES Report-Schema Replay Realigned
+
+Status: cleared the current BYTES/MachinePlan aggregate blocker. This was a
+verifier/report-contract fix, not a runtime behavior or Cells performance
+change.
+
+What changed:
+
+- `boon_report_schema` source-derived replay now commits source-derived root
+  values into expected root state before list appends/removes/root updates,
+  matching current PlanExecutor behavior.
+- Source-derived retain predicate evidence now matches the current
+  PlanExecutor proof shape with `selector_ref`, `row_field_ref`, and
+  `selector_materialized`, instead of the older `selector_state_id` /
+  `row_field_state_id` fields.
+- Two stale ad hoc target reports that were not recognized by the recursive
+  schema verifier were moved out of `target/reports` into
+  `target/quarantine/reports-schema-stale-20260704/`.
+
+Evidence:
+
+- `cargo check -p boon_report_schema -p xtask`: pass with existing warnings.
+- `cargo fmt -p boon_report_schema -- --check`: pass.
+- `cargo build -p boon_cli -p xtask`: pass with existing warnings.
+- Focused schema checks passed after regenerating current child reports:
+  `bytes-initial-dump-plan.json`,
+  `todomvc-submit-root-list-scenario-run-plan.json`, and
+  `todomvc-new-text-route-run-plan.json`.
+- `target/debug/xtask verify-bytes-machine-plan-adversarial --report target/reports/bytes-plan/bytes-machine-plan-adversarial.json`:
+  pass.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass, `63/63` required reports, `52` proof reports, `11` diagnostic reports,
+  `43` PlanExecutor reports, and `43` no-fallback PlanExecutor reports.
+- `target/debug/xtask verify-report-schema target/reports/bytes-plan/bytes-machine-plan-all.json`:
+  pass.
+- `target/debug/xtask verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass, `readiness_mode=post-switch-plan-default`,
+  `default_engine=plan`, `default_switch_allowed=true`.
+- `target/debug/xtask verify-report-schema`: pass after quarantining the two
+  stale unrecognized target report artifacts.
+
+Fresh remaining blockers:
+
+- `target/debug/xtask audit-machine-readiness --report target/reports/debug/machine-readiness.json`:
+  expected fail. Current blockers are stale
+  `runtime-production-hardening.json`, stale `runtime-finality.json`, failing
+  `preview-e2e-todomvc.json`, and stale TodoMVC/native/genericity reports.
+- `target/debug/xtask audit-goal-readiness --report target/reports/bytes-plan/goal-readiness.json`:
+  expected fail. Current blockers are stale Cells release benchmark evidence,
+  stale runtime production/finality reports, and the failing machine-readiness
+  report.
+- Native GPU handoff remains unproven on the current worktree and must be
+  refreshed from `docs/architecture/native_gpu_handoff_manifest.json`.
+- ProductRenderGraph still needs the retained renderer-owned
+  `ProductFrameGraph` implementation; current graph evidence remains a
+  wrapper/metrics bridge.

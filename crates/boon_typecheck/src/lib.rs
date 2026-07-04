@@ -3246,8 +3246,10 @@ impl<'a> Checker<'a> {
         let AstStatementKind::Function { name, .. } = &statement.kind else {
             return false;
         };
-        let _ = name;
-        statement_contains_render_context_syntax(statement, &self.program.expressions)
+        self.user_function_return_type(name, &mut BTreeSet::new())
+            .as_ref()
+            .is_some_and(type_contains_renderable)
+            || statement_contains_render_context_syntax(statement, &self.program.expressions)
     }
 
     fn unresolved_type_variable_count(&mut self) -> usize {
@@ -11601,6 +11603,63 @@ document:
             1
         );
         assert_eq!(report.render_slot_failure_count, 0);
+    }
+
+    #[test]
+    fn allows_no_element_inside_render_valued_user_function() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+show: True
+FUNCTION maybe_child() {
+    show |> WHEN {
+        True => Element/text(label: TEXT { visible })
+        False => NoElement
+    }
+}
+document:
+    root:
+        Element/stripe(
+            items: LIST {
+                maybe_child()
+            }
+        )
+"#;
+        let parsed = boon_parser::parse_source("render-helper-no-element.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("`NoElement` can only be used as a render value")),
+            "{:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.render_slot_failure_count, 0);
+    }
+
+    #[test]
+    fn rejects_no_element_helper_result_as_normal_data() {
+        let source = r#"
+source: SOURCE
+value: "" |> HOLD value { LATEST {} }
+FUNCTION empty_child() {
+    NoElement
+}
+bad: empty_child()
+"#;
+        let parsed = boon_parser::parse_source("no-element-helper-data.bn", source).unwrap();
+        let report = check(&parsed);
+        assert!(report.has_errors());
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("`NoElement` can only be used as a render value"))
+                .count(),
+            1
+        );
     }
 
     #[test]

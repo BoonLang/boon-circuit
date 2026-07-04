@@ -143,6 +143,7 @@ pub struct CompilerStaticProgramAnalysis {
     pub row_scopes: Vec<CompilerRowScope>,
     pub source_paths: Vec<String>,
     pub source_row_lookup_fields: BTreeMap<String, String>,
+    pub output_roots: Vec<CompilerStaticOutputRoot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +165,14 @@ pub enum CompilerViewBindingKind {
 pub struct CompilerRowScope {
     pub list: String,
     pub row_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerStaticOutputRoot {
+    pub root: String,
+    pub output_kind: String,
+    pub typed_contract_known: bool,
+    pub generic_output_port: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1009,6 +1018,16 @@ impl CompilerStaticProgramAnalysis {
                 .collect(),
             source_paths,
             source_row_lookup_fields,
+            output_roots: ir
+                .output_values
+                .iter()
+                .map(|output| CompilerStaticOutputRoot {
+                    root: output.root.clone(),
+                    output_kind: output.output_kind.clone(),
+                    typed_contract_known: output.typed_contract_known,
+                    generic_output_port: output.generic_output_port,
+                })
+                .collect(),
         }
     }
 }
@@ -5303,35 +5322,7 @@ pub fn compile_source_path_to_machine_plan(
     let parse_started = Instant::now();
     let parsed = parse_source_path_or_manifest_project(source_path)?;
     let parse_ms = elapsed_ms(parse_started);
-    let lower_started = Instant::now();
-    let (ir, lower_profile) = lower_profiled(&parsed)?;
-    let lower_ms = elapsed_ms(lower_started);
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = elapsed_ms(verify_started);
-    let compile_started = Instant::now();
-    let plan = compile_typed_program(&ir, target_profile)?;
-    let compile_ms = elapsed_ms(compile_started);
-    let load_pipeline_profile = json!({
-        "owner": "boon_compiler",
-        "cache_hit": false,
-        "source_unit_count": parsed.files.len(),
-        "parse_ms": parse_ms,
-        "lower_ms": lower_ms,
-        "lower_profile": lower_profile,
-        "verify_ms": verify_ms,
-        "compile_ms": compile_ms,
-        "expression_count": ir.expression_count,
-        "graph_node_count": ir.graph_node_count,
-        "total_ms": elapsed_ms(total_started)
-    });
-    Ok(CompiledMachinePlanFromSource {
-        parsed,
-        ir,
-        plan,
-        load_pipeline_profile,
-    })
+    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
 }
 
 pub fn compile_source_path_to_runtime_ir(
@@ -5376,6 +5367,18 @@ pub fn compile_source_text_to_full_ir(
     compile_parsed_to_full_ir(parsed, parse_ms, total_started)
 }
 
+pub fn compile_source_text_to_machine_plan(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+    let parse_ms = elapsed_ms(parse_started);
+    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
+}
+
 pub fn compile_source_units_to_runtime_ir(
     source_label: &str,
     units: &[CompilerSourceUnit],
@@ -5398,6 +5401,18 @@ pub fn compile_source_units_to_full_ir(
     compile_parsed_to_full_ir(parsed, parse_ms, total_started)
 }
 
+pub fn compile_source_units_to_machine_plan(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_source_units(source_label, units)?;
+    let parse_ms = elapsed_ms(parse_started);
+    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
+}
+
 pub fn compile_parsed_program_to_runtime_ir(
     parsed: ParsedProgram,
 ) -> CompilerResult<CompiledRuntimeIrFromSource> {
@@ -5408,6 +5423,51 @@ pub fn compile_parsed_program_to_full_ir(
     parsed: ParsedProgram,
 ) -> CompilerResult<CompiledFullIrFromSource> {
     compile_parsed_to_full_ir(parsed, 0.0, Instant::now())
+}
+
+pub fn compile_parsed_program_to_machine_plan(
+    parsed: ParsedProgram,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_parsed_to_machine_plan(parsed, 0.0, Instant::now(), target_profile)
+}
+
+fn compile_parsed_to_machine_plan(
+    parsed: ParsedProgram,
+    parse_ms: f64,
+    total_started: Instant,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let lower_started = Instant::now();
+    let (ir, lower_profile) = lower_profiled(&parsed)?;
+    let lower_ms = elapsed_ms(lower_started);
+    let verify_started = Instant::now();
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let verify_ms = elapsed_ms(verify_started);
+    let compile_started = Instant::now();
+    let plan = compile_typed_program(&ir, target_profile)?;
+    let compile_ms = elapsed_ms(compile_started);
+    let load_pipeline_profile = json!({
+        "owner": "boon_compiler",
+        "surface": "machine-plan",
+        "cache_hit": false,
+        "source_unit_count": parsed.files.len(),
+        "parse_ms": parse_ms,
+        "lower_ms": lower_ms,
+        "lower_profile": lower_profile,
+        "verify_ms": verify_ms,
+        "compile_ms": compile_ms,
+        "expression_count": ir.expression_count,
+        "graph_node_count": ir.graph_node_count,
+        "total_ms": elapsed_ms(total_started)
+    });
+    Ok(CompiledMachinePlanFromSource {
+        parsed,
+        ir,
+        plan,
+        load_pipeline_profile,
+    })
 }
 
 fn compile_parsed_to_runtime_ir(
@@ -5859,6 +5919,27 @@ mod tests {
         assert!(compiled.ir.expression_count > 0);
         assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
         assert_eq!(compiled.load_pipeline_profile["surface"], "full-ir");
+    }
+
+    #[test]
+    fn compiler_facade_loads_machine_plan_from_source_units() {
+        let units = vec![CompilerSourceUnit {
+            path: "examples/counter.bn".to_owned(),
+            source: include_str!("../../../examples/counter.bn").to_owned(),
+        }];
+        let compiled = compile_source_units_to_machine_plan(
+            "examples/counter.bn",
+            &units,
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap();
+
+        assert_eq!(compiled.parsed.files.len(), 1);
+        assert!(compiled.ir.expression_count > 0);
+        assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
+        assert_eq!(compiled.load_pipeline_profile["surface"], "machine-plan");
+        assert!(!compiled.plan.regions.is_empty());
+        assert!(!compiled.plan.source_routes.is_empty());
     }
 
     #[test]

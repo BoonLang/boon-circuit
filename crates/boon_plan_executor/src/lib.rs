@@ -3309,7 +3309,10 @@ pub fn evaluate_root_pure_number_compare_values(
     list_state: &BTreeMap<usize, Vec<PlanExecutorListRow>>,
 ) -> PlanExecutorResult<BTreeMap<usize, JsonValue>> {
     let aggregate_counts = aggregate_count_values(plan, list_state)?;
-    let mut values = BTreeMap::new();
+    let mut values = aggregate_counts
+        .iter()
+        .map(|(field_id, value)| (*field_id, json!(value)))
+        .collect::<BTreeMap<_, _>>();
     for op in plan
         .regions
         .iter()

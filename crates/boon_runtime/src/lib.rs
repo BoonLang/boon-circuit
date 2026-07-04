@@ -32,8 +32,9 @@ use boon_compiler::{
     CompilerUpdateValueExpression as UpdateValueExpression,
     CompilerUpdateValueMatchArm as UpdateValueMatchArm, DocumentAst, ParsedProgram,
     compile_source_path_to_full_ir, compile_source_path_to_machine_plan,
-    compile_source_text_to_full_ir, compile_source_text_to_runtime_ir,
-    compile_source_units_to_full_ir, compile_source_units_to_runtime_ir,
+    compile_source_text_to_full_ir, compile_source_text_to_machine_plan,
+    compile_source_text_to_runtime_ir, compile_source_units_to_full_ir,
+    compile_source_units_to_machine_plan, compile_source_units_to_runtime_ir,
     compiler_ir_debug_report_from_path, compiler_parsed_document,
     compiler_source_files_for_manifest_source, compiler_source_text_for_manifest_source,
     compiler_source_text_for_path, compiler_source_units_for_manifest_source,
@@ -57,9 +58,9 @@ use boon_ir::TypedProgram;
 use boon_ir::{lower, lower_profiled};
 use boon_plan::{
     FieldId, InitialValueKind as PlanInitialValueKind, ListId, MachinePlan, PlanConstantId,
-    PlanConstantValue, PlanDerivedExpression, PlanExpressionKind, PlanOpKind, PlanRowExpression,
-    PlanRowSelectPattern, PlanValueType, RegionKind, SourceId, SourcePayloadField, StateId,
-    TargetProfile, ValueRef, plan_sha256, verify_plan,
+    PlanConstantValue, PlanDerivedExpression, PlanExpressionKind, PlanListProjection, PlanOpKind,
+    PlanRowExpression, PlanRowSelectPattern, PlanValueType, RegionKind, SourceId,
+    SourcePayloadField, StateId, TargetProfile, ValueRef, plan_sha256, verify_plan,
 };
 use boon_plan_executor::{
     IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
@@ -98,7 +99,8 @@ use boon_plan_executor::{
     decode_expected_source_event as decode_plan_expected_source_event,
     demand_current_field_paths as plan_demand_current_field_paths,
     demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
-    evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
+    derived_field_label as plan_derived_field_label, evaluate_indexed_bytes_read_update,
+    evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
     evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
     evaluate_root_bytes_write_update,
@@ -180,16 +182,10 @@ static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-static BYTES_INLINE_VALUE_COUNT: AtomicU64 = AtomicU64::new(0);
-static BYTES_INLINE_VALUE_BYTES: AtomicU64 = AtomicU64::new(0);
-static BYTES_COPY_FROM_SLICE_COUNT: AtomicU64 = AtomicU64::new(0);
-static BYTES_COPY_FROM_SLICE_BYTES: AtomicU64 = AtomicU64::new(0);
-static BYTES_VEC_CLONE_COUNT: AtomicU64 = AtomicU64::new(0);
-static BYTES_VEC_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
-static BYTES_VEC_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
-static BYTES_VEC_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-static BYTES_ZERO_FILL_COUNT: AtomicU64 = AtomicU64::new(0);
-static BYTES_ZERO_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static BYTES_STORAGE_COUNTERS: RefCell<RuntimeBytesStorageCounters> =
+        RefCell::new(RuntimeBytesStorageCounters::default());
+}
 
 struct CountingAllocator;
 
@@ -270,7 +266,7 @@ impl RuntimeBytesStorageCounters {
     pub fn report_json(self) -> JsonValue {
         json!({
             "status": "measured",
-            "measurement_scope": "runtime BYTES storage helpers in the current process",
+            "measurement_scope": "runtime BYTES storage helpers on the current runtime thread",
             "inline_value_count": self.inline_value_count,
             "inline_value_bytes": self.inline_value_bytes,
             "copy_from_slice_count": self.copy_from_slice_count,
@@ -297,61 +293,65 @@ impl RuntimeBytesStorageCounters {
 }
 
 pub fn runtime_bytes_storage_counters_snapshot() -> RuntimeBytesStorageCounters {
-    RuntimeBytesStorageCounters {
-        inline_value_count: BYTES_INLINE_VALUE_COUNT.load(Ordering::Relaxed),
-        inline_value_bytes: BYTES_INLINE_VALUE_BYTES.load(Ordering::Relaxed),
-        copy_from_slice_count: BYTES_COPY_FROM_SLICE_COUNT.load(Ordering::Relaxed),
-        copy_from_slice_bytes: BYTES_COPY_FROM_SLICE_BYTES.load(Ordering::Relaxed),
-        vec_clone_count: BYTES_VEC_CLONE_COUNT.load(Ordering::Relaxed),
-        vec_clone_bytes: BYTES_VEC_CLONE_BYTES.load(Ordering::Relaxed),
-        vec_alloc_count: BYTES_VEC_ALLOC_COUNT.load(Ordering::Relaxed),
-        vec_alloc_bytes: BYTES_VEC_ALLOC_BYTES.load(Ordering::Relaxed),
-        zero_fill_count: BYTES_ZERO_FILL_COUNT.load(Ordering::Relaxed),
-        zero_fill_bytes: BYTES_ZERO_FILL_BYTES.load(Ordering::Relaxed),
-    }
+    BYTES_STORAGE_COUNTERS.with(|counters| *counters.borrow())
 }
 
 pub fn reset_runtime_bytes_storage_counters() {
-    BYTES_INLINE_VALUE_COUNT.store(0, Ordering::Relaxed);
-    BYTES_INLINE_VALUE_BYTES.store(0, Ordering::Relaxed);
-    BYTES_COPY_FROM_SLICE_COUNT.store(0, Ordering::Relaxed);
-    BYTES_COPY_FROM_SLICE_BYTES.store(0, Ordering::Relaxed);
-    BYTES_VEC_CLONE_COUNT.store(0, Ordering::Relaxed);
-    BYTES_VEC_CLONE_BYTES.store(0, Ordering::Relaxed);
-    BYTES_VEC_ALLOC_COUNT.store(0, Ordering::Relaxed);
-    BYTES_VEC_ALLOC_BYTES.store(0, Ordering::Relaxed);
-    BYTES_ZERO_FILL_COUNT.store(0, Ordering::Relaxed);
-    BYTES_ZERO_FILL_BYTES.store(0, Ordering::Relaxed);
+    BYTES_STORAGE_COUNTERS.with(|counters| {
+        *counters.borrow_mut() = RuntimeBytesStorageCounters::default();
+    });
+}
+
+fn runtime_bytes_storage_counter_measurement_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn record_runtime_bytes_inline_value(byte_len: usize) {
-    BYTES_INLINE_VALUE_COUNT.fetch_add(1, Ordering::Relaxed);
-    BYTES_INLINE_VALUE_BYTES.fetch_add(byte_len as u64, Ordering::Relaxed);
+    BYTES_STORAGE_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.inline_value_count = counters.inline_value_count.saturating_add(1);
+        counters.inline_value_bytes = counters.inline_value_bytes.saturating_add(byte_len as u64);
+    });
 }
 
 fn runtime_bytes_copy_from_slice(slice: &[u8]) -> Bytes {
-    BYTES_COPY_FROM_SLICE_COUNT.fetch_add(1, Ordering::Relaxed);
-    BYTES_COPY_FROM_SLICE_BYTES.fetch_add(slice.len() as u64, Ordering::Relaxed);
+    BYTES_STORAGE_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.copy_from_slice_count = counters.copy_from_slice_count.saturating_add(1);
+        counters.copy_from_slice_bytes = counters
+            .copy_from_slice_bytes
+            .saturating_add(slice.len() as u64);
+    });
     Bytes::copy_from_slice(slice)
 }
 
 fn runtime_bytes_vec_clone(slice: &[u8]) -> Vec<u8> {
-    BYTES_VEC_CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
-    BYTES_VEC_CLONE_BYTES.fetch_add(slice.len() as u64, Ordering::Relaxed);
+    BYTES_STORAGE_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        counters.vec_clone_count = counters.vec_clone_count.saturating_add(1);
+        counters.vec_clone_bytes = counters.vec_clone_bytes.saturating_add(slice.len() as u64);
+    });
     slice.to_vec()
 }
 
 fn record_runtime_bytes_vec_alloc(byte_len: usize) {
     if byte_len > 0 {
-        BYTES_VEC_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        BYTES_VEC_ALLOC_BYTES.fetch_add(byte_len as u64, Ordering::Relaxed);
+        BYTES_STORAGE_COUNTERS.with(|counters| {
+            let mut counters = counters.borrow_mut();
+            counters.vec_alloc_count = counters.vec_alloc_count.saturating_add(1);
+            counters.vec_alloc_bytes = counters.vec_alloc_bytes.saturating_add(byte_len as u64);
+        });
     }
 }
 
 fn record_runtime_bytes_zero_fill(byte_len: usize) {
     if byte_len > 0 {
-        BYTES_ZERO_FILL_COUNT.fetch_add(1, Ordering::Relaxed);
-        BYTES_ZERO_FILL_BYTES.fetch_add(byte_len as u64, Ordering::Relaxed);
+        BYTES_STORAGE_COUNTERS.with(|counters| {
+            let mut counters = counters.borrow_mut();
+            counters.zero_fill_count = counters.zero_fill_count.saturating_add(1);
+            counters.zero_fill_bytes = counters.zero_fill_bytes.saturating_add(byte_len as u64);
+        });
     }
 }
 
@@ -359,36 +359,39 @@ fn record_runtime_bytes_executor_copy_cost(executor_report: &JsonValue) {
     let Some(cost) = executor_report.get("bytes_copy_cost") else {
         return;
     };
-    if let Some(count) = cost
-        .get("copy_from_slice_count")
-        .and_then(JsonValue::as_u64)
-    {
-        BYTES_COPY_FROM_SLICE_COUNT.fetch_add(count, Ordering::Relaxed);
-    }
-    if let Some(bytes) = cost
-        .get("copy_from_slice_bytes")
-        .and_then(JsonValue::as_u64)
-    {
-        BYTES_COPY_FROM_SLICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-    if let Some(count) = cost.get("vec_alloc_count").and_then(JsonValue::as_u64) {
-        BYTES_VEC_ALLOC_COUNT.fetch_add(count, Ordering::Relaxed);
-    }
-    if let Some(bytes) = cost.get("vec_alloc_bytes").and_then(JsonValue::as_u64) {
-        BYTES_VEC_ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-    if let Some(count) = cost.get("vec_clone_count").and_then(JsonValue::as_u64) {
-        BYTES_VEC_CLONE_COUNT.fetch_add(count, Ordering::Relaxed);
-    }
-    if let Some(bytes) = cost.get("vec_clone_bytes").and_then(JsonValue::as_u64) {
-        BYTES_VEC_CLONE_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
-    if let Some(count) = cost.get("zero_fill_count").and_then(JsonValue::as_u64) {
-        BYTES_ZERO_FILL_COUNT.fetch_add(count, Ordering::Relaxed);
-    }
-    if let Some(bytes) = cost.get("zero_fill_bytes").and_then(JsonValue::as_u64) {
-        BYTES_ZERO_FILL_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    }
+    BYTES_STORAGE_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        if let Some(count) = cost
+            .get("copy_from_slice_count")
+            .and_then(JsonValue::as_u64)
+        {
+            counters.copy_from_slice_count = counters.copy_from_slice_count.saturating_add(count);
+        }
+        if let Some(bytes) = cost
+            .get("copy_from_slice_bytes")
+            .and_then(JsonValue::as_u64)
+        {
+            counters.copy_from_slice_bytes = counters.copy_from_slice_bytes.saturating_add(bytes);
+        }
+        if let Some(count) = cost.get("vec_alloc_count").and_then(JsonValue::as_u64) {
+            counters.vec_alloc_count = counters.vec_alloc_count.saturating_add(count);
+        }
+        if let Some(bytes) = cost.get("vec_alloc_bytes").and_then(JsonValue::as_u64) {
+            counters.vec_alloc_bytes = counters.vec_alloc_bytes.saturating_add(bytes);
+        }
+        if let Some(count) = cost.get("vec_clone_count").and_then(JsonValue::as_u64) {
+            counters.vec_clone_count = counters.vec_clone_count.saturating_add(count);
+        }
+        if let Some(bytes) = cost.get("vec_clone_bytes").and_then(JsonValue::as_u64) {
+            counters.vec_clone_bytes = counters.vec_clone_bytes.saturating_add(bytes);
+        }
+        if let Some(count) = cost.get("zero_fill_count").and_then(JsonValue::as_u64) {
+            counters.zero_fill_count = counters.zero_fill_count.saturating_add(count);
+        }
+        if let Some(bytes) = cost.get("zero_fill_bytes").and_then(JsonValue::as_u64) {
+            counters.zero_fill_bytes = counters.zero_fill_bytes.saturating_add(bytes);
+        }
+    });
 }
 
 fn allocation_snapshot() -> AllocationSnapshot {
@@ -3755,7 +3758,7 @@ pub fn run_plan_source_route(
     let units = runtime_source_units_from_compiler(report_context.source_units.clone());
     let legacy_comparison = if compare_legacy {
         let mut legacy_runtime =
-            LiveRuntime::from_project(&source_path.display().to_string(), &units)?;
+            LiveRuntime::from_project_legacy(&source_path.display().to_string(), &units)?;
         let legacy_output = legacy_runtime.apply_source_event(event.clone())?;
         let route_is_indexed = output
             .route_surface
@@ -4103,6 +4106,771 @@ struct RootScenarioExecution {
 type RootBytesState = BTreeMap<usize, PlanExecutorBytes>;
 type RootFixedBytesBanks = BTreeMap<usize, Vec<u8>>;
 
+#[derive(Clone)]
+struct PlanExecutorRuntimeState {
+    root_state: PlanExecutorRootState,
+    root_bytes_initialization_core: JsonValue,
+    initialized_state_count: usize,
+    list_state: BTreeMap<usize, Vec<PlanListRowState>>,
+    list_next_keys: BTreeMap<usize, u64>,
+    bytes_counter_baseline: RuntimeBytesStorageCounters,
+    list_append_row_bool_delta_lists: BTreeSet<usize>,
+    per_step: Vec<JsonValue>,
+    semantic_delta_signatures: Vec<String>,
+    semantic_deltas: Vec<JsonValue>,
+    executed_update_branch_count: usize,
+    executed_derived_value_count: usize,
+    executed_list_append_count: usize,
+    executed_list_remove_count: usize,
+    executed_indexed_update_count: usize,
+    emitted_source_bind_count: usize,
+    emitted_source_unbind_count: usize,
+    executed_list_retain_count: usize,
+    executed_list_view_count: usize,
+    retained_list_row_count: usize,
+    assertion_checkpoints: Vec<JsonValue>,
+}
+
+#[derive(Clone)]
+struct PlanExecutorLiveSession {
+    plan: Arc<MachinePlan>,
+    state: PlanExecutorRuntimeState,
+    host_file_root: Option<PathBuf>,
+    next_step: usize,
+}
+
+impl PlanExecutorRuntimeState {
+    fn new(plan: &MachinePlan) -> RuntimeResult<Self> {
+        let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
+            plan_root_scalar_initial_state(plan)?;
+        let list_state = plan_initial_list_state(plan)?;
+        let initial_list_derived_values = root_pure_number_compare_values(plan, &list_state)?
+            .into_iter()
+            .map(|(field_id, value)| (FieldId(field_id), value))
+            .collect::<BTreeMap<_, _>>();
+        let initial_list_derived_commits = commit_plan_source_derived_values_to_root_state(
+            plan,
+            &mut root_state.root_state,
+            &initial_list_derived_values,
+        );
+        if let Some(report) = root_state.executor_report.as_object_mut() {
+            report.insert(
+                "initialized_root_list_derived_count".to_owned(),
+                json!(initial_list_derived_values.len()),
+            );
+            report.insert(
+                "root_list_derived_commits".to_owned(),
+                JsonValue::Array(initial_list_derived_commits),
+            );
+        }
+        let list_next_keys =
+            initial_plan_list_next_keys(&plan_executor_list_state_for_materialization(&list_state));
+        Ok(Self {
+            root_state,
+            root_bytes_initialization_core,
+            initialized_state_count,
+            list_state,
+            list_next_keys,
+            bytes_counter_baseline: runtime_bytes_storage_counters_snapshot(),
+            list_append_row_bool_delta_lists: BTreeSet::new(),
+            per_step: Vec::new(),
+            semantic_delta_signatures: Vec::new(),
+            semantic_deltas: Vec::new(),
+            executed_update_branch_count: 0,
+            executed_derived_value_count: 0,
+            executed_list_append_count: 0,
+            executed_list_remove_count: 0,
+            executed_indexed_update_count: 0,
+            emitted_source_bind_count: 0,
+            emitted_source_unbind_count: 0,
+            executed_list_retain_count: 0,
+            executed_list_view_count: 0,
+            retained_list_row_count: 0,
+            assertion_checkpoints: Vec::new(),
+        })
+    }
+
+    fn apply_step(
+        &mut self,
+        plan: &MachinePlan,
+        step: &ScenarioStep,
+        host_file_root: Option<&Path>,
+    ) -> RuntimeResult<()> {
+        if step.expected_source_event.is_none() {
+            self.assertion_checkpoints
+                .push(assert_plan_executor_scenario_checkpoint(
+                    plan,
+                    &self.root_state.root_state,
+                    &self.list_state,
+                    step,
+                )?);
+            return Ok(());
+        }
+
+        let step_bytes_counter_start = runtime_bytes_storage_counters_snapshot();
+        let generic_event = GenericSourceEvent::require(step)?;
+        let event = live_source_event_from_generic(&generic_event);
+        let root_json_event = root_json_source_event_from_live(&event);
+        let step_preparation = prepare_plan_root_scenario_step(
+            plan,
+            generic_event.source,
+            &root_json_event,
+            &self.root_state.root_state,
+        )?;
+        let source_id = step_preparation.source_id;
+        let source_route_slot = &step_preparation.source_route_slot;
+        let derived_values = step_preparation.derived_values;
+        let route_ops = step_preparation.route_ops;
+        let root_update_key_matches = step_preparation.root_update_key_matches;
+        let root_dispatch_report = step_preparation.root_dispatch_report;
+
+        let mut touched_states = serde_json::Map::new();
+        let mut touched_updates: BTreeMap<usize, RootExecutedUpdate> = BTreeMap::new();
+        let mut touched_update_candidates = RootUpdateCandidateTracker::default();
+        let mut staged_root_state = self.root_state.clone();
+        let mut step_signatures = Vec::new();
+        let mut step_deltas = Vec::new();
+        let mut updates = Vec::new();
+        let mut derived = Vec::new();
+        let mut indexed_updates = Vec::new();
+        let mut pending_indexed_deltas = Vec::new();
+        let mut list_removes = Vec::new();
+        let root_derived_values_before_updates =
+            root_pure_number_compare_values(plan, &self.list_state)?;
+        let source_derived_step = assemble_plan_source_derived_step_deltas(plan, &derived_values);
+        for (signature, delta) in source_derived_step
+            .semantic_delta_signatures
+            .iter()
+            .cloned()
+            .zip(source_derived_step.semantic_deltas.iter().cloned())
+        {
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+            self.executed_derived_value_count += 1;
+        }
+        derived.extend(source_derived_step.reports);
+        let root_source_derived_commits = commit_plan_source_derived_values_to_root_state(
+            plan,
+            &mut self.root_state.root_state,
+            &derived_values,
+        );
+        derived.extend(root_source_derived_commits);
+
+        let append_result = append_plan_list_rows_for_derived_values_with(
+            plan,
+            &mut self.list_state,
+            &mut self.list_next_keys,
+            &mut self.list_append_row_bool_delta_lists,
+            &derived_values,
+            eval_plan_row_expression,
+        )?;
+        for delta in &append_result.semantic_deltas {
+            let signature = plan_json_delta_signature(delta)?;
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        self.executed_list_append_count += append_result.appended_row_count;
+        self.emitted_source_bind_count += append_result.source_bind_count;
+
+        let remove_event = PlanExecutorLiveSourceEvent {
+            source: generic_event.source,
+            text: generic_event.text,
+            key: generic_event.key,
+            list_id: generic_event.list_id,
+            address: generic_event.address,
+            target_text: generic_event.target_text,
+            target_occurrence: generic_event.target_occurrence.map(|value| value as u64),
+            target_key: generic_event.target_key,
+            target_generation: generic_event.target_generation,
+            bind_epoch: generic_event.bind_epoch,
+            source_epoch: generic_event.source_epoch,
+            source_id: None,
+        };
+        let remove_result = remove_plan_list_rows_for_source_event(
+            plan,
+            source_id,
+            source_route_slot,
+            &remove_event,
+            &mut self.list_state,
+        )?;
+        for delta in &remove_result.semantic_deltas {
+            let signature = plan_json_delta_signature(delta)?;
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        self.executed_list_remove_count += remove_result.removed_row_count;
+        self.emitted_source_unbind_count += remove_result.source_unbind_count;
+        self.executed_derived_value_count += remove_result.derived_count;
+        derived.extend(remove_result.report_derived);
+        list_removes.extend(remove_result.report_rows);
+
+        let mut row_resolution_cache = BTreeMap::new();
+        for op in &route_ops {
+            if !root_update_key_matches {
+                continue;
+            }
+            if op.indexed {
+                let indexed_target_rows =
+                    plan_executor_list_state_for_materialization(&self.list_state);
+                let indexed_batch = execute_plan_indexed_update_batch_with(
+                    plan,
+                    op,
+                    source_route_slot,
+                    &IndexedUpdateTargetEvent {
+                        source: generic_event.source.to_owned(),
+                        list_id: generic_event.list_id.map(str::to_owned),
+                        target_key: generic_event.target_key,
+                        target_text: generic_event.target_text.map(str::to_owned),
+                        address: generic_event.address.map(str::to_owned),
+                    },
+                    &indexed_target_rows,
+                    |target: Option<IndexedUpdateTargetOverride>| {
+                        if let Some(target) = target {
+                            let mut row_event = generic_event.clone();
+                            row_event.list_id = Some(target.list_label.as_str());
+                            row_event.target_key = Some(target.key);
+                            row_event.target_generation = Some(target.generation);
+                            let mut per_row_resolution_cache = BTreeMap::new();
+                            execute_indexed_update_branch(
+                                plan,
+                                op,
+                                source_id,
+                                source_route_slot,
+                                &row_event,
+                                &mut self.list_state,
+                                &mut per_row_resolution_cache,
+                                &root_derived_values_before_updates,
+                                host_file_root,
+                            )
+                        } else {
+                            execute_indexed_update_branch(
+                                plan,
+                                op,
+                                source_id,
+                                source_route_slot,
+                                &generic_event,
+                                &mut self.list_state,
+                                &mut row_resolution_cache,
+                                &root_derived_values_before_updates,
+                                host_file_root,
+                            )
+                        }
+                    },
+                )?;
+                pending_indexed_deltas.extend(indexed_batch.semantic_deltas);
+                self.executed_update_branch_count += indexed_batch.updated_row_count;
+                self.executed_indexed_update_count += indexed_batch.updated_row_count;
+                indexed_updates.extend(indexed_batch.report_rows);
+                continue;
+            }
+            let mut runtime_branch = |op: &boon_plan::PlanOp,
+                                      staged_state: &PlanExecutorRootState|
+             -> RuntimeResult<Option<RootExecutedUpdate>> {
+                execute_root_scalar_update_branch(
+                    plan,
+                    op,
+                    source_id,
+                    source_route_slot,
+                    &event,
+                    &staged_state.root_state,
+                    &staged_state.private_bytes,
+                    &staged_state.fixed_byte_banks,
+                    host_file_root,
+                )
+            };
+            collect_plan_root_update_candidate_for_step(
+                plan,
+                op,
+                source_id,
+                generic_event.source,
+                source_route_slot,
+                &root_json_event,
+                &mut staged_root_state,
+                &mut touched_update_candidates,
+                &mut touched_updates,
+                &mut runtime_branch,
+            )?;
+        }
+
+        let root_update_commit_batch = commit_plan_ordered_root_update_candidates(
+            &mut self.root_state,
+            plan,
+            source_id,
+            &touched_update_candidates,
+            touched_updates,
+        )?;
+        touched_states.extend(root_update_commit_batch.touched_states);
+        for signature in root_update_commit_batch.semantic_delta_signatures {
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+        }
+        for delta in root_update_commit_batch.semantic_deltas {
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+        }
+        let changed_root_state_ids =
+            changed_root_state_ids_from_update_reports(&root_update_commit_batch.update_reports);
+        updates.extend(root_update_commit_batch.update_reports);
+        self.executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
+        pending_indexed_deltas.extend(refresh_indexed_derived_fields_after_root_state_changes(
+            plan,
+            &mut self.list_state,
+            &changed_root_state_ids,
+        )?);
+        let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
+        for delta in &pending_indexed_deltas {
+            let signature = plan_json_delta_signature(delta)?;
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta.clone());
+        }
+        let step_retain_execution =
+            materialize_plan_list_retains(plan, &self.root_state.root_state, &self.list_state)?;
+        self.executed_list_retain_count += step_retain_execution.executed_count;
+        self.executed_list_view_count += step_retain_execution.view_count;
+        self.retained_list_row_count += step_retain_execution.retained_row_count;
+        let step_bytes_counters = runtime_bytes_storage_counters_snapshot()
+            .saturating_delta_since(step_bytes_counter_start);
+        let step_report = assemble_plan_root_scenario_step_report(
+            &step.id,
+            generic_event.source,
+            source_id,
+            &root_dispatch_report,
+            touched_states.len() + indexed_updates.len(),
+            derived.len(),
+            append_result.appended_row_count,
+            list_removes.len(),
+            indexed_updates.len(),
+            step_retain_execution.executed_count,
+            step_retain_execution.view_count,
+            step_retain_execution.retained_row_count,
+            append_result.source_bind_count,
+            remove_result.source_unbind_count,
+            derived,
+            append_result.report_rows,
+            list_removes,
+            step_retain_execution.reports,
+            JsonValue::Object(step_retain_execution.summary),
+            indexed_updates,
+            updates,
+            JsonValue::Object(touched_states),
+            step_signatures,
+            step_deltas,
+            step_bytes_counters.report_json(),
+            step_bytes_counters.no_runtime_byte_copies(),
+        );
+        self.per_step.push(step_report.step_report);
+        Ok(())
+    }
+
+    fn apply_live_source_event(
+        &mut self,
+        plan: &MachinePlan,
+        event: LiveSourceEvent,
+        sequence: usize,
+        host_file_root: Option<&Path>,
+    ) -> RuntimeResult<()> {
+        let step = event.into_step(sequence);
+        self.apply_step(plan, &step, host_file_root)
+    }
+
+    fn finish(self, plan: &MachinePlan) -> RuntimeResult<RootScenarioExecution> {
+        let plan_hash = plan_sha256(plan)?;
+        let bytes_storage_counters = runtime_bytes_storage_counters_snapshot()
+            .saturating_delta_since(self.bytes_counter_baseline);
+        let state_summary = JsonValue::Object(self.root_state.root_state);
+        let list_summary = plan_list_summary(plan, &self.list_state);
+        let projection_execution = materialize_plan_list_projections(
+            plan,
+            state_summary.as_object().unwrap(),
+            &self.list_state,
+        )?;
+        let retain_execution = materialize_plan_list_retains(
+            plan,
+            state_summary.as_object().unwrap(),
+            &self.list_state,
+        )?;
+        let semantic_deltas = JsonValue::Array(self.semantic_deltas);
+        let list_projection_summary = JsonValue::Object(projection_execution.summary);
+        let list_view_summary = JsonValue::Object(retain_execution.summary);
+        let bytes_storage_counters_report = bytes_storage_counters.report_json();
+        let bytes_storage_no_copy = bytes_storage_counters.no_runtime_byte_copies();
+        let report_assembly = assemble_plan_root_scenario_report(
+            plan,
+            self.per_step.len(),
+            self.initialized_state_count,
+            &self.root_bytes_initialization_core,
+            self.executed_update_branch_count,
+            self.executed_derived_value_count,
+            self.executed_list_append_count,
+            self.executed_list_remove_count,
+            self.executed_indexed_update_count,
+            self.emitted_source_bind_count,
+            self.emitted_source_unbind_count,
+            self.executed_list_retain_count,
+            self.executed_list_view_count,
+            self.retained_list_row_count,
+            projection_execution.executed_count,
+            projection_execution.find_count,
+            projection_execution.chunk_count,
+            projection_execution.projected_row_count,
+            &state_summary,
+            &list_summary,
+            &list_projection_summary,
+            &projection_execution.reports,
+            &list_view_summary,
+            &retain_execution.reports,
+            &self.semantic_delta_signatures,
+            &semantic_deltas,
+            &self.per_step,
+            &self.assertion_checkpoints,
+            &bytes_storage_counters_report,
+            bytes_storage_no_copy,
+        )?;
+        Ok(RootScenarioExecution {
+            plan_hash,
+            state_summary,
+            semantic_delta_signatures: self.semantic_delta_signatures,
+            semantic_deltas,
+            per_step: self.per_step,
+            assertion_checkpoints: self.assertion_checkpoints,
+            executor_report: report_assembly.executor_report,
+        })
+    }
+
+    fn snapshot(&self, plan: &MachinePlan) -> RuntimeResult<RootScenarioExecution> {
+        self.clone().finish(plan)
+    }
+
+    fn state_summary(&self) -> JsonValue {
+        JsonValue::Object(self.root_state.root_state.clone())
+    }
+
+    fn document_state_summary(&self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
+        plan_executor_document_summary_with_limits(
+            plan,
+            &self.root_state.root_state,
+            &self.list_state,
+            limits,
+        )
+    }
+}
+
+impl PlanExecutorLiveSession {
+    fn from_source(
+        source_label: &str,
+        source_text: &str,
+        target_profile: TargetProfile,
+    ) -> RuntimeResult<Self> {
+        let compiled =
+            compile_source_text_to_machine_plan(source_label, source_text, target_profile)?;
+        Self::from_machine_plan(compiled.plan, None)
+    }
+
+    fn from_project(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        target_profile: TargetProfile,
+    ) -> RuntimeResult<Self> {
+        let compiler_units = compiler_source_units_from_runtime_units(units);
+        let compiled =
+            compile_source_units_to_machine_plan(source_label, &compiler_units, target_profile)?;
+        Self::from_machine_plan(compiled.plan, None)
+    }
+
+    fn from_source_path(source_path: &Path, target_profile: TargetProfile) -> RuntimeResult<Self> {
+        let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
+        Self::from_machine_plan(compiled.plan, source_path.parent().map(Path::to_path_buf))
+    }
+
+    fn from_machine_plan(
+        plan: MachinePlan,
+        host_file_root: Option<PathBuf>,
+    ) -> RuntimeResult<Self> {
+        let plan = Arc::new(plan);
+        let state = PlanExecutorRuntimeState::new(plan.as_ref())?;
+        Ok(Self {
+            plan,
+            state,
+            host_file_root,
+            next_step: 1,
+        })
+    }
+
+    fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<JsonValue> {
+        let step_index = self.next_step;
+        self.next_step = self.next_step.saturating_add(1);
+        let previous_step_count = self.state.per_step.len();
+        self.state.apply_live_source_event(
+            self.plan.as_ref(),
+            event,
+            step_index,
+            self.host_file_root.as_deref(),
+        )?;
+        self.state
+            .per_step
+            .get(previous_step_count)
+            .cloned()
+            .ok_or_else(|| "PlanExecutor live source event produced no step report".into())
+    }
+
+    fn snapshot(&self) -> RuntimeResult<RootScenarioExecution> {
+        self.state.snapshot(self.plan.as_ref())
+    }
+
+    fn state_summary(&self) -> JsonValue {
+        self.state.state_summary()
+    }
+
+    fn document_state_summary(&self, limits: SummaryLimits) -> JsonValue {
+        self.state
+            .document_state_summary(self.plan.as_ref(), limits)
+    }
+
+    fn canonical_source_path(&self, source: &str) -> Option<String> {
+        if self
+            .plan
+            .source_routes
+            .iter()
+            .any(|route| route.path == source)
+        {
+            return Some(source.to_owned());
+        }
+        runtime_event_source_path_alias(source).filter(|alias| {
+            self.plan
+                .source_routes
+                .iter()
+                .any(|route| route.path == *alias)
+        })
+    }
+
+    fn source_id(&self, source: &str) -> Option<SourceId> {
+        let source = self
+            .canonical_source_path(source)
+            .unwrap_or_else(|| source.to_owned());
+        self.plan
+            .source_routes
+            .iter()
+            .find(|route| route.path == source)
+            .map(|route| route.source_id)
+    }
+
+    fn has_source_path(&self, source: &str) -> bool {
+        self.canonical_source_path(source).is_some()
+    }
+
+    fn source_payload_has_text(&self, source: &str) -> bool {
+        let source = self
+            .canonical_source_path(source)
+            .unwrap_or_else(|| source.to_owned());
+        self.plan
+            .source_routes
+            .iter()
+            .find(|route| route.path == source)
+            .is_some_and(|route| {
+                route
+                    .payload_schema
+                    .fields
+                    .iter()
+                    .any(|field| matches!(field, SourcePayloadField::Text))
+            })
+    }
+
+    fn document_state_values(&self, paths: &[String]) -> JsonValue {
+        let mut values = serde_json::Map::new();
+        let preview = self.document_state_summary(SummaryLimits::document_preview());
+        let mut full: Option<JsonValue> = None;
+        for path in paths {
+            if path.starts_with('@') {
+                continue;
+            }
+            let value = runtime_value_at_path(&preview, path).cloned().or_else(|| {
+                let full_summary = full
+                    .get_or_insert_with(|| self.document_state_summary(SummaryLimits::unlimited()));
+                runtime_value_at_path(full_summary, path).cloned()
+            });
+            if let Some(value) = value {
+                values.insert(path.clone(), value);
+            }
+        }
+        JsonValue::Object(values)
+    }
+
+    fn runtime_value_summaries(
+        &self,
+        paths: &[String],
+        max_depth: usize,
+        max_fields: usize,
+        max_list_items: usize,
+    ) -> JsonValue {
+        let mut values = serde_json::Map::new();
+        let preview = self.document_state_summary(SummaryLimits::document_preview());
+        let mut full: Option<JsonValue> = None;
+        for path in paths {
+            let value = runtime_value_at_path(&preview, path)
+                .or_else(|| {
+                    let full_summary = full.get_or_insert_with(|| {
+                        self.document_state_summary(SummaryLimits::unlimited())
+                    });
+                    runtime_value_at_path(full_summary, path)
+                })
+                .map(|value| {
+                    runtime_json_value_summary(value, 0, max_depth, max_fields, max_list_items)
+                })
+                .unwrap_or_else(|| json!({"kind": "missing"}));
+            values.insert(path.clone(), value);
+        }
+        JsonValue::Object(values)
+    }
+
+    fn finish(self) -> RuntimeResult<RootScenarioExecution> {
+        self.state.finish(self.plan.as_ref())
+    }
+
+    fn provenance_report(&self) -> JsonValue {
+        json!({
+            "engine": "plan_executor",
+            "session_kind": "persistent-live",
+            "next_step": self.next_step,
+            "host_file_root": self.host_file_root.as_ref().map(|path| path.display().to_string()),
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "generic_fallback_enabled": false,
+        })
+    }
+}
+
+fn plan_executor_step_report_to_live_turn_output(
+    step_report: &JsonValue,
+    apply_step_ms: f64,
+) -> RuntimeResult<LiveTurnOutput> {
+    let semantic_deltas = step_report
+        .get("semantic_deltas")
+        .and_then(JsonValue::as_array)
+        .map(|deltas| {
+            deltas
+                .iter()
+                .map(plan_json_semantic_delta_to_typed)
+                .collect::<RuntimeResult<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let dirty_key_count = step_report
+        .get("touched_state_summary")
+        .and_then(JsonValue::as_object)
+        .map_or(0, serde_json::Map::len);
+    let executed_update_branch_count = step_report
+        .get("executed_update_branch_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0) as usize;
+    let executed_indexed_update_count = step_report
+        .get("executed_indexed_update_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0) as usize;
+    let executed_derived_value_count = step_report
+        .get("executed_derived_value_count")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0) as usize;
+    Ok(LiveTurnOutput {
+        semantic_deltas,
+        render_patches: Vec::new(),
+        apply_step_ms,
+        runtime_step_profile: LiveRuntimeStepProfile::default(),
+        dirty_key_count,
+        recomputed_field_count: executed_update_branch_count
+            .saturating_add(executed_indexed_update_count)
+            .saturating_add(executed_derived_value_count),
+        recompute_candidate_count: executed_update_branch_count
+            .saturating_add(executed_indexed_update_count),
+        list_scan_counters: LiveRuntimeListScanCounters::default(),
+        source_route_scan_summary: LiveRuntimeSourceRouteScanSummary::default(),
+        root_materialization_stats: LiveRuntimeRootMaterializationStats::default(),
+        function_call_stats: LiveRuntimeFunctionCallStats::default(),
+        recompute_candidate_samples: Vec::new(),
+        recomputed_field_samples: Vec::new(),
+    })
+}
+
+fn plan_json_semantic_delta_to_typed(delta: &JsonValue) -> RuntimeResult<SemanticDelta<'static>> {
+    let object = delta
+        .as_object()
+        .ok_or("PlanExecutor semantic delta must be a JSON object")?;
+    let kind = object
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .ok_or("PlanExecutor semantic delta is missing `kind`")?;
+    Ok(SemanticDelta {
+        kind: plan_semantic_delta_kind(kind)?,
+        list_id: plan_optional_cow_string(object.get("list_id")),
+        key: object.get("key").and_then(JsonValue::as_u64),
+        generation: object.get("generation").and_then(JsonValue::as_u64),
+        source_id: object.get("source_id").and_then(JsonValue::as_u64),
+        bind_epoch: object.get("bind_epoch").and_then(JsonValue::as_u64),
+        field_path: plan_optional_cow_string(object.get("field_path")),
+        value: plan_json_protocol_value(
+            object
+                .get("value")
+                .ok_or("PlanExecutor semantic delta is missing `value`")?,
+        ),
+    })
+}
+
+fn plan_semantic_delta_kind(kind: &str) -> RuntimeResult<&'static str> {
+    match kind {
+        "FieldSet" => Ok("FieldSet"),
+        "ListInsert" => Ok("ListInsert"),
+        "ListRemove" => Ok("ListRemove"),
+        "ListMove" => Ok("ListMove"),
+        "SourceBind" => Ok("SourceBind"),
+        "SourceUnbind" => Ok("SourceUnbind"),
+        other => Err(format!("unsupported PlanExecutor semantic delta kind `{other}`").into()),
+    }
+}
+
+fn plan_optional_cow_string(value: Option<&JsonValue>) -> Option<Cow<'static, str>> {
+    value
+        .and_then(JsonValue::as_str)
+        .map(|value| Cow::Owned(value.to_owned()))
+}
+
+fn plan_json_protocol_value(value: &JsonValue) -> ProtocolValue<'static> {
+    match value {
+        JsonValue::Null => ProtocolValue::Null,
+        JsonValue::Bool(value) => ProtocolValue::Bool(*value),
+        JsonValue::String(value) => ProtocolValue::Text(Cow::Owned(value.clone())),
+        JsonValue::Number(value) => value
+            .as_i64()
+            .map(ProtocolValue::NumberText)
+            .unwrap_or_else(|| ProtocolValue::Text(Cow::Owned(value.to_string()))),
+        JsonValue::Array(_) => ProtocolValue::Bytes(value.clone()),
+        JsonValue::Object(object) => {
+            if let Some(checked) = object.get("checked").and_then(JsonValue::as_bool) {
+                return ProtocolValue::CheckedProperty(checked);
+            }
+            if let (Some(source_path), Some(source_id), Some(bind_epoch)) = (
+                object.get("source_path").and_then(JsonValue::as_str),
+                object.get("source_id").and_then(JsonValue::as_u64),
+                object.get("bind_epoch").and_then(JsonValue::as_u64),
+            ) {
+                return ProtocolValue::SourceBinding {
+                    source_path: Cow::Owned(source_path.to_owned()),
+                    source_id,
+                    bind_epoch,
+                };
+            }
+            ProtocolValue::Bytes(value.clone())
+        }
+    }
+}
+
 pub fn execute_machine_plan_initial_state(
     plan: &MachinePlan,
 ) -> RuntimeResult<PlanInitialStateOutput> {
@@ -4161,6 +4929,9 @@ fn execute_machine_plan_root_scenario_inner(
     selected_steps: &[&ScenarioStep],
     host_file_root: Option<&Path>,
 ) -> RuntimeResult<RootScenarioExecution> {
+    let _bytes_counter_guard = runtime_bytes_storage_counter_measurement_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let verification = verify_plan(plan)?;
     if verification.status != "pass" {
         return Err(format!(
@@ -4175,354 +4946,11 @@ fn execute_machine_plan_root_scenario_inner(
         );
     }
 
-    let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
-        plan_root_scalar_initial_state(plan)?;
-    let mut list_state = plan_initial_list_state(plan)?;
-    let mut list_next_keys =
-        initial_plan_list_next_keys(&plan_executor_list_state_for_materialization(&list_state));
-    let bytes_counter_baseline = runtime_bytes_storage_counters_snapshot();
-    let mut list_append_row_bool_delta_lists = BTreeSet::new();
-    let mut per_step = Vec::new();
-    let mut semantic_delta_signatures = Vec::new();
-    let mut semantic_deltas = Vec::new();
-    let mut executed_update_branch_count = 0usize;
-    let mut executed_derived_value_count = 0usize;
-    let mut executed_list_append_count = 0usize;
-    let mut executed_list_remove_count = 0usize;
-    let mut executed_indexed_update_count = 0usize;
-    let mut emitted_source_bind_count = 0usize;
-    let mut emitted_source_unbind_count = 0usize;
-    let mut executed_list_retain_count = 0usize;
-    let mut executed_list_view_count = 0usize;
-    let mut retained_list_row_count = 0usize;
-    let mut assertion_checkpoints = Vec::new();
-
+    let mut runtime = PlanExecutorRuntimeState::new(plan)?;
     for step in selected_steps {
-        if step.expected_source_event.is_none() {
-            assertion_checkpoints.push(assert_plan_executor_scenario_checkpoint(
-                plan,
-                &root_state.root_state,
-                &list_state,
-                step,
-            )?);
-            continue;
-        }
-        let step_bytes_counter_start = runtime_bytes_storage_counters_snapshot();
-        let generic_event = GenericSourceEvent::require(step)?;
-        let event = live_source_event_from_generic(&generic_event);
-        let root_json_event = root_json_source_event_from_live(&event);
-        let step_preparation = prepare_plan_root_scenario_step(
-            plan,
-            generic_event.source,
-            &root_json_event,
-            &root_state.root_state,
-        )?;
-        let source_id = step_preparation.source_id;
-        let source_route_slot = &step_preparation.source_route_slot;
-        let derived_values = step_preparation.derived_values;
-        let route_ops = step_preparation.route_ops;
-        let root_update_key_matches = step_preparation.root_update_key_matches;
-        let root_dispatch_report = step_preparation.root_dispatch_report;
-
-        let mut touched_states = serde_json::Map::new();
-        let mut touched_updates: BTreeMap<usize, RootExecutedUpdate> = BTreeMap::new();
-        let mut touched_update_candidates = RootUpdateCandidateTracker::default();
-        let mut staged_root_state = root_state.clone();
-        let mut step_signatures = Vec::new();
-        let mut step_deltas = Vec::new();
-        let mut updates = Vec::new();
-        let mut derived = Vec::new();
-        let mut indexed_updates = Vec::new();
-        let mut pending_indexed_deltas = Vec::new();
-        let mut list_removes = Vec::new();
-        let root_derived_values_before_updates =
-            root_pure_number_compare_values(plan, &list_state)?;
-        let source_derived_step = assemble_plan_source_derived_step_deltas(plan, &derived_values);
-        for (signature, delta) in source_derived_step
-            .semantic_delta_signatures
-            .iter()
-            .cloned()
-            .zip(source_derived_step.semantic_deltas.iter().cloned())
-        {
-            step_signatures.push(signature.clone());
-            semantic_delta_signatures.push(signature);
-            semantic_deltas.push(delta.clone());
-            step_deltas.push(delta);
-            executed_derived_value_count += 1;
-        }
-        derived.extend(source_derived_step.reports);
-        let root_source_derived_commits = commit_plan_source_derived_values_to_root_state(
-            plan,
-            &mut root_state.root_state,
-            &derived_values,
-        );
-        derived.extend(root_source_derived_commits);
-
-        let append_result = append_plan_list_rows_for_derived_values_with(
-            plan,
-            &mut list_state,
-            &mut list_next_keys,
-            &mut list_append_row_bool_delta_lists,
-            &derived_values,
-            eval_plan_row_expression,
-        )?;
-        for delta in &append_result.semantic_deltas {
-            let signature = plan_json_delta_signature(delta)?;
-            step_signatures.push(signature.clone());
-            semantic_delta_signatures.push(signature);
-            semantic_deltas.push(delta.clone());
-            step_deltas.push(delta.clone());
-        }
-        executed_list_append_count += append_result.appended_row_count;
-        emitted_source_bind_count += append_result.source_bind_count;
-
-        let remove_event = PlanExecutorLiveSourceEvent {
-            source: generic_event.source,
-            text: generic_event.text,
-            key: generic_event.key,
-            list_id: generic_event.list_id,
-            address: generic_event.address,
-            target_text: generic_event.target_text,
-            target_occurrence: generic_event.target_occurrence.map(|value| value as u64),
-            target_key: generic_event.target_key,
-            target_generation: generic_event.target_generation,
-            bind_epoch: generic_event.bind_epoch,
-            source_epoch: generic_event.source_epoch,
-            source_id: None,
-        };
-        let remove_result = remove_plan_list_rows_for_source_event(
-            plan,
-            source_id,
-            source_route_slot,
-            &remove_event,
-            &mut list_state,
-        )?;
-        for delta in &remove_result.semantic_deltas {
-            let signature = plan_json_delta_signature(delta)?;
-            step_signatures.push(signature.clone());
-            semantic_delta_signatures.push(signature);
-            semantic_deltas.push(delta.clone());
-            step_deltas.push(delta.clone());
-        }
-        executed_list_remove_count += remove_result.removed_row_count;
-        emitted_source_unbind_count += remove_result.source_unbind_count;
-        executed_derived_value_count += remove_result.derived_count;
-        derived.extend(remove_result.report_derived);
-        list_removes.extend(remove_result.report_rows);
-
-        let mut row_resolution_cache = BTreeMap::new();
-        for op in &route_ops {
-            if !root_update_key_matches {
-                continue;
-            }
-            if op.indexed {
-                let indexed_target_rows = plan_executor_list_state_for_materialization(&list_state);
-                let indexed_batch = execute_plan_indexed_update_batch_with(
-                    plan,
-                    op,
-                    source_route_slot,
-                    &IndexedUpdateTargetEvent {
-                        source: generic_event.source.to_owned(),
-                        list_id: generic_event.list_id.map(str::to_owned),
-                        target_key: generic_event.target_key,
-                        target_text: generic_event.target_text.map(str::to_owned),
-                        address: generic_event.address.map(str::to_owned),
-                    },
-                    &indexed_target_rows,
-                    |target: Option<IndexedUpdateTargetOverride>| {
-                        if let Some(target) = target {
-                            let mut row_event = generic_event.clone();
-                            row_event.list_id = Some(target.list_label.as_str());
-                            row_event.target_key = Some(target.key);
-                            row_event.target_generation = Some(target.generation);
-                            let mut per_row_resolution_cache = BTreeMap::new();
-                            execute_indexed_update_branch(
-                                plan,
-                                op,
-                                source_id,
-                                source_route_slot,
-                                &row_event,
-                                &mut list_state,
-                                &mut per_row_resolution_cache,
-                                &root_derived_values_before_updates,
-                                host_file_root,
-                            )
-                        } else {
-                            execute_indexed_update_branch(
-                                plan,
-                                op,
-                                source_id,
-                                source_route_slot,
-                                &generic_event,
-                                &mut list_state,
-                                &mut row_resolution_cache,
-                                &root_derived_values_before_updates,
-                                host_file_root,
-                            )
-                        }
-                    },
-                )?;
-                pending_indexed_deltas.extend(indexed_batch.semantic_deltas);
-                executed_update_branch_count += indexed_batch.updated_row_count;
-                executed_indexed_update_count += indexed_batch.updated_row_count;
-                indexed_updates.extend(indexed_batch.report_rows);
-                continue;
-            }
-            let mut runtime_branch = |op: &boon_plan::PlanOp,
-                                      staged_state: &PlanExecutorRootState|
-             -> RuntimeResult<Option<RootExecutedUpdate>> {
-                execute_root_scalar_update_branch(
-                    plan,
-                    op,
-                    source_id,
-                    source_route_slot,
-                    &event,
-                    &staged_state.root_state,
-                    &staged_state.private_bytes,
-                    &staged_state.fixed_byte_banks,
-                    host_file_root,
-                )
-            };
-            collect_plan_root_update_candidate_for_step(
-                plan,
-                op,
-                source_id,
-                generic_event.source,
-                source_route_slot,
-                &root_json_event,
-                &mut staged_root_state,
-                &mut touched_update_candidates,
-                &mut touched_updates,
-                &mut runtime_branch,
-            )?;
-        }
-
-        let root_update_commit_batch = commit_plan_ordered_root_update_candidates(
-            &mut root_state,
-            plan,
-            source_id,
-            &touched_update_candidates,
-            touched_updates,
-        )?;
-        touched_states.extend(root_update_commit_batch.touched_states);
-        for signature in root_update_commit_batch.semantic_delta_signatures {
-            step_signatures.push(signature.clone());
-            semantic_delta_signatures.push(signature);
-        }
-        for delta in root_update_commit_batch.semantic_deltas {
-            semantic_deltas.push(delta.clone());
-            step_deltas.push(delta);
-        }
-        let changed_root_state_ids =
-            changed_root_state_ids_from_update_reports(&root_update_commit_batch.update_reports);
-        updates.extend(root_update_commit_batch.update_reports);
-        executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
-        pending_indexed_deltas.extend(refresh_indexed_derived_fields_after_root_state_changes(
-            plan,
-            &mut list_state,
-            &changed_root_state_ids,
-        )?);
-        let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
-        for delta in &pending_indexed_deltas {
-            let signature = plan_json_delta_signature(delta)?;
-            step_signatures.push(signature.clone());
-            semantic_delta_signatures.push(signature);
-            semantic_deltas.push(delta.clone());
-            step_deltas.push(delta.clone());
-        }
-        let step_retain_execution =
-            materialize_plan_list_retains(plan, &root_state.root_state, &list_state)?;
-        executed_list_retain_count += step_retain_execution.executed_count;
-        executed_list_view_count += step_retain_execution.view_count;
-        retained_list_row_count += step_retain_execution.retained_row_count;
-        let step_bytes_counters = runtime_bytes_storage_counters_snapshot()
-            .saturating_delta_since(step_bytes_counter_start);
-        let step_report = assemble_plan_root_scenario_step_report(
-            &step.id,
-            generic_event.source,
-            source_id,
-            &root_dispatch_report,
-            touched_states.len() + indexed_updates.len(),
-            derived.len(),
-            append_result.appended_row_count,
-            list_removes.len(),
-            indexed_updates.len(),
-            step_retain_execution.executed_count,
-            step_retain_execution.view_count,
-            step_retain_execution.retained_row_count,
-            append_result.source_bind_count,
-            remove_result.source_unbind_count,
-            derived,
-            append_result.report_rows,
-            list_removes,
-            step_retain_execution.reports,
-            JsonValue::Object(step_retain_execution.summary),
-            indexed_updates,
-            updates,
-            JsonValue::Object(touched_states),
-            step_signatures,
-            step_deltas,
-            step_bytes_counters.report_json(),
-            step_bytes_counters.no_runtime_byte_copies(),
-        );
-        per_step.push(step_report.step_report);
+        runtime.apply_step(plan, step, host_file_root)?;
     }
-
-    let plan_hash = plan_sha256(plan)?;
-    let bytes_storage_counters =
-        runtime_bytes_storage_counters_snapshot().saturating_delta_since(bytes_counter_baseline);
-    let state_summary = JsonValue::Object(root_state.root_state);
-    let list_summary = plan_list_summary(plan, &list_state);
-    let projection_execution =
-        materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_state)?;
-    let retain_execution =
-        materialize_plan_list_retains(plan, state_summary.as_object().unwrap(), &list_state)?;
-    let semantic_deltas = JsonValue::Array(semantic_deltas);
-    let list_projection_summary = JsonValue::Object(projection_execution.summary);
-    let list_view_summary = JsonValue::Object(retain_execution.summary);
-    let bytes_storage_counters_report = bytes_storage_counters.report_json();
-    let bytes_storage_no_copy = bytes_storage_counters.no_runtime_byte_copies();
-    let report_assembly = assemble_plan_root_scenario_report(
-        plan,
-        per_step.len(),
-        initialized_state_count,
-        &root_bytes_initialization_core,
-        executed_update_branch_count,
-        executed_derived_value_count,
-        executed_list_append_count,
-        executed_list_remove_count,
-        executed_indexed_update_count,
-        emitted_source_bind_count,
-        emitted_source_unbind_count,
-        executed_list_retain_count,
-        executed_list_view_count,
-        retained_list_row_count,
-        projection_execution.executed_count,
-        projection_execution.find_count,
-        projection_execution.chunk_count,
-        projection_execution.projected_row_count,
-        &state_summary,
-        &list_summary,
-        &list_projection_summary,
-        &projection_execution.reports,
-        &list_view_summary,
-        &retain_execution.reports,
-        &semantic_delta_signatures,
-        &semantic_deltas,
-        &per_step,
-        &assertion_checkpoints,
-        &bytes_storage_counters_report,
-        bytes_storage_no_copy,
-    )?;
-    Ok(RootScenarioExecution {
-        plan_hash,
-        state_summary,
-        semantic_delta_signatures,
-        semantic_deltas,
-        per_step,
-        assertion_checkpoints,
-        executor_report: report_assembly.executor_report,
-    })
+    runtime.finish(plan)
 }
 
 fn assert_plan_executor_scenario_checkpoint(
@@ -4627,6 +5055,407 @@ fn materialize_plan_list_retains(
 ) -> RuntimeResult<ListRetainExecution> {
     let executor_rows = plan_executor_list_state_for_materialization(list_state);
     materialize_plan_list_retains_core(plan, root_state, &executor_rows)
+}
+
+fn plan_executor_document_summary_with_limits(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    limits: SummaryLimits,
+) -> JsonValue {
+    let mut root = plan_executor_nested_root_summary(root_state);
+    let mut materialization = Vec::new();
+    plan_executor_insert_direct_list_summaries(
+        plan,
+        list_state,
+        limits,
+        &mut root,
+        &mut materialization,
+    );
+    plan_executor_insert_projection_summaries(
+        plan,
+        root_state,
+        list_state,
+        limits,
+        &mut root,
+        &mut materialization,
+    );
+    plan_executor_insert_retain_summaries(
+        plan,
+        root_state,
+        list_state,
+        limits,
+        &mut root,
+        &mut materialization,
+    );
+    root.insert(
+        "source_binding_count".to_owned(),
+        json!(plan_executor_source_binding_count(plan, list_state)),
+    );
+    if !materialization.is_empty() {
+        root.insert(
+            "__boon_materialization".to_owned(),
+            JsonValue::Array(materialization),
+        );
+    }
+    JsonValue::Object(root)
+}
+
+fn plan_executor_nested_root_summary(
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> serde_json::Map<String, JsonValue> {
+    let mut root = serde_json::Map::new();
+    for (path, value) in root_state {
+        insert_nested_json(&mut root, path, value.clone());
+        root.entry(row_field_name(path).to_owned())
+            .or_insert_with(|| value.clone());
+    }
+    root
+}
+
+fn plan_executor_insert_direct_list_summaries(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    limits: SummaryLimits,
+    root: &mut serde_json::Map<String, JsonValue>,
+    materialization: &mut Vec<JsonValue>,
+) {
+    for (list_id, rows) in list_state {
+        let list = plan_list_label(plan, *list_id);
+        let row_end = limits
+            .list_rows
+            .map_or(rows.len(), |limit| {
+                limits.list_row_start.saturating_add(limit)
+            })
+            .min(rows.len());
+        let visible_rows = rows
+            .get(limits.list_row_start..row_end)
+            .unwrap_or(&[])
+            .iter()
+            .map(|row| plan_executor_row_document_json(plan, *list_id, row))
+            .collect::<Vec<_>>();
+        materialization.push(materialization_report_for_rows(
+            &list,
+            rows.len(),
+            limits.list_row_start,
+            &visible_rows,
+        ));
+        let value = JsonValue::Array(visible_rows);
+        if let Some(store) = root
+            .get_mut("store")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            store.entry(list.clone()).or_insert(value.clone());
+        }
+        root.entry(list).or_insert(value);
+    }
+}
+
+fn plan_executor_insert_projection_summaries(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    limits: SummaryLimits,
+    root: &mut serde_json::Map<String, JsonValue>,
+    materialization: &mut Vec<JsonValue>,
+) {
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::ListProjections)
+        .flat_map(|region| region.ops.iter())
+    {
+        let PlanOpKind::ListProjection { projection } = &op.kind else {
+            continue;
+        };
+        let Some(ValueRef::Field(target_field_id)) = op.output else {
+            continue;
+        };
+        let target = plan_derived_field_label(plan, target_field_id.0);
+        match projection {
+            PlanListProjection::Find {
+                source_list,
+                field,
+                value,
+            } => {
+                let selector = plan_executor_projection_selector_value(plan, root_state, value);
+                let rows = list_state
+                    .get(&source_list.0)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let projected = rows
+                    .iter()
+                    .find(|row| row_json_values_equal(row.fields.get(field), &selector))
+                    .map(|row| JsonValue::Object(row.fields.clone().into_iter().collect()))
+                    .unwrap_or(JsonValue::Null);
+                insert_nested_json(root, &target, projected.clone());
+                root.entry(row_field_name(&target).to_owned())
+                    .or_insert(projected);
+            }
+            PlanListProjection::Chunk {
+                source_list,
+                size,
+                item_field,
+                label_field,
+            } => {
+                let rows = list_state
+                    .get(&source_list.0)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let value = plan_executor_windowed_chunk_projection(
+                    plan,
+                    source_list.0,
+                    rows,
+                    *size,
+                    item_field,
+                    label_field,
+                    limits,
+                );
+                materialization.push(materialization_report_for_chunk(
+                    &target,
+                    rows.len(),
+                    limits.chunk_row_start,
+                    limits.chunk_column_start,
+                    &value,
+                ));
+                insert_nested_json(root, &target, JsonValue::Array(value));
+            }
+            PlanListProjection::Unknown { .. } => {}
+        }
+    }
+}
+
+fn plan_executor_insert_retain_summaries(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    limits: SummaryLimits,
+    root: &mut serde_json::Map<String, JsonValue>,
+    materialization: &mut Vec<JsonValue>,
+) {
+    let Ok(retain_execution) = materialize_plan_list_retains(plan, root_state, list_state) else {
+        return;
+    };
+    for (target, summary) in retain_execution.summary {
+        let source_list_id = summary
+            .get("source_list_id")
+            .and_then(JsonValue::as_u64)
+            .map(|value| value as usize);
+        let all_rows = summary
+            .get("rows")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| plan_executor_retained_row_document_json(plan, source_list_id, &row))
+            .collect::<Vec<_>>();
+        let row_end = limits
+            .list_rows
+            .map_or(all_rows.len(), |limit| {
+                limits.list_row_start.saturating_add(limit)
+            })
+            .min(all_rows.len());
+        let rows = all_rows
+            .get(limits.list_row_start..row_end)
+            .unwrap_or(&[])
+            .to_vec();
+        materialization.push(materialization_report_for_rows(
+            &target,
+            all_rows.len(),
+            limits.list_row_start,
+            &rows,
+        ));
+        let value = JsonValue::Array(rows);
+        insert_nested_json(root, &target, value.clone());
+        root.entry(row_field_name(&target).to_owned())
+            .or_insert(value);
+    }
+}
+
+fn plan_executor_windowed_chunk_projection(
+    plan: &MachinePlan,
+    list_id: usize,
+    rows: &[PlanListRowState],
+    columns: usize,
+    item_field: &str,
+    label_field: &str,
+    limits: SummaryLimits,
+) -> Vec<JsonValue> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let total_rows = rows.len().div_ceil(columns);
+    let row_end = limits
+        .chunk_rows
+        .map_or(total_rows, |limit| {
+            limits.chunk_row_start.saturating_add(limit)
+        })
+        .min(total_rows);
+    let projected_columns = limits.chunk_columns.map_or_else(
+        || columns.saturating_sub(limits.chunk_column_start),
+        |limit| columns.saturating_sub(limits.chunk_column_start).min(limit),
+    );
+    let mut projected_rows = Vec::with_capacity(row_end.saturating_sub(limits.chunk_row_start));
+    for row in limits.chunk_row_start..row_end {
+        let mut row_object = serde_json::Map::new();
+        row_object.insert(label_field.to_owned(), json!(row.to_string()));
+        row_object.insert("index".to_owned(), json!(row));
+        let mut cells = Vec::with_capacity(projected_columns);
+        for column_offset in 0..projected_columns {
+            let column = limits.chunk_column_start.saturating_add(column_offset);
+            let index = row.saturating_mul(columns).saturating_add(column);
+            let Some(cell) = rows.get(index) else {
+                break;
+            };
+            cells.push(plan_executor_row_document_json(plan, list_id, cell));
+        }
+        row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
+        projected_rows.push(JsonValue::Object(row_object));
+    }
+    projected_rows
+}
+
+fn plan_executor_row_document_json(
+    plan: &MachinePlan,
+    list_id: usize,
+    row: &PlanListRowState,
+) -> JsonValue {
+    let mut object: serde_json::Map<String, JsonValue> = row.fields.clone().into_iter().collect();
+    object.insert(
+        "$boon".to_owned(),
+        json!({
+            "row_key": row.key,
+            "generation": row.generation,
+        }),
+    );
+    plan_executor_insert_row_source_bindings(plan, list_id, row.key, row.generation, &mut object);
+    JsonValue::Object(object)
+}
+
+fn plan_executor_retained_row_document_json(
+    plan: &MachinePlan,
+    source_list_id: Option<usize>,
+    row: &JsonValue,
+) -> JsonValue {
+    let Some(object) = row.as_object() else {
+        return JsonValue::Null;
+    };
+    let mut output = object
+        .get("fields")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let (Some(key), Some(generation)) = (
+        object.get("key").and_then(JsonValue::as_u64),
+        object.get("generation").and_then(JsonValue::as_u64),
+    ) {
+        if let Some(list_id) = source_list_id.or_else(|| {
+            object
+                .get("source_list_id")
+                .and_then(JsonValue::as_u64)
+                .map(|value| value as usize)
+        }) {
+            plan_executor_insert_row_source_bindings(plan, list_id, key, generation, &mut output);
+        }
+        output.insert(
+            "$boon".to_owned(),
+            json!({
+                "row_key": key,
+                "generation": generation,
+            }),
+        );
+    }
+    JsonValue::Object(output)
+}
+
+fn plan_executor_insert_row_source_bindings(
+    plan: &MachinePlan,
+    list_id: usize,
+    key: u64,
+    generation: u64,
+    row: &mut serde_json::Map<String, JsonValue>,
+) {
+    let Some(list_slot) = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id.0 == list_id)
+    else {
+        return;
+    };
+    let list_label = plan_list_label(plan, list_id);
+    for route in row_scoped_source_routes(plan, list_slot) {
+        let Some(binding_id) = plan_row_source_binding_id(plan, list_slot, key, route.source_id)
+        else {
+            continue;
+        };
+        let local_path = plan_executor_row_local_source_path(&route.path);
+        let binding = SourceBinding {
+            list_id: list_label.clone(),
+            key,
+            generation,
+            source_id: binding_id,
+            bind_epoch: binding_id,
+            source_path: route.path.clone(),
+        };
+        insert_nested_json(row, &local_path, source_binding_summary_json(&binding));
+    }
+}
+
+fn plan_executor_row_local_source_path(path: &str) -> String {
+    path.split_once(".sources.")
+        .map(|(_, suffix)| format!("sources.{suffix}"))
+        .unwrap_or_else(|| path.to_owned())
+}
+
+fn plan_executor_projection_selector_value(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    value: &ValueRef,
+) -> JsonValue {
+    match value {
+        ValueRef::State(state_id) => root_state
+            .get(&plan_state_label(plan, state_id.0))
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        ValueRef::Constant(constant_id) => plan
+            .constants
+            .iter()
+            .find(|constant| constant.id == *constant_id)
+            .and_then(|constant| {
+                plan_executor_constant_value_json_value(
+                    &constant.value,
+                    &format!("plan constant {}", constant.id.0),
+                )
+                .ok()
+            })
+            .unwrap_or(JsonValue::Null),
+        ValueRef::Field(field_id) => root_state
+            .get(&plan_field_label(plan, field_id.0))
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        _ => JsonValue::Null,
+    }
+}
+
+fn plan_executor_source_binding_count(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+) -> usize {
+    list_state
+        .iter()
+        .map(|(list_id, rows)| {
+            plan.storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.list_id.0 == *list_id)
+                .map(|slot| {
+                    rows.len()
+                        .saturating_mul(row_scoped_source_routes(plan, slot).len())
+                })
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 fn plan_executor_list_state_for_materialization(
@@ -9409,7 +10238,8 @@ fn compare_plan_root_scenario_with_legacy(
     plan_state_summary: &JsonValue,
     plan_per_step: &[JsonValue],
 ) -> RuntimeResult<JsonValue> {
-    let mut legacy_runtime = LiveRuntime::from_project(&source_path.display().to_string(), units)?;
+    let mut legacy_runtime =
+        LiveRuntime::from_project_legacy(&source_path.display().to_string(), units)?;
     let mut last_legacy_state_summary = legacy_runtime.state_summary();
     let mut step_inputs = Vec::new();
 
@@ -10144,9 +10974,15 @@ pub fn run_source_initial_state(
 
 #[derive(Clone)]
 pub struct LiveRuntime {
-    runtime: LoadedRuntime,
+    engine: LiveRuntimeEngine,
     next_step: usize,
     last_source_batch_sequence: Option<u64>,
+}
+
+#[derive(Clone)]
+enum LiveRuntimeEngine {
+    Legacy(LoadedRuntime),
+    PlanExecutor(PlanExecutorLiveSession),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10458,6 +11294,34 @@ pub fn cached_runtime_static_analysis_from_project(
         .ok_or_else(|| "compiled runtime plan has no compiler static analysis".into())
 }
 
+pub fn static_analysis_requires_legacy_output_runtime(
+    analysis: &RuntimeStaticProgramAnalysis,
+) -> bool {
+    analysis.output_roots.iter().any(|output| {
+        matches!(output.output_kind.as_str(), "world" | "manufacturing")
+            || matches!(output.root.as_str(), "world" | "manufacturing")
+    })
+}
+
+pub fn project_requires_legacy_output_runtime(
+    source_label: &str,
+    units: &[RuntimeSourceUnit],
+) -> RuntimeResult<bool> {
+    let analysis = cached_runtime_static_analysis_from_project(source_label, units)?;
+    Ok(static_analysis_requires_legacy_output_runtime(&analysis))
+}
+
+fn source_requires_legacy_output_runtime(
+    source_label: &str,
+    source_text: &str,
+) -> RuntimeResult<bool> {
+    let unit = RuntimeSourceUnit {
+        path: source_label.to_owned(),
+        source: source_text.to_owned(),
+    };
+    project_requires_legacy_output_runtime(source_label, &[unit])
+}
+
 fn cached_runtime_parsed_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
@@ -10481,13 +11345,69 @@ fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<St
 }
 
 impl LiveRuntime {
+    fn legacy_runtime(&self) -> RuntimeResult<&LoadedRuntime> {
+        match &self.engine {
+            LiveRuntimeEngine::Legacy(runtime) => Ok(runtime),
+            LiveRuntimeEngine::PlanExecutor(_) => Err(
+                "PlanExecutor LiveRuntime has no LoadedRuntime; refusing hidden fallback".into(),
+            ),
+        }
+    }
+
+    fn legacy_runtime_mut(&mut self) -> RuntimeResult<&mut LoadedRuntime> {
+        match &mut self.engine {
+            LiveRuntimeEngine::Legacy(runtime) => Ok(runtime),
+            LiveRuntimeEngine::PlanExecutor(_) => Err(
+                "PlanExecutor LiveRuntime has no LoadedRuntime; refusing hidden fallback".into(),
+            ),
+        }
+    }
+
+    fn plan_session(&self) -> Option<&PlanExecutorLiveSession> {
+        match &self.engine {
+            LiveRuntimeEngine::PlanExecutor(session) => Some(session),
+            LiveRuntimeEngine::Legacy(_) => None,
+        }
+    }
+
+    fn plan_session_mut(&mut self) -> Option<&mut PlanExecutorLiveSession> {
+        match &mut self.engine {
+            LiveRuntimeEngine::PlanExecutor(session) => Some(session),
+            LiveRuntimeEngine::Legacy(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn legacy_runtime_for_test(&self) -> &LoadedRuntime {
+        self.legacy_runtime()
+            .expect("test expected legacy LiveRuntime engine")
+    }
+
+    #[cfg(test)]
+    fn legacy_runtime_for_test_mut(&mut self) -> &mut LoadedRuntime {
+        self.legacy_runtime_mut()
+            .expect("test expected legacy LiveRuntime engine")
+    }
+
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
+        let _scenario = parse_scenario(scenario_path)?;
+        if source_requires_legacy_output_runtime(source_label, source_text)? {
+            return Self::new_legacy(source_label, source_text, scenario_path);
+        }
+        Self::from_source_plan_executor(source_label, source_text)
+    }
+
+    pub fn new_legacy(
+        source_label: &str,
+        source_text: &str,
+        scenario_path: &Path,
+    ) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let scenario = parse_scenario(scenario_path)?;
         let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
-            runtime,
+            engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
         })
@@ -10498,38 +11418,158 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
         scenario_path: &Path,
     ) -> RuntimeResult<Self> {
+        let _scenario = parse_scenario(scenario_path)?;
+        if project_requires_legacy_output_runtime(source_label, units)? {
+            return Self::new_from_project_legacy(source_label, units, scenario_path);
+        }
+        Self::from_project_plan_executor(source_label, units)
+    }
+
+    pub fn new_from_project_legacy(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        scenario_path: &Path,
+    ) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let scenario = parse_scenario(scenario_path)?;
         let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
         Ok(Self {
-            runtime,
+            engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
         })
     }
 
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
+        if source_requires_legacy_output_runtime(source_label, source_text)? {
+            return Self::from_source_legacy(source_label, source_text);
+        }
+        Self::from_source_plan_executor(source_label, source_text)
+    }
+
+    pub fn from_source_legacy(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
-            runtime,
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
+    }
+
+    pub fn from_source_plan_executor(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
+        let plan_session = PlanExecutorLiveSession::from_source(
+            source_label,
+            source_text,
+            TargetProfile::SoftwareDefault,
+        )?;
+        Ok(Self {
+            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
             next_step: 1,
             last_source_batch_sequence: None,
         })
     }
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
+        if project_requires_legacy_output_runtime(source_label, units)? {
+            return Self::from_project_legacy(source_label, units);
+        }
+        Self::from_project_plan_executor(source_label, units)
+    }
+
+    pub fn from_project_legacy(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
-            runtime,
+            engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
         })
     }
 
+    pub fn from_project_plan_executor(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<Self> {
+        let plan_session = PlanExecutorLiveSession::from_project(
+            source_label,
+            units,
+            TargetProfile::SoftwareDefault,
+        )?;
+        Ok(Self {
+            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
+    }
+
+    pub fn from_project_plan_executor_profiled(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        let total_started = Instant::now();
+        let session_started = Instant::now();
+        let plan_session = PlanExecutorLiveSession::from_project(
+            source_label,
+            units,
+            TargetProfile::SoftwareDefault,
+        )?;
+        let session_ms = runtime_elapsed_ms(session_started);
+        let live_runtime = Self {
+            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        };
+        let provenance = live_runtime.engine_provenance_report();
+        Ok((
+            live_runtime,
+            json!({
+                "initialized_runtime_cache_hit": false,
+                "engine": "plan_executor",
+                "session_kind": "machine-plan-live-session",
+                "generic_fallback_enabled": false,
+                "source_unit_count": units.len(),
+                "runtime": {
+                    "engine": "plan_executor",
+                    "session_init_ms": session_ms,
+                    "provenance": provenance
+                },
+                "runtime_total_ms": session_ms,
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ))
+    }
+
     pub fn from_project_profiled(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<(Self, JsonValue)> {
+        if project_requires_legacy_output_runtime(source_label, units)? {
+            let (runtime, mut profile) = Self::from_project_legacy_profiled(source_label, units)?;
+            if let Some(object) = profile.as_object_mut() {
+                object.insert(
+                    "default_runtime_selection".to_owned(),
+                    json!("explicit_legacy_output_runtime"),
+                );
+            }
+            return Ok((runtime, profile));
+        }
+        let (runtime, mut profile) =
+            Self::from_project_plan_executor_profiled(source_label, units)?;
+        if let Some(object) = profile.as_object_mut() {
+            object.insert(
+                "default_runtime_selection".to_owned(),
+                json!("plan_executor_document_runtime"),
+            );
+        }
+        Ok((runtime, profile))
+    }
+
+    pub fn from_project_legacy_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
@@ -10550,9 +11590,15 @@ impl LiveRuntime {
                         "total_ms": runtime_elapsed_ms(total_started)
                     },
                     "runtime": {
+                        "engine": "legacy_generic_runtime",
+                        "session_kind": "loaded-runtime",
+                        "generic_fallback_enabled": true,
                         "initialized_runtime_cache_hit": true,
                         "total_ms": 0.0
                     },
+                    "engine": "legacy_generic_runtime",
+                    "session_kind": "loaded-runtime",
+                    "generic_fallback_enabled": true,
                     "runtime_total_ms": 0.0,
                     "total_ms": runtime_elapsed_ms(total_started)
                 }),
@@ -10563,7 +11609,7 @@ impl LiveRuntime {
         let (runtime, runtime_profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref())?;
         let runtime_ms = runtime_elapsed_ms(runtime_started);
         let live_runtime = Self {
-            runtime,
+            engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
         };
@@ -10579,6 +11625,9 @@ impl LiveRuntime {
                 "initialized_runtime_cache_hit": false,
                 "plan": plan_profile,
                 "runtime": runtime_profile,
+                "engine": "legacy_generic_runtime",
+                "session_kind": "loaded-runtime",
+                "generic_fallback_enabled": true,
                 "runtime_total_ms": runtime_ms,
                 "total_ms": runtime_elapsed_ms(total_started)
             }),
@@ -10586,15 +11635,39 @@ impl LiveRuntime {
     }
 
     pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
-        self.runtime.world_scene_output()
+        self.legacy_runtime_mut()?.world_scene_output()
     }
 
     pub fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
-        self.runtime.solid_model_output()
+        self.legacy_runtime_mut()?.solid_model_output()
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
         let event = self.accept_single_source_event_batch(event)?;
+        if self.plan_session().is_some() {
+            let apply_started = Instant::now();
+            let (output, state_summary) = {
+                let plan_session = self
+                    .plan_session_mut()
+                    .expect("PlanExecutor session checked above");
+                let step_report = plan_session.apply_source_event(event)?;
+                let output = plan_executor_step_report_to_live_turn_output(
+                    &step_report,
+                    runtime_elapsed_ms(apply_started),
+                )?;
+                let summary_started = Instant::now();
+                let state_summary = plan_session.state_summary();
+                (output, (state_summary, runtime_elapsed_ms(summary_started)))
+            };
+            self.next_step = self.next_step.saturating_add(1);
+            return Ok(LiveStepOutput {
+                semantic_deltas: output.semantic_deltas,
+                render_patches: output.render_patches,
+                state_summary: state_summary.0,
+                apply_step_ms: output.apply_step_ms,
+                state_summary_ms: state_summary.1,
+            });
+        }
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step(&step)
@@ -10605,6 +11678,31 @@ impl LiveRuntime {
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveStepOutput> {
         let event = self.accept_single_source_event_batch(event)?;
+        if self.plan_session().is_some() {
+            let apply_started = Instant::now();
+            let (output, state_summary) = {
+                let plan_session = self
+                    .plan_session_mut()
+                    .expect("PlanExecutor session checked above");
+                let step_report = plan_session.apply_source_event(event)?;
+                let output = plan_executor_step_report_to_live_turn_output(
+                    &step_report,
+                    runtime_elapsed_ms(apply_started),
+                )?;
+                let summary_started = Instant::now();
+                let state_summary =
+                    plan_session.document_state_summary(SummaryLimits::document_preview());
+                (output, (state_summary, runtime_elapsed_ms(summary_started)))
+            };
+            self.next_step = self.next_step.saturating_add(1);
+            return Ok(LiveStepOutput {
+                semantic_deltas: output.semantic_deltas,
+                render_patches: output.render_patches,
+                state_summary: state_summary.0,
+                apply_step_ms: output.apply_step_ms,
+                state_summary_ms: state_summary.1,
+            });
+        }
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_with_document_summary(&step)
@@ -10619,6 +11717,36 @@ impl LiveRuntime {
         column_count: usize,
     ) -> RuntimeResult<LiveStepOutput> {
         let event = self.accept_single_source_event_batch(event)?;
+        if self.plan_session().is_some() {
+            let apply_started = Instant::now();
+            let (output, state_summary) = {
+                let plan_session = self
+                    .plan_session_mut()
+                    .expect("PlanExecutor session checked above");
+                let step_report = plan_session.apply_source_event(event)?;
+                let output = plan_executor_step_report_to_live_turn_output(
+                    &step_report,
+                    runtime_elapsed_ms(apply_started),
+                )?;
+                let summary_started = Instant::now();
+                let state_summary =
+                    plan_session.document_state_summary(SummaryLimits::document_preview_window(
+                        row_start,
+                        row_count,
+                        column_start,
+                        column_count,
+                    ));
+                (output, (state_summary, runtime_elapsed_ms(summary_started)))
+            };
+            self.next_step = self.next_step.saturating_add(1);
+            return Ok(LiveStepOutput {
+                semantic_deltas: output.semantic_deltas,
+                render_patches: output.render_patches,
+                state_summary: state_summary.0,
+                apply_step_ms: output.apply_step_ms,
+                state_summary_ms: state_summary.1,
+            });
+        }
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_with_document_window(
@@ -10635,6 +11763,15 @@ impl LiveRuntime {
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveTurnOutput> {
         let event = self.accept_single_source_event_batch(event)?;
+        if let Some(plan_session) = self.plan_session_mut() {
+            let apply_started = Instant::now();
+            let step_report = plan_session.apply_source_event(event)?;
+            self.next_step = self.next_step.saturating_add(1);
+            return plan_executor_step_report_to_live_turn_output(
+                &step_report,
+                runtime_elapsed_ms(apply_started),
+            );
+        }
         let step = event.into_step(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         self.apply_checked_step_turn(&step)
@@ -10642,6 +11779,73 @@ impl LiveRuntime {
 
     pub fn apply_source_batch_turn(&mut self, batch: SourceBatch) -> RuntimeResult<LiveTurnOutput> {
         self.validate_source_batch_sequence(&batch)?;
+        if self.plan_session().is_some() {
+            let mut previous_event_id = None;
+            let mut normalized_events = Vec::with_capacity(batch.events.len());
+            for batch_event in batch.events {
+                if let Some(previous) = previous_event_id
+                    && batch_event.event_id <= previous
+                {
+                    return Err(format!(
+                        "source batch `{}` event IDs must be strictly increasing; got `{}` after `{previous}`",
+                        batch.sequence_id, batch_event.event_id
+                    )
+                    .into());
+                }
+                previous_event_id = Some(batch_event.event_id);
+                let event = self.normalize_live_source_event(batch_event.event);
+                if event.source_id.is_none() {
+                    return Err(format!(
+                        "source batch `{}` event `{}` could not resolve source ID for `{}`",
+                        batch.sequence_id, batch_event.event_id, event.source
+                    )
+                    .into());
+                }
+                normalized_events.push(event);
+            }
+            let mut semantic_deltas = Vec::new();
+            let mut apply_step_ms = 0.0;
+            let mut dirty_key_count = 0usize;
+            let mut recomputed_field_count = 0usize;
+            let mut recompute_candidate_count = 0usize;
+            for event in normalized_events {
+                let apply_started = Instant::now();
+                let output = {
+                    let plan_session = self
+                        .plan_session_mut()
+                        .expect("PlanExecutor session checked above");
+                    let step_report = plan_session.apply_source_event(event)?;
+                    plan_executor_step_report_to_live_turn_output(
+                        &step_report,
+                        runtime_elapsed_ms(apply_started),
+                    )?
+                };
+                self.next_step = self.next_step.saturating_add(1);
+                apply_step_ms += output.apply_step_ms;
+                dirty_key_count = dirty_key_count.saturating_add(output.dirty_key_count);
+                recomputed_field_count =
+                    recomputed_field_count.saturating_add(output.recomputed_field_count);
+                recompute_candidate_count =
+                    recompute_candidate_count.saturating_add(output.recompute_candidate_count);
+                semantic_deltas.extend(output.semantic_deltas);
+            }
+            self.last_source_batch_sequence = Some(batch.sequence_id);
+            return Ok(LiveTurnOutput {
+                semantic_deltas,
+                render_patches: Vec::new(),
+                apply_step_ms,
+                runtime_step_profile: LiveRuntimeStepProfile::default(),
+                dirty_key_count,
+                recomputed_field_count,
+                recompute_candidate_count,
+                list_scan_counters: LiveRuntimeListScanCounters::default(),
+                source_route_scan_summary: LiveRuntimeSourceRouteScanSummary::default(),
+                root_materialization_stats: LiveRuntimeRootMaterializationStats::default(),
+                function_call_stats: LiveRuntimeFunctionCallStats::default(),
+                recompute_candidate_samples: Vec::new(),
+                recomputed_field_samples: Vec::new(),
+            });
+        }
         let mut previous_event_id = None;
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
@@ -10750,14 +11954,29 @@ impl LiveRuntime {
     }
 
     fn normalize_live_source_event(&self, mut event: LiveSourceEvent) -> LiveSourceEvent {
-        if let Some(source) = self.runtime.canonical_source_path(&event.source)
+        if let Some(plan_session) = self.plan_session() {
+            if let Some(source) = plan_session.canonical_source_path(&event.source)
+                && source != event.source
+            {
+                event.source = source;
+            }
+            if event.source_id.is_none() {
+                event.source_id = plan_session
+                    .source_id(&event.source)
+                    .map(|source_id| source_id.as_usize() as u64);
+            }
+            return event;
+        }
+        let Ok(runtime) = self.legacy_runtime() else {
+            return event;
+        };
+        if let Some(source) = runtime.canonical_source_path(&event.source)
             && source != event.source
         {
             event.source = source;
         }
         if event.source_id.is_none() {
-            event.source_id = self
-                .runtime
+            event.source_id = runtime
                 .source_id(&event.source)
                 .map(|source_id| source_id.as_usize() as u64);
         }
@@ -10795,6 +12014,9 @@ impl LiveRuntime {
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveStepOutput> {
         event.assert_matches_step(step)?;
+        if self.plan_session().is_some() {
+            return self.apply_source_event(event);
+        }
         let mut live_step = step.clone();
         live_step.user_action = Some(event.live_source_user_action_with_occurrence());
         live_step.expected_source_event = Some(event.into_expected_source_event());
@@ -10809,6 +12031,15 @@ impl LiveRuntime {
         paths: &[String],
     ) -> RuntimeResult<LiveSparseStepOutput> {
         event.assert_matches_step(step)?;
+        if self.plan_session().is_some() {
+            let output = self.apply_source_event_turn(event)?;
+            let value_summaries = self.runtime_value_summaries(paths, 3, 8, 4);
+            return Ok(LiveSparseStepOutput {
+                semantic_delta_count: output.semantic_deltas.len(),
+                render_patch_count: output.render_patches.len(),
+                value_summaries,
+            });
+        }
         let mut live_step = step.clone();
         live_step.user_action = Some(event.live_source_user_action_with_occurrence());
         live_step.expected_source_event = Some(event.into_expected_source_event());
@@ -10823,14 +12054,22 @@ impl LiveRuntime {
         paths: &[String],
     ) -> RuntimeResult<LiveSparseStepOutput> {
         event.assert_matches_step(step)?;
+        if self.plan_session().is_some() {
+            let output = self.apply_source_event_turn(event)?;
+            let value_summaries = self.runtime_value_summaries(paths, 3, 8, 4);
+            return Ok(LiveSparseStepOutput {
+                semantic_delta_count: output.semantic_deltas.len(),
+                render_patch_count: output.render_patches.len(),
+                value_summaries,
+            });
+        }
         let mut live_step = step.clone();
         live_step.user_action = Some(event.live_source_user_action_with_occurrence());
         live_step.expected_source_event = Some(event.into_expected_source_event());
         self.next_step = self.next_step.saturating_add(1);
-        let counts = self
-            .runtime
-            .apply_source_action_only_counted_step(&live_step)?;
-        let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+        let runtime = self.legacy_runtime_mut()?;
+        let counts = runtime.apply_source_action_only_counted_step(&live_step)?;
+        let value_summaries = runtime.runtime_value_summaries(paths, 3, 8, 4);
         Ok(LiveSparseStepOutput {
             semantic_delta_count: counts.semantic_delta_count,
             render_patch_count: counts.render_patch_count,
@@ -10848,6 +12087,15 @@ impl LiveRuntime {
         column_count: usize,
     ) -> RuntimeResult<LiveStepOutput> {
         event.assert_matches_step(step)?;
+        if self.plan_session().is_some() {
+            return self.apply_source_event_for_document_window(
+                event,
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            );
+        }
         let mut live_step = step.clone();
         live_step.user_action = Some(event.live_source_user_action_with_occurrence());
         live_step.expected_source_event = Some(event.into_expected_source_event());
@@ -10876,13 +12124,12 @@ impl LiveRuntime {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         let apply_started = Instant::now();
-        let metrics = self
-            .runtime
-            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        let runtime = self.legacy_runtime_mut()?;
+        let metrics = runtime.apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         let apply_step_ms = runtime_elapsed_ms(apply_started);
         if scenario_step_has_expectations(step) {
             assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-            self.runtime.assert_step_after_measurement(step)?;
+            runtime.assert_step_after_measurement(step)?;
         }
         Ok(LiveTurnOutput {
             semantic_deltas: semantic_deltas
@@ -10915,20 +12162,19 @@ impl LiveRuntime {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         let apply_started = Instant::now();
-        self.runtime
-            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
-        let apply_step_ms = runtime_elapsed_ms(apply_started);
-        if scenario_step_has_expectations(step) {
-            assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-            self.runtime.assert_step_after_measurement(step)?;
+        {
+            let runtime = self.legacy_runtime_mut()?;
+            runtime.apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+            if scenario_step_has_expectations(step) {
+                assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+                runtime.assert_step_after_measurement(step)?;
+            }
         }
+        let apply_step_ms = runtime_elapsed_ms(apply_started);
         let summary_started = Instant::now();
-        let state_summary = self.runtime.document_state_summary_for_window(
-            row_start,
-            row_count,
-            column_start,
-            column_count,
-        );
+        let state_summary = self
+            .legacy_runtime_mut()?
+            .document_state_summary_for_window(row_start, row_count, column_start, column_count);
         let state_summary_ms = runtime_elapsed_ms(summary_started);
         Ok(LiveStepOutput {
             semantic_deltas: semantic_deltas
@@ -10950,18 +12196,20 @@ impl LiveRuntime {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
         let apply_started = Instant::now();
-        self.runtime
-            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
-        let apply_step_ms = runtime_elapsed_ms(apply_started);
-        if scenario_step_has_expectations(step) {
-            assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-            self.runtime.assert_step_after_measurement(step)?;
+        {
+            let runtime = self.legacy_runtime_mut()?;
+            runtime.apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+            if scenario_step_has_expectations(step) {
+                assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
+                runtime.assert_step_after_measurement(step)?;
+            }
         }
+        let apply_step_ms = runtime_elapsed_ms(apply_started);
         let summary_started = Instant::now();
         let state_summary = if document_summary {
-            self.runtime.document_state_summary()
+            self.legacy_runtime_mut()?.document_state_summary()
         } else {
-            self.runtime.state_summary()
+            self.legacy_runtime_mut()?.state_summary()
         };
         let state_summary_ms = runtime_elapsed_ms(summary_started);
         Ok(LiveStepOutput {
@@ -10984,11 +12232,12 @@ impl LiveRuntime {
         if step.expect_semantic_delta_contains.is_empty()
             && step.expect_render_delta_contains.is_empty()
         {
-            let counts = self.runtime.apply_counted_step(step)?;
+            let runtime = self.legacy_runtime_mut()?;
+            let counts = runtime.apply_counted_step(step)?;
             if scenario_step_has_expectations(step) {
-                self.runtime.assert_step_after_measurement(step)?;
+                runtime.assert_step_after_measurement(step)?;
             }
-            let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+            let value_summaries = runtime.runtime_value_summaries(paths, 3, 8, 4);
             return Ok(LiveSparseStepOutput {
                 semantic_delta_count: counts.semantic_delta_count,
                 render_patch_count: counts.render_patch_count,
@@ -10997,11 +12246,11 @@ impl LiveRuntime {
         }
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
-        self.runtime
-            .apply_step(step, &mut semantic_deltas, &mut render_patches)?;
+        let runtime = self.legacy_runtime_mut()?;
+        runtime.apply_step(step, &mut semantic_deltas, &mut render_patches)?;
         assert_delta_expectations(step, &semantic_deltas, &render_patches)?;
-        self.runtime.assert_step_after_measurement(step)?;
-        let value_summaries = self.runtime.runtime_value_summaries(paths, 3, 8, 4);
+        runtime.assert_step_after_measurement(step)?;
+        let value_summaries = runtime.runtime_value_summaries(paths, 3, 8, 4);
         Ok(LiveSparseStepOutput {
             semantic_delta_count: semantic_deltas.len(),
             render_patch_count: render_patches.len(),
@@ -11010,15 +12259,43 @@ impl LiveRuntime {
     }
 
     pub fn state_summary(&mut self) -> JsonValue {
-        self.runtime.state_summary()
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.state_summary();
+        }
+        self.legacy_runtime_mut()
+            .map(LoadedRuntime::state_summary)
+            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+    }
+
+    pub fn engine_provenance_report(&self) -> JsonValue {
+        self.plan_session().map_or_else(
+            || {
+                json!({
+                    "engine": "legacy_generic_runtime",
+                    "session_kind": "loaded-runtime",
+                    "generic_fallback_enabled": true,
+                })
+            },
+            PlanExecutorLiveSession::provenance_report,
+        )
     }
 
     pub fn refresh_candidate_defer_probe_profile(&mut self, profile: &mut LiveRuntimeStepProfile) {
-        self.runtime.copy_candidate_defer_probe_to_profile(profile);
+        if self.plan_session().is_some() {
+            return;
+        }
+        if let Ok(runtime) = self.legacy_runtime_mut() {
+            runtime.copy_candidate_defer_probe_to_profile(profile);
+        }
     }
 
     pub fn clear_candidate_defer_probe(&mut self) {
-        self.runtime.clear_candidate_defer_probe();
+        if self.plan_session().is_some() {
+            return;
+        }
+        if let Ok(runtime) = self.legacy_runtime_mut() {
+            runtime.clear_candidate_defer_probe();
+        }
     }
 
     pub fn runtime_value_summaries(
@@ -11028,24 +12305,51 @@ impl LiveRuntime {
         max_fields: usize,
         max_list_items: usize,
     ) -> JsonValue {
-        self.runtime
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.runtime_value_summaries(
+                paths,
+                max_depth,
+                max_fields,
+                max_list_items,
+            );
+        }
+        self.legacy_runtime_mut()
+            .expect("legacy runtime should be present")
             .runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
     }
 
     pub fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
-        self.runtime.document_state_values(paths)
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.document_state_values(paths);
+        }
+        self.legacy_runtime_mut()
+            .expect("legacy runtime should be present")
+            .document_state_values(paths)
     }
 
     pub fn document_state_summary(&mut self) -> JsonValue {
-        self.runtime.document_state_summary()
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.document_state_summary(SummaryLimits::document_preview());
+        }
+        self.legacy_runtime_mut()
+            .expect("legacy runtime should be present")
+            .document_state_summary()
     }
 
     pub fn source_payload_has_text(&self, source: &str) -> bool {
-        self.runtime.source_payload_has_text(source)
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.source_payload_has_text(source);
+        }
+        self.legacy_runtime()
+            .is_ok_and(|runtime| runtime.source_payload_has_text(source))
     }
 
     pub fn has_source_path(&self, source: &str) -> bool {
-        self.runtime.has_source_path(source)
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.has_source_path(source);
+        }
+        self.legacy_runtime()
+            .is_ok_and(|runtime| runtime.has_source_path(source))
     }
 
     pub fn document_state_summary_for_window(
@@ -11055,12 +12359,17 @@ impl LiveRuntime {
         column_start: usize,
         column_count: usize,
     ) -> JsonValue {
-        self.runtime.document_state_summary_for_window(
-            row_start,
-            row_count,
-            column_start,
-            column_count,
-        )
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.document_state_summary(SummaryLimits::document_preview_window(
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            ));
+        }
+        self.legacy_runtime_mut()
+            .expect("legacy runtime should be present")
+            .document_state_summary_for_window(row_start, row_count, column_start, column_count)
     }
 }
 
@@ -27263,10 +28572,13 @@ impl GenericScheduledRuntime {
     }
 
     fn list_for_row_scope(&self, scope: &str) -> Option<&str> {
-        self.list_summary_fields
-            .iter()
-            .find_map(|summary| (summary.row_scope == scope).then_some(summary.list.as_str()))
-            .or_else(|| self.list_source_bindings.list_for_row_scope(scope))
+        self.list_source_bindings
+            .list_for_row_scope(scope)
+            .or_else(|| {
+                self.list_summary_fields.iter().find_map(|summary| {
+                    (summary.row_scope == scope).then_some(summary.list.as_str())
+                })
+            })
     }
 
     fn row_scope_belongs_to_list(&self, scope: &str, list: &str) -> bool {
@@ -33219,7 +34531,7 @@ impl GenericScheduledRuntime {
             .list_name_for_path(&field.path)
             .map(str::to_owned)
         else {
-            return Ok(RootListViewMaterializationResult::default());
+            return self.materialize_value_backed_root_list_view_field(field, ancestor_root_stack);
         };
         self.root_list_view_field_cache_pass = self.root_list_view_field_cache_pass.wrapping_add(1);
         let materialization_pass = self.root_list_view_field_cache_pass;
@@ -33567,6 +34879,59 @@ impl GenericScheduledRuntime {
         Ok(RootListViewMaterializationResult {
             changed_reads,
             profile: Some(profile),
+        })
+    }
+
+    fn materialize_value_backed_root_list_view_field(
+        &mut self,
+        field: &GenericDerivedRootField,
+        ancestor_root_stack: &[String],
+    ) -> RuntimeResult<RootListViewMaterializationResult> {
+        let previous_cached_value = self
+            .generic_derived_state
+            .root_value_cache
+            .get(&field.path)
+            .cloned();
+        let mut frame = GenericEvalFrame::root();
+        frame.root_stack.extend_from_slice(ancestor_root_stack);
+        let reads_before = frame.reads.clone();
+        let numeric_guards_before = frame.numeric_stability_guards.clone();
+        frame.root_stack.push(field.path.clone());
+        let value =
+            self.eval_root_derived_statement_value(&field.path, &field.statement, &mut frame);
+        frame.root_stack.pop();
+        let value = value?;
+        let mut field_reads = frame
+            .reads
+            .difference(&reads_before)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        field_reads.extend(root_dependency_read_keys_for_path(&field.path));
+        let numeric_stability_guards = frame
+            .numeric_stability_guards
+            .iter()
+            .filter_map(|(read, interval)| {
+                (numeric_guards_before.get(read) != Some(interval))
+                    .then_some((read.clone(), *interval))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.generic_derived_state
+            .replace_root_reads(field.path.clone(), field_reads);
+        self.generic_derived_state
+            .root_value_cache
+            .insert(field.path.clone(), value.clone());
+        self.generic_derived_state
+            .replace_root_numeric_stability_guards(field.path.clone(), numeric_stability_guards);
+        let changed_reads = if previous_cached_value.as_ref() == Some(&value) {
+            BTreeSet::new()
+        } else {
+            root_dependency_read_keys_for_path(&field.path)
+                .into_iter()
+                .collect()
+        };
+        Ok(RootListViewMaterializationResult {
+            changed_reads,
+            profile: None,
         })
     }
 
@@ -34782,6 +36147,20 @@ impl GenericScheduledRuntime {
                 _ => BoonValue::Error("type_error".to_owned()),
             });
         }
+        if self.generic_derived_runtime.function(function).is_some() {
+            return self.eval_runtime_user_function(function, args, input, frame);
+        }
+        self.eval_runtime_generic_builtin_call(function, args, input, frame)
+    }
+
+    #[inline(never)]
+    fn eval_runtime_generic_builtin_call(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
         match function {
             "SOURCE" => self.runtime_call_input_or_first(input, args, frame),
             "Text/empty" => Ok(BoonValue::Text(String::new())),
@@ -36471,27 +37850,33 @@ impl GenericScheduledRuntime {
                 index,
                 field: field.to_owned(),
             };
-            if frame.stack.contains(&key)
-                || self
-                    .generic_derived_state
-                    .active_recompute_stack
-                    .contains(&key)
-                || self
-                    .generic_derived_state
-                    .active_recompute_stack
-                    .iter()
-                    .any(|active| {
-                        active.list == list
-                            && active.index == index
-                            && ((active.field == "error" && field == "value")
-                                || (active.field == "value" && field == "error"))
-                    })
-            {
-                return Ok(BoonValue::Error("cycle_error".to_owned()));
-            }
-            let (_, value) = self.recompute_generic_derived_key_value(&key, &frame.stack)?;
-            if matches!(value, BoonValue::Error(_)) {
-                return Ok(value);
+            let storage_current_source_event_field = self
+                .generic_derived
+                .field_plan(&key)
+                .is_some_and(|plan| plan.kind == DerivedValueKind::SourceEventTransform);
+            if !storage_current_source_event_field {
+                if frame.stack.contains(&key)
+                    || self
+                        .generic_derived_state
+                        .active_recompute_stack
+                        .contains(&key)
+                    || self
+                        .generic_derived_state
+                        .active_recompute_stack
+                        .iter()
+                        .any(|active| {
+                            active.list == list
+                                && active.index == index
+                                && ((active.field == "error" && field == "value")
+                                    || (active.field == "value" && field == "error"))
+                        })
+                {
+                    return Ok(BoonValue::Error("cycle_error".to_owned()));
+                }
+                let (_, value) = self.recompute_generic_derived_key_value(&key, &frame.stack)?;
+                if matches!(value, BoonValue::Error(_)) {
+                    return Ok(value);
+                }
             }
         }
         let value = self.storage.list_row_field(list, index, field).map_err(|error| {
@@ -38108,6 +39493,7 @@ impl GenericScheduledRuntime {
     fn root_list_map_output_cache_entry_is_invalidated(
         &mut self,
         frame: &GenericEvalFrame,
+        key: &RootListMapOutputCacheKey,
         entry: &RootListMapOutputCacheEntry,
     ) -> bool {
         let Some(context) = frame.root_list_view_field_cache_context.as_ref() else {
@@ -38116,6 +39502,9 @@ impl GenericScheduledRuntime {
         if entry.materialization_pass == context.materialization_pass {
             return false;
         }
+        if self.root_list_map_output_source_row_is_dirty(key, &context.current_dirty_reads) {
+            return true;
+        }
         let root_numbers = self.root_numeric_values_for_reads(&context.current_dirty_reads);
         cache_entry_invalidated_by_reads(
             &entry.reads,
@@ -38123,6 +39512,27 @@ impl GenericScheduledRuntime {
             &context.current_dirty_reads,
             &root_numbers,
         )
+    }
+
+    fn root_list_map_output_source_row_is_dirty(
+        &self,
+        key: &RootListMapOutputCacheKey,
+        changed_reads: &BTreeSet<GenericReadKey>,
+    ) -> bool {
+        let source_index = self
+            .storage
+            .bound_index(&key.source_list, key.source_key, key.source_generation)
+            .ok()
+            .flatten();
+        changed_reads.iter().any(|read| match read {
+            GenericReadKey::List { list } => list == &key.source_list,
+            GenericReadKey::ListColumn { list, .. } => list == &key.source_list,
+            GenericReadKey::ListLookupText { list, .. } => list == &key.source_list,
+            GenericReadKey::ListField { list, index, .. } => {
+                list == &key.source_list && source_index == Some(*index)
+            }
+            GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. } => false,
+        })
     }
 
     fn root_list_view_cache_entry_reads_root_stack(
@@ -38152,43 +39562,28 @@ impl GenericScheduledRuntime {
         if context.current_dirty_reads.is_empty() || entry.reads.is_empty() {
             return 0;
         }
-        let mut invalidated_count = 0usize;
         let mut root_numbers = None;
-        for read in entry.reads.intersection(&context.current_dirty_reads) {
-            if let GenericReadKey::Root { field } = read
-                && let Some(interval) = entry.numeric_stability_guards.get(read).copied()
-            {
-                let numbers = root_numbers.get_or_insert_with(|| {
-                    self.root_numeric_values_for_reads(&context.current_dirty_reads)
-                });
-                if numbers
-                    .get(field)
-                    .is_some_and(|value| interval.contains(*value))
-                {
-                    continue;
-                }
-            }
-            invalidated_count = invalidated_count.saturating_add(1);
-        }
-        if invalidated_count > 0 {
-            return invalidated_count;
-        }
-        let changed_lists = context
-            .current_dirty_reads
-            .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::List { list } => Some(list.as_str()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if changed_lists.is_empty() {
-            return 0;
-        }
         entry
             .reads
             .iter()
             .filter(|read| {
-                generic_read_key_list(read).is_some_and(|list| changed_lists.contains(list))
+                context.current_dirty_reads.iter().any(|changed| {
+                    if !cache_read_invalidated_by_changed_read(read, changed) {
+                        return false;
+                    }
+                    if let GenericReadKey::Root { field } = read
+                        && read == &changed
+                        && let Some(interval) = entry.numeric_stability_guards.get(read).copied()
+                    {
+                        let numbers = root_numbers.get_or_insert_with(|| {
+                            self.root_numeric_values_for_reads(&context.current_dirty_reads)
+                        });
+                        return !numbers
+                            .get(field)
+                            .is_some_and(|value| interval.contains(*value));
+                    }
+                    true
+                })
             })
             .count()
     }
@@ -40278,7 +41673,9 @@ impl GenericScheduledRuntime {
                     .get(&cache_key)
                     .cloned()
                 {
-                    if self.root_list_map_output_cache_entry_is_invalidated(frame, &entry) {
+                    if self
+                        .root_list_map_output_cache_entry_is_invalidated(frame, &cache_key, &entry)
+                    {
                         self.generic_derived_state
                             .root_list_map_output_cache
                             .remove(&cache_key);
@@ -43986,6 +45383,13 @@ impl GenericScheduledRuntime {
         }
         for (path, value) in self.root_derived_summary_values(limits) {
             insert_nested_json(&mut root, &path, value.clone());
+            if !path.contains('.')
+                && let Some(store) = root
+                    .get_mut("store")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                store.entry(path.clone()).or_insert(value.clone());
+            }
             root.insert(row_field_name(&path).to_owned(), value);
         }
         let retain_targets = self
@@ -43997,6 +45401,7 @@ impl GenericScheduledRuntime {
             if contains_nested_json(&root, &target) {
                 continue;
             }
+            let _ = self.refresh_storage_backed_root_list_view_for_summary(&list);
             let Some(summary) = self
                 .list_summary_fields
                 .iter()
@@ -44042,6 +45447,7 @@ impl GenericScheduledRuntime {
                 .or_insert(value);
         }
         for summary in self.list_summary_fields.clone() {
+            let _ = self.refresh_storage_backed_root_list_view_for_summary(&summary.list);
             let len = self.storage.list_len(&summary.list).unwrap_or_default();
             let (row_start, row_end) = summary.window_bounds(len, limits);
             let mut rows = Vec::with_capacity(row_end.saturating_sub(row_start));
@@ -44058,11 +45464,27 @@ impl GenericScheduledRuntime {
                 rows.as_slice(),
             ));
             let value = JsonValue::Array(rows);
+            let summary_list_is_storage_backed_root_view =
+                self.generic_derived.root_fields.iter().any(|field| {
+                    matches!(field.kind, DerivedValueKind::ListView)
+                        && self.storage.list_name_for_path(&field.path)
+                            == Some(summary.list.as_str())
+                });
             if let Some(store) = root
                 .get_mut("store")
                 .and_then(serde_json::Value::as_object_mut)
             {
-                store.entry(summary.list.clone()).or_insert(value.clone());
+                let replace_empty_placeholder = !summary_list_is_storage_backed_root_view
+                    && store
+                        .get(&summary.list)
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(Vec::is_empty)
+                    && value.as_array().is_some_and(|rows| !rows.is_empty());
+                if summary_list_is_storage_backed_root_view || replace_empty_placeholder {
+                    store.insert(summary.list.clone(), value.clone());
+                } else {
+                    store.entry(summary.list.clone()).or_insert(value.clone());
+                }
             }
             root.insert(summary.list.clone(), value);
         }
@@ -44077,6 +45499,25 @@ impl GenericScheduledRuntime {
             );
         }
         JsonValue::Object(root)
+    }
+
+    fn refresh_storage_backed_root_list_view_for_summary(
+        &mut self,
+        list: &str,
+    ) -> RuntimeResult<()> {
+        let Some(field) = self
+            .generic_derived
+            .root_fields
+            .iter()
+            .find(|field| {
+                matches!(field.kind, DerivedValueKind::ListView)
+                    && self.storage.list_name_for_path(&field.path) == Some(list)
+            })
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.ensure_root_list_view_materialized_for_read(&field, &[])
     }
 
     fn insert_list_projection_summary(&mut self, summary: &mut JsonValue) {
@@ -44571,10 +46012,12 @@ impl GenericScheduledRuntime {
                 .storage
                 .row_source_bindings(&binding_list, key, generation)
             {
-                let Some(path) = binding.source_path.strip_prefix(&prefix) else {
-                    continue;
-                };
-                insert_nested_json(&mut row, path, source_binding_summary_json(binding));
+                let local_path = binding
+                    .source_path
+                    .strip_prefix(&prefix)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| plan_executor_row_local_source_path(&binding.source_path));
+                insert_nested_json(&mut row, &local_path, source_binding_summary_json(binding));
             }
         }
         Ok(row)
@@ -53255,31 +54698,99 @@ fn cache_entry_invalidated_by_reads(
     if cached_reads.is_empty() || changed_reads.is_empty() {
         return false;
     }
-    let direct_overlaps = cached_reads.intersection(changed_reads).collect::<Vec<_>>();
-    if !direct_overlaps.is_empty() {
-        return direct_overlaps.into_iter().any(|read| {
-            let GenericReadKey::Root { field } = read else {
-                return true;
-            };
-            let Some(interval) = numeric_stability_guards.get(read).copied() else {
-                return true;
-            };
-            !root_numbers
-                .get(field)
-                .is_some_and(|value| interval.contains(*value))
-        });
+    cached_reads.iter().any(|read| {
+        changed_reads.iter().any(|changed| {
+            if !cache_read_invalidated_by_changed_read(read, changed) {
+                return false;
+            }
+            if let GenericReadKey::Root { field } = read
+                && read == changed
+                && let Some(interval) = numeric_stability_guards.get(read).copied()
+            {
+                return !root_numbers
+                    .get(field)
+                    .is_some_and(|value| interval.contains(*value));
+            }
+            true
+        })
+    })
+}
+
+fn cache_read_invalidated_by_changed_read(read: &GenericReadKey, changed: &GenericReadKey) -> bool {
+    match (read, changed) {
+        (GenericReadKey::Root { .. }, _) | (GenericReadKey::RootChild { .. }, _) => read == changed,
+        (GenericReadKey::List { list }, GenericReadKey::List { list: changed_list }) => {
+            changed_list == list
+        }
+        (GenericReadKey::List { .. }, _) => false,
+        (
+            GenericReadKey::ListColumn { list, .. } | GenericReadKey::ListLookupText { list, .. },
+            GenericReadKey::List { list: changed_list },
+        ) => changed_list == list,
+        (
+            GenericReadKey::ListColumn { list, field },
+            GenericReadKey::ListColumn {
+                list: changed_list,
+                field: changed_field,
+            }
+            | GenericReadKey::ListLookupText {
+                list: changed_list,
+                field: changed_field,
+                ..
+            },
+        ) => changed_list == list && changed_field == field,
+        (
+            GenericReadKey::ListLookupText {
+                list,
+                field,
+                expected,
+            },
+            GenericReadKey::ListLookupText {
+                list: changed_list,
+                field: changed_field,
+                expected: changed_expected,
+            },
+        ) => changed_list == list && changed_field == field && changed_expected == expected,
+        (GenericReadKey::ListLookupText { .. }, GenericReadKey::ListColumn { .. }) => false,
+        (
+            GenericReadKey::ListColumn { list, field },
+            GenericReadKey::ListField {
+                list: changed_list,
+                field: changed_field,
+                ..
+            },
+        ) => changed_list == list && changed_field == field,
+        (GenericReadKey::ListLookupText { .. }, GenericReadKey::ListField { .. }) => false,
+        (GenericReadKey::ListField { list, .. }, GenericReadKey::List { list: changed_list }) => {
+            changed_list == list
+        }
+        (
+            GenericReadKey::ListField { list, field, .. },
+            GenericReadKey::ListColumn {
+                list: changed_list,
+                field: changed_field,
+            }
+            | GenericReadKey::ListLookupText {
+                list: changed_list,
+                field: changed_field,
+                ..
+            },
+        ) => changed_list == list && changed_field == field,
+        (
+            GenericReadKey::ListField { list, index, field },
+            GenericReadKey::ListField {
+                list: changed_list,
+                index: changed_index,
+                field: changed_field,
+            },
+        ) => changed_list == list && changed_index == index && changed_field == field,
+        (
+            GenericReadKey::ListColumn { .. }
+            | GenericReadKey::ListLookupText { .. }
+            | GenericReadKey::ListField { .. },
+            GenericReadKey::Root { .. } | GenericReadKey::RootChild { .. },
+        ) => false,
     }
-    let changed_lists = changed_reads
-        .iter()
-        .filter_map(|read| match read {
-            GenericReadKey::List { list } => Some(list.as_str()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    !changed_lists.is_empty()
-        && cached_reads.iter().any(|read| {
-            generic_read_key_list(read).is_some_and(|list| changed_lists.contains(list))
-        })
 }
 
 fn homogeneous_row_ref_list(values: &[BoonValue]) -> Option<&str> {
@@ -58907,9 +60418,12 @@ impl GenericDerivedState {
         reads: impl IntoIterator<Item = GenericReadKey>,
     ) -> BTreeSet<String> {
         let mut dependents = BTreeSet::new();
-        for read in reads {
-            if let Some(fields) = self.root_dependents_by_read.get(&read) {
-                dependents.extend(fields.iter().cloned());
+        let reads = reads.into_iter().collect::<Vec<_>>();
+        for changed in reads {
+            for (read, fields) in &self.root_dependents_by_read {
+                if cache_read_invalidated_by_changed_read(read, &changed) {
+                    dependents.extend(fields.iter().cloned());
+                }
             }
         }
         dependents
@@ -58920,9 +60434,12 @@ impl GenericDerivedState {
         reads: impl IntoIterator<Item = GenericReadKey>,
     ) -> Vec<(GenericReadKey, String)> {
         let mut edges = Vec::new();
-        for read in reads {
-            if let Some(fields) = self.root_dependents_by_read.get(&read) {
-                edges.extend(fields.iter().cloned().map(|field| (read.clone(), field)));
+        let reads = reads.into_iter().collect::<Vec<_>>();
+        for changed in reads {
+            for (read, fields) in &self.root_dependents_by_read {
+                if cache_read_invalidated_by_changed_read(read, &changed) {
+                    edges.extend(fields.iter().cloned().map(|field| (read.clone(), field)));
+                }
             }
         }
         edges
@@ -64211,8 +65728,9 @@ FUNCTION icon_code(item) {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo_mvc_physical/RUN.bn");
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC units should load");
-        let mut runtime = LiveRuntime::from_project("physical-todomvc-toggle-all-live", &units)
-            .expect("physical TodoMVC live runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("physical-todomvc-toggle-all-live", &units)
+                .expect("physical TodoMVC live runtime should initialize");
 
         let initial = runtime.document_state_summary();
         assert_eq!(initial["store"]["active_count"], 3);
@@ -65646,7 +67164,11 @@ FUNCTION icon_code(item) {
     #[test]
     fn runtime_generic_user_functions_execute_without_ast_bodies() {
         let source = r#"
-HOLD
+prelude: [
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
 store: [
     sources: [
         noop: SOURCE
@@ -66659,7 +68181,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.path))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("source-text-then-update-expression", source).unwrap();
+            LiveRuntime::from_source_legacy("source-text-then-update-expression", source).unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/path"),
             Some(&json!("default-path"))
@@ -66683,7 +68205,7 @@ document: Document/new(root: Element/label(element: [], label: store.path))
         let source_with_path_default =
             source.replace("default-path", "~/repos/NovyWave/test_files/simple.vcd");
         let mut runtime =
-            LiveRuntime::from_source("source-text-path-default", &source_with_path_default)
+            LiveRuntime::from_source_legacy("source-text-path-default", &source_with_path_default)
                 .unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/path"),
@@ -66715,7 +68237,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.external_file_tree_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("source-payload-concat-latest-runtime", source).unwrap();
+            LiveRuntime::from_source_legacy("source-payload-concat-latest-runtime", source)
+                .unwrap();
         assert_eq!(
             runtime
                 .document_state_summary()
@@ -66783,9 +68306,9 @@ FUNCTION new_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("row-lookup-payload-without-address", source).unwrap();
+            LiveRuntime::from_source_legacy("row-lookup-payload-without-address", source).unwrap();
         let route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -66844,7 +68367,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-derived-dependencies", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-derived-dependencies", source).unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/label"),
             Some(&json!("Path: default-path"))
@@ -66908,7 +68432,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.cursor))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-scalar-same-event-flush", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-scalar-same-event-flush", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["cursor"], "A:ready");
 
         let output = runtime
@@ -66963,7 +68488,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-scalar-direct-read-defers-flush", source).unwrap();
+            LiveRuntime::from_source_legacy("root-scalar-direct-read-defers-flush", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["label"], "old/old");
 
         let output = runtime
@@ -67020,7 +68546,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-currentness-scalar", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-currentness-scalar", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["consumer"],
             "consumer:value:old"
@@ -67039,7 +68566,7 @@ document: Document/new(root: Element/label(element: [], label: store.consumer))
         );
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -67121,7 +68648,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer_a))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-currentness-dependent-cache", source).unwrap();
+            LiveRuntime::from_source_legacy("root-currentness-dependent-cache", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["consumer_a"], "A:value:old");
         assert_eq!(initial["store"]["consumer_b"], "B:value:old");
@@ -67138,7 +68665,7 @@ document: Document/new(root: Element/label(element: [], label: store.consumer_a)
         assert_eq!(updated["store"]["consumer_b"], "B:value:new");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -67202,7 +68729,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-currentness-structured-parent", source).unwrap();
+            LiveRuntime::from_source_legacy("root-currentness-structured-parent", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
 
         runtime
@@ -67215,7 +68742,7 @@ document: Document/new(root: Element/label(element: [], label: store.consumer))
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:new");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -67267,7 +68794,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-currentness-root-child-cache", source).unwrap();
+            LiveRuntime::from_source_legacy("root-currentness-root-child-cache", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
 
         runtime
@@ -67280,7 +68807,7 @@ document: Document/new(root: Element/label(element: [], label: store.consumer))
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:new");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -67347,7 +68874,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-structured-parent-no-empty-patch", source).unwrap();
+            LiveRuntime::from_source_legacy("root-structured-parent-no-empty-patch", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["page_label"],
             "42 s PageRef"
@@ -67402,10 +68930,10 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-structured-parent-prune-child", source).unwrap();
+            LiveRuntime::from_source_legacy("root-structured-parent-prune-child", source).unwrap();
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("generic runtime should be available");
@@ -67492,15 +69020,17 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source("root-structured-child-no-leaf-alias-collision", source)
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy(
+            "root-structured-child-no-leaf-alias-collision",
+            source,
+        )
+        .unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["cursor_label"], "top-cursor label");
         assert_eq!(initial["store"]["page_label"], "nested-cursor PageRef");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -67683,7 +69213,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.a_summary))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-derived-revisit", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("root-derived-revisit", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["a_summary"], "old/old");
 
         let output = runtime
@@ -67717,7 +69247,7 @@ document: Document/new(root: Element/label(element: [], label: store.a_summary))
     fn live_runtime_applies_observed_todomvc_source_events() {
         let source = include_str!("../../../examples/todomvc.bn");
         let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -67781,7 +69311,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }))
 "#;
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:key-payload",
             source,
             Path::new("../../examples/counter.scn"),
@@ -67843,7 +69373,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
             })
             .map(|branch| format!("{:?}", branch.expression))
             .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project("plain-latest-key-match", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("plain-latest-key-match", &units)
             .expect("runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -67903,7 +69433,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
 
     #[test]
     fn source_batch_dispatches_ordered_events_and_rejects_equal_sequence_conflict() {
-        let mut runtime = LiveRuntime::from_source(
+        let mut runtime = LiveRuntime::from_source_legacy(
             "examples/counter.bn",
             include_str!("../../../examples/counter.bn"),
         )
@@ -67987,7 +69517,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     fn live_runtime_applies_numeric_counter_hold_updates_generically() {
         let source = include_str!("../../../examples/counter.bn");
         let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:counter",
             source,
             Path::new("../../examples/counter.scn"),
@@ -68055,7 +69585,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_runtime_routes_duplicate_todo_title_events_by_occurrence() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68103,7 +69633,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_runtime_prefers_bound_row_identity_over_target_text() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68175,7 +69705,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_source_event_preserves_bound_row_identity() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68218,7 +69748,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn row_identity_live_source_event_carries_list_and_source_epoch() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68238,7 +69768,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
         let target_key = json_u64_field(first_todo, "row_key");
         let target_generation = json_u64_field(first_todo, "generation");
         let source_epoch = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available")
@@ -68273,7 +69803,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     fn document_summary_uses_source_identity_for_filtered_todomvc_rows() {
         let source = include_str!("../../../examples/todomvc.bn");
         let mut runtime =
-            LiveRuntime::from_source("todomvc-filtered-document-source-identity", source).unwrap();
+            LiveRuntime::from_source_legacy("todomvc-filtered-document-source-identity", source)
+                .unwrap();
         for event in [
             LiveSourceEvent {
                 source: "store.sources.new_todo_input.change".to_owned(),
@@ -68366,7 +69897,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-identity-only-change", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-identity-only-change", source).unwrap();
         let first_summary = runtime.document_state_summary();
         let first_visible = first_summary["store"]["visible"]
             .as_array()
@@ -68405,7 +69936,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     #[test]
     fn live_runtime_keeps_one_todomvc_row_in_edit_mode() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68447,11 +69978,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .expect("physical TodoMVC scenario should parse");
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
-        let mut runtime = LiveRuntime::from_project("physical-todomvc-live-row-routing", &units)
-            .expect("physical TodoMVC runtime should initialize from manifest units");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("physical-todomvc-live-row-routing", &units)
+                .expect("physical TodoMVC runtime should initialize from manifest units");
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("physical TodoMVC should use generic runtime");
@@ -68641,7 +70173,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 
         assert!(edit_commit_seen, "scenario should include edit-todo-commit");
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("physical TodoMVC should use generic runtime");
@@ -68659,8 +70191,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             .join("../../examples/todo_mvc_physical/RUN.bn");
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
-        let mut runtime = LiveRuntime::from_project("physical-todomvc-live-theme-events", &units)
-            .expect("physical TodoMVC runtime should initialize from manifest units");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("physical-todomvc-live-theme-events", &units)
+                .expect("physical TodoMVC runtime should initialize from manifest units");
 
         assert_eq!(
             runtime.document_state_summary()["theme_options"]["name"],
@@ -68771,7 +70304,7 @@ FUNCTION new_todo(title) {
     fn live_runtime_applies_observed_cells_source_events() {
         let source = cells_project_source_for_test();
         let scenario = parse_scenario(Path::new("../../examples/cells.scn")).unwrap();
-        let mut runtime = LiveRuntime::new(
+        let mut runtime = LiveRuntime::new_legacy(
             "playground-live:cells",
             &source,
             Path::new("../../examples/cells.scn"),
@@ -68903,10 +70436,11 @@ FUNCTION new_todo(title) {
     fn cells_selected_input_list_find_materializes_single_row_storage() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-list-find-storage", &source).unwrap();
+            LiveRuntime::from_source_legacy("cells-selected-input-list-find-storage", &source)
+                .unwrap();
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("Cells should use the generic runtime");
@@ -68934,7 +70468,7 @@ FUNCTION new_todo(title) {
             "6"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("Cells should use the generic runtime");
@@ -68963,7 +70497,8 @@ FUNCTION new_todo(title) {
     fn cells_selected_input_document_state_values_use_indexed_list_find_projection() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-targeted-values", &source).unwrap();
+            LiveRuntime::from_source_legacy("cells-selected-input-targeted-values", &source)
+                .unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.select".to_owned(),
@@ -68973,7 +70508,7 @@ FUNCTION new_todo(title) {
             .unwrap();
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test_mut()
                 .generic
                 .as_mut()
                 .expect("Cells should use the generic runtime");
@@ -68998,7 +70533,7 @@ FUNCTION new_todo(title) {
         );
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("Cells should use the generic runtime");
@@ -69030,7 +70565,8 @@ FUNCTION new_todo(title) {
     fn cells_window_document_summary_keeps_selected_projection_current() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-window-summary", &source).unwrap();
+            LiveRuntime::from_source_legacy("cells-selected-input-window-summary", &source)
+                .unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.select".to_owned(),
@@ -69040,7 +70576,7 @@ FUNCTION new_todo(title) {
             .unwrap();
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test_mut()
                 .generic
                 .as_mut()
                 .expect("Cells should use the generic runtime");
@@ -69060,7 +70596,7 @@ FUNCTION new_todo(title) {
         assert_eq!(cells[1]["address"], "B0");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("Cells should use the generic runtime");
@@ -69091,13 +70627,13 @@ FUNCTION new_todo(title) {
     fn cells_visible_value_edit_does_not_rematerialize_chunked_sheet_rows() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source("cells-chunk-row-field-edit-skip", &source).unwrap();
+            LiveRuntime::from_source_legacy("cells-chunk-row-field-edit-skip", &source).unwrap();
 
         let initial = runtime.document_state_summary_for_window(0, 24, 0, 10);
         assert_eq!(initial["store"]["sheet_rows"].as_array().unwrap().len(), 24);
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("Cells should use the generic runtime");
@@ -69533,7 +71069,7 @@ FUNCTION new_todo(title) {
             })
         }));
         let mut runtime =
-            LiveRuntime::from_source("cells-defaults-from-boon", &cells_source).unwrap();
+            LiveRuntime::from_source_legacy("cells-defaults-from-boon", &cells_source).unwrap();
         let summary = runtime.state_summary();
         let a0 = summary
             .get("cells")
@@ -69587,7 +71123,7 @@ FUNCTION new_number(number) {
             CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
         );
 
-        let mut runtime = LiveRuntime::from_source("range-list", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("range-list", source).unwrap();
         let summary = runtime.state_summary();
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -69626,7 +71162,7 @@ FUNCTION new_number(number) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source("generic-window-materialization", source).unwrap();
+            LiveRuntime::from_source_legacy("generic-window-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(4, 3, 0, 1);
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -69714,7 +71250,7 @@ FUNCTION projected_row(row) {
         ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("nested-row-fields", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("nested-row-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["page_ref"]["page_kind"], "signal_page");
         let row = &summary["rows"][0];
@@ -69790,7 +71326,8 @@ FUNCTION new_row_with_ref(row) {
 
 "#;
         let mut runtime =
-            LiveRuntime::from_source("row-structured-parent-no-empty-patch", source).unwrap();
+            LiveRuntime::from_source_legacy("row-structured-parent-no-empty-patch", source)
+                .unwrap();
         let initial_summary = runtime.state_summary();
         assert_eq!(
             initial_summary["rows_with_refs"][0]["page_ref"]["cursor"], "42 s",
@@ -69855,7 +71392,8 @@ FUNCTION new_item(item) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("generic-page-materialization", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("generic-page-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(1, 1, 0, 2);
         let pages = summary["store"]["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 1);
@@ -69935,7 +71473,8 @@ FUNCTION new_entry(entry) {
                 && projection.columns == 2
         }));
 
-        let mut runtime = LiveRuntime::from_source("generic-list-projections", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("generic-list-projections", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "B0");
         assert_eq!(summary["store"]["selected_input"]["value"], "2");
@@ -69990,7 +71529,7 @@ FUNCTION new_record(record) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source("generic-root-find-projection-cache", source).unwrap();
+            LiveRuntime::from_source_legacy("generic-root-find-projection-cache", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["selected_record"]["key"],
             "row-1"
@@ -70005,7 +71544,11 @@ FUNCTION new_record(record) {
             .expect("selection source should refresh the root List/find projection");
 
         let result = {
-            let generic = runtime.runtime.generic.as_mut().unwrap();
+            let generic = runtime
+                .legacy_runtime_for_test_mut()
+                .generic
+                .as_mut()
+                .unwrap();
             generic.reset_list_scan_counters();
             generic
                 .cached_find_list_indices_by_textlike_indexed("records", "key", "row-2")
@@ -70041,7 +71584,7 @@ FUNCTION new_record(record) {
         );
         assert_eq!(
             runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .unwrap()
@@ -70051,7 +71594,7 @@ FUNCTION new_record(record) {
             "root List/find projection must not scan rows on indexed exact lookup"
         );
 
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         let reads = generic
             .generic_derived_state
             .root_reads_by_field
@@ -70089,8 +71632,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Records }))
 "#;
         let runtime =
-            LiveRuntime::from_source("generic-root-list-diff-exact-lookup", source).unwrap();
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+            LiveRuntime::from_source_legacy("generic-root-list-diff-exact-lookup", source).unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         let mut previous = RuntimeRowSnapshot::default();
         previous
             .columns
@@ -70197,7 +71740,7 @@ FUNCTION signal_label(signal) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-list-search", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("derived-list-search", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["search_results_count"], 2);
         assert_eq!(
@@ -70297,7 +71840,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-user-key-fields", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("list-user-key-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["selected_value"], "signal");
         assert_eq!(summary["store"]["selected_end"], 150);
@@ -70339,7 +71882,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.response))
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-hold-trigger-same-turn", source)
+        let mut runtime = LiveRuntime::from_source_legacy("derived-hold-trigger-same-turn", source)
             .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -70386,8 +71929,9 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.cursor))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-derived-cascade-unqualified", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-derived-cascade-unqualified", source)
+                .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select_file".to_owned(),
@@ -70453,8 +71997,9 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.active_signal_key))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-latest-row-source-derived-leaf", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("list-latest-row-source-derived-leaf", source)
+                .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.rows.elements.select".to_owned(),
@@ -70499,7 +72044,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let error = match LiveRuntime::from_source("bad-list-field-selector", source) {
+        let error = match LiveRuntime::from_source_legacy("bad-list-field-selector", source) {
             Ok(_) => panic!("hidden row_key selector should fail"),
             Err(error) => error,
         };
@@ -70531,7 +72076,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let error = match LiveRuntime::from_source("bad-list-target-selector", source) {
+        let error = match LiveRuntime::from_source_legacy("bad-list-target-selector", source) {
             Ok(_) => panic!("hidden generation selector should fail"),
             Err(error) => error,
         };
@@ -70580,7 +72125,7 @@ FUNCTION new_signal(signal) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-list-chunk", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("derived-list-chunk", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(
             summary["store"]["search_results"].as_array().unwrap().len(),
@@ -70639,7 +72184,8 @@ FUNCTION new_signal(signal) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("root-list-chunk-direct", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-list-chunk-direct", source).unwrap();
         let initial = runtime.state_summary();
         let initial_rows = initial["store"]["visible_rows"].as_array().unwrap();
         assert_eq!(initial_rows.len(), 2);
@@ -70719,8 +72265,13 @@ FUNCTION new_item(item) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("lazy-runtime-list-chunk", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("lazy-runtime-list-chunk", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let mut frame = GenericEvalFrame::root();
         let chunk = generic
             .runtime_list_chunk(
@@ -70799,8 +72350,13 @@ FUNCTION new_item(item) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("lazy-chunk-window-summary", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("lazy-chunk-window-summary", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let chunk = BoonValue::ListChunk {
             source: Box::new(BoonValue::ListRef("items".to_owned())),
             size: 2,
@@ -70897,7 +72453,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Selected rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("selected-list-transforms", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("selected-list-transforms", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["selected_rows_order_label"],
             "none"
@@ -70973,7 +72530,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Text concat }))
 "#;
-        let mut runtime = LiveRuntime::from_source("text-concat-labels", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("text-concat-labels", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["scoped_label"], "4 results in top.cpu");
         assert_eq!(
@@ -71012,7 +72569,7 @@ FUNCTION new_marker(marker, store) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("indexed-text-const-row-update", source)
+        let mut runtime = LiveRuntime::from_source_legacy("indexed-text-const-row-update", source)
             .expect("runtime should load const indexed text source");
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
@@ -71117,7 +72674,7 @@ FUNCTION new_marker(marker) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("source-const-append-row", source)
+        let mut runtime = LiveRuntime::from_source_legacy("source-const-append-row", source)
             .expect("runtime should load const append source");
         let mut create_expected = BTreeMap::new();
         create_expected.insert(
@@ -71235,7 +72792,7 @@ FUNCTION rendered_row(row) {
     Element/label(element: [], label: row.label)
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("render-label-projection-row", source)
+        let mut runtime = LiveRuntime::from_source_legacy("render-label-projection-row", source)
             .expect("runtime should load render label projection source");
         let mut add_expected = BTreeMap::new();
         add_expected.insert(
@@ -71287,7 +72844,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("append-sibling-derived-values", source)
+        let mut runtime = LiveRuntime::from_source_legacy("append-sibling-derived-values", source)
             .expect("runtime should load sibling-derived append source");
         let mut add_expected = BTreeMap::new();
         add_expected.insert(
@@ -71320,7 +72877,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
         let mut runtime =
-            LiveRuntime::from_project("physical-append-enter-key-source-text", &units)
+            LiveRuntime::from_project_legacy("physical-append-enter-key-source-text", &units)
                 .expect("physical TodoMVC runtime should initialize from manifest units");
         runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -72456,7 +74013,7 @@ FUNCTION fake_todomvc_app() {
 
     #[test]
     fn runtime_value_summaries_are_path_bounded_for_inspector() {
-        let mut runtime = LiveRuntime::from_source(
+        let mut runtime = LiveRuntime::from_source_legacy(
             "examples/todomvc.bn",
             include_str!("../../../examples/todomvc.bn"),
         )
@@ -72530,7 +74087,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.one))
 "#;
-        let mut runtime = LiveRuntime::from_source("value-summary-path-count", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("value-summary-path-count", source).unwrap();
         let paths = [
             "store.one",
             "store.two",
@@ -72576,7 +74134,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-pure-bool", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("root-pure-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["ready"], true);
         assert_eq!(summary["ready"], true);
@@ -72620,7 +74178,8 @@ FUNCTION new_row(row) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source("indexed-plain-latest-bool", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("indexed-plain-latest-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["rows"][0]["selected_once"], false);
 
@@ -72651,7 +74210,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-plain-latest-bool", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-plain-latest-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["ready"], true);
 
@@ -72682,7 +74242,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-event-plain-latest-bool", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-event-plain-latest-bool", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["ready"], false);
 
         runtime
@@ -72737,7 +74298,7 @@ FUNCTION new_signal(signal, store) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source("top-level-indexed-bool-row-context", source).unwrap();
+            LiveRuntime::from_source_legacy("top-level-indexed-bool-row-context", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["signals"][0]["selected"], true);
         assert_eq!(summary["signals"][1]["selected"], false);
@@ -72808,7 +74369,7 @@ FUNCTION new_signal(signal) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source("row-scoped-source-needs-row-context", source).unwrap();
+            LiveRuntime::from_source_legacy("row-scoped-source-needs-row-context", source).unwrap();
         let error = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "signal.signal_elements.select_signal".to_owned(),
@@ -72861,7 +74422,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-numeric-infix-when-clamp", source).unwrap();
+            LiveRuntime::from_source_legacy("root-numeric-infix-when-clamp", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["zoom_step"], json!(0));
 
         for expected in [1, 2, 3, 3] {
@@ -72903,7 +74464,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-key-match-nested-numeric-infix-clamp", source).unwrap();
+            LiveRuntime::from_source_legacy("root-key-match-nested-numeric-infix-clamp", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["zoom_step"], json!(0));
 
         for expected in [1, 2, 3, 3] {
@@ -72959,7 +74521,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-shared-key-skip-noop", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-shared-key-skip-noop", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["cursor_position"],
             "Cursor42"
@@ -73027,7 +74590,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.selected_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-predicate-store-derived-number", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-predicate-store-derived-number", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["selected_label"], "middle");
 
         let clicked = runtime
@@ -73068,7 +74632,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-materialization-profile", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-materialization-profile", source)
+                .unwrap();
         let output = runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "store.elements.click".to_owned(),
@@ -73191,11 +74756,11 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-identity-list-ref", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-identity-list-ref", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["visible"][0]["label"], "A");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -73257,7 +74822,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-identity-selection", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-identity-selection", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["visible"][0]["label"], "A");
         assert_eq!(initial["store"]["visible"][1]["label"], "C");
@@ -73356,7 +74921,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-cursor", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-cursor", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["cursor"],
             "A/1"
@@ -73543,7 +75108,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "cursor nested projected fields should be stored after recompute: {cursor_meta_profile:?}"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -73611,9 +75176,9 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-in-place-source-rows", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-in-place-source-rows", source).unwrap();
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -73637,7 +75202,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(summary["store"]["projected"][1]["cursor_label"], "B/2");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -73766,7 +75331,7 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-branch-field-only", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-branch-field-only", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A/1"
@@ -73896,7 +75461,8 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-branch-field-scope-skip", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-branch-field-scope-skip", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A/1"
@@ -73991,7 +75557,8 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-branch-selector-dirty", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-branch-selector-dirty", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["variable_only"],
             "variable"
@@ -74088,9 +75655,9 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-filtered-source-rows", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-filtered-source-rows", source).unwrap();
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -74112,7 +75679,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(summary["store"]["projected"][0]["label"], "A/2");
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -74218,7 +75785,8 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-row-independent", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-row-independent", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["shared_meta"]["label"],
             "global"
@@ -74228,7 +75796,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "global"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be available");
@@ -74298,13 +75866,13 @@ FUNCTION projected_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-compiled-frontier", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-compiled-frontier", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A=old"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -74404,13 +75972,14 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-compiled-branch-frontier", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-compiled-branch-frontier", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A=old"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -74498,7 +76067,8 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-same-pass-dirty", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-same-pass-dirty", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["shared_meta"]["label"],
             "one"
@@ -74580,13 +76150,14 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-dirty-guard", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-dirty-guard", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["stable"],
             "A/stable"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -74712,7 +76283,8 @@ FUNCTION selected_segment(segment) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-forward-list-dependency", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-forward-list-dependency", source)
+                .unwrap();
         let summary = runtime.state_summary();
         let lanes = summary["store"]["lanes"]
             .as_array()
@@ -74795,10 +76367,10 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-row-field-shadowing", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-row-field-shadowing", source).unwrap();
         let _ = runtime.state_summary();
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -74858,14 +76430,15 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-root-child-stack-cache", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-root-child-stack-cache", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "fresh",
             "initial summary should prime a previous-pass field cache entry"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -74945,14 +76518,15 @@ FUNCTION dependent_row(row) {
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-list-view-mutual-cycle", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-list-view-mutual-cycle", source).unwrap();
         let warm = runtime.state_summary();
         assert_eq!(
             warm["store"]["lanes"][0]["dependency"], "selected_segments",
             "the test must prime a reusable field-cache entry before the inherited-stack read"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -75024,14 +76598,14 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-deferred-clean-hit", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-deferred-clean-hit", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A/value:old",
             "initial summary should prime previous-pass field cache entries"
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -75121,7 +76695,8 @@ FUNCTION signal_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-numeric-guard", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-numeric-guard", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["signals"][0]["value"],
             "middle"
@@ -75139,7 +76714,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test_mut()
             .generic
             .as_mut()
             .expect("generic runtime should be available");
@@ -75286,11 +76861,11 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: store.projected_count))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-length-row-field-skip", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-length-row-field-skip", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["projected_count"], 2);
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("generic runtime should be available");
@@ -75372,7 +76947,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-same-count-reorder", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-same-count-reorder", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"]
                 .as_array()
@@ -75469,7 +77044,8 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-remove-append-no-stale-row", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-remove-append-no-stale-row", source)
+                .unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["projected"][0]["label"], "a=A");
         assert_eq!(initial["store"]["projected"][1]["label"], "b=B");
@@ -75482,7 +77058,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 RuntimeRowSnapshot { columns }
             };
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test_mut()
                 .generic
                 .as_mut()
                 .expect("generic runtime should be available");
@@ -75629,7 +77205,8 @@ FUNCTION detail_row(row, suffix) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-field-cache-caller-env", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-field-cache-caller-env", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["projected"][0]["flavor_id"], "left");
         assert_eq!(summary["store"]["projected"][0]["label"], "A/left");
@@ -75712,7 +77289,8 @@ FUNCTION cursor_probe_row(signal) {
 document: Document/new(root: Element/label(element: [], label: store.row_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("mapped-root-list-function-store-cursor", source).unwrap();
+            LiveRuntime::from_source_legacy("mapped-root-list-function-store-cursor", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["row_labels"], "A=middle");
 
         let clicked = runtime
@@ -75755,10 +77333,12 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { ok }))
 "#;
-        let runtime = LiveRuntime::from_source("root-list-view-row-field-diff", source).unwrap();
+        let runtime =
+            LiveRuntime::from_source_legacy("root-list-view-row-field-diff", source).unwrap();
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
+            .as_ref()
             .expect("test runtime should use generic engine");
         let row = |id: &str, label: &str| {
             let mut columns = ValueColumns::default();
@@ -75771,10 +77351,17 @@ document: Document/new(root: Element/label(element: [], label: TEXT { ok }))
         let reads =
             generic.root_list_view_changed_read_keys("store.rows", "rows", &previous, &current);
         let mut expected = BTreeSet::new();
-        insert_changed_list_field_read_keys(&mut expected, "rows", 0, "label");
+        insert_changed_list_field_read_keys_for_values(
+            &mut expected,
+            "rows",
+            0,
+            "label",
+            Some(&FieldValue::Text("middle".to_owned())),
+            Some(&FieldValue::Text("new".to_owned())),
+        );
         assert_eq!(
             reads, expected,
-            "row-field changes should dirty only the exact row field"
+            "row-field changes should dirty the exact row field plus old/new text lookup reads"
         );
 
         let row_with_extra = |id: &str, label: &str, extra: &str| {
@@ -75793,7 +77380,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { ok }))
             &current_shape,
         );
         let mut expected_shape = BTreeSet::new();
-        insert_changed_list_field_read_keys(&mut expected_shape, "rows", 0, "extra");
+        insert_changed_list_field_read_keys_for_values(
+            &mut expected_shape,
+            "rows",
+            0,
+            "extra",
+            Some(&FieldValue::Text("x".to_owned())),
+            None,
+        );
         assert_eq!(
             shape_change.changed_reads, expected_shape,
             "same-length row-shape changes should dirty only added/removed row fields"
@@ -75848,7 +77442,8 @@ FUNCTION pair_label(mode, side) {
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-list-when-derived", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-list-when-derived", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["derived_pair_label"],
             "compact primary"
@@ -75892,8 +77487,9 @@ FUNCTION selected_value(format) {
 
 document: Document/new(root: Element/label(element: [], label: store.rendered_value))
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-root-summary-flat-alias", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("derived-root-summary-flat-alias", source)
+                .expect("runtime should initialize");
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["rendered_value"], "0x2a");
         assert_eq!(initial["rendered_value"], "0x2a");
@@ -75938,8 +77534,9 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-root-summary-byte-length", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("derived-root-summary-byte-length", source)
+                .expect("runtime should initialize");
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["descriptor_file"], "simple.vcd");
         assert_eq!(initial["store"]["byte_length"], 311);
@@ -76043,7 +77640,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.a_output))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-derived-revisit", source)
+        let mut runtime = LiveRuntime::from_source_legacy("root-derived-revisit", source)
             .expect("runtime should initialize");
         assert_eq!(runtime.state_summary()["store"]["a_output"], "cold-output");
 
@@ -76081,8 +77678,9 @@ document: Document/new(root: Element/label(element: [], label: store.a_output))
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("derived-root-list-alias-summary", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("derived-root-list-alias-summary", source)
+                .expect("runtime should initialize");
         let initial = runtime.document_state_summary();
         assert_eq!(initial["store"]["row_alias"][0]["label"], "first");
         assert_eq!(initial["store"]["row_alias"][1]["label"], "second");
@@ -76109,7 +77707,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-format-cycle-runtime", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-format-cycle-runtime", &units)
             .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -76150,8 +77748,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-initial-format-runtime", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-initial-format-runtime", &units)
+                .expect("NovyWave runtime should initialize");
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["value_format"], "Hexadecimal");
         assert_eq!(summary["store"]["active_signal_format"], "Hexadecimal");
@@ -76239,11 +77838,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             ),
             ("store.elements.format_ascii", "ASCII", "ASCII", "DATA_ASC"),
         ] {
-            let mut runtime =
-                LiveRuntime::from_project("novywave-top-format-selected-row-runtime", &units)
-                    .expect("NovyWave runtime should initialize");
+            let mut runtime = LiveRuntime::from_project_legacy(
+                "novywave-top-format-selected-row-runtime",
+                &units,
+            )
+            .expect("NovyWave runtime should initialize");
             let route = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .and_then(|generic| generic.source_routes.for_source(source))
@@ -76301,7 +77902,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-row-format-runtime", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-row-format-runtime", &units)
             .expect("NovyWave runtime should initialize");
         let visible_row_by_id = |summary: &JsonValue, id: &str| -> JsonValue {
             summary["store"]["selected_visible_items"]
@@ -76323,15 +77924,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(clk["format_label"], "Hex");
         assert_eq!(clk["current_value"], "0xc");
         assert_eq!(reset["current_value"], "0x5");
-
-        let opened = runtime
+        let opened_output = runtime
             .apply_source_event_for_document(LiveSourceEvent {
                 source: "selected_signal.format_elements.format_dropdown_toggle".to_owned(),
                 target_text: Some("A[3:0]".to_owned()),
                 ..LiveSourceEvent::default()
             })
-            .expect("row formatter dropdown should open")
-            .state_summary;
+            .expect("row formatter dropdown should open");
+        let opened = opened_output.state_summary;
         assert_eq!(
             visible_row_by_id(&opened, "clk")["format_dropdown_state"],
             "Open"
@@ -76379,8 +77979,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-row-signal-select-runtime", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-row-signal-select-runtime", &units)
+                .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.selected_clear_all".to_owned(),
@@ -76390,7 +77991,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let empty = runtime.document_state_summary();
         assert_eq!(empty["store"]["selected_rows_count"], 0);
         let route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -76400,7 +78001,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("signal row select source route should be compiled");
         let active_signal_branches = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be present")
@@ -76463,7 +78064,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-scope-expand-runtime", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-scope-expand-runtime", &units)
             .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -76497,10 +78098,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let runtime = LiveRuntime::from_project("novywave-scope-route-runtime", &units)
+        let runtime = LiveRuntime::from_project_legacy("novywave-scope-route-runtime", &units)
             .expect("NovyWave runtime should initialize");
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("NovyWave runtime should use generic runtime");
@@ -76526,8 +78127,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-hover-width-noop-runtime", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-hover-width-noop-runtime", &units)
+                .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.waveform_hover".to_owned(),
@@ -76568,10 +78170,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-waveform-click-route", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-waveform-click-route", &units)
             .expect("NovyWave runtime should initialize");
         let route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -76675,7 +78277,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-click-internal-roots", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-click-internal-roots", &units)
             .expect("NovyWave runtime should initialize");
         for time in [150, 50] {
             runtime
@@ -76779,7 +78381,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        LiveRuntime::from_project(project, &units).expect("NovyWave runtime should initialize")
+        LiveRuntime::from_project_legacy(project, &units)
+            .expect("NovyWave runtime should initialize")
     }
 
     fn novywave_apply_source(
@@ -77004,7 +78607,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-cursor-rows-alias", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-cursor-rows-alias", &units)
             .expect("NovyWave runtime should initialize");
         assert_eq!(
             runtime.state_summary()["store"]["bridge_cursor_values"]["rows"][0]["label"],
@@ -77012,7 +78615,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("NovyWave should use generic runtime");
@@ -77060,11 +78663,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-external-name-payload", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-external-name-payload", &units)
+                .expect("NovyWave runtime should initialize");
         {
             let generic = runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .expect("NovyWave runtime should use generic runtime");
@@ -77087,7 +78691,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             );
         }
         let external_name_route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -77125,7 +78729,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("show empty should clear active file");
         let stored_active_file = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| generic.storage.root.owned_value("store.active_file"));
@@ -77206,7 +78810,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let mut turn_runtime =
-            LiveRuntime::from_project("novywave-external-metadata-turns", &units)
+            LiveRuntime::from_project_legacy("novywave-external-metadata-turns", &units)
                 .expect("NovyWave runtime should initialize for live turns");
         for (source, text) in [
             (
@@ -77254,10 +78858,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-generic-file-row-select", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-generic-file-row-select", &units)
+                .expect("NovyWave runtime should initialize");
         let route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -77267,7 +78872,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .unwrap_or_else(|| {
                 let generic = runtime
-                    .runtime
+                    .legacy_runtime_for_test()
                     .generic
                     .as_ref()
                     .expect("generic runtime should be present");
@@ -77327,7 +78932,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(primary["store"]["selected_signal_family"], "simple_vcd");
 
         let scope_route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -77355,7 +78960,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(ghw_scope["store"]["active_signal"], "ghw_counter");
         assert_eq!(ghw_scope["store"]["selected_signal_family"], "ghw");
 
-        let mut runtime = LiveRuntime::from_project("novywave-external-row-select", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-external-row-select", &units)
             .expect("NovyWave runtime should initialize for external rows");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -77365,7 +78970,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             })
             .expect("external loaded name should apply");
         let external_file_route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -77402,7 +79007,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
         let external_file_route_debug = format!("{external_file_route:#?}");
         let external_file_derived_debug = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .map(|generic| {
@@ -77439,7 +79044,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "external file row route should clear signal, route={external_file_route_debug}"
         );
         let mut fallback_runtime =
-            LiveRuntime::from_project("novywave-virtual-external-row-select", &units)
+            LiveRuntime::from_project_legacy("novywave-virtual-external-row-select", &units)
                 .expect("NovyWave runtime should initialize for virtual external rows");
         fallback_runtime
             .apply_source_event(LiveSourceEvent {
@@ -77477,7 +79082,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let external_scope_route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -77491,7 +79096,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Some("scope_key")
         );
         let generic = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .expect("generic runtime should be present");
@@ -77511,7 +79116,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "external scope source should resolve to catalog rows, lists={external_scope_lists:?}, row_bindings={row_bindings:?}"
         );
         let external_scope_derived_debug = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .map(|generic| {
@@ -77566,8 +79171,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-selected-visible-items", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-selected-visible-items", &units)
+                .expect("NovyWave runtime should initialize");
 
         let initial = runtime.document_state_summary();
         let visible = initial["store"]["selected_visible_items"]
@@ -77945,7 +79551,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "viewport labels should compose numeric metadata and the selected file unit"
         );
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-waveform-metadata", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-waveform-metadata", &units)
             .expect("NovyWave runtime should initialize");
 
         let initial = runtime.state_summary();
@@ -78221,7 +79827,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-timeline-pan-zoom", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-timeline-pan-zoom", &units)
             .expect("NovyWave runtime should initialize from manifest units");
         let apply = |runtime: &mut LiveRuntime, source: &str, key: Option<&str>| {
             runtime
@@ -78394,8 +80000,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-hover-zoom-current-viewport", &units)
-            .expect("NovyWave runtime should initialize from manifest units");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-hover-zoom-current-viewport", &units)
+                .expect("NovyWave runtime should initialize from manifest units");
 
         let zoomed = runtime
             .apply_source_event(LiveSourceEvent {
@@ -78526,7 +80133,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project("novywave-sparse-timeline", &units)
+        let mut runtime = LiveRuntime::from_project_legacy("novywave-sparse-timeline", &units)
             .expect("NovyWave runtime should initialize from manifest units");
 
         apply_sparse(
@@ -78707,10 +80314,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let route_probe_runtime =
-            LiveRuntime::from_project("novywave-bridge-file-row-route-probe", &units)
+            LiveRuntime::from_project_legacy("novywave-bridge-file-row-route-probe", &units)
                 .expect("NovyWave route probe runtime should initialize from manifest units");
         let file_row_route = route_probe_runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -78730,7 +80337,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             file_row_route.actions
         );
         let mut direct_runtime =
-            LiveRuntime::from_project("novywave-bridge-file-row-direct-compare", &units)
+            LiveRuntime::from_project_legacy("novywave-bridge-file-row-direct-compare", &units)
                 .expect("NovyWave direct runtime should initialize from manifest units");
         let direct = direct_runtime
             .apply_source_event(LiveSourceEvent {
@@ -78750,7 +80357,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             direct["store"].get("file_tree_selected_file")
         );
         let mut counted_runtime =
-            LiveRuntime::from_project("novywave-bridge-file-counted-compare", &units)
+            LiveRuntime::from_project_legacy("novywave-bridge-file-counted-compare", &units)
                 .expect("NovyWave counted runtime should initialize from manifest units");
         let mut counted_expected = BTreeMap::new();
         counted_expected.insert(
@@ -78787,10 +80394,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             &json!("TX_DATA"),
             "counted compare source should update active_signal_key"
         );
-        let mut runtime = LiveRuntime::from_project("novywave-bridge-file-row-scenario", &units)
-            .expect("NovyWave runtime should initialize from manifest units");
+        let mut runtime =
+            LiveRuntime::from_project_legacy("novywave-bridge-file-row-scenario", &units)
+                .expect("NovyWave runtime should initialize from manifest units");
         let compare_route = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -78816,11 +80424,15 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             !active_signal_key_targets.is_empty(),
             "compare file route should have an active_signal_key target, got {active_signal_key_targets:?}"
         );
-        let active_signal_key_derived_plan = runtime.runtime.generic.as_ref().and_then(|generic| {
-            generic
-                .generic_derived
-                .root_field_plan("store.active_signal_key")
-        });
+        let active_signal_key_derived_plan = runtime
+            .legacy_runtime_for_test()
+            .generic
+            .as_ref()
+            .and_then(|generic| {
+                generic
+                    .generic_derived
+                    .root_field_plan("store.active_signal_key")
+            });
         assert!(
             active_signal_key_derived_plan.is_none(),
             "held active_signal_key must not be materialized as a derived root: {active_signal_key_derived_plan:?}"
@@ -78848,7 +80460,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
         let full_summary = runtime.state_summary();
         let stored_active_signal_key = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| generic.storage.root.owned_value("store.active_signal_key"));
@@ -78915,7 +80527,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let mut runtime =
-            LiveRuntime::from_project("novywave-bridge-reload-default-scenario", &units)
+            LiveRuntime::from_project_legacy("novywave-bridge-reload-default-scenario", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
 
         let output = apply_novywave_scenario_until(
@@ -79008,7 +80620,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let mut runtime =
-            LiveRuntime::from_project("novywave-bridge-format-sequence-scenario", &units)
+            LiveRuntime::from_project_legacy("novywave-bridge-format-sequence-scenario", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
 
         let output = apply_novywave_scenario_until(
@@ -79055,7 +80667,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
 
-        let mut add_runtime = LiveRuntime::from_project("novywave-marker-count-add", &units)
+        let mut add_runtime = LiveRuntime::from_project_legacy("novywave-marker-count-add", &units)
             .expect("NovyWave runtime should initialize from manifest units");
         let added = apply_novywave_scenario_until(
             &mut add_runtime,
@@ -79077,8 +80689,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             &json!("2 markers")
         );
 
-        let mut remove_runtime = LiveRuntime::from_project("novywave-marker-count-remove", &units)
-            .expect("NovyWave runtime should initialize from manifest units");
+        let mut remove_runtime =
+            LiveRuntime::from_project_legacy("novywave-marker-count-remove", &units)
+                .expect("NovyWave runtime should initialize from manifest units");
         let removed = apply_novywave_scenario_until(
             &mut remove_runtime,
             &scenario,
@@ -79674,7 +81287,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     #[test]
     fn cells_deltas_use_hidden_list_slots_not_visible_address_hashes() {
         let mut runtime =
-            LiveRuntime::from_source("cells-hidden-keys", &cells_project_source_for_test())
+            LiveRuntime::from_source_legacy("cells-hidden-keys", &cells_project_source_for_test())
                 .unwrap();
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -79735,7 +81348,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let parsed = parse_source("examples/cells.bn", source).unwrap();
         lower(&parsed).unwrap();
         let mut runtime =
-            LiveRuntime::from_source("renamed-cells-sources", &parsed.source).unwrap();
+            LiveRuntime::from_source_legacy("renamed-cells-sources", &parsed.source).unwrap();
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.apply".to_owned(),
@@ -79804,7 +81417,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     #[test]
     fn cells_escape_cancel_restores_uncommitted_draft_from_row_formula_text() {
         let mut runtime =
-            LiveRuntime::from_source("cells-cancel-draft", &cells_project_source_for_test())
+            LiveRuntime::from_source_legacy("cells-cancel-draft", &cells_project_source_for_test())
                 .unwrap();
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -80546,8 +82159,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let runtime = LiveRuntime::from_source("list-index-find-value", source).unwrap();
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let runtime = LiveRuntime::from_source_legacy("list-index-find-value", source).unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic
                 .storage
@@ -80581,8 +82194,12 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-index-find", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("list-index-find", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -80716,8 +82333,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("indexed-cache-field-invalidation", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("indexed-cache-field-invalidation", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let records = generic
             .storage
             .list_name_for_path("store.records")
@@ -80802,8 +82423,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-find-value-selection-index", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("list-find-value-selection-index", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -80859,8 +82484,13 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-find-selection-index", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("list-find-selection-index", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -80923,8 +82553,12 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-selection-length", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("list-selection-length", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -80968,8 +82602,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-move-field-list-ref-view", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("list-move-field-list-ref-view", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -81033,8 +82671,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-move-field-selection-view", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("list-move-field-selection-view", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -81104,8 +82746,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-direct-access-row-index-view", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("list-direct-access-row-index-view", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -81203,8 +82849,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-selection-storage-mode-oracle", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+            LiveRuntime::from_source_legacy("list-selection-storage-mode-oracle", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -81397,8 +83047,13 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-map-identity-view", source).unwrap();
-        let generic = runtime.runtime.generic.as_mut().unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("list-map-identity-view", source).unwrap();
+        let generic = runtime
+            .legacy_runtime_for_test_mut()
+            .generic
+            .as_mut()
+            .unwrap();
         let list = generic
             .storage
             .list_name_for_path("store.records")
@@ -81519,10 +83174,10 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-filter-field-equal-index", source).unwrap();
+            LiveRuntime::from_source_legacy("list-filter-field-equal-index", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "second,duplicate");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_hits > 0,
             "List/filter_field_equal should use the exact text lookup index for ListRef rows"
@@ -81562,12 +83217,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label_a))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("repeated-indexed-text-filter-cache", source).unwrap();
+            LiveRuntime::from_source_legacy("repeated-indexed-text-filter-cache", source).unwrap();
 
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["label_a"], "second-a,second-b");
         assert_eq!(summary["store"]["label_b"], "second-a,second-b");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_hits >= 2,
             "both identical filters should use the text lookup path; counters={:?}",
@@ -81604,10 +83259,11 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("path-qualified-root-list-filter-index", source).unwrap();
+            LiveRuntime::from_source_legacy("path-qualified-root-list-filter-index", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "second,duplicate");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_hits > 0,
             "path-qualified root list filters should use the materialized list index"
@@ -81646,8 +83302,9 @@ FUNCTION lookup_value(key) {
     |> List/join_field(field: "value", separator: "", empty: TEXT { missing })
 }
 "#;
-        let runtime = LiveRuntime::from_source("repeated-user-function-cache", source).unwrap();
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let runtime =
+            LiveRuntime::from_source_legacy("repeated-user-function-cache", source).unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic.storage.root_textlike_ref("store.combined").unwrap(),
             "second|second"
@@ -81710,8 +83367,9 @@ FUNCTION lookup_value(key) {
     |> List/join_field(field: "value", separator: "", empty: TEXT { missing })
 }
 "#;
-        let runtime = LiveRuntime::from_source("function-cache-unreferenced-env", source).unwrap();
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let runtime =
+            LiveRuntime::from_source_legacy("function-cache-unreferenced-env", source).unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic.storage.root_textlike_ref("store.labels").unwrap(),
             "second,second,second"
@@ -81774,11 +83432,12 @@ FUNCTION pair_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("function-cache-row-arg-access-fields", source).unwrap();
+            LiveRuntime::from_source_legacy("function-cache-row-arg-access-fields", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["lane_rows"][0]["label"], "hit");
         assert_eq!(summary["store"]["pair_rows"][0]["label"], "hit");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         let stats = generic
             .function_call_stats
             .by_function
@@ -81834,10 +83493,10 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
-        let mut runtime = LiveRuntime::from_source("map-join-field-fusion", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("map-join-field-fusion", source).unwrap();
 
         assert_eq!(runtime.state_summary()["store"]["labels"], "tx0,tx1");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.map_join_field_fusions >= 1,
             "map-to-record plus join_field should fuse; counters={:?}",
@@ -81918,13 +83577,13 @@ FUNCTION two_direct_empty() {
 
 document: Document/new(root: Element/label(element: [], label: store.two_direct))
 "#;
-        let mut runtime = LiveRuntime::from_source("join-field-lazy-args", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy("join-field-lazy-args", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["single_direct"], "one");
         assert_eq!(summary["store"]["single_fused"], "one");
         assert_eq!(summary["store"]["empty_direct"], "missing");
         assert_eq!(summary["store"]["two_direct"], "one|two");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         let called_functions = generic
             .function_call_stats
             .by_function
@@ -81985,10 +83644,11 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
-        let mut runtime = LiveRuntime::from_source("map-join-field-fusion-reads", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("map-join-field-fusion-reads", source).unwrap();
 
         assert_eq!(runtime.state_summary()["store"]["labels"], "a!,b!");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.map_join_field_fusions > 0,
             "initial evaluation should use the fused map/join path; counters={:?}",
@@ -82032,10 +83692,11 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-filter-row-ref-index", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("list-filter-row-ref-index", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "tx0,tx1");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_hits >= 2,
             "the ListRef filter and selected-set filter should use text indexes"
@@ -82075,10 +83736,10 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-filter-not-equal-row-ref-index", source).unwrap();
+            LiveRuntime::from_source_legacy("list-filter-not-equal-row-ref-index", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "segment-a,segment-b");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_hits >= 3,
             "the equal filter and both selected-set not-equal filters should use text indexes"
@@ -82113,10 +83774,11 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
-        let mut runtime = LiveRuntime::from_source("list-filter-bool-fallback", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("list-filter-bool-fallback", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "first,third");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic.list_scan_counters.text_lookup_index_hits, 0,
             "bool filters must not use the text lookup index"
@@ -82169,11 +83831,11 @@ FUNCTION new_record(record) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source("indexed-filter-column-read-dirties", source).unwrap();
+            LiveRuntime::from_source_legacy("indexed-filter-column-read-dirties", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["filtered_labels"], "second");
         let edit_source = {
-            let generic = runtime.runtime.generic.as_ref().unwrap();
+            let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
             [
                 "record.elements.edit_key",
                 "store.records.elements.edit_key",
@@ -82242,9 +83904,10 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.active_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-retain-numeric-row-field-compare", source).unwrap();
+            LiveRuntime::from_source_legacy("list-retain-numeric-row-field-compare", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["active_label"], "mid");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.numeric_lookup_index_hits >= 2,
             "both numeric retain stages should use range indexes"
@@ -82257,9 +83920,10 @@ document: Document/new(root: Element/label(element: [], label: store.active_labe
 
         let source = source.replace("75 |> HOLD cursor", "125 |> HOLD cursor");
         let mut runtime =
-            LiveRuntime::from_source("list-retain-numeric-row-field-compare-125", &source).unwrap();
+            LiveRuntime::from_source_legacy("list-retain-numeric-row-field-compare-125", &source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["active_label"], "new");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.numeric_lookup_index_hits >= 2,
             "both numeric retain stages should use range indexes after cursor change"
@@ -82315,11 +83979,12 @@ FUNCTION cursor_value(signal) {
 document: Document/new(root: Element/label(element: [], label: store.value))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("indexed-filter-retain-map-join-pipeline", source).unwrap();
+            LiveRuntime::from_source_legacy("indexed-filter-retain-map-join-pipeline", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["value"], "mid-a|mid-b");
         assert_eq!(summary["store"]["fallback_value"], "fallback-missing");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.map_join_field_fusions >= 2,
             "both cursor-value joins should use the map/join fusion; counters={:?}",
@@ -82386,11 +84051,11 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.direct_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("list-selection-view-direct-join", source).unwrap();
+            LiveRuntime::from_source_legacy("list-selection-view-direct-join", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["direct_labels"], "old|mid-a|mid-b");
         assert_eq!(summary["store"]["fused_labels"], "old|mid-a|mid-b");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.list_view_direct_rows >= 6,
             "direct join and fused map/join should both consume list-view rows directly; counters={:?}",
@@ -82470,10 +84135,11 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         ]
         .concat();
         let mut runtime =
-            LiveRuntime::from_source("indexed-pipeline-reorders-text-equality", &source).unwrap();
+            LiveRuntime::from_source_legacy("indexed-pipeline-reorders-text-equality", &source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["value"], "hit-a|hit-b");
-        let generic = runtime.runtime.generic.as_ref().unwrap();
+        let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert!(
             generic.list_scan_counters.text_lookup_index_candidates <= 6,
             "the narrow signal_id bucket should run before the broad file bucket; counters={:?}",
@@ -82534,11 +84200,11 @@ FUNCTION signal_row(signal) {
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("numeric-retain-stability-guard", source).unwrap();
+            LiveRuntime::from_source_legacy("numeric-retain-stability-guard", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["labels"], "middle");
         let field_cache_hits = |runtime: &LiveRuntime| {
             runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .map(|generic| generic.root_list_view_field_cache_hits)
@@ -82546,7 +84212,7 @@ document: Document/new(root: Element/label(element: [], label: store.labels))
         };
         let field_cache_misses = |runtime: &LiveRuntime| {
             runtime
-                .runtime
+                .legacy_runtime_for_test()
                 .generic
                 .as_ref()
                 .map(|generic| generic.root_list_view_field_cache_misses)
@@ -82650,13 +84316,14 @@ FUNCTION selected_cursor_pair_row(signal) {
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source("root-numeric-stability-guard", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_legacy("root-numeric-stability-guard", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["bridge_cursor_values"]["rows"][0]["label"],
             "A=middle"
         );
         let alias_reads = runtime
-            .runtime
+            .legacy_runtime_for_test()
             .generic
             .as_ref()
             .and_then(|generic| {
@@ -82787,7 +84454,7 @@ FUNCTION row_b(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source("root-list-view-function-cache-reuse", source).unwrap();
+            LiveRuntime::from_source_legacy("root-list-view-function-cache-reuse", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["rows_a"][0]["label"],
             "old"
@@ -83524,7 +85191,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 
     #[test]
     fn bytes_runtime_builtins_execute_through_live_runtime() {
-        let mut runtime = LiveRuntime::from_source(
+        let mut runtime = LiveRuntime::from_source_legacy(
             "bytes-runtime-builtins",
             r#"
 source: SOURCE
@@ -87059,6 +88726,795 @@ expected_source_event = {{ source = "store.decode" }}
     }
 
     #[test]
+    fn persistent_plan_executor_runtime_matches_whole_todomvc_scenario_runner() {
+        let compiled = compile_source_path_to_machine_plan(
+            Path::new("../../examples/todomvc.bn"),
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("TodoMVC should compile to a MachinePlan");
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let selected_step_ids = vec![
+            "add-test-todo-type".to_owned(),
+            "add-test-todo-submit".to_owned(),
+            "filter-active".to_owned(),
+            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+        ];
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let step_selection = select_plan_explicit_root_scenario_steps(
+            &scenario.name,
+            &scenario_step_meta,
+            &selected_step_ids,
+        )
+        .expect("selected TodoMVC steps should be accepted");
+        let selected_steps = step_selection
+            .selected_indices
+            .iter()
+            .map(|index| &scenario.step[*index])
+            .collect::<Vec<_>>();
+
+        let whole = execute_machine_plan_root_scenario_inner(
+            &compiled.plan,
+            &selected_steps,
+            Path::new("../../examples/todomvc.bn").parent(),
+        )
+        .expect("whole scenario PlanExecutor runner should pass");
+
+        let mut persistent = PlanExecutorRuntimeState::new(&compiled.plan)
+            .expect("persistent PlanExecutor runtime should initialize");
+        for step in &selected_steps {
+            persistent
+                .apply_step(
+                    &compiled.plan,
+                    step,
+                    Path::new("../../examples/todomvc.bn").parent(),
+                )
+                .expect("persistent PlanExecutor step should apply");
+        }
+        let incremental = persistent
+            .finish(&compiled.plan)
+            .expect("persistent PlanExecutor runtime should finish");
+
+        assert_eq!(incremental.state_summary, whole.state_summary);
+        assert_eq!(
+            incremental.semantic_delta_signatures,
+            whole.semantic_delta_signatures
+        );
+        assert_eq!(incremental.semantic_deltas, whole.semantic_deltas);
+        assert_eq!(incremental.per_step, whole.per_step);
+        assert_eq!(
+            incremental.executor_report["executor"],
+            "cpu-plan-root-list-scenario-v1"
+        );
+        assert_eq!(
+            incremental.executor_report["runtime_ast_eval_count"],
+            json!(0)
+        );
+        assert_eq!(
+            incremental.executor_report["executable_string_path_count"],
+            json!(0)
+        );
+        assert_eq!(
+            incremental.executor_report["unknown_plan_op_count"],
+            json!(0)
+        );
+        assert_eq!(
+            incremental.executor_report["executed_indexed_update_count"],
+            json!(1)
+        );
+        assert_eq!(incremental.executor_report, whole.executor_report);
+    }
+
+    #[test]
+    fn persistent_plan_executor_runtime_accepts_live_source_events() {
+        let compiled = compile_source_path_to_machine_plan(
+            Path::new("../../examples/todomvc.bn"),
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("TodoMVC should compile to a MachinePlan");
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let selected_step_ids = vec![
+            "add-test-todo-type".to_owned(),
+            "add-test-todo-submit".to_owned(),
+            "filter-active".to_owned(),
+            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+        ];
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let step_selection = select_plan_explicit_root_scenario_steps(
+            &scenario.name,
+            &scenario_step_meta,
+            &selected_step_ids,
+        )
+        .expect("selected TodoMVC steps should be accepted");
+        let selected_steps = step_selection
+            .selected_indices
+            .iter()
+            .map(|index| &scenario.step[*index])
+            .collect::<Vec<_>>();
+        let whole = execute_machine_plan_root_scenario_inner(
+            &compiled.plan,
+            &selected_steps,
+            Path::new("../../examples/todomvc.bn").parent(),
+        )
+        .expect("whole scenario PlanExecutor runner should pass");
+
+        let mut live_session = PlanExecutorRuntimeState::new(&compiled.plan)
+            .expect("persistent PlanExecutor runtime should initialize");
+        for (sequence, step) in selected_steps.iter().enumerate() {
+            let generic_event =
+                GenericSourceEvent::require(step).expect("scenario step should contain source");
+            live_session
+                .apply_live_source_event(
+                    &compiled.plan,
+                    live_source_event_from_generic(&generic_event),
+                    sequence + 1,
+                    Path::new("../../examples/todomvc.bn").parent(),
+                )
+                .expect("PlanExecutor live source event should apply");
+        }
+        let live = live_session
+            .finish(&compiled.plan)
+            .expect("persistent PlanExecutor live runtime should finish");
+
+        assert_eq!(live.state_summary, whole.state_summary);
+        assert_eq!(
+            live.semantic_delta_signatures,
+            whole.semantic_delta_signatures
+        );
+        assert_eq!(live.semantic_deltas, whole.semantic_deltas);
+        assert_eq!(live.per_step.len(), whole.per_step.len());
+        for (live_step, whole_step) in live.per_step.iter().zip(whole.per_step.iter()) {
+            assert_eq!(live_step["source"], whole_step["source"]);
+            assert_eq!(
+                live_step["semantic_delta_signatures"],
+                whole_step["semantic_delta_signatures"]
+            );
+            assert_eq!(live_step["semantic_deltas"], whole_step["semantic_deltas"]);
+            assert_eq!(
+                live_step["executed_update_branch_count"],
+                whole_step["executed_update_branch_count"]
+            );
+            assert_eq!(
+                live_step["executed_indexed_update_count"],
+                whole_step["executed_indexed_update_count"]
+            );
+            assert_eq!(
+                live_step["executed_list_append_count"],
+                whole_step["executed_list_append_count"]
+            );
+        }
+        assert_eq!(
+            live.executor_report["executed_update_branch_count"],
+            whole.executor_report["executed_update_branch_count"]
+        );
+        assert_eq!(
+            live.executor_report["executed_indexed_update_count"],
+            whole.executor_report["executed_indexed_update_count"]
+        );
+        assert_eq!(
+            live.executor_report["executed_list_append_count"],
+            whole.executor_report["executed_list_append_count"]
+        );
+        assert_eq!(
+            live.executor_report["runtime_ast_eval_count"],
+            whole.executor_report["runtime_ast_eval_count"]
+        );
+        assert_eq!(
+            live.executor_report["executable_string_path_count"],
+            whole.executor_report["executable_string_path_count"]
+        );
+        assert_eq!(
+            live.executor_report["unknown_plan_op_count"],
+            whole.executor_report["unknown_plan_op_count"]
+        );
+    }
+
+    #[test]
+    fn plan_executor_live_session_from_project_accepts_live_source_events() {
+        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load");
+        let runtime_units = compiler_units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let compiled = compile_source_units_to_machine_plan(
+            "examples/todomvc.bn",
+            &compiler_source_units_from_runtime_units(&runtime_units),
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("TodoMVC source units should compile to a MachinePlan");
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let selected_step_ids = vec![
+            "add-test-todo-type".to_owned(),
+            "add-test-todo-submit".to_owned(),
+            "filter-active".to_owned(),
+            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+        ];
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let step_selection = select_plan_explicit_root_scenario_steps(
+            &scenario.name,
+            &scenario_step_meta,
+            &selected_step_ids,
+        )
+        .expect("selected TodoMVC steps should be accepted");
+        let selected_steps = step_selection
+            .selected_indices
+            .iter()
+            .map(|index| &scenario.step[*index])
+            .collect::<Vec<_>>();
+        let whole = execute_machine_plan_root_scenario_inner(
+            &compiled.plan,
+            &selected_steps,
+            Path::new("../../examples/todomvc.bn").parent(),
+        )
+        .expect("whole scenario PlanExecutor runner should pass");
+
+        let mut session = PlanExecutorLiveSession::from_project(
+            "examples/todomvc.bn",
+            &runtime_units,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("PlanExecutor live session should initialize from source units");
+        assert_eq!(session.provenance_report()["engine"], "plan_executor");
+        assert_eq!(
+            session.provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        for step in &selected_steps {
+            let generic_event =
+                GenericSourceEvent::require(step).expect("scenario step should contain source");
+            let report = session
+                .apply_source_event(live_source_event_from_generic(&generic_event))
+                .expect("PlanExecutor live source event should apply");
+            assert_eq!(report["source"], generic_event.source);
+        }
+        let live = session
+            .finish()
+            .expect("PlanExecutor live session should finish");
+
+        assert_eq!(live.state_summary, whole.state_summary);
+        assert_eq!(
+            live.semantic_delta_signatures,
+            whole.semantic_delta_signatures
+        );
+        assert_eq!(live.semantic_deltas, whole.semantic_deltas);
+        assert_eq!(
+            live.executor_report["executed_indexed_update_count"],
+            whole.executor_report["executed_indexed_update_count"]
+        );
+        assert_eq!(live.executor_report["runtime_ast_eval_count"], json!(0));
+        assert_eq!(
+            live.executor_report["executable_string_path_count"],
+            json!(0)
+        );
+        assert_eq!(live.executor_report["unknown_plan_op_count"], json!(0));
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner() {
+        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load");
+        let runtime_units = compiler_units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let compiled = compile_source_units_to_machine_plan(
+            "examples/todomvc.bn",
+            &compiler_source_units_from_runtime_units(&runtime_units),
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("TodoMVC source units should compile to a MachinePlan");
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let selected_step_ids = vec![
+            "add-test-todo-type".to_owned(),
+            "add-test-todo-submit".to_owned(),
+            "filter-active".to_owned(),
+            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+        ];
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let step_selection = select_plan_explicit_root_scenario_steps(
+            &scenario.name,
+            &scenario_step_meta,
+            &selected_step_ids,
+        )
+        .expect("selected TodoMVC steps should be accepted");
+        let selected_steps = step_selection
+            .selected_indices
+            .iter()
+            .map(|index| &scenario.step[*index])
+            .collect::<Vec<_>>();
+        let whole = execute_machine_plan_root_scenario_inner(
+            &compiled.plan,
+            &selected_steps,
+            Path::new("../../examples/todomvc.bn").parent(),
+        )
+        .expect("whole scenario PlanExecutor runner should pass");
+        let batch_events = selected_steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let generic_event =
+                    GenericSourceEvent::require(step).expect("scenario step should contain source");
+                SourceBatchEvent {
+                    event_id: (index + 1) as u64,
+                    event: live_source_event_from_generic(&generic_event),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut runtime =
+            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
+                .expect("LiveRuntime PlanExecutor mode should initialize");
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        let output = runtime
+            .apply_source_batch_turn(SourceBatch {
+                sequence_id: 1,
+                events: batch_events,
+            })
+            .expect("LiveRuntime PlanExecutor batch should apply");
+
+        assert_eq!(runtime.state_summary(), whole.state_summary);
+        assert_eq!(
+            serde_json::to_value(&output.semantic_deltas)
+                .expect("typed semantic deltas should serialize"),
+            whole.semantic_deltas
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        assert!(
+            output.render_patches.is_empty(),
+            "PlanExecutor live turn must not synthesize legacy render patches during this slice"
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_profiled_constructor_reports_no_fallback_provenance() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+
+        let (runtime, profile) =
+            LiveRuntime::from_project_plan_executor_profiled("examples/todomvc.bn", &runtime_units)
+                .expect("profiled PlanExecutor constructor should initialize TodoMVC");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        assert_eq!(profile["engine"], "plan_executor");
+        assert_eq!(profile["generic_fallback_enabled"], false);
+        assert_eq!(
+            profile["runtime"]["provenance"]["engine"],
+            json!("plan_executor")
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_source_constructor_uses_plan_executor_for_document_programs() {
+        let runtime = LiveRuntime::from_source(
+            "examples/counter.bn",
+            include_str!("../../../examples/counter.bn"),
+        )
+        .expect("Counter should initialize through the default LiveRuntime constructor");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_project_constructor_uses_plan_executor_for_document_programs() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units).expect(
+            "TodoMVC should initialize through the default LiveRuntime project constructor",
+        );
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_scenario_constructor_uses_plan_executor_for_document_programs() {
+        let runtime = LiveRuntime::new(
+            "examples/counter.bn",
+            include_str!("../../../examples/counter.bn"),
+            Path::new("../../examples/counter.scn"),
+        )
+        .expect("Counter scenario constructor should initialize through PlanExecutor");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_project_scenario_constructor_uses_plan_executor() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::new_from_project(
+            "examples/todomvc.bn",
+            &runtime_units,
+            Path::new("../../examples/todomvc.scn"),
+        )
+        .expect("TodoMVC project scenario constructor should initialize through PlanExecutor");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_profiled_constructor_reports_plan_executor_selection() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let (runtime, profile) =
+            LiveRuntime::from_project_profiled("examples/todomvc.bn", &runtime_units)
+                .expect("TodoMVC profiled default constructor should initialize");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        assert_eq!(profile["engine"], "plan_executor");
+        assert_eq!(profile["generic_fallback_enabled"], false);
+        assert_eq!(
+            profile["default_runtime_selection"],
+            "plan_executor_document_runtime"
+        );
+    }
+
+    #[test]
+    fn live_runtime_default_constructor_keeps_legacy_explicit_for_world_outputs() {
+        let mut runtime = LiveRuntime::from_source(
+            "examples/hello_3d/RUN.bn",
+            include_str!("../../../examples/hello_3d/RUN.bn"),
+        )
+        .expect("world output should initialize through explicit legacy output selection");
+
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "legacy_generic_runtime"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            true
+        );
+        runtime.world_scene_output().expect(
+            "world output remains on explicit legacy output runtime until PlanExecutor supports it",
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_document_summary_exposes_todomvc_rows_and_sources() {
+        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load");
+        let runtime_units = compiler_units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let selected_step_ids = vec![
+            "add-test-todo-type".to_owned(),
+            "add-test-todo-submit".to_owned(),
+            "filter-active".to_owned(),
+            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
+        ];
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let step_selection = select_plan_explicit_root_scenario_steps(
+            &scenario.name,
+            &scenario_step_meta,
+            &selected_step_ids,
+        )
+        .expect("selected TodoMVC steps should be accepted");
+        let batch_events = step_selection
+            .selected_indices
+            .iter()
+            .enumerate()
+            .map(|(index, step_index)| {
+                let step = &scenario.step[*step_index];
+                let generic_event =
+                    GenericSourceEvent::require(step).expect("scenario step should contain source");
+                SourceBatchEvent {
+                    event_id: (index + 1) as u64,
+                    event: live_source_event_from_generic(&generic_event),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut runtime =
+            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
+                .expect("LiveRuntime PlanExecutor mode should initialize");
+        runtime
+            .apply_source_batch_turn(SourceBatch {
+                sequence_id: 1,
+                events: batch_events,
+            })
+            .expect("PlanExecutor batch should apply");
+
+        let summary = runtime.document_state_summary();
+        assert_eq!(summary["store"]["selected_filter"], "Active");
+        let todos = summary["todos"]
+            .as_array()
+            .expect("todos should be summarized");
+        let dynamic = todos
+            .iter()
+            .find(|row| row["title"] == "Test todo")
+            .expect("dynamic TodoMVC row should be present");
+        assert_eq!(dynamic["completed"], true);
+        assert_eq!(dynamic["$boon"]["row_key"], 5);
+        assert_eq!(
+            dynamic["sources"]["todo_checkbox"]["click"]["list_id"],
+            "todos"
+        );
+        assert_eq!(
+            dynamic["sources"]["todo_checkbox"]["click"]["target_key"],
+            dynamic["$boon"]["row_key"]
+        );
+        let visible = summary["store"]["visible_todos"]
+            .as_array()
+            .expect("visible_todos retain should be a document array");
+        assert!(
+            visible.iter().all(|row| row["completed"] == false),
+            "Active filter document summary should expose only active visible rows: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_source_inventory_and_values_are_plan_owned() {
+        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load");
+        let runtime_units = compiler_units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let mut runtime =
+            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
+                .expect("LiveRuntime PlanExecutor mode should initialize");
+
+        assert!(runtime.has_source_path("store.sources.new_todo_input.change"));
+        assert!(runtime.has_source_path("store.sources.new_todo_input.events.change"));
+        assert!(runtime.source_payload_has_text("store.sources.new_todo_input.events.change"));
+        assert!(!runtime.source_payload_has_text("store.sources.new_todo_input.events.key_down"));
+
+        let output = runtime
+            .apply_source_event_for_document(LiveSourceEvent {
+                source: "store.sources.new_todo_input.events.change".to_owned(),
+                text: Some("Plan-owned query".to_owned()),
+                source_id: None,
+                ..LiveSourceEvent::default()
+            })
+            .expect("PlanExecutor mode should resolve source_id from MachinePlan routes");
+        assert_eq!(
+            output.state_summary["store"]["new_todo_text"],
+            "Plan-owned query"
+        );
+
+        let values = runtime.document_state_values(&["store.new_todo_text".to_owned()]);
+        assert_eq!(values["store.new_todo_text"], "Plan-owned query");
+        let summaries =
+            runtime.runtime_value_summaries(&["store.new_todo_text".to_owned()], 3, 8, 4);
+        assert_eq!(
+            summaries["store.new_todo_text"],
+            json!({"kind": "string", "value": "Plan-owned query"})
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+
+        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
+            .expect("TodoMVC scenario should parse");
+        let step = scenario
+            .step
+            .iter()
+            .find(|step| step.id == "add-test-todo-submit")
+            .expect("TodoMVC scenario should include add-test-todo-submit");
+        let generic_event =
+            GenericSourceEvent::require(step).expect("scenario step should contain source");
+        let sparse = runtime
+            .apply_source_event_for_step_value_summaries(
+                step,
+                live_source_event_from_generic(&generic_event),
+                &["store.new_todo_text".to_owned()],
+            )
+            .expect("PlanExecutor sparse step helper should not mutate legacy runtime");
+        assert_eq!(
+            sparse.value_summaries["store.new_todo_text"]["kind"],
+            "string"
+        );
+        assert_eq!(sparse.value_summaries["store.new_todo_text"]["value"], "");
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_rejects_legacy_only_outputs_without_fallback() {
+        let source = r#"
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+store: [
+    elements: [noop: SOURCE]
+    value: TEXT { ready }
+]
+
+document: Document/new(root: Element/label(element: [], label: store.value))
+"#;
+        let mut runtime =
+            LiveRuntime::from_source_plan_executor("plan-executor-legacy-output-guard", source)
+                .expect("source should initialize in PlanExecutor mode");
+        let world_error = runtime
+            .world_scene_output()
+            .expect_err("PlanExecutor mode must not fall back for world output")
+            .to_string();
+        assert!(
+            world_error.contains("has no LoadedRuntime")
+                && world_error.contains("refusing hidden fallback"),
+            "unexpected world output error: {world_error}"
+        );
+        let solid_error = runtime
+            .solid_model_output()
+            .expect_err("PlanExecutor mode must not fall back for solid output")
+            .to_string();
+        assert!(
+            solid_error.contains("has no LoadedRuntime")
+                && solid_error.contains("refusing hidden fallback"),
+            "unexpected solid output error: {solid_error}"
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_cells_window_summary_is_bounded_and_current() {
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-plan-window-summary",
+            &cells_project_source_for_test(),
+        )
+        .expect("Cells should initialize in explicit PlanExecutor mode");
+        let output = runtime
+            .apply_source_event_for_document_window(
+                LiveSourceEvent {
+                    source: "cell.sources.editor.select".to_owned(),
+                    address: Some("B0".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+                0,
+                24,
+                0,
+                10,
+            )
+            .expect("Cells select source should apply through PlanExecutor mode");
+        assert_eq!(
+            output.state_summary["store"]["selected_input"]["address"],
+            "B0"
+        );
+
+        let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
+        assert_eq!(summary["store"]["selected_address"], "B0");
+        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
+        assert_eq!(
+            summary["store"]["selected_input"]["editing_text"],
+            "=add(A0,A1)"
+        );
+        let rows = summary["store"]["sheet_rows"]
+            .as_array()
+            .expect("sheet_rows should be summarized as rows");
+        assert_eq!(rows.len(), 24);
+        let first_row_cells = rows[0]["cells"]
+            .as_array()
+            .expect("sheet row should contain cells");
+        assert_eq!(first_row_cells.len(), 10);
+        assert_eq!(first_row_cells[0]["address"], "A0");
+        assert_eq!(first_row_cells[1]["address"], "B0");
+        assert!(
+            summary["__boon_materialization"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|entry| entry["collection"] == "store.sheet_rows"),
+            "window summary should report bounded sheet_rows materialization"
+        );
+
+        let values = runtime.document_state_values(&[
+            "store.selected_input.address".to_owned(),
+            "store.selected_input.editing_text".to_owned(),
+        ]);
+        assert_eq!(values["store.selected_input.address"], "B0");
+        assert_eq!(values["store.selected_input.editing_text"], "=add(A0,A1)");
+        let summaries = runtime.runtime_value_summaries(
+            &["store.selected_input.editing_text".to_owned()],
+            3,
+            8,
+            4,
+        );
+        assert_eq!(
+            summaries["store.selected_input.editing_text"],
+            json!({"kind": "string", "value": "=add(A0,A1)"})
+        );
+    }
+
+    #[test]
     fn root_list_plan_executor_replays_todomvc_delete_row() {
         let steps = vec![
             "add-test-todo-type".to_owned(),
@@ -87805,7 +90261,8 @@ expected_source_event = {{ source = "store.decode" }}
     #[test]
     fn pure_boon_cells_helpers_support_documented_arithmetic_ops() {
         let mut runtime =
-            LiveRuntime::from_source("cells-arithmetic", &cells_project_source_for_test()).unwrap();
+            LiveRuntime::from_source_legacy("cells-arithmetic", &cells_project_source_for_test())
+                .unwrap();
         for (formula, expected) in [
             ("=8+2", "10"),
             ("=8-2", "6"),
@@ -87856,7 +90313,7 @@ expected_source_event = {{ source = "store.decode" }}
 
     #[test]
     fn cells_unrelated_row_commit_preserves_default_sum_until_formula_changes() {
-        let mut runtime = LiveRuntime::from_source(
+        let mut runtime = LiveRuntime::from_source_legacy(
             "cells-unrelated-row-commit",
             &cells_project_source_for_test(),
         )
@@ -87880,7 +90337,7 @@ expected_source_event = {{ source = "store.decode" }}
 
     #[test]
     fn cells_source_event_recompute_samples_accumulate_source_action_followups() {
-        let mut runtime = LiveRuntime::from_source(
+        let mut runtime = LiveRuntime::from_source_legacy(
             "cells-recompute-accounting",
             &cells_project_source_for_test(),
         )
@@ -87909,9 +90366,11 @@ expected_source_event = {{ source = "store.decode" }}
 
     #[test]
     fn pure_boon_cells_replacing_reference_removes_stale_dependents() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-replace-reference", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_legacy(
+            "cells-replace-reference",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         commit_cell(&mut runtime, "A0", "1");
         let output = commit_cell(&mut runtime, "B0", "=A0+1");
         assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "2");
@@ -87934,7 +90393,8 @@ expected_source_event = {{ source = "store.decode" }}
     #[test]
     fn pure_boon_cells_fanout_recomputes_from_generic_read_index() {
         let mut runtime =
-            LiveRuntime::from_source("cells-fanout", &cells_project_source_for_test()).unwrap();
+            LiveRuntime::from_source_legacy("cells-fanout", &cells_project_source_for_test())
+                .unwrap();
         commit_cell(&mut runtime, "A0", "1");
         commit_cell(&mut runtime, "B0", "=A0+1");
         commit_cell(&mut runtime, "C0", "=A0+2");
@@ -87958,7 +90418,7 @@ expected_source_event = {{ source = "store.decode" }}
     #[test]
     fn pure_boon_cells_range_formula_updates_from_member_change() {
         let mut runtime =
-            LiveRuntime::from_source("cells-range-fanout", &cells_project_source_for_test())
+            LiveRuntime::from_source_legacy("cells-range-fanout", &cells_project_source_for_test())
                 .unwrap();
         commit_cell(&mut runtime, "A3", "20");
         let output = commit_cell(&mut runtime, "C0", "=sum(A0:A3)");
@@ -88138,7 +90598,7 @@ world: World/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("world-output-runtime-lowering", source)
+        let mut runtime = LiveRuntime::from_source_legacy("world-output-runtime-lowering", source)
             .expect("world output source should compile");
         let output = runtime
             .world_scene_output()
@@ -88204,8 +90664,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("manufacturing-output-runtime-lowering", source)
-            .expect("manufacturing output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("manufacturing-output-runtime-lowering", source)
+                .expect("manufacturing output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("manufacturing output should lower into a SolidModelBundle");
@@ -88252,8 +90713,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("curved-solid-output-runtime-lowering", source)
-            .expect("curved solid output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("curved-solid-output-runtime-lowering", source)
+                .expect("curved solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("curved solid output should lower into a SolidModelBundle");
@@ -88313,8 +90775,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("shell-solid-output-runtime-lowering", source)
-            .expect("shell solid output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("shell-solid-output-runtime-lowering", source)
+                .expect("shell solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("shell solid output should lower into a SolidModelBundle");
@@ -88370,8 +90833,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("extrude-solid-output-runtime-lowering", source)
-            .expect("extrude solid output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("extrude-solid-output-runtime-lowering", source)
+                .expect("extrude solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("extrude solid output should lower into a SolidModelBundle");
@@ -88433,8 +90897,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("revolve-solid-output-runtime-lowering", source)
-            .expect("revolve solid output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("revolve-solid-output-runtime-lowering", source)
+                .expect("revolve solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("revolve solid output should lower into a SolidModelBundle");
@@ -88496,8 +90961,9 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source("loft-solid-output-runtime-lowering", source)
-            .expect("loft solid output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_legacy("loft-solid-output-runtime-lowering", source)
+                .expect("loft solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("loft solid output should lower into a SolidModelBundle");

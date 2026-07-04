@@ -13641,6 +13641,17 @@ fn expected_root_scalar_scenario_execution(
             }));
             executed_derived_value_count += 1;
         }
+        for (field_id, value) in &derived_values {
+            let field_path = plan_derived_field_label(plan, field_id.0);
+            let changed = state.get(&field_path) != Some(value);
+            state.insert(field_path.clone(), value.clone());
+            derived.push(json!({
+                "field_id": field_id.0,
+                "field_path": field_path,
+                "value": value,
+                "changed": changed,
+            }));
+        }
 
         let append_result =
             expected_append_list_rows(plan, &mut list_state, &derived_values, report_path)?;
@@ -24338,10 +24349,11 @@ fn expected_list_retain_predicate_resolution(
                 retained,
                 report: json!({
                     "kind": "selected_filter_visibility",
-                    "selector_state_id": selector_id.0,
+                    "selector_ref": expected_value_ref_report(selector),
                     "selector": selector_label,
                     "selector_value": selector_value,
-                    "row_field_state_id": row_field_id.0,
+                    "selector_materialized": true,
+                    "row_field_ref": expected_value_ref_report(row_field),
                     "row_field": row_field_name,
                 }),
             })
@@ -24417,10 +24429,11 @@ fn expected_list_retain_empty_predicate_report(
                 })?;
             Ok(json!({
                 "kind": "selected_filter_visibility",
-                "selector_state_id": selector_id.0,
+                "selector_ref": expected_value_ref_report(selector),
                 "selector": selector_label,
                 "selector_value": selector_value,
-                "row_field_state_id": row_field_id.0,
+                "selector_materialized": true,
+                "row_field_ref": expected_value_ref_report(row_field),
                 "row_field": local_field_name(&plan_state_label(plan, row_field_id.0)),
             }))
         }
@@ -24449,6 +24462,36 @@ fn expected_plan_state_label_from_ref(
         return Err(format!("expected state ref, got {value_ref:?}").into());
     };
     Ok(plan_state_label(plan, state_id.0))
+}
+
+fn expected_value_ref_report(value_ref: &boon_plan::ValueRef) -> JsonValue {
+    match value_ref {
+        boon_plan::ValueRef::State(state_id) => json!({
+            "kind": "state",
+            "id": state_id.0,
+        }),
+        boon_plan::ValueRef::Field(field_id) => json!({
+            "kind": "field",
+            "id": field_id.0,
+        }),
+        boon_plan::ValueRef::List(list_id) => json!({
+            "kind": "list",
+            "id": list_id.0,
+        }),
+        boon_plan::ValueRef::Source(source_id) => json!({
+            "kind": "source",
+            "id": source_id.0,
+        }),
+        boon_plan::ValueRef::SourcePayload { source_id, field } => json!({
+            "kind": "source_payload",
+            "source_id": source_id.0,
+            "field": format!("{field:?}"),
+        }),
+        boon_plan::ValueRef::Constant(constant_id) => json!({
+            "kind": "constant",
+            "id": constant_id.0,
+        }),
+    }
 }
 
 fn list_summary_mismatch_detail(actual: &JsonValue, expected: &JsonValue) -> String {

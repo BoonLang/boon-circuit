@@ -146,6 +146,8 @@ pub struct FrameMetrics {
     #[serde(default)]
     pub renderer_render_graph_plan_hash: String,
     #[serde(default)]
+    pub renderer_render_graph_workload_hash: String,
+    #[serde(default)]
     pub renderer_render_graph_pass_count: u32,
     #[serde(default)]
     pub renderer_render_graph_product_pass_count: u32,
@@ -626,6 +628,7 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 renderer_render_graph_kind: String::new(),
                 renderer_render_graph_execution_kind: String::new(),
                 renderer_render_graph_plan_hash: String::new(),
+                renderer_render_graph_workload_hash: String::new(),
                 renderer_render_graph_pass_count: 0,
                 renderer_render_graph_product_pass_count: 0,
                 renderer_render_graph_proof_pass_count: 0,
@@ -2788,6 +2791,8 @@ fn encode_internal_scene_to_surface(
         renderer_render_graph_resources_for_passes(&renderer_render_graph_passes);
     let renderer_render_graph_plan_hash =
         renderer_render_graph_plan_hash(&renderer_render_graph_passes);
+    let renderer_render_graph_workload_hash =
+        renderer_render_graph_workload_hash(&renderer_render_graph_passes);
     let renderer_render_graph_resource_lifetime_hash =
         renderer_render_graph_resource_lifetime_hash(&renderer_render_graph_resources);
     Ok(FrameMetrics {
@@ -2796,6 +2801,7 @@ fn encode_internal_scene_to_surface(
         renderer_render_graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
         renderer_render_graph_execution_kind: "executor_wrapped_product_passes".to_owned(),
         renderer_render_graph_plan_hash,
+        renderer_render_graph_workload_hash,
         renderer_render_graph_pass_count: renderer_render_graph_passes.len() as u32,
         renderer_render_graph_product_pass_count: renderer_render_graph_passes
             .iter()
@@ -2909,6 +2915,15 @@ fn renderer_render_graph_plan_hash(passes: &[RendererRenderGraphPassMetric]) -> 
             u8::from(pass.product_visible),
             u8::from(pass.proof_or_readback),
         ]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn renderer_render_graph_workload_hash(passes: &[RendererRenderGraphPassMetric]) -> String {
+    let mut hasher = Sha256::new();
+    for pass in passes {
+        hasher.update(pass.pass_id.as_bytes());
+        hasher.update([0]);
         hasher.update(pass.upload_bytes.to_le_bytes());
         hasher.update(pass.dirty_chunk_count.to_le_bytes());
         hasher.update(pass.queue_write_count.to_le_bytes());
@@ -10342,6 +10357,40 @@ mod tests {
             }
         }
         (positions, colors)
+    }
+
+    fn test_graph_pass(upload_bytes: u64, dirty_chunk_count: u32) -> RendererRenderGraphPassMetric {
+        RendererRenderGraphPassMetric {
+            schema_version: 1,
+            pass_id: "prepare".to_owned(),
+            pass_kind: "retained_quad_prepare_and_dirty_upload".to_owned(),
+            input: "RenderSceneItems".to_owned(),
+            output: "RetainedGpuBuffers".to_owned(),
+            read_resources: vec!["RenderSceneItems".to_owned()],
+            write_resources: vec!["RetainedGpuBuffers".to_owned()],
+            product_visible: true,
+            proof_or_readback: false,
+            duration_ms: 1.0,
+            upload_bytes,
+            dirty_chunk_count,
+            queue_write_count: 1,
+            draw_call_count: 1,
+        }
+    }
+
+    #[test]
+    fn renderer_graph_plan_hash_ignores_workload_metrics() {
+        let low_workload = vec![test_graph_pass(128, 1)];
+        let high_workload = vec![test_graph_pass(4096, 8)];
+
+        assert_eq!(
+            renderer_render_graph_plan_hash(&low_workload),
+            renderer_render_graph_plan_hash(&high_workload)
+        );
+        assert_ne!(
+            renderer_render_graph_workload_hash(&low_workload),
+            renderer_render_graph_workload_hash(&high_workload)
+        );
     }
 
     #[test]

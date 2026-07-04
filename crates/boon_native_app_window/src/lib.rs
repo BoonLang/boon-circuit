@@ -3743,6 +3743,8 @@ pub struct NativeProductRenderGraphSummary {
     pub renderer_graph_execution_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renderer_graph_plan_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_workload_hash: Option<String>,
     #[serde(default)]
     pub renderer_graph_pass_count: u32,
     #[serde(default)]
@@ -3772,6 +3774,10 @@ pub struct NativeProductRenderGraphSummary {
     pub proof_readback_in_product_graph: bool,
     pub stale_epoch_rejection_count: u64,
     pub plan_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_subscriber_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passes: Vec<NativeProductRenderGraphPassSummary>,
 }

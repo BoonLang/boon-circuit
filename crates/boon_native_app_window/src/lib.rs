@@ -5923,7 +5923,6 @@ async fn run_surface_probe_inner(
         render_loop_state
             .note_armed_frame_input_sampled(hold_started.elapsed().as_secs_f64() * 1000.0);
         last_sampled_input_event_wake_count = sampled_input_event_wake_count;
-        let sampled_delta_has_real_os_events = input.real_os_events_observed;
         let raw_host_input_wake_pending =
             sampled_input_event_wake_count > last_presented_input_event_wake_count;
         let host_input_observed_this_turn =
@@ -5961,7 +5960,7 @@ async fn run_surface_probe_inner(
                 input_poll_result,
                 reportable_host_input_this_turn,
             );
-            if effective_input_poll_result.dirty || sampled_delta_has_real_os_events {
+            if effective_input_poll_result.dirty {
                 dirty_poll_result_this_turn = effective_input_poll_result.dirty;
                 poll_result = Some(effective_input_poll_result);
             }

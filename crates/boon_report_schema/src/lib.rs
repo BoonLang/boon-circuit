@@ -19678,6 +19678,12 @@ fn expected_plan_derived_expression_contains_state(
         boon_plan::PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state, .. } => {
             *state == boon_plan::ValueRef::State(state_id)
         }
+        boon_plan::PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            expected_plan_row_expression_contains_state(default, state_id)
+                || arms
+                    .iter()
+                    .any(|arm| expected_plan_row_expression_contains_state(&arm.value, state_id))
+        }
         boon_plan::PlanDerivedExpression::BoolNot { input } => {
             *input == boon_plan::ValueRef::State(state_id)
         }

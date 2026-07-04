@@ -451,6 +451,12 @@ pub enum PlanDerivedExpression {
         state: ValueRef,
         skip_empty: bool,
     },
+    SourceEventTransform {
+        default: Box<PlanRowExpression>,
+        arms: Vec<PlanSourceEventTransformArm>,
+        #[serde(default)]
+        router_route: bool,
+    },
     BoolNot {
         input: ValueRef,
     },
@@ -469,6 +475,12 @@ pub enum PlanDerivedExpression {
     RowExpression {
         expression: PlanRowExpression,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanSourceEventTransformArm {
+    pub source_id: SourceId,
+    pub value: PlanRowExpression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1542,11 +1554,16 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && (source_payload_field.is_some()
                             || source_payload_inputs_are_empty_or_guard_only(op, source_guard))
                 }
+                PlanExpressionKind::MatchConst => {
+                    source_payload_field.is_none()
+                        && update_constant_id.is_none()
+                        && update_branch_source_ids(op).len() == 1
+                        && root_match_const_inputs_supported(scalar_slots, constants, op)
+                }
                 PlanExpressionKind::NumberInfix
                 | PlanExpressionKind::ProjectTime
                 | PlanExpressionKind::PrefixPayloadConcat
                 | PlanExpressionKind::PrefixRootConcat
-                | PlanExpressionKind::MatchConst
                 | PlanExpressionKind::MatchValueConst
                 | PlanExpressionKind::MatchTextIsEmptyConst
                 | PlanExpressionKind::MatchNumberInfixConst
@@ -1750,6 +1767,20 @@ fn cpu_plan_executor_supports_derived_value_op(
                 _ => false,
             }
         }
+        (
+            false,
+            PlanDerivedKind::SourceEventTransform,
+            PlanDerivedExpression::SourceEventTransform { default, arms, .. },
+        ) => {
+            root_row_expression_cpu_evaluable(default)
+                && row_expression_refs_resolve(op, default)
+                && !arms.is_empty()
+                && arms.iter().all(|arm| {
+                    op.inputs.contains(&ValueRef::Source(arm.source_id))
+                        && root_row_expression_cpu_evaluable(&arm.value)
+                        && row_expression_refs_resolve(op, &arm.value)
+                })
+        }
         (true, PlanDerivedKind::Pure, PlanDerivedExpression::BoolNot { input }) => {
             matches!(
                 input,
@@ -1765,6 +1796,10 @@ fn cpu_plan_executor_supports_derived_value_op(
         }
         (true, PlanDerivedKind::Pure, PlanDerivedExpression::RowExpression { expression }) => {
             row_expression_refs_resolve(op, expression) && row_expression_cpu_evaluable(expression)
+        }
+        (false, PlanDerivedKind::Pure, PlanDerivedExpression::RowExpression { expression }) => {
+            row_expression_refs_resolve(op, expression)
+                && root_row_expression_cpu_evaluable(expression)
         }
         (false, PlanDerivedKind::Pure, expression) => {
             root_bool_expression_cpu_supported(op, expression, supported_list_count_outputs)
@@ -2006,6 +2041,13 @@ fn cpu_plan_executor_supports_indexed_update_op(
                 && (source_payload_field.is_some()
                     || source_payload_inputs_are_empty_or_guard_only(op, source_guard))
         }
+        PlanExpressionKind::MatchTextIsEmptyConst => {
+            source_payload_field.is_none()
+                && update_constant_id.is_none()
+                && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
+                && indexed_match_text_is_empty_const_inputs_supported(scalar_slots, constants, op)
+                && source_payload_inputs_are_empty_or_guard_only(op, source_guard)
+        }
         PlanExpressionKind::FileWriteBytes => {
             source_payload_field.is_none()
                 && update_constant_id.is_none()
@@ -2025,7 +2067,6 @@ fn cpu_plan_executor_supports_indexed_update_op(
         | PlanExpressionKind::PrefixRootConcat
         | PlanExpressionKind::MatchConst
         | PlanExpressionKind::MatchValueConst
-        | PlanExpressionKind::MatchTextIsEmptyConst
         | PlanExpressionKind::MatchNumberInfixConst
         | PlanExpressionKind::ListFindValue
         | PlanExpressionKind::Unknown => false,
@@ -3172,6 +3213,136 @@ fn text_trim_or_previous_inputs_supported(
     }
 }
 
+fn indexed_match_text_is_empty_const_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [input, first_arm, rest @ ..] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    if rest.len() > 1 {
+        return false;
+    }
+    if !text_operand_ref_supported(scalar_slots, constants, input, true) {
+        return false;
+    }
+    if !text_operand_ref_supported(scalar_slots, constants, first_arm, false) {
+        return false;
+    }
+    rest.iter()
+        .all(|operand| text_operand_ref_supported(scalar_slots, constants, operand, false))
+}
+
+fn root_match_const_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let Some(output_type) = output_state_type(scalar_slots, op) else {
+        return false;
+    };
+    if matches!(
+        output_type,
+        PlanValueType::Bytes { .. }
+            | PlanValueType::RootInitialField
+            | PlanValueType::RowInitialField
+            | PlanValueType::Unknown
+    ) {
+        return false;
+    }
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [input, arm_operands @ ..] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    if arm_operands.is_empty() || arm_operands.len() % 2 != 0 {
+        return false;
+    }
+    if !match_const_input_ref_supported(scalar_slots, op, input) {
+        return false;
+    }
+    arm_operands.chunks_exact(2).all(|pair| {
+        match_const_pattern_ref_supported(constants, &pair[0])
+            && match_const_output_ref_supported(constants, output_type, &pair[1])
+    })
+}
+
+fn match_const_input_ref_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    op: &PlanOp,
+    value_ref: &ValueRef,
+) -> bool {
+    match value_ref {
+        ValueRef::State(state_id) => {
+            op.inputs.contains(value_ref)
+                && matches!(
+                    plan_value_type_for_state_slots(scalar_slots, *state_id),
+                    Some(PlanValueType::Text | PlanValueType::Enum)
+                )
+        }
+        ValueRef::SourcePayload { field, .. } => {
+            op.inputs.contains(value_ref) && *field != SourcePayloadField::Bytes
+        }
+        ValueRef::Constant(_) | ValueRef::Field(_) | ValueRef::Source(_) | ValueRef::List(_) => {
+            false
+        }
+    }
+}
+
+fn match_const_pattern_ref_supported(constants: &[PlanConstant], value_ref: &ValueRef) -> bool {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return false;
+    };
+    plan_constant_by_id(constants, *constant_id).is_some_and(|constant| {
+        matches!(
+            constant.value,
+            PlanConstantValue::Text { .. } | PlanConstantValue::Enum { .. }
+        )
+    })
+}
+
+fn match_const_output_ref_supported(
+    constants: &[PlanConstant],
+    output_type: &PlanValueType,
+    value_ref: &ValueRef,
+) -> bool {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return false;
+    };
+    let Some(constant) = plan_constant_by_id(constants, *constant_id) else {
+        return false;
+    };
+    if matches!(
+        &constant.value,
+        PlanConstantValue::Text { value } if value == "SKIP"
+    ) {
+        return true;
+    }
+    constant_value_matches_plan_type(&constant.value, output_type)
+}
+
+fn text_operand_ref_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    value_ref: &ValueRef,
+    allow_source_payload: bool,
+) -> bool {
+    match value_ref {
+        ValueRef::State(state_id) => {
+            plan_value_type_for_state_slots(scalar_slots, *state_id) == Some(&PlanValueType::Text)
+        }
+        ValueRef::Constant(constant_id) => plan_constant_by_id(constants, *constant_id)
+            .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Text { .. })),
+        ValueRef::SourcePayload { .. } => allow_source_payload,
+        ValueRef::Field(_) | ValueRef::Source(_) | ValueRef::List(_) => false,
+    }
+}
+
 pub fn is_unknown_op(op: &PlanOp) -> bool {
     matches!(
         &op.kind,
@@ -3999,6 +4170,18 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         return false;
                     }
                 }
+                PlanExpressionKind::MatchConst if !op.indexed => {
+                    if source_payload_field.is_some()
+                        || update_constant_id.is_some()
+                        || !root_match_const_inputs_supported(
+                            &plan.storage_layout.scalar_slots,
+                            &plan.constants,
+                            op,
+                        )
+                    {
+                        return false;
+                    }
+                }
                 PlanExpressionKind::FileReadBytes => {
                     if source_payload_field.is_some()
                         || update_constant_id.is_some()
@@ -4491,6 +4674,13 @@ fn derived_expression_refs_resolve(plan: &MachinePlan) -> bool {
                         field: key_field.clone(),
                     }) && op.inputs.contains(state)
                 }
+                PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+                    row_expression_refs_resolve(op, default)
+                        && arms.iter().all(|arm| {
+                            op.inputs.contains(&ValueRef::Source(arm.source_id))
+                                && row_expression_refs_resolve(op, &arm.value)
+                        })
+                }
                 PlanDerivedExpression::BoolNot { input } => op.inputs.contains(input),
                 PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
                 PlanDerivedExpression::BoolAnd { left, right } => {
@@ -4519,6 +4709,13 @@ fn derived_expression_refs_resolve_for_op(op: &PlanOp, expression: &PlanDerivedE
                 source_id: *source_id,
                 field: key_field.clone(),
             }) && op.inputs.contains(state)
+        }
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            row_expression_refs_resolve(op, default)
+                && arms.iter().all(|arm| {
+                    op.inputs.contains(&ValueRef::Source(arm.source_id))
+                        && row_expression_refs_resolve(op, &arm.value)
+                })
         }
         PlanDerivedExpression::BoolNot { input } => op.inputs.contains(input),
         PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
@@ -5068,8 +5265,10 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
             input,
             args,
         } => {
-            matches!(function.as_str(), "Text/empty" | "Error/new" | "Error/text")
-                && input.as_deref().is_none_or(row_expression_cpu_evaluable)
+            matches!(
+                function.as_str(),
+                "Text/empty" | "Error/new" | "Error/text" | "Router/route"
+            ) && input.as_deref().is_none_or(row_expression_cpu_evaluable)
                 && args
                     .iter()
                     .all(|arg| row_expression_cpu_evaluable(&arg.value))
@@ -5080,6 +5279,31 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                     .iter()
                     .all(|arm| row_expression_cpu_evaluable(&arm.value))
         }
+    }
+}
+
+fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
+    match expression {
+        PlanRowExpression::Field { .. } | PlanRowExpression::Constant { .. } => true,
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::ObjectField { object: input, .. } => {
+            root_row_expression_cpu_evaluable(input)
+        }
+        PlanRowExpression::TextConcat { parts } => {
+            parts.iter().all(root_row_expression_cpu_evaluable)
+        }
+        PlanRowExpression::BuiltinCall {
+            function,
+            input,
+            args,
+        } => function == "Router/route" && input.is_none() && args.is_empty(),
+        PlanRowExpression::Select { input, arms } => {
+            root_row_expression_cpu_evaluable(input)
+                && arms
+                    .iter()
+                    .all(|arm| root_row_expression_cpu_evaluable(&arm.value))
+        }
+        _ => false,
     }
 }
 

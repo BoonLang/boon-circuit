@@ -4,6 +4,7 @@ use boon_parser::{
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -473,6 +474,7 @@ struct Checker<'a> {
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
     function_args_by_name: BTreeMap<String, Vec<String>>,
     function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
+    function_return_type_cache: RefCell<BTreeMap<String, Option<Type>>>,
     object_bindings: BTreeMap<String, ObjectShape>,
     name_bindings: BTreeMap<String, Type>,
     flow_bindings: BTreeMap<String, FlowMode>,
@@ -480,6 +482,7 @@ struct Checker<'a> {
     expr_type_vars: BTreeMap<usize, TypeVar>,
     runtime_list_map_exprs: BTreeSet<usize>,
     visited: BTreeSet<usize>,
+    expr_type_in_progress: BTreeSet<usize>,
     expr_type_cache: Vec<Option<FlowType>>,
     expr_type_table: ExprTypeTable,
     function_type_table: FunctionTypeTable,
@@ -567,6 +570,7 @@ impl<'a> Checker<'a> {
             function_call_graph,
             function_args_by_name,
             function_arg_call_sites,
+            function_return_type_cache: RefCell::new(BTreeMap::new()),
             object_bindings,
             name_bindings,
             flow_bindings,
@@ -574,6 +578,7 @@ impl<'a> Checker<'a> {
             expr_type_vars: BTreeMap::new(),
             runtime_list_map_exprs: BTreeSet::new(),
             visited: BTreeSet::new(),
+            expr_type_in_progress: BTreeSet::new(),
             expr_type_cache: vec![None; program.expressions.len()],
             expr_type_table: ExprTypeTable::default(),
             function_type_table: FunctionTypeTable::default(),
@@ -661,22 +666,43 @@ impl<'a> Checker<'a> {
         include_type_hints: bool,
         init_profile: CheckerInitProfile,
     ) -> (TypeCheckReport, TypeCheckProfile) {
+        let trace_typecheck = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace_phase = |phase: &str, elapsed_ms: f64| {
+            if trace_typecheck {
+                eprintln!("boon_typecheck {phase}: {elapsed_ms:.3}ms");
+            }
+        };
         let total_started = Instant::now();
         self.collect_type_hints = include_type_hints;
         let recursive_functions_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck recursive_functions:start");
+        }
         self.check_recursive_functions();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
+        trace_phase("recursive_functions", recursive_functions_ms);
         let check_statements_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck check_statements:start");
+        }
         for statement in &self.program.ast.statements {
             self.check_statement(statement, false);
         }
         let check_statements_ms = typecheck_elapsed_ms(check_statements_started);
+        trace_phase("check_statements", check_statements_ms);
         let ensure_all_expressions_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck ensure_all_expressions:start");
+        }
         for expr in &self.program.expressions {
             self.ensure_expr(expr.id);
         }
         let ensure_all_expressions_ms = typecheck_elapsed_ms(ensure_all_expressions_started);
+        trace_phase("ensure_all_expressions", ensure_all_expressions_ms);
         let report_counts_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck report_counts:start");
+        }
         let render_slot_count = self.render_slot_table.slots.len();
         let render_slot_failure_count = self
             .render_slot_table
@@ -703,7 +729,11 @@ impl<'a> Checker<'a> {
             .count();
         let source_payload_shape_table = self.source_payload_shape_table.clone();
         let report_counts_ms = typecheck_elapsed_ms(report_counts_started);
+        trace_phase("report_counts", report_counts_ms);
         let type_hint_table_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck type_hint_table:start");
+        }
         let type_hint_table = if include_type_hints {
             type_hint_table(
                 self.program,
@@ -717,8 +747,15 @@ impl<'a> Checker<'a> {
             TypeHintTable::default()
         };
         let type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
+        trace_phase("type_hint_table", type_hint_table_ms);
+        if trace_typecheck {
+            eprintln!("boon_typecheck resolved_constant_table:start");
+        }
         let resolved_constant_table = resolved_constant_table(self.program);
         let assemble_report_started = Instant::now();
+        if trace_typecheck {
+            eprintln!("boon_typecheck assemble_report:start");
+        }
         let report = TypeCheckReport {
             expression_count: self.program.expressions.len(),
             checked_expression_count: self.visited.len(),
@@ -751,6 +788,7 @@ impl<'a> Checker<'a> {
             diagnostics: std::mem::take(&mut self.diagnostics),
         };
         let assemble_report_ms = typecheck_elapsed_ms(assemble_report_started);
+        trace_phase("assemble_report", assemble_report_ms);
         (
             report,
             TypeCheckProfile {
@@ -779,6 +817,15 @@ impl<'a> Checker<'a> {
     }
 
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
+        if std::env::var_os("BOON_TYPECHECK_STATEMENT_TRACE").is_some() {
+            eprintln!(
+                "boon_typecheck statement kind={:?} expr={:?} line={} children={}",
+                statement.kind,
+                statement.expr,
+                statement.line,
+                statement.children.len()
+            );
+        }
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
@@ -813,10 +860,7 @@ impl<'a> Checker<'a> {
                 name: name.clone(),
                 args: args.clone(),
                 arg_types,
-                result: FlowType {
-                    mode: FlowMode::Continuous,
-                    ty: self.type_for_call(name),
-                },
+                result: self.function_type_hint_result(name),
             });
         }
         if next_in_document
@@ -881,6 +925,34 @@ impl<'a> Checker<'a> {
                 .unwrap_or(ty);
         }
         requirement.unwrap_or_else(open_object_type)
+    }
+
+    fn function_type_hint_result(&self, function: &str) -> FlowType {
+        let builtin = self
+            .builtins
+            .type_for_call(function, &self.render_contracts);
+        if !matches!(builtin, Type::Unknown) {
+            return FlowType {
+                mode: FlowMode::Continuous,
+                ty: builtin,
+            };
+        }
+        let cached = self
+            .function_return_type_cache
+            .borrow()
+            .get(function)
+            .cloned()
+            .flatten();
+        FlowType {
+            mode: FlowMode::Continuous,
+            ty: cached.unwrap_or_else(|| {
+                if self.program.functions.iter().any(|name| name == function) {
+                    open_object_type()
+                } else {
+                    Type::Unknown
+                }
+            }),
+        }
     }
 
     fn function_arg_call_site_type(&self, function: &str, arg: &str) -> Option<Type> {
@@ -1117,6 +1189,13 @@ impl<'a> Checker<'a> {
             return existing;
         }
         let expr_var = self.expr_type_var_key(expr_id);
+        if self.expr_type_in_progress.contains(&expr_id) {
+            return FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(expr_var),
+            };
+        }
+        self.expr_type_in_progress.insert(expr_id);
         self.visited.insert(expr_id);
         let flow_type = self
             .program
@@ -1127,6 +1206,7 @@ impl<'a> Checker<'a> {
                 mode: FlowMode::Continuous,
                 ty: Type::Var(expr_var),
             });
+        self.expr_type_in_progress.remove(&expr_id);
         self.constraints.push(Constraint::Equal {
             left: Type::Var(expr_var),
             right: flow_type.ty.clone(),
@@ -2753,6 +2833,16 @@ impl<'a> Checker<'a> {
         function: &str,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
+        let cacheable = active_functions.is_empty();
+        if cacheable
+            && let Some(cached) = self
+                .function_return_type_cache
+                .borrow()
+                .get(function)
+                .cloned()
+        {
+            return cached;
+        }
         if !active_functions.insert(function.to_owned()) {
             return None;
         }
@@ -2764,6 +2854,11 @@ impl<'a> Checker<'a> {
                 self.function_body_return_type(function, statement, active_functions)
             });
         active_functions.remove(function);
+        if cacheable {
+            self.function_return_type_cache
+                .borrow_mut()
+                .insert(function.to_owned(), result.clone());
+        }
         result
     }
 
@@ -3151,8 +3246,8 @@ impl<'a> Checker<'a> {
         let AstStatementKind::Function { name, .. } = &statement.kind else {
             return false;
         };
-        self.user_function_return_type(name, &mut BTreeSet::new())
-            .is_some_and(|ty| type_contains_renderable(&ty))
+        let _ = name;
+        statement_contains_render_context_syntax(statement, &self.program.expressions)
     }
 
     fn unresolved_type_variable_count(&mut self) -> usize {
@@ -4112,40 +4207,52 @@ fn render_slot_contains_malformed_list_map(
 }
 
 fn expr_contains_list_map(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    expr_contains_list_map_seen(expr_id, expressions, &mut BTreeSet::new())
+}
+
+fn expr_contains_list_map_seen(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    seen: &mut BTreeSet<usize>,
+) -> bool {
+    if !seen.insert(expr_id) {
+        return false;
+    }
     let Some(expr) = expressions.get(expr_id) else {
         return false;
     };
     match &expr.kind {
         AstExprKind::Pipe { input, op, args } => {
             op == "List/map"
-                || expr_contains_list_map(*input, expressions)
+                || expr_contains_list_map_seen(*input, expressions, seen)
                 || args
                     .iter()
-                    .any(|arg| expr_contains_list_map(arg.value, expressions))
+                    .any(|arg| expr_contains_list_map_seen(arg.value, expressions, seen))
         }
         AstExprKind::Call { args, .. } => args
             .iter()
-            .any(|arg| expr_contains_list_map(arg.value, expressions)),
+            .any(|arg| expr_contains_list_map_seen(arg.value, expressions, seen)),
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
-            expr_contains_list_map(*initial, expressions)
+            expr_contains_list_map_seen(*initial, expressions, seen)
         }
         AstExprKind::Then { input, output } => {
-            expr_contains_list_map(*input, expressions)
-                || output.is_some_and(|output| expr_contains_list_map(output, expressions))
+            expr_contains_list_map_seen(*input, expressions, seen)
+                || output
+                    .is_some_and(|output| expr_contains_list_map_seen(output, expressions, seen))
         }
         AstExprKind::MatchArm {
             output: Some(output),
             ..
-        } => expr_contains_list_map(*output, expressions),
+        } => expr_contains_list_map_seen(*output, expressions, seen),
         AstExprKind::Infix { left, right, .. } => {
-            expr_contains_list_map(*left, expressions)
-                || expr_contains_list_map(*right, expressions)
+            expr_contains_list_map_seen(*left, expressions, seen)
+                || expr_contains_list_map_seen(*right, expressions, seen)
         }
         AstExprKind::Record(fields)
         | AstExprKind::Object(fields)
         | AstExprKind::TaggedObject { fields, .. } => fields
             .iter()
-            .any(|field| expr_contains_list_map(field.value, expressions)),
+            .any(|field| expr_contains_list_map_seen(field.value, expressions, seen)),
         _ => false,
     }
 }
@@ -5952,8 +6059,20 @@ fn collect_following_sibling_pipe_continuation_expr_ids(
 }
 
 fn expr_contains_expr_id(root: usize, needle: usize, expressions: &[AstExpr]) -> bool {
+    expr_contains_expr_id_seen(root, needle, expressions, &mut BTreeSet::new())
+}
+
+fn expr_contains_expr_id_seen(
+    root: usize,
+    needle: usize,
+    expressions: &[AstExpr],
+    seen: &mut BTreeSet<usize>,
+) -> bool {
     if root == needle {
         return true;
+    }
+    if !seen.insert(root) {
+        return false;
     }
     let Some(expr) = expressions.get(root) else {
         return false;
@@ -5961,42 +6080,42 @@ fn expr_contains_expr_id(root: usize, needle: usize, expressions: &[AstExpr]) ->
     match &expr.kind {
         AstExprKind::Call { args, .. } => args
             .iter()
-            .any(|arg| expr_contains_expr_id(arg.value, needle, expressions)),
+            .any(|arg| expr_contains_expr_id_seen(arg.value, needle, expressions, seen)),
         AstExprKind::Pipe { input, args, .. } => {
-            expr_contains_expr_id(*input, needle, expressions)
+            expr_contains_expr_id_seen(*input, needle, expressions, seen)
                 || args
                     .iter()
-                    .any(|arg| expr_contains_expr_id(arg.value, needle, expressions))
+                    .any(|arg| expr_contains_expr_id_seen(arg.value, needle, expressions, seen))
         }
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
-            expr_contains_expr_id(*initial, needle, expressions)
+            expr_contains_expr_id_seen(*initial, needle, expressions, seen)
         }
         AstExprKind::Then {
             input,
             output: Some(output),
             ..
         } => {
-            expr_contains_expr_id(*input, needle, expressions)
-                || expr_contains_expr_id(*output, needle, expressions)
+            expr_contains_expr_id_seen(*input, needle, expressions, seen)
+                || expr_contains_expr_id_seen(*output, needle, expressions, seen)
         }
         AstExprKind::Then {
             input,
             output: None,
             ..
-        } => expr_contains_expr_id(*input, needle, expressions),
+        } => expr_contains_expr_id_seen(*input, needle, expressions, seen),
         AstExprKind::MatchArm {
             output: Some(output),
             ..
-        } => expr_contains_expr_id(*output, needle, expressions),
+        } => expr_contains_expr_id_seen(*output, needle, expressions, seen),
         AstExprKind::Infix { left, right, .. } => {
-            expr_contains_expr_id(*left, needle, expressions)
-                || expr_contains_expr_id(*right, needle, expressions)
+            expr_contains_expr_id_seen(*left, needle, expressions, seen)
+                || expr_contains_expr_id_seen(*right, needle, expressions, seen)
         }
         AstExprKind::Record(fields)
         | AstExprKind::Object(fields)
         | AstExprKind::TaggedObject { fields, .. } => fields
             .iter()
-            .any(|field| expr_contains_expr_id(field.value, needle, expressions)),
+            .any(|field| expr_contains_expr_id_seen(field.value, needle, expressions, seen)),
         _ => false,
     }
 }
@@ -6478,6 +6597,96 @@ fn render_constructor_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Optio
             Some(function.as_str())
         }
         _ => None,
+    }
+}
+
+fn statement_contains_render_context_syntax(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    statement_field(statement).as_deref().is_some_and(|field| {
+        matches!(
+            field,
+            "document" | "scene" | "world" | "root" | "child" | "items" | "children"
+        )
+    }) || statement
+        .expr
+        .is_some_and(|expr_id| expr_contains_render_constructor(expr_id, expressions))
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_contains_render_context_syntax(child, expressions))
+}
+
+fn expr_contains_render_constructor(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    expr_contains_render_constructor_seen(expr_id, expressions, &mut BTreeSet::new())
+}
+
+fn expr_contains_render_constructor_seen(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    seen: &mut BTreeSet<usize>,
+) -> bool {
+    if !seen.insert(expr_id) {
+        return false;
+    }
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Call { function, args } => {
+            is_registered_render_constructor(function)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_render_constructor_seen(arg.value, expressions, seen))
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            is_registered_render_constructor(op)
+                || expr_contains_render_constructor_seen(*input, expressions, seen)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_render_constructor_seen(arg.value, expressions, seen))
+        }
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+            expr_contains_render_constructor_seen(*initial, expressions, seen)
+        }
+        AstExprKind::Then { input, output } => {
+            expr_contains_render_constructor_seen(*input, expressions, seen)
+                || output.is_some_and(|output| {
+                    expr_contains_render_constructor_seen(output, expressions, seen)
+                })
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expr_contains_render_constructor_seen(*output, expressions, seen),
+        AstExprKind::Infix { left, right, .. } => {
+            expr_contains_render_constructor_seen(*left, expressions, seen)
+                || expr_contains_render_constructor_seen(*right, expressions, seen)
+        }
+        AstExprKind::Record(fields)
+        | AstExprKind::Object(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .any(|field| expr_contains_render_constructor_seen(field.value, expressions, seen)),
+        AstExprKind::BytesLiteral { items, .. } => items
+            .iter()
+            .any(|item| expr_contains_render_constructor_seen(*item, expressions, seen)),
+        AstExprKind::ListLiteral { .. }
+        | AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => false,
     }
 }
 

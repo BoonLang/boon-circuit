@@ -1408,10 +1408,288 @@ fn derived_expression_for_value(
     _unresolved_refs: &mut BTreeSet<String>,
 ) -> Option<PlanDerivedExpression> {
     source_key_text_trim_non_empty_expression(program, derived, index, inputs)
+        .or_else(|| source_event_transform_expression(program, derived, index, constants, inputs))
         .or_else(|| bool_not_derived_expression(program, derived, index, inputs))
         .or_else(|| number_compare_const_derived_expression(program, derived, index, inputs))
         .or_else(|| root_bool_derived_expression(program, derived, index, inputs))
         .or_else(|| row_expression_for_value(program, derived, index, constants, inputs))
+}
+
+fn source_event_transform_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+) -> Option<PlanDerivedExpression> {
+    if derived.kind != DerivedValueKind::SourceEventTransform {
+        return None;
+    }
+
+    let mut local_constants = constants.clone();
+    let mut local_inputs = inputs.clone();
+    let expr_value_types = expression_value_type_lookup(program);
+    let mut env = BTreeMap::new();
+
+    let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
+    let mut arm_values = Vec::new();
+    for source in &derived.sources {
+        let ValueRef::Source(source_id) = index.resolve(source)? else {
+            continue;
+        };
+        let value = if let Some(value) = super::compiler_source_then_field_value(&exprs, source) {
+            row_expression_from_compiler_field_value(&mut local_constants, &mut local_inputs, value)
+        } else {
+            source_event_transform_text_arm_expression(
+                program,
+                derived,
+                index,
+                &mut local_inputs,
+                source,
+            )?
+        };
+        if !local_inputs.contains(&ValueRef::Source(source_id)) {
+            local_inputs.push(ValueRef::Source(source_id));
+        }
+        arm_values.push((source_id, value));
+    }
+    if arm_values.is_empty() {
+        return None;
+    }
+    let default = source_event_transform_default_expression(
+        program,
+        derived,
+        index,
+        &mut local_constants,
+        &mut local_inputs,
+        &mut env,
+        &expr_value_types,
+    )
+    .unwrap_or_else(|| {
+        let value = if arm_values
+            .iter()
+            .all(|(_, value)| plan_row_expression_is_bool_constant(&local_constants, value))
+        {
+            PlanConstantValue::Bool { value: false }
+        } else {
+            PlanConstantValue::Text {
+                value: String::new(),
+            }
+        };
+        row_constant_expression(&mut local_constants, &mut local_inputs, value)
+    });
+    let arms = arm_values
+        .into_iter()
+        .map(|(source_id, value)| PlanSourceEventTransformArm { source_id, value })
+        .collect::<Vec<_>>();
+
+    *constants = local_constants;
+    *inputs = local_inputs;
+    Some(PlanDerivedExpression::SourceEventTransform {
+        default: Box::new(default),
+        arms,
+        router_route: super::compiler_statement_calls_router_go_to(&exprs),
+    })
+}
+
+fn plan_row_expression_is_bool_constant(
+    constants: &[PlanConstant],
+    expression: &PlanRowExpression,
+) -> bool {
+    let PlanRowExpression::Constant { constant_id } = expression else {
+        return false;
+    };
+    constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Bool { .. }))
+}
+
+fn source_event_transform_text_arm_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+    source: &str,
+) -> Option<PlanRowExpression> {
+    let expression = super::compiler_source_event_transform_text_expression(
+        derived,
+        source,
+        &program.expressions,
+        &program.functions,
+    );
+    if std::env::var_os("BOON_COMPILER_SOURCE_EVENT_TRACE").is_some() {
+        eprintln!(
+            "source_event_transform_text_arm path={} source={} expression={expression:?}",
+            derived.path, source
+        );
+    }
+    match expression {
+        super::CompilerDerivedTextExpression::SourceRootText { path }
+        | super::CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
+            source_event_transform_text_path_expression(
+                program, derived, index, inputs, source, &path,
+            )
+        }
+        _ => {
+            let path =
+                source_event_transform_final_then_source_text_path(program, derived, source)?;
+            if std::env::var_os("BOON_COMPILER_SOURCE_EVENT_TRACE").is_some() {
+                eprintln!(
+                    "source_event_transform_text_arm final_then path={} source={} text_path={path}",
+                    derived.path, source
+                );
+            }
+            source_event_transform_text_path_expression(
+                program, derived, index, inputs, source, &path,
+            )
+        }
+    }
+}
+
+fn source_event_transform_text_path_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+    source: &str,
+    path: &str,
+) -> Option<PlanRowExpression> {
+    let mut input = resolve_update_value_ref(index, source, &derived.path, derived.indexed, path)?;
+    if let ValueRef::SourcePayload {
+        source_id: payload_source_id,
+        field,
+    } = &input
+    {
+        input = source_payload_backing_row_state(
+            program,
+            index,
+            source,
+            *payload_source_id,
+            field,
+            derived.indexed,
+        )?;
+    }
+    if !inputs.contains(&input) {
+        inputs.push(input.clone());
+    }
+    Some(PlanRowExpression::Field { input })
+}
+
+fn source_event_transform_final_then_source_text_path(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    source: &str,
+) -> Option<String> {
+    let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
+    exprs.iter().rev().find_map(|expr| {
+        let AstExprKind::Then {
+            output: Some(output),
+            ..
+        } = expr.kind
+        else {
+            return None;
+        };
+        let path = expression_path_string(program, output)?;
+        matches!(
+            source_payload_field_from_path(source, &path, true),
+            Some(SourcePayloadField::Text)
+        )
+        .then_some(path)
+    })
+}
+
+fn source_payload_backing_row_state(
+    program: &TypedProgram,
+    index: &ValueIndex,
+    source: &str,
+    source_id: SourceId,
+    field: &SourcePayloadField,
+    indexed: bool,
+) -> Option<ValueRef> {
+    program.update_branches.iter().find_map(|branch| {
+        if branch.source != source || branch.indexed != indexed {
+            return None;
+        }
+        if source_payload_field_for_expression(index, source, &branch.expression).as_ref()
+            != Some(field)
+        {
+            return None;
+        }
+        let Some(ValueRef::Source(branch_source_id)) = index.resolve(&branch.source) else {
+            return None;
+        };
+        if branch_source_id != source_id {
+            return None;
+        }
+        match index.resolve(&branch.target)? {
+            ValueRef::State(state_id) => Some(ValueRef::State(state_id)),
+            _ => None,
+        }
+    })
+}
+
+fn source_event_transform_default_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    env: &mut BTreeMap<String, LoweredRowValue>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+) -> Option<PlanRowExpression> {
+    for child in &derived.statement.children {
+        if source_event_transform_statement_mentions_source(program, child, &derived.sources) {
+            continue;
+        }
+        if let Some(value) = lower_row_statement_value(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            child,
+        )
+        .and_then(lowered_scalar)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn source_event_transform_statement_mentions_source(
+    program: &TypedProgram,
+    statement: &AstStatement,
+    sources: &[String],
+) -> bool {
+    let exprs = super::compiler_statement_ast_exprs(statement, &program.expressions);
+    exprs.iter().any(|expr| {
+        let path = match &expr.kind {
+            AstExprKind::Identifier(value) => value.clone(),
+            AstExprKind::Path(parts) => parts.join("."),
+            _ => return false,
+        };
+        sources.iter().any(|source| {
+            source_event_ref_variants(source)
+                .iter()
+                .any(|variant| source_suffix_after_variant(&path, variant).is_some())
+        })
+    })
+}
+
+fn row_expression_from_compiler_field_value(
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    value: super::CompilerFieldValue,
+) -> PlanRowExpression {
+    let value = match value {
+        super::CompilerFieldValue::Text(value) => PlanConstantValue::Text { value },
+        super::CompilerFieldValue::Bool(value) => PlanConstantValue::Bool { value },
+    };
+    row_constant_expression(constants, inputs, value)
 }
 
 fn source_key_text_trim_non_empty_expression(
@@ -1428,6 +1706,11 @@ fn source_key_text_trim_non_empty_expression(
         ValueRef::Source(source_id) => source_id,
         _ => return None,
     };
+    if let Some(expression) = source_key_text_trim_non_empty_runtime_expression(
+        program, derived, index, inputs, source, source_id,
+    ) {
+        return Some(expression);
+    }
     let source_event_statement = derived.statement.children.first()?;
     let AstExprKind::When { input } = &expr_by_id(program, source_event_statement.expr?)?.kind
     else {
@@ -1468,8 +1751,81 @@ fn source_key_text_trim_non_empty_expression(
         source_id,
         field: key_field.clone(),
     };
-    inputs.push(payload_ref);
-    inputs.push(state.clone());
+    let source_ref = ValueRef::Source(source_id);
+    if !inputs.contains(&source_ref) {
+        inputs.push(source_ref);
+    }
+    if !inputs.contains(&payload_ref) {
+        inputs.push(payload_ref);
+    }
+    if !inputs.contains(&state) {
+        inputs.push(state.clone());
+    }
+    Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
+        source_id,
+        key_field,
+        required_key: "Enter".to_owned(),
+        state,
+        skip_empty: true,
+    })
+}
+
+fn source_key_text_trim_non_empty_runtime_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+    source: &str,
+    source_id: SourceId,
+) -> Option<PlanDerivedExpression> {
+    if !index.source_has_payload_field(source, &SourcePayloadField::Key) {
+        return None;
+    }
+    let state = match super::compiler_source_event_transform_text_expression(
+        derived,
+        source,
+        &program.expressions,
+        &program.functions,
+    ) {
+        super::CompilerDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
+            if !index.source_has_payload_field(source, &SourcePayloadField::Text) {
+                return None;
+            }
+            ValueRef::SourcePayload {
+                source_id,
+                field: SourcePayloadField::Text,
+            }
+        }
+        super::CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
+            match resolve_update_value_ref(index, source, &derived.path, derived.indexed, &path)? {
+                ValueRef::State(state_id) => ValueRef::State(state_id),
+                ValueRef::SourcePayload {
+                    source_id,
+                    field: SourcePayloadField::Text,
+                } => ValueRef::SourcePayload {
+                    source_id,
+                    field: SourcePayloadField::Text,
+                },
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let key_field = SourcePayloadField::Key;
+    let payload_ref = ValueRef::SourcePayload {
+        source_id,
+        field: key_field.clone(),
+    };
+    let source_ref = ValueRef::Source(source_id);
+    if !inputs.contains(&source_ref) {
+        inputs.push(source_ref);
+    }
+    if !inputs.contains(&payload_ref) {
+        inputs.push(payload_ref);
+    }
+    if !inputs.contains(&state) {
+        inputs.push(state.clone());
+    }
     Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
         source_id,
         key_field,
@@ -1663,7 +2019,10 @@ fn row_expression_for_value(
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
 ) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::Pure || !derived.indexed {
+    if derived.kind != DerivedValueKind::Pure {
+        return None;
+    }
+    if !derived.indexed && !row_statement_calls_router_route(program, &derived.statement) {
         return None;
     }
     let mut local_constants = constants.clone();
@@ -1686,6 +2045,16 @@ fn row_expression_for_value(
     *constants = local_constants;
     *inputs = local_inputs;
     Some(PlanDerivedExpression::RowExpression { expression })
+}
+
+fn row_statement_calls_router_route(program: &TypedProgram, statement: &AstStatement) -> bool {
+    super::compiler_statement_ast_exprs(statement, &program.expressions)
+        .iter()
+        .any(|expr| match &expr.kind {
+            AstExprKind::Pipe { op, .. } => op == "Router/route",
+            AstExprKind::Call { function, .. } => function == "Router/route",
+            _ => false,
+        })
 }
 
 fn lower_row_expr(
@@ -2107,7 +2476,7 @@ fn row_expression_value_type(
         | PlanRowExpression::NumberInfix { .. }
         | PlanRowExpression::ListSum { .. } => Some(PlanValueType::Number),
         PlanRowExpression::BuiltinCall { function, .. } => match function.as_str() {
-            "Text/empty" | "Error/text" => Some(PlanValueType::Text),
+            "Text/empty" | "Error/text" | "Router/route" => Some(PlanValueType::Text),
             _ => None,
         },
         PlanRowExpression::Select { arms, .. } => {
@@ -2412,6 +2781,7 @@ fn row_generic_builtin(function: &str) -> bool {
     matches!(
         function,
         "Text/empty"
+            | "Router/route"
             | "Text/to_bytes"
             | "Bytes/to_text"
             | "Bytes/to_hex"
@@ -3657,6 +4027,18 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
     }
 }
 
+fn match_const_output_constant_value(
+    value: &str,
+    target_type: &PlanValueType,
+) -> Option<PlanConstantValue> {
+    if value == "SKIP" {
+        return Some(PlanConstantValue::Text {
+            value: value.to_owned(),
+        });
+    }
+    update_constant_value(value, target_type)
+}
+
 fn op(
     next_op: &mut usize,
     kind: PlanOpKind,
@@ -4186,7 +4568,85 @@ fn ordered_update_expression_inputs(
             );
             vec![input, ValueRef::Constant(encoding_constant_id)]
         }
+        UpdateExpression::MatchConst { input, arms } => {
+            let Some(input_ref) = resolve_update_value_ref(index, source, target, indexed, input)
+            else {
+                return Vec::new();
+            };
+            let Some(target_type) = index.state_value_type(target) else {
+                return Vec::new();
+            };
+            let mut refs = vec![input_ref];
+            for arm in arms {
+                let pattern_constant_id = push_plan_constant(
+                    constants,
+                    PlanConstantValue::Text {
+                        value: arm.pattern.clone(),
+                    },
+                );
+                let Some(output_constant) =
+                    match_const_output_constant_value(&arm.output, target_type)
+                else {
+                    return Vec::new();
+                };
+                let output_constant_id = push_plan_constant(constants, output_constant);
+                refs.push(ValueRef::Constant(pattern_constant_id));
+                refs.push(ValueRef::Constant(output_constant_id));
+            }
+            refs
+        }
+        UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+            let Some(input_ref) = resolve_update_value_ref(index, source, target, indexed, input)
+            else {
+                return Vec::new();
+            };
+            let mut refs = vec![input_ref];
+            for pattern in ["True", "False", "__"] {
+                let Some(arm) = arms.iter().find(|arm| arm.pattern == pattern) else {
+                    continue;
+                };
+                let Some(output_ref) = update_value_expression_value_ref(
+                    index,
+                    constants,
+                    source,
+                    target,
+                    indexed,
+                    &arm.output,
+                ) else {
+                    continue;
+                };
+                refs.push(output_ref);
+            }
+            refs
+        }
         _ => Vec::new(),
+    }
+}
+
+fn update_value_expression_value_ref(
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    source: &str,
+    target: &str,
+    indexed: bool,
+    expression: &UpdateValueExpression,
+) -> Option<ValueRef> {
+    match expression {
+        UpdateValueExpression::Const { value } => {
+            let constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: value.clone(),
+                },
+            );
+            Some(ValueRef::Constant(constant_id))
+        }
+        UpdateValueExpression::ReadPath { path } => {
+            resolve_update_value_ref(index, source, target, indexed, path)
+        }
+        UpdateValueExpression::MatchConst { .. }
+        | UpdateValueExpression::NumberInfix { .. }
+        | UpdateValueExpression::MatchNumberInfixConst { .. } => None,
     }
 }
 

@@ -94,6 +94,7 @@ use boon_plan_executor::{
     coalesce_field_set_deltas as coalesce_plan_field_set_deltas,
     collect_root_update_candidate_for_step as collect_plan_root_update_candidate_for_step,
     commit_ordered_root_update_candidates as commit_plan_ordered_root_update_candidates,
+    commit_source_derived_values_to_root_state as commit_plan_source_derived_values_to_root_state,
     decode_expected_source_event as decode_plan_expected_source_event,
     demand_current_field_paths as plan_demand_current_field_paths,
     demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
@@ -4250,6 +4251,12 @@ fn execute_machine_plan_root_scenario_inner(
             executed_derived_value_count += 1;
         }
         derived.extend(source_derived_step.reports);
+        let root_source_derived_commits = commit_plan_source_derived_values_to_root_state(
+            plan,
+            &mut root_state.root_state,
+            &derived_values,
+        );
+        derived.extend(root_source_derived_commits);
 
         let append_result = append_plan_list_rows_for_derived_values_with(
             plan,
@@ -4735,6 +4742,14 @@ fn execute_indexed_update_branch(
         row_resolution_cache.insert(cache_key, row_index);
         row_index
     };
+    let source_transform_deltas = apply_indexed_source_event_transforms_for_row(
+        plan,
+        source_id,
+        list_slot,
+        &list_label,
+        list_state,
+        row_index,
+    )?;
     let rows = list_state
         .get_mut(&list_slot.list_id.0)
         .ok_or_else(|| format!("list state missing list {}", list_slot.list_id.0))?;
@@ -4766,6 +4781,13 @@ fn execute_indexed_update_branch(
         row,
         root_derived_values,
     )?;
+    if json_evaluation.supported && json_evaluation.value.is_none() {
+        return Ok(IndexedUpdateBranchExecution {
+            semantic_deltas: source_transform_deltas,
+            report_rows: Vec::new(),
+            updated_row_count: 0,
+        });
+    }
     let (value, bytes_value, expression_kind, update_constant_id, update_constant_value) =
         if json_evaluation.supported {
             (
@@ -5078,6 +5100,7 @@ fn execute_indexed_update_branch(
             "value": value,
         }));
     }
+    semantic_deltas.extend(source_transform_deltas);
     semantic_deltas.extend(derived_deltas);
     Ok(IndexedUpdateBranchExecution {
         semantic_deltas,
@@ -6885,6 +6908,78 @@ fn refresh_indexed_derived_fields_for_row(
     )
 }
 
+fn apply_indexed_source_event_transforms_for_row(
+    plan: &MachinePlan,
+    source_id: SourceId,
+    list_slot: &boon_plan::ListStorageSlot,
+    list_label: &str,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    row_index: usize,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut row_eval = list_state
+        .get(&list_slot.list_id.0)
+        .and_then(|rows| rows.get(row_index))
+        .cloned()
+        .ok_or_else(|| format!("row index {row_index} missing in `{list_label}`"))?;
+    let mut changed_fields = Vec::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if !op.indexed {
+            continue;
+        }
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        if !plan_row_expression_applies_to_list(plan, list_slot, output_id) {
+            continue;
+        }
+        let PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+            expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(arm) = arms.iter().find(|arm| arm.source_id == source_id) else {
+            continue;
+        };
+        let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
+        let value = eval_plan_row_expression(plan, list_state, &row_eval, &arm.value)?;
+        if row_eval.fields.get(&output_name) == Some(&value) {
+            continue;
+        }
+        row_eval.fields.insert(output_name.clone(), value.clone());
+        changed_fields.push((output_name, value));
+    }
+    if changed_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    let row = list_state
+        .get_mut(&list_slot.list_id.0)
+        .and_then(|rows| rows.get_mut(row_index))
+        .ok_or_else(|| format!("row index {row_index} missing in `{list_label}`"))?;
+    let mut deltas = Vec::new();
+    for (field_name, value) in changed_fields {
+        row.fields.insert(field_name.clone(), value.clone());
+        deltas.push(json!({
+            "kind": "FieldSet",
+            "list_id": list_label,
+            "key": row.key,
+            "generation": row.generation,
+            "source_id": null,
+            "bind_epoch": null,
+            "field_path": field_name,
+            "value": value,
+        }));
+    }
+    Ok(deltas)
+}
+
 #[derive(Clone, Copy)]
 struct IndexedDerivedRefreshOptions<'a> {
     suppress_recursive_cycle_values: bool,
@@ -7271,6 +7366,12 @@ fn plan_derived_expression_contains_state(
     match expression {
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state, .. } => {
             *state == ValueRef::State(state_id)
+        }
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            plan_row_expression_contains_state(default, state_id)
+                || arms
+                    .iter()
+                    .any(|arm| plan_row_expression_contains_state(&arm.value, state_id))
         }
         PlanDerivedExpression::BoolNot { input } => *input == ValueRef::State(state_id),
         PlanDerivedExpression::BoolAnd { left, right } => {

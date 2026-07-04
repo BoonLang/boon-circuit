@@ -1030,14 +1030,24 @@ fn lower_profiled_with_typecheck(
     program: &ParsedProgram,
     include_type_hints: bool,
 ) -> Result<(TypedProgram, serde_json::Value), String> {
+    let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
+    let trace_phase = |phase: &str, elapsed_ms: f64| {
+        if trace_lower {
+            eprintln!("boon_ir lower {phase}: {elapsed_ms:.3}ms");
+        }
+    };
     let total_started = Instant::now();
     let typecheck_started = Instant::now();
+    if trace_lower {
+        eprintln!("boon_ir lower typecheck:start");
+    }
     let (typecheck_report, typecheck_profile) = if include_type_hints {
         boon_typecheck::check_profiled(program)
     } else {
         boon_typecheck::check_runtime_profiled(program)
     };
     let typecheck_ms = lower_elapsed_ms(typecheck_started);
+    trace_phase("typecheck", typecheck_ms);
     if typecheck_report.has_errors() {
         let messages = typecheck_report
             .diagnostics
@@ -1053,15 +1063,19 @@ fn lower_profiled_with_typecheck(
     let nodes_started = Instant::now();
     let nodes = source_driven_nodes(program);
     let nodes_ms = lower_elapsed_ms(nodes_started);
+    trace_phase("source_driven_nodes", nodes_ms);
     let fields_started = Instant::now();
     let fields = typed_field_defs(program);
     let fields_ms = lower_elapsed_ms(fields_started);
+    trace_phase("typed_field_defs", fields_ms);
     let direct_sources_started = Instant::now();
     let direct_sources = direct_source_refs_by_path(&fields, program);
     let direct_sources_ms = lower_elapsed_ms(direct_sources_started);
+    trace_phase("direct_source_refs", direct_sources_ms);
     let row_scopes_started = Instant::now();
     let row_scopes = row_scopes(program);
     let row_scopes_ms = lower_elapsed_ms(row_scopes_started);
+    trace_phase("row_scopes", row_scopes_ms);
     let sources_started = Instant::now();
     let sources = program
         .source_ports
@@ -1076,6 +1090,7 @@ fn lower_profiled_with_typecheck(
         })
         .collect::<Vec<_>>();
     let sources_ms = lower_elapsed_ms(sources_started);
+    trace_phase("sources", sources_ms);
     let state_cells_started = Instant::now();
     let state_cells = program
         .state_cells
@@ -1098,9 +1113,11 @@ fn lower_profiled_with_typecheck(
         })
         .collect::<Vec<_>>();
     let state_cells_ms = lower_elapsed_ms(state_cells_started);
+    trace_phase("state_cells", state_cells_ms);
     let verify_cycles_started = Instant::now();
     verify_combinational_field_cycles(&fields, &state_cells)?;
     let verify_cycles_ms = lower_elapsed_ms(verify_cycles_started);
+    trace_phase("verify_combinational_field_cycles", verify_cycles_ms);
     let lists_started = Instant::now();
     let lists = program
         .list_memories
@@ -1118,6 +1135,7 @@ fn lower_profiled_with_typecheck(
         })
         .collect::<Vec<_>>();
     let lists_ms = lower_elapsed_ms(lists_started);
+    trace_phase("lists", lists_ms);
     if nodes
         .iter()
         .any(|node| matches!(node.kind, IrNodeKind::ListMap) && !node.indexed)
@@ -1128,9 +1146,11 @@ fn lower_profiled_with_typecheck(
     let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources);
     let dependencies = dependency_edges(program, &state_cells, &mut candidate_sources);
     let dependencies_ms = lower_elapsed_ms(dependencies_started);
+    trace_phase("dependency_edges", dependencies_ms);
     let possible_causes_started = Instant::now();
     let possible_causes = possible_causes(&state_cells, &mut candidate_sources);
     let possible_causes_ms = lower_elapsed_ms(possible_causes_started);
+    trace_phase("possible_causes", possible_causes_ms);
     let update_branches_started = Instant::now();
     let resolved_constants = ResolvedConstantLookup::new(&typecheck_report);
     let update_branches = update_branches(
@@ -1142,25 +1162,32 @@ fn lower_profiled_with_typecheck(
         &resolved_constants,
     );
     let update_branches_ms = lower_elapsed_ms(update_branches_started);
+    trace_phase("update_branches", update_branches_ms);
     let list_operations_started = Instant::now();
-    let list_operations = list_operations(program);
+    let list_operations = list_operations(program, &typecheck_report);
     let list_operations_ms = lower_elapsed_ms(list_operations_started);
+    trace_phase("list_operations", list_operations_ms);
     let list_projections_started = Instant::now();
     let list_projections = list_projections(program);
     let list_projections_ms = lower_elapsed_ms(list_projections_started);
+    trace_phase("list_projections", list_projections_ms);
     let functions_started = Instant::now();
     let functions = function_definitions(program);
     let functions_ms = lower_elapsed_ms(functions_started);
+    trace_phase("function_definitions", functions_ms);
     let output_values_started = Instant::now();
     let output_values = output_root_values(program, &typecheck_report);
     let output_values_ms = lower_elapsed_ms(output_values_started);
+    trace_phase("output_values", output_values_ms);
     let derived_values_started = Instant::now();
     let derived_values =
         derived_values(program, &row_scopes, &fields, &state_cells, &direct_sources);
     let derived_values_ms = lower_elapsed_ms(derived_values_started);
+    trace_phase("derived_values", derived_values_ms);
     let view_bindings_started = Instant::now();
     let view_bindings = view_bindings(program, &row_scopes, &sources, &typecheck_report);
     let view_bindings_ms = lower_elapsed_ms(view_bindings_started);
+    trace_phase("view_bindings", view_bindings_ms);
     let expression_coverage_started = Instant::now();
     let expression_coverage = expression_coverage(
         program,
@@ -1172,6 +1199,7 @@ fn lower_profiled_with_typecheck(
         &list_operations,
     );
     let expression_coverage_ms = lower_elapsed_ms(expression_coverage_started);
+    trace_phase("expression_coverage", expression_coverage_ms);
     let semantic_index_started = Instant::now();
     let semantic_index = semantic_index(
         program,
@@ -1185,6 +1213,7 @@ fn lower_profiled_with_typecheck(
         &typecheck_report,
     );
     let semantic_index_ms = lower_elapsed_ms(semantic_index_started);
+    trace_phase("semantic_index", semantic_index_ms);
     let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
@@ -1213,12 +1242,15 @@ fn lower_profiled_with_typecheck(
     let verify_static_started = Instant::now();
     verify_static_schedule(&typed)?;
     let verify_static_ms = lower_elapsed_ms(verify_static_started);
+    trace_phase("verify_static_schedule", verify_static_ms);
     let verify_hidden_started = Instant::now();
     verify_hidden_identity(&typed)?;
     let verify_hidden_ms = lower_elapsed_ms(verify_hidden_started);
+    trace_phase("verify_hidden_identity", verify_hidden_ms);
     let representation_analysis_started = Instant::now();
     let representation_analysis = representation_analysis(program, &typed);
     let representation_analysis_ms = lower_elapsed_ms(representation_analysis_started);
+    trace_phase("representation_analysis", representation_analysis_ms);
     let profile = serde_json::json!({
         "typecheck_ms": typecheck_ms,
         "typecheck_profile": typecheck_profile,
@@ -6749,7 +6781,10 @@ fn derived_then_empty_update_branches(
     branches
 }
 
-fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
+fn list_operations(
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<ListOperation> {
     let fields = typed_field_defs(program);
     let mut operations = Vec::new();
     for field in &fields {
@@ -6779,11 +6814,19 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                 || field.has_token("List/remove")
                 || (field.has_operator("List/retain") && branch.has_token("False"))
             {
-                let row_scope = row_scope_for_list(program, list_name);
+                let canonical_row_scope = row_scope_for_list(program, list_name);
+                let row_scope = ast_call_argument(field, "List/retain")
+                    .or_else(|| canonical_row_scope.map(str::to_owned));
                 operations.push(ListOperation {
                     list: list_name.to_owned(),
                     kind: ListOperationKind::Remove {
-                        predicate: list_remove_predicate(field, &source, &branch, row_scope),
+                        predicate: list_remove_predicate(
+                            field,
+                            &source,
+                            &branch,
+                            row_scope.as_deref(),
+                            canonical_row_scope,
+                        ),
                         source,
                     },
                 });
@@ -6798,20 +6841,28 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
             let row_scope = row_scope_for_list(program, &list)
                 .map(str::to_owned)
                 .or_else(|| ast_call_argument(field, "List/count"));
+            let canonical_row_scope = row_scope_for_list(program, &list);
             operations.push(ListOperation {
                 list,
                 kind: ListOperationKind::Count {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(field, row_scope.as_deref()),
+                    predicate: list_retain_predicate(
+                        field,
+                        row_scope.as_deref(),
+                        canonical_row_scope,
+                    ),
                 },
             });
-        } else if field.has_operator("List/retain") && !field_retains_into_materialized_map(field) {
+        } else if field.has_operator("List/retain") {
             let Some(list) = count_or_retain_source_list(field, program) else {
                 continue;
             };
+            let canonical_row_scope = row_scope_for_list(program, &list);
             let row_scope = ast_call_argument(field, "List/retain")
-                .or_else(|| row_scope_for_list(program, &list).map(str::to_owned));
-            for source in retain_remove_sources(field, program, row_scope.as_deref()) {
+                .or_else(|| canonical_row_scope.map(str::to_owned));
+            for source in
+                retain_remove_sources(field, program, row_scope.as_deref(), canonical_row_scope)
+            {
                 let branch = field.source_branch(&source).unwrap_or_default();
                 operations.push(ListOperation {
                     list: list.clone(),
@@ -6821,6 +6872,7 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                             &source,
                             &branch,
                             row_scope.as_deref(),
+                            canonical_row_scope,
                         ),
                         source,
                     },
@@ -6830,29 +6882,305 @@ fn list_operations(program: &ParsedProgram) -> Vec<ListOperation> {
                 list,
                 kind: ListOperationKind::Retain {
                     target: field.path.clone(),
-                    predicate: list_retain_predicate(field, row_scope.as_deref()),
+                    predicate: list_retain_predicate(
+                        field,
+                        row_scope.as_deref(),
+                        canonical_row_scope,
+                    ),
                 },
             });
         }
     }
+    append_render_materialization_list_operations(
+        program,
+        typecheck_report,
+        &fields,
+        &mut operations,
+    );
     operations
 }
 
-fn field_retains_into_materialized_map(field: &FieldDef) -> bool {
-    let Some(first_retain_id) = field
+fn append_render_materialization_list_operations(
+    program: &ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+    fields: &[FieldDef],
+    operations: &mut Vec<ListOperation>,
+) {
+    for binding in &typecheck_report.list_map_bindings {
+        if binding.result_kind != boon_typecheck::ListMapResultKind::RenderSlotMaterialization {
+            continue;
+        }
+        let Some(field) =
+            synthetic_render_list_field(program, binding.list_expr_id, binding.map_expr_id)
+        else {
+            continue;
+        };
+        if !field.has_operator("List/retain") {
+            continue;
+        }
+        let Some(list) =
+            source_list_from_program_expr(program, binding.list_expr_id).and_then(|source| {
+                let list_name = source.strip_prefix("store.").unwrap_or(&source);
+                program
+                    .list_memories
+                    .iter()
+                    .any(|list| list.name == list_name)
+                    .then(|| list_name.to_owned())
+            })
+        else {
+            continue;
+        };
+        let canonical_row_scope_owned = canonical_row_scope_for_materialized_list(program, &list);
+        let canonical_row_scope = canonical_row_scope_owned.as_deref();
+        let row_scope = ast_call_argument(&field, "List/retain")
+            .or_else(|| inferred_row_scope_from_exprs(&field.ast_exprs))
+            .or_else(|| canonical_row_scope.map(str::to_owned));
+        let operation = ListOperation {
+            list: list.clone(),
+            kind: ListOperationKind::Retain {
+                target: format!("store.{list}"),
+                predicate: render_materialization_retain_predicate(
+                    fields,
+                    &field,
+                    &list,
+                    row_scope.as_deref(),
+                    canonical_row_scope,
+                )
+                .unwrap_or_else(|| {
+                    list_retain_predicate(&field, row_scope.as_deref(), canonical_row_scope)
+                }),
+            },
+        };
+        if !operations.contains(&operation) {
+            operations.push(operation);
+        }
+    }
+}
+
+fn render_materialization_retain_predicate(
+    fields: &[FieldDef],
+    field: &FieldDef,
+    list: &str,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let materialized_canonical_row_scope =
+        singular_row_scope_for_list(list).or_else(|| canonical_row_scope.map(str::to_owned));
+    let materialized_canonical_row_scope = materialized_canonical_row_scope.as_deref();
+    field
         .ast_exprs
         .iter()
-        .filter_map(|expr| {
-            matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "List/retain")
-                .then_some(expr.id)
+        .find_map(|expr| {
+            selected_filter_predicate_from_when_or_while_expr(
+                fields,
+                field,
+                expr.id,
+                row_scope,
+                materialized_canonical_row_scope,
+            )
         })
-        .min()
-    else {
-        return false;
+        .or_else(|| {
+            render_materialization_selected_filter_fallback(
+                fields,
+                field,
+                list,
+                row_scope,
+                materialized_canonical_row_scope,
+            )
+        })
+}
+
+fn inferred_row_scope_from_exprs(exprs: &[AstExpr]) -> Option<String> {
+    bool_not_path_in_exprs(exprs)
+        .or_else(|| row_field_path_in_exprs(exprs, Some("item"), None))
+        .and_then(|path| path.split('.').next().map(str::to_owned))
+}
+
+fn selected_filter_predicate_from_when_or_while_expr(
+    fields: &[FieldDef],
+    field: &FieldDef,
+    expr_id: usize,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let expr = field_expr(field, expr_id)?;
+    let input = match &expr.kind {
+        AstExprKind::When { input } => *input,
+        AstExprKind::Pipe { input, op, .. } if op == "WHILE" => *input,
+        _ => return None,
     };
-    field.ast_exprs.iter().any(|expr| {
-        expr.id > first_retain_id
-            && matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "List/map")
+    let selector = ast_argument_value(field, input)?;
+    if selector.is_empty() {
+        return None;
+    }
+    let row_field =
+        selected_filter_row_field_for_when(field, expr_id, row_scope, canonical_row_scope)?;
+    let row_field = canonical_row_field_path_from_raw(&row_field, row_scope, canonical_row_scope)
+        .unwrap_or(row_field);
+    Some(ListPredicate::SelectedFilterVisibility {
+        selector: canonical_selector_path(fields, field, &selector),
+        row_field,
+    })
+}
+
+fn canonical_selector_path(fields: &[FieldDef], field: &FieldDef, selector: &str) -> String {
+    if selector.contains('.') {
+        return selector.to_owned();
+    }
+    let store_path = format!("store.{selector}");
+    if fields.iter().any(|field| field.path == store_path) {
+        return store_path;
+    }
+    canonical_local_path(selector, &field.parent_path)
+}
+
+fn render_materialization_selected_filter_fallback(
+    fields: &[FieldDef],
+    field: &FieldDef,
+    list: &str,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let selector = field.ast_exprs.iter().find_map(|expr| match &expr.kind {
+        AstExprKind::Identifier(name) if name.contains("filter") => Some(name.clone()),
+        AstExprKind::Path(parts) if parts.last().is_some_and(|part| part.contains("filter")) => {
+            Some(parts.join("."))
+        }
+        _ => None,
+    })?;
+    let canonical_row_scope_owned = canonical_row_scope
+        .map(str::to_owned)
+        .or_else(|| singular_row_scope_for_list(list));
+    let canonical_row_scope = canonical_row_scope_owned.as_deref();
+    let raw_row_field = bool_not_path_in_exprs(&field.ast_exprs)
+        .or_else(|| row_field_path_in_exprs(&field.ast_exprs, row_scope, canonical_row_scope))?;
+    let row_field =
+        canonical_row_field_path_from_raw(&raw_row_field, row_scope, canonical_row_scope)
+            .unwrap_or(raw_row_field);
+    Some(ListPredicate::SelectedFilterVisibility {
+        selector: canonical_selector_path(fields, field, &selector),
+        row_field,
+    })
+}
+
+fn canonical_row_scope_for_materialized_list(
+    program: &ParsedProgram,
+    list: &str,
+) -> Option<String> {
+    let from_list = singular_row_scope_for_list(list);
+    match row_scope_for_list(program, list) {
+        Some(scope) if matches!(scope, "item" | "row" | "old" | "new") => from_list,
+        Some(scope) => Some(scope.to_owned()),
+        None => from_list,
+    }
+}
+
+fn singular_row_scope_for_list(list: &str) -> Option<String> {
+    list.strip_suffix('s')
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn source_list_from_program_expr(program: &ParsedProgram, expr_id: usize) -> Option<String> {
+    let expr = program
+        .ast
+        .expressions
+        .iter()
+        .find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
+        AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
+        AstExprKind::Path(parts) if parts.len() == 2 && parts.first()? == "store" => {
+            Some(parts.join("."))
+        }
+        AstExprKind::Pipe { input, .. } => source_list_from_program_expr(program, *input)
+            .or_else(|| previous_source_list_program_expr(program, *input)),
+        _ => None,
+    }
+}
+
+fn previous_source_list_program_expr(program: &ParsedProgram, before_id: usize) -> Option<String> {
+    program
+        .ast
+        .expressions
+        .iter()
+        .filter(|candidate| candidate.id < before_id)
+        .rev()
+        .find_map(|candidate| {
+            let source = match &candidate.kind {
+                AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
+                AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
+                AstExprKind::Path(parts) if parts.len() == 2 && parts.first()? == "store" => {
+                    Some(parts.join("."))
+                }
+                AstExprKind::Pipe { .. } => source_list_from_program_expr(program, candidate.id),
+                _ => None,
+            }?;
+            source_is_program_list(program, &source).then_some(source)
+        })
+}
+
+fn source_is_program_list(program: &ParsedProgram, source: &str) -> bool {
+    let list_name = source.strip_prefix("store.").unwrap_or(source);
+    program
+        .list_memories
+        .iter()
+        .any(|list| list.name == list_name)
+}
+
+fn synthetic_render_list_field(
+    program: &ParsedProgram,
+    expr_id: usize,
+    end_expr_id: usize,
+) -> Option<FieldDef> {
+    let expr = program
+        .ast
+        .expressions
+        .iter()
+        .find(|expr| expr.id == expr_id)?;
+    let start_line = expr.line;
+    let statement = AstStatement {
+        id: usize::MAX.saturating_sub(expr_id),
+        line: expr.line,
+        indent: 0,
+        start: expr.start,
+        end: expr.end,
+        kind: AstStatementKind::Expression,
+        expr: Some(expr_id),
+        children: Vec::new(),
+    };
+    let mut expr_ids = Vec::new();
+    collect_expr_tree(expr_id, program, &mut Vec::new(), &mut expr_ids);
+    let end_line = program
+        .ast
+        .expressions
+        .iter()
+        .find(|expr| expr.id == end_expr_id)
+        .map(|expr| expr.line)
+        .unwrap_or(expr.line);
+    for expr in &program.ast.expressions {
+        if expr.line >= start_line && expr.line <= end_line && !expr_ids.contains(&expr.id) {
+            collect_expr_tree(expr.id, program, &mut Vec::new(), &mut expr_ids);
+        }
+    }
+    let ast_exprs = expr_ids
+        .into_iter()
+        .filter_map(|id| {
+            program
+                .ast
+                .expressions
+                .iter()
+                .find(|expr| expr.id == id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    Some(FieldDef {
+        path: format!("render.materialized.expr_{expr_id}"),
+        local_name: format!("expr_{expr_id}"),
+        parent_path: "render.materialized".to_owned(),
+        ast_exprs,
+        ast_items: Vec::new(),
+        statement,
     })
 }
 
@@ -8440,6 +8768,7 @@ fn retain_remove_sources(
     field: &FieldDef,
     program: &ParsedProgram,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Vec<String> {
     let mut sources = direct_source_refs(field, program)
         .into_iter()
@@ -8449,11 +8778,12 @@ fn retain_remove_sources(
                 .iter()
                 .find(|port| port.path == *source)
                 .is_some_and(|port| port.scoped);
-            scoped || retain_source_predicate(field, source, row_scope).is_some()
+            scoped
+                || retain_source_predicate(field, source, row_scope, canonical_row_scope).is_some()
         })
         .collect::<Vec<_>>();
     for source in &program.source_ports {
-        if retain_source_predicate(field, &source.path, row_scope).is_some() {
+        if retain_source_predicate(field, &source.path, row_scope, canonical_row_scope).is_some() {
             push_unique(&mut sources, source.path.clone());
         }
     }
@@ -8482,6 +8812,7 @@ fn list_retain_remove_predicate(
     source: &str,
     branch: &RoutedBranch,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> ListPredicate {
     if !source.starts_with("store.")
         && source
@@ -8493,28 +8824,35 @@ fn list_retain_remove_predicate(
     if branch.has_token("False") {
         return ListPredicate::AlwaysTrue;
     }
-    if let Some(retain_predicate) = retain_source_predicate(field, source, row_scope)
+    if let Some(retain_predicate) =
+        retain_source_predicate(field, source, row_scope, canonical_row_scope)
         && let Some(remove_predicate) = invert_retain_predicate(retain_predicate)
     {
         return remove_predicate;
     }
-    list_remove_predicate(field, source, branch, row_scope)
+    list_remove_predicate(field, source, branch, row_scope, canonical_row_scope)
 }
 
 fn retain_source_predicate(
     field: &FieldDef,
     source: &str,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<ListPredicate> {
-    list_remove_predicate_from_then_output(field, source, row_scope).or_else(|| {
-        let branch = field.source_branch(source)?;
-        let path = row_field_path_in_exprs(branch.ast_exprs(), row_scope)?;
-        if branch.bool_not_path().as_deref() == Some(path.as_str()) {
-            Some(ListPredicate::RowFieldBoolNot { path })
-        } else {
-            Some(ListPredicate::RowFieldBool { path })
-        }
-    })
+    list_remove_predicate_from_then_output(field, source, row_scope, canonical_row_scope).or_else(
+        || {
+            let branch = field.source_branch(source)?;
+            let path = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)?;
+            let bool_not_path = branch.bool_not_path().and_then(|path| {
+                canonical_row_field_path_from_raw(&path, row_scope, canonical_row_scope)
+            });
+            if bool_not_path.as_deref() == Some(path.as_str()) {
+                Some(ListPredicate::RowFieldBoolNot { path })
+            } else {
+                Some(ListPredicate::RowFieldBool { path })
+            }
+        },
+    )
 }
 
 fn invert_retain_predicate(predicate: ListPredicate) -> Option<ListPredicate> {
@@ -8532,6 +8870,7 @@ fn list_remove_predicate(
     source: &str,
     branch: &RoutedBranch,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> ListPredicate {
     if source
         .split('.')
@@ -8539,18 +8878,27 @@ fn list_remove_predicate(
     {
         return ListPredicate::AlwaysTrue;
     }
-    if let Some(predicate) = list_remove_predicate_from_then_output(field, source, row_scope) {
+    if let Some(predicate) =
+        list_remove_predicate_from_then_output(field, source, row_scope, canonical_row_scope)
+    {
         return predicate;
     }
     if branch.has_bool_expr(true) {
         return ListPredicate::AlwaysTrue;
     }
-    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope)
-        && branch.bool_not_path().as_deref() == Some(path.as_str())
+    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)
+        && branch
+            .bool_not_path()
+            .and_then(|bool_not_path| {
+                canonical_row_field_path_from_raw(&bool_not_path, row_scope, canonical_row_scope)
+            })
+            .as_deref()
+            == Some(path.as_str())
     {
         return ListPredicate::RowFieldBoolNot { path };
     }
-    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope) {
+    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)
+    {
         return ListPredicate::RowFieldBool { path };
     }
     ListPredicate::Unknown {
@@ -8562,6 +8910,7 @@ fn list_remove_predicate_from_then_output(
     field: &FieldDef,
     source: &str,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<ListPredicate> {
     field.ast_exprs.iter().find_map(|expr| {
         let AstExprKind::Then {
@@ -8582,7 +8931,7 @@ fn list_remove_predicate_from_then_output(
         if !matches_source {
             return None;
         }
-        list_predicate_from_expr(field, output, row_scope)
+        list_predicate_from_expr(field, output, row_scope, canonical_row_scope)
     })
 }
 
@@ -8597,16 +8946,22 @@ fn list_predicate_from_expr(
     field: &FieldDef,
     expr_id: usize,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<ListPredicate> {
     let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
     match &expr.kind {
         AstExprKind::Bool(true) => Some(ListPredicate::AlwaysTrue),
-        AstExprKind::Latest => latest_default_list_predicate(field, expr_id, row_scope),
+        AstExprKind::Latest => {
+            latest_default_list_predicate(field, expr_id, row_scope, canonical_row_scope)
+        }
+        AstExprKind::When { .. } => {
+            selected_filter_predicate_from_when_expr(field, expr_id, row_scope, canonical_row_scope)
+        }
         AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            row_field_path_from_expr(field, *input, row_scope)
+            row_field_path_from_expr(field, *input, row_scope, canonical_row_scope)
                 .map(|path| ListPredicate::RowFieldBoolNot { path })
         }
-        _ => row_field_path_from_expr(field, expr_id, row_scope)
+        _ => row_field_path_from_expr(field, expr_id, row_scope, canonical_row_scope)
             .map(|path| ListPredicate::RowFieldBool { path }),
     }
 }
@@ -8615,13 +8970,16 @@ fn latest_default_list_predicate(
     field: &FieldDef,
     latest_expr_id: usize,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<ListPredicate> {
     let statement = statement_containing_expr(&field.statement, latest_expr_id)?;
     statement
         .children
         .iter()
         .find_map(|child| child.expr)
-        .and_then(|expr_id| list_predicate_from_expr(field, expr_id, row_scope))
+        .and_then(|expr_id| {
+            list_predicate_from_expr(field, expr_id, row_scope, canonical_row_scope)
+        })
 }
 
 fn statement_containing_expr(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
@@ -8638,31 +8996,40 @@ fn row_field_path_from_expr(
     field: &FieldDef,
     expr_id: usize,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<String> {
     let row_scope = row_scope?;
     let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
     let AstExprKind::Path(parts) = &expr.kind else {
         return None;
     };
-    row_field_path_from_parts(parts, row_scope)
+    row_field_path_from_parts(parts, row_scope, canonical_row_scope)
 }
 
-fn list_retain_predicate(field: &FieldDef, row_scope: Option<&str>) -> ListPredicate {
-    if let Some(selector) = selected_filter_selector(field)
-        && let Some(row_field) = row_field_path_in_exprs(&field.ast_exprs, row_scope)
+fn list_retain_predicate(
+    field: &FieldDef,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> ListPredicate {
+    if let Some(predicate) =
+        list_retain_predicate_from_ast_arg(field, row_scope, canonical_row_scope)
     {
-        return ListPredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        };
+        return predicate;
     }
-    if let Some(predicate) = list_retain_predicate_from_ast_arg(field, row_scope) {
+    if let Some(predicate) = field.ast_exprs.iter().find_map(|expr| match expr.kind {
+        AstExprKind::When { .. } => {
+            selected_filter_predicate_from_when_expr(field, expr.id, row_scope, canonical_row_scope)
+        }
+        _ => None,
+    }) {
         return predicate;
     }
     if let Some(path) = bool_not_path_in_exprs(&field.ast_exprs) {
+        let path = canonical_row_field_path_from_raw(&path, row_scope, canonical_row_scope)
+            .unwrap_or(path);
         return ListPredicate::RowFieldBoolNot { path };
     }
-    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope) {
+    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope, canonical_row_scope) {
         return ListPredicate::RowFieldBool { path };
     }
     ListPredicate::Unknown {
@@ -8677,6 +9044,7 @@ fn list_retain_predicate(field: &FieldDef, row_scope: Option<&str>) -> ListPredi
 fn list_retain_predicate_from_ast_arg(
     field: &FieldDef,
     row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
 ) -> Option<ListPredicate> {
     let retain = field.ast_exprs.iter().find(|expr| {
         matches!(
@@ -8691,7 +9059,7 @@ fn list_retain_predicate_from_ast_arg(
         .iter()
         .find(|arg| arg.name.as_deref() == Some("if"))
         .or_else(|| args.get(1))?;
-    list_predicate_from_expr(field, predicate_arg.value, row_scope)
+    list_predicate_from_expr(field, predicate_arg.value, row_scope, canonical_row_scope)
 }
 
 fn count_or_retain_source_list(field: &FieldDef, program: &ParsedProgram) -> Option<String> {
@@ -8752,28 +9120,186 @@ fn row_scope_for_list<'a>(program: &'a ParsedProgram, list_name: &str) -> Option
         .map(|scope| scope.row_scope.as_str())
 }
 
-fn row_field_path_in_exprs(exprs: &[AstExpr], row_scope: Option<&str>) -> Option<String> {
+fn row_field_path_in_exprs(
+    exprs: &[AstExpr],
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<String> {
     let row_scope = row_scope?;
     exprs.iter().find_map(|expr| match &expr.kind {
-        AstExprKind::Path(parts) => row_field_path_from_parts(parts, row_scope),
+        AstExprKind::Path(parts) => {
+            row_field_path_from_parts(parts, row_scope, canonical_row_scope)
+        }
         _ => None,
     })
 }
 
-fn selected_filter_selector(field: &FieldDef) -> Option<String> {
-    field.ast_exprs.iter().find_map(|expr| {
-        let AstExprKind::When { input } = expr.kind else {
-            return None;
-        };
-        let selector = ast_argument_value(field, input)?;
-        (!selector.is_empty()).then(|| canonical_local_path(&selector, &field.parent_path))
+fn canonical_row_field_path_from_raw(
+    raw: &str,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<String> {
+    let row_scope = row_scope?;
+    let parts = raw.split('.').map(str::to_owned).collect::<Vec<_>>();
+    row_field_path_from_parts(&parts, row_scope, canonical_row_scope).or_else(|| {
+        let canonical = canonical_row_scope?;
+        raw.strip_prefix(canonical)
+            .is_some_and(|rest| rest.starts_with('.'))
+            .then(|| raw.to_owned())
     })
 }
 
-fn row_field_path_from_parts(parts: &[String], row_scope: &str) -> Option<String> {
+fn selected_filter_predicate_from_when_expr(
+    field: &FieldDef,
+    when_expr_id: usize,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<ListPredicate> {
+    let expr = field_expr(field, when_expr_id)?;
+    let AstExprKind::When { input } = expr.kind else {
+        return None;
+    };
+    let selector = ast_argument_value(field, input)?;
+    if selector.is_empty() {
+        return None;
+    }
+    let row_field =
+        selected_filter_row_field_for_when(field, when_expr_id, row_scope, canonical_row_scope)?;
+    Some(ListPredicate::SelectedFilterVisibility {
+        selector: canonical_local_path(&selector, &field.parent_path),
+        row_field,
+    })
+}
+
+fn selected_filter_row_field_for_when(
+    field: &FieldDef,
+    when_expr_id: usize,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<String> {
+    let mut outputs = Vec::new();
+    collect_match_arm_outputs_for_when(field, &field.statement, when_expr_id, &mut outputs);
+    if outputs.is_empty() {
+        outputs = match_arm_outputs_after_when_expr(field, when_expr_id);
+    }
+    let mut row_field = None;
+    for output in outputs {
+        let Some(candidate) =
+            selected_filter_row_field_from_expr(field, output, row_scope, canonical_row_scope)
+        else {
+            continue;
+        };
+        if row_field
+            .as_deref()
+            .is_some_and(|existing| existing != candidate)
+        {
+            return None;
+        }
+        row_field = Some(candidate);
+    }
+    row_field
+}
+
+fn collect_match_arm_outputs_for_when(
+    field: &FieldDef,
+    statement: &AstStatement,
+    when_expr_id: usize,
+    outputs: &mut Vec<usize>,
+) -> bool {
+    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
+        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
+    });
+    if statement_contains_when {
+        for child in &statement.children {
+            if let Some(output) = match_arm_output(field, child) {
+                outputs.push(output);
+            }
+        }
+        if !outputs.is_empty() {
+            return true;
+        }
+    }
+    for child in &statement.children {
+        if collect_match_arm_outputs_for_when(field, child, when_expr_id, outputs) {
+            return true;
+        }
+    }
+    false
+}
+
+fn match_arm_output(field: &FieldDef, statement: &AstStatement) -> Option<usize> {
+    let expr_id = statement.expr?;
+    let expr = field_expr(field, expr_id)?;
+    let AstExprKind::MatchArm {
+        output: Some(output),
+        ..
+    } = expr.kind
+    else {
+        return None;
+    };
+    Some(output)
+}
+
+fn match_arm_outputs_after_when_expr(field: &FieldDef, when_expr_id: usize) -> Vec<usize> {
+    let Some(when_expr) = field_expr(field, when_expr_id) else {
+        return Vec::new();
+    };
+    let end_line = field
+        .ast_exprs
+        .iter()
+        .filter(|expr| {
+            expr.line > when_expr.line
+                && matches!(
+                    expr.kind,
+                    AstExprKind::When { .. } | AstExprKind::Then { .. }
+                )
+        })
+        .map(|expr| expr.line)
+        .min()
+        .unwrap_or(usize::MAX);
+    field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
+        .filter_map(|expr| match &expr.kind {
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            } => Some(*output),
+            _ => None,
+        })
+        .collect()
+}
+
+fn selected_filter_row_field_from_expr(
+    field: &FieldDef,
+    expr_id: usize,
+    row_scope: Option<&str>,
+    canonical_row_scope: Option<&str>,
+) -> Option<String> {
+    let row_scope = row_scope?;
+    let expr = field_expr(field, expr_id)?;
+    match &expr.kind {
+        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
+            row_field_path_from_expr(field, *input, Some(row_scope), canonical_row_scope)
+        }
+        AstExprKind::Path(parts) => {
+            row_field_path_from_parts(parts, row_scope, canonical_row_scope)
+        }
+        AstExprKind::Bool(_) => None,
+        _ => None,
+    }
+}
+
+fn row_field_path_from_parts(
+    parts: &[String],
+    row_scope: &str,
+    canonical_row_scope: Option<&str>,
+) -> Option<String> {
+    let output_scope = canonical_row_scope.unwrap_or(row_scope);
     parts.windows(2).find_map(|window| {
         (window[0] == row_scope && is_name(&window[1]))
-            .then(|| format!("{row_scope}.{}", window[1]))
+            .then(|| format!("{output_scope}.{}", window[1]))
     })
 }
 
@@ -10664,8 +11190,20 @@ fn match_const_pattern_label(pattern: &[String]) -> Option<String> {
 }
 
 fn expr_contains_expr_id_in_exprs(exprs: &[AstExpr], root: usize, needle: usize) -> bool {
+    expr_contains_expr_id_in_exprs_seen(exprs, root, needle, &mut BTreeSet::new())
+}
+
+fn expr_contains_expr_id_in_exprs_seen(
+    exprs: &[AstExpr],
+    root: usize,
+    needle: usize,
+    seen: &mut BTreeSet<usize>,
+) -> bool {
     if root == needle {
         return true;
+    }
+    if !seen.insert(root) {
+        return false;
     }
     let Some(expr) = exprs.iter().find(|expr| expr.id == root) else {
         return false;
@@ -10673,43 +11211,43 @@ fn expr_contains_expr_id_in_exprs(exprs: &[AstExpr], root: usize, needle: usize)
     match &expr.kind {
         AstExprKind::Call { args, .. } => args
             .iter()
-            .any(|arg| expr_contains_expr_id_in_exprs(exprs, arg.value, needle)),
+            .any(|arg| expr_contains_expr_id_in_exprs_seen(exprs, arg.value, needle, seen)),
         AstExprKind::Pipe { input, args, .. } => {
-            expr_contains_expr_id_in_exprs(exprs, *input, needle)
+            expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen)
                 || args
                     .iter()
-                    .any(|arg| expr_contains_expr_id_in_exprs(exprs, arg.value, needle))
+                    .any(|arg| expr_contains_expr_id_in_exprs_seen(exprs, arg.value, needle, seen))
         }
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
-            expr_contains_expr_id_in_exprs(exprs, *initial, needle)
+            expr_contains_expr_id_in_exprs_seen(exprs, *initial, needle, seen)
         }
         AstExprKind::Then {
             input,
             output: Some(output),
         } => {
-            expr_contains_expr_id_in_exprs(exprs, *input, needle)
-                || expr_contains_expr_id_in_exprs(exprs, *output, needle)
+            expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen)
+                || expr_contains_expr_id_in_exprs_seen(exprs, *output, needle, seen)
         }
         AstExprKind::Then {
             input,
             output: None,
-        } => expr_contains_expr_id_in_exprs(exprs, *input, needle),
+        } => expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen),
         AstExprKind::MatchArm {
             output: Some(output),
             ..
-        } => expr_contains_expr_id_in_exprs(exprs, *output, needle),
+        } => expr_contains_expr_id_in_exprs_seen(exprs, *output, needle, seen),
         AstExprKind::Infix { left, right, .. } => {
-            expr_contains_expr_id_in_exprs(exprs, *left, needle)
-                || expr_contains_expr_id_in_exprs(exprs, *right, needle)
+            expr_contains_expr_id_in_exprs_seen(exprs, *left, needle, seen)
+                || expr_contains_expr_id_in_exprs_seen(exprs, *right, needle, seen)
         }
         AstExprKind::Record(fields)
         | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields
-            .iter()
-            .any(|record_field| expr_contains_expr_id_in_exprs(exprs, record_field.value, needle)),
+        | AstExprKind::TaggedObject { fields, .. } => fields.iter().any(|record_field| {
+            expr_contains_expr_id_in_exprs_seen(exprs, record_field.value, needle, seen)
+        }),
         AstExprKind::BytesLiteral { items, .. } => items
             .iter()
-            .any(|item| expr_contains_expr_id_in_exprs(exprs, *item, needle)),
+            .any(|item| expr_contains_expr_id_in_exprs_seen(exprs, *item, needle, seen)),
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
@@ -10729,8 +11267,20 @@ fn expr_contains_expr_id_in_exprs(exprs: &[AstExpr], root: usize, needle: usize)
 }
 
 fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
+    expr_contains_expr_id_seen(field, root, needle, &mut BTreeSet::new())
+}
+
+fn expr_contains_expr_id_seen(
+    field: &FieldDef,
+    root: usize,
+    needle: usize,
+    seen: &mut BTreeSet<usize>,
+) -> bool {
     if root == needle {
         return true;
+    }
+    if !seen.insert(root) {
+        return false;
     }
     let Some(expr) = field_expr(field, root) else {
         return false;
@@ -10738,43 +11288,43 @@ fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
     match &expr.kind {
         AstExprKind::Call { args, .. } => args
             .iter()
-            .any(|arg| expr_contains_expr_id(field, arg.value, needle)),
+            .any(|arg| expr_contains_expr_id_seen(field, arg.value, needle, seen)),
         AstExprKind::Pipe { input, args, .. } => {
-            expr_contains_expr_id(field, *input, needle)
+            expr_contains_expr_id_seen(field, *input, needle, seen)
                 || args
                     .iter()
-                    .any(|arg| expr_contains_expr_id(field, arg.value, needle))
+                    .any(|arg| expr_contains_expr_id_seen(field, arg.value, needle, seen))
         }
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
-            expr_contains_expr_id(field, *initial, needle)
+            expr_contains_expr_id_seen(field, *initial, needle, seen)
         }
         AstExprKind::Then {
             input,
             output: Some(output),
         } => {
-            expr_contains_expr_id(field, *input, needle)
-                || expr_contains_expr_id(field, *output, needle)
+            expr_contains_expr_id_seen(field, *input, needle, seen)
+                || expr_contains_expr_id_seen(field, *output, needle, seen)
         }
         AstExprKind::Then {
             input,
             output: None,
-        } => expr_contains_expr_id(field, *input, needle),
+        } => expr_contains_expr_id_seen(field, *input, needle, seen),
         AstExprKind::MatchArm {
             output: Some(output),
             ..
-        } => expr_contains_expr_id(field, *output, needle),
+        } => expr_contains_expr_id_seen(field, *output, needle, seen),
         AstExprKind::Infix { left, right, .. } => {
-            expr_contains_expr_id(field, *left, needle)
-                || expr_contains_expr_id(field, *right, needle)
+            expr_contains_expr_id_seen(field, *left, needle, seen)
+                || expr_contains_expr_id_seen(field, *right, needle, seen)
         }
         AstExprKind::Record(fields)
         | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields
-            .iter()
-            .any(|record_field| expr_contains_expr_id(field, record_field.value, needle)),
+        | AstExprKind::TaggedObject { fields, .. } => fields.iter().any(|record_field| {
+            expr_contains_expr_id_seen(field, record_field.value, needle, seen)
+        }),
         AstExprKind::BytesLiteral { items, .. } => items
             .iter()
-            .any(|item| expr_contains_expr_id(field, *item, needle)),
+            .any(|item| expr_contains_expr_id_seen(field, *item, needle, seen)),
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
@@ -15904,9 +16454,10 @@ FUNCTION new_todo(todo) {
                 todos_field,
                 "store.elements.remove_completed_button",
                 Some("item"),
+                Some("todo"),
             ),
             Some(ListPredicate::RowFieldBoolNot {
-                path: "item.completed".to_owned(),
+                path: "todo.completed".to_owned(),
             }),
             "{:#?}",
             remove_completed_branch
@@ -15914,6 +16465,24 @@ FUNCTION new_todo(todo) {
                 .iter()
                 .map(|expr| format!("{:?}", expr.kind))
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            ir.list_operations.iter().any(|operation| {
+                operation.list == "todos"
+                    && matches!(
+                        &operation.kind,
+                        ListOperationKind::Retain {
+                            predicate:
+                                ListPredicate::SelectedFilterVisibility {
+                                    selector,
+                                    row_field,
+                                },
+                            ..
+                        } if selector == "store.selected_filter" && row_field == "todo.completed"
+                    )
+            }),
+            "physical TodoMVC selected-filter retain must use canonical row metadata, operations={:#?}",
+            ir.list_operations
         );
         assert!(
             ir.row_scopes
@@ -15966,7 +16535,7 @@ FUNCTION new_todo(todo) {
                         == ListOperationKind::Remove {
                             source: "store.elements.remove_completed_button".to_owned(),
                             predicate: ListPredicate::RowFieldBool {
-                                path: "item.completed".to_owned(),
+                                path: "todo.completed".to_owned(),
                             },
                         }
             }),

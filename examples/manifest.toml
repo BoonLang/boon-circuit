@@ -183,6 +183,7 @@ input_scenarios = [
   "reject-empty-todo",
   "toggle-one-todo",
   "toggle-all",
+  "toggle-all-active",
   "filter-all-active-completed",
   "filter-active",
   "filter-completed",

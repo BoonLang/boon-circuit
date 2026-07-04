@@ -3339,6 +3339,380 @@ pub fn evaluate_root_pure_number_compare_values(
     Ok(values)
 }
 
+fn plan_has_root_router_route_reader(plan: &MachinePlan) -> bool {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .any(|op| {
+            !op.indexed
+                && matches!(
+                    &op.kind,
+                    PlanOpKind::DerivedValue {
+                        derived_kind: boon_plan::PlanDerivedKind::Pure,
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } if row_expression_reads_router_route(expression)
+                )
+        })
+}
+
+fn row_expression_reads_router_route(expression: &PlanRowExpression) -> bool {
+    match expression {
+        PlanRowExpression::BuiltinCall {
+            function,
+            input,
+            args,
+        } => {
+            function == "Router/route"
+                || input
+                    .as_deref()
+                    .is_some_and(row_expression_reads_router_route)
+                || args
+                    .iter()
+                    .any(|arg| row_expression_reads_router_route(&arg.value))
+        }
+        PlanRowExpression::Select { input, arms } => {
+            row_expression_reads_router_route(input)
+                || arms
+                    .iter()
+                    .any(|arm| row_expression_reads_router_route(&arm.value))
+        }
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input }
+        | PlanRowExpression::ObjectField { object: input, .. }
+        | PlanRowExpression::ListSum { input } => row_expression_reads_router_route(input),
+        PlanRowExpression::TextStartsWith { input, prefix } => {
+            row_expression_reads_router_route(input) || row_expression_reads_router_route(prefix)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        }
+        | PlanRowExpression::BytesSlice {
+            input,
+            offset: start,
+            byte_count: length,
+        } => {
+            row_expression_reads_router_route(input)
+                || row_expression_reads_router_route(start)
+                || row_expression_reads_router_route(length)
+        }
+        PlanRowExpression::TextToBytes { input, encoding }
+        | PlanRowExpression::BytesToText { input, encoding } => {
+            row_expression_reads_router_route(input)
+                || encoding
+                    .as_deref()
+                    .is_some_and(row_expression_reads_router_route)
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            row_expression_reads_router_route(input) || row_expression_reads_router_route(index)
+        }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            row_expression_reads_router_route(input)
+                || row_expression_reads_router_route(byte_count)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => {
+            row_expression_reads_router_route(byte_count)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_reads_router_route(input)
+                || row_expression_reads_router_route(offset)
+                || row_expression_reads_router_route(byte_count)
+                || row_expression_reads_router_route(endian)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_reads_router_route(input)
+                || row_expression_reads_router_route(index)
+                || row_expression_reads_router_route(value)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_reads_router_route(input)
+                || row_expression_reads_router_route(offset)
+                || row_expression_reads_router_route(byte_count)
+                || row_expression_reads_router_route(endian)
+                || row_expression_reads_router_route(value)
+        }
+        PlanRowExpression::BytesFind { input, needle }
+        | PlanRowExpression::BytesStartsWith {
+            input,
+            prefix: needle,
+        }
+        | PlanRowExpression::BytesEndsWith {
+            input,
+            suffix: needle,
+        } => row_expression_reads_router_route(input) || row_expression_reads_router_route(needle),
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right }
+        | PlanRowExpression::NumberInfix { left, right, .. } => {
+            row_expression_reads_router_route(left) || row_expression_reads_router_route(right)
+        }
+        PlanRowExpression::TextConcat { parts } => {
+            parts.iter().any(row_expression_reads_router_route)
+        }
+        PlanRowExpression::ListFindValue {
+            value, fallback, ..
+        } => {
+            row_expression_reads_router_route(value)
+                || fallback
+                    .as_deref()
+                    .is_some_and(row_expression_reads_router_route)
+        }
+        PlanRowExpression::ListRange { from, to } => {
+            row_expression_reads_router_route(from) || row_expression_reads_router_route(to)
+        }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            row_expression_reads_router_route(input) || row_expression_reads_router_route(value)
+        }
+        PlanRowExpression::ListGetField { index, .. } => row_expression_reads_router_route(index),
+        PlanRowExpression::Object { fields } => fields
+            .iter()
+            .any(|field| row_expression_reads_router_route(&field.value)),
+        PlanRowExpression::Field { .. }
+        | PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListMapItem { .. } => false,
+    }
+}
+
+pub fn evaluate_initial_root_source_event_transforms(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if op.indexed {
+            continue;
+        }
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+            expression: Some(PlanDerivedExpression::SourceEventTransform { default, .. }),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let value = eval_root_source_transform_row_expression(plan, root_state, default)?;
+        values.insert(output_id, value);
+    }
+    Ok(values)
+}
+
+pub fn evaluate_initial_root_derived_values(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    let mut evaluation_state = root_state.clone();
+    evaluation_state
+        .entry("Router/route".to_owned())
+        .or_insert_with(|| json!("/"));
+    let mut values = evaluate_initial_root_source_event_transforms(plan, &evaluation_state)?;
+    commit_source_derived_values_to_root_state(plan, &mut evaluation_state, &values);
+    for (field_id, value) in evaluate_root_row_expression_derived_values(plan, &evaluation_state)? {
+        values.insert(field_id, value);
+    }
+    Ok(values)
+}
+
+fn evaluate_root_row_expression_derived_values(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if op.indexed {
+            continue;
+        }
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let PlanOpKind::DerivedValue {
+            derived_kind: boon_plan::PlanDerivedKind::Pure,
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let value = eval_root_source_transform_row_expression(plan, root_state, expression)?;
+        values.insert(output_id, value);
+    }
+    Ok(values)
+}
+
+pub fn commit_source_derived_values_to_root_state(
+    plan: &MachinePlan,
+    root_state: &mut JsonMap<String, JsonValue>,
+    derived_values: &BTreeMap<FieldId, JsonValue>,
+) -> Vec<JsonValue> {
+    let mut reports = Vec::with_capacity(derived_values.len());
+    for (field_id, value) in derived_values {
+        let field_path = derived_field_label(plan, field_id.0);
+        let changed = root_state.get(&field_path) != Some(value);
+        root_state.insert(field_path.clone(), value.clone());
+        reports.push(json!({
+            "field_id": field_id.0,
+            "field_path": field_path,
+            "value": value,
+            "changed": changed,
+        }));
+    }
+    reports
+}
+
+fn eval_root_source_transform_row_expression(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    expression: &PlanRowExpression,
+) -> PlanExecutorResult<JsonValue> {
+    match expression {
+        PlanRowExpression::Constant { constant_id } => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| format!("missing source-transform constant {}", constant_id.0))?;
+            plan_constant_json_value(constant)
+        }
+        PlanRowExpression::Field { input } => match input {
+            ValueRef::State(state_id) => {
+                let label = state_label(plan, *state_id);
+                root_state.get(&label).cloned().ok_or_else(|| {
+                    format!("source-transform root state input `{label}` is missing").into()
+                })
+            }
+            ValueRef::Field(field_id) => {
+                let label = derived_field_label(plan, field_id.0);
+                root_state.get(&label).cloned().ok_or_else(|| {
+                    format!("source-transform root derived input `{label}` is missing").into()
+                })
+            }
+            other => {
+                Err(format!("source-transform field input `{other:?}` is not root-readable").into())
+            }
+        },
+        PlanRowExpression::TextTrim { input } => {
+            let value = eval_root_source_transform_row_expression(plan, root_state, input)?;
+            Ok(JsonValue::String(
+                value
+                    .as_str()
+                    .ok_or("source-transform Text/trim input is not text")?
+                    .trim()
+                    .to_owned(),
+            ))
+        }
+        PlanRowExpression::TextConcat { parts } => {
+            let mut text = String::new();
+            for part in parts {
+                let value = eval_root_source_transform_row_expression(plan, root_state, part)?;
+                text.push_str(
+                    &json_scalar_textlike(&value)
+                        .ok_or("source-transform TextConcat part is not textlike")?,
+                );
+            }
+            Ok(JsonValue::String(text))
+        }
+        PlanRowExpression::ObjectField { object, field } => {
+            let value = eval_root_source_transform_row_expression(plan, root_state, object)?;
+            value
+                .get(field)
+                .cloned()
+                .ok_or_else(|| format!("source-transform object is missing field `{field}`").into())
+        }
+        PlanRowExpression::BuiltinCall {
+            function,
+            input,
+            args,
+        } if function == "Router/route" && input.is_none() && args.is_empty() => Ok(root_state
+            .get("Router/route")
+            .cloned()
+            .unwrap_or_else(|| json!("/"))),
+        PlanRowExpression::Select { input, arms } => {
+            let input = eval_root_source_transform_row_expression(plan, root_state, input)?;
+            for arm in arms {
+                if row_select_pattern_matches_json(&arm.pattern, &input) {
+                    return eval_root_source_transform_row_expression(plan, root_state, &arm.value);
+                }
+            }
+            Ok(JsonValue::Null)
+        }
+        other => Err(format!(
+            "CPU PlanExecutor does not support root source-transform row expression `{other:?}`"
+        )
+        .into()),
+    }
+}
+
+fn row_select_pattern_matches_json(
+    pattern: &boon_plan::PlanRowSelectPattern,
+    value: &JsonValue,
+) -> bool {
+    match pattern {
+        boon_plan::PlanRowSelectPattern::Bool { value: expected } => {
+            value.as_bool() == Some(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::Text { value: expected } => {
+            value.as_str() == Some(expected.as_str())
+        }
+        boon_plan::PlanRowSelectPattern::Number { value: expected } => {
+            value.as_i64() == Some(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::NaN => value.is_null(),
+        boon_plan::PlanRowSelectPattern::Wildcard => true,
+    }
+}
+
 pub fn changed_root_derived_deltas(
     plan: &MachinePlan,
     before: &BTreeMap<usize, JsonValue>,
@@ -4328,11 +4702,22 @@ pub fn execute_initial_state(plan: &MachinePlan) -> PlanExecutorResult<InitialSt
         .into());
     }
 
+    let initial_source_event_transforms =
+        evaluate_initial_root_derived_values(plan, &state_summary)?;
+    let initialized_source_event_transform_count = initial_source_event_transforms.len();
+    let source_event_transform_commits = commit_source_derived_values_to_root_state(
+        plan,
+        &mut state_summary,
+        &initial_source_event_transforms,
+    );
+
     let plan_hash = plan_sha256(plan)?;
     let state_summary = JsonValue::Object(state_summary);
     let executor_report = json!({
         "executor": "cpu-plan-executor-core-v1",
         "initialized_state_count": initialized_state_count,
+        "initialized_root_source_event_transform_count": initialized_source_event_transform_count,
+        "root_source_event_transform_commits": source_event_transform_commits,
         "source_route_metadata_count": source_route_metadata_count,
         "validated_list_projection_count": list_projection_count,
         "validated_list_operation_count": list_operation_count,
@@ -4726,10 +5111,19 @@ pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecu
         root_state.insert(state_label(plan, slot.state_id), value);
         initialized_state_count += 1;
     }
+    let initial_source_event_transforms = evaluate_initial_root_derived_values(plan, &root_state)?;
+    let initialized_source_event_transform_count = initial_source_event_transforms.len();
+    let source_event_transform_commits = commit_source_derived_values_to_root_state(
+        plan,
+        &mut root_state,
+        &initial_source_event_transforms,
+    );
     let bytes_initialization = initialize_root_bytes_storage(plan, &root_state)?;
     let executor_report = json!({
         "executor": "cpu-plan-root-state-initializer-v1",
         "initialized_state_count": initialized_state_count,
+        "initialized_root_source_event_transform_count": initialized_source_event_transform_count,
+        "root_source_event_transform_commits": source_event_transform_commits,
         "initialized_bytes_state_count": bytes_initialization.initialized_bytes_state_count,
         "fixed_byte_bank_count": bytes_initialization.fixed_byte_bank_count,
         "bytes_initialization_core": bytes_initialization.executor_report,
@@ -8305,7 +8699,22 @@ pub fn evaluate_indexed_json_update_branch(
                 )
                 .into());
             }
-            let value = source_payload_json_value(event, source_payload_field)?;
+            let Some(value) = source_payload_json_value_if_present(event, source_payload_field)?
+            else {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "source_payload",
+                        serde_json::to_value(source_payload_field)?,
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
             Ok(indexed_json_update_outcome(
                 op.id,
                 true,
@@ -8414,14 +8823,8 @@ pub fn evaluate_indexed_json_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let input_state_id = indexed_single_state_input(op, output_state_id)?;
-            let input_name = local_field_name(&state_label(plan, input_state_id));
-            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
-                format!(
-                    "indexed ReadPath update branch {} input field `{input_name}` is missing",
-                    op.id.0
-                )
-            })?;
+            let input = indexed_single_state_or_field_input(op, output_state_id)?;
+            let value = indexed_row_read_path_value(plan, row, &input, op.id)?;
             if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
                 return Ok(indexed_json_update_outcome(
                     op.id,
@@ -8502,7 +8905,24 @@ pub fn evaluate_indexed_json_update_branch(
                     ));
                 }
                 validate_typed_payload_input(op, source_id, payload_field)?;
-                source_payload_json_value(event, payload_field)?
+                let Some(payload_value) =
+                    source_payload_json_value_if_present(event, payload_field)?
+                else {
+                    return Ok(indexed_json_update_outcome(
+                        op.id,
+                        true,
+                        None,
+                        output_state_id,
+                        None,
+                        Some((
+                            "text_trim_or_previous",
+                            serde_json::to_value(payload_field)?,
+                            JsonValue::Null,
+                            JsonValue::Null,
+                        )),
+                    ));
+                };
+                payload_value
                     .as_str()
                     .ok_or_else(|| {
                         format!(
@@ -8570,6 +8990,110 @@ pub fn evaluate_indexed_json_update_branch(
             ))
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let input_ref = ordered_inputs.first().ok_or_else(|| {
+                format!(
+                    "indexed MatchTextIsEmptyConst update branch {} has no match input",
+                    op.id.0
+                )
+            })?;
+            let input_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                input_ref,
+                op.id,
+                "match input",
+            )?;
+            let input_text = input_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed MatchTextIsEmptyConst update branch {} match input is not text",
+                    op.id.0
+                )
+            })?;
+            let selected_operand_index = if input_text.is_empty() { 1 } else { 2 };
+            let Some(selected_ref) = ordered_inputs.get(selected_operand_index) else {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "match_text_is_empty_const",
+                        json!({
+                            "input_empty": input_text.is_empty(),
+                            "selected_operand_index": selected_operand_index,
+                            "selected_arm_missing": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                selected_ref,
+                op.id,
+                "match selected arm",
+            )?;
+            if value.as_str() == Some("SKIP") {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "match_text_is_empty_const",
+                        json!({
+                            "input_empty": input_text.is_empty(),
+                            "selected_operand_index": selected_operand_index,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            }
+            if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    false,
+                    Some("BYTES match arm values require runtime byte storage".to_owned()),
+                    output_state_id,
+                    None,
+                    None,
+                ));
+            }
+            Ok(indexed_json_update_outcome(
+                op.id,
+                true,
+                None,
+                output_state_id,
+                Some(value),
+                Some((
+                    "match_text_is_empty_const",
+                    json!({
+                        "input_empty": input_text.is_empty(),
+                        "selected_operand_index": selected_operand_index,
+                        "skip": false,
+                    }),
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            ))
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind, ..
         } => Ok(indexed_json_update_outcome(
             op.id,
@@ -8584,6 +9108,201 @@ pub fn evaluate_indexed_json_update_branch(
         _ => Err(format!(
             "CPU PlanExecutor indexed JSON update branch {} is not an update branch",
             op.id.0
+        )
+        .into()),
+    }
+}
+
+fn indexed_single_state_or_field_input(
+    op: &PlanOp,
+    output_state_id: StateId,
+) -> PlanExecutorResult<ValueRef> {
+    let inputs = op
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            ValueRef::State(state_id) if *state_id != output_state_id => Some(input.clone()),
+            ValueRef::Field(_) => Some(input.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return Err(format!(
+            "indexed update branch {} expected one non-output state or row-field input, found {}",
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok(input.clone())
+}
+
+fn indexed_row_read_path_value(
+    plan: &MachinePlan,
+    row: &PlanExecutorListRowState,
+    input: &ValueRef,
+    op_id: PlanOpId,
+) -> PlanExecutorResult<JsonValue> {
+    let input_name = match input {
+        ValueRef::State(state_id) => local_field_name(&state_label(plan, *state_id)),
+        ValueRef::Field(field_id) => local_field_name(&semantic_field_label(plan, field_id.0)),
+        _ => {
+            return Err(format!(
+                "indexed ReadPath update branch {} input {input:?} is not a state or row field",
+                op_id.0
+            )
+            .into());
+        }
+    };
+    row.fields.get(&input_name).cloned().ok_or_else(|| {
+        format!(
+            "indexed ReadPath update branch {} input field `{input_name}` is missing",
+            op_id.0
+        )
+        .into()
+    })
+}
+
+fn root_update_json_value_for_ref(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    root_state: &JsonMap<String, JsonValue>,
+    value_ref: &ValueRef,
+    active_source_id: SourceId,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<Option<JsonValue>> {
+    match value_ref {
+        ValueRef::State(state_id) => Ok(Some(
+            root_state_value(plan, root_state, *state_id, op_id.0)?.clone(),
+        )),
+        ValueRef::SourcePayload { source_id, field } => {
+            if *source_id != active_source_id {
+                return Err(format!(
+                    "root update branch {} {context} source-payload ref source {} does not match active source {}",
+                    op_id.0, source_id.0, active_source_id.0
+                )
+                .into());
+            }
+            source_payload_json_value_if_present(event, field)
+        }
+        ValueRef::Constant(constant_id) => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| format!("missing update constant {}", constant_id.0))?;
+            plan_constant_json_value(constant).map(Some)
+        }
+        ValueRef::Field(field_id) => Err(format!(
+            "root update branch {} {context} cannot use derived field ref {} as a root value",
+            op_id.0, field_id.0
+        )
+        .into()),
+        ValueRef::Source(source_id) => Err(format!(
+            "root update branch {} {context} cannot use source ref {} as a value",
+            op_id.0, source_id.0
+        )
+        .into()),
+        ValueRef::List(list_id) => Err(format!(
+            "root update branch {} {context} cannot use list ref {} as a scalar value",
+            op_id.0, list_id.0
+        )
+        .into()),
+    }
+}
+
+fn root_match_const_pattern(
+    plan: &MachinePlan,
+    value_ref: &ValueRef,
+    op_id: PlanOpId,
+    arm_index: usize,
+) -> PlanExecutorResult<String> {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return Err(format!(
+            "root MatchConst update branch {} arm {arm_index} pattern is not a constant",
+            op_id.0
+        )
+        .into());
+    };
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .ok_or_else(|| {
+            format!(
+                "root MatchConst update branch {} arm {arm_index} references missing pattern constant {}",
+                op_id.0, constant_id.0
+            )
+        })?;
+    match &constant.value {
+        PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => Ok(value.clone()),
+        _ => Err(format!(
+            "root MatchConst update branch {} arm {arm_index} pattern constant {} is not text-like",
+            op_id.0, constant_id.0
+        )
+        .into()),
+    }
+}
+
+fn indexed_update_json_value_for_ref(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    row: &PlanExecutorListRowState,
+    root_derived_values: &BTreeMap<usize, JsonValue>,
+    value_ref: &ValueRef,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<JsonValue> {
+    match value_ref {
+        ValueRef::State(state_id) => {
+            let input_name = local_field_name(&state_label(plan, *state_id));
+            row.fields.get(&input_name).cloned().ok_or_else(|| {
+                format!(
+                    "indexed update branch {} {context} state field `{input_name}` is missing",
+                    op_id.0
+                )
+                .into()
+            })
+        }
+        ValueRef::Field(field_id) => {
+            let input_label = derived_field_label(plan, field_id.0);
+            root_derived_values
+                .get(&field_id.0)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "indexed update branch {} {context} derived field `{input_label}` is missing",
+                        op_id.0
+                    )
+                    .into()
+                })
+        }
+        ValueRef::SourcePayload { source_id, field } => {
+            source_payload_json_value(event, field).map_err(|error| {
+                format!(
+                    "indexed update branch {} {context} source-payload ref source {} field {:?} failed: {error}",
+                    op_id.0, source_id.0, field
+                )
+                .into()
+            })
+        }
+        ValueRef::Constant(constant_id) => {
+            let constant = plan
+                .constants
+                .iter()
+                .find(|constant| constant.id == *constant_id)
+                .ok_or_else(|| format!("missing update constant {}", constant_id.0))?;
+            plan_constant_json_value(constant)
+        }
+        ValueRef::Source(source_id) => Err(format!(
+            "indexed update branch {} {context} cannot use source ref {} as a value",
+            op_id.0, source_id.0
+        )
+        .into()),
+        ValueRef::List(list_id) => Err(format!(
+            "indexed update branch {} {context} cannot use list ref {} as a scalar value",
+            op_id.0, list_id.0
         )
         .into()),
     }
@@ -10904,11 +11623,7 @@ pub fn select_root_source_event_work(
         .iter()
         .filter(|region| region.kind == RegionKind::DerivedEvaluation)
         .flat_map(|region| region.ops.iter())
-        .filter(|op| {
-            op.inputs
-                .iter()
-                .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
-        })
+        .filter(|op| source_derived_op_is_executable_for_source(op, source_id))
         .count();
     let has_list_remove_work = plan
         .regions
@@ -10962,6 +11677,29 @@ pub fn select_root_source_event_work(
         root_update_key_gate,
         executor_report,
     })
+}
+
+fn source_derived_op_is_executable_for_source(op: &PlanOp, source_id: SourceId) -> bool {
+    if op.indexed {
+        return false;
+    }
+    if !op
+        .inputs
+        .iter()
+        .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
+    {
+        return false;
+    }
+    matches!(
+        &op.kind,
+        PlanOpKind::DerivedValue {
+            expression: Some(
+                PlanDerivedExpression::SourceEventTransform { .. }
+                    | PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+            ),
+            ..
+        }
+    )
 }
 
 pub fn dispatch_root_scenario_step(
@@ -11099,21 +11837,46 @@ pub fn evaluate_source_derived_values_for_event(
     root_state: &JsonMap<String, JsonValue>,
 ) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
     let mut values = BTreeMap::new();
+    let mut router_route: Option<String> = None;
     for op in plan
         .regions
         .iter()
         .filter(|region| region.kind == RegionKind::DerivedEvaluation)
         .flat_map(|region| region.ops.iter())
-        .filter(|op| {
-            op.inputs
-                .iter()
-                .any(|input| matches!(input, ValueRef::Source(id) if *id == source_id))
-        })
+        .filter(|op| source_derived_op_is_executable_for_source(op, source_id))
     {
         let Some(ValueRef::Field(output_id)) = op.output else {
             return Err(format!("derived op {} does not output a field", op.id.0).into());
         };
         match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression:
+                    Some(PlanDerivedExpression::SourceEventTransform {
+                        default: _,
+                        arms,
+                        router_route: is_router_route,
+                    }),
+                ..
+            } => {
+                if let Some(arm) = arms.iter().find(|arm| arm.source_id == source_id) {
+                    let value =
+                        eval_root_source_transform_row_expression(plan, root_state, &arm.value)?;
+                    if *is_router_route {
+                        router_route = Some(
+                            value
+                                .as_str()
+                                .ok_or_else(|| {
+                                    format!(
+                                        "derived op {} Router/go_to route value is not text",
+                                        op.id.0
+                                    )
+                                })?
+                                .to_owned(),
+                        );
+                    }
+                    values.insert(output_id, value);
+                }
+            }
             PlanOpKind::DerivedValue {
                 expression:
                     Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
@@ -11178,6 +11941,18 @@ pub fn evaluate_source_derived_values_for_event(
             }
         }
     }
+    if plan_has_root_router_route_reader(plan)
+        && let Some(route) = router_route
+    {
+        let mut evaluation_state = root_state.clone();
+        commit_source_derived_values_to_root_state(plan, &mut evaluation_state, &values);
+        evaluation_state.insert("Router/route".to_owned(), JsonValue::String(route));
+        for (field_id, value) in
+            evaluate_root_row_expression_derived_values(plan, &evaluation_state)?
+        {
+            values.insert(field_id, value);
+        }
+    }
     Ok(values)
 }
 
@@ -11199,7 +11974,7 @@ pub fn prepare_root_scenario_step(
     let materialized_work = validate_root_scenario_materialized_work(
         source_route,
         route_ops.len(),
-        derived_values.len(),
+        dispatch.derived_op_count,
         dispatch.has_list_remove_work,
     )?;
     let mut root_dispatch_report = dispatch.executor_report.clone();
@@ -11242,8 +12017,10 @@ pub fn build_source_derived_value_deltas(
     plan: &MachinePlan,
     derived_values: &BTreeMap<FieldId, JsonValue>,
 ) -> Vec<(String, JsonValue, JsonValue)> {
+    let router_route_outputs = router_route_output_field_ids(plan);
     derived_values
         .iter()
+        .filter(|(field_id, _)| !router_route_outputs.contains(field_id))
         .map(|(field_id, value)| {
             let field_label = derived_field_label(plan, field_id.0);
             let signature = format!("FieldSet:{field_label}");
@@ -11263,6 +12040,30 @@ pub fn build_source_derived_value_deltas(
                 "value": value,
             });
             (signature, delta, report)
+        })
+        .collect()
+}
+
+fn router_route_output_field_ids(plan: &MachinePlan) -> BTreeSet<FieldId> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            let PlanOpKind::DerivedValue {
+                expression:
+                    Some(PlanDerivedExpression::SourceEventTransform {
+                        router_route: true, ..
+                    }),
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let Some(ValueRef::Field(field_id)) = op.output else {
+                return None;
+            };
+            Some(field_id)
         })
         .collect()
 }
@@ -11518,6 +12319,183 @@ pub fn evaluate_root_json_update_branch(
                 Some((
                     "previous_value",
                     JsonValue::Null,
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            )
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::MatchConst,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [input_ref, arm_operands @ ..] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "root MatchConst update branch {} has no match input",
+                    op.id.0
+                )
+                .into());
+            };
+            if arm_operands.is_empty() || arm_operands.len() % 2 != 0 {
+                return Err(format!(
+                    "root MatchConst update branch {} has malformed arm operands",
+                    op.id.0
+                )
+                .into());
+            }
+            let Some(input_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                input_ref,
+                source_id,
+                op.id,
+                "match input",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_const",
+                        json!({
+                            "input_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            if input_value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    false,
+                    false,
+                    Some("BYTES match input requires runtime byte storage".to_owned()),
+                    Some(output_state_id),
+                    None,
+                    None,
+                ));
+            }
+            let input_text = input_value.as_str().ok_or_else(|| {
+                format!(
+                    "root MatchConst update branch {} match input is not text-like",
+                    op.id.0
+                )
+            })?;
+            let mut fallback = None;
+            let mut selected = None;
+            for (arm_index, pair) in arm_operands.chunks_exact(2).enumerate() {
+                let pattern = root_match_const_pattern(plan, &pair[0], op.id, arm_index)?;
+                if pattern == "__" {
+                    fallback = Some((arm_index, &pair[1]));
+                } else if pattern == input_text {
+                    selected = Some((arm_index, &pair[1]));
+                    break;
+                }
+            }
+            let Some((selected_arm_index, selected_ref)) = selected.or(fallback) else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                selected_ref,
+                source_id,
+                op.id,
+                "match selected arm",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_index": selected_arm_index,
+                            "selected_value_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            if value.as_str() == Some("SKIP") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_index": selected_arm_index,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            }
+            if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    false,
+                    false,
+                    Some("BYTES match arm values require runtime byte storage".to_owned()),
+                    Some(output_state_id),
+                    None,
+                    None,
+                ));
+            }
+            root_json_update_outcome(
+                op.id,
+                true,
+                false,
+                None,
+                Some(output_state_id),
+                Some(value),
+                Some((
+                    "match_const",
+                    json!({
+                        "input": input_text,
+                        "selected_arm_index": selected_arm_index,
+                        "skip": false,
+                    }),
                     JsonValue::Null,
                     JsonValue::Null,
                 )),
@@ -12038,10 +13016,41 @@ pub fn list_label(plan: &MachinePlan, list_id: usize) -> String {
 }
 
 fn state_label_from_ref(plan: &MachinePlan, value_ref: &ValueRef) -> PlanExecutorResult<String> {
-    let ValueRef::State(state_id) = value_ref else {
-        return Err(format!("expected state ref, got {value_ref:?}").into());
-    };
-    Ok(state_label(plan, *state_id))
+    match value_ref {
+        ValueRef::State(state_id) => Ok(state_label(plan, *state_id)),
+        ValueRef::Field(field_id) => Ok(field_label(plan, field_id.0)),
+        _ => Err(format!("expected state or field ref, got {value_ref:?}").into()),
+    }
+}
+
+fn value_ref_report(value_ref: &ValueRef) -> JsonValue {
+    match value_ref {
+        ValueRef::State(state_id) => json!({
+            "kind": "state",
+            "id": state_id.0,
+        }),
+        ValueRef::Field(field_id) => json!({
+            "kind": "field",
+            "id": field_id.0,
+        }),
+        ValueRef::List(list_id) => json!({
+            "kind": "list",
+            "id": list_id.0,
+        }),
+        ValueRef::Source(source_id) => json!({
+            "kind": "source",
+            "id": source_id.0,
+        }),
+        ValueRef::SourcePayload { source_id, field } => json!({
+            "kind": "source_payload",
+            "source_id": source_id.0,
+            "field": format!("{field:?}"),
+        }),
+        ValueRef::Constant(constant_id) => json!({
+            "kind": "constant",
+            "id": constant_id.0,
+        }),
+    }
 }
 
 fn projection_selector_value(
@@ -12103,20 +13112,14 @@ fn list_retain_predicate_resolution(
             selector,
             row_field,
         } => {
-            let ValueRef::State(selector_id) = selector else {
-                return Err("selected-filter retain selector is not a state ref".into());
-            };
-            let ValueRef::State(row_field_id) = row_field else {
-                return Err("selected-filter retain row field is not a state ref".into());
-            };
-            let selector_label = state_label(plan, *selector_id);
+            let selector_label = state_label_from_ref(plan, selector)?;
             let selector_value = root_state
                 .get(&selector_label)
-                .and_then(JsonValue::as_str)
+                .and_then(json_scalar_textlike)
                 .ok_or_else(|| {
-                    format!("selected-filter retain selector `{selector_label}` is not text")
+                    format!("selected-filter retain selector `{selector_label}` is not materialized")
                 })?;
-            let row_field_label = state_label(plan, *row_field_id);
+            let row_field_label = state_label_from_ref(plan, row_field)?;
             let row_field_name = local_field_name(&row_field_label);
             let row_value = row
                 .fields
@@ -12128,7 +13131,7 @@ fn list_retain_predicate_resolution(
                         row.key, row.generation
                     )
                 })?;
-            let retained = match selector_value {
+            let retained = match selector_value.as_str() {
                 "All" => true,
                 "Active" => !row_value,
                 "Completed" => row_value,
@@ -12143,10 +13146,11 @@ fn list_retain_predicate_resolution(
                 retained,
                 report: json!({
                     "kind": "selected_filter_visibility",
-                    "selector_state_id": selector_id.0,
+                    "selector_ref": value_ref_report(selector),
                     "selector": selector_label,
                     "selector_value": selector_value,
-                    "row_field_state_id": row_field_id.0,
+                    "selector_materialized": true,
+                    "row_field_ref": value_ref_report(row_field),
                     "row_field": row_field_name,
                 }),
             })
@@ -12192,26 +13196,22 @@ fn list_retain_empty_predicate_report(
             selector,
             row_field,
         } => {
-            let ValueRef::State(selector_id) = selector else {
-                return Err("selected-filter retain selector is not a state ref".into());
-            };
-            let ValueRef::State(row_field_id) = row_field else {
-                return Err("selected-filter retain row field is not a state ref".into());
-            };
-            let selector_label = state_label(plan, *selector_id);
+            let selector_label = state_label_from_ref(plan, selector)?;
             let selector_value = root_state
                 .get(&selector_label)
-                .and_then(JsonValue::as_str)
+                .and_then(json_scalar_textlike)
                 .ok_or_else(|| {
-                    format!("selected-filter retain selector `{selector_label}` is not text")
+                    format!("selected-filter retain selector `{selector_label}` is not materialized")
                 })?;
+            let row_field_label = state_label_from_ref(plan, row_field)?;
             Ok(json!({
                 "kind": "selected_filter_visibility",
-                "selector_state_id": selector_id.0,
+                "selector_ref": value_ref_report(selector),
                 "selector": selector_label,
                 "selector_value": selector_value,
-                "row_field_state_id": row_field_id.0,
-                "row_field": local_field_name(&state_label(plan, *row_field_id)),
+                "selector_materialized": true,
+                "row_field_ref": value_ref_report(row_field),
+                "row_field": local_field_name(&row_field_label),
             }))
         }
         boon_plan::PlanListRemovePredicate::AlwaysTrue => Ok(json!({ "kind": "always_true" })),
@@ -12322,6 +13322,10 @@ pub fn source_guard_matches(
                 .into());
             }
             if *field == SourcePayloadField::Bytes {
+                let field_name = source_payload_bytes_field_name(field)?;
+                if !event.payload_bytes.contains_key(field_name) {
+                    return Ok(false);
+                }
                 let payload = source_payload_bytes(event, field)?;
                 for expected in values {
                     let expected_bytes = bytes_decode_hex(expected).map_err(|error| {
@@ -12335,7 +13339,9 @@ pub fn source_guard_matches(
                 }
                 return Ok(false);
             }
-            let value = source_payload_json_value(event, field)?;
+            let Some(value) = source_payload_json_value_if_present(event, field)? else {
+                return Ok(false);
+            };
             Ok(value
                 .as_str()
                 .is_some_and(|payload| values.iter().any(|expected| expected == payload)))
@@ -12370,6 +13376,29 @@ fn source_payload_json_value(
             .map(JsonValue::String)
             .ok_or_else(|| format!("source event is missing `{name}` payload").into()),
         SourcePayloadField::Bytes => source_payload_bytes(event, field).map(bytes_report_json),
+    }
+}
+
+fn source_payload_json_value_if_present(
+    event: &RootJsonSourceEvent,
+    field: &SourcePayloadField,
+) -> PlanExecutorResult<Option<JsonValue>> {
+    match field {
+        SourcePayloadField::Text => Ok(event.text.clone().map(JsonValue::String)),
+        SourcePayloadField::Key => Ok(event.key.clone().map(JsonValue::String)),
+        SourcePayloadField::Address => Ok(event.address.clone().map(JsonValue::String)),
+        SourcePayloadField::Named(name) => {
+            Ok(event.payload.get(name).cloned().map(JsonValue::String))
+        }
+        SourcePayloadField::Bytes => {
+            let field_name = source_payload_bytes_field_name(field)?;
+            if !event.payload_bytes.contains_key(field_name) {
+                return Ok(None);
+            }
+            source_payload_bytes(event, field)
+                .map(bytes_report_json)
+                .map(Some)
+        }
     }
 }
 
@@ -15533,6 +16562,7 @@ pub fn list_row_default_fields(
     let mut default_field_count = 0usize;
     let mut bytes_field_count = 0usize;
     let mut fixed_byte_bank_count = 0usize;
+    let mut inferred_record_bool_default_count = 0usize;
     for slot in &plan.storage_layout.scalar_slots {
         if slot.scope_id != list_slot.scope_id {
             continue;
@@ -15561,11 +16591,35 @@ pub fn list_row_default_fields(
             bytes_field_count += 1;
         }
     }
+    if !list_slot.initial_rows.is_empty() {
+        let mut initial_values_by_field = BTreeMap::<String, Vec<&PlanConstantValue>>::new();
+        for row in &list_slot.initial_rows {
+            for field in &row.fields {
+                initial_values_by_field
+                    .entry(field.name.clone())
+                    .or_default()
+                    .push(&field.value);
+            }
+        }
+        for (field_name, values) in initial_values_by_field {
+            if fields.contains_key(&field_name) || values.len() != list_slot.initial_rows.len() {
+                continue;
+            }
+            if values
+                .iter()
+                .all(|value| matches!(value, PlanConstantValue::Bool { .. }))
+            {
+                fields.insert(field_name, JsonValue::Bool(false));
+                inferred_record_bool_default_count += 1;
+            }
+        }
+    }
     let executor_report = json!({
         "executor": "cpu-plan-list-row-default-fields-v1",
         "list_id": list_slot.list_id.0,
         "scope_id": list_slot.scope_id.map(|scope_id| scope_id.0),
         "default_field_count": default_field_count,
+        "inferred_record_bool_default_count": inferred_record_bool_default_count,
         "bytes_field_count": bytes_field_count,
         "fixed_byte_bank_count": fixed_byte_bank_count,
         "runtime_ast_eval_count": 0,
@@ -16332,6 +17386,204 @@ mod tests {
                 .contains("source guard did not match the supplied event"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn root_match_const_update_executes_on_json_surface() {
+        let source_id = SourceId(2);
+        let state_id = StateId(3);
+        let update_op_id = PlanOpId(4);
+        let constants = vec![
+            boon_plan::PlanConstant {
+                id: PlanConstantId(0),
+                value: PlanConstantValue::Enum {
+                    value: "Light".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(1),
+                value: PlanConstantValue::Text {
+                    value: "Light".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(2),
+                value: PlanConstantValue::Enum {
+                    value: "Dark".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(3),
+                value: PlanConstantValue::Text {
+                    value: "Dark".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(4),
+                value: PlanConstantValue::Enum {
+                    value: "Light".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(5),
+                value: PlanConstantValue::Text {
+                    value: "__".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(6),
+                value: PlanConstantValue::Text {
+                    value: "SKIP".to_owned(),
+                },
+            },
+        ];
+        let source_route = SourceRoute {
+            id: boon_plan::PlanSourceRouteId(0),
+            source_id,
+            path: "store.mode_toggle".to_owned(),
+            scoped: false,
+            scope_id: None,
+            payload_schema: boon_plan::SourcePayloadSchema {
+                fields: Vec::new(),
+                typed_fields: Vec::new(),
+                row_lookup_field: None,
+                address_lookup_field: None,
+            },
+        };
+        let update_op = PlanOp {
+            id: update_op_id,
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::MatchConst,
+                ordered_inputs: vec![
+                    ValueRef::State(state_id),
+                    ValueRef::Constant(PlanConstantId(1)),
+                    ValueRef::Constant(PlanConstantId(2)),
+                    ValueRef::Constant(PlanConstantId(3)),
+                    ValueRef::Constant(PlanConstantId(4)),
+                    ValueRef::Constant(PlanConstantId(5)),
+                    ValueRef::Constant(PlanConstantId(6)),
+                ],
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: vec![ValueRef::Source(source_id), ValueRef::State(state_id)],
+            output: Some(ValueRef::State(state_id)),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        };
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants,
+            source_routes: vec![source_route.clone()],
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: vec![boon_plan::ScalarStorageSlot {
+                    id: boon_plan::PlanStorageId(1),
+                    state_id,
+                    value_type: PlanValueType::Enum,
+                    scope_id: None,
+                    indexed: false,
+                    initial_value_kind: InitialValueKind::Enum,
+                    initial_constant_id: Some(PlanConstantId(0)),
+                    initial_row_field_path: None,
+                }],
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: vec![boon_plan::OperationRegion {
+                id: boon_plan::PlanRegionId(3),
+                kind: RegionKind::UpdateBranches,
+                ops: vec![update_op.clone()],
+            }],
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 1,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 7,
+                source_route_count: 1,
+                scalar_storage_count: 1,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 1,
+                typed_value_ref_count: 9,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: vec![boon_plan::DebugEntry {
+                    id: "source:2".to_owned(),
+                    label: "store.mode_toggle".to_owned(),
+                }],
+                state_slots: vec![boon_plan::DebugEntry {
+                    id: "state:3".to_owned(),
+                    label: "store.mode".to_owned(),
+                }],
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: Vec::new(),
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+
+        let root_state = JsonMap::from_iter([("store.mode".to_owned(), json!("Light"))]);
+        let evaluation = evaluate_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &root_state,
+        )
+        .expect("root MatchConst should evaluate");
+        assert!(evaluation.supported);
+        assert!(!evaluation.skipped_by_guard);
+        assert_eq!(evaluation.expression_kind, Some("match_const"));
+        assert_eq!(evaluation.value, Some(json!("Dark")));
+
+        let execution = execute_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &root_state,
+        )
+        .expect("root MatchConst should execute on JSON surface");
+        assert_eq!(
+            execution.surface_kind,
+            RootUpdateExecutionSurfaceKind::PlanJson
+        );
+        assert_eq!(execution.executed.unwrap().value, json!("Dark"));
+
+        let skipped_root_state = JsonMap::from_iter([("store.mode".to_owned(), json!("System"))]);
+        let skipped = evaluate_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &skipped_root_state,
+        )
+        .expect("fallback SKIP should evaluate as a no-op");
+        assert!(skipped.supported);
+        assert!(skipped.skipped_by_guard);
+        assert_eq!(skipped.value, None);
     }
 
     #[test]
@@ -19430,7 +20682,33 @@ mod tests {
                 initial_constant_id: None,
                 initial_row_field_path: None,
             },
+            boon_plan::ScalarStorageSlot {
+                id: boon_plan::PlanStorageId(3),
+                state_id: StateId(32),
+                value_type: PlanValueType::Text,
+                scope_id: Some(scope_id),
+                indexed: true,
+                initial_value_kind: InitialValueKind::Text,
+                initial_constant_id: None,
+                initial_row_field_path: None,
+            },
+            boon_plan::ScalarStorageSlot {
+                id: boon_plan::PlanStorageId(4),
+                state_id: StateId(33),
+                value_type: PlanValueType::Text,
+                scope_id: Some(scope_id),
+                indexed: true,
+                initial_value_kind: InitialValueKind::Text,
+                initial_constant_id: None,
+                initial_row_field_path: None,
+            },
         ];
+        plan.constants = vec![boon_plan::PlanConstant {
+            id: PlanConstantId(0),
+            value: PlanConstantValue::Text {
+                value: "SKIP".to_owned(),
+            },
+        }];
         plan.debug_map.state_slots = vec![
             boon_plan::DebugEntry {
                 id: "state:30".to_owned(),
@@ -19439,6 +20717,14 @@ mod tests {
             boon_plan::DebugEntry {
                 id: "state:31".to_owned(),
                 label: "todo.completed".to_owned(),
+            },
+            boon_plan::DebugEntry {
+                id: "state:32".to_owned(),
+                label: "todo.edited_title".to_owned(),
+            },
+            boon_plan::DebugEntry {
+                id: "state:33".to_owned(),
+                label: "todo.edited_title.draft_title".to_owned(),
             },
         ];
         plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
@@ -19451,6 +20737,8 @@ mod tests {
             fields: BTreeMap::from([
                 ("title".to_owned(), json!("Old")),
                 ("completed".to_owned(), json!(false)),
+                ("edited_title".to_owned(), json!("")),
+                ("draft_title".to_owned(), json!("")),
             ]),
             private_bytes: BTreeMap::new(),
             fixed_bytes_banks: BTreeMap::new(),
@@ -19527,6 +20815,63 @@ mod tests {
             text_eval.source_payload_field,
             serde_json::to_value(SourcePayloadField::Named("title".to_owned())).unwrap()
         );
+
+        let match_op = PlanOp {
+            id: PlanOpId(12),
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
+                ordered_inputs: vec![
+                    ValueRef::State(StateId(33)),
+                    ValueRef::State(StateId(30)),
+                    ValueRef::Constant(PlanConstantId(0)),
+                ],
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: vec![
+                ValueRef::State(StateId(33)),
+                ValueRef::State(StateId(30)),
+                ValueRef::Constant(PlanConstantId(0)),
+            ],
+            output: Some(ValueRef::State(StateId(32))),
+            indexed: true,
+            unresolved_executable_ref_count: 0,
+        };
+        let match_eval = evaluate_indexed_json_update_branch(
+            &plan,
+            &match_op,
+            SourceId(1),
+            &plan.source_routes[0],
+            &RootJsonSourceEvent::default(),
+            &row,
+            &BTreeMap::new(),
+        )
+        .expect("MatchTextIsEmptyConst evaluation should succeed");
+        assert!(match_eval.supported);
+        assert_eq!(
+            match_eval.expression_kind,
+            Some("match_text_is_empty_const")
+        );
+        assert_eq!(match_eval.value, Some(json!("Old")));
+
+        let mut non_empty_row = row.clone();
+        non_empty_row
+            .fields
+            .insert("draft_title".to_owned(), json!("Draft"));
+        let skip_eval = evaluate_indexed_json_update_branch(
+            &plan,
+            &match_op,
+            SourceId(1),
+            &plan.source_routes[0],
+            &RootJsonSourceEvent::default(),
+            &non_empty_row,
+            &BTreeMap::new(),
+        )
+        .expect("MatchTextIsEmptyConst SKIP evaluation should succeed");
+        assert!(skip_eval.supported);
+        assert_eq!(skip_eval.expression_kind, Some("match_text_is_empty_const"));
+        assert_eq!(skip_eval.value, None);
     }
 
     #[test]

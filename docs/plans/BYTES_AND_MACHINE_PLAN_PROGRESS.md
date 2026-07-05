@@ -37157,3 +37157,40 @@ Current interpretation:
 - Remaining raw `run_legacy_scenario` callers are in xtask verifier/diagnostic
   code and runtime tests. Those are the next cleanup target before deleting
   the `LoadedRuntime` implementation island.
+
+## 2026-07-05 - Obsolete xtask Legacy Semantic Gates Removed
+
+Status: removed the old `xtask` semantic/metamorphic verifier surfaces that
+still treated `LoadedRuntime` scenario execution as active proof. This is not
+the full legacy runtime deletion; it is a control-plane cut that removes stale
+legacy proof paths from `xtask` and report schema blocker-audit recognition.
+
+What changed:
+
+- Removed `verify-example-semantic`, `verify-todomvc-semantic`, and
+  `verify-cells-semantic` from `xtask` command dispatch/help.
+- `verify_specific` now rejects semantic mode internally so the removed
+  wrappers cannot be reached through a private command alias.
+- Removed the now-unreachable semantic build-file evidence helper.
+- Removed `verify-metamorphic-hidden-fixtures` and its hidden-fixture
+  legacy/runtime-project implementation block from `xtask`.
+- Removed `verify-metamorphic-hidden-fixtures` from report-schema and xtask
+  blocker-audit command allowlists.
+
+Fresh evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `rg` over `crates/xtask/src/main.rs` and
+  `crates/boon_report_schema/src/lib.rs` finds no
+  `verify-example-semantic`, `verify-todomvc-semantic`,
+  `verify-cells-semantic`, `verify-metamorphic-hidden-fixtures`,
+  `run_legacy_scenario_project`, or `metamorphic` references.
+
+Remaining legacy callers:
+
+- `xtask` still calls `run_legacy_scenario` for old speed/benchmark and
+  large-list scan commands, BoonDriver E2E, and schema fixture generation.
+- `boon_runtime` still contains the `LoadedRuntime` /
+  `GenericScheduledRuntime` implementation island. The next cleanup slice
+  should replace or delete those remaining callers before making the runtime
+  symbols private/test-only or deleting them.

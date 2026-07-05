@@ -3278,7 +3278,6 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-unified-architecture-all"
                 | "verify-boon-source-syntax"
                 | "verify-scenario-manifest-integrity"
-                | "verify-metamorphic-hidden-fixtures"
                 | "verify-bytes-storage-profile"
                 | "verify-bytes-fixed-warm-tick"
                 | "verify-bytes-byte-bank-layout"

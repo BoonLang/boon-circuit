@@ -37625,3 +37625,31 @@ Why this is not the final legacy cleanup:
 - The next cut should delete or rewrite obsolete legacy tests and move any
   still-useful coverage to PlanExecutor semantics. Avoid preserving the
   wrapper as another permanent compatibility layer.
+
+## 2026-07-05 - Public LiveRuntime Source APIs Made PlanExecutor-Only
+
+Status: moved another layer of legacy behavior out of the product runtime API.
+The public `LiveRuntime` source-event, batch-event, scenario-step adapter,
+summary, inspection, and candidate-probe methods now require a PlanExecutor
+session instead of falling through to the test-only `LoadedRuntime` path.
+
+What changed:
+
+- Added explicit `require_plan_session` helpers for product `LiveRuntime`.
+- Removed test-only legacy fallback branches from public source-event and
+  summary/inspection methods.
+- Moved legacy source normalization, single-event acceptance, batch replay,
+  scenario-step adapters, summaries, value summaries, and provenance reporting
+  into `LegacyRuntimeHarness`.
+- Product-facing candidate-defer probe hooks are now no-ops until PlanExecutor
+  owns equivalent profiling data; they no longer read legacy runtime state.
+- `verify-compiler-boundaries` now fails if public `LiveRuntime` source APIs
+  call checked-step legacy helpers or legacy candidate-probe hooks.
+
+Remaining cleanup:
+
+- The private checked-step helpers and `LoadedRuntime` / `GenericScheduledRuntime`
+  still exist for old unit coverage behind `LegacyRuntimeHarness`.
+- The next destructive cleanup should delete or migrate obsolete legacy tests
+  in groups, starting with tests that assert public LiveRuntime behavior rather
+  than storage-engine internals.

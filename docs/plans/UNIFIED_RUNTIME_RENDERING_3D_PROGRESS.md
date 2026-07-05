@@ -36770,3 +36770,59 @@ Evidence:
 - `cargo run -q -p xtask -- verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json`:
   pass; fresh report has `case_count=14` and zero
   `legacy_comparison_enabled` fields.
+
+## 2026-07-05 - Product Route And Root Reports Dropped Disabled Legacy Fields
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Removed top-level disabled `legacy_comparison` from product
+  `run-plan-route` reports.
+- Removed top-level disabled `legacy_comparison` and
+  `legacy_comparison_acceptance` from product
+  `run-plan-root-scalar-scenario` reports.
+- Removed `legacy-route-parity` and `legacy-root-scenario-parity` rows from
+  product report `per_step_pass_fail` arrays.
+- Removed `command_report_assembly_core.legacy_*` fields from source-route and
+  root-scenario product report assembly.
+- Removed the unused legacy demand-current semantic-delta acceptance policy
+  helper from `boon_plan_executor`.
+- Updated report schema to reject legacy comparison fields on product
+  source-route/root-scenario reports and on BYTES file read/write wrapper
+  reports.
+- Stopped copying root-scenario legacy comparison into BYTES file read/write
+  wrapper reports; those verifiers now stand on PlanExecutor fallback counters
+  and host-boundary file evidence.
+- Updated compiler-boundary checks so source-route legacy comparison and root
+  legacy acceptance policy are expected to be removed, not extracted.
+
+Current interpretation:
+
+- Normal product proof reports no longer carry disabled legacy-comparison
+  compatibility objects for route, root-scenario, or scenario-events surfaces.
+- This is still not complete runtime deletion. `LoadedRuntime` /
+  `GenericScheduledRuntime` remain as an implementation island, and some CLI
+  argument rejection text still names retired legacy flags.
+- This is not a Cells performance fix; it removes report/control-plane
+  ambiguity before the next runtime/render performance cut.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_cli -p boon_report_schema -p xtask`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_scenario_command_output_assembles_report_and_executor_core -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime run_plan_route_reports_full_source_event_delta_batch -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime root_list_plan_executor_replays_todomvc_submit -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_report_schema --lib -- --nocapture`:
+  pass, `70` tests.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
+  pass; source-route legacy comparison removed and root acceptance policy
+  removed checks are true with zero blockers.
+- `cargo run -q -p xtask -- verify-bytes-file-read-plan --report target/reports/bytes-plan/bytes-file-read-plan.json`:
+  pass; fresh report has zero `legacy_comparison` fields.
+- `cargo run -q -p xtask -- verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json`:
+  pass; fresh report has zero `legacy_comparison` fields.

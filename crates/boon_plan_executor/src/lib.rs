@@ -12203,11 +12203,6 @@ pub fn assemble_source_route_report(
 pub fn assemble_source_route_command_report(
     input: SourceRouteCommandReportInput,
 ) -> SourceRouteCommandReportAssembly {
-    let legacy_comparison = json!({
-        "enabled": false,
-        "passed": true,
-        "reason": "legacy comparison was not requested"
-    });
     let comparison_status = "not-requested";
     let plan_executor_status = "pass";
     let accepted_for_product_status = "pass";
@@ -12222,8 +12217,6 @@ pub fn assemble_source_route_command_report(
     let report_status_basis = "plan-executor-product";
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
-        "legacy_passed": false,
-        "legacy_required_for_status": false,
         "plan_executor_status": plan_executor_status,
         "comparison_status": comparison_status,
         "accepted_for_product_status": accepted_for_product_status,
@@ -12271,7 +12264,6 @@ pub fn assemble_source_route_command_report(
         "state_summary": input.state_summary,
         "semantic_delta_signatures": input.semantic_delta_signatures,
         "semantic_deltas": input.semantic_deltas,
-        "legacy_comparison": legacy_comparison,
         "per_step_pass_fail": [
             {
                 "id": "machine-plan-verified",
@@ -12289,11 +12281,6 @@ pub fn assemble_source_route_command_report(
                 "detail": format!(
                     "CPU PlanExecutor executed the full source event and selected one typed {expression_kind} target branch"
                 )
-            },
-            {
-                "id": "legacy-route-parity",
-                "pass": true,
-                "detail": "legacy runtime comparison was not requested and is not part of product report status"
             }
         ],
         "artifact_sha256s": input.artifact_sha256s,
@@ -12361,17 +12348,6 @@ pub fn assemble_root_scenario_command_output(
 pub fn assemble_root_scenario_command_report(
     input: RootScenarioCommandReportInput,
 ) -> RootScenarioCommandReportAssembly {
-    let legacy_comparison = json!({
-        "enabled": false,
-        "passed": false,
-        "reason": "legacy comparison was not requested"
-    });
-    let legacy_comparison_acceptance = json!({
-        "accepted": false,
-        "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-        "kind": "not-applicable",
-        "reason": "legacy comparison disabled"
-    });
     let comparison_status = "not-requested";
     let plan_executor_status = "pass";
     let accepted_for_product_status = "pass";
@@ -12380,9 +12356,6 @@ pub fn assemble_root_scenario_command_report(
     let report_status_basis = "plan-executor-product";
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
-        "legacy_passed": false,
-        "legacy_accepted": false,
-        "legacy_required_for_status": false,
         "plan_executor_status": plan_executor_status,
         "comparison_status": comparison_status,
         "accepted_for_product_status": accepted_for_product_status,
@@ -12430,8 +12403,6 @@ pub fn assemble_root_scenario_command_report(
         "state_summary": input.state_summary,
         "semantic_delta_signatures": input.semantic_delta_signatures,
         "semantic_deltas": input.semantic_deltas,
-        "legacy_comparison": legacy_comparison,
-        "legacy_comparison_acceptance": legacy_comparison_acceptance,
         "per_step_pass_fail": [
             {
                 "id": "machine-plan-verified",
@@ -12442,11 +12413,6 @@ pub fn assemble_root_scenario_command_report(
                 "id": "cpu-plan-root-list-scenario-executed",
                 "pass": true,
                 "detail": "CPU PlanExecutor replayed selected unscoped root/list source events"
-            },
-            {
-                "id": "legacy-root-scenario-parity",
-                "pass": true,
-                "detail": "legacy runtime comparison was not requested and is not part of product report status"
             }
         ],
         "artifact_sha256s": [],
@@ -12872,168 +12838,6 @@ fn derived_expression_reads_field_ids(
         }
         _ => false,
     }
-}
-
-pub fn demand_current_semantic_delta_acceptance_policy(
-    legacy_comparison: &JsonValue,
-    demand_current_field_paths: &BTreeSet<String>,
-) -> JsonValue {
-    if legacy_comparison
-        .get("enabled")
-        .and_then(JsonValue::as_bool)
-        != Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "not-applicable",
-            "reason": "legacy comparison disabled",
-            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-        });
-    }
-    if legacy_comparison
-        .get("semantic_delta_match")
-        .and_then(JsonValue::as_bool)
-        == Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "not-needed",
-            "reason": "legacy semantic deltas already match",
-            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-        });
-    }
-    if legacy_comparison
-        .get("state_match")
-        .and_then(JsonValue::as_bool)
-        != Some(true)
-    {
-        return json!({
-            "accepted": false,
-            "kind": "demand-current-coalesced-semantic-deltas",
-            "reason": "legacy state parity failed",
-            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-        });
-    }
-
-    let Some(steps) = legacy_comparison
-        .get("step_comparisons")
-        .and_then(JsonValue::as_array)
-    else {
-        return json!({
-            "accepted": false,
-            "kind": "demand-current-coalesced-semantic-deltas",
-            "reason": "legacy step comparisons missing",
-            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-        });
-    };
-
-    let mut mismatched_step_ids = Vec::new();
-    let mut missing_delta_field_paths = BTreeSet::new();
-    let mut extra_plan_delta_field_paths = BTreeSet::new();
-    let mut missing_delta_count = 0_u64;
-    let mut extra_plan_delta_count = 0_u64;
-    let mut rejected_missing_deltas = Vec::new();
-    let mut rejected_extra_plan_deltas = Vec::new();
-    for step in steps {
-        if step
-            .get("semantic_delta_match")
-            .and_then(JsonValue::as_bool)
-            == Some(true)
-        {
-            continue;
-        }
-        let step_id = step
-            .get("step_id")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("missing")
-            .to_owned();
-        mismatched_step_ids.push(step_id.clone());
-        if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
-            return json!({
-                "accepted": false,
-                "kind": "demand-current-coalesced-semantic-deltas",
-                "reason": format!("step `{step_id}` did not preserve touched state"),
-                "mismatched_step_ids": mismatched_step_ids,
-                "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-            });
-        }
-        let legacy_deltas = step
-            .get("legacy_semantic_deltas")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let plan_deltas = step
-            .get("plan_semantic_deltas")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut remaining_legacy = legacy_deltas;
-        for plan_delta in plan_deltas {
-            if let Some(index) = remaining_legacy
-                .iter()
-                .position(|legacy| legacy == &plan_delta)
-            {
-                remaining_legacy.remove(index);
-            } else {
-                extra_plan_delta_count += 1;
-                let field_path = plan_delta
-                    .get("field_path")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("missing")
-                    .to_owned();
-                extra_plan_delta_field_paths.insert(field_path.clone());
-                let kind_ok =
-                    plan_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
-                let field_ok = demand_current_field_paths.contains(&field_path);
-                if !(kind_ok && field_ok) {
-                    rejected_extra_plan_deltas.push(json!({
-                        "step_id": step_id.clone(),
-                        "delta": plan_delta,
-                    }));
-                }
-            }
-        }
-        for missing_delta in remaining_legacy {
-            missing_delta_count += 1;
-            let field_path = missing_delta
-                .get("field_path")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("missing")
-                .to_owned();
-            missing_delta_field_paths.insert(field_path.clone());
-            let kind_ok = missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
-            let field_ok = demand_current_field_paths.contains(&field_path);
-            if !(kind_ok && field_ok) {
-                rejected_missing_deltas.push(json!({
-                    "step_id": step_id.clone(),
-                    "delta": missing_delta,
-                }));
-            }
-        }
-    }
-
-    let accepted = !mismatched_step_ids.is_empty()
-        && (missing_delta_count > 0 || extra_plan_delta_count > 0)
-        && rejected_missing_deltas.is_empty()
-        && rejected_extra_plan_deltas.is_empty();
-    json!({
-        "accepted": accepted,
-        "kind": "demand-current-coalesced-semantic-deltas",
-        "reason": if accepted {
-            "PlanExecutor preserved state/assertion parity; semantic-delta differences are bounded to demand-current/list-derived FieldSet currentness"
-        } else {
-            "legacy semantic delta mismatch did not match the demand-current coalescing policy"
-        },
-        "mismatched_step_ids": mismatched_step_ids,
-        "missing_delta_field_paths": missing_delta_field_paths.into_iter().collect::<Vec<_>>(),
-        "extra_plan_delta_field_paths": extra_plan_delta_field_paths.into_iter().collect::<Vec<_>>(),
-        "accepted_demand_current_field_paths": demand_current_field_paths.iter().cloned().collect::<Vec<_>>(),
-        "missing_delta_count": missing_delta_count,
-        "extra_plan_delta_count": extra_plan_delta_count,
-        "rejected_missing_deltas": rejected_missing_deltas,
-        "rejected_extra_plan_deltas": rejected_extra_plan_deltas,
-        "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-    })
 }
 
 pub fn assemble_root_scenario_coverage_report(
@@ -19015,7 +18819,8 @@ mod tests {
             output.executor_report["executor"],
             "cpu-plan-root-scenario-command-output-v1"
         );
-        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
+        assert!(output.report.get("legacy_comparison").is_none());
+        assert!(output.report.get("legacy_comparison_acceptance").is_none());
     }
 
     #[test]
@@ -19132,9 +18937,11 @@ mod tests {
             output.report["report_status_basis"],
             "plan-executor-product-plus-assertion-coverage"
         );
-        assert_eq!(
-            output.report["command_report_assembly_core"]["legacy_required_for_status"],
-            JsonValue::Null
+        assert!(
+            output
+                .report
+                .pointer("/command_report_assembly_core/legacy_required_for_status")
+                .is_none()
         );
         assert_eq!(output.report["per_step_pass_fail"][2]["pass"], true);
         assert_eq!(

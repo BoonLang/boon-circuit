@@ -36,9 +36,13 @@ Current checkpoint:
   The unused enabled root-scenario legacy comparison assembly has also been
   deleted, `verify-compiler-boundaries` now checks that it stays removed, and
   BYTES storage profile reports no longer emit `legacy_comparison_enabled=false`
-  sentinels. The next legacy cuts are root-scalar/source-route disabled legacy
-  report contracts and the `LoadedRuntime` / `GenericScheduledRuntime`
-  implementation island.
+  sentinels. Product source-route/root-scenario reports now also omit disabled
+  `legacy_comparison*` objects, legacy parity rows, and legacy status fields;
+  BYTES file read/write wrapper reports no longer copy legacy comparison from
+  their underlying root-scenario reports. The next legacy cuts are the
+  `LoadedRuntime` / `GenericScheduledRuntime` implementation island, remaining
+  CLI retired-legacy flag rejection text, and any native legacy negative
+  counters that are no longer useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

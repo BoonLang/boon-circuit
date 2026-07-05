@@ -85800,7 +85800,8 @@ payload:
         assert_eq!(output.state_summary["store.selected_filter"], "All");
         assert_eq!(output.state_summary["store.new_todo_focused"], true);
         assert_eq!(output.report["comparison_status"], "not-requested");
-        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
+        assert!(output.report.get("legacy_comparison").is_none());
+        assert!(output.report.get("legacy_comparison_acceptance").is_none());
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-root-scenario-command-report-assembly-v1"
@@ -85830,7 +85831,8 @@ payload:
 
     fn assert_root_scenario_product_only(report: &JsonValue) {
         assert_eq!(report["comparison_status"], "not-requested");
-        assert_eq!(report["legacy_comparison"]["enabled"], false);
+        assert!(report.get("legacy_comparison").is_none());
+        assert!(report.get("legacy_comparison_acceptance").is_none());
     }
 
     #[test]
@@ -85983,7 +85985,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.state_summary["store.flag"], true);
         assert_eq!(output.report["comparison_status"], "not-requested");
-        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
+        assert!(output.report.get("legacy_comparison").is_none());
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-source-route-command-report-assembly-v1"
@@ -88425,32 +88427,7 @@ expected_source_event = {{ source = "store.decode" }}
             "cpu-plan-root-list-scenario-v1"
         );
         assert_eq!(output.state_summary["store.new_todo_text"], "");
-        assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            report["legacy_comparison"]["semantic_delta_match"], false,
-            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
-        );
-        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
-            json!(["add-test-todo-submit"])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
-            1
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
-            json!(["store.active_count"])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
-            json!([])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
-            json!([])
-        );
+        assert_root_scenario_product_only(report);
         assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
@@ -88563,35 +88540,7 @@ expected_source_event = {{ source = "store.decode" }}
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            report["legacy_comparison"]["semantic_delta_match"], false,
-            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
-        );
-        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
-            json!([
-                "add-test-todo-submit",
-                "toggle-dynamic-test-todo-under-active-filter"
-            ])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
-            3
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
-            json!(["store.active_count", "store.completed_count"])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
-            json!([])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
-            json!([])
-        );
+        assert_root_scenario_product_only(report);
         assert_eq!(report["plan_executor"]["executed_indexed_update_count"], 1);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
@@ -89795,32 +89744,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            report["legacy_comparison"]["semantic_delta_match"], false,
-            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
-        );
-        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
-            json!(["add-test-todo-submit", "delete-dynamic-test-todo"])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
-            2
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
-            json!(["store.active_count"])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
-            json!([])
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
-            json!([])
-        );
+        assert_root_scenario_product_only(report);
         assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
@@ -89912,16 +89836,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], false);
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["accepted"], true,
-            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
-        );
-        assert_eq!(
-            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
-            json!(["store.completed_count"])
-        );
+        assert_root_scenario_product_only(report);
         assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
         assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
@@ -90016,7 +89931,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         let report = &output.report;
         assert_eq!(report["status"], "pass");
         assert_eq!(output.state_summary["store.new_todo_text"], "");
-        assert_eq!(report["legacy_comparison"]["passed"], true);
+        assert_root_scenario_product_only(report);
         assert_eq!(report["plan_executor"]["executed_derived_value_count"], 0);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 0);
         assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 0);

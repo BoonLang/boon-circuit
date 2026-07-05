@@ -4025,51 +4025,6 @@ fn verify_run_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResu
     Ok(())
 }
 
-fn legacy_required_for_status(report: &JsonValue) -> bool {
-    report
-        .get("command_report_assembly_core")
-        .and_then(|core| core.get("legacy_required_for_status"))
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false)
-}
-
-fn verify_legacy_required_is_diagnostic_only(
-    report: &JsonValue,
-    report_path: &Path,
-    command_name: &str,
-) -> RuntimeResult<()> {
-    if !legacy_required_for_status(report) {
-        return Ok(());
-    }
-    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("diagnostic") {
-        return Err(format!(
-            "{} {command_name} report cannot require legacy comparison for status in proof mode",
-            report_path.display()
-        )
-        .into());
-    }
-    let command_argv = report
-        .get("command_argv")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} {command_name} command_argv is not an array",
-                report_path.display()
-            )
-        })?;
-    if !command_argv
-        .iter()
-        .any(|arg| arg.as_str() == Some("--diagnostic-compare-legacy"))
-    {
-        return Err(format!(
-            "{} {command_name} legacy-required diagnostic report is missing --diagnostic-compare-legacy",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     for key in [
         "target_profile",
@@ -4081,7 +4036,6 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
         "state_summary",
         "semantic_delta_signatures",
         "semantic_deltas",
-        "legacy_comparison",
         "plan_executor",
     ] {
         if report.get(key).is_none() {
@@ -4091,6 +4045,13 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
             )
             .into());
         }
+    }
+    if report.get("legacy_comparison").is_some() {
+        return Err(format!(
+            "{} run-plan-route product report must not emit legacy_comparison",
+            report_path.display()
+        )
+        .into());
     }
     let source_plan = compile_report_machine_plan(report, report_path)?;
     let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
@@ -4396,56 +4357,10 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
         }
     }
 
-    let legacy = report
-        .get("legacy_comparison")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{} legacy_comparison is not an object",
-                report_path.display()
-            )
-        })?;
-    verify_legacy_required_is_diagnostic_only(report, report_path, "run-plan-route")?;
-    if !legacy_required_for_status(report) {
-        if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
-            || legacy.get("reason").and_then(JsonValue::as_str)
-                != Some("legacy comparison was not requested")
-        {
-            return Err(format!(
-                "{} run-plan-route product report must keep legacy comparison disabled and non-gating",
-                report_path.display()
-            )
-            .into());
-        }
-        return Ok(());
-    }
-    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
-        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} run-plan-route legacy_comparison.{key} must be true",
-                report_path.display()
-            )
-            .into());
-        }
-    }
-    if legacy.get("plan_value") != Some(&expected_value)
-        || legacy.get("legacy_value") != Some(&expected_value)
-        || legacy.get("legacy_semantic_delta_signatures") != Some(&expected_signatures)
-        || legacy.get("plan_semantic_delta_signatures") != Some(&expected_signatures)
-        || legacy.get("legacy_semantic_deltas") != Some(&expected_deltas)
-        || legacy.get("plan_semantic_deltas") != Some(&expected_deltas)
-    {
-        return Err(format!(
-            "{} run-plan-route legacy comparison values do not match plan output",
-            report_path.display()
-        )
-        .into());
-    }
     let expected_check_ids = [
         "machine-plan-verified",
         "cpu-plan-route-surface-executable",
         "cpu-plan-source-route-executed",
-        "legacy-route-parity",
     ];
     let actual_check_ids = report
         .get("per_step_pass_fail")
@@ -4486,12 +4401,20 @@ fn verify_run_plan_root_scalar_scenario_report(
         "state_summary",
         "semantic_delta_signatures",
         "semantic_deltas",
-        "legacy_comparison",
         "plan_executor",
     ] {
         if report.get(key).is_none() {
             return Err(format!(
                 "{} run-plan-root-scalar-scenario report missing `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in ["legacy_comparison", "legacy_comparison_acceptance"] {
+        if report.get(key).is_some() {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario product report must not emit `{key}`",
                 report_path.display()
             )
             .into());
@@ -4528,10 +4451,7 @@ fn verify_run_plan_root_scalar_scenario_report(
                 report_path.display()
             )
         })?;
-    if !matches!(
-        comparison_status,
-        "pass" | "accepted-currentness-policy" | "not-requested"
-    ) {
+    if comparison_status != "not-requested" {
         return Err(format!(
             "{} run-plan-scenario-events comparison_status has invalid value `{comparison_status}`",
             report_path.display()
@@ -4547,13 +4467,7 @@ fn verify_run_plan_root_scalar_scenario_report(
                 report_path.display()
             )
         })?;
-    if !matches!(
-        report_status_basis,
-        "plan-executor-product-plus-assertion-coverage"
-            | "plan-executor-plus-explicit-legacy-comparison-and-assertion-coverage"
-            | "plan-executor-product"
-            | "plan-executor-plus-explicit-legacy-comparison"
-    ) {
+    if report_status_basis != "plan-executor-product" {
         return Err(format!(
             "{} run-plan-scenario-events report_status_basis has invalid PlanExecutor basis `{report_status_basis}`",
             report_path.display()
@@ -4862,94 +4776,6 @@ fn verify_run_plan_root_scalar_scenario_report(
         .into());
     }
 
-    let legacy = report
-        .get("legacy_comparison")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{} run-plan-root-scalar-scenario legacy_comparison is not an object",
-                report_path.display()
-            )
-        })?;
-    verify_legacy_required_is_diagnostic_only(
-        report,
-        report_path,
-        "run-plan-root-scalar-scenario",
-    )?;
-    if !legacy_required_for_status(report) {
-        if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
-            || legacy.get("reason").and_then(JsonValue::as_str)
-                != Some("legacy comparison was not requested")
-        {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario product report must keep legacy comparison disabled and non-gating",
-                report_path.display()
-            )
-            .into());
-        }
-        return Ok(());
-    }
-    for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
-        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario legacy_comparison.{key} must be true",
-                report_path.display()
-            )
-            .into());
-        }
-    }
-    if legacy.get("plan_state_summary") != Some(&expected.state_summary)
-        || legacy.get("legacy_state_summary") != Some(&expected.state_summary)
-    {
-        return Err(format!(
-            "{} run-plan-root-scalar-scenario legacy state projection does not match plan replay",
-            report_path.display()
-        )
-        .into());
-    }
-    let legacy_steps = legacy
-        .get("step_comparisons")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} run-plan-root-scalar-scenario legacy step_comparisons is not an array",
-                report_path.display()
-            )
-        })?;
-    let expected_steps = expected
-        .per_step
-        .as_array()
-        .ok_or("expected per_step is not an array")?;
-    if legacy_steps.len() != expected_steps.len() {
-        return Err(format!(
-            "{} run-plan-root-scalar-scenario legacy step count does not match selected steps",
-            report_path.display()
-        )
-        .into());
-    }
-    for (legacy_step, expected_step) in legacy_steps.iter().zip(expected_steps) {
-        if legacy_step.get("state_match").and_then(JsonValue::as_bool) != Some(true)
-            || legacy_step
-                .get("semantic_delta_match")
-                .and_then(JsonValue::as_bool)
-                != Some(true)
-            || legacy_step.get("step_id") != expected_step.get("step_id")
-            || legacy_step.get("touched_state_summary")
-                != expected_step.get("touched_state_summary")
-            || legacy_step.get("legacy_semantic_delta_signatures")
-                != expected_step.get("semantic_delta_signatures")
-            || legacy_step.get("plan_semantic_delta_signatures")
-                != expected_step.get("semantic_delta_signatures")
-            || legacy_step.get("legacy_semantic_deltas") != expected_step.get("semantic_deltas")
-            || legacy_step.get("plan_semantic_deltas") != expected_step.get("semantic_deltas")
-        {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario legacy step comparison does not match source-derived replay",
-                report_path.display()
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 
@@ -10596,7 +10422,6 @@ fn verify_bytes_file_write_plan_report_inner(
         "state_summary",
         "semantic_delta_signatures",
         "semantic_deltas",
-        "legacy_comparison",
         "file_write_summary",
         "dynamic_path_file_write_summary",
         "plan_executor",
@@ -10956,20 +10781,9 @@ fn verify_bytes_file_write_plan_report_inner(
         )
         .into());
     }
-    let legacy = report
-        .get("legacy_comparison")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{} legacy_comparison is not an object",
-                report_path.display()
-            )
-        })?;
-    if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
-        || legacy.get("passed").and_then(JsonValue::as_bool) != Some(false)
-    {
+    if report.get("legacy_comparison").is_some() {
         return Err(format!(
-            "{} verify-bytes-file-write-plan must keep legacy comparison disabled for this host-boundary proof",
+            "{} verify-bytes-file-write-plan must not emit legacy_comparison",
             report_path.display()
         )
         .into());
@@ -13107,7 +12921,6 @@ fn verify_bytes_file_read_plan_report(report: &JsonValue, report_path: &Path) ->
         "state_summary",
         "semantic_delta_signatures",
         "semantic_deltas",
-        "legacy_comparison",
         "file_read_summary",
         "dynamic_path_file_read_summary",
         "plan_executor",
@@ -13406,20 +13219,9 @@ fn verify_bytes_file_read_plan_report(report: &JsonValue, report_path: &Path) ->
         )
         .into());
     }
-    let legacy = report
-        .get("legacy_comparison")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{} legacy_comparison is not an object",
-                report_path.display()
-            )
-        })?;
-    if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
-        || legacy.get("passed").and_then(JsonValue::as_bool) != Some(false)
-    {
+    if report.get("legacy_comparison").is_some() {
         return Err(format!(
-            "{} verify-bytes-file-read-plan must keep legacy comparison disabled for this host-boundary proof",
+            "{} verify-bytes-file-read-plan must not emit legacy_comparison",
             report_path.display()
         )
         .into());
@@ -33861,15 +33663,8 @@ mod tests {
             "selected_op_indexed": false
         });
         let semantic_deltas = expected.semantic_deltas.clone();
-        let legacy_comparison = json!({
-            "enabled": false,
-            "passed": true,
-            "reason": "legacy comparison was not requested"
-        });
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-source-route-command-report-assembly-v1",
-            "legacy_passed": false,
-            "legacy_required_for_status": false,
             "plan_executor_status": "pass",
             "comparison_status": "not-requested",
             "accepted_for_product_status": "pass",
@@ -33943,12 +33738,10 @@ mod tests {
             "state_summary": state_summary,
             "semantic_delta_signatures": signatures,
             "semantic_deltas": semantic_deltas,
-            "legacy_comparison": legacy_comparison,
             "per_step_pass_fail": [
                 {"id": "machine-plan-verified", "pass": true},
                 {"id": "cpu-plan-route-surface-executable", "pass": true},
-                {"id": "cpu-plan-source-route-executed", "pass": true},
-                {"id": "legacy-route-parity", "pass": true}
+                {"id": "cpu-plan-source-route-executed", "pass": true}
             ],
             "artifact_sha256s": [],
             "plan_executor": plan_executor,
@@ -33979,22 +33772,8 @@ mod tests {
         )
         .unwrap();
         let expected_steps = expected.per_step.as_array().unwrap();
-        let legacy_comparison = json!({
-            "enabled": false,
-            "passed": false,
-            "reason": "legacy comparison was not requested"
-        });
-        let legacy_comparison_acceptance = json!({
-            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
-            "accepted": false,
-            "kind": "not-applicable",
-            "reason": "legacy comparison disabled"
-        });
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
-            "legacy_passed": false,
-            "legacy_accepted": false,
-            "legacy_required_for_status": false,
             "plan_executor_status": "pass",
             "comparison_status": "not-requested",
             "accepted_for_product_status": "pass",
@@ -34063,12 +33842,9 @@ mod tests {
         report["state_summary"] = plan_executor["state_summary"].clone();
         report["semantic_delta_signatures"] = plan_executor["semantic_delta_signatures"].clone();
         report["semantic_deltas"] = expected.semantic_deltas;
-        report["legacy_comparison"] = legacy_comparison;
-        report["legacy_comparison_acceptance"] = legacy_comparison_acceptance;
         report["per_step_pass_fail"] = json!([
             {"id": "machine-plan-verified", "pass": true},
-            {"id": "cpu-plan-root-list-scenario-executed", "pass": true},
-            {"id": "legacy-root-scenario-parity", "pass": true}
+            {"id": "cpu-plan-root-list-scenario-executed", "pass": true}
         ]);
         report["plan_executor"] = plan_executor;
         report["command_report_assembly_core"] = command_report_assembly_core;

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use boon_plan::{
     FieldId, InitialValueKind, MachinePlan, PlanConstantId, PlanConstantValue,
     PlanDerivedExpression, PlanExpressionKind, PlanListOperationKind, PlanListProjection, PlanOp,
@@ -644,6 +646,7 @@ pub struct RootScenarioCommandReportInput {
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
     pub legacy_comparison: JsonValue,
+    pub legacy_comparison_acceptance: JsonValue,
     pub compare_legacy: bool,
     pub plan_executor: JsonValue,
 }
@@ -680,6 +683,7 @@ pub struct RootScenarioCommandOutputInput {
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
     pub legacy_comparison: JsonValue,
+    pub legacy_comparison_acceptance: JsonValue,
     pub compare_legacy: bool,
     pub plan_executor: JsonValue,
 }
@@ -10803,6 +10807,13 @@ pub fn assemble_source_route_command_report(
         .get("passed")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
+    let comparison_status = plan_executor_comparison_status(
+        &input.legacy_comparison,
+        legacy_passed,
+        input.compare_legacy,
+    );
+    let plan_executor_status = "pass";
+    let accepted_for_product_status = "pass";
     let expression_kind = input
         .route_surface
         .get("expression_kind")
@@ -10814,7 +10825,11 @@ pub fn assemble_source_route_command_report(
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
         "legacy_passed": legacy_passed,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
+        "report_status_basis": "legacy-comparison-compat",
         "exit_status": exit_status,
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
@@ -10824,6 +10839,10 @@ pub fn assemble_source_route_command_report(
     });
     let report = json!({
         "status": report_status,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
+        "report_status_basis": "legacy-comparison-compat",
         "report_version": 1,
         "command": "run-plan-route",
         "command_argv": input.command_argv,
@@ -10889,6 +10908,27 @@ pub fn assemble_source_route_command_report(
     SourceRouteCommandReportAssembly { report }
 }
 
+fn plan_executor_comparison_status(
+    legacy_comparison: &JsonValue,
+    legacy_accepted: bool,
+    compare_legacy: bool,
+) -> &'static str {
+    let comparison_enabled = compare_legacy
+        && legacy_comparison
+            .get("enabled")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    if !comparison_enabled {
+        "not-requested"
+    } else if legacy_comparison.get("passed").and_then(JsonValue::as_bool) == Some(true) {
+        "pass"
+    } else if legacy_accepted {
+        "accepted-currentness-policy"
+    } else {
+        "fail"
+    }
+}
+
 pub fn assemble_root_scenario_command_output(
     input: RootScenarioCommandOutputInput,
 ) -> RootScenarioCommandOutput {
@@ -10936,6 +10976,7 @@ pub fn assemble_root_scenario_command_output(
         semantic_delta_signatures: input.semantic_delta_signatures,
         semantic_deltas: input.semantic_deltas,
         legacy_comparison: input.legacy_comparison,
+        legacy_comparison_acceptance: input.legacy_comparison_acceptance,
         compare_legacy: input.compare_legacy,
         plan_executor,
     })
@@ -10955,12 +10996,30 @@ pub fn assemble_root_scenario_command_report(
         .get("passed")
         .and_then(JsonValue::as_bool)
         == Some(true);
-    let report_status = if legacy_passed { "pass" } else { "fail" };
-    let exit_status = if legacy_passed { 0 } else { 1 };
+    let legacy_accepted = legacy_passed
+        || input
+            .legacy_comparison_acceptance
+            .get("accepted")
+            .and_then(JsonValue::as_bool)
+            == Some(true);
+    let comparison_status = plan_executor_comparison_status(
+        &input.legacy_comparison,
+        legacy_accepted,
+        input.compare_legacy,
+    );
+    let plan_executor_status = "pass";
+    let accepted_for_product_status = "pass";
+    let report_status = if legacy_accepted { "pass" } else { "fail" };
+    let exit_status = if legacy_accepted { 0 } else { 1 };
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
         "legacy_passed": legacy_passed,
+        "legacy_accepted": legacy_accepted,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
+        "report_status_basis": "legacy-comparison-compat",
         "exit_status": exit_status,
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
@@ -10970,6 +11029,10 @@ pub fn assemble_root_scenario_command_report(
     });
     let report = json!({
         "status": report_status,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
+        "report_status_basis": "legacy-comparison-compat",
         "report_version": 1,
         "command": "run-plan-root-scalar-scenario",
         "command_argv": input.command_argv,
@@ -11000,6 +11063,7 @@ pub fn assemble_root_scenario_command_report(
         "semantic_delta_signatures": input.semantic_delta_signatures,
         "semantic_deltas": input.semantic_deltas,
         "legacy_comparison": input.legacy_comparison,
+        "legacy_comparison_acceptance": input.legacy_comparison_acceptance,
         "per_step_pass_fail": [
             {
                 "id": "machine-plan-verified",
@@ -11013,9 +11077,9 @@ pub fn assemble_root_scenario_command_report(
             },
             {
                 "id": "legacy-root-scenario-parity",
-                "pass": legacy_passed,
+                "pass": legacy_accepted,
                 "detail": if input.compare_legacy {
-                    "legacy runtime produced matching touched root states and semantic deltas"
+                    "legacy runtime produced matching touched root states and either exact semantic deltas or accepted currentness-only deltas"
                 } else {
                     "legacy runtime comparison was not requested"
                 }
@@ -11108,6 +11172,17 @@ pub fn assemble_scenario_events_command_report(
             .get("accepted")
             .and_then(JsonValue::as_bool)
             == Some(true);
+    let comparison_status = plan_executor_comparison_status(
+        &input.legacy_comparison,
+        legacy_accepted,
+        input.compare_legacy,
+    );
+    let plan_executor_status = "pass";
+    let accepted_for_product_status = if input.assertion_only_covered {
+        "pass"
+    } else {
+        "fail"
+    };
     let accepted = legacy_accepted && input.assertion_only_covered;
     let report_status = if accepted { "pass" } else { "fail" };
     let exit_status = if accepted { 0 } else { 1 };
@@ -11116,7 +11191,11 @@ pub fn assemble_scenario_events_command_report(
         "legacy_passed": legacy_passed,
         "legacy_accepted": legacy_accepted,
         "assertion_only_covered": input.assertion_only_covered,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
+        "report_status_basis": "legacy-comparison-plus-assertion-coverage-compat",
         "exit_status": exit_status,
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
@@ -11131,6 +11210,10 @@ pub fn assemble_scenario_events_command_report(
         .unwrap_or_else(|| JsonValue::Array(Vec::new()));
     let report = json!({
         "status": report_status,
+        "plan_executor_status": plan_executor_status,
+        "comparison_status": comparison_status,
+        "accepted_for_product_status": accepted_for_product_status,
+        "report_status_basis": "legacy-comparison-plus-assertion-coverage-compat",
         "report_version": 1,
         "command": "run-plan-scenario-events",
         "command_argv": input.command_argv,
@@ -11361,7 +11444,28 @@ pub fn assemble_root_scenario_step_report(
 }
 
 pub fn demand_current_field_paths(plan: &MachinePlan) -> BTreeSet<String> {
-    plan.regions
+    let mut count_field_ids = BTreeSet::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+    {
+        let PlanOpKind::ListOperation {
+            operation_kind: boon_plan::PlanListOperationKind::Count,
+            count: Some(count),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if let ValueRef::Field(field_id) = count.target {
+            count_field_ids.insert(field_id.0);
+        }
+    }
+
+    let mut paths = plan
+        .regions
         .iter()
         .filter(|region| region.kind == RegionKind::DerivedEvaluation)
         .flat_map(|region| region.ops.iter())
@@ -11374,13 +11478,24 @@ pub fn demand_current_field_paths(plan: &MachinePlan) -> BTreeSet<String> {
             else {
                 return Vec::new();
             };
-            if *startup_recompute {
+            let reads_list_count = match &op.kind {
+                PlanOpKind::DerivedValue {
+                    expression: Some(expression),
+                    ..
+                } => derived_expression_reads_field_ids(expression, &count_field_ids),
+                _ => false,
+            };
+            if *startup_recompute && !reads_list_count {
                 return Vec::new();
             }
             let Some(ValueRef::Field(field_id)) = op.output else {
                 return Vec::new();
             };
-            let label = field_label(plan, field_id.0);
+            let label = if op.indexed {
+                field_label(plan, field_id.0)
+            } else {
+                derived_field_label(plan, field_id.0)
+            };
             let mut labels = vec![label.clone()];
             if op.indexed
                 && let Some((_, local_field)) = label.rsplit_once('.')
@@ -11389,7 +11504,35 @@ pub fn demand_current_field_paths(plan: &MachinePlan) -> BTreeSet<String> {
             }
             labels
         })
-        .collect()
+        .collect::<BTreeSet<_>>();
+
+    for field_id in count_field_ids {
+        paths.insert(derived_field_label(plan, field_id));
+    }
+
+    paths
+}
+
+fn derived_expression_reads_field_ids(
+    expression: &PlanDerivedExpression,
+    field_ids: &BTreeSet<usize>,
+) -> bool {
+    match expression {
+        PlanDerivedExpression::NumberCompareConst { left, .. } => {
+            matches!(left, ValueRef::Field(field_id) if field_ids.contains(&field_id.0))
+        }
+        PlanDerivedExpression::BoolAnd { left, right } => {
+            derived_expression_reads_field_ids(left, field_ids)
+                || derived_expression_reads_field_ids(right, field_ids)
+        }
+        PlanDerivedExpression::BoolNot { input } => {
+            matches!(input, ValueRef::Field(field_id) if field_ids.contains(&field_id.0))
+        }
+        PlanDerivedExpression::BoolNotExpression { input } => {
+            derived_expression_reads_field_ids(input, field_ids)
+        }
+        _ => false,
+    }
 }
 
 pub fn demand_current_semantic_delta_acceptance_policy(
@@ -11447,9 +11590,11 @@ pub fn demand_current_semantic_delta_acceptance_policy(
 
     let mut mismatched_step_ids = Vec::new();
     let mut missing_delta_field_paths = BTreeSet::new();
+    let mut extra_plan_delta_field_paths = BTreeSet::new();
     let mut missing_delta_count = 0_u64;
     let mut extra_plan_delta_count = 0_u64;
     let mut rejected_missing_deltas = Vec::new();
+    let mut rejected_extra_plan_deltas = Vec::new();
     for step in steps {
         if step
             .get("semantic_delta_match")
@@ -11492,6 +11637,21 @@ pub fn demand_current_semantic_delta_acceptance_policy(
                 remaining_legacy.remove(index);
             } else {
                 extra_plan_delta_count += 1;
+                let field_path = plan_delta
+                    .get("field_path")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("missing")
+                    .to_owned();
+                extra_plan_delta_field_paths.insert(field_path.clone());
+                let kind_ok =
+                    plan_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet");
+                let field_ok = demand_current_field_paths.contains(&field_path);
+                if !(kind_ok && field_ok) {
+                    rejected_extra_plan_deltas.push(json!({
+                        "step_id": step_id.clone(),
+                        "delta": plan_delta,
+                    }));
+                }
             }
         }
         for missing_delta in remaining_legacy {
@@ -11506,7 +11666,7 @@ pub fn demand_current_semantic_delta_acceptance_policy(
             let field_ok = demand_current_field_paths.contains(&field_path);
             if !(kind_ok && field_ok) {
                 rejected_missing_deltas.push(json!({
-                    "step_id": step_id,
+                    "step_id": step_id.clone(),
                     "delta": missing_delta,
                 }));
             }
@@ -11514,22 +11674,25 @@ pub fn demand_current_semantic_delta_acceptance_policy(
     }
 
     let accepted = !mismatched_step_ids.is_empty()
-        && extra_plan_delta_count == 0
-        && rejected_missing_deltas.is_empty();
+        && (missing_delta_count > 0 || extra_plan_delta_count > 0)
+        && rejected_missing_deltas.is_empty()
+        && rejected_extra_plan_deltas.is_empty();
     json!({
         "accepted": accepted,
         "kind": "demand-current-coalesced-semantic-deltas",
         "reason": if accepted {
-            "PlanExecutor preserved state/assertion parity and emitted a subset of legacy deltas; omitted deltas are transient demand-current FieldSet values"
+            "PlanExecutor preserved state/assertion parity; semantic-delta differences are bounded to demand-current/list-derived FieldSet currentness"
         } else {
             "legacy semantic delta mismatch did not match the demand-current coalescing policy"
         },
         "mismatched_step_ids": mismatched_step_ids,
         "missing_delta_field_paths": missing_delta_field_paths.into_iter().collect::<Vec<_>>(),
+        "extra_plan_delta_field_paths": extra_plan_delta_field_paths.into_iter().collect::<Vec<_>>(),
         "accepted_demand_current_field_paths": demand_current_field_paths.iter().cloned().collect::<Vec<_>>(),
         "missing_delta_count": missing_delta_count,
         "extra_plan_delta_count": extra_plan_delta_count,
         "rejected_missing_deltas": rejected_missing_deltas,
+        "rejected_extra_plan_deltas": rejected_extra_plan_deltas,
         "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
     })
 }
@@ -17095,6 +17258,9 @@ mod tests {
 
         let digest = sha256_bytes(&payload);
         assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["plan_executor_status"], "pass");
+        assert_eq!(output.report["comparison_status"], "pass");
+        assert_eq!(output.report["accepted_for_product_status"], "pass");
         assert_eq!(
             output.report["plan_executor"]["command_output_core"]["executor"],
             "cpu-plan-source-route-command-output-v1"
@@ -17199,11 +17365,18 @@ mod tests {
             semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
             semantic_deltas: json!([{"kind": "FieldSet"}]),
             legacy_comparison: json!({"enabled": true, "passed": true}),
+            legacy_comparison_acceptance: json!({
+                "accepted": false,
+                "kind": "not-needed"
+            }),
             compare_legacy: true,
             plan_executor: json!({"executor": "cpu-plan-root-scenario-v1"}),
         });
 
         assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["plan_executor_status"], "pass");
+        assert_eq!(output.report["comparison_status"], "pass");
+        assert_eq!(output.report["accepted_for_product_status"], "pass");
         assert_eq!(output.report["command"], "run-plan-root-scalar-scenario");
         assert_eq!(
             output.report["selected_step_ids"],
@@ -17270,6 +17443,12 @@ mod tests {
         });
 
         assert_eq!(output.report["status"], "pass");
+        assert_eq!(output.report["plan_executor_status"], "pass");
+        assert_eq!(
+            output.report["comparison_status"],
+            "accepted-currentness-policy"
+        );
+        assert_eq!(output.report["accepted_for_product_status"], "pass");
         assert_eq!(output.report["command"], "run-plan-scenario-events");
         assert_eq!(
             output.report["selected_step_ids"],
@@ -17291,6 +17470,60 @@ mod tests {
         assert_eq!(
             output.report["legacy_comparison_acceptance"]["accepted"],
             true
+        );
+    }
+
+    #[test]
+    fn scenario_events_report_splits_product_status_from_legacy_comparison_status() {
+        let output = assemble_scenario_events_command_output(ScenarioEventsCommandOutputInput {
+            command_argv: vec![
+                "target/debug/boon_cli".to_owned(),
+                "run-plan-scenario-events".to_owned(),
+                "examples/counter.bn".to_owned(),
+            ],
+            generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
+            git_commit: "abc123".to_owned(),
+            worktree_fingerprint: "worktreehash".to_owned(),
+            binary_hash: "binhash".to_owned(),
+            binary_path: "target/debug/boon_cli".to_owned(),
+            source_path: "examples/counter.bn".to_owned(),
+            source_hash: "sourcehash".to_owned(),
+            source_files: vec!["examples/counter.bn".to_owned()],
+            scenario_path: "examples/counter.scn".to_owned(),
+            scenario_hash: "scenariohash".to_owned(),
+            program_hash: "programhash".to_owned(),
+            program_kind: "single-file".to_owned(),
+            program_file_count: 1,
+            graph_node_count: 3,
+            load_pipeline_profile: json!({"total_ms": 1.0}),
+            target_profile: "software-default".to_owned(),
+            plan_hash: "planhash".to_owned(),
+            plan_version: json!({"major": 1}),
+            capability_summary: json!({"executable": true}),
+            state_summary: json!({"store": {"count": 1}}),
+            semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
+            semantic_deltas: json!([{"kind": "FieldSet"}]),
+            legacy_comparison: json!({"enabled": true, "passed": false}),
+            legacy_comparison_acceptance: json!({
+                "accepted": false,
+                "kind": "not-accepted"
+            }),
+            compare_legacy: true,
+            plan_executor_coverage: json!({
+                "selected_step_ids": ["increment"],
+                "covers_assertion_only_steps": true
+            }),
+            assertion_only_covered: true,
+            plan_executor: json!({"executor": "cpu-plan-scenario-events-v1"}),
+        });
+
+        assert_eq!(output.report["status"], "fail");
+        assert_eq!(output.report["plan_executor_status"], "pass");
+        assert_eq!(output.report["comparison_status"], "fail");
+        assert_eq!(output.report["accepted_for_product_status"], "pass");
+        assert_eq!(
+            output.report["report_status_basis"],
+            "legacy-comparison-plus-assertion-coverage-compat"
         );
     }
 

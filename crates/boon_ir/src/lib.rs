@@ -7350,9 +7350,7 @@ const DERIVED_LIST_VIEW_OPERATORS: [&str; 8] = [
 
 fn list_initializer_has_dynamic_fields(rows: &[ListInitialRecord]) -> bool {
     rows.iter().any(|row| {
-        row.fields
-            .iter()
-        .any(|field| {
+        row.fields.iter().any(|field| {
             matches!(
                 field.value,
                 InitialValue::Unknown { .. } | InitialValue::RootInitialField { .. }
@@ -7771,9 +7769,7 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
 }
 
 fn value_is_root_initial_field_ref(value: &str) -> bool {
-    !value.is_empty()
-        && !value_starts_uppercase_identifier(value)
-        && value.split('.').all(is_name)
+    !value.is_empty() && !value_starts_uppercase_identifier(value) && value.split('.').all(is_name)
 }
 
 fn signed_integer_literal_value(tokens: &[String]) -> Option<i64> {

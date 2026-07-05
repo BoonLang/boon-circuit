@@ -12930,6 +12930,22 @@ fn preview_compile_product_render_graph(
         renderer_graph_resource_lifetime_hash: renderer_metrics
             .map(|metrics| metrics.renderer_render_graph_resource_lifetime_hash.clone())
             .filter(|hash| !hash.is_empty()),
+        renderer_graph_retained_resource_epoch_hash: renderer_metrics
+            .map(|metrics| {
+                metrics
+                    .renderer_render_graph_retained_resource_epoch_hash
+                    .clone()
+            })
+            .filter(|hash| !hash.is_empty()),
+        renderer_graph_retained_state_resource_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_retained_state_resource_count
+        }),
+        renderer_graph_retained_dirty_resource_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_retained_dirty_resource_count
+        }),
+        renderer_graph_retained_reused_resource_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_retained_reused_resource_count
+        }),
         active_scene_identity,
         render_scene_identity,
         pass_count: passes.len() as u32,

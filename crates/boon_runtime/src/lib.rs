@@ -35,7 +35,7 @@ use boon_compiler::{
     compile_source_text_to_full_ir, compile_source_text_to_machine_plan,
     compile_source_text_to_runtime_ir, compile_source_units_to_full_ir,
     compile_source_units_to_machine_plan, compile_source_units_to_runtime_ir,
-    compiler_ir_debug_report_from_path, compiler_parsed_document,
+    compile_typed_program, compiler_ir_debug_report_from_path, compiler_parsed_document,
     compiler_source_files_for_manifest_source, compiler_source_text_for_manifest_source,
     compiler_source_text_for_path, compiler_source_units_for_manifest_source,
     compiler_source_units_for_path, parse_scenario_file as compiler_parse_scenario_file,
@@ -92,6 +92,7 @@ use boon_plan_executor::{
     assert_live_source_event_matches_expected as assert_plan_live_source_event_matches_expected,
     assert_scenario_checkpoint as assert_plan_scenario_checkpoint,
     build_live_source_event_expected_toml as build_plan_live_source_event_expected_toml,
+    changed_root_derived_deltas as changed_plan_root_derived_deltas,
     coalesce_field_set_deltas as coalesce_plan_field_set_deltas,
     collect_root_update_candidate_for_step as collect_plan_root_update_candidate_for_step,
     commit_ordered_root_update_candidates as commit_plan_ordered_root_update_candidates,
@@ -3281,6 +3282,9 @@ pub fn emit_compiled_artifact(
     report_path: Option<&Path>,
 ) -> RuntimeResult<JsonValue> {
     let compiler_output = compile_source_path_to_full_ir(source_path)?;
+    let machine_plan = compile_typed_program(&compiler_output.ir, TargetProfile::SoftwareDefault)?;
+    let machine_plan_hash = plan_sha256(&machine_plan)?;
+    let machine_plan_verification = verify_plan(&machine_plan)?;
     let parsed = compiler_output.parsed;
     let compiled = CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let program_hash = report_source_hash_for_parsed(&parsed);
@@ -3294,6 +3298,10 @@ pub fn emit_compiled_artifact(
         &program_hash,
         &typecheck_hash,
         &render_slot_hash,
+        &machine_plan,
+        &machine_plan_hash,
+        &machine_plan_verification.status,
+        machine_plan_verification.error_count,
     );
     write_json(out_path, &artifact.body)?;
     let artifact_hash = sha256_file(out_path)?;
@@ -3320,6 +3328,9 @@ pub fn emit_compiled_artifact(
         "source_path": source_path.display().to_string(),
         "source_hash": source_hash,
         "program_hash": program_hash.clone(),
+        "machine_plan_hash": artifact.body["machine_plan_hash"].clone(),
+        "plan_hash": artifact.body["plan_hash"].clone(),
+        "target_profile": artifact.body["target_profile"].clone(),
         "program_kind": parsed.kind.as_str(),
         "program_file_count": parsed.files.len(),
         "source_files": parsed.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
@@ -3333,6 +3344,11 @@ pub fn emit_compiled_artifact(
             "artifact_version": artifact.body["artifact_version"].clone(),
             "program_hash": artifact.body["program_hash"].clone(),
             "report_schema_hash": artifact.body["report_schema_hash"].clone(),
+            "machine_plan_hash": artifact.body["machine_plan_hash"].clone(),
+            "plan_hash": artifact.body["plan_hash"].clone(),
+            "target_profile": artifact.body["target_profile"].clone(),
+            "capability_summary": artifact.body["capability_summary"].clone(),
+            "machine_plan_verification": artifact.body["machine_plan_verification"].clone(),
             "source_unit_count": artifact
                 .body
                 .get("source_unit_hashes")
@@ -3350,6 +3366,7 @@ pub fn emit_compiled_artifact(
             "bridge_schemas": artifact.body.get("bridge_schemas").is_some(),
             "compiled_schedule": artifact.body.get("compiled_schedule").is_some(),
             "runtime_plan": artifact.body.get("runtime_plan").is_some(),
+            "machine_plan": artifact.body.get("machine_plan").is_some(),
         },
         "artifact_sha256s": [{
             "path": out_path.display().to_string(),
@@ -3376,8 +3393,10 @@ pub fn inspect_compiled_artifact_report(
     let document_lowering_tables = artifact.runtime_document_lowering_tables()?;
     let non_route_tables = artifact.runtime_non_route_tables()?;
     let source_routes = artifact.runtime_source_routes()?;
-    let (_runtime, runtime_instantiation_profile) =
-        LoadedRuntime::from_compiled_artifact_profiled(&artifact)?;
+    let plan_session = PlanExecutorLiveSession::from_compiled_artifact(&artifact)?;
+    let plan_executor_provenance = plan_session.provenance_report();
+    let machine_plan = artifact.machine_plan()?;
+    let machine_plan_hash = plan_sha256(&machine_plan)?;
     let storage_initial_row_count = storage_initialization_plan
         .list_slots
         .iter()
@@ -3399,6 +3418,10 @@ pub fn inspect_compiled_artifact_report(
         "artifact_path": artifact_path.display().to_string(),
         "artifact_hash": artifact_hash.clone(),
         "program_hash": artifact.body["program_hash"].clone(),
+        "machine_plan_hash": machine_plan_hash,
+        "plan_hash": artifact.body["plan_hash"].clone(),
+        "target_profile": artifact.body["target_profile"].clone(),
+        "capability_summary": artifact.body["capability_summary"].clone(),
         "compiled_artifact": artifact.report_with_path(artifact_path),
         "artifact_sections": artifact.section_presence(),
         "artifact_sha256s": [{
@@ -3407,9 +3430,22 @@ pub fn inspect_compiled_artifact_report(
         }],
         "inspection_result": {
             "artifact_valid": true,
-            "loaded_runtime_from_artifact": true,
+            "runtime_engine": "plan_executor",
+            "loaded_runtime_from_artifact": false,
+            "legacy_loaded_runtime_from_artifact": false,
+            "plan_executor_runtime_from_artifact": true,
+            "plan_executor_provenance": plan_executor_provenance,
             "runtime_instantiated_from_artifact": true,
-            "artifact_runtime_instantiation_profile": runtime_instantiation_profile,
+            "artifact_runtime_instantiation_profile": {
+                "engine": "plan_executor",
+                "source": "compiled_artifact.machine_plan",
+                "generic_fallback_enabled": false
+            },
+            "machine_plan_deserialized_from_artifact": true,
+            "machine_plan_hash": artifact.body["machine_plan_hash"].clone(),
+            "plan_hash": artifact.body["plan_hash"].clone(),
+            "target_profile": artifact.body["target_profile"].clone(),
+            "machine_plan_verification": artifact.body["machine_plan_verification"].clone(),
             "runtime_plan_present": runtime_plan_present,
             "runtime_plan_generic_derived_deserialized_from_artifact": true,
             "runtime_plan_generic_derived_deserialized_counts": {
@@ -3949,6 +3985,11 @@ pub fn run_plan_root_scalar_scenario(
             "reason": "legacy comparison is required for accepted root-scenario proof reports"
         })
     };
+    let demand_current_field_paths = plan_demand_current_field_paths(&plan);
+    let legacy_comparison_acceptance = plan_demand_current_semantic_delta_acceptance_policy(
+        &legacy_comparison,
+        &demand_current_field_paths,
+    );
     let command_output =
         assemble_plan_root_scenario_command_output(RootScenarioCommandOutputInput {
             command_argv: std::env::args().collect::<Vec<_>>(),
@@ -3976,6 +4017,7 @@ pub fn run_plan_root_scalar_scenario(
             semantic_delta_signatures: output.semantic_delta_signatures.clone(),
             semantic_deltas: output.semantic_deltas.clone(),
             legacy_comparison,
+            legacy_comparison_acceptance,
             compare_legacy,
             plan_executor: output.executor_report.clone(),
         });
@@ -4076,7 +4118,9 @@ pub fn run_plan_scenario_events(
             assertion_only_covered,
             plan_executor: output.executor_report.clone(),
         });
-    let report = command_output.report;
+    let mut report = command_output.report;
+    insert_plan_executor_source_replay_worktree_fields(&mut report);
+    insert_plan_executor_source_replay_identity(&mut report);
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -4431,6 +4475,30 @@ impl PlanExecutorRuntimeState {
             self.semantic_deltas.push(delta.clone());
             step_deltas.push(delta.clone());
         }
+        let root_list_derived_values_after_updates =
+            root_pure_number_compare_values(plan, &self.list_state)?;
+        let root_list_derived_changes = changed_plan_root_derived_deltas(
+            plan,
+            &root_derived_values_before_updates,
+            &root_list_derived_values_after_updates,
+        );
+        commit_root_list_derived_values_to_root_state(
+            plan,
+            &mut self.root_state.root_state,
+            &root_list_derived_values_after_updates,
+        );
+        for (delta, report) in root_list_derived_changes {
+            if root_field_set_delta_already_recorded(&step_deltas, &delta) {
+                continue;
+            }
+            let signature = plan_json_delta_signature(&delta)?;
+            step_signatures.push(signature.clone());
+            self.semantic_delta_signatures.push(signature);
+            self.semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+            derived.push(report);
+            self.executed_derived_value_count += 1;
+        }
         let step_retain_execution =
             materialize_plan_list_retains(plan, &self.root_state.root_state, &self.list_state)?;
         self.executed_list_retain_count += step_retain_execution.executed_count;
@@ -4588,6 +4656,10 @@ impl PlanExecutorLiveSession {
     fn from_source_path(source_path: &Path, target_profile: TargetProfile) -> RuntimeResult<Self> {
         let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
         Self::from_machine_plan(compiled.plan, source_path.parent().map(Path::to_path_buf))
+    }
+
+    fn from_compiled_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
+        Self::from_machine_plan(artifact.machine_plan()?, None)
     }
 
     fn from_machine_plan(
@@ -5473,6 +5545,33 @@ fn root_pure_number_compare_values(
         plan,
         &executor_rows,
     )?)
+}
+
+fn commit_root_list_derived_values_to_root_state(
+    plan: &MachinePlan,
+    root_state: &mut serde_json::Map<String, JsonValue>,
+    values: &BTreeMap<usize, JsonValue>,
+) {
+    for (field_id, value) in values {
+        root_state.insert(plan_derived_field_label(plan, *field_id), value.clone());
+    }
+}
+
+fn root_field_set_delta_already_recorded(recorded: &[JsonValue], candidate: &JsonValue) -> bool {
+    let candidate_kind = candidate.get("kind").and_then(JsonValue::as_str);
+    if candidate_kind != Some("FieldSet") {
+        return false;
+    }
+    let candidate_field = candidate.get("field_path").and_then(JsonValue::as_str);
+    let candidate_value = candidate.get("value");
+    recorded.iter().any(|delta| {
+        delta.get("kind").and_then(JsonValue::as_str) == candidate_kind
+            && delta.get("list_id").is_some_and(JsonValue::is_null)
+            && delta.get("key").is_some_and(JsonValue::is_null)
+            && delta.get("generation").is_some_and(JsonValue::is_null)
+            && delta.get("field_path").and_then(JsonValue::as_str) == candidate_field
+            && delta.get("value") == candidate_value
+    })
 }
 
 fn execute_indexed_update_branch(
@@ -10722,9 +10821,9 @@ pub fn run_compiled_artifact_scenario(
     scenario_path: &Path,
 ) -> RuntimeResult<ArtifactScenarioRunOutput> {
     let artifact = CompiledArtifact::load_from_path(artifact_path)?;
-    let runtime = LoadedRuntime::from_compiled_artifact(&artifact)?;
+    let plan = artifact.machine_plan()?;
     let scenario = parse_scenario(scenario_path)?;
-    run_artifact_runtime_scenario(runtime, &scenario)
+    run_artifact_plan_scenario(&plan, &scenario)
 }
 
 pub fn run_scenario_project(
@@ -20732,7 +20831,7 @@ struct CompiledArtifact {
 }
 
 impl CompiledArtifact {
-    const REQUIRED_SECTIONS: [&'static str; 10] = [
+    const REQUIRED_SECTIONS: [&'static str; 11] = [
         "semantic_index",
         "symbol_table",
         "storage_layout",
@@ -20743,6 +20842,7 @@ impl CompiledArtifact {
         "bridge_schemas",
         "compiled_schedule",
         "runtime_plan",
+        "machine_plan",
     ];
 
     fn from_parts(
@@ -20751,6 +20851,10 @@ impl CompiledArtifact {
         program_hash: &str,
         typecheck_report_hash: &str,
         render_slot_table_hash: &str,
+        machine_plan: &MachinePlan,
+        machine_plan_hash: &str,
+        machine_plan_verification_status: &str,
+        machine_plan_verification_error_count: usize,
     ) -> Self {
         let program_metadata = compiled.source_program_metadata("compiled artifact body");
         let compiled_schedule = compiled.report();
@@ -20801,7 +20905,17 @@ impl CompiledArtifact {
                 "schema_count": 0
             },
             "typecheck_report_hash": typecheck_report_hash,
+            "machine_plan_hash": machine_plan_hash,
+            "plan_hash": machine_plan_hash,
+            "plan_version": machine_plan.version,
+            "target_profile": machine_plan.target_profile.as_str(),
+            "capability_summary": machine_plan.capability_summary,
+            "machine_plan_verification": {
+                "status": machine_plan_verification_status,
+                "error_count": machine_plan_verification_error_count
+            },
             "runtime_plan": compiled.runtime_plan_artifact(),
+            "machine_plan": machine_plan,
             "compiled_schedule": compiled_schedule
         });
         let bytes =
@@ -20856,6 +20970,16 @@ impl CompiledArtifact {
         SourceRoutePlan::from_artifact_body(&self.body)
     }
 
+    fn machine_plan(&self) -> RuntimeResult<MachinePlan> {
+        serde_json::from_value(
+            self.body
+                .get("machine_plan")
+                .cloned()
+                .ok_or("compiled artifact missing machine_plan")?,
+        )
+        .map_err(|error| format!("compiled artifact machine_plan did not decode: {error}").into())
+    }
+
     fn validate(&self, path: &Path) -> RuntimeResult<()> {
         if self.body.get("artifact_kind").and_then(JsonValue::as_str)
             != Some("boonc.compiled_program")
@@ -20903,6 +21027,7 @@ impl CompiledArtifact {
             "source_unit_hashes",
             "report_schema_hash",
             "typecheck_report_hash",
+            "machine_plan_hash",
         ] {
             if self.body.get(key).is_none() {
                 return Err(format!("{} compiled artifact missing `{key}`", path.display()).into());
@@ -20918,6 +21043,70 @@ impl CompiledArtifact {
             }
         }
         self.validate_partial_runtime_plan(path)?;
+        self.validate_machine_plan(path)?;
+        Ok(())
+    }
+
+    fn validate_machine_plan(&self, path: &Path) -> RuntimeResult<()> {
+        let plan = self.machine_plan()?;
+        let canonical_plan = serde_json::to_value(&plan).map_err(|error| {
+            format!(
+                "{} embedded machine_plan could not reserialize canonically: {error}",
+                path.display()
+            )
+        })?;
+        if self.body.get("machine_plan") != Some(&canonical_plan) {
+            return Err(format!(
+                "{} embedded machine_plan contains unknown or non-canonical fields",
+                path.display()
+            )
+            .into());
+        }
+        let actual_hash = plan_sha256(&plan)?;
+        let expected_hash = self
+            .body
+            .get("machine_plan_hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{} machine_plan_hash is not a string", path.display()))?;
+        if actual_hash != expected_hash {
+            return Err(format!(
+                "{} machine_plan_hash mismatch: expected {expected_hash}, got {actual_hash}",
+                path.display()
+            )
+            .into());
+        }
+        if self.body.get("plan_hash").and_then(JsonValue::as_str) != Some(expected_hash) {
+            return Err(
+                format!("{} plan_hash must match machine_plan_hash", path.display()).into(),
+            );
+        }
+        if self.body.get("target_profile").and_then(JsonValue::as_str)
+            != Some(plan.target_profile.as_str())
+        {
+            return Err(format!(
+                "{} target_profile must match embedded machine_plan",
+                path.display()
+            )
+            .into());
+        }
+        if self.body.get("capability_summary")
+            != Some(&serde_json::to_value(&plan.capability_summary)?)
+        {
+            return Err(format!(
+                "{} capability_summary must match embedded machine_plan",
+                path.display()
+            )
+            .into());
+        }
+        let verification = verify_plan(&plan)?;
+        if verification.status != "pass" {
+            return Err(format!(
+                "{} embedded machine_plan verification failed with {} error(s)",
+                path.display(),
+                verification.error_count
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -21224,6 +21413,11 @@ impl CompiledArtifact {
             "sha256": self.sha256,
             "program_hash": self.body["program_hash"].clone(),
             "report_schema_hash": self.body["report_schema_hash"].clone(),
+            "machine_plan_hash": self.body["machine_plan_hash"].clone(),
+            "plan_hash": self.body["plan_hash"].clone(),
+            "target_profile": self.body["target_profile"].clone(),
+            "capability_summary": self.body["capability_summary"].clone(),
+            "machine_plan_verification": self.body["machine_plan_verification"].clone(),
             "parser_ast_required_for_execution": self.body["parser_ast_required_for_execution"].clone(),
             "typed_ir_required_for_mvp_loader": self.body["typed_ir_required_for_mvp_loader"].clone(),
             "source_unit_count": self
@@ -22387,6 +22581,31 @@ fn run_artifact_runtime_scenario(
         render_patches,
         state_summary,
         per_step,
+    })
+}
+
+fn run_artifact_plan_scenario(
+    plan: &MachinePlan,
+    scenario: &Scenario,
+) -> RuntimeResult<ArtifactScenarioRunOutput> {
+    let steps = scenario.step.iter().collect::<Vec<_>>();
+    let output = execute_machine_plan_root_scenario_inner(plan, &steps, None)?;
+    let semantic_deltas = output
+        .semantic_deltas
+        .as_array()
+        .map(|deltas| {
+            deltas
+                .iter()
+                .map(plan_json_semantic_delta_to_typed)
+                .collect::<RuntimeResult<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(ArtifactScenarioRunOutput {
+        semantic_deltas,
+        render_patches: Vec::new(),
+        state_summary: output.state_summary,
+        per_step: output.per_step,
     })
 }
 
@@ -65045,6 +65264,117 @@ fn git_commit() -> String {
         .clone()
 }
 
+pub const PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE: &str =
+    "plan-executor-source-replay";
+
+pub fn plan_executor_source_replay_worktree_fingerprint_paths() -> &'static [&'static str] {
+    &[
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/boon_cli",
+        "crates/boon_compiler",
+        "crates/boon_ir",
+        "crates/boon_parser",
+        "crates/boon_plan",
+        "crates/boon_plan_executor",
+        "crates/boon_runtime",
+        "crates/boon_typecheck",
+    ]
+}
+
+const PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND: &str = "plan-executor-source-replay-contract";
+const PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_SCHEME_VERSION: u64 = 1;
+const PLAN_EXECUTOR_SOURCE_REPLAY_CONTRACT_VERSION: &str =
+    "plan-executor-source-replay-2026-07-05.1";
+
+fn canonical_plan_executor_source_replay_args(args: &[String]) -> Vec<String> {
+    let mut canonical = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--report" {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            index = index.saturating_add(1);
+            continue;
+        }
+        canonical.push(arg.clone());
+        index = index.saturating_add(1);
+    }
+    canonical
+}
+
+fn json_value_hash(value: &JsonValue) -> Option<String> {
+    serde_json::to_vec(value)
+        .ok()
+        .map(|bytes| sha256_bytes(&bytes))
+}
+
+pub fn plan_executor_source_replay_identity_for_report(report: &JsonValue) -> Option<JsonValue> {
+    let command = report.get("command").and_then(JsonValue::as_str)?;
+    if command != "run-plan-scenario-events" {
+        return None;
+    }
+    let measurement_mode = report.get("measurement_mode").and_then(JsonValue::as_str)?;
+    let args = report.get("command_argv").and_then(JsonValue::as_array)?;
+    let args = args
+        .iter()
+        .map(|arg| arg.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let canonical_args = canonical_plan_executor_source_replay_args(&args);
+    let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
+    let source_hash = report.get("source_hash").and_then(JsonValue::as_str)?;
+    let scenario_hash = report.get("scenario_hash").and_then(JsonValue::as_str)?;
+    let target_profile = report.get("target_profile").and_then(JsonValue::as_str)?;
+    let plan_hash = report.get("plan_hash").and_then(JsonValue::as_str)?;
+    let plan_version_hash = json_value_hash(report.get("plan_version")?)?;
+    let selected_step_ids_hash = json_value_hash(report.get("selected_step_ids")?)?;
+    let plan_executor_coverage_hash = json_value_hash(report.get("plan_executor_coverage")?)?;
+
+    let mut material = Vec::new();
+    let scheme_version = PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_SCHEME_VERSION.to_string();
+    for part in [
+        PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND,
+        scheme_version.as_str(),
+        command,
+        measurement_mode,
+        PLAN_EXECUTOR_SOURCE_REPLAY_CONTRACT_VERSION,
+        canonical_args_hash.as_str(),
+        source_hash,
+        scenario_hash,
+        target_profile,
+        plan_hash,
+        plan_version_hash.as_str(),
+        selected_step_ids_hash.as_str(),
+        plan_executor_coverage_hash.as_str(),
+    ] {
+        material.extend_from_slice(part.as_bytes());
+        material.push(0);
+    }
+    let identity_hash = sha256_bytes(&material);
+
+    Some(json!({
+        "kind": PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND,
+        "scheme_version": PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_SCHEME_VERSION,
+        "command": command,
+        "measurement_mode": measurement_mode,
+        "contract_version": PLAN_EXECUTOR_SOURCE_REPLAY_CONTRACT_VERSION,
+        "canonical_args": canonical_args,
+        "canonical_args_hash": canonical_args_hash,
+        "source_hash": source_hash,
+        "scenario_hash": scenario_hash,
+        "target_profile": target_profile,
+        "plan_hash": plan_hash,
+        "plan_version_hash": plan_version_hash,
+        "selected_step_ids_hash": selected_step_ids_hash,
+        "plan_executor_coverage_hash": plan_executor_coverage_hash,
+        "identity_hash": identity_hash,
+        "binary_hash_policy": "binary-hash-remains-schema-owned; source replay identity is control-plane evidence"
+    }))
+}
+
 fn worktree_fingerprint() -> String {
     static WORKTREE_FINGERPRINT: OnceLock<String> = OnceLock::new();
     WORKTREE_FINGERPRINT
@@ -65064,6 +65394,101 @@ fn worktree_fingerprint() -> String {
             sha256_bytes(&[status, diff].concat())
         })
         .clone()
+}
+
+fn worktree_fingerprint_for_paths(paths: &[&str]) -> String {
+    let mut status_command = std::process::Command::new("git");
+    status_command.args(["status", "--porcelain=v1", "--untracked-files=all", "--"]);
+    status_command.args(paths);
+    let status = status_command
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+
+    let mut diff_command = std::process::Command::new("git");
+    diff_command.args(["diff", "--binary", "HEAD", "--"]);
+    diff_command.args(paths);
+    let diff = diff_command
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+
+    let mut tree_command = std::process::Command::new("git");
+    tree_command.args(["ls-tree", "-r", "--full-tree", "HEAD", "--"]);
+    tree_command.args(paths);
+    let head_tree = tree_command
+        .output()
+        .ok()
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+
+    let mut material = Vec::new();
+    material.extend_from_slice(b"scoped-worktree-fingerprint-v2\0");
+    material.extend_from_slice(&head_tree);
+    material.push(0);
+    material.extend_from_slice(&status);
+    material.push(0);
+    material.extend_from_slice(&diff);
+    sha256_bytes(&material)
+}
+
+fn plan_executor_source_replay_worktree_fingerprint() -> String {
+    static PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT: OnceLock<String> = OnceLock::new();
+    PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT
+        .get_or_init(|| {
+            worktree_fingerprint_for_paths(plan_executor_source_replay_worktree_fingerprint_paths())
+        })
+        .clone()
+}
+
+fn insert_plan_executor_source_replay_worktree_fields(report: &mut JsonValue) {
+    let Some(object) = report.as_object_mut() else {
+        return;
+    };
+    let full = object
+        .get("worktree_fingerprint")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(worktree_fingerprint);
+    let scoped = plan_executor_source_replay_worktree_fingerprint();
+    let mut fingerprints = object
+        .get("worktree_fingerprints")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    fingerprints.insert("full".to_owned(), json!(full.clone()));
+    fingerprints.insert(
+        PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE.to_owned(),
+        json!(scoped.clone()),
+    );
+    object.insert("worktree_fingerprint".to_owned(), json!(full));
+    object.insert(
+        "worktree_fingerprint_scope".to_owned(),
+        json!(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE),
+    );
+    object.insert("worktree_scoped_fingerprint".to_owned(), json!(scoped));
+    object.insert(
+        "worktree_fingerprints".to_owned(),
+        JsonValue::Object(fingerprints),
+    );
+    object.insert(
+        "worktree_fingerprint_scope_inputs".to_owned(),
+        json!({
+            PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE:
+                plan_executor_source_replay_worktree_fingerprint_paths()
+        }),
+    );
+}
+
+fn insert_plan_executor_source_replay_identity(report: &mut JsonValue) {
+    let Some(identity) = plan_executor_source_replay_identity_for_report(report) else {
+        return;
+    };
+    if let Some(object) = report.as_object_mut() {
+        object.insert("source_replay_identity".to_owned(), identity);
+    }
 }
 
 fn current_binary_hash() -> String {
@@ -65115,6 +65540,99 @@ mod tests {
                 },
             ]),
             sha256_bytes(format!("{source}{source}").as_bytes())
+        );
+    }
+
+    #[test]
+    fn plan_executor_source_replay_report_carries_scoped_freshness_and_identity() {
+        let mut report = json!({
+            "command": "run-plan-scenario-events",
+            "command_argv": [
+                "target/debug/boon_cli",
+                "run",
+                "examples/cells.bn",
+                "--scenario",
+                "examples/cells.scn",
+                "--engine",
+                "plan",
+                "--report",
+                "target/reports/bytes-plan/cells-scenario-events-full.json"
+            ],
+            "measurement_mode": "proof",
+            "worktree_fingerprint": "stale-full-worktree",
+            "source_hash": "sourcehash",
+            "scenario_hash": "scenariohash",
+            "target_profile": "native",
+            "plan_hash": "planhash",
+            "plan_version": {"major": 1, "minor": 0},
+            "selected_step_ids": ["edit-a1"],
+            "plan_executor_coverage": {"full_scenario_parity": true}
+        });
+        insert_plan_executor_source_replay_worktree_fields(&mut report);
+        insert_plan_executor_source_replay_identity(&mut report);
+
+        assert_eq!(
+            report
+                .get("worktree_fingerprint_scope")
+                .and_then(JsonValue::as_str),
+            Some(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE)
+        );
+        assert_eq!(
+            report
+                .get("worktree_fingerprint")
+                .and_then(JsonValue::as_str),
+            Some("stale-full-worktree")
+        );
+        assert_eq!(
+            report
+                .get("worktree_scoped_fingerprint")
+                .and_then(JsonValue::as_str),
+            report
+                .get("worktree_fingerprints")
+                .and_then(JsonValue::as_object)
+                .and_then(|fingerprints| {
+                    fingerprints.get(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE)
+                })
+                .and_then(JsonValue::as_str)
+        );
+        let inputs = report
+            .get("worktree_fingerprint_scope_inputs")
+            .and_then(JsonValue::as_object)
+            .and_then(|inputs| inputs.get(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE))
+            .and_then(JsonValue::as_array)
+            .expect("scope inputs should be recorded for audit");
+        assert!(
+            inputs
+                .iter()
+                .any(|path| path.as_str() == Some("crates/boon_runtime"))
+        );
+        assert!(
+            !inputs
+                .iter()
+                .any(|path| path.as_str() == Some("docs/plans/GOAL_PROMPT.md"))
+        );
+        let identity = report
+            .get("source_replay_identity")
+            .expect("source replay identity should be recorded");
+        assert_eq!(
+            identity.get("kind").and_then(JsonValue::as_str),
+            Some(PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND)
+        );
+        let canonical_args = identity
+            .get("canonical_args")
+            .and_then(JsonValue::as_array)
+            .expect("canonical args should be recorded");
+        assert!(
+            !canonical_args
+                .iter()
+                .any(|arg| arg.as_str() == Some("--report"))
+        );
+        assert!(!canonical_args.iter().any(|arg| {
+            arg.as_str() == Some("target/reports/bytes-plan/cells-scenario-events-full.json")
+        }));
+        assert_eq!(
+            report.get("source_replay_identity"),
+            plan_executor_source_replay_identity_for_report(&report).as_ref()
         );
     }
 
@@ -66963,40 +67481,133 @@ FUNCTION icon_code(item) {
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
-    #[test]
-    fn compiled_artifact_runs_counter_scenario_without_source_and_matches_source_runtime() {
+    fn assert_compiled_artifact_scenario_paths_match_source_plan_executor(
+        label: &str,
+        source: &Path,
+        scenario: &Path,
+    ) {
         let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-scenario-test-{}",
+            "boon-compiled-artifact-scenario-{label}-{}",
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let artifact_path = temp_root.join(format!("{label}.boonc"));
+
+        emit_compiled_artifact(source, &artifact_path, None).unwrap();
+        let inspection = inspect_compiled_artifact_report(&artifact_path, None).unwrap();
+        assert_eq!(
+            inspection["inspection_result"]["runtime_engine"], "plan_executor",
+            "{label} artifact inspection must use the PlanExecutor runtime path"
+        );
+        assert_eq!(
+            inspection["inspection_result"]["plan_executor_runtime_from_artifact"], true,
+            "{label} artifact inspection must deserialize the embedded MachinePlan"
+        );
+        assert_eq!(
+            inspection["inspection_result"]["source_reparse_attempted"], false,
+            "{label} artifact inspection must not reparse source"
+        );
+        assert_eq!(
+            inspection["inspection_result"]["source_file_access"], "not_attempted",
+            "{label} artifact inspection must not touch source files"
+        );
+        let source_output = run_plan_scenario_events(
+            source,
+            scenario,
+            TargetProfile::SoftwareDefault,
+            false,
+            None,
+        )
+        .unwrap();
+        let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
+
+        assert_eq!(
+            source_output.report["semantic_deltas"],
+            serde_json::to_value(&artifact_output.semantic_deltas).unwrap(),
+            "{label} artifact scenario semantic deltas must match source PlanExecutor"
+        );
+        assert_eq!(
+            artifact_output.render_patches.len(),
+            0,
+            "{label} PlanExecutor artifact scenario should not claim legacy render-patch output"
+        );
+        assert_eq!(
+            source_output.state_summary, artifact_output.state_summary,
+            "{label} artifact scenario final state must match source PlanExecutor"
+        );
+        assert_eq!(
+            artifact_output.per_step.len() as u64,
+            source_output.report["plan_executor"]["per_step"]
+                .as_array()
+                .unwrap()
+                .len() as u64,
+            "{label} artifact scenario should execute the same selected PlanExecutor steps"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    fn assert_compiled_artifact_example_scenario_matches_source_plan_executor(example: &str) {
+        let (source, scenario, _) = example_paths(example).unwrap();
+        assert_compiled_artifact_scenario_paths_match_source_plan_executor(
+            example, &source, &scenario,
+        );
+    }
+
+    #[test]
+    fn compiled_artifact_runs_representative_scenarios_through_plan_executor() {
+        assert_compiled_artifact_example_scenario_matches_source_plan_executor("todomvc");
+        assert_compiled_artifact_scenario_paths_match_source_plan_executor(
+            "bytes_indexed_source_payload_plan_ops",
+            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.bn"),
+            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
+        );
+        std::thread::Builder::new()
+            .name("compiled-artifact-cells-scenario".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                assert_compiled_artifact_example_scenario_matches_source_plan_executor("cells");
+            })
+            .expect("Cells artifact scenario thread should start")
+            .join()
+            .expect("Cells artifact scenario should not panic");
+    }
+
+    #[test]
+    fn compiled_artifact_runs_single_file_scenario_after_source_is_deleted() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "boon-compiled-artifact-source-deleted-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&temp_root);
         std::fs::create_dir_all(&temp_root).unwrap();
-        let source = temp_root.join("counter.bn");
-        std::fs::copy("../../examples/counter.bn", &source).unwrap();
-        let scenario = Path::new("../../examples/counter.scn");
-        let artifact_path = temp_root.join("counter.boonc");
+        let source = temp_root.join("todomvc.bn");
+        std::fs::copy("../../examples/todomvc.bn", &source).unwrap();
+        let scenario = Path::new("../../examples/todomvc.scn");
+        let artifact_path = temp_root.join("todomvc.boonc");
 
         emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-        let source_output =
-            run_scenario(&source, scenario, VerificationLayer::Semantic, None).unwrap();
+        let source_output = run_plan_scenario_events(
+            &source,
+            scenario,
+            TargetProfile::SoftwareDefault,
+            false,
+            None,
+        )
+        .unwrap();
         std::fs::remove_file(&source).unwrap();
         let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
 
         assert_eq!(
-            serde_json::to_value(&source_output.semantic_deltas).unwrap(),
+            source_output.report["semantic_deltas"],
             serde_json::to_value(&artifact_output.semantic_deltas).unwrap(),
-            "artifact scenario semantic deltas must match source runtime"
-        );
-        assert_eq!(
-            serde_json::to_value(&source_output.render_patches).unwrap(),
-            serde_json::to_value(&artifact_output.render_patches).unwrap(),
-            "artifact scenario render patches must match source runtime"
+            "deleted-source artifact scenario semantic deltas must match source PlanExecutor"
         );
         assert_eq!(
             source_output.state_summary, artifact_output.state_summary,
-            "artifact scenario final state must match source runtime"
+            "deleted-source artifact scenario final state must match source PlanExecutor"
         );
-        assert_eq!(artifact_output.per_step.len(), 7);
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }
@@ -67343,7 +67954,19 @@ FUNCTION decorate(value) {
         );
         assert_eq!(
             loaded["inspection_result"]["loaded_runtime_from_artifact"],
+            json!(false)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["runtime_engine"],
+            json!("plan_executor")
+        );
+        assert_eq!(
+            loaded["inspection_result"]["plan_executor_runtime_from_artifact"],
             json!(true)
+        );
+        assert_eq!(
+            loaded["inspection_result"]["plan_executor_provenance"]["generic_fallback_enabled"],
+            json!(false)
         );
         assert_eq!(
             loaded["inspection_result"]["source_free_runtime_load_available"],
@@ -88725,6 +89348,298 @@ expected_source_event = {{ source = "store.decode" }}
         );
     }
 
+    fn selected_plan_executor_source_steps<'a>(
+        scenario: &'a Scenario,
+        selected_step_ids: Option<&[&str]>,
+    ) -> Vec<&'a ScenarioStep> {
+        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
+        let selected_indices = if let Some(selected_step_ids) = selected_step_ids {
+            let selected_step_ids = selected_step_ids
+                .iter()
+                .map(|step| (*step).to_owned())
+                .collect::<Vec<_>>();
+            select_plan_explicit_root_scenario_steps(
+                &scenario.name,
+                &scenario_step_meta,
+                &selected_step_ids,
+            )
+            .expect("explicit PlanExecutor scenario steps should be accepted")
+            .selected_indices
+        } else {
+            select_plan_scenario_event_steps(&scenario.name, &scenario_step_meta)
+                .expect("PlanExecutor source-event scenario steps should be accepted")
+                .selected_indices
+        };
+        selected_indices
+            .into_iter()
+            .map(|index| &scenario.step[index])
+            .collect::<Vec<_>>()
+    }
+
+    fn runtime_units_for_source_path(source_path: &Path) -> Vec<RuntimeSourceUnit> {
+        compiler_source_units_for_path(source_path)
+            .expect("source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn assert_no_plan_executor_fallback_counters(label: &str, surface: &str, report: &JsonValue) {
+        for key in [
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+        ] {
+            assert_eq!(
+                report[key],
+                json!(0),
+                "{label} {surface} fallback counter {key} must stay zero"
+            );
+        }
+    }
+
+    fn assert_plan_executor_execution_matches(
+        label: &str,
+        surface: &str,
+        actual: &RootScenarioExecution,
+        expected: &RootScenarioExecution,
+    ) {
+        assert_eq!(
+            actual.state_summary, expected.state_summary,
+            "{label} {surface} final state must match whole scenario PlanExecutor"
+        );
+        assert_eq!(
+            actual.semantic_delta_signatures, expected.semantic_delta_signatures,
+            "{label} {surface} semantic delta signatures must match whole scenario PlanExecutor"
+        );
+        assert_eq!(
+            actual.semantic_deltas, expected.semantic_deltas,
+            "{label} {surface} semantic deltas must match whole scenario PlanExecutor"
+        );
+        assert_eq!(
+            actual.per_step.len(),
+            expected.per_step.len(),
+            "{label} {surface} per-step count must match whole scenario PlanExecutor"
+        );
+        for (actual_step, expected_step) in actual.per_step.iter().zip(expected.per_step.iter()) {
+            for key in [
+                "source",
+                "semantic_delta_signatures",
+                "semantic_deltas",
+                "executed_update_branch_count",
+                "executed_indexed_update_count",
+                "executed_list_append_count",
+            ] {
+                assert_eq!(
+                    actual_step[key], expected_step[key],
+                    "{label} {surface} per-step field {key} must match"
+                );
+            }
+        }
+        assert_eq!(
+            actual.executor_report["executed_update_branch_count"],
+            expected.executor_report["executed_update_branch_count"],
+            "{label} {surface} root update count must match"
+        );
+        assert_eq!(
+            actual.executor_report["executed_indexed_update_count"],
+            expected.executor_report["executed_indexed_update_count"],
+            "{label} {surface} indexed update count must match"
+        );
+        assert_eq!(
+            actual.executor_report["executed_list_append_count"],
+            expected.executor_report["executed_list_append_count"],
+            "{label} {surface} list append count must match"
+        );
+        assert_no_plan_executor_fallback_counters(label, surface, &actual.executor_report);
+    }
+
+    fn assert_plan_executor_live_surfaces_match_scenario_events(
+        label: &str,
+        source_label: &str,
+        source_path: &Path,
+        scenario_path: &Path,
+        selected_step_ids: Option<&[&str]>,
+    ) {
+        let runtime_units = runtime_units_for_source_path(source_path);
+        let compiled = compile_source_units_to_machine_plan(
+            source_label,
+            &compiler_source_units_from_runtime_units(&runtime_units),
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("source units should compile to a MachinePlan");
+        let scenario = parse_scenario(scenario_path).expect("scenario should parse");
+        let selected_steps = selected_plan_executor_source_steps(&scenario, selected_step_ids);
+        let whole = execute_machine_plan_root_scenario_inner(
+            &compiled.plan,
+            &selected_steps,
+            source_path.parent(),
+        )
+        .expect("whole scenario PlanExecutor runner should pass");
+        assert_no_plan_executor_fallback_counters(label, "whole", &whole.executor_report);
+
+        let mut persistent = PlanExecutorRuntimeState::new(&compiled.plan)
+            .expect("persistent PlanExecutor runtime should initialize");
+        for step in &selected_steps {
+            persistent
+                .apply_step(&compiled.plan, step, source_path.parent())
+                .expect("persistent PlanExecutor step should apply");
+        }
+        let incremental = persistent
+            .finish(&compiled.plan)
+            .expect("persistent PlanExecutor runtime should finish");
+        assert_plan_executor_execution_matches(label, "apply_step", &incremental, &whole);
+
+        let mut live_state = PlanExecutorRuntimeState::new(&compiled.plan)
+            .expect("persistent PlanExecutor live runtime should initialize");
+        for (sequence, step) in selected_steps.iter().enumerate() {
+            let generic_event =
+                GenericSourceEvent::require(step).expect("scenario step should contain source");
+            live_state
+                .apply_live_source_event(
+                    &compiled.plan,
+                    live_source_event_from_generic(&generic_event),
+                    sequence + 1,
+                    source_path.parent(),
+                )
+                .expect("PlanExecutor live source event should apply");
+        }
+        let live = live_state
+            .finish(&compiled.plan)
+            .expect("persistent PlanExecutor live runtime should finish");
+        assert_plan_executor_execution_matches(label, "live_source_event", &live, &whole);
+
+        let mut session = PlanExecutorLiveSession::from_project(
+            source_label,
+            &runtime_units,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("PlanExecutor live session should initialize from source units");
+        assert_eq!(session.provenance_report()["engine"], "plan_executor");
+        assert_eq!(
+            session.provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        for step in &selected_steps {
+            let generic_event =
+                GenericSourceEvent::require(step).expect("scenario step should contain source");
+            let report = session
+                .apply_source_event(live_source_event_from_generic(&generic_event))
+                .expect("PlanExecutor live session source event should apply");
+            assert_eq!(
+                report["source"], generic_event.source,
+                "{label} PlanExecutorLiveSession should report the applied source"
+            );
+        }
+        let session_output = session
+            .finish()
+            .expect("PlanExecutor live session should finish");
+        assert_plan_executor_execution_matches(
+            label,
+            "PlanExecutorLiveSession",
+            &session_output,
+            &whole,
+        );
+
+        let batch_events = selected_steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let generic_event =
+                    GenericSourceEvent::require(step).expect("scenario step should contain source");
+                SourceBatchEvent {
+                    event_id: (index + 1) as u64,
+                    event: live_source_event_from_generic(&generic_event),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut runtime = LiveRuntime::from_project_plan_executor(source_label, &runtime_units)
+            .expect("LiveRuntime PlanExecutor mode should initialize");
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        let output = runtime
+            .apply_source_batch_turn(SourceBatch {
+                sequence_id: 1,
+                events: batch_events,
+            })
+            .expect("LiveRuntime PlanExecutor batch should apply");
+        assert_eq!(
+            runtime.state_summary(),
+            whole.state_summary,
+            "{label} LiveRuntime batch final state must match whole scenario PlanExecutor"
+        );
+        assert_eq!(
+            serde_json::to_value(&output.semantic_deltas)
+                .expect("typed semantic deltas should serialize"),
+            whole.semantic_deltas,
+            "{label} LiveRuntime batch semantic deltas must match whole scenario PlanExecutor"
+        );
+        assert!(
+            output.render_patches.is_empty(),
+            "{label} PlanExecutor live batch must not synthesize legacy render patches"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+    }
+
+    #[test]
+    fn plan_executor_live_surfaces_match_representative_scenario_events() {
+        assert_plan_executor_live_surfaces_match_scenario_events(
+            "todomvc",
+            "examples/todomvc.bn",
+            Path::new("../../examples/todomvc.bn"),
+            Path::new("../../examples/todomvc.scn"),
+            Some(&[
+                "add-test-todo-type",
+                "add-test-todo-submit",
+                "filter-active",
+                "toggle-dynamic-test-todo-under-active-filter",
+            ]),
+        );
+        assert_plan_executor_live_surfaces_match_scenario_events(
+            "bytes-source-payload",
+            "examples/bytes_source_payload_plan_ops.bn",
+            Path::new("../../examples/bytes_source_payload_plan_ops.bn"),
+            Path::new("../../examples/bytes_source_payload_plan_ops.scn"),
+            None,
+        );
+        assert_plan_executor_live_surfaces_match_scenario_events(
+            "bytes-indexed-source-payload",
+            "examples/bytes_indexed_source_payload_plan_ops.bn",
+            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.bn"),
+            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
+            None,
+        );
+        std::thread::Builder::new()
+            .name("cells-plan-live-surfaces".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                assert_plan_executor_live_surfaces_match_scenario_events(
+                    "cells",
+                    "examples/cells.bn",
+                    Path::new("../../examples/cells.bn"),
+                    Path::new("../../examples/cells.scn"),
+                    None,
+                );
+            })
+            .expect("Cells live-surface parity thread should start")
+            .join()
+            .expect("Cells live-surface parity should not panic");
+    }
+
     #[test]
     fn persistent_plan_executor_runtime_matches_whole_todomvc_scenario_runner() {
         let compiled = compile_source_path_to_machine_plan(
@@ -89627,12 +90542,19 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["passed"], true);
         assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], true);
+        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], false);
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["accepted"], true,
+            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
+            json!(["store.completed_count"])
+        );
         assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
-        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 1);
+        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
         for key in [
             "runtime_ast_eval_count",
             "executable_string_path_count",
@@ -89657,6 +90579,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
                 "SourceUnbind:todo.sources.todo_title_element.double_click",
                 "SourceUnbind:todo.sources.todo_checkbox.click",
                 "ListRemove",
+                "FieldSet:store.completed_count",
                 "FieldSet:store.has_completed"
             ])
         );
@@ -89682,13 +90605,18 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         assert_eq!(removed["source_unbinds"][5]["source_id"], 12);
         assert_eq!(
             clear_step["derived"][0]["field_path"],
+            "store.completed_count"
+        );
+        assert_eq!(clear_step["derived"][0]["value"], 0);
+        assert_eq!(
+            clear_step["derived"][1]["field_path"],
             "store.has_completed"
         );
         assert_eq!(
-            clear_step["derived"][0]["expression_kind"],
+            clear_step["derived"][1]["expression_kind"],
             "number_compare_const"
         );
-        assert_eq!(clear_step["derived"][0]["value"], false);
+        assert_eq!(clear_step["derived"][1]["value"], false);
 
         let todos = &report["plan_executor"]["list_summary"]["todos"];
         assert_eq!(todos["row_count"], 3);

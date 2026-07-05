@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 const CLI_HELP: &str = "\
 usage:
-  boon_cli run <source> [--scenario <path>] [--engine <legacy|plan|compare>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run <source> [--scenario <path>] [--engine <legacy|plan|compare>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
@@ -67,6 +67,8 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = "plan".to_owned();
     let mut target = "software_default".to_owned();
     let mut report = None;
+    let mut explicit_report = false;
+    let mut print_report = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -90,7 +92,12 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--report" => {
                 report = args.get(index + 1).map(PathBuf::from);
+                explicit_report = true;
                 index += 2;
+            }
+            "--print-report" => {
+                print_report = true;
+                index += 1;
             }
             other if other.ends_with(".scn") => {
                 scenario = Some(other.to_owned());
@@ -123,7 +130,9 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 engine == "compare",
                 report.as_deref(),
             )?;
-            println!("{}", serde_json::to_string_pretty(&output.report)?);
+            if print_report || !explicit_report {
+                println!("{}", serde_json::to_string_pretty(&output.report)?);
+            }
             if output
                 .report
                 .get("status")

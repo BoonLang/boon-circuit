@@ -259,6 +259,231 @@ pub fn report_schema_hash() -> String {
     sha256_bytes(include_str!("lib.rs").as_bytes())
 }
 
+const VERIFIER_IDENTITY_KIND: &str = "xtask-verifier-contract";
+const VERIFIER_IDENTITY_SCHEME_VERSION: u64 = 1;
+const NATIVE_GPU_VERIFIER_CONTRACT_VERSION: &str = "native-gpu-control-plane-2026-07-05.1";
+
+fn verifier_identity_contract_version(command: &str) -> Option<&'static str> {
+    command_supports_scoped_verifier_identity(command)
+        .then_some(NATIVE_GPU_VERIFIER_CONTRACT_VERSION)
+}
+
+fn command_supports_scoped_verifier_identity(command: &str) -> bool {
+    command == "verify-platform-contract"
+        || command == "verify-wgpu-readback"
+        || command == "verify-wgpu-retained-arenas"
+        || command == "verify-demand-driven-render-loop"
+        || command == "verify-native-gpu-all"
+        || command.starts_with("verify-native-")
+        || command.starts_with("verify-native-gpu-")
+}
+
+fn canonical_verifier_args(command: &str, args: &[String]) -> Vec<String> {
+    let mut start = args
+        .iter()
+        .position(|arg| arg == command)
+        .map_or(0, |index| index.saturating_add(1));
+    if start == 0
+        && args
+            .first()
+            .and_then(|arg| Path::new(arg).file_stem())
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|stem| stem == "xtask" || stem == "xtask.exe")
+    {
+        start = 1;
+        if args.get(start).is_some_and(|arg| arg == command) {
+            start = start.saturating_add(1);
+        }
+    }
+    let mut canonical = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--report" {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            index = index.saturating_add(1);
+            continue;
+        }
+        canonical.push(arg.clone());
+        index = index.saturating_add(1);
+    }
+    canonical
+}
+
+fn verifier_identity_hash(
+    command: &str,
+    measurement_mode: &str,
+    contract_version: &str,
+    canonical_args: &[String],
+) -> String {
+    let mut material = Vec::new();
+    let scheme_version = VERIFIER_IDENTITY_SCHEME_VERSION.to_string();
+    for part in [
+        VERIFIER_IDENTITY_KIND,
+        scheme_version.as_str(),
+        command,
+        measurement_mode,
+        contract_version,
+    ] {
+        material.extend_from_slice(part.as_bytes());
+        material.push(0);
+    }
+    for arg in canonical_args {
+        material.extend_from_slice(arg.as_bytes());
+        material.push(0);
+    }
+    sha256_bytes(&material)
+}
+
+fn verifier_identity_for_command_args(
+    command: &str,
+    measurement_mode: &str,
+    args: &[String],
+) -> Option<JsonValue> {
+    let contract_version = verifier_identity_contract_version(command)?;
+    let canonical_args = canonical_verifier_args(command, args);
+    let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
+    let identity_hash =
+        verifier_identity_hash(command, measurement_mode, contract_version, &canonical_args);
+    Some(json!({
+        "kind": VERIFIER_IDENTITY_KIND,
+        "scheme_version": VERIFIER_IDENTITY_SCHEME_VERSION,
+        "command": command,
+        "measurement_mode": measurement_mode,
+        "contract_version": contract_version,
+        "canonical_args": canonical_args,
+        "canonical_args_hash": canonical_args_hash,
+        "identity_hash": identity_hash,
+        "binary_hash_policy": "binary-hash-may-be-superseded-by-matching-verifier-identity"
+    }))
+}
+
+fn report_verifier_identity_matches_report(report: &JsonValue) -> bool {
+    let Some(command) = report.get("command").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(measurement_mode) = report.get("measurement_mode").and_then(JsonValue::as_str) else {
+        return false;
+    };
+    let Some(args) = report.get("command_argv").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    let Some(args) = args
+        .iter()
+        .map(|arg| arg.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(expected) = verifier_identity_for_command_args(command, measurement_mode, &args)
+    else {
+        return false;
+    };
+    report.get("verifier_identity") == Some(&expected)
+}
+
+const SOURCE_REPLAY_IDENTITY_KIND: &str = "plan-executor-source-replay-contract";
+const SOURCE_REPLAY_IDENTITY_SCHEME_VERSION: u64 = 1;
+const SOURCE_REPLAY_CONTRACT_VERSION: &str = "plan-executor-source-replay-2026-07-05.1";
+
+fn canonical_source_replay_args(args: &[String]) -> Vec<String> {
+    let mut canonical = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--report" {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            index = index.saturating_add(1);
+            continue;
+        }
+        canonical.push(arg.clone());
+        index = index.saturating_add(1);
+    }
+    canonical
+}
+
+fn json_value_hash(value: &JsonValue) -> Option<String> {
+    serde_json::to_vec(value)
+        .ok()
+        .map(|bytes| sha256_bytes(&bytes))
+}
+
+fn source_replay_identity_for_report(report: &JsonValue) -> Option<JsonValue> {
+    let command = report.get("command").and_then(JsonValue::as_str)?;
+    if command != "run-plan-scenario-events" {
+        return None;
+    }
+    let measurement_mode = report.get("measurement_mode").and_then(JsonValue::as_str)?;
+    let args = report.get("command_argv").and_then(JsonValue::as_array)?;
+    let args = args
+        .iter()
+        .map(|arg| arg.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let canonical_args = canonical_source_replay_args(&args);
+    let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
+    let source_hash = report.get("source_hash").and_then(JsonValue::as_str)?;
+    let scenario_hash = report.get("scenario_hash").and_then(JsonValue::as_str)?;
+    let target_profile = report.get("target_profile").and_then(JsonValue::as_str)?;
+    let plan_hash = report.get("plan_hash").and_then(JsonValue::as_str)?;
+    let plan_version_hash = json_value_hash(report.get("plan_version")?)?;
+    let selected_step_ids_hash = json_value_hash(report.get("selected_step_ids")?)?;
+    let plan_executor_coverage_hash = json_value_hash(report.get("plan_executor_coverage")?)?;
+
+    let mut material = Vec::new();
+    let scheme_version = SOURCE_REPLAY_IDENTITY_SCHEME_VERSION.to_string();
+    for part in [
+        SOURCE_REPLAY_IDENTITY_KIND,
+        scheme_version.as_str(),
+        command,
+        measurement_mode,
+        SOURCE_REPLAY_CONTRACT_VERSION,
+        canonical_args_hash.as_str(),
+        source_hash,
+        scenario_hash,
+        target_profile,
+        plan_hash,
+        plan_version_hash.as_str(),
+        selected_step_ids_hash.as_str(),
+        plan_executor_coverage_hash.as_str(),
+    ] {
+        material.extend_from_slice(part.as_bytes());
+        material.push(0);
+    }
+    let identity_hash = sha256_bytes(&material);
+
+    Some(json!({
+        "kind": SOURCE_REPLAY_IDENTITY_KIND,
+        "scheme_version": SOURCE_REPLAY_IDENTITY_SCHEME_VERSION,
+        "command": command,
+        "measurement_mode": measurement_mode,
+        "contract_version": SOURCE_REPLAY_CONTRACT_VERSION,
+        "canonical_args": canonical_args,
+        "canonical_args_hash": canonical_args_hash,
+        "source_hash": source_hash,
+        "scenario_hash": scenario_hash,
+        "target_profile": target_profile,
+        "plan_hash": plan_hash,
+        "plan_version_hash": plan_version_hash,
+        "selected_step_ids_hash": selected_step_ids_hash,
+        "plan_executor_coverage_hash": plan_executor_coverage_hash,
+        "identity_hash": identity_hash,
+        "binary_hash_policy": "binary-hash-remains-schema-owned; source replay identity is control-plane evidence"
+    }))
+}
+
+fn report_source_replay_identity_matches_report(report: &JsonValue) -> bool {
+    let Some(expected) = source_replay_identity_for_report(report) else {
+        return false;
+    };
+    report.get("source_replay_identity") == Some(&expected)
+}
+
 pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
     if report.get("command").and_then(JsonValue::as_str) == Some("compile-artifact") {
@@ -504,6 +729,42 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_common_report_shape(&report, path)?;
         verify_measurement_mode(&report, path)?;
         verify_bytes_machine_plan_all_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "verify-native-gpu-all") {
+        let status = report.get("status").and_then(JsonValue::as_str);
+        if status == Some("pass") {
+            verify_common_report_shape(&report, path)?;
+        } else if status == Some("fail") {
+            verify_failing_blocker_report_shape(&report, path)?;
+        } else {
+            return Err(format!(
+                "{} verify-native-gpu-all status must be pass or fail",
+                path.display()
+            )
+            .into());
+        }
+        verify_measurement_mode(&report, path)?;
+        verify_native_gpu_all_report(&report, path)?;
+        verify_artifact_hashes(&report, path)?;
+        return Ok(());
+    }
+    if report_command_is(&report, "run-report-refresh-queue") {
+        let status = report.get("status").and_then(JsonValue::as_str);
+        if status == Some("pass") {
+            verify_common_report_shape(&report, path)?;
+        } else if status == Some("fail") {
+            verify_failing_blocker_report_shape(&report, path)?;
+        } else {
+            return Err(format!(
+                "{} run-report-refresh-queue status must be pass or fail",
+                path.display()
+            )
+            .into());
+        }
+        verify_measurement_mode(&report, path)?;
+        verify_report_refresh_queue_report(&report, path)?;
         verify_artifact_hashes(&report, path)?;
         return Ok(());
     }
@@ -1687,6 +1948,9 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         "source_path",
         "source_hash",
         "program_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
         "graph_node_count",
         "semantic_index",
         "compiled_schedule",
@@ -1723,6 +1987,11 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         "artifact_version",
         "program_hash",
         "report_schema_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
+        "capability_summary",
+        "machine_plan_verification",
         "source_unit_count",
     ] {
         if artifact.get(key).is_none() {
@@ -1746,6 +2015,15 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         )
         .into());
     }
+    if artifact.get("machine_plan_hash") != report.get("machine_plan_hash")
+        || report.get("machine_plan_hash") != report.get("plan_hash")
+    {
+        return Err(format!(
+            "{} compile-artifact machine_plan_hash, plan_hash, and compiled_artifact.machine_plan_hash must match",
+            path.display()
+        )
+        .into());
+    }
     let sections = report
         .get("artifact_sections")
         .and_then(JsonValue::as_object)
@@ -1761,6 +2039,7 @@ fn verify_compiled_artifact_report(report: &JsonValue, path: &Path) -> RuntimeRe
         "bridge_schemas",
         "compiled_schedule",
         "runtime_plan",
+        "machine_plan",
     ] {
         if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
@@ -1784,6 +2063,10 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "artifact_path",
         "artifact_hash",
         "program_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
+        "capability_summary",
         "compiled_artifact",
         "artifact_sections",
         "artifact_sha256s",
@@ -1822,6 +2105,11 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         "artifact_version",
         "program_hash",
         "report_schema_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
+        "capability_summary",
+        "machine_plan_verification",
         "source_unit_count",
     ] {
         if artifact.get(key).is_none() {
@@ -1849,14 +2137,32 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         )
         .into());
     }
+    if artifact.get("machine_plan_hash") != report.get("machine_plan_hash")
+        || report.get("machine_plan_hash") != report.get("plan_hash")
+    {
+        return Err(format!(
+            "{} machine_plan_hash, plan_hash, and compiled_artifact.machine_plan_hash must match",
+            path.display()
+        )
+        .into());
+    }
     let inspection = report
         .get("inspection_result")
         .and_then(JsonValue::as_object)
         .ok_or_else(|| format!("{} inspection_result is not an object", path.display()))?;
     for key in [
         "artifact_valid",
+        "runtime_engine",
         "loaded_runtime_from_artifact",
+        "legacy_loaded_runtime_from_artifact",
+        "plan_executor_runtime_from_artifact",
+        "plan_executor_provenance",
         "runtime_instantiated_from_artifact",
+        "machine_plan_deserialized_from_artifact",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
+        "machine_plan_verification",
         "runtime_plan_present",
         "runtime_plan_generic_derived_deserialized_from_artifact",
         "runtime_plan_generic_derived_deserialized_counts",
@@ -1888,9 +2194,14 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
         .and_then(JsonValue::as_bool)
         != Some(true)
         || inspection
-            .get("loaded_runtime_from_artifact")
+            .get("plan_executor_runtime_from_artifact")
             .and_then(JsonValue::as_bool)
             != Some(true)
+        || inspection
+            .get("machine_plan_deserialized_from_artifact")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        || inspection.get("runtime_engine").and_then(JsonValue::as_str) != Some("plan_executor")
         || inspection
             .get("runtime_instantiated_from_artifact")
             .and_then(JsonValue::as_bool)
@@ -1941,7 +2252,28 @@ fn verify_inspected_compiled_artifact_report(report: &JsonValue, path: &Path) ->
             != Some(false)
     {
         return Err(format!(
-            "{} inspection_result must prove source-free runtime load and must not claim scenario execution",
+            "{} inspection_result must prove source-free PlanExecutor load and must not claim scenario execution",
+            path.display()
+        )
+        .into());
+    }
+    let provenance = inspection
+        .get("plan_executor_provenance")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} plan_executor_provenance is not an object",
+                path.display()
+            )
+        })?;
+    if provenance.get("engine").and_then(JsonValue::as_str) != Some("plan_executor")
+        || provenance
+            .get("generic_fallback_enabled")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+    {
+        return Err(format!(
+            "{} inspection_result must prove PlanExecutor provenance with no generic fallback",
             path.display()
         )
         .into());
@@ -2148,6 +2480,9 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
         "scenario_path",
         "scenario_hash",
         "program_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
         "artifact_path",
         "artifact_hash",
         "compiled_artifact",
@@ -2188,6 +2523,11 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
         "artifact_version",
         "program_hash",
         "report_schema_hash",
+        "machine_plan_hash",
+        "plan_hash",
+        "target_profile",
+        "capability_summary",
+        "machine_plan_verification",
         "source_unit_count",
     ] {
         if artifact.get(key).is_none() {
@@ -2215,6 +2555,15 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
         )
         .into());
     }
+    if artifact.get("machine_plan_hash") != report.get("machine_plan_hash")
+        || report.get("machine_plan_hash") != report.get("plan_hash")
+    {
+        return Err(format!(
+            "{} machine_plan_hash, plan_hash, and compiled_artifact.machine_plan_hash must match",
+            path.display()
+        )
+        .into());
+    }
     let scenario = report
         .get("artifact_scenario")
         .and_then(JsonValue::as_object)
@@ -2227,6 +2576,10 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
         "source_file_access",
         "typed_ir_required_for_artifact_execution",
         "parser_ast_required_for_artifact_execution",
+        "source_oracle_layer",
+        "runtime_engine",
+        "generic_fallback_enabled",
+        "render_patch_surface",
         "semantic_deltas_match",
         "render_patches_match",
         "state_summary_match",
@@ -2250,6 +2603,19 @@ fn verify_compiled_artifact_scenario_report(report: &JsonValue, path: &Path) -> 
             .get("runtime_instantiated_from_artifact")
             .and_then(JsonValue::as_bool)
             != Some(true)
+        || scenario
+            .get("source_oracle_layer")
+            .and_then(JsonValue::as_str)
+            != Some("plan_executor")
+        || scenario.get("runtime_engine").and_then(JsonValue::as_str) != Some("plan_executor")
+        || scenario
+            .get("generic_fallback_enabled")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
+        || scenario
+            .get("render_patch_surface")
+            .and_then(JsonValue::as_str)
+            != Some("not_owned_by_plan_executor")
         || scenario
             .get("semantic_deltas_match")
             .and_then(JsonValue::as_bool)
@@ -2515,6 +2881,7 @@ fn verify_compiled_artifact_sections(report: &JsonValue, path: &Path) -> Runtime
         "bridge_schemas",
         "compiled_schedule",
         "runtime_plan",
+        "machine_plan",
     ] {
         if sections.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!("{} artifact_sections `{key}` is not true", path.display()).into());
@@ -2893,6 +3260,7 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "audit-goal-readiness"
                 | "audit-manual-readiness"
                 | "verify-report-schema"
+                | "run-report-refresh-queue"
                 | "boon-native-playground-role"
                 | "verify-runtime-finality"
                 | "verify-cells-wayland-scroll-speed"
@@ -4124,6 +4492,10 @@ fn verify_run_plan_root_scalar_scenario_report(
         "plan_hash",
         "plan_version",
         "capability_summary",
+        "plan_executor_status",
+        "accepted_for_product_status",
+        "comparison_status",
+        "report_status_basis",
         "selected_step_ids",
         "state_summary",
         "semantic_delta_signatures",
@@ -4138,6 +4510,58 @@ fn verify_run_plan_root_scalar_scenario_report(
             )
             .into());
         }
+    }
+    if report
+        .get("plan_executor_status")
+        .and_then(JsonValue::as_str)
+        != Some("pass")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events plan_executor_status must be pass",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("accepted_for_product_status")
+        .and_then(JsonValue::as_str)
+        != Some("pass")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events accepted_for_product_status must be pass",
+            report_path.display()
+        )
+        .into());
+    }
+    let comparison_status = report
+        .get("comparison_status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events comparison_status is not a string",
+                report_path.display()
+            )
+        })?;
+    if !matches!(
+        comparison_status,
+        "pass" | "accepted-currentness-policy" | "not-requested"
+    ) {
+        return Err(format!(
+            "{} run-plan-scenario-events comparison_status has invalid value `{comparison_status}`",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("report_status_basis")
+        .and_then(JsonValue::as_str)
+        != Some("legacy-comparison-plus-assertion-coverage-compat")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events report_status_basis must be legacy-comparison-plus-assertion-coverage-compat",
+            report_path.display()
+        )
+        .into());
     }
     let source_plan = compile_report_machine_plan(report, report_path)?;
     let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
@@ -4538,6 +4962,15 @@ fn verify_run_plan_scenario_events_report(
             )
             .into());
         }
+    }
+    if report.get("source_replay_identity").is_some()
+        && !report_source_replay_identity_matches_report(report)
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events source_replay_identity is stale",
+            report_path.display()
+        )
+        .into());
     }
 
     let source_plan = compile_report_machine_plan(report, report_path)?;
@@ -5013,25 +5446,37 @@ fn run_plan_step_matches_demand_current_delta_policy(
         return false;
     };
     let mut remaining_legacy = legacy_deltas.clone();
+    let mut extra_plan_deltas = Vec::new();
     for plan_delta in plan_deltas {
-        let Some(index) = remaining_legacy
+        if let Some(index) = remaining_legacy
             .iter()
             .position(|legacy_delta| legacy_delta == plan_delta)
-        else {
-            return false;
-        };
-        remaining_legacy.remove(index);
+        {
+            remaining_legacy.remove(index);
+        } else {
+            extra_plan_deltas.push(plan_delta);
+        }
     }
-    if remaining_legacy.is_empty() {
+    if remaining_legacy.is_empty() && extra_plan_deltas.is_empty() {
         return false;
     }
-    remaining_legacy.iter().all(|missing_delta| {
-        missing_delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet")
-            && missing_delta
-                .get("field_path")
-                .and_then(JsonValue::as_str)
-                .is_some_and(|field_path| accepted_demand_current_field_paths.contains(field_path))
-    })
+    remaining_legacy
+        .iter()
+        .chain(extra_plan_deltas)
+        .all(|delta| {
+            run_plan_delta_matches_demand_current_policy(delta, accepted_demand_current_field_paths)
+        })
+}
+
+fn run_plan_delta_matches_demand_current_policy(
+    delta: &JsonValue,
+    accepted_demand_current_field_paths: &BTreeSet<String>,
+) -> bool {
+    delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet")
+        && delta
+            .get("field_path")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|field_path| accepted_demand_current_field_paths.contains(field_path))
 }
 
 fn scenario_assertion_checkpoint_expectation_names(
@@ -8582,7 +9027,32 @@ fn verify_bytes_machine_plan_all_report(
                     report_path.display()
                 )
             })?;
-        if label != "phase0-baseline" && child_git_commit != aggregate_git_commit {
+        let child_uses_source_replay_scope = expected_child.command == "run-plan-scenario-events"
+            && child
+                .get("source_replay_identity_required")
+                .and_then(JsonValue::as_bool)
+                == Some(true)
+            && child
+                .get("source_replay_identity_present")
+                .and_then(JsonValue::as_bool)
+                == Some(true)
+            && child
+                .get("source_replay_identity_fresh")
+                .and_then(JsonValue::as_bool)
+                == Some(true)
+            && child
+                .get("worktree_fingerprint_basis")
+                .and_then(JsonValue::as_str)
+                == Some("scoped")
+            && child
+                .get("worktree_fingerprint_scope")
+                .and_then(JsonValue::as_str)
+                == Some("plan-executor-source-replay")
+            && child.get("worktree_fresh").and_then(JsonValue::as_bool) == Some(true);
+        if label != "phase0-baseline"
+            && child_git_commit != aggregate_git_commit
+            && !child_uses_source_replay_scope
+        {
             return Err(format!(
                 "{} child report `{label}` git_commit `{child_git_commit}` does not match aggregate `{aggregate_git_commit}`",
                 report_path.display()
@@ -8599,7 +9069,9 @@ fn verify_bytes_machine_plan_all_report(
                         report_path.display()
                     )
                 })?;
-            if child_worktree_fingerprint != aggregate_worktree_fingerprint {
+            if child_worktree_fingerprint != aggregate_worktree_fingerprint
+                && !child_uses_source_replay_scope
+            {
                 return Err(format!(
                     "{} child report `{label}` worktree_fingerprint `{child_worktree_fingerprint}` does not match aggregate `{aggregate_worktree_fingerprint}`",
                     report_path.display()
@@ -8704,6 +9176,1390 @@ fn verify_bytes_machine_plan_all_report(
             report_path.display()
         )
         .into());
+    }
+    Ok(())
+}
+
+const NATIVE_GPU_HANDOFF_MANIFEST_PATH: &str = "docs/architecture/native_gpu_handoff_manifest.json";
+const NATIVE_GPU_HANDOFF_MANIFEST_JSON: &str =
+    include_str!("../../../docs/architecture/native_gpu_handoff_manifest.json");
+const BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH: &str =
+    "target/reports/bytes-plan/bytes-machine-plan-all.json";
+
+fn native_gpu_handoff_manifest_json() -> RuntimeResult<JsonValue> {
+    Ok(serde_json::from_str(NATIVE_GPU_HANDOFF_MANIFEST_JSON)?)
+}
+
+fn verify_native_gpu_all_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    if report.get("aggregate_scope").and_then(JsonValue::as_str)
+        != Some("agents-native-gpu-handoff")
+    {
+        return Err(format!(
+            "{} has invalid aggregate_scope for native GPU handoff aggregate",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("check_existing").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} native GPU handoff aggregate did not run with --check-existing",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("handoff_manifest_path")
+        .and_then(JsonValue::as_str)
+        != Some(NATIVE_GPU_HANDOFF_MANIFEST_PATH)
+    {
+        return Err(format!(
+            "{} native GPU handoff aggregate has wrong handoff_manifest_path",
+            report_path.display()
+        )
+        .into());
+    }
+    if !report
+        .get("handoff_manifest_sha256")
+        .and_then(JsonValue::as_str)
+        .is_some_and(is_sha256_hex)
+    {
+        return Err(format!(
+            "{} native GPU handoff aggregate missing valid handoff_manifest_sha256",
+            report_path.display()
+        )
+        .into());
+    }
+    let manifest = native_gpu_handoff_manifest_json()?;
+    if report
+        .get("handoff_manifest_id")
+        .and_then(JsonValue::as_str)
+        != manifest.get("manifest_id").and_then(JsonValue::as_str)
+    {
+        return Err(format!(
+            "{} native GPU handoff aggregate manifest id does not match canonical manifest",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("handoff_manifest_version")
+        .and_then(JsonValue::as_u64)
+        != manifest.get("manifest_version").and_then(JsonValue::as_u64)
+    {
+        return Err(format!(
+            "{} native GPU handoff aggregate manifest version does not match canonical manifest",
+            report_path.display()
+        )
+        .into());
+    }
+    let manifest_reports = manifest
+        .get("reports")
+        .and_then(JsonValue::as_array)
+        .ok_or("canonical native GPU handoff manifest missing reports array")?;
+    let required_count = json_u64_field(report, "required_report_count")?;
+    let checked_count = json_u64_field(report, "checked_report_count")?;
+    let missing_count = json_u64_field(report, "missing_report_count")?;
+    let passed_count = json_u64_field(report, "passed_report_count")?;
+    let failed_count = json_u64_field(report, "failed_report_count")?;
+    if required_count != manifest_reports.len() as u64 {
+        return Err(format!(
+            "{} native GPU required_report_count {required_count} does not match manifest count {}",
+            report_path.display(),
+            manifest_reports.len()
+        )
+        .into());
+    }
+    if checked_count + missing_count != required_count {
+        return Err(format!(
+            "{} native GPU checked_report_count + missing_report_count does not match required_report_count",
+            report_path.display()
+        )
+        .into());
+    }
+    if passed_count + failed_count != checked_count {
+        return Err(format!(
+            "{} native GPU passed_report_count + failed_report_count does not match checked_report_count",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let required_reports = report
+        .get("required_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing required_reports", report_path.display()))?;
+    let child_reports = report
+        .get("child_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing child_reports", report_path.display()))?;
+    if required_reports.len() as u64 != required_count {
+        return Err(format!(
+            "{} required_reports length does not match required_report_count",
+            report_path.display()
+        )
+        .into());
+    }
+    if child_reports.len() as u64 != required_count {
+        return Err(format!(
+            "{} child_reports length does not match required_report_count",
+            report_path.display()
+        )
+        .into());
+    }
+
+    let mut required_by_label = BTreeMap::new();
+    for (index, required) in required_reports.iter().enumerate() {
+        let label = required
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} required_reports[{index}] missing label",
+                    report_path.display()
+                )
+            })?;
+        if required_by_label.insert(label, required).is_some() {
+            return Err(format!(
+                "{} duplicate required report label `{label}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let mut child_by_label = BTreeMap::new();
+    for (index, child) in child_reports.iter().enumerate() {
+        let label = child
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} child_reports[{index}] missing label",
+                    report_path.display()
+                )
+            })?;
+        if child_by_label.insert(label, child).is_some() {
+            return Err(format!(
+                "{} duplicate child report label `{label}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+
+    let mut expected_dependency_edges = BTreeSet::new();
+    for manifest_report in manifest_reports {
+        let label = json_object_str(manifest_report, "label", report_path)?;
+        let required = required_by_label.get(label).ok_or_else(|| {
+            format!(
+                "{} required_reports missing manifest label `{label}`",
+                report_path.display()
+            )
+        })?;
+        let child = child_by_label.get(label).ok_or_else(|| {
+            format!(
+                "{} child_reports missing manifest label `{label}`",
+                report_path.display()
+            )
+        })?;
+        for key in ["path", "command"] {
+            if required.get(key).and_then(JsonValue::as_str)
+                != manifest_report.get(key).and_then(JsonValue::as_str)
+            {
+                return Err(format!(
+                    "{} required report `{label}` field `{key}` does not match manifest",
+                    report_path.display()
+                )
+                .into());
+            }
+            if child.get(key).and_then(JsonValue::as_str)
+                != manifest_report.get(key).and_then(JsonValue::as_str)
+            {
+                return Err(format!(
+                    "{} child report `{label}` field `{key}` does not match manifest",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if required.get("required_argv") != manifest_report.get("required_argv")
+            || child.get("required_argv") != manifest_report.get("required_argv")
+        {
+            return Err(format!(
+                "{} native report `{label}` required_argv does not match manifest",
+                report_path.display()
+            )
+            .into());
+        }
+        for key in ["max_report_bytes", "max_sidecar_bytes"] {
+            if required.get(key).and_then(JsonValue::as_u64)
+                != manifest_report.get(key).and_then(JsonValue::as_u64)
+            {
+                return Err(format!(
+                    "{} required report `{label}` field `{key}` does not match manifest",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        let manifest_requires_contract = manifest_report
+            .get("requires_native_gpu_contract")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true);
+        if required
+            .get("requires_native_gpu_contract")
+            .and_then(JsonValue::as_bool)
+            != Some(manifest_requires_contract)
+        {
+            return Err(format!(
+                "{} required report `{label}` requires_native_gpu_contract does not match manifest",
+                report_path.display()
+            )
+            .into());
+        }
+        let manifest_dependencies = manifest_report
+            .get("upstream_dependencies")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let required_dependencies = required
+            .get("upstream_dependencies")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if required_dependencies != manifest_dependencies {
+            return Err(format!(
+                "{} required report `{label}` upstream_dependencies do not match manifest",
+                report_path.display()
+            )
+            .into());
+        }
+        if child
+            .get("refresh_argv")
+            .and_then(JsonValue::as_array)
+            .is_none_or(|argv| argv.is_empty())
+        {
+            return Err(format!(
+                "{} child report `{label}` missing refresh_argv",
+                report_path.display()
+            )
+            .into());
+        }
+        for dependency in &manifest_dependencies {
+            let dependency_label = json_object_str(dependency, "label", report_path)?;
+            let dependency_kind = dependency
+                .get("kind")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("consumes-source-replay-report");
+            let owner_aggregate = dependency
+                .get("owner_aggregate")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("verify-bytes-machine-plan-all");
+            let owner_aggregate_report_path = dependency
+                .get("owner_aggregate_report_path")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH);
+            expected_dependency_edges.insert((
+                label.to_owned(),
+                dependency_label.to_owned(),
+                dependency_kind.to_owned(),
+                owner_aggregate.to_owned(),
+                owner_aggregate_report_path.to_owned(),
+            ));
+        }
+    }
+
+    verify_native_gpu_all_dependency_graph(
+        report,
+        report_path,
+        &expected_dependency_edges,
+        &required_by_label,
+    )?;
+    verify_native_gpu_all_refresh_taxonomy(report, report_path)?;
+    verify_native_gpu_all_refresh_commands(report, report_path)?;
+    Ok(())
+}
+
+fn verify_native_gpu_all_dependency_graph(
+    report: &JsonValue,
+    report_path: &Path,
+    expected_dependency_edges: &BTreeSet<(String, String, String, String, String)>,
+    required_by_label: &BTreeMap<&str, &JsonValue>,
+) -> RuntimeResult<()> {
+    let graph = report
+        .get("report_dependency_graph")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing report_dependency_graph", report_path.display()))?;
+    if graph.get("kind").and_then(JsonValue::as_str) != Some("report-dependency-dag-v1") {
+        return Err(format!(
+            "{} native report_dependency_graph has invalid kind",
+            report_path.display()
+        )
+        .into());
+    }
+    if graph.get("owner").and_then(JsonValue::as_str) != Some("verify-native-gpu-all") {
+        return Err(format!(
+            "{} native report_dependency_graph has invalid owner",
+            report_path.display()
+        )
+        .into());
+    }
+    if graph.get("source").and_then(JsonValue::as_str) != Some("native_gpu_handoff_manifest") {
+        return Err(format!(
+            "{} native report_dependency_graph source must be native_gpu_handoff_manifest",
+            report_path.display()
+        )
+        .into());
+    }
+    let upstream_dependency_count = json_u64_field(report, "upstream_dependency_count")?;
+    if upstream_dependency_count != expected_dependency_edges.len() as u64 {
+        return Err(format!(
+            "{} upstream_dependency_count {upstream_dependency_count} does not match manifest dependency count {}",
+            report_path.display(),
+            expected_dependency_edges.len()
+        )
+        .into());
+    }
+    for key in [
+        "upstream_dependency_count",
+        "upstream_dependency_refresh_debt_count",
+        "upstream_dependency_true_blocker_count",
+    ] {
+        if graph.get(key).and_then(JsonValue::as_u64) != report.get(key).and_then(JsonValue::as_u64)
+        {
+            return Err(format!(
+                "{} report_dependency_graph `{key}` does not match top-level count",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let edges = graph
+        .get("edges")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} report_dependency_graph missing edges",
+                report_path.display()
+            )
+        })?;
+    let upstream_reports = graph
+        .get("upstream_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} report_dependency_graph missing upstream_reports",
+                report_path.display()
+            )
+        })?;
+    if edges.len() != expected_dependency_edges.len()
+        || upstream_reports.len() != expected_dependency_edges.len()
+    {
+        return Err(format!(
+            "{} report_dependency_graph edge/upstream_report lengths do not match manifest dependencies",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut observed_edges = BTreeSet::new();
+    for edge in edges {
+        let from = json_object_str(edge, "from", report_path)?;
+        let to = json_object_str(edge, "to", report_path)?;
+        let kind = json_object_str(edge, "kind", report_path)?;
+        if !matches!(
+            kind,
+            "consumes-source-replay-report" | "consumes-native-report"
+        ) {
+            return Err(format!(
+                "{} report_dependency_graph edge {from}->{to} has invalid kind",
+                report_path.display()
+            )
+            .into());
+        }
+        let owner_aggregate = json_object_str(edge, "owner_aggregate", report_path)?;
+        let owner_aggregate_report_path =
+            json_object_str(edge, "owner_aggregate_report_path", report_path)?;
+        if !matches!(
+            owner_aggregate,
+            "verify-bytes-machine-plan-all" | "verify-native-gpu-all"
+        ) {
+            return Err(format!(
+                "{} report_dependency_graph edge {from}->{to} has invalid owner aggregate",
+                report_path.display()
+            )
+            .into());
+        }
+        observed_edges.insert((
+            from.to_owned(),
+            to.to_owned(),
+            kind.to_owned(),
+            owner_aggregate.to_owned(),
+            owner_aggregate_report_path.to_owned(),
+        ));
+    }
+    if &observed_edges != expected_dependency_edges {
+        return Err(format!(
+            "{} report_dependency_graph edges do not match manifest upstream_dependencies",
+            report_path.display()
+        )
+        .into());
+    }
+    let mut observed_upstream_reports = BTreeSet::new();
+    for upstream in upstream_reports {
+        let label = json_object_str(upstream, "label", report_path)?;
+        let required_by = json_object_str(upstream, "required_by", report_path)?;
+        let kind = json_object_str(upstream, "kind", report_path)?;
+        let owner_aggregate = json_object_str(upstream, "owner_aggregate", report_path)?;
+        let owner_aggregate_report_path =
+            json_object_str(upstream, "owner_aggregate_report_path", report_path)?;
+        if !required_by_label.contains_key(required_by) {
+            return Err(format!(
+                "{} upstream report `{label}` references unknown required_by `{required_by}`",
+                report_path.display()
+            )
+            .into());
+        }
+        if !matches!(
+            owner_aggregate,
+            "verify-bytes-machine-plan-all" | "verify-native-gpu-all"
+        ) {
+            return Err(format!(
+                "{} upstream report `{label}` has invalid owner aggregate",
+                report_path.display()
+            )
+            .into());
+        }
+        for key in [
+            "exists",
+            "schema_valid",
+            "git_fresh",
+            "worktree_fresh",
+            "artifact_hashes_fresh",
+            "freshness_debt",
+            "true_blocker",
+        ] {
+            if upstream.get(key).and_then(JsonValue::as_bool).is_none() {
+                return Err(format!(
+                    "{} upstream report `{label}` missing boolean `{key}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        observed_upstream_reports.insert((
+            required_by.to_owned(),
+            label.to_owned(),
+            kind.to_owned(),
+            owner_aggregate.to_owned(),
+            owner_aggregate_report_path.to_owned(),
+        ));
+    }
+    if &observed_upstream_reports != expected_dependency_edges {
+        return Err(format!(
+            "{} report_dependency_graph upstream_reports do not match manifest upstream_dependencies",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_native_gpu_all_refresh_taxonomy(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let taxonomy = report
+        .get("failure_taxonomy")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} missing failure_taxonomy", report_path.display()))?;
+    for key in [
+        "missing_report_count",
+        "report_size_failure_count",
+        "sidecar_size_failure_count",
+        "schema_file_contract_failure_count",
+        "schema_file_freshness_failure_count",
+        "schema_shape_contract_failure_count",
+        "schema_shape_freshness_failure_count",
+        "native_product_contract_failure_count",
+        "native_refresh_first_product_contract_count",
+        "native_contract_freshness_failure_count",
+        "all_steps_failure_count",
+        "status_failure_count",
+        "git_stale_count",
+        "worktree_stale_count",
+        "binary_stale_count",
+        "identity_fast_refresh_child_count",
+        "refresh_debt_child_count",
+        "true_blocker_child_count",
+        "product_contract_child_count",
+        "refresh_first_product_contract_child_count",
+        "upstream_dependency_refresh_debt_count",
+        "upstream_dependency_true_blocker_count",
+    ] {
+        if taxonomy.get(key).and_then(JsonValue::as_u64).is_none() {
+            return Err(format!(
+                "{} failure_taxonomy missing numeric `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    for key in [
+        "missing_report_count",
+        "identity_fast_refresh_child_count",
+        "refresh_debt_child_count",
+        "true_blocker_child_count",
+        "product_contract_child_count",
+        "refresh_first_product_contract_child_count",
+        "upstream_dependency_refresh_debt_count",
+        "upstream_dependency_true_blocker_count",
+    ] {
+        if taxonomy.get(key).and_then(JsonValue::as_u64)
+            != report.get(key).and_then(JsonValue::as_u64)
+        {
+            return Err(format!(
+                "{} failure_taxonomy `{key}` does not match top-level count",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    let true_blocker_children = report
+        .get("true_blocker_children")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing true_blocker_children", report_path.display()))?;
+    let true_blocker_child_count = report
+        .get("true_blocker_child_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing true_blocker_child_count", report_path.display()))?;
+    if true_blocker_children.len() as u64 != true_blocker_child_count {
+        return Err(format!(
+            "{} true_blocker_children length does not match true_blocker_child_count",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("aggregate_checks_pass")
+        .and_then(JsonValue::as_bool)
+        .is_none()
+    {
+        return Err(format!(
+            "{} missing boolean aggregate_checks_pass",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_native_gpu_all_refresh_commands(
+    report: &JsonValue,
+    report_path: &Path,
+) -> RuntimeResult<()> {
+    let refresh_commands = report
+        .get("refresh_commands")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} missing refresh_commands", report_path.display()))?;
+    for (index, command) in refresh_commands.iter().enumerate() {
+        let label = json_object_str(command, "label", report_path)?;
+        if json_object_str(command, "path", report_path)?
+            .trim()
+            .is_empty()
+            || json_object_str(command, "reason", report_path)?
+                .trim()
+                .is_empty()
+            || json_object_str(command, "command", report_path)?
+                .trim()
+                .is_empty()
+        {
+            return Err(format!(
+                "{} refresh_commands[{index}] for `{label}` has empty path/reason/command",
+                report_path.display()
+            )
+            .into());
+        }
+        let argv = command
+            .get("argv")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} refresh_commands[{index}] for `{label}` missing argv",
+                    report_path.display()
+                )
+            })?;
+        if argv.is_empty()
+            || argv
+                .iter()
+                .any(|arg| arg.as_str().is_none_or(|arg| arg.trim().is_empty()))
+        {
+            return Err(format!(
+                "{} refresh_commands[{index}] for `{label}` has malformed argv",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn json_object_str<'a>(
+    value: &'a JsonValue,
+    key: &str,
+    report_path: &Path,
+) -> RuntimeResult<&'a str> {
+    value.get(key).and_then(JsonValue::as_str).ok_or_else(|| {
+        format!(
+            "{} JSON object missing string `{key}`",
+            report_path.display()
+        )
+        .into()
+    })
+}
+
+fn report_array_or_json_sidecar(
+    report: &JsonValue,
+    report_path: &Path,
+    pointer: &str,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let value = report
+        .pointer(pointer)
+        .ok_or_else(|| format!("{} missing {pointer}", report_path.display()))?;
+    if let Some(array) = value.as_array() {
+        return Ok(array.clone());
+    }
+    if value.get("kind").and_then(JsonValue::as_str) != Some("json-sidecar-ref")
+        || value.get("sidecar").and_then(JsonValue::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "{} {pointer} must be an inline array or json-sidecar-ref",
+            report_path.display()
+        )
+        .into());
+    }
+    let sidecar_path = value
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} {pointer} sidecar missing path", report_path.display()))?;
+    let expected_sha256 = value
+        .get("sha256")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} {pointer} sidecar missing sha256", report_path.display()))?;
+    let expected_byte_len = value
+        .get("byte_len")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} {pointer} sidecar missing byte_len",
+                report_path.display()
+            )
+        })?;
+    let metadata_byte_len = fs::metadata(sidecar_path)?.len();
+    if metadata_byte_len != expected_byte_len {
+        return Err(format!(
+            "{} {pointer} sidecar `{sidecar_path}` byte_len is stale: report={expected_byte_len}, fs={metadata_byte_len}",
+            report_path.display()
+        )
+        .into());
+    }
+    let actual_sha256 = sha256_file(Path::new(sidecar_path))?;
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "{} {pointer} sidecar `{sidecar_path}` sha256 is stale",
+            report_path.display()
+        )
+        .into());
+    }
+    let sidecar_file = fs::File::open(sidecar_path)?;
+    let sidecar_json: JsonValue = serde_json::from_reader(BufReader::new(sidecar_file))?;
+    sidecar_json.as_array().cloned().ok_or_else(|| {
+        format!(
+            "{} {pointer} sidecar `{sidecar_path}` must contain a JSON array",
+            report_path.display()
+        )
+        .into()
+    })
+}
+
+fn verify_report_refresh_queue_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
+    let selected_count = report
+        .get("selected_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing selected_count", report_path.display()))?;
+    let selection_mode = report
+        .get("selection_mode")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing selection_mode", report_path.display()))?;
+    if !matches!(
+        selection_mode,
+        "dependency-order-full-queue" | "dependency-expanded-label-filter"
+    ) {
+        return Err(format!(
+            "{} invalid selection_mode `{selection_mode}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let dependency_expansion_count = report
+        .get("dependency_expansion_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing dependency_expansion_count",
+                report_path.display()
+            )
+        })?;
+    let dependency_deferred_count = report
+        .get("dependency_deferred_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing dependency_deferred_count",
+                report_path.display()
+            )
+        })?;
+    if dependency_expansion_count + dependency_deferred_count > selected_count {
+        return Err(format!(
+            "{} dependency expansion/deferred counts cannot exceed selected_count",
+            report_path.display()
+        )
+        .into());
+    }
+    let pass_count = report
+        .get("pass_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing pass_count", report_path.display()))?;
+    let fail_count = report
+        .get("fail_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing fail_count", report_path.display()))?;
+    let run_count = report
+        .get("run_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing run_count", report_path.display()))?;
+    let missing_argv_count = report
+        .get("missing_argv_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing missing_argv_count", report_path.display()))?;
+    let invalid_command_count = report
+        .get("invalid_command_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing invalid_command_count", report_path.display()))?;
+    let total_result_count = pass_count + fail_count;
+    if total_result_count < selected_count {
+        return Err(format!(
+            "{} pass_count + fail_count must be at least selected_count",
+            report_path.display()
+        )
+        .into());
+    }
+    if run_count > total_result_count {
+        return Err(format!(
+            "{} run_count cannot exceed pass_count + fail_count",
+            report_path.display()
+        )
+        .into());
+    }
+    let dry_run = report.get("dry_run").and_then(JsonValue::as_bool) == Some(true);
+    if dry_run && run_count != 0 {
+        return Err(format!(
+            "{} dry-run queue has nonzero run_count",
+            report_path.display()
+        )
+        .into());
+    }
+    let closed_loop_requested = report
+        .get("closed_loop_requested")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| format!("{} missing closed_loop_requested", report_path.display()))?;
+    if (!closed_loop_requested || dry_run) && total_result_count != selected_count {
+        return Err(format!(
+            "{} non-closed-loop refresh queue must have pass_count + fail_count equal selected_count",
+            report_path.display()
+        )
+        .into());
+    }
+    let closed_loop_max_runs = report
+        .get("closed_loop_max_runs")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("{} missing closed_loop_max_runs", report_path.display()))?;
+    if closed_loop_max_runs == 0 {
+        return Err(format!(
+            "{} closed_loop_max_runs must be positive",
+            report_path.display()
+        )
+        .into());
+    }
+    let closed_loop_stop_reason = report
+        .get("closed_loop_stop_reason")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} missing closed_loop_stop_reason", report_path.display()))?;
+    if !matches!(
+        closed_loop_stop_reason,
+        "not-requested"
+            | "dry-run"
+            | "clean"
+            | "selected-label-burndown"
+            | "no-refresh-commands"
+            | "post-aggregate-unavailable"
+            | "refresh-command-failed"
+            | "aggregate-rerun-failed"
+            | "max-runs"
+    ) {
+        return Err(format!(
+            "{} invalid closed_loop_stop_reason `{closed_loop_stop_reason}`",
+            report_path.display()
+        )
+        .into());
+    }
+    let closed_loop_executed_run_count = report
+        .get("closed_loop_executed_run_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing closed_loop_executed_run_count",
+                report_path.display()
+            )
+        })?;
+    if closed_loop_executed_run_count > run_count {
+        return Err(format!(
+            "{} closed_loop_executed_run_count cannot exceed run_count",
+            report_path.display()
+        )
+        .into());
+    }
+    for key in [
+        "closed_loop_final_refresh_debt_child_count",
+        "closed_loop_final_selected_refresh_command_count",
+    ] {
+        if report.get(key).and_then(JsonValue::as_u64).is_none() {
+            return Err(format!("{} missing {key}", report_path.display()).into());
+        }
+    }
+    let closed_loop_cycles =
+        report_array_or_json_sidecar(report, report_path, "/closed_loop_cycles")?;
+    if !closed_loop_requested && closed_loop_stop_reason != "not-requested" {
+        return Err(format!(
+            "{} non-closed-loop report must use closed_loop_stop_reason=not-requested",
+            report_path.display()
+        )
+        .into());
+    }
+    if dry_run && closed_loop_requested && closed_loop_stop_reason != "dry-run" {
+        return Err(format!(
+            "{} dry-run closed-loop report must use closed_loop_stop_reason=dry-run",
+            report_path.display()
+        )
+        .into());
+    }
+    for (index, cycle) in closed_loop_cycles.iter().enumerate() {
+        for key in [
+            "cycle",
+            "pre_refresh_debt_child_count",
+            "selected_count",
+            "skipped_label_count",
+            "run_count",
+            "pass_count",
+            "fail_count",
+            "missing_argv_count",
+            "invalid_command_count",
+        ] {
+            if cycle.get(key).and_then(JsonValue::as_u64).is_none() {
+                return Err(format!(
+                    "{} closed_loop_cycles[{index}] missing numeric {key}",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+        if cycle
+            .get("selected_labels")
+            .and_then(JsonValue::as_array)
+            .is_none()
+        {
+            return Err(format!(
+                "{} closed_loop_cycles[{index}] missing selected_labels",
+                report_path.display()
+            )
+            .into());
+        }
+        verify_refresh_queue_boon_cli_prebuild(
+            cycle.get("boon_cli_prebuild").ok_or_else(|| {
+                format!(
+                    "{} closed_loop_cycles[{index}] missing boon_cli_prebuild",
+                    report_path.display()
+                )
+            })?,
+            report_path,
+            &format!("closed_loop_cycles[{index}].boon_cli_prebuild"),
+        )?;
+        if cycle.get("owner_aggregate_rerun_requested").is_some()
+            || cycle.get("owner_aggregate_rerun_executed").is_some()
+            || cycle.get("owner_aggregate_rerun_count").is_some()
+            || cycle.get("owner_aggregate_reruns").is_some()
+        {
+            let owner_requested = cycle
+                .get("owner_aggregate_rerun_requested")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_requested",
+                        report_path.display()
+                    )
+                })?;
+            let owner_executed = cycle
+                .get("owner_aggregate_rerun_executed")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_executed",
+                        report_path.display()
+                    )
+                })?;
+            let owner_count = cycle
+                .get("owner_aggregate_rerun_count")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_count",
+                        report_path.display()
+                    )
+                })?;
+            let owner_reruns = cycle
+                .get("owner_aggregate_reruns")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "{} closed_loop_cycles[{index}] missing owner_aggregate_reruns",
+                        report_path.display()
+                    )
+                })?;
+            if owner_count != owner_reruns.len() as u64 {
+                return Err(format!(
+                    "{} closed_loop_cycles[{index}] owner_aggregate_rerun_count does not match owner_aggregate_reruns length",
+                    report_path.display()
+                )
+                .into());
+            }
+            if dry_run && owner_executed {
+                return Err(format!(
+                    "{} closed_loop_cycles[{index}] dry-run cannot execute owner aggregate reruns",
+                    report_path.display()
+                )
+                .into());
+            }
+            if owner_executed && !owner_requested {
+                return Err(format!(
+                    "{} closed_loop_cycles[{index}] owner aggregate rerun cannot execute unless requested",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    let results = report_array_or_json_sidecar(report, report_path, "/results")?;
+    if results.len() as u64 != total_result_count {
+        return Err(format!(
+            "{} results length {} does not match pass_count + fail_count {total_result_count}",
+            report_path.display(),
+            results.len()
+        )
+        .into());
+    }
+    let mut observed_fail_count = 0_u64;
+    let mut observed_pass_count = 0_u64;
+    for (index, result) in results.iter().enumerate() {
+        let label = result
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{} results[{index}] missing label", report_path.display()))?;
+        if label.trim().is_empty() {
+            return Err(format!("{} results[{index}] empty label", report_path.display()).into());
+        }
+        let status = result
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{} results[{index}] missing status", report_path.display()))?;
+        match status {
+            "pass" => observed_pass_count += 1,
+            "dry-run" => {
+                observed_pass_count += 1;
+                if !dry_run {
+                    return Err(format!(
+                        "{} results[{index}] is dry-run while report.dry_run=false",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            "fail" => observed_fail_count += 1,
+            other => {
+                return Err(format!(
+                    "{} results[{index}] has invalid status `{other}`",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    }
+    if observed_pass_count != pass_count || observed_fail_count != fail_count {
+        return Err(format!(
+            "{} result statuses do not match pass_count/fail_count",
+            report_path.display()
+        )
+        .into());
+    }
+    if report.get("status").and_then(JsonValue::as_str) == Some("pass") && fail_count != 0 {
+        return Err(format!(
+            "{} passing refresh queue has failed child results",
+            report_path.display()
+        )
+        .into());
+    }
+    if missing_argv_count > fail_count || invalid_command_count > fail_count {
+        return Err(format!(
+            "{} missing/invalid command counts cannot exceed fail_count",
+            report_path.display()
+        )
+        .into());
+    }
+    let execution_plan =
+        report_array_or_json_sidecar(report, report_path, "/refresh_execution_plan")?;
+    if execution_plan.len() as u64 != selected_count {
+        return Err(format!(
+            "{} refresh_execution_plan length {} does not match selected_count {selected_count}",
+            report_path.display(),
+            execution_plan.len()
+        )
+        .into());
+    }
+    let phase_summaries =
+        report_array_or_json_sidecar(report, report_path, "/refresh_phase_summaries")?;
+    let mut phase_summary_total = 0_u64;
+    for (index, summary) in phase_summaries.iter().enumerate() {
+        let phase = summary
+            .get("refresh_phase")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} refresh_phase_summaries[{index}] missing refresh_phase",
+                    report_path.display()
+                )
+            })?;
+        if phase.trim().is_empty() {
+            return Err(format!(
+                "{} refresh_phase_summaries[{index}] has empty refresh_phase",
+                report_path.display()
+            )
+            .into());
+        }
+        phase_summary_total += summary
+            .get("selected_count")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{} refresh_phase_summaries[{index}] missing selected_count",
+                    report_path.display()
+                )
+            })?;
+    }
+    if phase_summary_total != selected_count {
+        return Err(format!(
+            "{} refresh_phase_summaries total {phase_summary_total} does not match selected_count {selected_count}",
+            report_path.display()
+        )
+        .into());
+    }
+    let selected_labels = report_array_or_json_sidecar(report, report_path, "/selected_labels")?;
+    if selected_labels.len() as u64 != selected_count {
+        return Err(format!(
+            "{} selected_labels length {} does not match selected_count {selected_count}",
+            report_path.display(),
+            selected_labels.len()
+        )
+        .into());
+    }
+    for (index, plan_entry) in execution_plan.iter().enumerate() {
+        let label = plan_entry
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} refresh_execution_plan[{index}] missing label",
+                    report_path.display()
+                )
+            })?;
+        if label.trim().is_empty() {
+            return Err(format!(
+                "{} refresh_execution_plan[{index}] empty label",
+                report_path.display()
+            )
+            .into());
+        }
+        let selected_label = selected_labels
+            .get(index)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} selected_labels[{index}] missing string",
+                    report_path.display()
+                )
+            })?;
+        let result_label = results
+            .get(index)
+            .and_then(|result| result.get("label"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{} results[{index}] missing label", report_path.display()))?;
+        if label != selected_label || label != result_label {
+            return Err(format!(
+                "{} refresh_execution_plan[{index}] label does not match selected_labels/results",
+                report_path.display()
+            )
+            .into());
+        }
+        let phase = plan_entry
+            .get("refresh_phase")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} refresh_execution_plan[{index}] missing refresh_phase",
+                    report_path.display()
+                )
+            })?;
+        if phase.trim().is_empty() {
+            return Err(format!(
+                "{} refresh_execution_plan[{index}] empty refresh_phase",
+                report_path.display()
+            )
+            .into());
+        }
+        if plan_entry
+            .get("dependency_depth")
+            .and_then(JsonValue::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} refresh_execution_plan[{index}] missing dependency_depth",
+                report_path.display()
+            )
+            .into());
+        }
+        if plan_entry
+            .get("selected_by_label_filter")
+            .and_then(JsonValue::as_bool)
+            .is_none()
+        {
+            return Err(format!(
+                "{} refresh_execution_plan[{index}] missing selected_by_label_filter",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    verify_refresh_queue_boon_cli_prebuild(
+        report
+            .get("boon_cli_prebuild")
+            .ok_or_else(|| format!("{} missing boon_cli_prebuild", report_path.display()))?,
+        report_path,
+        "boon_cli_prebuild",
+    )?;
+    let owner_rerun_requested = report
+        .get("owner_aggregate_rerun_requested")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} missing owner_aggregate_rerun_requested",
+                report_path.display()
+            )
+        })?;
+    let owner_rerun_executed = report
+        .get("owner_aggregate_rerun_executed")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| {
+            format!(
+                "{} missing owner_aggregate_rerun_executed",
+                report_path.display()
+            )
+        })?;
+    let owner_rerun_count = report
+        .get("owner_aggregate_rerun_count")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "{} missing owner_aggregate_rerun_count",
+                report_path.display()
+            )
+        })?;
+    let owner_reruns =
+        report_array_or_json_sidecar(report, report_path, "/owner_aggregate_reruns")?;
+    if owner_rerun_count != owner_reruns.len() as u64 {
+        return Err(format!(
+            "{} owner_aggregate_rerun_count does not match owner_aggregate_reruns length",
+            report_path.display()
+        )
+        .into());
+    }
+    if dry_run && owner_rerun_executed {
+        return Err(format!(
+            "{} dry-run queue cannot execute owner aggregate reruns",
+            report_path.display()
+        )
+        .into());
+    }
+    if owner_rerun_executed && !owner_rerun_requested {
+        return Err(format!(
+            "{} owner aggregate rerun cannot execute unless requested",
+            report_path.display()
+        )
+        .into());
+    }
+    let rerun_requested = report
+        .get("post_refresh_aggregate_rerun_requested")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let rerun_executed = report
+        .get("post_refresh_aggregate_rerun_executed")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let post = report
+        .get("post_refresh_aggregate")
+        .ok_or_else(|| format!("{} missing post_refresh_aggregate", report_path.display()))?;
+    if rerun_requested {
+        let post_object = post.as_object().ok_or_else(|| {
+            format!(
+                "{} post_refresh_aggregate must be an object when rerun is requested",
+                report_path.display()
+            )
+        })?;
+        if post_object
+            .get("rerun_requested")
+            .and_then(JsonValue::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "{} post_refresh_aggregate.rerun_requested must be true",
+                report_path.display()
+            )
+            .into());
+        }
+        if dry_run {
+            if rerun_executed {
+                return Err(format!(
+                    "{} dry-run queue cannot execute post-refresh aggregate",
+                    report_path.display()
+                )
+                .into());
+            }
+        } else if post_object
+            .get("rerun_executed")
+            .and_then(JsonValue::as_bool)
+            != Some(rerun_executed)
+        {
+            return Err(format!(
+                "{} post_refresh_aggregate.rerun_executed mismatch",
+                report_path.display()
+            )
+            .into());
+        }
+        if rerun_executed {
+            for key in [
+                "refresh_debt_child_count",
+                "remaining_refresh_command_count",
+                "remaining_selected_refresh_command_count",
+            ] {
+                if post_object.get(key).and_then(JsonValue::as_u64).is_none() {
+                    return Err(format!(
+                        "{} post_refresh_aggregate missing numeric {key}",
+                        report_path.display()
+                    )
+                    .into());
+                }
+            }
+            if post_object
+                .get("remaining_selected_refresh_commands")
+                .and_then(JsonValue::as_array)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} post_refresh_aggregate missing remaining_selected_refresh_commands",
+                    report_path.display()
+                )
+                .into());
+            }
+            if post_object
+                .get("selected_burndown")
+                .and_then(JsonValue::as_bool)
+                .is_none()
+            {
+                return Err(format!(
+                    "{} post_refresh_aggregate missing selected_burndown",
+                    report_path.display()
+                )
+                .into());
+            }
+        }
+    } else if !post.is_null() {
+        return Err(format!(
+            "{} post_refresh_aggregate must be null unless rerun is requested",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_refresh_queue_boon_cli_prebuild(
+    prebuild: &JsonValue,
+    report_path: &Path,
+    field_path: &str,
+) -> RuntimeResult<()> {
+    let object = prebuild
+        .as_object()
+        .ok_or_else(|| format!("{} {field_path} must be an object", report_path.display()))?;
+    let required = object
+        .get("required")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| format!("{} {field_path} missing required", report_path.display()))?;
+    let executed = object
+        .get("executed")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| format!("{} {field_path} missing executed", report_path.display()))?;
+    let status = object
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{} {field_path} missing status", report_path.display()))?;
+    if !matches!(status, "not-required" | "skipped-dry-run" | "pass" | "fail") {
+        return Err(format!(
+            "{} {field_path} has invalid status `{status}`",
+            report_path.display()
+        )
+        .into());
+    }
+    if !required && status != "not-required" {
+        return Err(format!(
+            "{} {field_path} must use status=not-required when required=false",
+            report_path.display()
+        )
+        .into());
+    }
+    if executed {
+        if object
+            .get("elapsed_ms")
+            .and_then(JsonValue::as_f64)
+            .is_none()
+        {
+            return Err(format!(
+                "{} {field_path} missing elapsed_ms for executed prebuild",
+                report_path.display()
+            )
+            .into());
+        }
+        if !matches!(status, "pass" | "fail") {
+            return Err(format!(
+                "{} {field_path} executed prebuild must use pass/fail status",
+                report_path.display()
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -27270,6 +29126,12 @@ fn verify_report_binary_hash_matches_command(
         .get("binary_hash")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| format!("{} binary_hash is not a string", report_path.display()))?;
+    let verifier_identity_present = report.get("verifier_identity").is_some();
+    let verifier_identity_fresh =
+        verifier_identity_present && report_verifier_identity_matches_report(report);
+    if verifier_identity_present && !verifier_identity_fresh {
+        return Err(format!("{} has stale verifier_identity", report_path.display()).into());
+    }
     if let Some(binary_path) = report.get("binary_path").and_then(JsonValue::as_str) {
         let binary_path = Path::new(binary_path);
         if !binary_path.is_file() {
@@ -27282,6 +29144,9 @@ fn verify_report_binary_hash_matches_command(
         }
         let actual_hash = cached_report_binary_hash(binary_path)?;
         if reported_hash != actual_hash {
+            if verifier_identity_fresh {
+                return Ok(());
+            }
             return Err(format!(
                 "{} has stale binary_hash for binary_path `{}`: report={}, actual={}",
                 report_path.display(),
@@ -27301,6 +29166,9 @@ fn verify_report_binary_hash_matches_command(
     }
     let actual_hash = cached_report_binary_hash(command_path)?;
     if reported_hash != actual_hash {
+        if verifier_identity_fresh {
+            return Ok(());
+        }
         return Err(format!(
             "{} has stale binary_hash for command `{}`: report={}, actual={}",
             report_path.display(),
@@ -32226,6 +34094,357 @@ mod tests {
         accepted
     }
 
+    fn refresh_queue_report() -> JsonValue {
+        let mut report = base_report();
+        report["command"] = json!("run-report-refresh-queue");
+        report["command_argv"] = json!([
+            "xtask",
+            "run-report-refresh-queue",
+            "target/reports/native-gpu-all.json",
+            "--dry-run"
+        ]);
+        report["measurement_mode"] = json!("diagnostic");
+        report["aggregate_report_path"] = json!("target/reports/native-gpu-all.json");
+        report["aggregate_status"] = json!("fail");
+        report["dry_run"] = json!(true);
+        report["closed_loop_requested"] = json!(true);
+        report["closed_loop_max_runs"] = json!(4);
+        report["closed_loop_stop_reason"] = json!("dry-run");
+        report["closed_loop_executed_run_count"] = json!(0);
+        report["closed_loop_final_refresh_debt_child_count"] = json!(3);
+        report["closed_loop_final_selected_refresh_command_count"] = json!(1);
+        report["closed_loop_cycles"] = json!([]);
+        report["post_refresh_aggregate_rerun_requested"] = json!(true);
+        report["post_refresh_aggregate_rerun_executed"] = json!(false);
+        report["label_filter"] = json!(["cells-native-preview-source-replay"]);
+        report["limit"] = JsonValue::Null;
+        report["output_byte_limit"] = json!(4096);
+        report["pre_refresh_debt_child_count"] = json!(3);
+        report["pre_product_contract_child_count"] = json!(0);
+        report["pre_refresh_first_product_contract_child_count"] = json!(2);
+        report["pre_true_blocker_child_count"] = json!(0);
+        report["refresh_entry_count"] = json!(3);
+        report["selected_count"] = json!(1);
+        report["selection_mode"] = json!("dependency-expanded-label-filter");
+        report["dependency_expansion_count"] = json!(0);
+        report["dependency_deferred_count"] = json!(0);
+        report["refresh_phase_summaries"] = json!([{
+            "refresh_phase": "upstream-dependency",
+            "selected_count": 1
+        }]);
+        report["refresh_execution_plan"] = json!([{
+            "index": 0,
+            "label": "cells-native-preview-source-replay",
+            "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
+            "refresh_phase": "upstream-dependency",
+            "dependency_depth": 1,
+            "required_by": "preview-e2e-cells",
+            "owner_aggregate": "verify-bytes-machine-plan-all",
+            "selected_by_label_filter": true
+        }]);
+        report["boon_cli_prebuild"] = json!({
+            "required": true,
+            "executed": false,
+            "dry_run": true,
+            "status": "skipped-dry-run",
+            "argv": ["cargo", "build", "-p", "boon_cli"]
+        });
+        report["owner_aggregate_rerun_requested"] = json!(true);
+        report["owner_aggregate_rerun_executed"] = json!(false);
+        report["owner_aggregate_rerun_count"] = json!(0);
+        report["owner_aggregate_reruns"] = json!([]);
+        report["selected_labels"] = json!(["cells-native-preview-source-replay"]);
+        report["full_queue_mode"] = json!(false);
+        report["skipped_label_count"] = json!(2);
+        report["run_count"] = json!(0);
+        report["pass_count"] = json!(1);
+        report["fail_count"] = json!(0);
+        report["missing_argv_count"] = json!(0);
+        report["invalid_command_count"] = json!(0);
+        report["results"] = json!([{
+            "label": "cells-native-preview-source-replay",
+            "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
+            "status": "dry-run",
+            "argv": ["boon_cli", "run", "examples/cells.bn"],
+            "command": "boon_cli run examples/cells.bn"
+        }]);
+        report["post_refresh_aggregate"] = json!({
+            "rerun_requested": true,
+            "rerun_executed": false
+        });
+        report
+    }
+
+    fn native_gpu_all_aggregate_report() -> JsonValue {
+        let manifest = native_gpu_handoff_manifest_json().unwrap();
+        let manifest_reports = manifest
+            .get("reports")
+            .and_then(JsonValue::as_array)
+            .unwrap();
+        let mut required_reports = Vec::new();
+        let mut child_reports = Vec::new();
+        let mut dependency_edges = Vec::new();
+        let mut upstream_reports = Vec::new();
+        for manifest_report in manifest_reports {
+            let label = manifest_report
+                .get("label")
+                .and_then(JsonValue::as_str)
+                .unwrap();
+            let path = manifest_report
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .unwrap();
+            let command = manifest_report
+                .get("command")
+                .and_then(JsonValue::as_str)
+                .unwrap();
+            let required_argv = manifest_report.get("required_argv").cloned().unwrap();
+            let upstream_dependencies = manifest_report
+                .get("upstream_dependencies")
+                .and_then(JsonValue::as_array)
+                .cloned()
+                .unwrap_or_default();
+            required_reports.push(json!({
+                "label": label,
+                "path": path,
+                "command": command,
+                "required_argv": required_argv,
+                "upstream_dependencies": upstream_dependencies,
+                "requires_native_gpu_contract": manifest_report
+                    .get("requires_native_gpu_contract")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(true),
+                "max_report_bytes": manifest_report
+                    .get("max_report_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap(),
+                "max_sidecar_bytes": manifest_report
+                    .get("max_sidecar_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap()
+            }));
+            child_reports.push(json!({
+                "manifest_index": child_reports.len(),
+                "label": label,
+                "path": path,
+                "command": command,
+                "required_argv": manifest_report.get("required_argv").cloned().unwrap(),
+                "requires_native_gpu_contract": true,
+                "max_report_bytes": manifest_report
+                    .get("max_report_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap(),
+                "max_sidecar_bytes": manifest_report
+                    .get("max_sidecar_bytes")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap(),
+                "exists": true,
+                "observed_status": "pass",
+                "observed_command": command,
+                "status_pass": true,
+                "schema_file_valid": true,
+                "schema_valid": true,
+                "native_contract_valid": true,
+                "native_contract_ok_for_aggregate": true,
+                "all_steps_pass": true,
+                "all_steps_ok_for_aggregate": true,
+                "status_ok_for_aggregate": true,
+                "git_fresh": true,
+                "worktree_fresh": true,
+                "binary_fresh": true,
+                "freshness_debt": false,
+                "refresh_command": format!("xtask {command} --report {path}"),
+                "refresh_argv": ["xtask", command, "--report", path],
+                "report_size_ok": true,
+                "sidecar_size_ok": true
+            }));
+            for dependency in upstream_dependencies {
+                let dependency_label = dependency.get("label").and_then(JsonValue::as_str).unwrap();
+                let dependency_path = dependency.get("path").and_then(JsonValue::as_str).unwrap();
+                let dependency_kind = dependency
+                    .get("kind")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("consumes-source-replay-report");
+                let owner_aggregate = dependency
+                    .get("owner_aggregate")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("verify-bytes-machine-plan-all");
+                let owner_aggregate_report_path = dependency
+                    .get("owner_aggregate_report_path")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH);
+                let dependency_command = dependency
+                    .get("command")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("run-plan-scenario-events");
+                let dependency_measurement_mode = dependency
+                    .get("measurement_mode")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("proof");
+                dependency_edges.push(json!({
+                    "from": label,
+                    "to": dependency_label,
+                    "kind": dependency_kind,
+                    "owner_aggregate": owner_aggregate,
+                    "owner_aggregate_report_path": owner_aggregate_report_path
+                }));
+                upstream_reports.push(json!({
+                    "label": dependency_label,
+                    "path": dependency_path,
+                    "required_by": label,
+                    "kind": dependency_kind,
+                    "owner_aggregate": owner_aggregate,
+                    "owner_aggregate_report_path": owner_aggregate_report_path,
+                    "refresh_command": format!("boon_cli run --report {dependency_path}"),
+                    "refresh_argv": ["boon_cli", "run", "--report", dependency_path],
+                    "exists": true,
+                    "sha256": "0".repeat(64),
+                    "status": "pass",
+                    "command": dependency_command,
+                    "measurement_mode": dependency_measurement_mode,
+                    "schema_valid": true,
+                    "schema_failure_kind": "none",
+                    "git_fresh": true,
+                    "worktree_fresh": true,
+                    "worktree_fingerprint_basis": "scoped",
+                    "worktree_fingerprint_scope": "native-gpu-handoff",
+                    "report_worktree_fingerprint_compared": "0".repeat(64),
+                    "current_worktree_fingerprint_compared": "0".repeat(64),
+                    "artifact_hashes_fresh": true,
+                    "artifact_detail": "fresh",
+                    "freshness_debt": false,
+                    "true_blocker": false
+                }));
+            }
+        }
+        let report_count = manifest_reports.len() as u64;
+        let dependency_count = dependency_edges.len() as u64;
+        let mut report = base_report();
+        report["command"] = json!("verify-native-gpu-all");
+        report["command_argv"] = json!([
+            "xtask",
+            "verify-native-gpu-all",
+            "--check-existing",
+            "--report",
+            "target/reports/native-gpu-all.json"
+        ]);
+        report["measurement_mode"] = json!("proof");
+        report["aggregate_scope"] = json!("agents-native-gpu-handoff");
+        report["check_existing"] = json!(true);
+        report["handoff_manifest_path"] = json!(NATIVE_GPU_HANDOFF_MANIFEST_PATH);
+        report["handoff_manifest_id"] = json!("native-gpu-handoff");
+        report["handoff_manifest_version"] = json!(1);
+        report["handoff_manifest_sha256"] =
+            json!(sha256_bytes(NATIVE_GPU_HANDOFF_MANIFEST_JSON.as_bytes()));
+        report["required_report_count"] = json!(report_count);
+        report["checked_report_count"] = json!(report_count);
+        report["missing_report_count"] = json!(0);
+        report["passed_report_count"] = json!(report_count);
+        report["failed_report_count"] = json!(0);
+        report["acknowledged_known_failure_count"] = json!(0);
+        report["schema_file_valid_report_count"] = json!(report_count);
+        report["schema_valid_report_count"] = json!(report_count);
+        report["native_contract_valid_report_count"] = json!(report_count);
+        report["all_steps_pass_report_count"] = json!(report_count);
+        report["git_fresh_report_count"] = json!(report_count);
+        report["worktree_fresh_report_count"] = json!(report_count);
+        report["identity_fast_refresh_child_count"] = json!(0);
+        report["refresh_debt_child_count"] = json!(0);
+        report["true_blocker_child_count"] = json!(0);
+        report["product_contract_child_count"] = json!(0);
+        report["refresh_first_product_contract_child_count"] = json!(0);
+        report["upstream_dependency_count"] = json!(dependency_count);
+        report["upstream_dependency_refresh_debt_count"] = json!(0);
+        report["upstream_dependency_true_blocker_count"] = json!(0);
+        report["failure_taxonomy"] = json!({
+            "missing_report_count": 0,
+            "report_size_failure_count": 0,
+            "sidecar_size_failure_count": 0,
+            "schema_file_contract_failure_count": 0,
+            "schema_file_freshness_failure_count": 0,
+            "schema_shape_contract_failure_count": 0,
+            "schema_shape_freshness_failure_count": 0,
+            "native_product_contract_failure_count": 0,
+            "native_refresh_first_product_contract_count": 0,
+            "native_contract_freshness_failure_count": 0,
+            "all_steps_failure_count": 0,
+            "status_failure_count": 0,
+            "git_stale_count": 0,
+            "worktree_stale_count": 0,
+            "binary_stale_count": 0,
+            "identity_fast_refresh_child_count": 0,
+            "refresh_debt_child_count": 0,
+            "true_blocker_child_count": 0,
+            "product_contract_child_count": 0,
+            "refresh_first_product_contract_child_count": 0,
+            "upstream_dependency_refresh_debt_count": 0,
+            "upstream_dependency_true_blocker_count": 0
+        });
+        report["aggregate_checks_pass"] = json!(true);
+        report["child_reports"] = json!(child_reports);
+        report["refresh_commands"] = json!([]);
+        report["true_blocker_children"] = json!([]);
+        report["product_contract_children"] = json!([]);
+        report["refresh_first_product_contract_children"] = json!([]);
+        report["report_dependency_graph"] = json!({
+            "kind": "report-dependency-dag-v1",
+            "owner": "verify-native-gpu-all",
+            "source": "native_gpu_handoff_manifest",
+            "upstream_dependency_count": dependency_count,
+            "upstream_dependency_refresh_debt_count": 0,
+            "upstream_dependency_true_blocker_count": 0,
+            "edges": dependency_edges,
+            "upstream_reports": upstream_reports
+        });
+        report["required_reports"] = json!(required_reports);
+        report["linked_report_artifacts"] = json!([]);
+        report
+    }
+
+    #[test]
+    fn native_gpu_all_schema_accepts_manifest_dependency_graph() {
+        assert!(schema_accepts(
+            native_gpu_all_aggregate_report(),
+            "native-gpu-all-manifest-dependency-graph"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_wrong_dependency_graph_source() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["report_dependency_graph"]["source"] = json!("hidden-code-table");
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-hidden-dependency-source"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_upstream_dependency_count_drift() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["report_dependency_graph"]["edges"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-upstream-count-drift"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_missing_true_blocker_children() {
+        let mut report = native_gpu_all_aggregate_report();
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("true_blocker_children");
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-missing-true-blocker-children"
+        ));
+    }
+
     #[test]
     fn native_gpu_schema_accepts_structured_frame_evidence() {
         assert!(schema_accepts(
@@ -32242,6 +34461,169 @@ mod tests {
             .unwrap()
             .remove("frame_evidence_key");
         assert!(!schema_accepts(report, "native-frame-evidence-missing-key"));
+    }
+
+    #[test]
+    fn refresh_queue_schema_accepts_closed_loop_dry_run() {
+        assert!(schema_accepts(
+            refresh_queue_report(),
+            "refresh-queue-closed-loop-dry-run"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_accepts_closed_loop_appended_results() {
+        let mut report = refresh_queue_report();
+        report["dry_run"] = json!(false);
+        report["closed_loop_stop_reason"] = json!("max-runs");
+        report["closed_loop_executed_run_count"] = json!(2);
+        report["post_refresh_aggregate_rerun_executed"] = json!(true);
+        report["boon_cli_prebuild"] = json!({
+            "required": true,
+            "executed": true,
+            "status": "pass",
+            "argv": ["cargo", "build", "-p", "boon_cli"],
+            "command": "cargo build -p boon_cli",
+            "exit_status": "exit status: 0",
+            "exit_code": 0,
+            "elapsed_ms": 1.0,
+            "stdout": "",
+            "stdout_truncated": false,
+            "stderr": "",
+            "stderr_truncated": false
+        });
+        report["closed_loop_cycles"] = json!([{
+            "cycle": 2,
+            "pre_refresh_debt_child_count": 2,
+            "selected_count": 1,
+            "selected_labels": ["preview-e2e-cells"],
+            "skipped_label_count": 0,
+            "run_count": 1,
+            "pass_count": 1,
+            "fail_count": 0,
+            "missing_argv_count": 0,
+            "invalid_command_count": 0,
+            "boon_cli_prebuild": {
+                "required": false,
+                "executed": false,
+                "status": "not-required"
+            },
+            "owner_aggregate_rerun_requested": true,
+            "owner_aggregate_rerun_executed": true,
+            "owner_aggregate_rerun_count": 1,
+            "owner_aggregate_reruns": [{
+                "owner_aggregate": "verify-bytes-machine-plan-all",
+                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
+                "rerun_executed": true
+            }]
+        }]);
+        report["run_count"] = json!(2);
+        report["pass_count"] = json!(2);
+        report["fail_count"] = json!(0);
+        report["results"] = json!([
+            {
+                "label": "cells-native-preview-source-replay",
+                "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
+                "status": "pass",
+                "argv": ["boon_cli", "run", "examples/cells.bn"],
+                "command": "boon_cli run examples/cells.bn"
+            },
+            {
+                "label": "preview-e2e-cells",
+                "path": "target/reports/native-gpu/preview-e2e-cells.json",
+                "status": "pass",
+                "argv": ["xtask", "verify-native-gpu-preview-e2e"],
+                "command": "xtask verify-native-gpu-preview-e2e"
+            }
+        ]);
+        report["post_refresh_aggregate"] = json!({
+            "rerun_requested": true,
+            "rerun_executed": true,
+            "refresh_debt_child_count": 2,
+            "remaining_refresh_command_count": 2,
+            "remaining_selected_refresh_command_count": 1,
+            "remaining_selected_refresh_commands": [{
+                "label": "preview-e2e-cells",
+                "path": "target/reports/native-gpu/preview-e2e-cells.json"
+            }],
+            "selected_burndown": false
+        });
+        assert!(schema_accepts(
+            report,
+            "refresh-queue-closed-loop-appended-results"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_non_loop_extra_results() {
+        let mut report = refresh_queue_report();
+        report["closed_loop_requested"] = json!(false);
+        report["closed_loop_stop_reason"] = json!("not-requested");
+        report["pass_count"] = json!(2);
+        report["results"].as_array_mut().unwrap().push(json!({
+            "label": "preview-e2e-cells",
+            "path": "target/reports/native-gpu/preview-e2e-cells.json",
+            "status": "dry-run"
+        }));
+        assert!(!schema_accepts(
+            report,
+            "refresh-queue-non-loop-extra-results"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_missing_closed_loop_reason() {
+        let mut report = refresh_queue_report();
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("closed_loop_stop_reason");
+        assert!(!schema_accepts(
+            report,
+            "refresh-queue-missing-closed-loop-reason"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_missing_execution_plan() {
+        let mut report = refresh_queue_report();
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh_execution_plan");
+        assert!(!schema_accepts(
+            report,
+            "refresh-queue-missing-execution-plan"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_execution_plan_label_drift() {
+        let mut report = refresh_queue_report();
+        report["refresh_execution_plan"][0]["label"] = json!("preview-e2e-cells");
+        assert!(!schema_accepts(
+            report,
+            "refresh-queue-execution-plan-label-drift"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_missing_boon_cli_prebuild() {
+        let mut report = refresh_queue_report();
+        report.as_object_mut().unwrap().remove("boon_cli_prebuild");
+        assert!(!schema_accepts(
+            report,
+            "refresh-queue-missing-boon-cli-prebuild"
+        ));
+    }
+
+    #[test]
+    fn refresh_queue_schema_rejects_pass_with_failed_child() {
+        let mut report = refresh_queue_report();
+        report["results"][0]["status"] = json!("fail");
+        report["pass_count"] = json!(0);
+        report["fail_count"] = json!(1);
+        assert!(!schema_accepts(report, "refresh-queue-failed-child"));
     }
 
     #[test]
@@ -32577,6 +34959,128 @@ mod tests {
             verify_common_report_shape(&report, &temp_report_path("stale-binary-common")).is_err()
         );
         assert!(!schema_accepts(report, "stale-binary-hash"));
+        let _ = fs::remove_file(command_path);
+    }
+
+    fn source_replay_identity_report_fixture() -> JsonValue {
+        json!({
+            "command": "run-plan-scenario-events",
+            "command_argv": [
+                "target/debug/boon_cli",
+                "run",
+                "examples/cells.bn",
+                "--scenario",
+                "examples/cells.scn",
+                "--engine",
+                "plan",
+                "--report",
+                "target/reports/bytes-plan/cells-scenario-events-full.json"
+            ],
+            "measurement_mode": "proof",
+            "source_hash": "sourcehash",
+            "scenario_hash": "scenariohash",
+            "target_profile": "native",
+            "plan_hash": "planhash",
+            "plan_version": {"major": 1, "minor": 0},
+            "selected_step_ids": ["edit-a1"],
+            "plan_executor_coverage": {"full_scenario_parity": true}
+        })
+    }
+
+    #[test]
+    fn source_replay_identity_excludes_report_path_and_detects_stale_fields() {
+        let mut report = source_replay_identity_report_fixture();
+        let identity = source_replay_identity_for_report(&report)
+            .expect("run-plan-scenario-events report should have source replay identity");
+        assert!(
+            !identity["canonical_args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str() == Some("--report"))
+        );
+        report["source_replay_identity"] = identity;
+        assert!(report_source_replay_identity_matches_report(&report));
+
+        report["plan_hash"] = json!("different-planhash");
+        assert!(
+            !report_source_replay_identity_matches_report(&report),
+            "identity must stale when source replay proof fields change"
+        );
+    }
+
+    #[test]
+    fn common_report_shape_accepts_native_scoped_verifier_identity_with_stale_binary_hash() {
+        let command_path = temp_report_path("native-command-binary-scoped-ok");
+        fs::write(&command_path, b"test native command binary").unwrap();
+        assert!(command_path.is_file());
+        let args = vec![
+            command_path.display().to_string(),
+            "verify-native-gpu-preview-e2e".to_owned(),
+            "--example".to_owned(),
+            "cells".to_owned(),
+            "--report".to_owned(),
+            "ignored-report-path.json".to_owned(),
+        ];
+        let mut report = base_report();
+        report["command"] = json!("verify-native-gpu-preview-e2e");
+        report["command_argv"] = json!(args);
+        report["binary_path"] = json!(command_path.display().to_string());
+        report["binary_hash"] =
+            json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        report["verifier_identity"] = verifier_identity_for_command_args(
+            "verify-native-gpu-preview-e2e",
+            "proof",
+            report
+                .get("command_argv")
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .unwrap();
+
+        verify_common_report_shape(&report, &temp_report_path("native-scoped-common")).unwrap();
+        assert!(schema_accepts(report, "native-scoped-stale-binary"));
+        let _ = fs::remove_file(command_path);
+    }
+
+    #[test]
+    fn common_report_shape_rejects_stale_native_scoped_verifier_identity() {
+        let command_path = temp_report_path("native-command-binary-scoped-stale");
+        fs::write(&command_path, b"test native command binary").unwrap();
+        assert!(command_path.is_file());
+        let args = vec![
+            command_path.display().to_string(),
+            "verify-native-gpu-preview-e2e".to_owned(),
+            "--example".to_owned(),
+            "cells".to_owned(),
+        ];
+        let stale_identity_args = vec![
+            command_path.display().to_string(),
+            "verify-native-gpu-preview-e2e".to_owned(),
+            "--example".to_owned(),
+            "todomvc".to_owned(),
+        ];
+        let mut report = base_report();
+        report["command"] = json!("verify-native-gpu-preview-e2e");
+        report["command_argv"] = json!(args);
+        report["binary_path"] = json!(command_path.display().to_string());
+        report["binary_hash"] = json!(sha256_file(&command_path).unwrap());
+        report["verifier_identity"] = verifier_identity_for_command_args(
+            "verify-native-gpu-preview-e2e",
+            "proof",
+            &stale_identity_args,
+        )
+        .unwrap();
+
+        assert!(
+            verify_common_report_shape(&report, &temp_report_path("native-scoped-stale-common"))
+                .is_err()
+        );
+        assert!(!schema_accepts(report, "native-scoped-stale-identity"));
         let _ = fs::remove_file(command_path);
     }
 
@@ -35606,6 +38110,7 @@ expected_source_event = {{ source = "store.inspect" }}
         )
         .unwrap();
         let artifact_hash = sha256_file(&artifact_path).unwrap();
+        let plan_hash = "plan";
         let mut report = json!({
             "status": "pass",
             "report_version": 1,
@@ -35623,6 +38128,9 @@ expected_source_event = {{ source = "store.inspect" }}
             "source_path": "examples/todomvc.bn",
             "source_hash": "source",
             "program_hash": "program",
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
             "graph_node_count": 1,
             "semantic_index": {},
             "compiled_schedule": {},
@@ -35633,6 +38141,14 @@ expected_source_event = {{ source = "store.inspect" }}
                 "artifact_version": 1,
                 "program_hash": "program",
                 "report_schema_hash": report_schema_hash(),
+                "machine_plan_hash": plan_hash,
+                "plan_hash": plan_hash,
+                "target_profile": "software_default",
+                "capability_summary": {},
+                "machine_plan_verification": {
+                    "status": "pass",
+                    "error_count": 0
+                },
                 "source_unit_count": 1
             },
             "artifact_sections": {
@@ -35645,7 +38161,8 @@ expected_source_event = {{ source = "store.inspect" }}
                 "document_lowering_tables": true,
                 "bridge_schemas": true,
                 "compiled_schedule": true,
-                "runtime_plan": true
+                "runtime_plan": true,
+                "machine_plan": true
             },
             "artifact_sha256s": [{
                 "path": artifact_path.display().to_string(),
@@ -35671,6 +38188,104 @@ expected_source_event = {{ source = "store.inspect" }}
         )
         .unwrap();
         let artifact_hash = sha256_file(&artifact_path).unwrap();
+        let plan_hash = "plan";
+        let compiled_artifact = json!({
+            "path": artifact_path.display().to_string(),
+            "sha256": sha256_file(&artifact_path).unwrap(),
+            "format": "boonc-json-v1",
+            "artifact_version": 1,
+            "program_hash": "program",
+            "report_schema_hash": report_schema_hash(),
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
+            "capability_summary": {},
+            "machine_plan_verification": {
+                "status": "pass",
+                "error_count": 0
+            },
+            "source_unit_count": 1
+        });
+        let artifact_sections = json!({
+            "semantic_index": true,
+            "symbol_table": true,
+            "storage_layout": true,
+            "source_schemas": true,
+            "route_op_streams": true,
+            "dependency_graph": true,
+            "document_lowering_tables": true,
+            "bridge_schemas": true,
+            "compiled_schedule": true,
+            "runtime_plan": true,
+            "machine_plan": true
+        });
+        let inspection_result = json!({
+            "artifact_valid": true,
+            "runtime_engine": "plan_executor",
+            "loaded_runtime_from_artifact": false,
+            "legacy_loaded_runtime_from_artifact": false,
+            "plan_executor_runtime_from_artifact": true,
+            "plan_executor_provenance": {
+                "engine": "plan_executor",
+                "generic_fallback_enabled": false
+            },
+            "runtime_instantiated_from_artifact": true,
+            "machine_plan_deserialized_from_artifact": true,
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
+            "machine_plan_verification": {
+                "status": "pass",
+                "error_count": 0
+            },
+            "runtime_plan_present": true,
+            "runtime_plan_generic_derived_deserialized_from_artifact": true,
+            "runtime_plan_generic_derived_deserialized_counts": {
+                "function_count": 0,
+                "root_supported_count": 1,
+                "indexed_supported_count": 0,
+                "unsupported_reason_count": 0
+            },
+            "runtime_plan_storage_deserialized_from_artifact": true,
+            "runtime_plan_storage_deserialized_counts": {
+                "root_slot_count": 1,
+                "root_initial_field_copy_count": 0,
+                "list_slot_count": 1,
+                "indexed_row_initial_reset_count": 0,
+                "initial_row_count": 0
+            },
+            "runtime_plan_document_lowering_deserialized_from_artifact": true,
+            "runtime_plan_document_lowering_deserialized_counts": {
+                "root_summary_path_count": 1,
+                "list_summary_field_count": 0,
+                "dynamic_list_view_list_count": 0,
+                "projection_storage_resolution_count": 0,
+                "unresolved_projection_storage_path_count": 0,
+                "observed_root_path_count": 0,
+                "render_slot_count": 0,
+                "render_slot_failure_count": 0
+            },
+            "runtime_plan_non_route_tables_deserialized_from_artifact": true,
+            "runtime_plan_non_route_tables_deserialized_counts": {
+                "runtime_symbol_count": 4,
+                "scalar_source_path_count": 1,
+                "scalar_branch_count": 1,
+                "derived_text_transform_count": 0,
+                "list_operation_count": 0,
+                "list_projection_count": 0,
+                "list_source_binding_count": 0
+            },
+            "source_free_runtime_load_available": true,
+            "source_reparse_required_for_current_runtime": false,
+            "source_reparse_attempted": false,
+            "source_file_access": "not_attempted",
+            "parser_ast_required_for_execution": false,
+            "typed_ir_required_for_mvp_loader": false,
+            "scenario_execution_available": false,
+            "blocked_task": "none",
+            "scenario_execution_pending_task": "TASK-0901C",
+            "missing_runtime_plan_sections": []
+        });
         let mut report = json!({
             "status": "pass",
             "report_version": 1,
@@ -35688,83 +38303,17 @@ expected_source_event = {{ source = "store.inspect" }}
             "artifact_path": artifact_path.display().to_string(),
             "artifact_hash": artifact_hash,
             "program_hash": "program",
-            "compiled_artifact": {
-                "path": artifact_path.display().to_string(),
-                "sha256": sha256_file(&artifact_path).unwrap(),
-                "format": "boonc-json-v1",
-                "artifact_version": 1,
-                "program_hash": "program",
-                "report_schema_hash": report_schema_hash(),
-                "source_unit_count": 1
-            },
-            "artifact_sections": {
-                "semantic_index": true,
-                "symbol_table": true,
-                "storage_layout": true,
-                "source_schemas": true,
-                "route_op_streams": true,
-                "dependency_graph": true,
-                "document_lowering_tables": true,
-                "bridge_schemas": true,
-                "compiled_schedule": true,
-                "runtime_plan": true
-            },
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
+            "capability_summary": {},
+            "compiled_artifact": compiled_artifact,
+            "artifact_sections": artifact_sections,
             "artifact_sha256s": [{
                 "path": artifact_path.display().to_string(),
                 "sha256": sha256_file(&artifact_path).unwrap()
             }],
-            "inspection_result": {
-                "artifact_valid": true,
-                "loaded_runtime_from_artifact": true,
-                "runtime_instantiated_from_artifact": true,
-                "runtime_plan_present": true,
-                "runtime_plan_generic_derived_deserialized_from_artifact": true,
-                "runtime_plan_generic_derived_deserialized_counts": {
-                    "function_count": 0,
-                    "root_supported_count": 1,
-                    "indexed_supported_count": 0,
-                    "unsupported_reason_count": 0
-                },
-                "runtime_plan_storage_deserialized_from_artifact": true,
-                "runtime_plan_storage_deserialized_counts": {
-                    "root_slot_count": 1,
-                    "root_initial_field_copy_count": 0,
-                    "list_slot_count": 1,
-                    "indexed_row_initial_reset_count": 0,
-                    "initial_row_count": 0
-                },
-                "runtime_plan_document_lowering_deserialized_from_artifact": true,
-                "runtime_plan_document_lowering_deserialized_counts": {
-                    "root_summary_path_count": 1,
-                    "list_summary_field_count": 0,
-                    "dynamic_list_view_list_count": 0,
-                    "projection_storage_resolution_count": 0,
-                    "unresolved_projection_storage_path_count": 0,
-                    "observed_root_path_count": 0,
-                    "render_slot_count": 0,
-                    "render_slot_failure_count": 0
-                },
-                "runtime_plan_non_route_tables_deserialized_from_artifact": true,
-                "runtime_plan_non_route_tables_deserialized_counts": {
-                    "runtime_symbol_count": 4,
-                    "scalar_source_path_count": 1,
-                    "scalar_branch_count": 1,
-                    "derived_text_transform_count": 0,
-                    "list_operation_count": 0,
-                    "list_projection_count": 0,
-                    "list_source_binding_count": 0
-                },
-                "source_free_runtime_load_available": true,
-                "source_reparse_required_for_current_runtime": false,
-                "source_reparse_attempted": false,
-                "source_file_access": "not_attempted",
-                "parser_ast_required_for_execution": false,
-                "typed_ir_required_for_mvp_loader": false,
-                "scenario_execution_available": false,
-                "blocked_task": "none",
-                "scenario_execution_pending_task": "TASK-0901C",
-                "missing_runtime_plan_sections": []
-            }
+            "inspection_result": inspection_result
         });
         report["inspection_result"]["runtime_plan_source_routes_deserialized_from_artifact"] =
             json!(true);
@@ -35894,6 +38443,7 @@ expected_source_event = {{ source = "store.inspect" }}
         let source_hash = sha256_file(&source_path).unwrap();
         let scenario_hash = sha256_file(&scenario_path).unwrap();
         let signature_hash = sha256_bytes(b"matching-runtime-signature");
+        let plan_hash = "plan";
         let compiled_artifact = json!({
             "path": artifact_path.display().to_string(),
             "sha256": artifact_hash.clone(),
@@ -35901,6 +38451,14 @@ expected_source_event = {{ source = "store.inspect" }}
             "artifact_version": 1,
             "program_hash": "program",
             "report_schema_hash": report_schema_hash(),
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
+            "capability_summary": {},
+            "machine_plan_verification": {
+                "status": "pass",
+                "error_count": 0
+            },
             "source_unit_count": 1
         });
         let artifact_sections = json!({
@@ -35913,7 +38471,8 @@ expected_source_event = {{ source = "store.inspect" }}
             "document_lowering_tables": true,
             "bridge_schemas": true,
             "compiled_schedule": true,
-            "runtime_plan": true
+            "runtime_plan": true,
+            "machine_plan": true
         });
         let artifact_scenario = json!({
             "scenario_execution_available": true,
@@ -35923,13 +38482,16 @@ expected_source_event = {{ source = "store.inspect" }}
             "source_file_access": "not_attempted",
             "typed_ir_required_for_artifact_execution": false,
             "parser_ast_required_for_artifact_execution": false,
-            "source_oracle_layer": "semantic",
+            "source_oracle_layer": "plan_executor",
+            "runtime_engine": "plan_executor",
+            "generic_fallback_enabled": false,
+            "render_patch_surface": "not_owned_by_plan_executor",
             "artifact_run_step_count": 7,
             "source_run_step_count": 7,
             "source_total_semantic_deltas": 7,
             "artifact_total_semantic_deltas": 7,
-            "source_total_render_patches": 7,
-            "artifact_total_render_patches": 7,
+            "source_total_render_patches": 0,
+            "artifact_total_render_patches": 0,
             "semantic_deltas_match": true,
             "render_patches_match": true,
             "state_summary_match": true,
@@ -35955,6 +38517,9 @@ expected_source_event = {{ source = "store.inspect" }}
             "source_path": source_path.display().to_string(),
             "source_hash": source_hash,
             "program_hash": "program",
+            "machine_plan_hash": plan_hash,
+            "plan_hash": plan_hash,
+            "target_profile": "software_default",
             "scenario_path": scenario_path.display().to_string(),
             "scenario_hash": scenario_hash,
             "artifact_path": artifact_path.display().to_string(),

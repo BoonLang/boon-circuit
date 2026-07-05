@@ -80,6 +80,71 @@ virtualization architecture exists to test. This disposition does not make the
 old readiness/default switch pass. The focused handoff for the next attempt is
 `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
 
+## 2026-07-04 - Currentness Fix And Harness Taxonomy Checkpoint
+
+Status: focused U1/harness slice implemented; structured refresh queue added;
+final unified readiness remains open.
+
+Current evidence summary:
+
+- Default-engine readiness now passes freshly with PlanExecutor as the default
+  engine, TodoMVC compare, Cells compare, explicit legacy smoke, and schema-valid
+  child reports.
+- PlanExecutor root list-derived currentness is fixed for list mutations, and
+  compare/report-schema policies now accept only reviewed demand-current
+  `FieldSet` differences in either direction.
+- The BYTES/MachinePlan aggregate is still failing only on stale child evidence
+  in the current worktree. Its failure taxonomy shows no structural schema,
+  status, command, measurement-mode, artifact, or PlanExecutor fallback
+  failures. The current queue has `62` refresh-debt children and `0` true
+  blockers.
+- The native GPU handoff aggregate is still failing on stale child evidence.
+  The new taxonomy separates freshness-only schema/contract failures from real
+  product-contract gaps. It currently has `18` refresh-debt children, `0` fresh
+  product-contract children, and `3` refresh-first product-contract children
+  from stale release/hardware preview E2E evidence.
+- Aggregates now emit structured `refresh_commands[].argv`. Native refreshes are
+  manifest-canonical and keep old observed child command lines only as
+  diagnostic `observed_argv`; BYTES refreshes preserve original `boon_cli`
+  command shapes such as the Cells compare replay.
+- `xtask run-report-refresh-queue` now reads those structured queues, supports
+  dry-run, label, and limit filters, rejects recursive aggregate commands,
+  normalizes local `xtask` / `boon_cli` binaries, truncates child output, and
+  writes schema-valid compact reports. Focused dry-runs for native and BYTES
+  queue entries pass.
+- Native-preview source replay reports are now aggregate-owned BYTES children.
+  The TodoMVC, Cells, and physical TodoMVC replay reports refresh with
+  canonical PlanExecutor-only `boon_cli run --engine plan` commands instead of
+  relying on hidden stale side files under native preview E2E.
+- Focused refresh evidence now proves the control-plane fix: the three
+  native-preview source replay reports pass through
+  `refresh-queue-native-preview-replays.json`, and `preview-e2e-todomvc`
+  refreshes fresh/pass after consuming that fresh replay evidence.
+- The native aggregate now emits `report_dependency_graph.kind =
+  report-dependency-dag-v1` with three `consumes-source-replay-report` edges
+  from preview E2E reports to BYTES-owned PlanExecutor replay reports. When the
+  replay reports are stale, their `boon_cli run ... --engine plan` refresh
+  commands appear directly in the native aggregate queue.
+
+Next unified cut:
+
+1. Use `run-report-refresh-queue` label/limit filters to refresh stale BYTES
+   child reports with current binaries, then rerun the BYTES aggregate.
+2. Implement the closed-loop queue runner slice: refresh selected children,
+   rerun the owner aggregate, and fail/report any selected labels that remain
+   in post-refresh debt.
+3. Refresh the remaining native release/hardware preview E2E reports
+   (`preview-e2e-cells`, `preview-e2e-todo_mvc_physical`) through the structured
+   queue before treating stale provenance gaps as current product bugs.
+4. Add compact summary sidecars/freshness indexes so broad aggregate
+   classification does not repeatedly parse huge child reports.
+5. Add PlanExecutor provenance to default-engine readiness child rows:
+   `engine=plan_executor`, `generic_fallback_enabled=false`, and zero fallback
+   counters for default/compare cases.
+6. Continue U5 by promoting ProductRenderGraph into a renderer-owned retained
+   ProductFrameGraph only after the stale evidence debt is not hiding current
+   product failures.
+
 ## 2026-07-04 - U1 Persistent PlanExecutor Live Session Slice
 
 Status: implemented a focused prerequisite for PlanExecutor-backed
@@ -34865,3 +34930,757 @@ Fresh blockers:
 - Native GPU handoff reports still need a current manifest refresh.
 - U5 still needs the real retained renderer-owned `ProductFrameGraph`, not more
   ProductRenderGraph wrapper metrics.
+
+## 2026-07-04 - Harness Control Plane And Handoff Manifest Tightening
+
+Status: reduced verifier/harness ambiguity so the next implementation pass can
+avoid stale-report loops and focus on fresh blockers or the renderer-owned
+graph cut.
+
+What changed:
+
+- Native and BYTES aggregates now report refresh debt separately from true
+  product/runtime blockers and emit machine-readable refresh queues.
+- Native handoff manifest now requires stronger final evidence:
+  release/hardware preview E2E for TodoMVC, Cells, and physical TodoMVC, and
+  the focus-safe hardware product-surface present-floor path.
+- Aggregate refresh commands now merge observed child `command_argv` with
+  newly required manifest arguments and normalize the `--report` path.
+- Present-floor refresh commands now drop stale nested `--inner-app-window`
+  child-probe argv and return to the public focus-safe verifier command.
+- BYTES aggregate refresh commands now replay source paths, scenarios, step
+  filters, and compare flags from child reports instead of emitting generic
+  command names.
+
+Evidence:
+
+- `cargo check -p xtask`: pass with existing warnings.
+- `cargo test -p xtask native_gpu_handoff -- --nocapture`: pass, `5` focused
+  handoff manifest tests.
+- `cargo test -p xtask present_floor -- --nocapture`: pass, `12` focused
+  present-floor tests.
+- `target/debug/xtask verify-native-gpu-present-floor --report
+  target/reports/native-gpu/present-floor.json`: pass, focus-safe hardware
+  product-preview surface, observed input wake count `0`, p95 about `2.16ms`.
+- `target/debug/xtask verify-bytes-machine-plan-all --check-existing --report
+  target/reports/bytes-plan/bytes-machine-plan-all.json`: expected fail, but
+  `true_blocker_child_count=0` and `refresh_debt_child_count=62`.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report
+  target/reports/native-gpu-all.json`: expected fail, with
+  `refresh_debt_child_count=18` and `product_contract_child_count=3`, all
+  `refresh_first=true`.
+
+Current blockers:
+
+- Execute the aggregate-provided refresh commands before debugging child
+  behavior. Stale reports are now a queued refresh problem, not a reason to
+  inspect huge JSON manually.
+- The main architecture blocker remains U5: promote ProductRenderGraph from a
+  proof/report wrapper into a renderer-owned retained `ProductFrameGraph` with
+  typed resources, patches, present plans, and post-present proof subscribers.
+- PlanExecutor/source-free equivalence coverage is still needed before
+  quarantining more legacy runtime/oracle paths.
+
+## 2026-07-05 - Closed-Loop Refresh Queue Implemented
+
+Status: closed the immediate verifier-control gap that made the unified goal
+burn tokens on stale child reports. The refresh queue can now refresh selected
+aggregate-owned dependencies and rerun the owning aggregate to prove selected
+label burndown.
+
+What changed:
+
+- `run-report-refresh-queue` now supports `--rerun-aggregate` and
+  `--closed-loop`.
+- The queue report records pre-refresh aggregate debt, selected labels,
+  full-queue mode, post-aggregate execution status, post-refresh debt,
+  remaining selected refresh commands, and selected-label burndown.
+- Dry-run closed-loop reports are schema-valid and structured; they report that
+  the post-refresh aggregate rerun was intentionally skipped.
+- `verify-report-schema` now validates refresh-queue reports explicitly instead
+  of treating them as generic pass/fail reports.
+
+Evidence:
+
+- `cargo test -p xtask refresh_queue_reruns_native_aggregate_argv -- --nocapture`:
+  pass.
+- `cargo test -p xtask refresh_queue_partial_mode_detects_selected_label_burndown -- --nocapture`:
+  pass.
+- `cargo test -p xtask refresh -- --nocapture`: pass.
+- `cargo test -p boon_report_schema refresh_queue_schema -- --nocapture`: pass.
+- `cargo check -p boon_report_schema -p xtask`: pass with existing warnings.
+- Closed-loop dry-run against `target/reports/native-gpu-all.json` for
+  `cells-native-preview-source-replay` passed schema and reported
+  `pre_refresh_debt_child_count=18`, `selected_count=1`, and
+  `post_refresh_aggregate.rerun_executed=false`.
+
+Next:
+
+- Use closed-loop refresh before interpreting native/BYTES readiness failures.
+- Continue the larger architecture work: PlanExecutor/source-free equivalence,
+  removal/quarantine of hidden legacy fallback paths, and the real
+  renderer-owned retained `ProductFrameGraph`.
+
+## 2026-07-05 - Typed Linear ProductFrameGraph Slice
+
+Status: moved the native renderer graph one step past the old stringly
+`executor_wrapped_product_passes` contract. This is a generic renderer
+architecture slice, not a Cells-specific patch and not a final WGPU scheduler.
+
+What changed:
+
+- `boon_native_gpu` now has typed `ProductFrameGraphPassId` and
+  `ProductFrameGraphResourceId` values for the visible product frame path.
+- The renderer graph executor now records a `ProductFrameGraph` with typed
+  passes/resources and emits the existing report metrics from that typed graph.
+- Renderer metrics now identify the path as
+  `renderer_render_graph_execution_kind=retained_product_frame_graph_linear_v1`.
+- `xtask` product-frame graph checks and fixtures now require the retained
+  linear graph execution kind instead of the old wrapper kind.
+
+Evidence:
+
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --rerun-aggregate --label todomvc-native-preview-source-replay --label cells-native-preview-source-replay --label todo-mvc-physical-native-preview-source-replay --report target/reports/native-gpu/refresh-queue-native-preview-replays-closed-loop.json`:
+  pass, selected-label burndown true, remaining selected refresh commands `0`.
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --rerun-aggregate --limit 8 --report target/reports/native-gpu/refresh-queue-native-contracts-closed-loop.json`:
+  pass, selected-label burndown true, native refresh debt reduced from `18` to
+  `10`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/refresh-queue-native-preview-replays-closed-loop.json`:
+  pass.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu/refresh-queue-native-contracts-closed-loop.json`:
+  pass.
+- `cargo check -p boon_native_gpu -p xtask`: pass with existing warnings.
+- `cargo test -p boon_native_gpu product_frame_graph_executor_emits_typed_pass_and_resource_metrics -- --nocapture`:
+  pass.
+- `cargo test -p boon_native_gpu renderer_graph_plan_hash_ignores_workload_metrics -- --nocapture`:
+  pass.
+- `cargo test -p xtask cells_visible_click_lane_contracts_accept_split_product_and_proof_paths -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- Native report evidence remains incomplete after this code change because the
+  heavier product/window labels still need fresh reruns against the new binary.
+- The graph is now renderer-owned and typed, but still linear. The next render
+  graph step is retained dirty-resource scheduling and proof subscribers keyed
+  by frame evidence, not Cells-specific renderer shortcuts.
+- Source-free artifact execution has a first PlanExecutor-backed path:
+  artifacts embed a verified `MachinePlan`, inspection proves PlanExecutor
+  provenance without source reparse, and TodoMVC artifact scenarios compare
+  artifact-loaded PlanExecutor against source PlanExecutor. The remaining
+  artifact work is broader Cells/BYTES/indexed coverage, explicit quarantine or
+  deletion of the legacy artifact diagnostic path, and render-patch ownership by
+  PlanExecutor/render graph rather than the old legacy lane.
+
+## 2026-07-05 - Artifact Parity Coverage Broadened
+
+Status: cut another harness/control-plane ambiguity before more native product
+tuning. This is not a Cells-specific optimization; it makes representative
+artifact execution use the same PlanExecutor source/artifact oracle.
+
+What changed:
+
+- `boon_runtime` now has a reusable artifact scenario parity helper that
+  compares source PlanExecutor output with artifact-loaded PlanExecutor output.
+- The helper asserts artifact inspection provenance:
+  `runtime_engine=plan_executor`, `plan_executor_runtime_from_artifact=true`,
+  `source_reparse_attempted=false`, and `source_file_access=not_attempted`.
+- Representative parity now covers TodoMVC, Cells, and
+  `bytes_indexed_source_payload_plan_ops`.
+- A separate source-deleted TodoMVC test keeps actual source-free scenario
+  execution covered.
+
+Evidence:
+
+- `cargo test -p boon_runtime compiled_artifact_runs_representative_scenarios_through_plan_executor --lib -- --nocapture`:
+  pass.
+- `cargo test -p boon_runtime compiled_artifact_runs_single_file_scenario_after_source_is_deleted --lib -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- One major source of verifier noise is smaller: representative source-free
+  artifact failures should now be interpreted as PlanExecutor/artifact bugs, not
+  legacy runtime comparison drift.
+- The remaining runtime harness cut is live-event/session/batch parity for
+  Cells and BYTES, followed by quarantine or deletion of explicit legacy
+  diagnostic paths once replacement evidence is sufficient.
+- Continue to use aggregate refresh queues and compact summaries for native
+  reports. Do not spend product time on stale report fingerprints or legacy
+  oracle mismatches until the owning aggregate reports a fresh true blocker.
+
+## 2026-07-05 - Live Surface Parity Coverage Broadened
+
+Status: continued the harness/control-plane cleanup by proving representative
+source-event surfaces through PlanExecutor, instead of leaving the normal live
+runtime path as a TodoMVC-only proof.
+
+What changed:
+
+- `boon_runtime` now has a reusable live-surface parity helper that compares
+  whole selected PlanExecutor scenario execution with:
+  - direct persistent `PlanExecutorRuntimeState::apply_step`;
+  - `PlanExecutorRuntimeState::apply_live_source_event`;
+  - `PlanExecutorLiveSession::apply_source_event`;
+  - `LiveRuntime::apply_source_batch_turn`.
+- The helper verifies state summaries, semantic deltas, key executor counters,
+  PlanExecutor provenance, zero fallback counters, and no legacy render patches
+  on the batch surface.
+- Representative coverage now includes TodoMVC, Cells full source-event steps,
+  root BYTES source payload, and indexed BYTES source payload.
+
+Evidence:
+
+- `cargo test -p boon_runtime plan_executor_live_surfaces_match_representative_scenario_events --lib -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- Source-free artifact and live source-event surfaces are now both covered by
+  representative non-TodoMVC fixtures. Runtime/control-plane failures in these
+  lanes should be treated as PlanExecutor bugs, not legacy oracle drift.
+- Remaining broad work is native aggregate refresh, retained dirty-resource
+  `ProductFrameGraph` scheduling, dedicated demand-current/list-find edge
+  coverage, and legacy diagnostic path quarantine/deletion.
+
+## 2026-07-05 - Retained ProductFrameGraph Resource State
+
+Status: moved the native renderer graph beyond per-frame metric-derived
+resource tables. This is a generic renderer architecture slice, not a
+Cells-specific patch and not yet the final dirty-resource scheduler.
+
+What changed:
+
+- `VisibleLayoutRenderer` now owns a retained `ProductFrameGraphState` beside
+  the existing text, texture, quad-buffer, upload-ring, prepared-quad, and
+  retained-chunk caches.
+- `ProductFrameGraphState` tracks typed renderer resources across frames by
+  resource id, signature, epoch, dirty/reused status, and last-used frame.
+- `FrameMetrics` now reports retained graph evidence:
+  `renderer_render_graph_retained_resource_epoch_hash`,
+  `renderer_render_graph_retained_state_resource_count`,
+  `renderer_render_graph_retained_dirty_resource_count`, and
+  `renderer_render_graph_retained_reused_resource_count`.
+- Product render graph summaries propagate those retained-state counters, and
+  xtask graph contracts now require a retained resource epoch hash plus retained
+  state counts when graph evidence is present.
+- Existing graph plan/topology hashes remain separate from workload and retained
+  epoch hashes, so mutable resource state does not redefine product graph plan
+  identity.
+
+Evidence:
+
+- `cargo test -p boon_native_gpu product_frame_graph_state_tracks_dirty_and_reused_resource_epochs -- --nocapture`:
+  pass.
+- `cargo test -p boon_native_gpu product_frame_graph -- --nocapture`: pass.
+- `cargo test -p boon_native_gpu renderer_graph_plan_hash_ignores_workload_metrics -- --nocapture`:
+  pass.
+- `cargo test -p xtask product_render_graph -- --nocapture`: pass.
+- `cargo test -p xtask cells_visible_click_lane_contracts_accept_split_product_and_proof_paths -- --nocapture`:
+  pass.
+- `cargo check -p boon_native_gpu -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass with existing warnings.
+
+Current interpretation:
+
+- The renderer now has retained typed resource state that a later scheduler can
+  use. The graph still executes in fixed linear order, so the remaining
+  ProductFrameGraph work is scheduler decisions such as clean/dirty upload,
+  dirty encode, surface epoch reset, and proof-subscriber-only handling.
+- Broad native handoff evidence still needs current report refresh through the
+  aggregate queue; stale child reports remain non-proof.
+
+## 2026-07-05 - Verifier Control Plane Fast-Path And Status Split
+
+Status: cut two sources of harness noise that were making development slower and
+more expensive without proving product regressions.
+
+What changed:
+
+- `verify-native-gpu-all` now detects stale child identity before full child
+  validation. Reports with stale git, worktree, or binary identity become one
+  `identity-freshness-fast-path` refresh-debt entry with canonical refresh argv;
+  schema, semantic, and artifact validation are skipped until the report is
+  regenerated.
+- The aggregate now reports `identity_fast_refresh_child_count` and
+  `binary_stale_count`, and child summaries say
+  `control_plane_validation_mode=identity-fast-refresh` or
+  `control_plane_validation_mode=full-contract`.
+- PlanExecutor command reports now split `plan_executor_status`,
+  `comparison_status`, and `accepted_for_product_status` from the compatibility
+  top-level `status`.
+- Native preview source replay summaries now expose those replay statuses and use
+  product acceptance as the source-replay signal, leaving legacy comparison
+  status as separate evidence.
+
+Evidence:
+
+- `cargo test -p xtask native_gpu_aggregate_fast_paths_stale_identity_before_child_contract_validation -- --nocapture`:
+  pass.
+- `cargo test -p boon_plan_executor scenario_events_report_splits_product_status_from_legacy_comparison_status -- --nocapture`:
+  pass.
+- `cargo test -p boon_plan_executor scenario_events_command_output_assembles_report_and_executor_core -- --nocapture`:
+  pass.
+- `cargo test -p boon_plan_executor root_scenario_command_output_assembles_report_and_executor_core -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- Stale native reports should now be refreshed, not deeply validated or manually
+  inspected. If the aggregate reports only identity fast-path debt, product code
+  should not be tuned from those stale children.
+- A PlanExecutor replay can be product-accepted even when legacy comparison is
+  disabled, currentness-accepted, or failing under the compatibility top-level
+  status. Gates should use the split status fields for product/runtime decisions.
+- Remaining control-plane cuts are scoped input fingerprints, generic
+  content-addressed sidecars, sidecar pruning, and a stricter closed-loop refresh
+  controller that reports only remaining fresh true blockers.
+
+## 2026-07-05 - Closed-Loop Refresh And Strict Replay Product Status
+
+Status: tightened the verifier/control-plane contract so stale report churn and
+legacy comparison ambiguity are cheaper to diagnose and harder to mistake for
+fresh product failures.
+
+What changed:
+
+- `run-report-refresh-queue` now has an explicit `--until-clean --max-runs N`
+  mode that repeats selected aggregate-owned refresh commands, reruns the owner
+  aggregate after each cycle, and records a bounded final stop reason.
+  `--closed-loop` is the alias for this bounded loop; `--rerun-aggregate`
+  remains a one-cycle aggregate rerun.
+- Refresh queue reports now include schema-required closed-loop fields:
+  requested flag, max run count, stop reason, executed cycle count, final
+  refresh-debt count, final selected-label count, and per-cycle summaries.
+- `run-plan-scenario-events` schema validation now requires
+  `plan_executor_status`, `accepted_for_product_status`, `comparison_status`,
+  and `report_status_basis`. Passing reports must prove
+  `plan_executor_status=pass` and `accepted_for_product_status=pass`.
+- Native preview source replay evidence no longer accepts missing
+  PlanExecutor/product status fields. Old pre-split replay reports are refresh
+  debt, not product proof.
+
+Evidence:
+
+- `cargo test -p boon_report_schema refresh_queue_schema -- --nocapture`: pass.
+- `cargo test -p xtask refresh_queue_until_clean_dry_run_reports_closed_loop_without_rerun -- --nocapture`:
+  pass.
+- `cargo test -p xtask refresh_queue_closed_loop_selection_honors_labels_and_limit -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- The next expensive native/BYTES refresh should use the closed-loop queue
+  controller and read the final stop reason, not manually inspect megabyte child
+  reports.
+- If native replay evidence fails because split product fields are missing, the
+  correct action is to refresh the BYTES-owned replay report or fix its producer
+  schema, not tune Cells or renderer product code.
+- Remaining harness architecture work is scoped input fingerprints,
+  manifest/DAG-owned dependencies beyond native preview source replay, compact
+  aggregate summaries, and generic sidecar pruning/deduplication.
+
+## 2026-07-05 - Native Scoped Worktree Fingerprints
+
+Status: added a conservative scoped freshness layer so plan/progress document
+churn no longer invalidates native product reports by itself.
+
+What changed:
+
+- Native/static reports still emit the legacy full `worktree_fingerprint`, but
+  now also emit `worktree_fingerprint_scope`,
+  `worktree_scoped_fingerprint`, and `worktree_fingerprints`.
+- The native aggregate prefers the `native-gpu-handoff` scoped fingerprint for
+  native child freshness when present, and falls back to the full fingerprint
+  for old reports.
+- The native scope includes Cargo metadata, `AGENTS.md`, `crates/`, `examples/`,
+  `budgets/native-gpu.toml`, `NATIVE_GPU_PIPELINE.md`, and the handoff manifest.
+  It excludes `docs/plans/*`, so progress-ledger or goal-prompt edits stop
+  causing product-report refresh debt.
+- Child summaries now report the freshness basis, compared scope, report
+  fingerprint, and current fingerprint used by aggregate identity checks.
+
+Evidence:
+
+- `cargo test -p xtask native_gpu_worktree_fingerprint_scope_tracks_product_inputs_not_plan_ledgers -- --nocapture`:
+  pass.
+- `cargo test -p xtask report_worktree_freshness_prefers_matching_native_scoped_fingerprint -- --nocapture`:
+  pass.
+- `cargo test -p xtask native_gpu_aggregate_fast_paths_stale_identity_before_child_contract_validation -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- This does not weaken git or binary freshness and does not bless stale product
+  code. It only prevents plan/progress prose from forcing a full native handoff
+  refresh.
+- Remaining control-plane architecture work is manifest-backed report
+  dependencies for native preview replay, dependency-first child modes such as
+  `upstream-refresh-first`, and dedicated native aggregate schema validation for
+  dependency graphs and compact summaries.
+
+## 2026-07-05 - Manifest-Owned Native Report Dependencies
+
+Status: moved native preview source-replay dependency ownership into the native
+handoff manifest instead of a hidden xtask label table.
+
+What changed:
+
+- `docs/architecture/native_gpu_handoff_manifest.json` now declares
+  `upstream_dependencies` for TodoMVC, Cells, and physical TodoMVC preview E2E
+  reports.
+- `verify-native-gpu-all` parses those manifest edges, emits them in
+  `report_dependency_graph`, and lists them under
+  `required_reports[].upstream_dependencies`.
+- The old helper name remains for tests, but it now reads manifest-derived
+  report data instead of owning dependency policy.
+
+Evidence:
+
+- `cargo test -p xtask native_gpu_handoff_manifest_owns_preview_source_replay_dependencies -- --nocapture`:
+  pass.
+- `cargo test -p xtask native_preview_e2e_declares_plan_executor_replay_dependency -- --nocapture`:
+  pass.
+- `cargo test -p xtask non_preview_native_reports_have_no_source_replay_dependency -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- This removes another harness/control-plane ambiguity: stale source replay
+  evidence should now be refreshed through an aggregate-owned dependency edge,
+  not rediscovered from a native preview verifier failure.
+- Remaining control-plane work is explicit dependency-first child modes
+  (`upstream-refresh-first`), compact aggregate summaries, and dedicated schema
+  checks for the native aggregate dependency graph.
+
+## 2026-07-05 - Native Aggregate Schema Validator
+
+Status: added command-specific schema validation for `verify-native-gpu-all`
+instead of letting native handoff aggregates fall through only generic
+pass/fail report shape checks.
+
+What changed:
+
+- `boon_report_schema` now validates native handoff aggregate manifest identity,
+  `required_reports`, child report labels/paths/commands, manifest-owned
+  `upstream_dependencies`, `report_dependency_graph`, refresh commands, and
+  failure taxonomy counts.
+- Failing native aggregates can remain schema-valid when they carry a proper
+  blocker shape and bounded refresh/dependency/product taxonomy; schema validity
+  no longer means the native gate passed.
+- The schema validator uses the canonical handoff manifest as its expected
+  dependency source and rejects hidden dependency graph sources or edge-count
+  drift.
+
+Evidence:
+
+- `cargo test -p boon_report_schema native_gpu_all_schema -- --nocapture`:
+  pass.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  fail as expected while all native children are identity refresh debt; report
+  written.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu-all.json`:
+  pass.
+- Compact summary from the fresh aggregate:
+  `required_report_count=18`, `refresh_debt_child_count=18`,
+  `identity_fast_refresh_child_count=18`, `upstream_dependency_count=3`,
+  `upstream_dependency_refresh_debt_count=3`,
+  `upstream_dependency_true_blocker_count=0`,
+  `dependency_graph_source=native_gpu_handoff_manifest`.
+
+Current interpretation:
+
+- Native aggregate output is now a more trustworthy control-plane artifact. The
+  next step is DAG-aware refresh ordering so upstream BYTES replay refreshes
+  run before their native preview E2E consumers.
+
+## 2026-07-05 - Dependency-Aware Refresh Queue
+
+Status: implemented the next control-plane slice so refresh scheduling follows
+the aggregate dependency graph instead of a flat stale-report list.
+
+What changed:
+
+- `run-report-refresh-queue` now plans selected entries with upstream dependency
+  expansion. Full queue mode sorts upstream dependency refreshes before native
+  aggregate children. A label-filtered native preview selection includes its
+  required BYTES source replay prerequisite before the native consumer.
+- Queue reports now carry `selection_mode`, dependency expansion/deferred
+  counts, `refresh_phase_summaries`, ordered `refresh_execution_plan`,
+  `selected_by_label_filter`, `boon_cli_prebuild`, and owner-aggregate rerun
+  intent.
+- Non-dry refresh execution now runs one `cargo build -p boon_cli` preflight
+  before executing selected `boon_cli` replay commands; dry-runs report the same
+  preflight as `skipped-dry-run`.
+- `boon_report_schema` now validates those fields and rejects missing execution
+  plans, missing prebuild metadata, or label/order drift between
+  `refresh_execution_plan`, `selected_labels`, and `results`.
+
+Evidence:
+
+- `cargo test -p xtask refresh_queue -- --nocapture`: pass (`8` focused tests).
+- `cargo test -p boon_report_schema refresh_queue_schema -- --nocapture`: pass
+  (`5` focused tests).
+- `cargo check -p xtask`: pass.
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --dry-run --limit 3 --report target/reports/native-gpu/refresh-queue-dag-dry-run.json`:
+  pass and schema-valid; selected labels are
+  `todomvc-native-preview-source-replay`,
+  `cells-native-preview-source-replay`, and
+  `todo-mvc-physical-native-preview-source-replay`, all phase
+  `upstream-dependency`; `boon_cli_prebuild.status=skipped-dry-run`.
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --dry-run --label preview-e2e-cells --limit 1 --report target/reports/native-gpu/refresh-queue-dag-cells-dry-run.json`:
+  pass and schema-valid; selected labels are
+  `cells-native-preview-source-replay` then `preview-e2e-cells`, with
+  `dependency_expansion_count=1` and
+  `boon_cli_prebuild.status=skipped-dry-run`.
+
+Current interpretation:
+
+- The verifier/control plane now has a deterministic path for burning down
+  native refresh debt without first running stale dependent previews. This
+  should reduce token/time waste on stale report diagnosis.
+- This does not claim Cells/product performance is fixed. The next useful step
+  is running the dependency-aware queue on the remaining native handoff debt,
+  then debugging only fresh true blockers.
+
+## 2026-07-05 - Native Refresh Queue Execution And True-Blocker Fields
+
+Status: ran the dependency-aware queue on the first native refresh slices and
+added explicit native aggregate true-blocker output.
+
+What changed:
+
+- `verify-native-gpu-all` now emits top-level `true_blocker_child_count` and
+  `true_blocker_children`, and mirrors the count into `failure_taxonomy`.
+- `boon_report_schema` now requires those fields for native aggregate reports
+  and rejects missing `true_blocker_children`.
+- The true-blocker list includes fresh native child blockers and fresh upstream
+  dependency blockers, while stale/missing identity remains refresh debt.
+
+Evidence:
+
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --limit 3 --rerun-aggregate --report target/reports/native-gpu/refresh-queue-dag-upstream-run.json`:
+  pass; refreshed the three upstream BYTES native-preview replay reports,
+  built `boon_cli` once, and left `remaining_selected_refresh_command_count=0`.
+  The native aggregate immediately after that had
+  `upstream_dependency_refresh_debt_count=0` and `remaining_refresh_command_count=18`.
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all.json --limit 8 --rerun-aggregate --report target/reports/native-gpu/refresh-queue-native-static-run.json`:
+  pass; refreshed `platform-contract`, `dependency-graph`, `architecture`,
+  `layout-contract`, `shaders`, `multiwindow`, `ipc-backpressure`, and
+  `observability`, all with child `status=pass`. The native aggregate after
+  that had `refresh_debt_child_count=10`, `true_blocker_child_count=0`, and
+  `remaining_refresh_command_count=10`.
+- After adding the native true-blocker fields and rebuilding `xtask`, the
+  regenerated aggregate is schema-valid and reports
+  `true_blocker_child_count=0`, but all native children are refresh debt again
+  because the verifier binary hash changed. Current aggregate:
+  `refresh_debt_child_count=18`,
+  `upstream_dependency_refresh_debt_count=3`, `true_blocker_child_count=0`.
+- `cargo test -p boon_report_schema native_gpu_all_schema -- --nocapture`:
+  pass.
+- `cargo test -p xtask native_gpu_aggregate_fast_paths_stale_identity_before_child_contract_validation -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- The queue works, but every verifier code change still invalidates child
+  reports by binary hash. This is honest refresh debt, not Cells product
+  evidence.
+- The next useful control-plane cut is summary/content-addressed or
+  verifier-versioned child evidence so aggregate/report-shape edits stop
+  forcing expensive product verifier reruns when the product/verifier command
+  under test did not materially change.
+
+## 2026-07-05 - Scoped Native Verifier Identity
+
+Status: implemented the first verifier identity cut so native `xtask` report
+freshness is no longer tied only to the whole `xtask` binary hash.
+
+What changed:
+
+- Native/static `xtask` reports now include `verifier_identity`, a scoped
+  verifier-contract identity made from the identity kind, scheme version,
+  command, measurement mode, contract version, and canonical verifier arguments
+  with transport-only `--report` paths removed.
+- `boon_report_schema` keeps generic `binary_hash` validation strict, but accepts
+  a stale legacy binary hash for native/verifier reports when the scoped
+  `verifier_identity` matches the current verifier contract. If a scoped
+  identity is present and mismatched, schema rejects the report even when the
+  legacy binary hash matches.
+- The native aggregate uses the same authority rule for child freshness and
+  records `binary_hash_matches`, `verifier_identity_present`,
+  `verifier_identity_fresh`, and `binary_freshness_basis` in child summaries.
+- Native/platform verifier commands now use the native handoff worktree
+  fingerprint scope instead of whole-worktree freshness when the command has
+  scoped verifier identity.
+
+Evidence:
+
+- `cargo test -p boon_report_schema scoped_verifier_identity -- --nocapture`:
+  pass.
+- `cargo test -p xtask native_gpu_aggregate_ -- --nocapture`: pass.
+- `target/debug/xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json`:
+  pass; the refreshed report includes `verifier_identity` and
+  `worktree_fingerprint_scope=native-gpu-handoff`.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail with schema-valid report; after refreshing only
+  `platform-contract`, the aggregate reports `refresh_debt_child_count=17`,
+  `true_blocker_child_count=0`, `upstream_dependency_refresh_debt_count=3`, and
+  classifies `platform-contract` as
+  `binary_freshness_basis=scoped-verifier-identity`.
+- `target/debug/xtask verify-report-schema target/reports/native-gpu-all.json`:
+  pass.
+
+Current interpretation:
+
+- This cuts a real harness/control-plane loop: native aggregate/schema edits no
+  longer have to force every native child report to refresh solely because the
+  `xtask` binary changed.
+- The current aggregate still has 17 native child refresh-debt reports because
+  those reports predate `verifier_identity`. They should need one refresh, not a
+  rerun after every unrelated aggregate/schema binary change.
+- It did not yet solve upstream `boon_cli` source replay churn; that follow-up
+  is recorded in the next checkpoint.
+
+## 2026-07-05 - Scoped PlanExecutor Source Replay Identity
+
+Status: implemented the BYTES/native upstream freshness cut for
+`run-plan-scenario-events` reports.
+
+What changed:
+
+- PlanExecutor source replay reports now keep their legacy full
+  `worktree_fingerprint`, but also carry
+  `worktree_fingerprint_scope=plan-executor-source-replay`,
+  `worktree_scoped_fingerprint`, scoped entries in `worktree_fingerprints`, and
+  audited scope inputs.
+- `source_replay_identity` is emitted by `boon_runtime` for
+  `run-plan-scenario-events`. It binds command, measurement mode, canonical
+  arguments with `--report` removed, source/scenario hashes, target profile,
+  plan hash/version, selected step surface, and PlanExecutor coverage surface.
+- `boon_report_schema` accepts missing identity for old reports, but rejects a
+  stale `source_replay_identity` when present.
+- `verify-native-gpu-all` now requires fresh source replay identity for
+  upstream `run-plan-scenario-events` dependencies and classifies missing/stale
+  identity as upstream refresh debt.
+
+Evidence:
+
+- `cargo test -p boon_runtime plan_executor_source_replay_report_carries_scoped_freshness_and_identity -- --nocapture`:
+  pass.
+- `cargo test -p boon_report_schema source_replay_identity_excludes_report_path_and_detects_stale_fields -- --nocapture`:
+  pass.
+- `cargo test -p xtask source_replay -- --nocapture`: pass.
+- Regenerated these three replay reports with stdout redirected to avoid
+  megabyte JSON dumps:
+  `target/reports/bytes-plan/todomvc-scenario-events-full.json`,
+  `target/reports/bytes-plan/cells-scenario-events-full.json`, and
+  `target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`.
+  All three pass `target/debug/xtask verify-report-schema`.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail, schema-valid. The aggregate now reports
+  `upstream_dependency_count=3`, `upstream_dependency_refresh_debt_count=0`,
+  `upstream_dependency_true_blocker_count=0`, and each native preview upstream
+  dependency is `worktree_fingerprint_scope=plan-executor-source-replay`,
+  `source_replay_identity_present=true`, and
+  `source_replay_identity_fresh=true`.
+
+Current interpretation:
+
+- BYTES-owned native preview source replay is no longer hidden refresh debt.
+  Unrelated plan/native report churn should not force replay reports to fall
+  back to full-worktree freshness.
+- The aggregate still fails with `refresh_debt_child_count=18`,
+  `identity_fast_refresh_child_count=18`, and `true_blocker_child_count=0`
+  because native child reports themselves need refresh after the current code
+  changes. That is remaining native report refresh debt, not upstream BYTES
+  ambiguity and not fresh Cells product evidence.
+- `boon_cli run --engine plan|compare --report ...` is now quiet by default;
+  use `--print-report` only when full stdout JSON is explicitly needed. This
+  removes one common source of megabyte report dumps during manual refreshes.
+
+## 2026-07-05 - Child-Reported Native Freshness Debt
+
+Status: fixed a native aggregate false true-blocker classification.
+
+What changed:
+
+- `verify-native-gpu-all` now inspects a failed child report's own `blockers[]`.
+  If all child blockers are freshness-only, such as a stale consumed preview E2E
+  report or stale framebuffer artifact, the aggregate classifies the child as
+  refresh debt instead of a fresh true blocker.
+- This is intentionally generic: it does not special-case Cells or physical
+  TodoMVC. It bridges report-local stale dependency evidence into aggregate
+  refresh taxonomy.
+
+Evidence:
+
+- `cargo test -p xtask native_gpu_aggregate_treats_child_reported_stale_dependency_as_refresh_debt -- --nocapture`:
+  pass.
+- Refreshed
+  `target/reports/native-gpu/todomvc-physical-reference-parity.json`; it still
+  fails because the consumed physical preview E2E report/framebuffer is stale.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail, schema-valid. Current compact classification:
+  `refresh_debt_child_count=18`, `identity_fast_refresh_child_count=17`,
+  `refresh_first_product_contract_child_count=1`,
+  `true_blocker_child_count=0`, with refresh reasons
+  `child-reported-freshness=1` and `identity-freshness-fast-path=17`.
+
+Current interpretation:
+
+- The previous `todomvc-physical-reference-parity` "true blocker" was not a
+  product bug; it was stale consumed preview evidence. The aggregate now says
+  that honestly.
+- Remaining work is to refresh the seven headed/performance/window reports and
+  the stale preview dependency before rerunning parity. Do not tune Cells until
+  those reports are fresh and any blocker survives as a true product failure.
+
+## 2026-07-05 - Native Report Dependency Edges And Queue Deduplication
+
+Status: implemented the next harness/control-plane cut for native report
+dependencies.
+
+What changed:
+
+- `docs/architecture/native_gpu_handoff_manifest.json` can now declare both
+  `consumes-source-replay-report` and `consumes-native-report` dependencies.
+- The manifest now models
+  `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical` as a
+  native-report dependency owned by `verify-native-gpu-all`.
+- `verify-native-gpu-all` emits dependency kind, owner aggregate, owner report
+  path, and refresh argv from the manifest instead of assuming every upstream
+  dependency is BYTES-owned source replay.
+- `run-report-refresh-queue` expands label-filtered selections through
+  `report_dependency_graph.edges` recursively and deduplicates duplicate stale
+  refresh labels, preferring dependency-phase entries over aggregate-child
+  duplicates.
+
+Evidence:
+
+- `cargo test -p xtask refresh_queue_selection_expands_report_dependency_graph_edges -- --nocapture`:
+  pass.
+- `cargo test -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.
+- `cargo test -p boon_report_schema native_gpu_all_schema -- --nocapture`:
+  pass.
+- `cargo test -p boon_report_schema refresh_queue_schema -- --nocapture`:
+  pass.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all-dependency-smoke.json`:
+  expected fail, schema-valid. The report includes the
+  `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical`
+  `consumes-native-report` edge and classifies the preview dependency as
+  refresh debt, not a true blocker.
+- `target/debug/xtask run-report-refresh-queue target/reports/native-gpu-all-dependency-smoke.json --dry-run --label todomvc-physical-reference-parity --output-byte-limit 512 --report target/reports/report-refresh-queue-parity-dependency-dry-run.json`:
+  pass and schema-valid. It selects exactly three unique reports in dependency
+  order: `todo-mvc-physical-native-preview-source-replay`,
+  `preview-e2e-todo_mvc_physical`, and `todomvc-physical-reference-parity`.
+
+Current interpretation:
+
+- Physical parity refreshes no longer need manual knowledge of its consumed
+  preview E2E evidence. The aggregate and queue can express the prerequisite
+  chain directly.
+- Remaining work is not another small refresh-queue polish pass. The next
+  architectural chunk should delete or quarantine legacy/default fallbacks and
+  obsolete verifier paths, then move product rendering toward the typed
+  ProductFrameGraph/ProofLane boundary.

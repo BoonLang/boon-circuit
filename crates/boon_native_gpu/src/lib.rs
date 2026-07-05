@@ -132,6 +132,14 @@ pub struct RendererRenderGraphResourceMetric {
     pub consumer_pass_ids: Vec<String>,
     pub product_visible: bool,
     pub proof_or_readback: bool,
+    #[serde(default)]
+    pub retained_epoch: u64,
+    #[serde(default)]
+    pub retained_dirty: bool,
+    #[serde(default)]
+    pub retained_reused: bool,
+    #[serde(default)]
+    pub last_used_frame_seq: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -159,6 +167,14 @@ pub struct FrameMetrics {
     pub renderer_render_graph_product_resource_count: u32,
     #[serde(default)]
     pub renderer_render_graph_resource_lifetime_hash: String,
+    #[serde(default)]
+    pub renderer_render_graph_retained_resource_epoch_hash: String,
+    #[serde(default)]
+    pub renderer_render_graph_retained_dirty_resource_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_retained_reused_resource_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_retained_state_resource_count: u32,
     #[serde(default)]
     pub renderer_render_graph_passes: Vec<RendererRenderGraphPassMetric>,
     #[serde(default)]
@@ -635,6 +651,10 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 renderer_render_graph_resource_count: 0,
                 renderer_render_graph_product_resource_count: 0,
                 renderer_render_graph_resource_lifetime_hash: String::new(),
+                renderer_render_graph_retained_resource_epoch_hash: String::new(),
+                renderer_render_graph_retained_dirty_resource_count: 0,
+                renderer_render_graph_retained_reused_resource_count: 0,
+                renderer_render_graph_retained_state_resource_count: 0,
                 renderer_render_graph_passes: Vec::new(),
                 renderer_render_graph_resources: Vec::new(),
                 document_scene_convert_ms: 0.0,
@@ -1912,6 +1932,7 @@ pub struct VisibleLayoutRenderer {
     quad_upload_ring: QuadUploadRing,
     prepared_quads: BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
     previous_chunk_ids: BTreeSet<String>,
+    product_frame_graph: ProductFrameGraphState,
 }
 
 impl VisibleLayoutRenderer {
@@ -1963,6 +1984,7 @@ impl VisibleLayoutRenderer {
             quad_upload_ring: QuadUploadRing::default(),
             prepared_quads: BTreeMap::new(),
             previous_chunk_ids: BTreeSet::new(),
+            product_frame_graph: ProductFrameGraphState::default(),
         }
     }
 
@@ -1981,6 +2003,7 @@ impl VisibleLayoutRenderer {
             Some(&mut self.quad_upload_ring),
             Some(&mut self.prepared_quads),
             Some(&mut self.previous_chunk_ids),
+            Some(&mut self.product_frame_graph),
             self.frame_seq,
         )
     }
@@ -2000,6 +2023,7 @@ impl VisibleLayoutRenderer {
             Some(&mut self.quad_upload_ring),
             Some(&mut self.prepared_quads),
             Some(&mut self.previous_chunk_ids),
+            Some(&mut self.product_frame_graph),
             self.frame_seq,
         )
     }
@@ -2019,6 +2043,7 @@ impl VisibleLayoutRenderer {
             Some(&mut self.quad_upload_ring),
             Some(&mut self.prepared_quads),
             Some(&mut self.previous_chunk_ids),
+            Some(&mut self.product_frame_graph),
             self.frame_seq,
         )
     }
@@ -2095,6 +2120,7 @@ fn encode_layout_to_surface_with_pipeline(
     quad_upload_ring: Option<&mut QuadUploadRing>,
     prepared_quads: Option<&mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>>,
     previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    product_frame_graph: Option<&mut ProductFrameGraphState>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
@@ -2124,6 +2150,7 @@ fn encode_layout_to_surface_with_pipeline(
         quad_upload_ring,
         prepared_quads,
         previous_chunk_ids,
+        product_frame_graph,
         None,
         frame_seq,
     )?;
@@ -2145,6 +2172,7 @@ fn encode_render_scene_to_surface_with_pipeline(
     quad_upload_ring: Option<&mut QuadUploadRing>,
     prepared_quads: Option<&mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>>,
     previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    product_frame_graph: Option<&mut ProductFrameGraphState>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
@@ -2190,6 +2218,7 @@ fn encode_render_scene_to_surface_with_pipeline(
         quad_upload_ring,
         prepared_quads,
         previous_chunk_ids,
+        product_frame_graph,
         render_scene_supplied_cache_key(request.scene_identity, None, width, height),
         frame_seq,
     )?;
@@ -2210,6 +2239,7 @@ fn encode_render_scene_patch_to_surface_with_pipeline(
     quad_upload_ring: Option<&mut QuadUploadRing>,
     prepared_quads: Option<&mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>>,
     previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    product_frame_graph: Option<&mut ProductFrameGraphState>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
@@ -2271,6 +2301,7 @@ fn encode_render_scene_patch_to_surface_with_pipeline(
         quad_upload_ring,
         prepared_quads,
         previous_chunk_ids,
+        product_frame_graph,
         render_scene_supplied_cache_key(
             request.scene_identity,
             request.patch_identity,
@@ -2303,74 +2334,246 @@ struct RendererRenderGraphPassStats {
     draw_call_count: u32,
 }
 
-#[derive(Debug, Default)]
-struct RendererRenderGraphExecutor {
-    passes: Vec<RendererRenderGraphPassMetric>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum ProductFrameGraphResourceId {
+    RenderScene,
+    RenderSceneItems,
+    SceneCacheKey,
+    RetainedGpuBuffers,
+    ColorTarget,
+    FrameMetrics,
+    TextRuns,
+    NoTextRuns,
 }
 
-impl RendererRenderGraphExecutor {
-    fn run_product_pass<T>(
-        &mut self,
-        pass_id: &'static str,
-        pass_kind: &'static str,
-        input: &'static str,
-        output: &'static str,
-        run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
-    ) -> Result<(T, f64), RenderError> {
-        let started = Instant::now();
-        let (value, stats) = run()?;
-        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.passes.push(RendererRenderGraphPassMetric {
+impl ProductFrameGraphResourceId {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RenderScene => "RenderScene",
+            Self::RenderSceneItems => "RenderSceneItems",
+            Self::SceneCacheKey => "SceneCacheKey",
+            Self::RetainedGpuBuffers => "RetainedGpuBuffers",
+            Self::ColorTarget => "ColorTarget",
+            Self::FrameMetrics => "FrameMetrics",
+            Self::TextRuns => "TextRuns",
+            Self::NoTextRuns => "NoTextRuns",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum ProductFrameGraphPassId {
+    SceneKey,
+    QuadPrepareUpload,
+    UiDraw,
+    RetainedMetrics,
+    TextDraw,
+}
+
+impl ProductFrameGraphPassId {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SceneKey => "renderer-scene-key",
+            Self::QuadPrepareUpload => "renderer-quad-prepare-upload",
+            Self::UiDraw => "renderer-ui-draw",
+            Self::RetainedMetrics => "renderer-retained-metrics",
+            Self::TextDraw => "renderer-text-draw",
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::SceneKey => "scene_identity",
+            Self::QuadPrepareUpload => "retained_quad_prepare_and_dirty_upload",
+            Self::UiDraw => "ui_draw_pass",
+            Self::RetainedMetrics => "retained_metrics",
+            Self::TextDraw => "text_draw_pass",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProductFrameGraphPass {
+    pass_id: ProductFrameGraphPassId,
+    input: ProductFrameGraphResourceId,
+    output: ProductFrameGraphResourceId,
+    product_visible: bool,
+    proof_or_readback: bool,
+}
+
+impl ProductFrameGraphPass {
+    fn metric(
+        &self,
+        duration_ms: f64,
+        stats: RendererRenderGraphPassStats,
+    ) -> RendererRenderGraphPassMetric {
+        RendererRenderGraphPassMetric {
             schema_version: 1,
-            pass_id: pass_id.to_owned(),
-            pass_kind: pass_kind.to_owned(),
-            input: input.to_owned(),
-            output: output.to_owned(),
-            read_resources: vec![input.to_owned()],
-            write_resources: vec![output.to_owned()],
-            product_visible: true,
-            proof_or_readback: false,
+            pass_id: self.pass_id.label().to_owned(),
+            pass_kind: self.pass_id.kind().to_owned(),
+            input: self.input.label().to_owned(),
+            output: self.output.label().to_owned(),
+            read_resources: vec![self.input.label().to_owned()],
+            write_resources: vec![self.output.label().to_owned()],
+            product_visible: self.product_visible,
+            proof_or_readback: self.proof_or_readback,
             duration_ms,
             upload_bytes: stats.upload_bytes,
             dirty_chunk_count: stats.dirty_chunk_count,
             queue_write_count: stats.queue_write_count,
             draw_call_count: stats.draw_call_count,
-        });
-        Ok((value, duration_ms))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductFrameGraph {
+    passes: Vec<ProductFrameGraphPass>,
+}
+
+#[derive(Debug, Default)]
+struct ProductFrameGraphExecutor {
+    graph: ProductFrameGraph,
+    executed_passes: Vec<RendererRenderGraphPassMetric>,
+}
+
+impl ProductFrameGraphExecutor {
+    fn run_product_pass<T>(
+        &mut self,
+        pass_id: ProductFrameGraphPassId,
+        input: ProductFrameGraphResourceId,
+        output: ProductFrameGraphResourceId,
+        run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
+    ) -> Result<(T, f64), RenderError> {
+        self.run_pass(pass_id, input, output, true, false, run)
     }
 
     fn run_metrics_pass<T>(
         &mut self,
-        pass_id: &'static str,
-        pass_kind: &'static str,
-        input: &'static str,
-        output: &'static str,
+        pass_id: ProductFrameGraphPassId,
+        input: ProductFrameGraphResourceId,
+        output: ProductFrameGraphResourceId,
         run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
     ) -> Result<(T, f64), RenderError> {
+        self.run_pass(pass_id, input, output, false, false, run)
+    }
+
+    fn run_pass<T>(
+        &mut self,
+        pass_id: ProductFrameGraphPassId,
+        input: ProductFrameGraphResourceId,
+        output: ProductFrameGraphResourceId,
+        product_visible: bool,
+        proof_or_readback: bool,
+        run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
+    ) -> Result<(T, f64), RenderError> {
+        let graph_pass = ProductFrameGraphPass {
+            pass_id,
+            input,
+            output,
+            product_visible,
+            proof_or_readback,
+        };
         let started = Instant::now();
         let (value, stats) = run()?;
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.passes.push(RendererRenderGraphPassMetric {
-            schema_version: 1,
-            pass_id: pass_id.to_owned(),
-            pass_kind: pass_kind.to_owned(),
-            input: input.to_owned(),
-            output: output.to_owned(),
-            read_resources: vec![input.to_owned()],
-            write_resources: vec![output.to_owned()],
-            product_visible: false,
-            proof_or_readback: false,
-            duration_ms,
-            upload_bytes: stats.upload_bytes,
-            dirty_chunk_count: stats.dirty_chunk_count,
-            queue_write_count: stats.queue_write_count,
-            draw_call_count: stats.draw_call_count,
-        });
+        self.executed_passes
+            .push(graph_pass.metric(duration_ms, stats));
+        self.graph.passes.push(graph_pass);
         Ok((value, duration_ms))
     }
 
     fn into_passes(self) -> Vec<RendererRenderGraphPassMetric> {
-        self.passes
+        self.executed_passes
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductFrameGraphResourceState {
+    epoch: u64,
+    last_signature: String,
+    last_used_frame_seq: u64,
+    dirty: bool,
+    reused: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductFrameGraphState {
+    resources: BTreeMap<String, ProductFrameGraphResourceState>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductFrameGraphStateMetrics {
+    resource_count: u32,
+    dirty_resource_count: u32,
+    reused_resource_count: u32,
+    resource_epoch_hash: String,
+}
+
+impl ProductFrameGraphState {
+    fn update_resources(
+        &mut self,
+        frame_seq: u64,
+        resources: &mut [RendererRenderGraphResourceMetric],
+        signatures: &BTreeMap<String, String>,
+    ) -> ProductFrameGraphStateMetrics {
+        let mut seen = BTreeSet::new();
+        for resource in resources.iter_mut() {
+            seen.insert(resource.resource_id.clone());
+            let signature = signatures
+                .get(&resource.resource_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        resource.resource_id,
+                        resource.first_pass_index,
+                        resource.last_pass_index,
+                        u8::from(resource.product_visible)
+                    )
+                });
+            let entry = self
+                .resources
+                .entry(resource.resource_id.clone())
+                .or_default();
+            let changed = entry.last_used_frame_seq == 0 || entry.last_signature != signature;
+            if changed {
+                entry.epoch = entry.epoch.saturating_add(1);
+                entry.last_signature = signature;
+            }
+            entry.last_used_frame_seq = frame_seq;
+            entry.dirty = changed;
+            entry.reused = !changed;
+
+            resource.retained_epoch = entry.epoch;
+            resource.retained_dirty = entry.dirty;
+            resource.retained_reused = entry.reused;
+            resource.last_used_frame_seq = entry.last_used_frame_seq;
+        }
+        self.resources
+            .retain(|resource_id, _| seen.contains(resource_id));
+        self.metrics()
+    }
+
+    fn metrics(&self) -> ProductFrameGraphStateMetrics {
+        let mut dirty_resource_count = 0_u32;
+        let mut reused_resource_count = 0_u32;
+        let mut hasher = Sha256::new();
+        for (resource_id, state) in &self.resources {
+            dirty_resource_count = dirty_resource_count.saturating_add(u32::from(state.dirty));
+            reused_resource_count = reused_resource_count.saturating_add(u32::from(state.reused));
+            hasher.update(resource_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(state.epoch.to_le_bytes());
+            hasher.update(state.last_used_frame_seq.to_le_bytes());
+            hasher.update([u8::from(state.dirty), u8::from(state.reused)]);
+        }
+        ProductFrameGraphStateMetrics {
+            resource_count: self.resources.len() as u32,
+            dirty_resource_count,
+            reused_resource_count,
+            resource_epoch_hash: format!("{:x}", hasher.finalize()),
+        }
     }
 }
 
@@ -2385,18 +2588,18 @@ fn encode_internal_scene_to_surface(
     mut quad_upload_ring: Option<&mut QuadUploadRing>,
     mut prepared_quads: Option<&mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>>,
     mut previous_chunk_ids: Option<&mut BTreeSet<String>>,
+    product_frame_graph: Option<&mut ProductFrameGraphState>,
     scene_key_override: Option<u64>,
     frame_seq: u64,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width;
     let height = request.height;
     let text_runs_shaped = scene.text_runs.len() as u32;
-    let mut render_graph = RendererRenderGraphExecutor::default();
+    let mut render_graph = ProductFrameGraphExecutor::default();
     let (scene_key, scene_key_ms) = render_graph.run_product_pass(
-        "renderer-scene-key",
-        "scene_identity",
-        "RenderScene",
-        "SceneCacheKey",
+        ProductFrameGraphPassId::SceneKey,
+        ProductFrameGraphResourceId::RenderScene,
+        ProductFrameGraphResourceId::SceneCacheKey,
         || {
             Ok((
                 scene_key_override.unwrap_or_else(|| render_scene_cache_key(scene)),
@@ -2431,10 +2634,9 @@ fn encode_internal_scene_to_surface(
     let mut quad_cache_hit = false;
     let ((gpu_batches, rect_metrics, asset_metrics), _quad_prepare_upload_ms) = render_graph
         .run_product_pass(
-            "renderer-quad-prepare-upload",
-            "retained_quad_prepare_and_dirty_upload",
-            "RenderSceneItems",
-            "RetainedGpuBuffers",
+            ProductFrameGraphPassId::QuadPrepareUpload,
+            ProductFrameGraphResourceId::RenderSceneItems,
+            ProductFrameGraphResourceId::RetainedGpuBuffers,
             || {
                 let prepared_key = PreparedQuadCacheKey {
                     scene_key,
@@ -2662,10 +2864,9 @@ fn encode_internal_scene_to_surface(
     let draw_ranges = coalesced_gpu_quad_draw_ranges(&gpu_batches);
     let draw_range_count = draw_ranges.len() as u32;
     let ((), draw_pass_ms) = render_graph.run_product_pass(
-        "renderer-ui-draw",
-        "ui_draw_pass",
-        "RetainedGpuBuffers",
-        "ColorTarget",
+        ProductFrameGraphPassId::UiDraw,
+        ProductFrameGraphResourceId::RetainedGpuBuffers,
+        ProductFrameGraphResourceId::ColorTarget,
         || {
             let mut pass = request
                 .encoder
@@ -2714,10 +2915,9 @@ fn encode_internal_scene_to_surface(
         },
     )?;
     let (retained_chunk_metrics, retained_metrics_ms) = render_graph.run_metrics_pass(
-        "renderer-retained-metrics",
-        "retained_metrics",
-        "RenderScene",
-        "FrameMetrics",
+        ProductFrameGraphPassId::RetainedMetrics,
+        ProductFrameGraphResourceId::RenderScene,
+        ProductFrameGraphResourceId::FrameMetrics,
         || {
             let metrics = sampled_retained_render_chunks(
                 scene,
@@ -2748,14 +2948,13 @@ fn encode_internal_scene_to_surface(
     let dirty_upload_chunk_count = dirty_upload_chunk_ids.len() as u32;
     let ((rendered_text_runs, text_cache_metrics), text_render_ms) = render_graph
         .run_product_pass(
-            "renderer-text-draw",
-            "text_draw_pass",
+            ProductFrameGraphPassId::TextDraw,
             if scene.text_runs.is_empty() {
-                "NoTextRuns"
+                ProductFrameGraphResourceId::NoTextRuns
             } else {
-                "TextRuns"
+                ProductFrameGraphResourceId::TextRuns
             },
-            "ColorTarget",
+            ProductFrameGraphResourceId::ColorTarget,
             || {
                 let result = match text.as_mut() {
                     Some(text) => {
@@ -2787,8 +2986,23 @@ fn encode_internal_scene_to_surface(
             },
         )?;
     let renderer_render_graph_passes = render_graph.into_passes();
-    let renderer_render_graph_resources =
+    let mut renderer_render_graph_resources =
         renderer_render_graph_resources_for_passes(&renderer_render_graph_passes);
+    let renderer_render_graph_resource_signatures = renderer_render_graph_resource_signatures(
+        scene_key,
+        frame_seq,
+        text_runs_shaped,
+        rendered_text_runs,
+        &dirty_upload_chunk_ids,
+    );
+    let mut fallback_product_frame_graph = ProductFrameGraphState::default();
+    let retained_state_metrics = product_frame_graph
+        .unwrap_or(&mut fallback_product_frame_graph)
+        .update_resources(
+            frame_seq,
+            &mut renderer_render_graph_resources,
+            &renderer_render_graph_resource_signatures,
+        );
     let renderer_render_graph_plan_hash =
         renderer_render_graph_plan_hash(&renderer_render_graph_passes);
     let renderer_render_graph_workload_hash =
@@ -2799,7 +3013,7 @@ fn encode_internal_scene_to_surface(
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
         renderer_render_graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
-        renderer_render_graph_execution_kind: "executor_wrapped_product_passes".to_owned(),
+        renderer_render_graph_execution_kind: "retained_product_frame_graph_linear_v1".to_owned(),
         renderer_render_graph_plan_hash,
         renderer_render_graph_workload_hash,
         renderer_render_graph_pass_count: renderer_render_graph_passes.len() as u32,
@@ -2817,6 +3031,13 @@ fn encode_internal_scene_to_surface(
             .filter(|resource| resource.product_visible)
             .count() as u32,
         renderer_render_graph_resource_lifetime_hash,
+        renderer_render_graph_retained_resource_epoch_hash: retained_state_metrics
+            .resource_epoch_hash,
+        renderer_render_graph_retained_dirty_resource_count: retained_state_metrics
+            .dirty_resource_count,
+        renderer_render_graph_retained_reused_resource_count: retained_state_metrics
+            .reused_resource_count,
+        renderer_render_graph_retained_state_resource_count: retained_state_metrics.resource_count,
         renderer_render_graph_passes,
         renderer_render_graph_resources,
         document_scene_convert_ms: 0.0,
@@ -2989,6 +3210,10 @@ fn renderer_render_graph_resources_for_passes(
             consumer_pass_ids: entry.consumer_pass_ids.into_iter().collect(),
             product_visible: entry.product_visible,
             proof_or_readback: entry.proof_or_readback,
+            retained_epoch: 0,
+            retained_dirty: false,
+            retained_reused: false,
+            last_used_frame_seq: 0,
         })
         .collect()
 }
@@ -3002,6 +3227,43 @@ fn renderer_render_graph_resource_kind(resource_id: &str) -> &'static str {
         "FrameMetrics" => "cpu_metrics",
         _ => "generic_resource",
     }
+}
+
+fn renderer_render_graph_resource_signatures(
+    scene_key: u64,
+    frame_seq: u64,
+    text_runs_shaped: u32,
+    rendered_text_runs: u32,
+    _dirty_upload_chunk_ids: &[String],
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("RenderScene".to_owned(), format!("scene:{scene_key}")),
+        (
+            "RenderSceneItems".to_owned(),
+            format!("scene-items:{scene_key}"),
+        ),
+        ("SceneCacheKey".to_owned(), format!("scene-key:{scene_key}")),
+        (
+            "RetainedGpuBuffers".to_owned(),
+            format!("gpu-buffers:{scene_key}"),
+        ),
+        (
+            "ColorTarget".to_owned(),
+            format!("color-target:{frame_seq}"),
+        ),
+        (
+            "FrameMetrics".to_owned(),
+            format!("frame-metrics:{frame_seq}"),
+        ),
+        (
+            "TextRuns".to_owned(),
+            format!("text-runs:{scene_key}:{text_runs_shaped}:{rendered_text_runs}"),
+        ),
+        (
+            "NoTextRuns".to_owned(),
+            format!("no-text-runs:{scene_key}:{text_runs_shaped}"),
+        ),
+    ])
 }
 
 fn renderer_render_graph_resource_lifetime_hash(
@@ -10390,6 +10652,133 @@ mod tests {
         assert_ne!(
             renderer_render_graph_workload_hash(&low_workload),
             renderer_render_graph_workload_hash(&high_workload)
+        );
+    }
+
+    #[test]
+    fn product_frame_graph_executor_emits_typed_pass_and_resource_metrics() {
+        let mut graph = ProductFrameGraphExecutor::default();
+        let (scene_key, _scene_key_ms) = graph
+            .run_product_pass(
+                ProductFrameGraphPassId::SceneKey,
+                ProductFrameGraphResourceId::RenderScene,
+                ProductFrameGraphResourceId::SceneCacheKey,
+                || {
+                    Ok((
+                        17_u64,
+                        RendererRenderGraphPassStats {
+                            queue_write_count: 0,
+                            ..RendererRenderGraphPassStats::default()
+                        },
+                    ))
+                },
+            )
+            .expect("scene-key graph pass should run");
+        assert_eq!(scene_key, 17);
+        let ((), _metrics_ms) = graph
+            .run_metrics_pass(
+                ProductFrameGraphPassId::RetainedMetrics,
+                ProductFrameGraphResourceId::RenderScene,
+                ProductFrameGraphResourceId::FrameMetrics,
+                || Ok(((), RendererRenderGraphPassStats::default())),
+            )
+            .expect("retained-metrics graph pass should run");
+
+        let passes = graph.into_passes();
+        assert_eq!(passes.len(), 2);
+        assert_eq!(passes[0].pass_id, "renderer-scene-key");
+        assert_eq!(passes[0].pass_kind, "scene_identity");
+        assert_eq!(passes[0].read_resources, vec!["RenderScene"]);
+        assert_eq!(passes[0].write_resources, vec!["SceneCacheKey"]);
+        assert!(passes[0].product_visible);
+        assert!(!passes[0].proof_or_readback);
+        assert_eq!(passes[1].pass_id, "renderer-retained-metrics");
+        assert_eq!(passes[1].pass_kind, "retained_metrics");
+        assert!(!passes[1].product_visible);
+        assert!(!passes[1].proof_or_readback);
+
+        let resources = renderer_render_graph_resources_for_passes(&passes);
+        assert!(resources.iter().any(|resource| {
+            resource.resource_id == "RenderScene" && resource.resource_kind == "cpu_scene"
+        }));
+        assert!(resources.iter().any(|resource| {
+            resource.resource_id == "SceneCacheKey" && resource.resource_kind == "cpu_identity"
+        }));
+        assert!(resources.iter().any(|resource| {
+            resource.resource_id == "FrameMetrics" && resource.resource_kind == "cpu_metrics"
+        }));
+    }
+
+    #[test]
+    fn product_frame_graph_state_tracks_dirty_and_reused_resource_epochs() {
+        let mut graph = ProductFrameGraphExecutor::default();
+        let ((), _scene_key_ms) = graph
+            .run_product_pass(
+                ProductFrameGraphPassId::SceneKey,
+                ProductFrameGraphResourceId::RenderScene,
+                ProductFrameGraphResourceId::SceneCacheKey,
+                || Ok(((), RendererRenderGraphPassStats::default())),
+            )
+            .expect("scene-key graph pass should run");
+        let passes = graph.into_passes();
+        let mut resources = renderer_render_graph_resources_for_passes(&passes);
+        let mut state = ProductFrameGraphState::default();
+        let first_signatures = BTreeMap::from([
+            ("RenderScene".to_owned(), "scene:1".to_owned()),
+            ("SceneCacheKey".to_owned(), "scene-key:1".to_owned()),
+        ]);
+
+        let first = state.update_resources(1, &mut resources, &first_signatures);
+        assert_eq!(first.resource_count, 2);
+        assert_eq!(first.dirty_resource_count, 2);
+        assert_eq!(first.reused_resource_count, 0);
+        assert!(first.resource_epoch_hash.len() == 64);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.retained_epoch == 1)
+        );
+        assert!(resources.iter().all(|resource| resource.retained_dirty));
+        assert!(resources.iter().all(|resource| !resource.retained_reused));
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.last_used_frame_seq == 1)
+        );
+
+        let mut second_resources = renderer_render_graph_resources_for_passes(&passes);
+        let second = state.update_resources(2, &mut second_resources, &first_signatures);
+        assert_eq!(second.resource_count, 2);
+        assert_eq!(second.dirty_resource_count, 0);
+        assert_eq!(second.reused_resource_count, 2);
+        assert!(
+            second_resources
+                .iter()
+                .all(|resource| resource.retained_epoch == 1)
+        );
+        assert!(
+            second_resources
+                .iter()
+                .all(|resource| !resource.retained_dirty)
+        );
+        assert!(
+            second_resources
+                .iter()
+                .all(|resource| resource.retained_reused)
+        );
+
+        let changed_signatures = BTreeMap::from([
+            ("RenderScene".to_owned(), "scene:2".to_owned()),
+            ("SceneCacheKey".to_owned(), "scene-key:2".to_owned()),
+        ]);
+        let mut third_resources = renderer_render_graph_resources_for_passes(&passes);
+        let third = state.update_resources(3, &mut third_resources, &changed_signatures);
+        assert_eq!(third.dirty_resource_count, 2);
+        assert_eq!(third.reused_resource_count, 0);
+        assert!(
+            third_resources
+                .iter()
+                .all(|resource| resource.retained_epoch == 2)
         );
     }
 

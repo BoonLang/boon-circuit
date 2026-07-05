@@ -3758,6 +3758,14 @@ pub struct NativeProductRenderGraphSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renderer_graph_resource_lifetime_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_graph_retained_resource_epoch_hash: Option<String>,
+    #[serde(default)]
+    pub renderer_graph_retained_state_resource_count: u32,
+    #[serde(default)]
+    pub renderer_graph_retained_dirty_resource_count: u32,
+    #[serde(default)]
+    pub renderer_graph_retained_reused_resource_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_scene_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_scene_identity: Option<String>,

@@ -1007,7 +1007,119 @@ must link every required native GPU report by path and sha256, and it is the
 native GPU acceptance aggregate for this architecture. Its required report list
 comes from the manifest, which is the single source of truth for handoff report
 labels, paths, commands, required arguments, inline JSON byte budgets, and JSON
-sidecar byte budgets.
+sidecar byte budgets. It also owns native handoff upstream report dependencies:
+if a native report consumes a BYTES/PlanExecutor source replay report, that edge
+must appear in `upstream_dependencies` in
+`docs/architecture/native_gpu_handoff_manifest.json` and in the aggregate
+`report_dependency_graph`.
+
+Some native gates consume non-native side reports, such as PlanExecutor source
+replay reports used by preview E2E proof. Those dependencies must be explicit
+in the aggregate's report dependency graph, must name their owning aggregate,
+and must contribute bounded `refresh_commands[].argv` entries when stale. A
+native product failure must not depend on an untracked side report; refresh
+upstream report dependencies first, rerun the aggregate, and only then debug
+fresh product-contract blockers.
+
+The aggregate control plane must classify stale identity before data-plane
+validation. If a child report was generated for a stale git commit, stale
+worktree fingerprint, stale scoped verifier identity, or stale legacy binary
+hash, the aggregate records refresh debt with the manifest-canonical command and
+skips schema, native-contract, semantic, and artifact validation for that child
+until it is regenerated. Fresh child reports still receive full validation.
+Stale children must not manufacture product-contract blockers. The aggregate
+must expose top-level `true_blocker_child_count` and `true_blocker_children`
+alongside refresh-debt fields so tooling can distinguish "rerun reports first"
+from "fix product or verifier code now" without inspecting large child reports.
+If a fresh child report fails only because its own `blockers[]` describe stale
+consumed evidence, such as a stale preview E2E report or stale framebuffer
+artifact, the aggregate must classify that child as refresh debt rather than a
+true product blocker. Fresh true blockers are reserved for failures that remain
+after the consumed evidence is current.
+
+Native reports carry both the legacy full `worktree_fingerprint` and scoped
+fingerprints in `worktree_fingerprints`. The handoff aggregate may use the
+`native-gpu-handoff` scoped fingerprint for native child freshness. The scoped
+fingerprint includes product/verifier inputs such as `crates/`, `examples/`,
+`budgets/native-gpu.toml`, `AGENTS.md`, Cargo metadata,
+`NATIVE_GPU_PIPELINE.md`, and the handoff manifest. It intentionally excludes
+progress ledgers and goal-prompt prose so plan-doc churn does not stale
+otherwise current product reports. Scoped fingerprint material must include the
+scoped committed `HEAD` tree/blob identity plus scoped dirty status and diff;
+status/diff-only scoped fingerprints are not sufficient freshness evidence
+after commits. Older reports without the scoped field fall back to the full
+worktree fingerprint.
+
+Native `xtask` reports also carry `verifier_identity`, a scoped verifier
+contract identity containing the identity kind, scheme version, command,
+measurement mode, contract version, canonical verifier arguments, and identity
+hash. When present, `verifier_identity` is authoritative for verifier freshness:
+a matching scoped identity may supersede a stale legacy `binary_hash`, while a
+mismatched scoped identity is refresh debt even if the legacy binary hash
+matches. Reports without `verifier_identity` fall back to the legacy
+`binary_hash` check. This keeps harmless aggregate/schema binary churn from
+forcing product verifier reruns without weakening stale-report detection for
+reports that have no scoped identity.
+
+PlanExecutor source replay reports consumed by native gates must distinguish
+execution from comparison. `plan_executor_status` and
+`accepted_for_product_status` describe whether the PlanExecutor replay is usable
+as product/source-replay evidence; `comparison_status` describes optional legacy
+oracle parity. The compatibility top-level `status` may remain stricter for
+older compare gates and must not be the only signal used to classify native
+product behavior. Native preview E2E must reject missing split status fields;
+old replay reports without `plan_executor_status=pass` and
+`accepted_for_product_status=pass` are refresh debt, not product proof.
+
+PlanExecutor source replay reports also carry source-replay freshness evidence
+separate from native verifier identity. `run-plan-scenario-events` reports keep
+the legacy full `worktree_fingerprint`, but also include
+`worktree_fingerprint_scope=plan-executor-source-replay`, scoped entries in
+`worktree_fingerprints`, and `source_replay_identity`. The scope is limited to
+Cargo metadata plus the compiler/runtime/PlanExecutor/CLI crates needed to
+produce source replay behavior; source and scenario contents remain checked by
+their own hashes and MachinePlan recomputation. `source_replay_identity` binds
+the command, measurement mode, canonical arguments with `--report` removed,
+source hash, scenario hash, target profile, plan hash/version, selected step
+surface, and PlanExecutor coverage surface. Native aggregates must treat missing
+or stale source replay identity as upstream refresh debt, not a native product
+blocker. The BYTES/MachinePlan owner aggregate applies the same rule to
+`run-plan-scenario-events` children: a child may use the
+`plan-executor-source-replay` scoped fingerprint and fresh
+`source_replay_identity` instead of exact full-worktree/git matching; missing or
+stale source-replay identity remains refresh debt.
+
+The preferred unattended refresh controller is `xtask
+run-report-refresh-queue ... --until-clean --max-runs N`. It executes selected
+aggregate-owned refresh commands, reruns the owning aggregate after each cycle,
+and stops only when the aggregate is clean, the selected labels are burned down,
+or a bounded stop reason such as `max-runs`, `refresh-command-failed`, or
+`post-aggregate-unavailable` is reported. `--closed-loop` is an alias for
+`--until-clean`; `--rerun-aggregate` remains a one-cycle aggregate rerun. Queue
+reports must include
+`closed_loop_requested`, `closed_loop_max_runs`, `closed_loop_stop_reason`,
+final refresh debt counts, selected-label counts, and per-cycle summaries.
+Dry-runs must be schema-valid and explicitly report `closed_loop_stop_reason =
+dry-run` plus a skipped post-refresh aggregate rerun. Bulky refresh controller
+arrays such as `results`, `closed_loop_cycles`, owner-rerun lists, and
+remaining-refresh-command lists may be emitted as JSON sidecars with SHA-256 and
+byte-length metadata; inline scalar counts remain canonical for quick
+classification.
+
+Refresh queues are dependency-aware. When a native refresh command depends on an
+upstream report declared by the handoff manifest, the queue must select and run
+the upstream refresh before the native consumer, mark the execution phase in
+`refresh_execution_plan`, and report whether an entry was selected directly by
+label or expanded from dependency edges. Upstream BYTES-owned replay refreshes
+must be followed by their owner aggregate rerun before native preview consumers
+are treated as meaningful product evidence. This keeps stale prerequisite
+reports from masquerading as Cells/native rendering failures.
+
+When selected refresh entries execute through `boon_cli`, the queue must run a
+single `cargo build -p boon_cli` preflight before executing non-dry replay
+commands and must report the result in `boon_cli_prebuild`. Dry-runs report the
+same preflight as `skipped-dry-run`. A failed prebuild fails only the selected
+`boon_cli` refresh entries instead of running a stale binary.
 
 The broader product/regression gates remain required before claiming the
 dev-editor/example-switch recovery complete, but they are not part of the

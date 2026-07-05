@@ -83,30 +83,72 @@
       "path": "target/reports/native-gpu/preview-e2e-todomvc.json",
       "command": "verify-native-gpu-preview-e2e",
       "required_argv": [
-        ["--example", "todomvc"]
+        ["--example", "todomvc"],
+        ["--profile", "release"],
+        ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
+      "max_sidecar_bytes": 0,
+      "upstream_dependencies": [
+        {
+          "kind": "consumes-source-replay-report",
+          "label": "todomvc-native-preview-source-replay",
+          "path": "target/reports/bytes-plan/todomvc-scenario-events-full.json",
+          "command": "run-plan-scenario-events",
+          "required_argv": [],
+          "measurement_mode": "proof",
+          "owner_aggregate": "verify-bytes-machine-plan-all",
+          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+        }
+      ]
     },
     {
       "label": "preview-e2e-cells",
       "path": "target/reports/native-gpu/preview-e2e-cells.json",
       "command": "verify-native-gpu-preview-e2e",
       "required_argv": [
-        ["--example", "cells"]
+        ["--example", "cells"],
+        ["--profile", "release"],
+        ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
+      "max_sidecar_bytes": 0,
+      "upstream_dependencies": [
+        {
+          "kind": "consumes-source-replay-report",
+          "label": "cells-native-preview-source-replay",
+          "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
+          "command": "run-plan-scenario-events",
+          "required_argv": [],
+          "measurement_mode": "proof",
+          "owner_aggregate": "verify-bytes-machine-plan-all",
+          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+        }
+      ]
     },
     {
       "label": "preview-e2e-todo_mvc_physical",
       "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
       "command": "verify-native-gpu-preview-e2e",
       "required_argv": [
-        ["--example", "todo_mvc_physical"]
+        ["--example", "todo_mvc_physical"],
+        ["--profile", "release"],
+        ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
+      "max_sidecar_bytes": 0,
+      "upstream_dependencies": [
+        {
+          "kind": "consumes-source-replay-report",
+          "label": "todo-mvc-physical-native-preview-source-replay",
+          "path": "target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json",
+          "command": "run-plan-scenario-events",
+          "required_argv": [],
+          "measurement_mode": "proof",
+          "owner_aggregate": "verify-bytes-machine-plan-all",
+          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+        }
+      ]
     },
     {
       "label": "todomvc-physical-reference-parity",
@@ -114,7 +156,23 @@
       "command": "verify-native-todomvc-physical-reference-parity",
       "required_argv": [],
       "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
+      "max_sidecar_bytes": 0,
+      "upstream_dependencies": [
+        {
+          "kind": "consumes-native-report",
+          "label": "preview-e2e-todo_mvc_physical",
+          "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
+          "command": "verify-native-gpu-preview-e2e",
+          "required_argv": [
+            ["--example", "todo_mvc_physical"],
+            ["--profile", "release"],
+            ["--require-hardware-adapter", ""]
+          ],
+          "measurement_mode": "proof",
+          "owner_aggregate": "verify-native-gpu-all",
+          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
+        }
+      ]
     },
     {
       "label": "scroll-speed-cells",

@@ -37952,8 +37952,8 @@ struct PreviewRetainedBoundSyncStats {
     status: &'static str,
     reason: Option<String>,
     selection_overlay_source: Option<&'static str>,
-    legacy_selection_fallback_count: usize,
-    legacy_selection_fallback_reason: Option<String>,
+    address_selection_fallback_count: usize,
+    address_selection_fallback_reason: Option<String>,
     target_node_count: usize,
     item_index_count: usize,
     source_intent_update_count: usize,
@@ -38024,12 +38024,12 @@ fn merge_preview_retained_bound_sync_stats(
     existing.selection_overlay_source = next
         .selection_overlay_source
         .or(existing.selection_overlay_source);
-    existing.legacy_selection_fallback_count = existing
-        .legacy_selection_fallback_count
-        .saturating_add(next.legacy_selection_fallback_count);
-    existing.legacy_selection_fallback_reason = next
-        .legacy_selection_fallback_reason
-        .or_else(|| existing.legacy_selection_fallback_reason.take());
+    existing.address_selection_fallback_count = existing
+        .address_selection_fallback_count
+        .saturating_add(next.address_selection_fallback_count);
+    existing.address_selection_fallback_reason = next
+        .address_selection_fallback_reason
+        .or_else(|| existing.address_selection_fallback_reason.take());
     existing.target_node_count = existing.target_node_count.max(next.target_node_count);
     existing.item_index_count = existing.item_index_count.max(next.item_index_count);
     existing.source_intent_update_count = existing
@@ -38125,8 +38125,8 @@ fn preview_retained_bound_sync_stats_json_for(
             "status": stats.status,
             "reason": stats.reason,
             "selection_overlay_source": stats.selection_overlay_source,
-            "legacy_selection_fallback_count": stats.legacy_selection_fallback_count,
-            "legacy_selection_fallback_reason": stats.legacy_selection_fallback_reason,
+            "address_selection_fallback_count": stats.address_selection_fallback_count,
+            "address_selection_fallback_reason": stats.address_selection_fallback_reason,
             "target_node_count": stats.target_node_count,
             "item_index_count": stats.item_index_count,
             "source_intent_update_count": stats.source_intent_update_count,
@@ -42423,13 +42423,13 @@ fn preview_try_apply_simple_source_click_input(
     let has_generic_selection_patch = retained_selection_patch
         .as_ref()
         .is_some_and(|patch| !patch.previous_nodes.is_empty() || !patch.current_nodes.is_empty());
-    let legacy_previous_selected_address = if has_generic_selection_patch {
+    let address_index_previous_selected_address = if has_generic_selection_patch {
         None
     } else {
         input_state.selected_overlay_address.clone()
     };
     if !has_generic_selection_patch
-        && let Some(previous_selected_address) = legacy_previous_selected_address.as_deref()
+        && let Some(previous_selected_address) = address_index_previous_selected_address.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
         let nodes = source_intent_value_index_nodes_for_value(
@@ -42442,13 +42442,13 @@ fn preview_try_apply_simple_source_click_input(
             bound_sync_nodes.extend(nodes);
         }
     }
-    let legacy_selected_address_for_style_patch = if has_generic_selection_patch {
+    let address_index_selected_address_for_style_patch = if has_generic_selection_patch {
         None
     } else {
         input_state.focused_address.clone()
     };
     if !has_generic_selection_patch
-        && let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref()
+        && let Some(selected_address) = address_index_selected_address_for_style_patch.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
         let nodes = source_intent_value_index_nodes_for_value(
@@ -42547,14 +42547,15 @@ fn preview_try_apply_simple_source_click_input(
                 &previous_selected_nodes,
             )?;
         }
-    } else if let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref() {
+    } else if let Some(selected_address) = address_index_selected_address_for_style_patch.as_deref()
+    {
         if !preview_retained_bound_sync_already_changed_style_for_nodes(
             &selected_overlay_sync_nodes,
         ) {
             preview_patch_retained_selected_row_lookup_overlay(
                 shared_render_state,
                 selected_address,
-                legacy_previous_selected_address.as_deref(),
+                address_index_previous_selected_address.as_deref(),
                 &previous_selected_nodes,
             )?;
         }
@@ -42568,7 +42569,9 @@ fn preview_try_apply_simple_source_click_input(
     }
     let selected_overlay_patch_ms = elapsed_ms(selected_overlay_patch_started);
     let selection_focus_overlay_state_started = Instant::now();
-    if legacy_selected_address_for_style_patch.is_some() || retained_selection_patch.is_some() {
+    if address_index_selected_address_for_style_patch.is_some()
+        || retained_selection_patch.is_some()
+    {
         let mut next_focus_overlay = PreviewFocusOverlayState::from_input_state_preserving_previous(
             input_state,
             input_state.focus_render_overlay.caret_visible,
@@ -42587,8 +42590,9 @@ fn preview_try_apply_simple_source_click_input(
         {
             next_focus_overlay.previous_selected_nodes = previous_selected_nodes.clone();
         }
-        if let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref()
-            && let Some(previous_selected_address) = legacy_previous_selected_address.as_ref()
+        if let Some(selected_address) = address_index_selected_address_for_style_patch.as_deref()
+            && let Some(previous_selected_address) =
+                address_index_previous_selected_address.as_ref()
             && previous_selected_address != selected_address
         {
             next_focus_overlay.previous_selected_address = Some(previous_selected_address.clone());
@@ -45273,8 +45277,8 @@ fn preview_patch_retained_selected_nodes_overlay(
         status: "pass",
         reason: None,
         selection_overlay_source: Some("generic-selected-node-set"),
-        legacy_selection_fallback_count: 0,
-        legacy_selection_fallback_reason: None,
+        address_selection_fallback_count: 0,
+        address_selection_fallback_reason: None,
         target_node_count: target_nodes.len(),
         item_index_count: target_nodes.len(),
         source_intent_update_count: 0,
@@ -45406,8 +45410,8 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         status: "pass",
         reason: None,
         selection_overlay_source: Some("indexed-row-lookup-overlay"),
-        legacy_selection_fallback_count: 0,
-        legacy_selection_fallback_reason: None,
+        address_selection_fallback_count: 0,
+        address_selection_fallback_reason: None,
         target_node_count: target_nodes.len(),
         item_index_count: target_nodes.len(),
         source_intent_update_count: 0,
@@ -67585,7 +67589,7 @@ mod tests {
                 vec!["store.formula_bar.text".to_owned()]
             )]
         );
-        assert_eq!(stats.legacy_selection_fallback_count, 0);
+        assert_eq!(stats.address_selection_fallback_count, 0);
     }
 
     #[test]
@@ -67993,7 +67997,7 @@ mod tests {
         assert_eq!(stats.source_intent_update_count, 1);
         assert_eq!(stats.source_intent_index_update_count, 1);
         assert_eq!(stats.text_update_count, 1);
-        assert_eq!(stats.legacy_selection_fallback_count, 0);
+        assert_eq!(stats.address_selection_fallback_count, 0);
     }
 
     fn test_display_bounds(layout: &boon_document::LayoutFrame, node: &str) -> boon_document::Rect {
@@ -68842,8 +68846,8 @@ mod tests {
             stats.selection_overlay_source,
             Some("generic-selected-node-set")
         );
-        assert_eq!(stats.legacy_selection_fallback_count, 0);
-        assert_eq!(stats.legacy_selection_fallback_reason, None);
+        assert_eq!(stats.address_selection_fallback_count, 0);
+        assert_eq!(stats.address_selection_fallback_reason, None);
         assert_eq!(stats.style_update_count, 2);
         assert_eq!(stats.text_update_count, 0);
     }
@@ -68913,8 +68917,8 @@ mod tests {
             stats.selection_overlay_source,
             Some("indexed-row-lookup-overlay")
         );
-        assert_eq!(stats.legacy_selection_fallback_count, 0);
-        assert_eq!(stats.legacy_selection_fallback_reason, None);
+        assert_eq!(stats.address_selection_fallback_count, 0);
+        assert_eq!(stats.address_selection_fallback_reason, None);
         assert_eq!(stats.style_update_count, 2);
     }
 

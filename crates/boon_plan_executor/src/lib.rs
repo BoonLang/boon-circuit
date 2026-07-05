@@ -9407,11 +9407,10 @@ fn root_update_json_value_for_ref(
                 .ok_or_else(|| format!("missing update constant {}", constant_id.0))?;
             plan_constant_json_value(constant).map(Some)
         }
-        ValueRef::Field(field_id) => Err(format!(
-            "root update branch {} {context} cannot use derived field ref {} as a root value",
-            op_id.0, field_id.0
-        )
-        .into()),
+        ValueRef::Field(field_id) => {
+            let input_label = derived_field_label(plan, field_id.0);
+            Ok(root_state.get(&input_label).cloned())
+        }
         ValueRef::Source(source_id) => Err(format!(
             "root update branch {} {context} cannot use source ref {} as a value",
             op_id.0, source_id.0
@@ -13804,7 +13803,6 @@ fn source_payload_value_for_slot(
         }
         SourcePayloadField::Address
         | SourcePayloadField::Key
-        | SourcePayloadField::Named(_)
         | SourcePayloadField::Text => {
             if slot.value_type != PlanValueType::Text {
                 return Err(format!(
@@ -13815,6 +13813,46 @@ fn source_payload_value_for_slot(
             }
             source_payload_json_value(event, field)
         }
+        SourcePayloadField::Named(name) if name == "press" => match slot.value_type {
+            PlanValueType::Bool => source_payload_bool_value(event, field),
+            PlanValueType::Text => source_payload_json_value(event, field),
+            _ => Err(format!(
+                "root source-payload update branch {} reads press payload but output state {} is neither BOOL nor TEXT",
+                op_id.0, slot.state_id.0
+            )
+            .into()),
+        },
+        SourcePayloadField::Named(_) => {
+            if slot.value_type != PlanValueType::Text {
+                return Err(format!(
+                    "root source-payload update branch {} reads text payload but output state {} is not TEXT",
+                    op_id.0, slot.state_id.0
+                )
+                .into());
+            }
+            source_payload_json_value(event, field)
+        }
+    }
+}
+
+fn source_payload_bool_value(
+    event: &RootJsonSourceEvent,
+    field: &SourcePayloadField,
+) -> PlanExecutorResult<JsonValue> {
+    let SourcePayloadField::Named(name) = field else {
+        return Err("bool source payloads must be named fields".into());
+    };
+    let Some(value) = event.payload.get(name) else {
+        return Ok(JsonValue::Bool(true));
+    };
+    match value.as_str() {
+        "true" | "True" | "1" | "yes" | "Yes" | "on" | "On" | "press" | "pressed" => {
+            Ok(JsonValue::Bool(true))
+        }
+        "false" | "False" | "0" | "no" | "No" | "off" | "Off" => Ok(JsonValue::Bool(false)),
+        _ => Err(
+            format!("source event bool payload `{name}` has unsupported value `{value}`").into(),
+        ),
     }
 }
 
@@ -18028,6 +18066,34 @@ mod tests {
         assert!(skipped.supported);
         assert!(skipped.skipped_by_guard);
         assert_eq!(skipped.value, None);
+
+        let field_id = FieldId(9);
+        let mut field_update_op = update_op.clone();
+        if let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &mut field_update_op.kind {
+            ordered_inputs[0] = ValueRef::Field(field_id);
+        }
+        field_update_op.inputs = vec![ValueRef::Source(source_id), ValueRef::Field(field_id)];
+        let mut field_plan = plan.clone();
+        field_plan.regions[0].ops = vec![field_update_op.clone()];
+        field_plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
+            id: "field:9".to_owned(),
+            label: "store.selected_mode".to_owned(),
+        }];
+        let field_root_state = JsonMap::from_iter([
+            ("store.mode".to_owned(), json!("System")),
+            ("store.selected_mode".to_owned(), json!("Light")),
+        ]);
+        let field_evaluation = evaluate_root_json_update_branch(
+            &field_plan,
+            &field_update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &field_root_state,
+        )
+        .expect("root MatchConst should read root derived fields");
+        assert!(field_evaluation.supported);
+        assert_eq!(field_evaluation.value, Some(json!("Dark")));
     }
 
     #[test]
@@ -19850,6 +19916,47 @@ mod tests {
         let value = eval_root_source_transform_row_expression(&plan, &root_state, &expression)
             .expect("root evaluator should use fallback when no initial row matches");
         assert_eq!(value, json!("88"));
+    }
+
+    #[test]
+    fn source_payload_press_updates_bool_state_as_event_pulse() {
+        let slot = boon_plan::ScalarStorageSlot {
+            id: boon_plan::PlanStorageId(0),
+            state_id: StateId(1),
+            value_type: PlanValueType::Bool,
+            scope_id: None,
+            indexed: false,
+            initial_value_kind: InitialValueKind::Bool,
+            initial_constant_id: None,
+            initial_root_field_path: None,
+            initial_row_field_path: None,
+        };
+        let event = RootJsonSourceEvent {
+            payload: BTreeMap::new(),
+            ..RootJsonSourceEvent::default()
+        };
+
+        let value = source_payload_value_for_slot(
+            &event,
+            &SourcePayloadField::Named("press".to_owned()),
+            &slot,
+            PlanOpId(7),
+        )
+        .expect("press source payload should be a bool event pulse");
+        assert_eq!(value, json!(true));
+
+        let false_event = RootJsonSourceEvent {
+            payload: BTreeMap::from([("press".to_owned(), "False".to_owned())]),
+            ..RootJsonSourceEvent::default()
+        };
+        let value = source_payload_value_for_slot(
+            &false_event,
+            &SourcePayloadField::Named("press".to_owned()),
+            &slot,
+            PlanOpId(8),
+        )
+        .expect("explicit false press source payload should decode");
+        assert_eq!(value, json!(false));
     }
 
     #[test]

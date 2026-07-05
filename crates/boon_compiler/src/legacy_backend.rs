@@ -66,6 +66,7 @@ fn source_payload_descriptor_from_ir(
 fn source_payload_value_type_from_ir(value: ir::SourcePayloadValueType) -> SourcePayloadValueType {
     match value {
         ir::SourcePayloadValueType::Bytes => SourcePayloadValueType::Bytes,
+        ir::SourcePayloadValueType::Bool => SourcePayloadValueType::Bool,
         ir::SourcePayloadValueType::Text => SourcePayloadValueType::Text,
     }
 }
@@ -107,6 +108,22 @@ fn plan_value_type_from_initial_with_row_fields(
                 .unwrap_or(PlanValueType::RowInitialField)
         }
         _ => plan_value_type_from_initial(value),
+    }
+}
+
+fn plan_value_type_from_initial_with_root_and_row_fields(
+    state_path: &str,
+    value: &InitialValue,
+    scope_id: Option<ScopeId>,
+    root_field_types: &RootInitialFieldTypeMap,
+    row_field_types: &RowInitialFieldTypeMap,
+) -> PlanValueType {
+    match value {
+        InitialValue::RootInitialField { .. } => root_field_types
+            .get(state_path)
+            .copied()
+            .unwrap_or(PlanValueType::RootInitialField),
+        _ => plan_value_type_from_initial_with_row_fields(value, scope_id, row_field_types),
     }
 }
 
@@ -160,8 +177,9 @@ pub fn compile_typed_program(
     target_profile: TargetProfile,
 ) -> Result<MachinePlan, PlanError> {
     let row_initial_field_types = row_initial_field_value_types(program);
+    let root_initial_field_types = root_initial_field_value_types(program);
     let synthetic_initial_field_ids = synthetic_initial_list_field_ids(program);
-    let index = ValueIndex::new(program, &row_initial_field_types);
+    let index = ValueIndex::new(program, &root_initial_field_types, &row_initial_field_types);
     let mut next_op = 0usize;
     let mut unresolved_refs = BTreeSet::new();
 
@@ -196,9 +214,11 @@ pub fn compile_typed_program(
         .map(|(slot_id, state)| ScalarStorageSlot {
             id: PlanStorageId(slot_id),
             state_id: plan_state_id(state.id),
-            value_type: plan_value_type_from_initial_with_row_fields(
+            value_type: plan_value_type_from_initial_with_root_and_row_fields(
+                &state.path,
                 &state.initial_value,
                 plan_scope_id(state.scope_id),
+                &root_initial_field_types,
                 &row_initial_field_types,
             ),
             scope_id: plan_scope_id(state.scope_id),
@@ -847,6 +867,7 @@ fn byte_bank_capacity_hint(
 }
 
 type RowInitialFieldTypeMap = BTreeMap<(Option<ScopeId>, String), PlanValueType>;
+type RootInitialFieldTypeMap = BTreeMap<String, PlanValueType>;
 
 fn row_initial_field_value_type(
     row_field_types: &RowInitialFieldTypeMap,
@@ -924,6 +945,141 @@ fn row_initial_field_value_types(program: &TypedProgram) -> RowInitialFieldTypeM
         .into_iter()
         .filter(|(_, value_type)| plan_value_type_is_concrete(*value_type))
         .collect()
+}
+
+fn root_initial_field_value_types(program: &TypedProgram) -> RootInitialFieldTypeMap {
+    let mut root_field_types = RootInitialFieldTypeMap::new();
+    let source_payload_types = source_payload_value_type_lookup(program);
+
+    for state in &program.state_cells {
+        if !matches!(state.initial_value, InitialValue::RootInitialField { .. }) {
+            continue;
+        }
+        for branch in program
+            .update_branches
+            .iter()
+            .filter(|branch| branch.target == state.path)
+        {
+            let Some(value_type) =
+                update_expression_output_type_for_root_initial(branch, &source_payload_types)
+            else {
+                continue;
+            };
+            insert_root_initial_field_value_type(&mut root_field_types, &state.path, value_type);
+        }
+    }
+
+    root_field_types
+        .into_iter()
+        .filter(|(_, value_type)| plan_value_type_is_concrete(*value_type))
+        .collect()
+}
+
+fn source_payload_value_type_lookup(
+    program: &TypedProgram,
+) -> BTreeMap<(String, SourcePayloadField), PlanValueType> {
+    let mut payload_types = BTreeMap::new();
+    for source in &program.sources {
+        for descriptor in &source.payload_schema.typed_fields {
+            payload_types.insert(
+                (
+                    source.path.clone(),
+                    source_payload_field_from_ir(&descriptor.field),
+                ),
+                plan_value_type_from_source_payload_type(descriptor.value_type),
+            );
+        }
+    }
+    payload_types
+}
+
+fn update_expression_output_type_for_root_initial(
+    branch: &boon_ir::UpdateBranch,
+    source_payload_types: &BTreeMap<(String, SourcePayloadField), PlanValueType>,
+) -> Option<PlanValueType> {
+    match &branch.expression {
+        UpdateExpression::SourcePayload { path } | UpdateExpression::ReadPath { path } => {
+            let field = source_payload_field_from_path(&branch.source, path, true)?;
+            source_payload_types
+                .get(&(branch.source.clone(), field))
+                .copied()
+        }
+        UpdateExpression::Const { value } => Some(infer_static_update_value_type(value)),
+        UpdateExpression::PrefixPayloadConcat { .. }
+        | UpdateExpression::PrefixRootConcat { .. }
+        | UpdateExpression::TextTrimOrPrevious { .. }
+        | UpdateExpression::BytesToHex { .. }
+        | UpdateExpression::BytesToBase64 { .. }
+        | UpdateExpression::BytesToText { .. } => Some(PlanValueType::Text),
+        UpdateExpression::BoolNot { .. }
+        | UpdateExpression::BytesIsEmpty { .. }
+        | UpdateExpression::BytesEqual { .. }
+        | UpdateExpression::BytesStartsWith { .. }
+        | UpdateExpression::BytesEndsWith { .. } => Some(PlanValueType::Bool),
+        UpdateExpression::NumberInfix { .. }
+        | UpdateExpression::ProjectTime { .. }
+        | UpdateExpression::BytesLength { .. }
+        | UpdateExpression::BytesReadUnsigned { .. }
+        | UpdateExpression::BytesReadSigned { .. }
+        | UpdateExpression::BytesFind { .. } => Some(PlanValueType::Number),
+        UpdateExpression::BytesGet { .. } => Some(PlanValueType::Byte),
+        UpdateExpression::BytesSet { .. }
+        | UpdateExpression::BytesSlice { .. }
+        | UpdateExpression::BytesTake { .. }
+        | UpdateExpression::BytesDrop { .. }
+        | UpdateExpression::BytesZeros { .. }
+        | UpdateExpression::BytesFromHex { .. }
+        | UpdateExpression::BytesFromBase64 { .. }
+        | UpdateExpression::TextToBytes { .. }
+        | UpdateExpression::BytesConcat { .. }
+        | UpdateExpression::BytesWriteUnsigned { .. }
+        | UpdateExpression::BytesWriteSigned { .. }
+        | UpdateExpression::FileReadBytes { .. }
+        | UpdateExpression::FileWriteBytes { .. } => Some(PlanValueType::Bytes { fixed_len: None }),
+        UpdateExpression::PreviousValue { .. }
+        | UpdateExpression::MatchConst { .. }
+        | UpdateExpression::MatchValueConst { .. }
+        | UpdateExpression::MatchTextIsEmptyConst { .. }
+        | UpdateExpression::MatchNumberInfixConst { .. }
+        | UpdateExpression::ListFindValue { .. }
+        | UpdateExpression::Unknown { .. } => None,
+    }
+}
+
+fn plan_value_type_from_source_payload_type(
+    value_type: ir::SourcePayloadValueType,
+) -> PlanValueType {
+    match value_type {
+        ir::SourcePayloadValueType::Bytes => PlanValueType::Bytes { fixed_len: None },
+        ir::SourcePayloadValueType::Bool => PlanValueType::Bool,
+        ir::SourcePayloadValueType::Text => PlanValueType::Text,
+    }
+}
+
+fn infer_static_update_value_type(value: &str) -> PlanValueType {
+    match value {
+        "True" | "False" => PlanValueType::Bool,
+        _ if value.parse::<i64>().is_ok() => PlanValueType::Number,
+        _ => PlanValueType::Text,
+    }
+}
+
+fn insert_root_initial_field_value_type(
+    root_field_types: &mut RootInitialFieldTypeMap,
+    path: &str,
+    value_type: PlanValueType,
+) {
+    if !plan_value_type_is_concrete(value_type) {
+        return;
+    }
+    root_field_types
+        .entry(path.to_owned())
+        .and_modify(|existing| {
+            if *existing != value_type {
+                *existing = PlanValueType::Unknown;
+            }
+        })
+        .or_insert(value_type);
 }
 
 fn insert_row_initial_field_value_type(
@@ -5026,7 +5182,11 @@ struct ValueIndex {
 }
 
 impl ValueIndex {
-    fn new(program: &TypedProgram, row_field_types: &RowInitialFieldTypeMap) -> Self {
+    fn new(
+        program: &TypedProgram,
+        root_field_types: &RootInitialFieldTypeMap,
+        row_field_types: &RowInitialFieldTypeMap,
+    ) -> Self {
         let mut by_path = BTreeMap::new();
         let mut source_payload_fields = BTreeMap::new();
         let mut state_value_types = BTreeMap::new();
@@ -5051,9 +5211,11 @@ impl ValueIndex {
             by_path.insert(state.path.clone(), ValueRef::State(plan_state_id(state.id)));
             state_value_types.insert(
                 state.path.clone(),
-                plan_value_type_from_initial_with_row_fields(
+                plan_value_type_from_initial_with_root_and_row_fields(
+                    &state.path,
                     &state.initial_value,
                     plan_scope_id(state.scope_id),
+                    root_field_types,
                     row_field_types,
                 ),
             );
@@ -5277,6 +5439,63 @@ store: [
             ),
             "root pure field alias should be executable by the generic CPU PlanExecutor"
         );
+    }
+
+    #[test]
+    fn source_payload_bool_type_maps_from_ir() {
+        assert_eq!(
+            source_payload_value_type_from_ir(ir::SourcePayloadValueType::Bool),
+            SourcePayloadValueType::Bool
+        );
+    }
+
+    #[test]
+    fn root_initial_field_state_type_is_inferred_from_text_updates() {
+        let parsed = boon_parser::parse_project(
+            "examples/root-initial-text-type.bn",
+            [(
+                "examples/root-initial-text-type.bn".to_owned(),
+                r#"
+store: [
+    input: [change: SOURCE]
+    startup_file:
+        TEXT { seed.vcd } |> HOLD startup_file { LATEST {} }
+    active_file:
+        startup_file |> HOLD active_file {
+            LATEST {
+                store.input.change.text |> THEN { store.input.change.text }
+                store.input.change |> THEN { TEXT { fallback.vcd } }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: store.active_file))
+"#
+                .to_owned(),
+            )],
+        )
+        .expect("root initial text fixture should parse");
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let active_file_state =
+            debug_entry_id(&plan.debug_map.state_slots, "state", "store.active_file");
+        let active_file_slot = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id.0 == active_file_state)
+            .expect("store.active_file should have scalar storage");
+
+        assert_eq!(active_file_slot.value_type, PlanValueType::Text);
+        assert_eq!(
+            active_file_slot.initial_value_kind,
+            InitialValueKind::RootInitialField
+        );
+        assert_eq!(
+            active_file_slot.initial_root_field_path.as_deref(),
+            Some("startup_file")
+        );
+        assert_eq!(verify_plan(&plan).unwrap().status, "pass");
     }
 
     #[test]

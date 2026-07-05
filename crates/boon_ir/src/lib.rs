@@ -521,6 +521,7 @@ pub struct SourcePayloadDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum SourcePayloadValueType {
     Bytes,
+    Bool,
     Text,
 }
 
@@ -3008,10 +3009,11 @@ fn source_payload_schema(
 fn source_payload_value_type(field: &SourcePayloadField) -> SourcePayloadValueType {
     match field {
         SourcePayloadField::Bytes => SourcePayloadValueType::Bytes,
-        SourcePayloadField::Address
-        | SourcePayloadField::Key
-        | SourcePayloadField::Named(_)
-        | SourcePayloadField::Text => SourcePayloadValueType::Text,
+        SourcePayloadField::Named(name) if name == "press" => SourcePayloadValueType::Bool,
+        SourcePayloadField::Address | SourcePayloadField::Key | SourcePayloadField::Text => {
+            SourcePayloadValueType::Text
+        }
+        SourcePayloadField::Named(_) => SourcePayloadValueType::Text,
     }
 }
 
@@ -14216,6 +14218,18 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.row_lookup_field_name(), Some("file"));
         assert_eq!(decoded.address_lookup_field, None);
+    }
+
+    #[test]
+    fn press_payload_fields_are_bool_typed() {
+        assert_eq!(
+            source_payload_value_type(&SourcePayloadField::Named("press".to_owned())),
+            SourcePayloadValueType::Bool
+        );
+        assert_eq!(
+            source_payload_value_type(&SourcePayloadField::Named("pointer_x".to_owned())),
+            SourcePayloadValueType::Text
+        );
     }
 
     #[test]

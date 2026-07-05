@@ -160,6 +160,7 @@ pub struct SourcePayloadDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum SourcePayloadValueType {
     Bytes,
+    Bool,
     Text,
 }
 
@@ -989,10 +990,13 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             plan.storage_layout.byte_banks.len()
         ),
     });
+    let constant_refs_failure = constant_refs_resolve_and_match_storage_types_failure(plan);
     checks.push(PlanCheck {
         id: "constant-refs-resolve-and-match-storage-types".to_owned(),
-        pass: constant_refs_resolve_and_match_storage_types(plan),
-        detail: "initial and update constant refs resolve to compatible typed constants".to_owned(),
+        pass: constant_refs_failure.is_none(),
+        detail: constant_refs_failure.unwrap_or_else(|| {
+            "initial and update constant refs resolve to compatible typed constants".to_owned()
+        }),
     });
     checks.push(PlanCheck {
         id: "initial-field-paths-resolve".to_owned(),
@@ -3124,12 +3128,61 @@ fn source_payload_refs_are_declared_and_typed(
     true
 }
 
+fn source_payload_ref_mismatch_detail(
+    plan: &MachinePlan,
+    op: &PlanOp,
+    expected: &SourcePayloadField,
+) -> String {
+    let Some(output_type) = output_state_type(&plan.storage_layout.scalar_slots, op) else {
+        return "missing output state type".to_owned();
+    };
+    let payload_inputs = source_payload_input_ids(op);
+    if payload_inputs.is_empty() {
+        return "no source payload input".to_owned();
+    }
+    for (source_id, field) in payload_inputs {
+        if &field != expected {
+            return format!(
+                "payload input field {:?} does not match {:?}",
+                field, expected
+            );
+        }
+        let Some(route) = plan
+            .source_routes
+            .iter()
+            .find(|route| route.source_id == source_id)
+        else {
+            return format!("missing source route for source {}", source_id.0);
+        };
+        let Some(payload_type) = route
+            .payload_schema
+            .typed_fields
+            .iter()
+            .find(|descriptor| descriptor.field == field)
+            .map(|descriptor| descriptor.value_type)
+        else {
+            return format!(
+                "source route {} has no typed schema entry for {:?}",
+                source_id.0, field
+            );
+        };
+        if !source_payload_value_type_matches_plan_type(payload_type, output_type) {
+            return format!(
+                "source route {} field {:?} payload_type={:?} does not match output_type={:?}",
+                source_id.0, field, payload_type, output_type
+            );
+        }
+    }
+    "unknown source-payload mismatch".to_owned()
+}
+
 fn source_payload_value_type_matches_plan_type(
     payload_type: SourcePayloadValueType,
     plan_type: &PlanValueType,
 ) -> bool {
     match payload_type {
         SourcePayloadValueType::Bytes => matches!(plan_type, PlanValueType::Bytes { .. }),
+        SourcePayloadValueType::Bool => plan_type == &PlanValueType::Bool,
         SourcePayloadValueType::Text => plan_type == &PlanValueType::Text,
     }
 }
@@ -3144,10 +3197,13 @@ fn source_payload_output_type_is_supported(
     };
     match field {
         SourcePayloadField::Bytes => matches!(output_type, PlanValueType::Bytes { .. }),
-        SourcePayloadField::Address
-        | SourcePayloadField::Key
-        | SourcePayloadField::Named(_)
-        | SourcePayloadField::Text => output_type == &PlanValueType::Text,
+        SourcePayloadField::Named(name) if name == "press" => {
+            output_type == &PlanValueType::Bool || output_type == &PlanValueType::Text
+        }
+        SourcePayloadField::Address | SourcePayloadField::Key | SourcePayloadField::Text => {
+            output_type == &PlanValueType::Text
+        }
+        SourcePayloadField::Named(_) => output_type == &PlanValueType::Text,
     }
 }
 
@@ -3290,9 +3346,8 @@ fn match_const_input_ref_supported(
         ValueRef::SourcePayload { field, .. } => {
             op.inputs.contains(value_ref) && *field != SourcePayloadField::Bytes
         }
-        ValueRef::Constant(_) | ValueRef::Field(_) | ValueRef::Source(_) | ValueRef::List(_) => {
-            false
-        }
+        ValueRef::Field(_) => op.inputs.contains(value_ref),
+        ValueRef::Constant(_) | ValueRef::Source(_) | ValueRef::List(_) => false,
     }
 }
 
@@ -3453,11 +3508,14 @@ fn plan_constants_are_deduplicated(constants: &[PlanConstant]) -> bool {
     true
 }
 
-fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
+fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> Option<String> {
     let mut ids = BTreeSet::new();
     for (index, constant) in plan.constants.iter().enumerate() {
         if constant.id.0 != index || !ids.insert(constant.id) {
-            return false;
+            return Some(format!(
+                "constant id order/uniqueness mismatch at index {index}: id={}",
+                constant.id.0
+            ));
         }
     }
 
@@ -3466,10 +3524,16 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
             continue;
         };
         let Some(constant) = plan_constant_by_id(&plan.constants, constant_id) else {
-            return false;
+            return Some(format!(
+                "scalar slot state {} references missing initial constant {}",
+                slot.state_id.0, constant_id.0
+            ));
         };
         if !constant_value_matches_plan_type(&constant.value, &slot.value_type) {
-            return false;
+            return Some(format!(
+                "scalar slot state {} initial constant {} type mismatch: constant={:?}, slot_type={:?}",
+                slot.state_id.0, constant_id.0, constant.value, slot.value_type
+            ));
         }
     }
 
@@ -3482,53 +3546,105 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                 source_guard,
                 ..
             } => match expression_kind {
-                _ if !source_guard_refs_resolve(op, source_guard) => return false,
+                _ if !source_guard_refs_resolve(op, source_guard) => {
+                    return Some(format!(
+                        "update op {} has unresolved source guard {:?}",
+                        op.id.0, source_guard
+                    ));
+                }
                 PlanExpressionKind::Const => {
                     if source_payload_field.is_some() {
-                        return false;
+                        return Some(format!(
+                            "const update op {} unexpectedly has source payload field {:?}",
+                            op.id.0, source_payload_field
+                        ));
                     }
                     let Some(constant_id) = update_constant_id else {
-                        return false;
+                        return Some(format!("const update op {} has no constant id", op.id.0));
                     };
                     let Some(constant) = plan_constant_by_id(&plan.constants, *constant_id) else {
-                        return false;
+                        return Some(format!(
+                            "const update op {} references missing constant {}",
+                            op.id.0, constant_id.0
+                        ));
                     };
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "const update op {} outputs missing state {}",
+                                op.id.0, state_id.0
+                            ));
                         };
                         if !constant_value_matches_plan_type(&constant.value, value_type) {
-                            return false;
+                            return Some(format!(
+                                "const update op {} output state {} type mismatch: constant {}={:?}, state_type={:?}",
+                                op.id.0, state_id.0, constant_id.0, constant.value, value_type
+                            ));
                         }
                     }
                 }
                 PlanExpressionKind::SourcePayload => {
                     let Some(field) = source_payload_field.as_ref() else {
-                        return false;
+                        return Some(format!(
+                            "source-payload update op {} has no payload field",
+                            op.id.0
+                        ));
                     };
                     if !source_payload_refs_are_declared_and_typed(plan, op, field) {
-                        return false;
+                        return Some(format!(
+                            "source-payload update op {} has undeclared or type-mismatched field {:?}: {}",
+                            op.id.0,
+                            field,
+                            source_payload_ref_mismatch_detail(plan, op, field)
+                        ));
                     }
                     if update_constant_id.is_some() {
-                        return false;
+                        return Some(format!(
+                            "source-payload update op {} unexpectedly has constant {:?}",
+                            op.id.0, update_constant_id
+                        ));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(output_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "source-payload update op {} outputs missing state {}",
+                                op.id.0, state_id.0
+                            ));
                         };
                         match field {
                             SourcePayloadField::Bytes
                                 if !matches!(output_type, PlanValueType::Bytes { .. }) =>
                             {
-                                return false;
+                                return Some(format!(
+                                    "source-payload update op {} bytes field outputs non-BYTES state {} type {:?}",
+                                    op.id.0, state_id.0, output_type
+                                ));
+                            }
+                            SourcePayloadField::Named(name) if name == "press" => {
+                                if output_type != &PlanValueType::Bool
+                                    && output_type != &PlanValueType::Text
+                                {
+                                    return Some(format!(
+                                        "source-payload update op {} press field outputs unsupported state {} type {:?}",
+                                        op.id.0, state_id.0, output_type
+                                    ));
+                                }
                             }
                             SourcePayloadField::Address
                             | SourcePayloadField::Key
-                            | SourcePayloadField::Named(_)
                             | SourcePayloadField::Text
                                 if output_type != &PlanValueType::Text =>
                             {
-                                return false;
+                                return Some(format!(
+                                    "source-payload update op {} text field {:?} outputs non-TEXT state {} type {:?}",
+                                    op.id.0, field, state_id.0, output_type
+                                ));
+                            }
+                            SourcePayloadField::Named(_) if output_type != &PlanValueType::Text => {
+                                return Some(format!(
+                                    "source-payload update op {} named field {:?} outputs non-TEXT state {} type {:?}",
+                                    op.id.0, field, state_id.0, output_type
+                                ));
                             }
                             _ => {}
                         }
@@ -3536,55 +3652,94 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                 }
                 PlanExpressionKind::BytesGet => {
                     if source_payload_field.is_some() {
-                        return false;
+                        return Some(format!(
+                            "bytes-get update op {} unexpectedly has source payload field {:?}",
+                            op.id.0, source_payload_field
+                        ));
                     }
                     let Some(constant_id) = update_constant_id else {
-                        return false;
+                        return Some(format!(
+                            "bytes-get update op {} has no index constant",
+                            op.id.0
+                        ));
                     };
                     let Some(constant) = plan_constant_by_id(&plan.constants, *constant_id) else {
-                        return false;
+                        return Some(format!(
+                            "bytes-get update op {} references missing index constant {}",
+                            op.id.0, constant_id.0
+                        ));
                     };
                     if !matches!(
                         constant.value,
                         PlanConstantValue::Number { value } if value >= 0
                     ) {
-                        return false;
+                        return Some(format!(
+                            "bytes-get update op {} index constant {} is not a non-negative number: {:?}",
+                            op.id.0, constant_id.0, constant.value
+                        ));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "bytes-get update op {} outputs missing state {}",
+                                op.id.0, state_id.0
+                            ));
                         };
                         if value_type != &PlanValueType::Byte {
-                            return false;
+                            return Some(format!(
+                                "bytes-get update op {} outputs non-BYTE state {} type {:?}",
+                                op.id.0, state_id.0, value_type
+                            ));
                         }
                     }
                 }
                 PlanExpressionKind::BytesIsEmpty => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(format!(
+                            "bytes-is-empty update op {} unexpectedly has payload/constant",
+                            op.id.0
+                        ));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "bytes-is-empty update op {} outputs missing state {}",
+                                op.id.0, state_id.0
+                            ));
                         };
                         if value_type != &PlanValueType::Bool {
-                            return false;
+                            return Some(format!(
+                                "bytes-is-empty update op {} outputs non-BOOL state {} type {:?}",
+                                op.id.0, state_id.0, value_type
+                            ));
                         }
                     }
                     if !bytes_length_input_is_supported(&plan.storage_layout.scalar_slots, op) {
-                        return false;
+                        return Some(format!(
+                            "bytes-is-empty update op {} has unsupported BYTES input",
+                            op.id.0
+                        ));
                     }
                 }
                 PlanExpressionKind::BytesFind => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(format!(
+                            "bytes-find update op {} unexpectedly has payload/constant",
+                            op.id.0
+                        ));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "bytes-find update op {} outputs missing state {}",
+                                op.id.0, state_id.0
+                            ));
                         };
                         if value_type != &PlanValueType::Number {
-                            return false;
+                            return Some(format!(
+                                "bytes-find update op {} outputs non-NUMBER state {} type {:?}",
+                                op.id.0, state_id.0, value_type
+                            ));
                         }
                     }
                     if !indexed_bytes_ordered_inputs_are_supported(
@@ -3592,19 +3747,31 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.storage_layout.list_slots,
                         op,
                     ) {
-                        return false;
+                        return Some(format!(
+                            "bytes-find update op {} has unsupported ordered BYTES inputs",
+                            op.id.0
+                        ));
                     }
                 }
                 PlanExpressionKind::BytesStartsWith | PlanExpressionKind::BytesEndsWith => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(format!(
+                            "{:?} update op {} unexpectedly has payload/constant",
+                            expression_kind, op.id.0
+                        ));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(format!(
+                                "{:?} update op {} outputs missing state {}",
+                                expression_kind, op.id.0, state_id.0
+                            ));
                         };
                         if value_type != &PlanValueType::Bool {
-                            return false;
+                            return Some(format!(
+                                "{:?} update op {} outputs non-BOOL state {} type {:?}",
+                                expression_kind, op.id.0, state_id.0, value_type
+                            ));
                         }
                     }
                     if !indexed_bytes_ordered_inputs_are_supported(
@@ -3612,12 +3779,15 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.storage_layout.list_slots,
                         op,
                     ) {
-                        return false;
+                        return Some(format!(
+                            "{:?} update op {} has unsupported ordered BYTES inputs",
+                            expression_kind, op.id.0
+                        ));
                     }
                 }
                 PlanExpressionKind::BytesSet => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [
@@ -3626,27 +3796,27 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         ValueRef::Constant(value_constant_id),
                     ] = ordered_inputs
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !matches!(input_type, PlanValueType::Bytes { .. }) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(index_constant) =
                         plan_constant_by_id(&plan.constants, *index_constant_id)
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !matches!(
                         index_constant.value,
                         PlanConstantValue::Number { value } if value >= 0
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let PlanConstantValue::Number { value } = &index_constant.value
                         && let PlanValueType::Bytes {
@@ -3654,48 +3824,48 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         } = input_type
                         && !u64::try_from(*value).is_ok_and(|index| index < *len)
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(value_constant) =
                         plan_constant_by_id(&plan.constants, *value_constant_id)
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !matches!(value_constant.value, PlanConstantValue::Byte { .. }) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_set_fixed_lengths_match(&plan.storage_layout.scalar_slots, op) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::BytesSlice => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [ValueRef::State(input), offset_ref, byte_count_ref] = ordered_inputs
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     let PlanValueType::Bytes {
                         fixed_len: input_len,
                     } = input_type
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !bytes_number_operand_is_supported(
                         &plan.storage_layout.scalar_slots,
@@ -3708,7 +3878,7 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         op,
                         byte_count_ref,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let (Some(len), Some(offset), Some(byte_count)) = (
                         input_len,
@@ -3718,14 +3888,14 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         .checked_add(byte_count)
                         .is_some_and(|end| end <= *len)
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_slice_fixed_lengths_match(
@@ -3733,28 +3903,28 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.constants,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::BytesTake => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [ValueRef::State(input), byte_count_ref] = ordered_inputs else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     let PlanValueType::Bytes {
                         fixed_len: input_len,
                     } = input_type
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !bytes_number_operand_is_supported(
                         &plan.storage_layout.scalar_slots,
@@ -3762,21 +3932,21 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         op,
                         byte_count_ref,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let (Some(len), Some(byte_count)) = (
                         input_len,
                         bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
                     ) && byte_count > *len
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_take_fixed_lengths_match(
@@ -3784,28 +3954,28 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.constants,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::BytesDrop => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [ValueRef::State(input), byte_count_ref] = ordered_inputs else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     let PlanValueType::Bytes {
                         fixed_len: input_len,
                     } = input_type
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !bytes_number_operand_is_supported(
                         &plan.storage_layout.scalar_slots,
@@ -3813,21 +3983,21 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         op,
                         byte_count_ref,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let (Some(len), Some(byte_count)) = (
                         input_len,
                         bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
                     ) && byte_count > *len
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_drop_fixed_lengths_match(
@@ -3835,30 +4005,30 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.constants,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::BytesZeros => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [ValueRef::Constant(byte_count_constant_id)] = ordered_inputs else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !state_input_ids(op).is_empty() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if plan_number_constant_u64(&plan.constants, *byte_count_constant_id).is_none()
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_zeros_fixed_length_matches(
@@ -3866,38 +4036,38 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.constants,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::BytesToHex | PlanExpressionKind::BytesToBase64 => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [ValueRef::State(input)] = ordered_inputs else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !matches!(input_type, PlanValueType::Bytes { .. }) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if value_type != &PlanValueType::Text {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesFromHex | PlanExpressionKind::BytesFromBase64 => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let input_supported = if op.indexed {
                         indexed_single_text_input_is_supported(
@@ -3908,28 +4078,28 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                     } else {
                         let ordered_inputs = update_branch_ordered_inputs(op);
                         let [ValueRef::State(input)] = ordered_inputs else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !op.inputs.contains(&ValueRef::State(*input)) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                         plan_value_type_for_state(plan, *input) == Some(&PlanValueType::Text)
                     };
                     if !input_supported {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesReadUnsigned | PlanExpressionKind::BytesReadSigned => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [
@@ -3939,10 +4109,10 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         ValueRef::Constant(endian_constant_id),
                     ] = ordered_inputs
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !byte_range_is_supported(
                         &plan.storage_layout.scalar_slots,
@@ -3951,23 +4121,23 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         *offset_constant_id,
                         *byte_count_constant_id,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !endian_constant_is_supported(&plan.constants, *endian_constant_id) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if value_type != &PlanValueType::Number {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesWriteUnsigned | PlanExpressionKind::BytesWriteSigned => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [
@@ -3978,10 +4148,10 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         ValueRef::Constant(value_constant_id),
                     ] = ordered_inputs
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !byte_range_is_supported(
                         &plan.storage_layout.scalar_slots,
@@ -3990,19 +4160,19 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         *offset_constant_id,
                         *byte_count_constant_id,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !endian_constant_is_supported(&plan.constants, *endian_constant_id) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(byte_count) =
                         plan_number_constant_u64(&plan.constants, *byte_count_constant_id)
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     let Some(value) = plan_number_constant_i64(&plan.constants, *value_constant_id)
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     let value_is_supported = match expression_kind {
                         PlanExpressionKind::BytesWriteUnsigned => {
@@ -4014,26 +4184,26 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         _ => false,
                     };
                     if !value_is_supported {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !bytes_numeric_write_fixed_lengths_match(
                         &plan.storage_layout.scalar_slots,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::TextToBytes => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let input_supported = if op.indexed {
                         indexed_text_to_bytes_inputs_are_supported(
@@ -4050,20 +4220,20 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         )
                     };
                     if !input_supported {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesToText => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let ordered_inputs = update_branch_ordered_inputs(op);
                     let [
@@ -4071,52 +4241,52 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         ValueRef::Constant(encoding_constant_id),
                     ] = ordered_inputs
                     else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !op.inputs.contains(&ValueRef::State(*input)) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     let Some(input_type) = plan_value_type_for_state(plan, *input) else {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
                     if !matches!(input_type, PlanValueType::Bytes { .. }) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !encoding_constant_is_supported(&plan.constants, *encoding_constant_id) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if value_type != &PlanValueType::Text {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesEqual => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if value_type != &PlanValueType::Bool {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::BytesConcat => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                     if !indexed_bytes_ordered_inputs_are_supported(
@@ -4124,14 +4294,14 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         &plan.storage_layout.list_slots,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if !indexed_bytes_concat_fixed_lengths_match(
                         &plan.storage_layout.scalar_slots,
                         &plan.storage_layout.list_slots,
                         op,
                     ) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::MatchConst if !op.indexed => {
@@ -4143,7 +4313,7 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                             op,
                         )
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 PlanExpressionKind::FileReadBytes => {
@@ -4155,20 +4325,20 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                             op,
                         )
                     {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
                         let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         };
                         if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
+                            return Some(constant_ref_update_op_failure(*expression_kind, op));
                         }
                     }
                 }
                 PlanExpressionKind::FileWriteBytes => {
                     if !file_write_bytes_op_is_well_formed(plan, op) {
-                        return false;
+                        return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                 }
                 _ => {}
@@ -4176,7 +4346,14 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
             _ => {}
         }
     }
-    true
+    None
+}
+
+fn constant_ref_update_op_failure(kind: PlanExpressionKind, op: &PlanOp) -> String {
+    format!(
+        "{kind:?} update op {} failed typed constant/ref validation",
+        op.id.0
+    )
 }
 
 fn initial_field_paths_resolve(plan: &MachinePlan) -> bool {
@@ -5396,6 +5573,22 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.row_lookup_field_name(), Some("file"));
         assert_eq!(decoded.address_lookup_field, None);
+    }
+
+    #[test]
+    fn bool_source_payload_type_matches_bool_plan_state_only() {
+        assert!(source_payload_value_type_matches_plan_type(
+            SourcePayloadValueType::Bool,
+            &PlanValueType::Bool
+        ));
+        assert!(!source_payload_value_type_matches_plan_type(
+            SourcePayloadValueType::Bool,
+            &PlanValueType::Text
+        ));
+        assert!(!source_payload_value_type_matches_plan_type(
+            SourcePayloadValueType::Text,
+            &PlanValueType::Bool
+        ));
     }
 
     #[test]

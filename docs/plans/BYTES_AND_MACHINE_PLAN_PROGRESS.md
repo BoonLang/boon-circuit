@@ -36576,3 +36576,61 @@ Current interpretation:
 - Because `verify-novywave-bridge-scenario` is not in the native handoff
   manifest, keep it classified as an explicit legacy regression harness until
   replacement evidence exists.
+
+## 2026-07-05 - Source Payload And Root-Initial Type Verification Cut
+
+Status: removed the current NovyWave MachinePlan verification failure without
+adding a NovyWave-specific fallback. The bridge/runtime migration is still not
+complete, but the remaining report failure is now honest PlanExecutor coverage
+debt instead of a stale opaque verifier/type error.
+
+What changed:
+
+- `press` source payload fields now lower as typed bool payloads through IR,
+  MachinePlan, compiler conversion, and PlanExecutor root source-payload
+  decoding.
+- Root states initialized from root startup fields now infer their concrete
+  storage type from generic update evidence when all known update branches agree.
+  The slot still carries `initial_value_kind=RootInitialField` and
+  `initial_root_field_path` for startup copying; only the runtime value type
+  becomes concrete.
+- Root `MatchConst` update branches can read root derived field values from the
+  root-state snapshot, matching the already-supported source-transform root
+  derived-field read path.
+- The MachinePlan verifier now emits bounded first-failure detail for the
+  constant/ref/type check instead of only reporting a boolean failure.
+
+Evidence:
+
+- `cargo test -q -p boon_ir press_payload_fields_are_bool_typed`: pass.
+- `cargo test -q -p boon_plan bool_source_payload_type_matches_bool_plan_state_only`: pass.
+- `cargo test -q -p boon_compiler source_payload_bool_type_maps_from_ir`: pass.
+- `cargo test -q -p boon_compiler root_initial_field_state_type_is_inferred_from_text_updates`:
+  pass.
+- `cargo test -q -p boon_plan_executor source_payload_press_updates_bool_state_as_event_pulse`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_match_const_update_executes_on_json_surface`: pass.
+- `cargo check -q -p boon_ir -p boon_plan -p boon_compiler -p boon_plan_executor -p boon_runtime -p boon_cli`:
+  pass.
+
+Fresh NovyWave evidence:
+
+- `cargo run -q -p boon_cli -- dump-plan examples/novywave/RUN.bn --report
+  target/reports/novywave-plan-dump.json` completed.
+- Compact summary:
+  `status=fail`, `cpu_plan_executor_unsupported_op_count=577`,
+  `unresolved_executable_ref_count=7`, failing verification checks `[]`,
+  `press_types=["bool"]`, root-initial placeholder count `2`.
+
+Current interpretation:
+
+- NovyWave MachinePlan verification is no longer the blocker; the blocker is
+  remaining PlanExecutor expression/list/update coverage plus seven unresolved
+  executable refs.
+- The old `verify-novywave-bridge-scenario` legacy runtime path should remain
+  explicit legacy-only until the unsupported/unresolved counts are burned down or
+  the verifier is replaced by a PlanExecutor-native report.
+- Next cut should not re-enter native GPU or Cells micro-tuning. It should
+  classify the 577 unsupported ops by expression/list kind, implement the
+  largest generic missing executor/compiler surface first, and delete or
+  quarantine obsolete bridge comparisons as soon as replacement evidence exists.

@@ -366,6 +366,7 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     }
     let source_path = PathBuf::from(&entry.source);
     let source = std::fs::read_to_string(&source_path)?;
+    let source_units = boon_runtime::source_units_for_entry(&entry)?;
     let scenario = boon_runtime::parse_scenario(Path::new(&entry.scenario))?;
     let step = scenario
         .step
@@ -397,11 +398,12 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         status_overlay: None,
         last_dirty_reason: None,
     }));
-    let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::new(
-        &format!("interaction-speed:{}", source_path.display()),
-        &source,
-        Path::new(&entry.scenario),
-    )?));
+    let live_runtime = Arc::new(Mutex::new(
+        boon_runtime::LiveRuntime::from_project_plan_executor(
+            &format!("interaction-speed:{}", source_path.display()),
+            &source_units,
+        )?,
+    ));
     let mut input_state = PreviewNativeInputState::default();
     let input = deterministic_click_input(event_count, x, y);
     let started = Instant::now();
@@ -1793,7 +1795,7 @@ fn run_novywave_interaction_speed(
         let source_path = PathBuf::from(&entry.source);
         let source = boon_runtime::source_text_for_entry(entry)?;
         let source_units = boon_runtime::source_units_for_entry(entry)?;
-        let runtime = boon_runtime::LiveRuntime::from_project(
+        let runtime = boon_runtime::LiveRuntime::from_project_plan_executor(
             &format!("interaction-speed:{}", source_path.display()),
             &source_units,
         )?;
@@ -8294,11 +8296,11 @@ fn live_runtime_from_source_text_with_scenario(
     source: &str,
     scenario_path: &Path,
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
+    let _scenario = boon_runtime::parse_scenario(scenario_path)?;
     let units = project_units_for_source_text(source_path, source);
-    Ok(boon_runtime::LiveRuntime::new_from_project(
+    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
         source_label,
         &units,
-        scenario_path,
     )?)
 }
 
@@ -19047,31 +19049,19 @@ impl BoonLanguageService {
         }
         let scenario_path = Path::new(source_label).with_extension("scn");
         let runtime = if scenario_path.exists() {
-            if units.len() > 1 {
-                boon_runtime::LiveRuntime::new_from_project(
-                    &format!("dev-window-validate:{source_label}"),
-                    units,
-                    &scenario_path,
-                )
+            boon_runtime::parse_scenario(&scenario_path)
                 .map_err(|error| error.to_string())
-            } else {
-                boon_runtime::LiveRuntime::new(
-                    &format!("dev-window-validate:{source_label}"),
-                    &units[0].source,
-                    &scenario_path,
-                )
-                .map_err(|error| error.to_string())
-            }
-        } else if units.len() > 1 {
-            boon_runtime::LiveRuntime::from_project(
+                .and_then(|_| {
+                    boon_runtime::LiveRuntime::from_project_plan_executor(
+                        &format!("dev-window-validate:{source_label}"),
+                        units,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+        } else {
+            boon_runtime::LiveRuntime::from_project_plan_executor(
                 &format!("dev-window-validate:{source_label}"),
                 units,
-            )
-            .map_err(|error| error.to_string())
-        } else {
-            boon_runtime::LiveRuntime::from_source(
-                &format!("dev-window-validate:{source_label}"),
-                &units[0].source,
             )
             .map_err(|error| error.to_string())
         };

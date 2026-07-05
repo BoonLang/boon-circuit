@@ -2,9 +2,9 @@
 
 use boon_runtime::{
     LiveRuntime, LiveSourceEvent, LiveStepOutput, RunOutput, Scenario, ScenarioStep,
-    VerificationLayer, example_paths, parse_scenario, run_scenario,
-    run_scenario_source_with_parsed_scenario_step_limit, run_source_initial_state, sha256_file,
-    write_json,
+    VerificationLayer, example_paths, parse_scenario, run_legacy_scenario,
+    run_legacy_scenario_source_with_parsed_scenario_step_limit, run_legacy_source_initial_state,
+    sha256_file, write_json,
 };
 use ply_engine::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -970,7 +970,7 @@ async fn run_verify_headed(args: &[String]) -> Result<(), Box<dyn std::error::Er
         &example,
     )
     .await;
-    let output = run_scenario(&source, &scenario, VerificationLayer::HeadedPly, None)?;
+    let output = run_legacy_scenario(&source, &scenario, VerificationLayer::HeadedPly, None)?;
     state = PlaygroundState::from_output(
         example.clone(),
         scenario.clone(),
@@ -5431,7 +5431,7 @@ impl PlaygroundState {
                 )
             })
             .and_then(|scenario| {
-                run_scenario_source_with_parsed_scenario_step_limit(
+                run_legacy_scenario_source_with_parsed_scenario_step_limit(
                     &format!("playground-editor:{}", self.selected),
                     source_text,
                     &self.scenario_path,
@@ -5466,7 +5466,7 @@ impl PlaygroundState {
                 self.selected
             )
         })?;
-        match run_source_initial_state(
+        match run_legacy_source_initial_state(
             &format!("playground-initial:{}", self.selected),
             source_text,
             &self.scenario_path,

@@ -37004,3 +37004,29 @@ Current interpretation:
 - Remaining legacy ambiguity after this cut is mostly explicit diagnostic
   schema acceptance plus public runtime helpers whose names still hide
   `LoadedRuntime` execution.
+
+## 2026-07-05 - Legacy Scenario Runtime API Fenced By Name
+
+Status: removed product-looking public names for scenario helpers that still
+execute through `LoadedRuntime` / `GenericScheduledRuntime`.
+
+What changed:
+
+- Renamed `run_scenario` to `run_legacy_scenario`.
+- Renamed project/source scenario helpers to `run_legacy_scenario_project`,
+  `run_legacy_scenario_source`, and related step-limited variants.
+- Renamed `run_source_initial_state` to `run_legacy_source_initial_state`.
+- Renamed the internal loaded-scenario helper to
+  `run_legacy_loaded_scenario_with_compiled`.
+- Deleted the unused private `run_artifact_runtime_scenario`; compiled artifact
+  scenario execution remains PlanExecutor-backed through MachinePlan.
+- Updated CLI diagnostic, xtask legacy/semantic verifiers, Ply playground, and
+  the runtime benchmark to call the explicitly named legacy APIs.
+
+Current interpretation:
+
+- Normal PlanExecutor APIs keep the plain product names (`run_plan_*`,
+  `LiveRuntime::from_project`, `run_compiled_artifact_scenario`).
+- Legacy runtime execution remains available only through names that make the
+  diagnostic/legacy nature visible. The implementation island still exists and
+  can be shrunk further, but callers no longer look product-neutral.

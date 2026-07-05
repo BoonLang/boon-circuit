@@ -32,7 +32,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (source, scenario, budget) = boon_runtime::example_paths("todomvc")?;
 
-    let speed_output = boon_runtime::run_scenario(
+    let speed_output = boon_runtime::run_legacy_scenario(
         &source,
         &scenario,
         boon_runtime::VerificationLayer::Speed,
@@ -42,7 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let started = Instant::now();
     for _ in 0..iterations {
-        boon_runtime::run_scenario(
+        boon_runtime::run_legacy_scenario(
             &source,
             &scenario,
             boon_runtime::VerificationLayer::Speed,

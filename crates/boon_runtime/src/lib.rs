@@ -3586,7 +3586,7 @@ pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
     compiler_parse_scenario_file::<Scenario>(path)
 }
 
-pub fn run_scenario(
+pub fn run_legacy_scenario(
     source_path: &Path,
     scenario_path: &Path,
     layer: VerificationLayer,
@@ -3601,7 +3601,7 @@ pub fn run_scenario(
     let compiled_program =
         CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    let output = run_loaded_scenario_with_compiled(
+    let output = run_legacy_loaded_scenario_with_compiled(
         &parsed,
         &compiled_program,
         Some(&report_context),
@@ -10826,7 +10826,7 @@ pub fn run_compiled_artifact_scenario(
     run_artifact_plan_scenario(&plan, &scenario)
 }
 
-pub fn run_scenario_project(
+pub fn run_legacy_scenario_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
     scenario_path: &Path,
@@ -10843,7 +10843,7 @@ pub fn run_scenario_project(
     let compiled_program =
         CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    let output = run_loaded_scenario_with_compiled(
+    let output = run_legacy_loaded_scenario_with_compiled(
         &parsed,
         &compiled_program,
         Some(&report_context),
@@ -10874,16 +10874,22 @@ pub fn run_scenario_project(
     })
 }
 
-pub fn run_scenario_source(
+pub fn run_legacy_scenario_source(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
     layer: VerificationLayer,
 ) -> RuntimeResult<RunOutput> {
-    run_scenario_source_with_step_limit(source_label, source_text, scenario_path, layer, None)
+    run_legacy_scenario_source_with_step_limit(
+        source_label,
+        source_text,
+        scenario_path,
+        layer,
+        None,
+    )
 }
 
-pub fn run_scenario_source_with_step_limit(
+pub fn run_legacy_scenario_source_with_step_limit(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -10891,7 +10897,7 @@ pub fn run_scenario_source_with_step_limit(
     step_limit: Option<usize>,
 ) -> RuntimeResult<RunOutput> {
     let scenario = parse_scenario(scenario_path)?;
-    run_scenario_source_with_parsed_scenario_step_limit(
+    run_legacy_scenario_source_with_parsed_scenario_step_limit(
         source_label,
         source_text,
         scenario_path,
@@ -10901,7 +10907,7 @@ pub fn run_scenario_source_with_step_limit(
     )
 }
 
-pub fn run_scenario_source_with_parsed_scenario_step_limit(
+pub fn run_legacy_scenario_source_with_parsed_scenario_step_limit(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -10921,7 +10927,7 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     let compiled_program =
         CompiledProgram::from_compiler_runtime_program(compiler_output.runtime_program)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    let output = run_loaded_scenario_with_compiled(
+    let output = run_legacy_loaded_scenario_with_compiled(
         &parsed,
         &compiled_program,
         Some(&report_context),
@@ -10949,7 +10955,7 @@ pub fn run_scenario_source_with_parsed_scenario_step_limit(
     })
 }
 
-pub fn run_source_initial_state(
+pub fn run_legacy_source_initial_state(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -13381,7 +13387,7 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
 }
 
 #[cfg(test)]
-fn run_loaded_scenario(
+fn run_legacy_loaded_scenario(
     _parsed: &ParsedProgram,
     ir: &TypedProgram,
     scenario: &Scenario,
@@ -13390,10 +13396,10 @@ fn run_loaded_scenario(
     let compile_started = Instant::now();
     let compiled = CompiledProgram::from_ir(ir)?;
     let compile_ms = runtime_elapsed_ms(compile_started);
-    run_loaded_scenario_with_compiled(_parsed, &compiled, None, compile_ms, scenario, layer)
+    run_legacy_loaded_scenario_with_compiled(_parsed, &compiled, None, compile_ms, scenario, layer)
 }
 
-fn run_loaded_scenario_with_compiled(
+fn run_legacy_loaded_scenario_with_compiled(
     _parsed: &ParsedProgram,
     compiled: &CompiledProgram,
     report_context: Option<&CompiledSourceReportContext>,
@@ -22546,41 +22552,6 @@ fn run_generic_scenario<R: ScenarioExecutor>(
         render_patches,
         state_summary,
         document: compiler_parsed_document(parsed),
-    })
-}
-
-fn run_artifact_runtime_scenario(
-    mut runtime: LoadedRuntime,
-    scenario: &Scenario,
-) -> RuntimeResult<ArtifactScenarioRunOutput> {
-    runtime.prepare_for_scenario(scenario)?;
-    let mut semantic_deltas = Vec::new();
-    let mut render_patches = Vec::new();
-    let mut per_step = Vec::new();
-    let mut step_deltas = Vec::with_capacity(64);
-    let mut step_patches = Vec::with_capacity(64);
-    for step in &scenario.step {
-        step_deltas.clear();
-        step_patches.clear();
-        runtime.apply_step(step, &mut step_deltas, &mut step_patches)?;
-        assert_delta_expectations(step, &step_deltas, &step_patches)?;
-        runtime.assert_step_after_measurement(step)?;
-        per_step.push(json!({
-            "id": step.id,
-            "pass": true,
-            "input_route_verified": step.user_action.is_some(),
-            "semantic_delta_count": step_deltas.len(),
-            "render_patch_count": step_patches.len(),
-        }));
-        semantic_deltas.extend(step_deltas.iter().map(SemanticDelta::to_static));
-        render_patches.extend(step_patches.iter().map(RenderPatch::to_static));
-    }
-    let state_summary = runtime.state_summary();
-    Ok(ArtifactScenarioRunOutput {
-        semantic_deltas,
-        render_patches,
-        state_summary,
-        per_step,
     })
 }
 
@@ -66367,7 +66338,7 @@ FUNCTION icon_code(item) {
 
     #[test]
     fn todomvc_scenario_runs_and_removes_rows() {
-        let output = run_scenario(
+        let output = run_legacy_scenario(
             Path::new("../../examples/todomvc.bn"),
             Path::new("../../examples/todomvc.scn"),
             VerificationLayer::Semantic,
@@ -66391,7 +66362,7 @@ FUNCTION icon_code(item) {
     #[test]
     fn profiled_list_capacity_rejects_overflow_append() {
         let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[4] {");
-        let error = run_scenario_source_with_step_limit(
+        let error = run_legacy_scenario_source_with_step_limit(
             "capacity:todomvc",
             &source,
             Path::new("../../examples/todomvc.scn"),
@@ -66409,7 +66380,7 @@ FUNCTION icon_code(item) {
     #[test]
     fn profiled_list_capacity_rejects_oversized_initializer() {
         let source = include_str!("../../../examples/todomvc.bn").replace("LIST {", "LIST[1] {");
-        let error = run_scenario_source_with_step_limit(
+        let error = run_legacy_scenario_source_with_step_limit(
             "capacity:todomvc",
             &source,
             Path::new("../../examples/todomvc.scn"),
@@ -66426,7 +66397,7 @@ FUNCTION icon_code(item) {
 
     #[test]
     fn cells_scenario_runs_and_detects_cycle() {
-        let output = run_scenario(
+        let output = run_legacy_scenario(
             Path::new("../../examples/cells.bn"),
             Path::new("../../examples/cells.scn"),
             VerificationLayer::Semantic,
@@ -66468,7 +66439,7 @@ FUNCTION icon_code(item) {
 
     #[test]
     fn runtime_execution_schema_rejects_adapter_or_incomplete_generic_slices() {
-        let output = run_scenario(
+        let output = run_legacy_scenario(
             Path::new("../../examples/todomvc.bn"),
             Path::new("../../examples/todomvc.scn"),
             VerificationLayer::Semantic,
@@ -68405,7 +68376,7 @@ FUNCTION decorate(value) {
 
     #[test]
     fn semantic_delta_batches_require_runtime_identity_and_server_tick() {
-        let output = run_scenario_source_with_step_limit(
+        let output = run_legacy_scenario_source_with_step_limit(
             "delta-protocol:todomvc",
             include_str!("../../../examples/todomvc.bn"),
             Path::new("../../examples/todomvc.scn"),
@@ -68552,7 +68523,7 @@ FUNCTION decorate(value) {
 
     #[test]
     fn developer_state_summary_hides_runtime_identity() {
-        let todo_output = run_scenario_source_with_step_limit(
+        let todo_output = run_legacy_scenario_source_with_step_limit(
             "identity-summary:todomvc",
             include_str!("../../../examples/todomvc.bn"),
             Path::new("../../examples/todomvc.scn"),
@@ -68569,7 +68540,7 @@ FUNCTION decorate(value) {
             assert!(row.get("hidden_generation").is_none());
         }
 
-        let cells_output = run_scenario(
+        let cells_output = run_legacy_scenario(
             Path::new("../../examples/cells.bn"),
             Path::new("../../examples/cells.scn"),
             VerificationLayer::Semantic,
@@ -68606,7 +68577,7 @@ FUNCTION decorate(value) {
     #[test]
     fn playground_source_text_runs_with_step_limit() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let output = run_scenario_source_with_step_limit(
+        let output = run_legacy_scenario_source_with_step_limit(
             "playground-editor:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -68621,7 +68592,7 @@ FUNCTION decorate(value) {
     #[test]
     fn generic_source_mutations_emit_keyed_semantic_deltas() {
         let todo_source = include_str!("../../../examples/todomvc.bn");
-        let todo_output = run_scenario_source_with_step_limit(
+        let todo_output = run_legacy_scenario_source_with_step_limit(
             "generic-delta:todomvc",
             todo_source,
             Path::new("../../examples/todomvc.scn"),
@@ -68643,7 +68614,7 @@ FUNCTION decorate(value) {
         ));
 
         let cells_source = cells_project_source_for_test();
-        let cells_output = run_scenario_source_with_step_limit(
+        let cells_output = run_legacy_scenario_source_with_step_limit(
             "generic-delta:cells",
             &cells_source,
             Path::new("../../examples/cells.scn"),
@@ -71588,7 +71559,7 @@ FUNCTION new_todo(title) {
     fn executable_surface_must_match_typed_ir_profile() {
         let source = include_str!("../../../examples/todomvc.bn")
             .replace("        completed:\n", "        done:\n");
-        let err = run_scenario_source_with_step_limit(
+        let err = run_legacy_scenario_source_with_step_limit(
             "playground-editor:todomvc",
             &source,
             Path::new("../../examples/todomvc.scn"),
@@ -71606,7 +71577,7 @@ FUNCTION new_todo(title) {
 
         let renamed_row_source =
             include_str!("../../../examples/todomvc.bn").replace("todo_checkbox", "done_checkbox");
-        run_scenario_source_with_step_limit(
+        run_legacy_scenario_source_with_step_limit(
             "playground-editor:todomvc",
             &renamed_row_source,
             Path::new("../../examples/todomvc.scn"),
@@ -71618,7 +71589,7 @@ FUNCTION new_todo(title) {
         let renamed_cell_source = cells_project_source_for_test()
             .replace("editor.commit", "editor.apply")
             .replace("commit: SOURCE", "apply: SOURCE");
-        run_scenario_source_with_step_limit(
+        run_legacy_scenario_source_with_step_limit(
             "playground-editor:cells",
             &renamed_cell_source,
             Path::new("../../examples/cells.scn"),
@@ -71632,7 +71603,7 @@ FUNCTION new_todo(title) {
             "compute_value(address: address, formula_text: formula_text)",
             &format!("{legacy_eval}(formula_text)"),
         );
-        let err = run_scenario_source_with_step_limit(
+        let err = run_legacy_scenario_source_with_step_limit(
             "playground-editor:cells",
             &cells_source,
             Path::new("../../examples/cells.scn"),
@@ -82147,7 +82118,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 .into_step(1),
             ],
         };
-        let output = run_loaded_scenario(&parsed, &ir, &scenario, VerificationLayer::Speed)
+        let output = run_legacy_loaded_scenario(&parsed, &ir, &scenario, VerificationLayer::Speed)
             .expect("TodoMVC count delta scenario should run");
         let step = &output.report["per_step_pass_fail"][0];
         assert_eq!(step["list_delta_operator_hits"], json!(2));

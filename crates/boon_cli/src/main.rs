@@ -4,8 +4,8 @@ use boon_compiler::{compile_source_path_to_full_ir, compile_typed_program};
 use boon_plan::{TargetProfile, verify_plan};
 use boon_runtime::{
     VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report,
-    run_plan_initial_state, run_plan_root_scalar_scenario, run_plan_scenario_events,
-    run_plan_source_route, run_scenario, write_json,
+    run_legacy_scenario, run_plan_initial_state, run_plan_root_scalar_scenario,
+    run_plan_scenario_events, run_plan_source_route, write_json,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -198,7 +198,7 @@ fn run_legacy_scenario_diagnostic(args: &[String]) -> Result<(), Box<dyn std::er
         None => default_scenario(source)?,
     };
     let report = report.or_else(|| default_cli_report(source, &scenario));
-    let output = run_scenario(
+    let output = run_legacy_scenario(
         Path::new(source),
         Path::new(&scenario),
         VerificationLayer::Semantic,

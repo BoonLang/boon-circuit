@@ -3906,6 +3906,16 @@ fn eval_root_source_transform_row_expression(
             }
             Ok(JsonValue::String(text))
         }
+        PlanRowExpression::Object { fields } => {
+            let mut object = JsonMap::with_capacity(fields.len());
+            for field in fields {
+                object.insert(
+                    field.name.clone(),
+                    eval_root_source_transform_row_expression(plan, root_state, &field.value)?,
+                );
+            }
+            Ok(JsonValue::Object(object))
+        }
         PlanRowExpression::ObjectField { object, field } => {
             let value = eval_root_source_transform_row_expression(plan, root_state, object)?;
             value

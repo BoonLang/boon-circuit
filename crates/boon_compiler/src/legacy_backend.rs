@@ -1725,14 +1725,16 @@ fn source_event_transform_text_path_expression(
         field,
     } = &input
     {
-        input = source_payload_backing_row_state(
+        if let Some(backing_state) = source_payload_backing_row_state(
             program,
             index,
             source,
             *payload_source_id,
             field,
             derived.indexed,
-        )?;
+        ) {
+            input = backing_state;
+        }
     }
     if !inputs.contains(&input) {
         inputs.push(input.clone());
@@ -2721,6 +2723,21 @@ fn lower_row_statement_value(
     statement: &AstStatement,
 ) -> Option<LoweredRowValue> {
     if let Some(expr_id) = statement.expr {
+        if !statement.children.is_empty()
+            && let Some(value) = lower_row_call_statement_with_field_args(
+                program,
+                derived,
+                index,
+                constants,
+                inputs,
+                env,
+                expr_value_types,
+                statement,
+                expr_id,
+            )
+        {
+            return Some(value);
+        }
         if let Some(value) = lower_row_while_statement(
             program,
             derived,
@@ -2767,6 +2784,50 @@ fn lower_row_statement_value(
         env,
         expr_value_types,
         expr_id,
+    )
+}
+
+fn lower_row_call_statement_with_field_args(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    env: &mut BTreeMap<String, LoweredRowValue>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    statement: &AstStatement,
+    expr_id: usize,
+) -> Option<LoweredRowValue> {
+    let expr = expr_by_id(program, expr_id)?;
+    let AstExprKind::Call { function, args } = &expr.kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let mut call_args = Vec::new();
+    for child in &statement.children {
+        let AstStatementKind::Field { name } = &child.kind else {
+            return None;
+        };
+        let value = child.expr?;
+        call_args.push(AstCallArg {
+            name: Some(name.clone()),
+            value,
+            start: child.start,
+            end: child.end,
+        });
+    }
+    lower_row_function_call(
+        program,
+        derived,
+        index,
+        constants,
+        inputs,
+        env,
+        expr_value_types,
+        function,
+        &call_args,
     )
 }
 
@@ -2822,42 +2883,17 @@ fn lower_row_while_statement(
         if let Some(binding) = binding {
             arm_env.insert(binding, LoweredRowValue::Scalar(input_expression.clone()));
         }
-        let arm_value = if let Some(output) = output {
-            if row_expr_is_block_marker(program, *output) && !child.children.is_empty() {
-                lower_row_function_body(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    child,
-                    &mut arm_env,
-                    expr_value_types,
-                )?
-            } else {
-                lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut arm_env,
-                    expr_value_types,
-                    *output,
-                )?
-            }
-        } else {
-            lower_row_function_body(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                child,
-                &mut arm_env,
-                expr_value_types,
-            )?
-        };
+        let arm_value = lower_row_match_arm_output(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            child,
+            &mut arm_env,
+            expr_value_types,
+            *output,
+        )?;
         arms.push(PlanRowSelectArm {
             pattern: select_pattern,
             value: lowered_scalar(arm_value)?,
@@ -2911,42 +2947,17 @@ fn lower_row_equality_while_statement(
             return None;
         }
         let mut arm_env = env.clone();
-        let arm_value = if let Some(output) = output {
-            if row_expr_is_block_marker(program, *output) && !child.children.is_empty() {
-                lower_row_function_body(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    child,
-                    &mut arm_env,
-                    expr_value_types,
-                )?
-            } else {
-                lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut arm_env,
-                    expr_value_types,
-                    *output,
-                )?
-            }
-        } else {
-            lower_row_function_body(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                child,
-                &mut arm_env,
-                expr_value_types,
-            )?
-        };
+        let arm_value = lower_row_match_arm_output(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            child,
+            &mut arm_env,
+            expr_value_types,
+            *output,
+        )?;
         let arm_value = lowered_scalar(arm_value)?;
         if label == "True" {
             true_value = Some(arm_value);
@@ -2974,6 +2985,68 @@ fn lower_row_equality_while_statement(
             },
         ],
     }))
+}
+
+fn lower_row_match_arm_output(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    arm_statement: &AstStatement,
+    env: &mut BTreeMap<String, LoweredRowValue>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    output: Option<usize>,
+) -> Option<LoweredRowValue> {
+    let Some(output) = output else {
+        return lower_row_function_body(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            arm_statement,
+            env,
+            expr_value_types,
+        );
+    };
+    if row_expr_is_block_marker(program, output) && !arm_statement.children.is_empty() {
+        return lower_row_function_body(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            arm_statement,
+            env,
+            expr_value_types,
+        );
+    }
+    if !arm_statement.children.is_empty()
+        && let Some(value) = lower_row_while_statement(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            arm_statement,
+            output,
+        )
+    {
+        return Some(value);
+    }
+    lower_row_expr(
+        program,
+        derived,
+        index,
+        constants,
+        inputs,
+        env,
+        expr_value_types,
+        output,
+    )
 }
 
 fn row_select_pattern_for_expr(
@@ -3987,6 +4060,7 @@ fn lower_row_function_body(
         .find(|child| matches!(child.kind, AstStatementKind::Block))
         .unwrap_or(statement);
     let mut output = None;
+    let mut object_fields = Vec::new();
     for child in &body.children {
         if let Some(previous) = output.clone() {
             env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
@@ -4005,6 +4079,12 @@ fn lower_row_function_body(
                     expr_value_types,
                     child,
                 )?;
+                if let Some(scalar) = lowered_scalar(value.clone()) {
+                    object_fields.push(PlanRowObjectField {
+                        name: name.clone(),
+                        value: scalar,
+                    });
+                }
                 env.insert(name.clone(), value);
             }
             AstStatementKind::Expression => {
@@ -4047,6 +4127,11 @@ fn lower_row_function_body(
         }
     }
     env.remove(ROW_PREVIOUS_BINDING);
+    if output.is_none() && !object_fields.is_empty() {
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::Object {
+            fields: object_fields,
+        }));
+    }
     output
 }
 
@@ -5773,6 +5858,14 @@ store: [
             True => selected_file
             False => selected_variable_file
         }
+    effective_metadata_format:
+        selected_file |> WHEN {
+            TEXT { none } => selected_variable_file
+            __ => external_file_active == Yes |> WHEN {
+                True => selected_file
+                False => selected_variable_file
+            }
+        }
     fallback_cursor:
         List/find_value(rows, field: "file", value: selected_metadata_file, target: "cursor", fallback: 7)
         |> Text/to_number()
@@ -5795,6 +5888,11 @@ document: Document/new(root: Element/label(element: [], label: store.selected_fi
             &plan.debug_map.derived_values,
             "field",
             "store.selected_metadata_file",
+        );
+        let effective_metadata_format_id = debug_entry_id(
+            &plan.debug_map.derived_values,
+            "field",
+            "store.effective_metadata_format",
         );
         let selected_metadata_file = plan
             .regions
@@ -5820,6 +5918,34 @@ document: Document/new(root: Element/label(element: [], label: store.selected_fi
                 }
             ),
             "equality-driven WHEN should lower to an executable row-expression select"
+        );
+        let effective_metadata_format = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+            .flat_map(|region| region.ops.iter())
+            .find(|op| {
+                matches!(
+                    op.output,
+                    Some(ValueRef::Field(field_id)) if field_id.0 == effective_metadata_format_id
+                )
+            })
+            .expect("store.effective_metadata_format should have a derived op");
+        assert!(
+            matches!(
+                &effective_metadata_format.kind,
+                PlanOpKind::DerivedValue {
+                    derived_kind: PlanDerivedKind::Pure,
+                    expression: Some(PlanDerivedExpression::RowExpression {
+                        expression: PlanRowExpression::Select { arms, .. }
+                    }),
+                    ..
+                } if arms.iter().any(|arm| matches!(
+                    arm.pattern,
+                    PlanRowSelectPattern::Text { ref value } if value == "none"
+                ))
+            ),
+            "value-driven block-form WHEN with nested WHEN arm output should lower generically"
         );
 
         let zoom_center = plan

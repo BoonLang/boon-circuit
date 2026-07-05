@@ -5583,6 +5583,20 @@ fn execute_indexed_update_branch(
         list_state,
         row_index,
     )?;
+    let _pre_read_currentness_deltas = refresh_indexed_derived_fields_for_row_with_options(
+        plan,
+        list_slot,
+        &list_label,
+        list_state,
+        row_index,
+        IndexedDerivedRefreshOptions {
+            suppress_recursive_cycle_values: false,
+            sort_cycle_error_first: true,
+            evaluate_demand_current_ops: true,
+            emit_demand_current_deltas: false,
+            changed_root_states: None,
+        },
+    )?;
     let rows = list_state
         .get_mut(&list_slot.list_id.0)
         .ok_or_else(|| format!("list state missing list {}", list_slot.list_id.0))?;

@@ -37435,3 +37435,57 @@ Remaining cleanup:
 - Do not reintroduce legacy runtime comparison to hide those failures. The next
   slice should either implement the missing PlanExecutor semantics or retire the
   obsolete scenario expectations that only prove old runtime behavior.
+
+## 2026-07-05 - NovyWave Bridge Root Objects Advanced On PlanExecutor
+
+Status: continued the PlanExecutor migration without restoring legacy runtime
+fallback. The NovyWave bridge verifier still fails, but the failure moved from
+missing root bridge data to narrower PlanExecutor coverage gaps.
+
+What changed:
+
+- Root block-form `WHEN` lowering now handles nested block-form `WHEN` match-arm
+  outputs generically. NovyWave fields such as
+  `store.effective_metadata_format`, digest, waveform ref, stats, and large-file
+  contract now lower to executable MachinePlan row expressions instead of
+  expression-less pure derived ops.
+- Source-event transform lowering now preserves typed `SourcePayload(Text)` refs
+  for root text-source arms when there is no backing state slot. This fixes
+  `store.diagnostic_file` and allows `store.bridge_diagnostic` and
+  `store.bridge_open_result` to materialize through PlanExecutor.
+- The NovyWave bridge verifier now consumes the PlanExecutor full state summary
+  for bridge contract checks and reconstructs nested objects from flat
+  `store.foo.bar` summary paths. Product/document preview summaries remain
+  preview-limited.
+- Live PlanExecutor indexed update handling now refreshes the selected row's
+  indexed derived fields before evaluating an indexed update branch, establishing
+  a generic currentness barrier before `ReadPath` updates.
+
+Fresh evidence:
+
+- `boon_cli dump-plan examples/novywave/RUN.bn` report status: pass.
+- Unsupported CPU PlanExecutor op count in the fresh NovyWave plan dropped from
+  `420` before this sequence to `392`.
+- `store.bridge_open_result` now appears in
+  `target/reports/novywave-bridge-scenario-planexecutor-cut.json` with
+  `result_type=OpenResult`, nested `ArtifactRef`, nested `BlobRef`, and
+  `BridgeDiagnostic`.
+- `cargo xtask verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario-planexecutor-cut.json`: still fails,
+  now on page-ref/page metadata projection coverage and indexed scenario replay
+  gaps rather than missing `bridge_open_result`.
+
+Remaining cleanup:
+
+- Root object-field projection lowering is still incomplete for page-ref/page
+  metadata fields such as `bridge_hierarchy_page_ref.artifact_digest`,
+  `schema_version`, `schema_hash`, request/response/input/page digests, and
+  generation. The parent page-ref expressions exist, but many child projections
+  still lower as expression-less pure derived ops.
+- Indexed scenario replay still has generic PlanExecutor gaps: target-text row
+  lookup misses, non-text source-payload writes to boolean row state, and two
+  `ReadPath` steps still missing `initial_formatter`.
+- The next large cut should be either generic root object-field projection
+  lowering/materialization or indexed row routing/update semantics. Do not
+  patch NovyWave-specific bridge constants or re-enable legacy comparison to
+  pass this verifier.

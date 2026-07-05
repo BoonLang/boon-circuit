@@ -2693,13 +2693,14 @@ Commands run:
 
 Evidence classification:
 
-- This does not remove the remaining native GPU LayoutFrame compatibility
-  adapters; it makes them observable in frame metrics so later gates/reports
-  can distinguish real retained render-scene use from legacy compatibility.
-- The main preview and dev visible render hooks already use external
-  `SurfaceRenderSceneRequest`; the remaining LayoutFrame paths are app-owned
-  proof/readback and low-level compatibility APIs that still lack a cached
-  document snapshot.
+- Superseded on 2026-07-05: the native GPU LayoutFrame compatibility adapters
+  were later removed. Current architecture verification checks that
+  `SurfaceRenderRequest`, `encode_layout_to_surface*`,
+  `render_app_owned_pixels(LayoutFrame)`, and the app-owned LayoutFrame proof
+  adapter remain absent.
+- The main preview, dev visible render hooks, and app-owned proof/readback now
+  use external `SurfaceRenderSceneRequest` / document `RenderScene` boundaries
+  instead of LayoutFrame render/proof adapters.
 - This does not complete retained incremental layout, broad source-binding
   protocol migration, `TASK-0804A`, BYTES aggregate freshness, or the Phase 10
   default executor switch.

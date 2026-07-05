@@ -54,9 +54,15 @@ Current checkpoint:
   through `LoadedRuntimeHarness`; the `LiveRuntime::*_legacy` constructor
   methods have been deleted, and `verify-compiler-boundaries` rejects
   reintroducing those constructor methods or direct `LiveRuntime::*_legacy`
-  calls. The remaining legacy cuts are deleting or migrating the test-only `LoadedRuntime` /
-  `GenericScheduledRuntime` coverage island and any native legacy negative
-  counters that are no longer useful as removal guards.
+  calls. The raw `run_loaded_runtime_scenario*` helpers and the old
+  `run_loaded_runtime_source_initial_state` diagnostic helper have now been
+  deleted from `boon_runtime`, along with the generic `ScenarioExecutor` trait,
+  the old `run_generic_scenario` report loop, `base_example_report`,
+  `enrich_report`, retired runtime change-batch protocol helpers, and the
+  obsolete `RuntimeProfile` report enum. Do not recreate them to make stale
+  report tests pass. The remaining legacy cuts are deleting or migrating the
+  test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage island and any
+  native legacy negative counters that are no longer useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

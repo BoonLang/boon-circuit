@@ -37766,3 +37766,48 @@ What changed:
 
 Fresh `verify-compiler-boundaries` and schema validation passed with all five
 renamed booleans true.
+
+## 2026-07-05 - Raw LoadedRuntime Scenario Helpers Removed
+
+Status: removed the old raw scenario proof entrypoint from `boon_runtime`.
+This is a destructive cleanup slice, not a complete old-runtime deletion.
+
+What changed:
+
+- Deleted the remaining `run_loaded_runtime_scenario*` test helpers, including
+  the source/project/step-limited variants and the compiled helper.
+- Deleted the unused `run_loaded_runtime_source_initial_state` diagnostic
+  report helper.
+- Deleted the generic `ScenarioExecutor` trait, the `LoadedRuntime` trait impl,
+  the old `run_generic_scenario` report loop, and the orphaned example-report
+  assembly helpers (`base_example_report`, `enrich_report`, runtime change
+  batch protocol helpers, and the retired `RuntimeProfile` report enum).
+- Removed obsolete tests that used raw LoadedRuntime scenario replay as product
+  evidence for TodoMVC, Cells, semantic-delta protocol batches, developer state
+  summaries, source mutation deltas, capacity errors, executable-surface shape,
+  and list-delta per-step reports.
+- Removed old LoadedRuntime scenario-oracle calls from compiled-artifact table
+  decoding tests. PlanExecutor artifact scenario parity remains the product
+  evidence.
+
+Verification:
+
+- `cargo fmt -- --check`
+- `cargo test -q -p boon_runtime --lib --no-run`
+- `cargo xtask verify-compiler-boundaries --report
+  target/reports/debug/compiler-boundaries.json` reported `status=pass` with
+  zero blockers.
+- `cargo xtask verify-runtime-change-sets --report
+  target/reports/unified/runtime-change-sets.json` reported `status=pass` after
+  moving the gate from retired `RuntimeChangeBatch`/LoadedRuntime scenario
+  proof to focused PlanExecutor route delta, field-set coalescing, and scenario
+  expectation checks.
+
+Remaining cleanup:
+
+- `LoadedRuntime`, `GenericScheduledRuntime`, `LoadedRuntimeHarness`, and many
+  internal old-runtime unit tests still exist inside `boon_runtime`.
+- The next destructive cut should either migrate a coherent group of those
+  tests to PlanExecutor/direct MachinePlan coverage, or delete obsolete
+  storage-runtime tests outright. Do not recreate raw scenario helpers to make
+  old report surfaces pass.

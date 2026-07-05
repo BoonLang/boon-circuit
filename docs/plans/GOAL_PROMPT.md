@@ -63,10 +63,13 @@ Current checkpoint:
   report tests pass. The old product-style `LoadedRuntimeHarness` live-source
   cluster for TodoMVC/Counter/NovyWave has also been cut, with PlanExecutor
   replacement tests for source-batch sequence/event-id rejection and duplicate
-  TodoMVC occurrence routing. The remaining legacy cuts are deleting or
-  migrating the test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage
-  island, now mostly lower-level runtime/list/currentness diagnostics, and any
-  native legacy negative counters that are no longer useful as removal guards.
+  TodoMVC occurrence routing; the last direct `LoadedRuntimeHarness::new` test
+  was deleted as an obsolete row-local TodoMVC edit-mode expectation. The
+  remaining legacy cuts are deleting or migrating the test-only `LoadedRuntime`
+  / `GenericScheduledRuntime` coverage island, now mostly lower-level runtime/
+  list/currentness diagnostics plus explicit `LoadedRuntimeHarness::from_*`
+  diagnostics, and any native legacy negative counters that are no longer
+  useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

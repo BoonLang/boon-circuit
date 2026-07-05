@@ -67651,43 +67651,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
-    fn live_runtime_keeps_one_todomvc_row_in_edit_mode() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "todo.sources.todo_title_element.double_click".to_owned(),
-                target_text: Some("Read documentation".to_owned()),
-                target_occurrence: Some(1),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "todo.sources.todo_title_element.double_click".to_owned(),
-                target_text: Some("Finish TodoMVC renderer".to_owned()),
-                target_occurrence: Some(1),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let editing = output
-            .state_summary
-            .get("todos")
-            .and_then(JsonValue::as_array)
-            .unwrap()
-            .iter()
-            .filter(|todo| todo["editing"] == true)
-            .collect::<Vec<_>>();
-        assert_eq!(editing.len(), 1);
-        assert_eq!(editing[0]["title"], "Finish TodoMVC renderer");
-    }
-
-    #[test]
     fn live_runtime_routes_physical_todomvc_row_edit_events_by_target_text() {
         let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/todo_mvc_physical/RUN.bn");

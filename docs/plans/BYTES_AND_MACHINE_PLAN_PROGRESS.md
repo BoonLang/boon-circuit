@@ -37829,6 +37829,10 @@ What changed:
   - duplicate TodoMVC title routing by `target_occurrence`.
 - Removed the now-unused `lower_profiled` runtime test import that only existed
   for the deleted NovyWave debug assertion.
+- Deleted the remaining direct `LoadedRuntimeHarness::new` TodoMVC edit-mode
+  test instead of migrating it. The current TodoMVC source and circuit-style
+  docs model editing as row-local state; forcing a single editing row would
+  preserve an old harness expectation the Boon model does not express.
 
 Verification:
 
@@ -37843,7 +37847,8 @@ Remaining cleanup:
 
 - Current `boon_runtime` old-runtime references still include
   `LoadedRuntimeHarness::from_source`, `LoadedRuntimeHarness::from_project`,
-  `LoadedRuntime`, and `GenericScheduledRuntime`.
+  `LoadedRuntime`, and `GenericScheduledRuntime`; direct
+  `LoadedRuntimeHarness::new` calls are gone.
 - The remaining old runtime island is now mostly lower-level runtime/list/
   currentness coverage plus explicit diagnostics. Next cuts should migrate
   essential engine semantics to PlanExecutor/MachinePlan tests or delete

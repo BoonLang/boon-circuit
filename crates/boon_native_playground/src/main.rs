@@ -44900,7 +44900,7 @@ fn preview_apply_selection_proxy_focus_overlay(
     let focused_caret_index = input_state.focused_caret_index;
     let replace_focused_text_on_next_edit = input_state.replace_focused_text_on_next_edit;
     let selected_address = input_state.focused_address.clone();
-    let selected_nodes = input_state.selected_overlay_nodes.clone();
+    let mut selected_nodes = input_state.selected_overlay_nodes.clone();
     if selected_nodes.is_empty()
         && let Some(address) = selected_address.as_deref()
     {
@@ -44911,7 +44911,8 @@ fn preview_apply_selection_proxy_focus_overlay(
                 target_nodes.extend(preview_current_selected_display_nodes(frame));
             }
         } else {
-            target_nodes.extend(address_nodes);
+            target_nodes.extend(address_nodes.iter().cloned());
+            selected_nodes = address_nodes;
         }
     }
     if target_nodes.is_empty() {

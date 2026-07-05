@@ -110,6 +110,9 @@ What changed:
   deleted instead of left as dead compatibility code.
 - The selected-overlay helper no longer exposes an `allow_fallback_scan` branch;
   the only product lookup path is indexed source-intent identity.
+- Indexed selected-address nodes are promoted into the selected-node patch state
+  before retained items are visited, avoiding per-item address fallback on the
+  product focus overlay path when indexed identity is available.
 
 Fresh evidence:
 
@@ -157,6 +160,11 @@ Fresh Cells report summary:
   `runtime_work_contract.total_list_find_rows_scanned=0`.
 - After removing the dead `allow_fallback_scan` branch, the refreshed release
   report still passes: product-only UX `p95=12.134ms`, `max=12.615ms`,
+  `legacy_selection_fallback_count=0`, and
+  `runtime_work_contract.total_list_find_rows_scanned=0`.
+- After promoting indexed selected-address nodes into the selected-node patch
+  state, the refreshed release report still passes: product-only UX
+  `p95=12.232ms`, `max=13.046ms`,
   `legacy_selection_fallback_count=0`, and
   `runtime_work_contract.total_list_find_rows_scanned=0`.
 

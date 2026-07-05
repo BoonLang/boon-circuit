@@ -3742,6 +3742,7 @@ pub fn run_plan_source_route(
                 route_context.selection.source_id,
                 &route_context.source_route_slot,
                 &event,
+                None,
                 &root_state.root_state,
                 &root_state.private_bytes,
                 &root_state.fixed_byte_banks,
@@ -4183,7 +4184,13 @@ impl PlanExecutorRuntimeState {
             &mut self.list_next_keys,
             &mut self.list_append_row_bool_delta_lists,
             &derived_values,
-            eval_plan_row_expression,
+            |plan, list_state, row, expression| {
+                eval_plan_row_expression(plan, list_state, row, expression).map_err(
+                    |error| -> Box<dyn std::error::Error> {
+                        format!("PlanExecutor list append row {}: {error}", row.key).into()
+                    },
+                )
+            },
         )?;
         for delta in &append_result.semantic_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -4267,6 +4274,13 @@ impl PlanExecutorRuntimeState {
                                 &root_derived_values_before_updates,
                                 host_file_root,
                             )
+                            .map_err(|error| -> Box<dyn std::error::Error> {
+                                format!(
+                                    "PlanExecutor indexed update op {} per-row override for source {}: {error}",
+                                    op.id.0, source_id.0
+                                )
+                                .into()
+                            })
                         } else {
                             execute_indexed_update_branch(
                                 plan,
@@ -4279,9 +4293,23 @@ impl PlanExecutorRuntimeState {
                                 &root_derived_values_before_updates,
                                 host_file_root,
                             )
+                            .map_err(|error| -> Box<dyn std::error::Error> {
+                                format!(
+                                    "PlanExecutor indexed update op {} for source {}: {error}",
+                                    op.id.0, source_id.0
+                                )
+                                .into()
+                            })
                         }
                     },
-                )?;
+                )
+                .map_err(|error| -> Box<dyn std::error::Error> {
+                    format!(
+                        "PlanExecutor indexed update batch op {} for source {}: {error}",
+                        op.id.0, source_id.0
+                    )
+                    .into()
+                })?;
                 pending_indexed_deltas.extend(indexed_batch.semantic_deltas);
                 self.executed_update_branch_count += indexed_batch.updated_row_count;
                 self.executed_indexed_update_count += indexed_batch.updated_row_count;
@@ -4297,11 +4325,19 @@ impl PlanExecutorRuntimeState {
                     source_id,
                     source_route_slot,
                     &event,
+                    Some(&self.list_state),
                     &staged_state.root_state,
                     &staged_state.private_bytes,
                     &staged_state.fixed_byte_banks,
                     host_file_root,
                 )
+                .map_err(|error| -> Box<dyn std::error::Error> {
+                    format!(
+                        "PlanExecutor root update op {} for source {}: {error}",
+                        op.id.0, source_id.0
+                    )
+                    .into()
+                })
             };
             collect_plan_root_update_candidate_for_step(
                 plan,
@@ -4887,12 +4923,6 @@ fn execute_machine_plan_root_scenario_inner(
         )
         .into());
     }
-    if !plan.capability_summary.typed_lowering_executable {
-        return Err(
-            "CPU root-scenario PlanExecutor requires typed_lowering_executable=true".into(),
-        );
-    }
-
     let mut runtime = PlanExecutorRuntimeState::new(plan)?;
     for step in selected_steps {
         runtime.apply_step(plan, step, host_file_root)?;
@@ -7297,6 +7327,120 @@ fn root_state_value<'a>(
     })
 }
 
+fn root_update_value_ref_json(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    event: &LiveSourceEvent,
+    source_route_slot: &boon_plan::SourceRoute,
+    input: &ValueRef,
+    op_id: usize,
+) -> RuntimeResult<JsonValue> {
+    match input {
+        ValueRef::State(state_id) => {
+            Ok(root_state_value(plan, root_state, *state_id, op_id)?.clone())
+        }
+        ValueRef::Field(field_id) => {
+            let semantic_label = plan_semantic_field_label(plan, field_id.0);
+            if let Some(value) = root_state.get(&semantic_label).cloned() {
+                return Ok(value);
+            }
+            let local_name = local_field_name(&semantic_label);
+            if let Some(value) =
+                root_update_event_field_value(event, source_route_slot, &local_name)
+            {
+                return Ok(value);
+            }
+            Err(format!(
+                "root update branch {op_id} cannot resolve field input `{semantic_label}` from root state or source event"
+            )
+            .into())
+        }
+        ValueRef::SourcePayload { source_id, field } => {
+            if *source_id != source_route_slot.source_id {
+                return Err(format!(
+                    "root update branch {op_id} source payload input belongs to source {} but route source is {}",
+                    source_id.0, source_route_slot.source_id.0
+                )
+                .into());
+            }
+            source_payload_json_value(event, field)
+        }
+        ValueRef::Constant(constant_id) => plan
+            .constants
+            .iter()
+            .find(|constant| constant.id == *constant_id)
+            .ok_or_else(|| {
+                format!(
+                    "root update branch {op_id} missing constant {}",
+                    constant_id.0
+                )
+                .into()
+            })
+            .and_then(plan_executor_constant_json_value),
+        other => Err(format!(
+            "root update branch {op_id} cannot resolve non-scalar input `{other:?}`"
+        )
+        .into()),
+    }
+}
+
+fn root_update_event_field_value(
+    event: &LiveSourceEvent,
+    source_route_slot: &boon_plan::SourceRoute,
+    field_name: &str,
+) -> Option<JsonValue> {
+    if source_route_slot.payload_schema.row_lookup_field_name() == Some(field_name) {
+        return live_source_event_payload_text_value(event, field_name)
+            .or_else(|| event.address.as_deref())
+            .map(|value| JsonValue::String(value.to_owned()));
+    }
+    live_source_event_payload_text_value(event, field_name)
+        .map(|value| JsonValue::String(value.to_owned()))
+}
+
+fn live_source_event_payload_text_value<'a>(
+    event: &'a LiveSourceEvent,
+    field: &str,
+) -> Option<&'a str> {
+    match field {
+        "key" => event.key.as_deref(),
+        "text" => event.text.as_deref(),
+        "address" => event.address.as_deref(),
+        "pointer_x" => event
+            .pointer_x
+            .as_deref()
+            .or_else(|| event.payload.get(field).map(String::as_str)),
+        "pointer_y" => event
+            .pointer_y
+            .as_deref()
+            .or_else(|| event.payload.get(field).map(String::as_str)),
+        "pointer_width" => event
+            .pointer_width
+            .as_deref()
+            .or_else(|| event.payload.get(field).map(String::as_str)),
+        "pointer_height" => event
+            .pointer_height
+            .as_deref()
+            .or_else(|| event.payload.get(field).map(String::as_str)),
+        _ => event.payload.get(field).map(String::as_str),
+    }
+}
+
+fn plan_initial_list_rows_for_root_lookup(
+    plan: &MachinePlan,
+    list_id: boon_plan::ListId,
+    op_id: usize,
+) -> RuntimeResult<Vec<PlanListRowState>> {
+    let mut lists = plan_initial_list_state(plan)?;
+    lists.remove(&list_id.0).ok_or_else(|| {
+        format!(
+            "root List/find_value update branch {op_id} list {} is missing from initial list state",
+            list_id.0
+        )
+        .into()
+    })
+}
+
 fn root_fixed_bytes_report_json(bytes: &[u8]) -> JsonValue {
     json!({
         "$boon_type": "BYTES",
@@ -7751,8 +7895,17 @@ fn apply_indexed_source_event_transforms_for_row(
         let Some(arm) = arms.iter().find(|arm| arm.source_id == source_id) else {
             continue;
         };
+        if plan_row_expression_row_input_missing(plan, &row_eval, &arm.value) {
+            continue;
+        }
         let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
-        let value = eval_plan_row_expression(plan, list_state, &row_eval, &arm.value)?;
+        let value =
+            eval_plan_row_expression(plan, list_state, &row_eval, &arm.value).map_err(|error| {
+                format!(
+                    "indexed source event transform op {} row {}: {error}",
+                    op.id.0, row_eval.key
+                )
+            })?;
         if row_eval.fields.get(&output_name) == Some(&value) {
             continue;
         }
@@ -7938,8 +8091,17 @@ fn stale_empty_text_indexed_derived_deltas(
         {
             continue;
         }
+        if plan_row_expression_row_input_missing(plan, row, expression) {
+            continue;
+        }
         let output_name = local_field_name(&plan_semantic_field_label(plan, output_id.0));
-        let value = eval_plan_row_expression(plan, list_state, row, expression)?;
+        let value =
+            eval_plan_row_expression(plan, list_state, row, expression).map_err(|error| {
+                format!(
+                    "stale empty indexed derived op {} row {}: {error}",
+                    op.id.0, row.key
+                )
+            })?;
         if value.as_str() != Some("") || row.fields.get(&output_name) != Some(&value) {
             continue;
         }
@@ -8426,9 +8588,14 @@ fn eval_indexed_derived_row_value(
             if !plan_row_expression_applies_to_list(plan, list_slot, output_id) {
                 return Ok(None);
             }
-            Ok(Some(eval_plan_row_expression(
-                plan, list_state, row, expression,
-            )?))
+            if plan_row_expression_row_input_missing(plan, row, expression) {
+                return Ok(None);
+            }
+            Ok(Some(
+                eval_plan_row_expression(plan, list_state, row, expression).map_err(|error| {
+                    format!("indexed derived op {} row {}: {error}", op.id.0, row.key)
+                })?,
+            ))
         }
         _ => Ok(None),
     }
@@ -8440,6 +8607,7 @@ fn execute_root_scalar_update_branch(
     source_id: SourceId,
     source_route_slot: &boon_plan::SourceRoute,
     event: &LiveSourceEvent,
+    list_state: Option<&BTreeMap<usize, Vec<PlanListRowState>>>,
     root_state: &serde_json::Map<String, JsonValue>,
     root_bytes_state: &RootBytesState,
     root_fixed_bytes_banks: &RootFixedBytesBanks,
@@ -8819,6 +8987,78 @@ fn execute_root_scalar_update_branch(
             )
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::ListFindValue,
+            source_payload_field: None,
+            update_constant_id: None,
+            ordered_inputs,
+            ..
+        } => {
+            let [
+                ValueRef::List(list_id),
+                ValueRef::Field(field_id),
+                expected_ref,
+                ValueRef::Field(target_id),
+                rest @ ..,
+            ] = ordered_inputs.as_slice()
+            else {
+                return Err(format!(
+                    "root List/find_value update branch {} ordered inputs must be list, field, expected, target, optional fallback; got {:?}",
+                    op.id.0, ordered_inputs
+                )
+                .into());
+            };
+            let expected = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                expected_ref,
+                op.id.0,
+            )?;
+            let field_name = plan_row_field_local_name(plan, *field_id);
+            let target_name = plan_row_field_local_name(plan, *target_id);
+            let initial_rows;
+            let rows: &[PlanListRowState] =
+                if let Some(rows) = list_state.and_then(|lists| lists.get(&list_id.0)) {
+                    rows
+                } else {
+                    initial_rows = plan_initial_list_rows_for_root_lookup(plan, *list_id, op.id.0)?;
+                    &initial_rows
+                };
+            let value = rows
+                .iter()
+                .find(|row| row_json_values_equal(row.fields.get(&field_name), &expected))
+                .and_then(|row| row.fields.get(&target_name).cloned());
+            let value = match value {
+                Some(value) => value,
+                None => {
+                    let Some(fallback_ref) = rest.first() else {
+                        return Err(format!(
+                            "root List/find_value update branch {} found no row and has no fallback",
+                            op.id.0
+                        )
+                        .into());
+                    };
+                    root_update_value_ref_json(
+                        plan,
+                        root_state,
+                        event,
+                        source_route_slot,
+                        fallback_ref,
+                        op.id.0,
+                    )?
+                }
+            };
+            (
+                value,
+                None,
+                "list_find_value",
+                JsonValue::Null,
+                JsonValue::Null,
+                JsonValue::Null,
+            )
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::TextTrimOrPrevious,
             source_payload_field,
             update_constant_id: None,
@@ -9096,7 +9336,7 @@ fn eval_plan_row_expression_with_stack(
     stack: &[PlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
     match expression {
-        PlanRowExpression::Field { input } => eval_plan_row_field_ref(plan, row, input),
+        PlanRowExpression::Field { input } => eval_plan_row_field_ref(plan, row, input, stack),
         PlanRowExpression::Constant { constant_id } => {
             let constant = plan
                 .constants
@@ -9637,6 +9877,172 @@ fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -
     local_field_name(&plan_semantic_field_label(plan, field_id.0))
 }
 
+fn plan_row_expression_row_input_missing(
+    plan: &MachinePlan,
+    row: &PlanListRowState,
+    expression: &PlanRowExpression,
+) -> bool {
+    match expression {
+        PlanRowExpression::Field { input } => {
+            let input_name = match input {
+                ValueRef::Field(field_id) => {
+                    local_field_name(&plan_semantic_field_label(plan, field_id.0))
+                }
+                ValueRef::State(state_id) => local_field_name(&plan_state_label(plan, state_id.0)),
+                _ => return false,
+            };
+            !row.fields.contains_key(&input_name)
+        }
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::TextToBytes { input, .. }
+        | PlanRowExpression::BytesToText { input, .. }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input }
+        | PlanRowExpression::BytesZeros { byte_count: input }
+        | PlanRowExpression::BytesTake { input, .. }
+        | PlanRowExpression::BytesDrop { input, .. }
+        | PlanRowExpression::ListSum { input }
+        | PlanRowExpression::ObjectField { object: input, .. } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+        }
+        PlanRowExpression::TextStartsWith { input, prefix } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, prefix)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        }
+        | PlanRowExpression::BytesSlice {
+            input,
+            offset: start,
+            byte_count: length,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, start)
+                || plan_row_expression_row_input_missing(plan, row, length)
+        }
+        PlanRowExpression::BytesGet { input, index }
+        | PlanRowExpression::BytesFind {
+            input,
+            needle: index,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, index)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix }
+        | PlanRowExpression::BytesEndsWith {
+            input,
+            suffix: prefix,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, prefix)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, index)
+                || plan_row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, offset)
+                || plan_row_expression_row_input_missing(plan, row, byte_count)
+                || plan_row_expression_row_input_missing(plan, row, endian)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, offset)
+                || plan_row_expression_row_input_missing(plan, row, byte_count)
+                || plan_row_expression_row_input_missing(plan, row, endian)
+                || plan_row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right }
+        | PlanRowExpression::NumberInfix { left, right, .. } => {
+            plan_row_expression_row_input_missing(plan, row, left)
+                || plan_row_expression_row_input_missing(plan, row, right)
+        }
+        PlanRowExpression::TextConcat { parts } => parts
+            .iter()
+            .any(|part| plan_row_expression_row_input_missing(plan, row, part)),
+        PlanRowExpression::Object { fields } => fields
+            .iter()
+            .any(|field| plan_row_expression_row_input_missing(plan, row, &field.value)),
+        PlanRowExpression::ListGetField { index, .. } => {
+            plan_row_expression_row_input_missing(plan, row, index)
+        }
+        PlanRowExpression::ListFindValue {
+            value, fallback, ..
+        } => {
+            plan_row_expression_row_input_missing(plan, row, value)
+                || fallback.as_deref().is_some_and(|fallback| {
+                    plan_row_expression_row_input_missing(plan, row, fallback)
+                })
+        }
+        PlanRowExpression::ListRange { from, to } => {
+            plan_row_expression_row_input_missing(plan, row, from)
+                || plan_row_expression_row_input_missing(plan, row, to)
+        }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || plan_row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BuiltinCall { input, args, .. } => {
+            input
+                .as_deref()
+                .is_some_and(|input| plan_row_expression_row_input_missing(plan, row, input))
+                || args
+                    .iter()
+                    .any(|arg| plan_row_expression_row_input_missing(plan, row, &arg.value))
+        }
+        PlanRowExpression::Select { input, arms } => {
+            plan_row_expression_row_input_missing(plan, row, input)
+                || arms
+                    .iter()
+                    .any(|arm| plan_row_expression_row_input_missing(plan, row, &arm.value))
+        }
+        PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListMapItem { .. } => false,
+    }
+}
+
 fn eval_plan_row_lookup_field(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
@@ -9646,6 +10052,9 @@ fn eval_plan_row_lookup_field(
     stack: &[PlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
     let target_name = plan_row_field_local_name(plan, field);
+    if let Some(value) = row.fields.get(&target_name).cloned() {
+        return Ok(value);
+    }
     let key = PlanRowEvalKey {
         list_id: list_id.0,
         row_key: row.key,
@@ -10040,6 +10449,7 @@ fn eval_plan_row_field_ref(
     plan: &MachinePlan,
     row: &PlanListRowState,
     input: &ValueRef,
+    stack: &[PlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
     let field_name = match input {
         ValueRef::Field(field_id) => local_field_name(&plan_semantic_field_label(plan, field_id.0)),
@@ -10052,7 +10462,14 @@ fn eval_plan_row_field_ref(
         .get(&field_name)
         .cloned()
         .or_else(|| row_initial_state_fallback(plan, row, input))
-        .ok_or_else(|| format!("row expression field `{field_name}` is missing").into())
+        .ok_or_else(|| {
+            let available = row.fields.keys().cloned().collect::<Vec<_>>().join(", ");
+            format!(
+                "row expression input `{input:?}` field `{field_name}` is missing from row key {} stack {:?}; available fields: [{}]",
+                row.key, stack, available
+            )
+            .into()
+        })
 }
 
 fn row_initial_state_fallback(

@@ -2974,6 +2974,9 @@ where
         if !row_expression_applies_to_list(plan, list_slot, output_id) {
             continue;
         }
+        if row_expression_row_input_missing(plan, row, expression) {
+            continue;
+        }
         let value = evaluator(plan, list_state, row, expression)?;
         let field_name = local_field_name(&semantic_field_label(plan, output_id.0));
         row.fields.insert(field_name, value);
@@ -3074,11 +3077,180 @@ fn refresh_list_row_expression_fields_best_effort_with_startup_filter<E>(
         if !row_expression_applies_to_list(plan, list_slot, output_id) {
             continue;
         }
+        if row_expression_row_input_missing(plan, row, expression) {
+            continue;
+        }
         let Ok(value) = evaluator(plan, list_state, row, expression) else {
             continue;
         };
         let field_name = local_field_name(&semantic_field_label(plan, output_id.0));
         row.fields.insert(field_name, value);
+    }
+}
+
+fn row_expression_row_input_missing(
+    plan: &MachinePlan,
+    row: &PlanExecutorListRowState,
+    expression: &PlanRowExpression,
+) -> bool {
+    match expression {
+        PlanRowExpression::Field { input } => {
+            let input_name = match input {
+                ValueRef::Field(input_id) => {
+                    local_field_name(&semantic_field_label(plan, input_id.0))
+                }
+                ValueRef::State(input_id) => local_field_name(&state_label(plan, *input_id)),
+                _ => return false,
+            };
+            !row.fields.contains_key(&input_name)
+        }
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::TextToBytes { input, .. }
+        | PlanRowExpression::BytesToText { input, .. }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input }
+        | PlanRowExpression::BytesZeros { byte_count: input }
+        | PlanRowExpression::BytesTake { input, .. }
+        | PlanRowExpression::BytesDrop { input, .. }
+        | PlanRowExpression::ListSum { input }
+        | PlanRowExpression::ObjectField { object: input, .. } => {
+            row_expression_row_input_missing(plan, row, input)
+        }
+        PlanRowExpression::TextStartsWith { input, prefix } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, prefix)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        }
+        | PlanRowExpression::BytesSlice {
+            input,
+            offset: start,
+            byte_count: length,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, start)
+                || row_expression_row_input_missing(plan, row, length)
+        }
+        PlanRowExpression::BytesGet { input, index }
+        | PlanRowExpression::BytesFind {
+            input,
+            needle: index,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, index)
+        }
+        PlanRowExpression::BytesStartsWith { input, prefix }
+        | PlanRowExpression::BytesEndsWith {
+            input,
+            suffix: prefix,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, prefix)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, index)
+                || row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, offset)
+                || row_expression_row_input_missing(plan, row, byte_count)
+                || row_expression_row_input_missing(plan, row, endian)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, offset)
+                || row_expression_row_input_missing(plan, row, byte_count)
+                || row_expression_row_input_missing(plan, row, endian)
+                || row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right }
+        | PlanRowExpression::NumberInfix { left, right, .. } => {
+            row_expression_row_input_missing(plan, row, left)
+                || row_expression_row_input_missing(plan, row, right)
+        }
+        PlanRowExpression::TextConcat { parts } => parts
+            .iter()
+            .any(|part| row_expression_row_input_missing(plan, row, part)),
+        PlanRowExpression::Object { fields } => fields
+            .iter()
+            .any(|field| row_expression_row_input_missing(plan, row, &field.value)),
+        PlanRowExpression::ListGetField { index, .. } => {
+            row_expression_row_input_missing(plan, row, index)
+        }
+        PlanRowExpression::ListFindValue {
+            value, fallback, ..
+        } => {
+            row_expression_row_input_missing(plan, row, value)
+                || fallback
+                    .as_deref()
+                    .is_some_and(|fallback| row_expression_row_input_missing(plan, row, fallback))
+        }
+        PlanRowExpression::ListRange { from, to } => {
+            row_expression_row_input_missing(plan, row, from)
+                || row_expression_row_input_missing(plan, row, to)
+        }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            row_expression_row_input_missing(plan, row, input)
+                || row_expression_row_input_missing(plan, row, value)
+        }
+        PlanRowExpression::BuiltinCall { input, args, .. } => {
+            input
+                .as_deref()
+                .is_some_and(|input| row_expression_row_input_missing(plan, row, input))
+                || args
+                    .iter()
+                    .any(|arg| row_expression_row_input_missing(plan, row, &arg.value))
+        }
+        PlanRowExpression::Select { input, arms } => {
+            row_expression_row_input_missing(plan, row, input)
+                || arms
+                    .iter()
+                    .any(|arm| row_expression_row_input_missing(plan, row, &arm.value))
+        }
+        PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListMapItem { .. } => false,
     }
 }
 
@@ -3533,6 +3705,21 @@ pub fn evaluate_initial_root_derived_values(
     plan: &MachinePlan,
     root_state: &JsonMap<String, JsonValue>,
 ) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    evaluate_initial_root_derived_values_with_policy(plan, root_state, false)
+}
+
+fn evaluate_initial_root_derived_values_partial(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    evaluate_initial_root_derived_values_with_policy(plan, root_state, true)
+}
+
+fn evaluate_initial_root_derived_values_with_policy(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    allow_unresolved: bool,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
     let mut evaluation_state = root_state.clone();
     evaluation_state
         .entry("Router/route".to_owned())
@@ -3590,6 +3777,9 @@ pub fn evaluate_initial_root_derived_values(
             }
         }
         if !progressed {
+            if allow_unresolved {
+                return Ok(values);
+            }
             return Err(format!(
                 "initial root derived value dependency resolution stalled: {}",
                 deferred_errors.join("; ")
@@ -3625,8 +3815,9 @@ fn evaluate_root_row_expression_derived_values(
         else {
             continue;
         };
-        let value = eval_root_source_transform_row_expression(plan, root_state, expression)?;
-        values.insert(output_id, value);
+        if let Ok(value) = eval_root_source_transform_row_expression(plan, root_state, expression) {
+            values.insert(output_id, value);
+        }
     }
     Ok(values)
 }
@@ -3722,6 +3913,48 @@ fn eval_root_source_transform_row_expression(
                 .cloned()
                 .ok_or_else(|| format!("source-transform object is missing field `{field}`").into())
         }
+        PlanRowExpression::NumberInfix { op, left, right } => {
+            let left_value = eval_root_source_transform_row_expression(plan, root_state, left)?;
+            let right_value = eval_root_source_transform_row_expression(plan, root_state, right)?;
+            if root_source_transform_value_is_nan(&left_value)
+                || root_source_transform_value_is_nan(&right_value)
+            {
+                return Ok(JsonValue::String("NaN".to_owned()));
+            }
+            if op == "+"
+                && (root_source_transform_number_value(&left_value).is_none()
+                    || root_source_transform_number_value(&right_value).is_none())
+            {
+                let left_text = json_scalar_textlike(&left_value)
+                    .ok_or("source-transform + left input is not textlike")?;
+                let right_text = json_scalar_textlike(&right_value)
+                    .ok_or("source-transform + right input is not textlike")?;
+                return Ok(JsonValue::String(format!("{left_text}{right_text}")));
+            }
+            let left = root_source_transform_number_value(&left_value)
+                .ok_or("source-transform numeric left input is not a number")?;
+            let right = root_source_transform_number_value(&right_value)
+                .ok_or("source-transform numeric right input is not a number")?;
+            let value = match op.as_str() {
+                "+" => left + right,
+                "-" => left - right,
+                "*" => left * right,
+                "/" => {
+                    if right == 0 {
+                        return Err("source-transform division by zero".into());
+                    }
+                    left / right
+                }
+                "%" => {
+                    if right == 0 {
+                        return Err("source-transform modulo by zero".into());
+                    }
+                    left % right
+                }
+                _ => return Err(format!("unsupported source-transform numeric op `{op}`").into()),
+            };
+            Ok(json!(value))
+        }
         PlanRowExpression::ListFindValue {
             list_id,
             field,
@@ -3778,6 +4011,16 @@ fn eval_root_source_transform_row_expression(
         )
         .into()),
     }
+}
+
+fn root_source_transform_value_is_nan(value: &JsonValue) -> bool {
+    value.as_str() == Some("NaN")
+}
+
+fn root_source_transform_number_value(value: &JsonValue) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
 }
 
 fn initial_row_field_json_value(
@@ -4823,21 +5066,8 @@ pub fn execute_initial_state(plan: &MachinePlan) -> PlanExecutorResult<InitialSt
         .into());
     }
 
-    let pre_copy_initial_source_event_transforms =
-        evaluate_initial_root_derived_values(plan, &state_summary)?;
-    let mut source_event_transform_commits = commit_source_derived_values_to_root_state(
-        plan,
-        &mut state_summary,
-        &pre_copy_initial_source_event_transforms,
-    );
-    let root_initial_field_copy_count = copy_root_initial_fields(plan, &mut state_summary)?;
-    let post_copy_initial_source_event_transforms =
-        evaluate_initial_root_derived_values(plan, &state_summary)?;
-    source_event_transform_commits.extend(commit_source_derived_values_to_root_state(
-        plan,
-        &mut state_summary,
-        &post_copy_initial_source_event_transforms,
-    ));
+    let (source_event_transform_commits, root_initial_field_copy_count) =
+        bootstrap_root_derived_values_and_initial_fields(plan, &mut state_summary)?;
     let initialized_source_event_transform_count = source_event_transform_commits.len();
 
     let plan_hash = plan_sha256(plan)?;
@@ -5225,11 +5455,63 @@ pub fn initialize_root_bytes_storage(
     })
 }
 
-fn copy_root_initial_fields(
+fn bootstrap_root_derived_values_and_initial_fields(
     plan: &MachinePlan,
     root_state: &mut JsonMap<String, JsonValue>,
-) -> PlanExecutorResult<usize> {
-    let mut pending = plan
+) -> PlanExecutorResult<(Vec<JsonValue>, usize)> {
+    let mut commits = Vec::new();
+    let mut copied_total = 0usize;
+    let max_iterations = plan
+        .storage_layout
+        .scalar_slots
+        .len()
+        .saturating_add(
+            plan.regions
+                .iter()
+                .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+                .map(|region| region.ops.len())
+                .sum::<usize>(),
+        )
+        .max(1);
+
+    for _ in 0..max_iterations {
+        let partial_values = evaluate_initial_root_derived_values_partial(plan, root_state)?;
+        let partial_commits =
+            commit_source_derived_values_to_root_state(plan, root_state, &partial_values);
+        let changed_commit_count = partial_commits
+            .iter()
+            .filter(|commit| commit.get("changed").and_then(JsonValue::as_bool) == Some(true))
+            .count();
+        commits.extend(partial_commits);
+
+        let (copied, unresolved) = copy_resolvable_root_initial_fields(plan, root_state)?;
+        copied_total += copied;
+        if unresolved.is_empty() {
+            let final_values = evaluate_initial_root_derived_values_partial(plan, root_state)?;
+            commits.extend(commit_source_derived_values_to_root_state(
+                plan,
+                root_state,
+                &final_values,
+            ));
+            return Ok((commits, copied_total));
+        }
+        if copied == 0 && changed_commit_count == 0 {
+            return Err(format!(
+                "root initial field copy source(s) unresolved: {}",
+                unresolved.join(", ")
+            )
+            .into());
+        }
+    }
+
+    Err("root initial field and derived-value bootstrap exceeded iteration limit".into())
+}
+
+fn copy_resolvable_root_initial_fields(
+    plan: &MachinePlan,
+    root_state: &mut JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<(usize, Vec<String>)> {
+    let pending = plan
         .storage_layout
         .scalar_slots
         .iter()
@@ -5238,55 +5520,86 @@ fn copy_root_initial_fields(
         })
         .collect::<Vec<_>>();
     let mut copied = 0usize;
+    let mut unresolved = Vec::new();
 
-    while !pending.is_empty() {
-        let pending_before = pending.len();
-        let mut still_pending = Vec::new();
-        for slot in pending {
-            let target_label = state_label(plan, slot.state_id);
-            let source_path = slot
-                .initial_root_field_path
-                .as_deref()
-                .ok_or_else(|| format!("root initial field `{target_label}` has no source path"))?;
-            if let Some(value) = resolve_root_initial_field_value(root_state, source_path) {
-                root_state.insert(target_label, value);
-                copied += 1;
-            } else {
-                still_pending.push(slot);
-            }
+    for slot in pending {
+        let target_label = state_label(plan, slot.state_id);
+        if root_state.contains_key(&target_label) {
+            continue;
         }
-        if still_pending.len() == pending_before {
-            let unresolved = still_pending
-                .iter()
-                .map(|slot| {
-                    let target_label = state_label(plan, slot.state_id);
-                    let source_path = slot
-                        .initial_root_field_path
-                        .as_deref()
-                        .unwrap_or("<missing>");
-                    format!("{target_label} <- {source_path}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(
-                format!("root initial field copy source(s) unresolved: {unresolved}").into(),
-            );
+        let source_path = slot
+            .initial_root_field_path
+            .as_deref()
+            .ok_or_else(|| format!("root initial field `{target_label}` has no source path"))?;
+        if let Some(value) = resolve_root_initial_field_value(plan, root_state, source_path)? {
+            root_state.insert(target_label, value);
+            copied += 1;
+        } else {
+            unresolved.push(format!("{target_label} <- {source_path}"));
         }
-        pending = still_pending;
     }
 
-    Ok(copied)
+    Ok((copied, unresolved))
 }
 
 fn resolve_root_initial_field_value(
+    plan: &MachinePlan,
     root_state: &JsonMap<String, JsonValue>,
     source_path: &str,
-) -> Option<JsonValue> {
-    root_state.get(source_path).cloned().or_else(|| {
+) -> PlanExecutorResult<Option<JsonValue>> {
+    if let Some(value) = root_state.get(source_path).cloned().or_else(|| {
         (!source_path.contains('.'))
             .then(|| root_state.get(&format!("store.{source_path}")).cloned())
             .flatten()
-    })
+    }) {
+        return Ok(Some(value));
+    }
+    let candidate_labels = if source_path.contains('.') {
+        vec![source_path.to_owned()]
+    } else {
+        vec![source_path.to_owned(), format!("store.{source_path}")]
+    };
+    for label in candidate_labels {
+        let Some(field_id) = plan.debug_map.fields.iter().find_map(|entry| {
+            (entry.label == label)
+                .then_some(entry.id.strip_prefix("field:")?.parse::<usize>().ok()?)
+        }) else {
+            continue;
+        };
+        let Some(expression) = root_derived_expression_for_field(plan, FieldId(field_id)) else {
+            continue;
+        };
+        return Ok(eval_root_source_transform_row_expression(plan, root_state, expression).ok());
+    }
+    Ok(None)
+}
+
+fn root_derived_expression_for_field(
+    plan: &MachinePlan,
+    field_id: FieldId,
+) -> Option<&PlanRowExpression> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .find_map(|op| {
+            if op.indexed || op.output != Some(ValueRef::Field(field_id)) {
+                return None;
+            }
+            match &op.kind {
+                PlanOpKind::DerivedValue {
+                    derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                    expression: Some(PlanDerivedExpression::SourceEventTransform { default, .. }),
+                    ..
+                } => Some(default.as_ref()),
+                PlanOpKind::DerivedValue {
+                    derived_kind: boon_plan::PlanDerivedKind::Pure,
+                    expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                    ..
+                } => Some(expression),
+                _ => None,
+            }
+        })
 }
 
 pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecutorRootState> {
@@ -5308,22 +5621,9 @@ pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecu
         root_state.insert(state_label(plan, slot.state_id), value);
         initialized_state_count += 1;
     }
-    let pre_copy_initial_source_event_transforms =
-        evaluate_initial_root_derived_values(plan, &root_state)?;
-    let mut source_event_transform_commits = commit_source_derived_values_to_root_state(
-        plan,
-        &mut root_state,
-        &pre_copy_initial_source_event_transforms,
-    );
-    let root_initial_field_copy_count = copy_root_initial_fields(plan, &mut root_state)?;
+    let (source_event_transform_commits, root_initial_field_copy_count) =
+        bootstrap_root_derived_values_and_initial_fields(plan, &mut root_state)?;
     initialized_state_count += root_initial_field_copy_count;
-    let post_copy_initial_source_event_transforms =
-        evaluate_initial_root_derived_values(plan, &root_state)?;
-    source_event_transform_commits.extend(commit_source_derived_values_to_root_state(
-        plan,
-        &mut root_state,
-        &post_copy_initial_source_event_transforms,
-    ));
     let initialized_source_event_transform_count = source_event_transform_commits.len();
     let bytes_initialization = initialize_root_bytes_storage(plan, &root_state)?;
     let executor_report = json!({
@@ -11912,12 +12212,6 @@ pub fn select_root_source_event_work(
         )
         .into());
     }
-    if !plan.capability_summary.typed_lowering_executable {
-        return Err(
-            "CPU root-scenario PlanExecutor requires typed_lowering_executable=true".into(),
-        );
-    }
-
     let source_id = source_id_for_label(plan, source_route)
         .ok_or_else(|| format!("MachinePlan has no source route `{source_route}`"))?;
     let source_route_slot = plan
@@ -11976,6 +12270,9 @@ pub fn select_root_source_event_work(
         "source": source_route,
         "source_id": source_id.0,
         "source_route_scoped": source_route_slot.scoped,
+        "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
+        "global_cpu_plan_executor_unsupported_op_count": plan.capability_summary.cpu_plan_executor_unsupported_op_count,
+        "selection_mode": "route_scoped_executable_work",
         "ordered_update_op_ids": ordered_update_op_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
         "ordered_update_op_count": ordered_update_op_ids.len(),
         "derived_op_count": derived_op_count,
@@ -12181,8 +12478,11 @@ pub fn evaluate_source_derived_values_for_event(
                 ..
             } => {
                 if let Some(arm) = arms.iter().find(|arm| arm.source_id == source_id) {
-                    let value =
-                        eval_root_source_transform_row_expression(plan, root_state, &arm.value)?;
+                    let Ok(value) =
+                        eval_root_source_transform_row_expression(plan, root_state, &arm.value)
+                    else {
+                        continue;
+                    };
                     if *is_router_route {
                         router_route = Some(
                             value

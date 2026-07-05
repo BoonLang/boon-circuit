@@ -37387,3 +37387,51 @@ Remaining cleanup:
 - `LiveRuntime::from_project_legacy*` still exists for explicit output-root
   paths and diagnostics; retiring it needs a first-class PlanExecutor/output
   root replacement.
+
+## 2026-07-05 - NovyWave List/find_value Root Updates Moved Into PlanExecutor
+
+Status: finished the in-flight PlanExecutor cut that was blocking the NovyWave
+bridge verifier immediately after moving it off `LiveRuntime::from_project_legacy`.
+The verifier now reaches broader PlanExecutor coverage failures instead of
+crashing on an unsupported root `List/find_value` update branch.
+
+What changed:
+
+- `verify-novywave-bridge-scenario`,
+  `novywave_bridge_scenario_coverage_evidence`,
+  `novywave_timeline_pan_zoom_replay_evidence_inner`, and
+  `novywave_signal_lane_runtime_evidence_inner` now construct the default
+  PlanExecutor runtime instead of explicit legacy runtime constructors.
+- MachinePlan lowering now records typed ordered operands for root
+  `List/find_value(...)` update branches: lookup list, lookup field, expected
+  value, target field, and optional fallback.
+- `ValueIndex` now indexes record-literal list row fields and keeps source
+  row-lookup metadata, so scoped source paths such as `file_tree_row.file` lower
+  to the source address payload instead of an unrelated row field.
+- Runtime root update execution now supports generic `List/find_value` branches
+  and uses the current PlanExecutor list state when available, with initial list
+  rows only for standalone route probes that have no live session state.
+
+Fresh evidence:
+
+- `cargo test -q -p boon_compiler
+  root_list_find_value_fallback_field_lowers_to_row_expression -- --nocapture`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_plan_executor -p boon_runtime -p
+  xtask`: pass.
+- `boon_cli dump-plan examples/novywave/RUN.bn` now shows op `1009` with
+  ordered `List/find_value` inputs `[list:0, field:803, source_payload
+  Address/source:98, field:806, field:21]` and zero unresolved executable refs.
+- `cargo xtask verify-novywave-bridge-scenario --report
+  target/reports/novywave-bridge-scenario-planexecutor-cut.json`: still fails,
+  but no longer on the empty `List/find_value` ordered-input blocker.
+
+Remaining cleanup:
+
+- NovyWave bridge coverage still exposes broader PlanExecutor gaps: scoped
+  target-text lookup misses in `signal_catalog`, non-text indexed source-payload
+  writes, unsupported indexed `MatchNumberInfixConst`, unresolved zoom/keyboard
+  update branches, and root text expectation mismatches.
+- Do not reintroduce legacy runtime comparison to hide those failures. The next
+  slice should either implement the missing PlanExecutor semantics or retire the
+  obsolete scenario expectations that only prove old runtime behavior.

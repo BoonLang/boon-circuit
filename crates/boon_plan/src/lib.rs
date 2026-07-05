@@ -1560,6 +1560,24 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && (source_payload_field.is_some()
                             || source_payload_inputs_are_empty_or_guard_only(op, source_guard))
                 }
+                PlanExpressionKind::PrefixPayloadConcat => {
+                    let Some(field) = source_payload_field.as_ref() else {
+                        return false;
+                    };
+                    update_constant_id.is_none()
+                        && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
+                        && update_branch_source_ids(op).len() == 1
+                        && source_payload_input_matches_single_source(op, field)
+                        && prefix_concat_inputs_supported(scalar_slots, constants, op, true)
+                }
+                PlanExpressionKind::PrefixRootConcat => {
+                    source_payload_field.is_none()
+                        && update_constant_id.is_none()
+                        && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
+                        && update_branch_source_ids(op).len() == 1
+                        && source_payload_input_ids(op).is_empty()
+                        && prefix_concat_inputs_supported(scalar_slots, constants, op, false)
+                }
                 PlanExpressionKind::MatchConst => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
@@ -1574,8 +1592,6 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                 }
                 PlanExpressionKind::NumberInfix
                 | PlanExpressionKind::ProjectTime
-                | PlanExpressionKind::PrefixPayloadConcat
-                | PlanExpressionKind::PrefixRootConcat
                 | PlanExpressionKind::MatchTextIsEmptyConst
                 | PlanExpressionKind::MatchNumberInfixConst
                 | PlanExpressionKind::ListFindValue
@@ -2052,6 +2068,22 @@ fn cpu_plan_executor_supports_indexed_update_op(
                 && (source_payload_field.is_some()
                     || source_payload_inputs_are_empty_or_guard_only(op, source_guard))
         }
+        PlanExpressionKind::PrefixPayloadConcat => {
+            let Some(field) = source_payload_field.as_ref() else {
+                return false;
+            };
+            update_constant_id.is_none()
+                && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
+                && source_payload_input_matches_single_source(op, field)
+                && prefix_concat_inputs_supported(scalar_slots, constants, op, true)
+        }
+        PlanExpressionKind::PrefixRootConcat => {
+            source_payload_field.is_none()
+                && update_constant_id.is_none()
+                && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
+                && source_payload_input_ids(op).is_empty()
+                && prefix_concat_inputs_supported(scalar_slots, constants, op, false)
+        }
         PlanExpressionKind::MatchTextIsEmptyConst => {
             source_payload_field.is_none()
                 && update_constant_id.is_none()
@@ -2074,8 +2106,6 @@ fn cpu_plan_executor_supports_indexed_update_op(
         }
         PlanExpressionKind::NumberInfix
         | PlanExpressionKind::ProjectTime
-        | PlanExpressionKind::PrefixPayloadConcat
-        | PlanExpressionKind::PrefixRootConcat
         | PlanExpressionKind::MatchConst
         | PlanExpressionKind::MatchValueConst
         | PlanExpressionKind::MatchNumberInfixConst
@@ -3282,6 +3312,23 @@ fn text_trim_or_previous_inputs_supported(
     } else {
         text_state_inputs_supported
     }
+}
+
+fn prefix_concat_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    allow_source_payload: bool,
+) -> bool {
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [prefix, input, separator] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    text_operand_ref_supported(scalar_slots, constants, prefix, false)
+        && text_operand_ref_supported(scalar_slots, constants, input, allow_source_payload)
+        && text_operand_ref_supported(scalar_slots, constants, separator, false)
 }
 
 fn indexed_match_text_is_empty_const_inputs_supported(

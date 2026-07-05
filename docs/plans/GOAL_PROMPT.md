@@ -81,11 +81,14 @@ Current checkpoint:
   invalidation helper tests, and lazy chunk summary scan-counter tests. One
   windowed materialization summary test now runs through
   `LiveRuntime::from_source_plan_executor`. Direct PlanExecutor migration
-  attempts exposed real unsupported product gaps (`PrefixPayloadConcat` root
-  update branches, incomplete arbitrary-fixture document summary/state
-  surfaces, `PrefixRootConcat` root update branches, unresolved root initial
-  field copies, and missing typed field ids for a row structured-parent
-  fixture).
+  attempts exposed real unsupported product gaps (incomplete arbitrary-fixture
+  document summary/state surfaces, unresolved root initial field copies, and
+  missing typed field ids for a row structured-parent fixture). A later
+  checkpoint implemented typed MachinePlan operands plus root/indexed
+  PlanExecutor execution for `PrefixPayloadConcat` and `PrefixRootConcat`, with
+  focused product-path coverage in
+  `root_scalar_plan_executor_replays_prefix_concat_update_branches`, so do not
+  keep treating prefix concat as a legacy-runtime blocker.
   Do not reintroduce the deleted tests through
   `LoadedRuntimeHarness`; replace them only with PlanExecutor/product tests
   after the missing executor semantics/diagnostics are implemented. This cut

@@ -10525,6 +10525,160 @@ pub fn evaluate_indexed_json_update_branch(
             ))
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::PrefixPayloadConcat,
+            source_payload_field: Some(source_payload_field),
+            update_constant_id: None,
+            ordered_inputs,
+            ..
+        } => {
+            if *source_payload_field == SourcePayloadField::Bytes {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    false,
+                    Some("BYTES prefix payload concat requires runtime byte storage".to_owned()),
+                    output_state_id,
+                    None,
+                    None,
+                ));
+            }
+            validate_route_payload_field(source_route_slot, source_payload_field, op.id)?;
+            validate_typed_payload_input(op, source_id, source_payload_field)?;
+            let [prefix_ref, input_ref, separator_ref] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "indexed PrefixPayloadConcat update branch {} expected prefix, input, and separator operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let ValueRef::SourcePayload {
+                source_id: input_source_id,
+                field,
+            } = input_ref
+            else {
+                return Err(format!(
+                    "indexed PrefixPayloadConcat update branch {} input operand is not a source-payload ref",
+                    op.id.0
+                )
+                .into());
+            };
+            if *input_source_id != source_id || field != source_payload_field {
+                return Err(format!(
+                    "indexed PrefixPayloadConcat update branch {} input source-payload ref {:?} does not match active source {} field {:?}",
+                    op.id.0, input_ref, source_id.0, source_payload_field
+                )
+                .into());
+            }
+            let Some(payload_value) =
+                source_payload_json_value_if_present(event, source_payload_field)?
+            else {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "prefix_payload_concat",
+                        serde_json::to_value(source_payload_field)?,
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let prefix = indexed_text_operand_value(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                prefix_ref,
+                op.id,
+                "prefix",
+            )?;
+            let payload = payload_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed PrefixPayloadConcat update branch {} payload is not text",
+                    op.id.0
+                )
+            })?;
+            let separator = indexed_text_operand_value(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                separator_ref,
+                op.id,
+                "separator",
+            )?;
+            Ok(indexed_json_update_outcome(
+                op.id,
+                true,
+                None,
+                output_state_id,
+                Some(JsonValue::String(format!("{prefix}{separator}{payload}"))),
+                Some((
+                    "prefix_payload_concat",
+                    serde_json::to_value(source_payload_field)?,
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            ))
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::PrefixRootConcat,
+            source_payload_field: None,
+            update_constant_id: None,
+            ordered_inputs,
+            ..
+        } => {
+            let [prefix_ref, input_ref, separator_ref] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "indexed PrefixRootConcat update branch {} expected prefix, input, and separator operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let prefix = indexed_text_operand_value(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                prefix_ref,
+                op.id,
+                "prefix",
+            )?;
+            let input = indexed_text_operand_value(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                input_ref,
+                op.id,
+                "input",
+            )?;
+            let separator = indexed_text_operand_value(
+                plan,
+                event,
+                row,
+                root_derived_values,
+                separator_ref,
+                op.id,
+                "separator",
+            )?;
+            Ok(indexed_json_update_outcome(
+                op.id,
+                true,
+                None,
+                output_state_id,
+                Some(JsonValue::String(format!("{prefix}{separator}{input}"))),
+                Some((
+                    "prefix_root_concat",
+                    JsonValue::Null,
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            ))
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
             ordered_inputs,
             source_payload_field: None,
@@ -10840,6 +10994,33 @@ fn indexed_update_json_value_for_ref(
         )
         .into()),
     }
+}
+
+fn indexed_text_operand_value(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    row: &PlanExecutorListRowState,
+    root_derived_values: &BTreeMap<usize, JsonValue>,
+    value_ref: &ValueRef,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<String> {
+    let value = indexed_update_json_value_for_ref(
+        plan,
+        event,
+        row,
+        root_derived_values,
+        value_ref,
+        op_id,
+        context,
+    )?;
+    value.as_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "indexed update branch {} {context} operand is not text",
+            op_id.0
+        )
+        .into()
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

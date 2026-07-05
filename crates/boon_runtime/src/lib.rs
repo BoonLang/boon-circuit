@@ -7952,6 +7952,64 @@ fn root_text_bytes_conversion_operands(
     ))
 }
 
+fn plan_text_constant_value(
+    plan: &MachinePlan,
+    constant_id: PlanConstantId,
+    operation: &str,
+    op_id: usize,
+) -> RuntimeResult<String> {
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .ok_or_else(|| {
+            format!(
+                "root {operation} update branch {op_id} references missing text constant {}",
+                constant_id.0
+            )
+        })?;
+    let PlanConstantValue::Text { value } = &constant.value else {
+        return Err(format!(
+            "root {operation} update branch {op_id} constant {} is not TEXT",
+            constant_id.0
+        )
+        .into());
+    };
+    Ok(value.clone())
+}
+
+fn root_prefix_concat_operands(
+    plan: &MachinePlan,
+    op: &boon_plan::PlanOp,
+    operation: &str,
+) -> RuntimeResult<(String, ValueRef, String)> {
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return Err(format!(
+            "root {operation} update branch {} is not an update branch",
+            op.id.0
+        )
+        .into());
+    };
+    let [
+        ValueRef::Constant(prefix_id),
+        input,
+        ValueRef::Constant(separator_id),
+    ] = ordered_inputs.as_slice()
+    else {
+        return Err(format!(
+            "root {operation} update branch {} expected prefix constant, text input, and separator constant operands, found {}",
+            op.id.0,
+            ordered_inputs.len()
+        )
+        .into());
+    };
+    Ok((
+        plan_text_constant_value(plan, *prefix_id, operation, op.id.0)?,
+        input.clone(),
+        plan_text_constant_value(plan, *separator_id, operation, op.id.0)?,
+    ))
+}
+
 fn root_single_source_payload_input(
     op: &boon_plan::PlanOp,
     active_source_id: SourceId,
@@ -9842,6 +9900,79 @@ fn execute_root_scalar_update_branch(
                     .map(serde_json::to_value)
                     .transpose()?
                     .unwrap_or(JsonValue::Null),
+                JsonValue::Null,
+                JsonValue::Null,
+            )
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::PrefixPayloadConcat,
+            source_payload_field: Some(source_payload_field),
+            update_constant_id: None,
+            ..
+        } => {
+            if !source_route_slot
+                .payload_schema
+                .fields
+                .contains(source_payload_field)
+            {
+                return Err(format!(
+                    "root PrefixPayloadConcat update branch {} reads payload field {:?}, but route schema is {:?}",
+                    op.id.0, source_payload_field, source_route_slot.payload_schema.fields
+                )
+                .into());
+            }
+            let (prefix, input, separator) =
+                root_prefix_concat_operands(plan, op, "PrefixPayloadConcat")?;
+            let input_value = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                &input,
+                op.id.0,
+            )?;
+            let payload = input_value.as_str().ok_or_else(|| {
+                format!(
+                    "root PrefixPayloadConcat update branch {} input is not text",
+                    op.id.0
+                )
+            })?;
+            (
+                JsonValue::String(format!("{prefix}{separator}{payload}")),
+                None,
+                "prefix_payload_concat",
+                serde_json::to_value(source_payload_field)?,
+                JsonValue::Null,
+                JsonValue::Null,
+            )
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::PrefixRootConcat,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let (prefix, input, separator) =
+                root_prefix_concat_operands(plan, op, "PrefixRootConcat")?;
+            let input_value = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                &input,
+                op.id.0,
+            )?;
+            let value = input_value.as_str().ok_or_else(|| {
+                format!(
+                    "root PrefixRootConcat update branch {} input is not text",
+                    op.id.0
+                )
+            })?;
+            (
+                JsonValue::String(format!("{prefix}{separator}{value}")),
+                None,
+                "prefix_root_concat",
+                JsonValue::Null,
                 JsonValue::Null,
                 JsonValue::Null,
             )
@@ -82236,6 +82367,94 @@ expected_source_event = {{ source = "store.input.change", text = "Typed payload"
                 "fallback counter {key} must stay zero"
             );
         }
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(scenario_path);
+    }
+
+    #[test]
+    fn root_scalar_plan_executor_replays_prefix_concat_update_branches() {
+        let pid = std::process::id();
+        let source_path = std::env::temp_dir().join(format!("boon-root-prefix-concat-{pid}.bn"));
+        let scenario_path = std::env::temp_dir().join(format!("boon-root-prefix-concat-{pid}.scn"));
+        fs::write(
+            &source_path,
+            r#"
+store: [
+    file_input: SOURCE
+    select: SOURCE
+    source_text:
+        TEXT { second } |> HOLD source_text { LATEST {} }
+    payload_label:
+        TEXT { - local file } |> HOLD payload_label {
+            LATEST {
+                TEXT { - } |> Text/concat(with: file_input.text, separator: " ")
+            }
+        }
+    root_label:
+        TEXT { response:first } |> HOLD root_label {
+            LATEST {
+                select.event.press |> THEN {
+                    TEXT { response } |> Text/concat(with: source_text, separator: ":")
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Prefix }))
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &scenario_path,
+            format!(
+                r#"
+name = "root prefix concat"
+source = "{}"
+
+[[step]]
+id = "payload"
+expected_source_event = {{ source = "store.file_input", text = "wave_27.fst" }}
+
+[[step]]
+id = "root"
+expected_source_event = {{ source = "store.select" }}
+"#,
+                source_path.display()
+            ),
+        )
+        .unwrap();
+
+        let output = run_plan_root_scalar_scenario(
+            &source_path,
+            &scenario_path,
+            TargetProfile::SoftwareDefault,
+            &["payload".to_owned(), "root".to_owned()],
+            None,
+        )
+        .expect("prefix concat branches should replay through PlanExecutor");
+
+        assert_eq!(output.report["status"], "pass");
+        assert_root_scenario_product_only(&output.report);
+        assert_eq!(output.state_summary["store.payload_label"], "- wave_27.fst");
+        assert_eq!(output.state_summary["store.root_label"], "response:second");
+        let expression_kinds = output.report["plan_executor"]["per_step"]
+            .as_array()
+            .expect("prefix scenario should report per-step updates")
+            .iter()
+            .flat_map(|step| step["updates"].as_array().into_iter().flatten())
+            .filter_map(|update| update["expression_kind"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expression_kinds,
+            BTreeSet::from(["prefix_payload_concat", "prefix_root_concat"])
+        );
+        assert_eq!(output.report["plan_executor"]["runtime_ast_eval_count"], 0);
+        assert_eq!(
+            output.report["plan_executor"]["executable_string_path_count"],
+            0
+        );
+        assert_eq!(output.report["plan_executor"]["unknown_plan_op_count"], 0);
 
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);

@@ -4992,6 +4992,60 @@ fn ordered_update_expression_inputs(
             );
             vec![input, ValueRef::Constant(encoding_constant_id)]
         }
+        UpdateExpression::PrefixPayloadConcat {
+            prefix,
+            payload_path,
+            separator,
+        } => {
+            let Some(input) =
+                resolve_update_value_ref(index, source, target, indexed, payload_path)
+            else {
+                return Vec::new();
+            };
+            let prefix_constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: prefix.clone(),
+                },
+            );
+            let separator_constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: separator.clone(),
+                },
+            );
+            vec![
+                ValueRef::Constant(prefix_constant_id),
+                input,
+                ValueRef::Constant(separator_constant_id),
+            ]
+        }
+        UpdateExpression::PrefixRootConcat {
+            prefix,
+            path,
+            separator,
+        } => {
+            let Some(input) = resolve_update_value_ref(index, source, target, indexed, path) else {
+                return Vec::new();
+            };
+            let prefix_constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: prefix.clone(),
+                },
+            );
+            let separator_constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: separator.clone(),
+                },
+            );
+            vec![
+                ValueRef::Constant(prefix_constant_id),
+                input,
+                ValueRef::Constant(separator_constant_id),
+            ]
+        }
         UpdateExpression::MatchConst { input, arms } => {
             let Some(input_ref) = resolve_update_value_ref(index, source, target, indexed, input)
             else {

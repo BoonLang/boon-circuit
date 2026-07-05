@@ -27,6 +27,55 @@ MachinePlan migration.
 | Phase 9 - Verification and Performance | Complete | The current gate set requires `verify-bytes-machine-plan-all --check-existing`, default-engine readiness, Cells full compare, Cells release benchmark, TodoMVC release benchmark reproduction, adversarial tamper checks, runtime hardening/finality, machine-readiness, and recursive schema evidence. |
 | Phase 10 - Default Switch | Complete | `boon_cli run` now defaults to PlanExecutor/default-engine mode. Explicit `--engine legacy` still runs the semantic runtime, and `--engine compare` still runs PlanExecutor with the legacy comparison oracle. |
 
+## 2026-07-05 Prefix Concat PlanExecutor Support
+
+Status: implemented and focused-verified; broader legacy migration still
+blocked by summary and typed-field coverage gaps.
+
+What changed:
+
+- MachinePlan update branches now carry typed operands for
+  `PrefixPayloadConcat` and `PrefixRootConcat`: prefix constant, text input, and
+  separator constant.
+- `cpu_plan_executor_supports_whole_plan_op(...)` now accepts root and indexed
+  prefix concat update branches under a narrow typed contract: TEXT output,
+  one source route, TEXT constants for prefix/separator, and either one typed
+  source-payload input or one TEXT state input.
+- The PlanExecutor root update path now evaluates both prefix concat expression
+  kinds without AST/string fallback.
+- The indexed JSON update evaluator also supports prefix concat so the plan
+  verifier and executor do not drift.
+- Added
+  `root_scalar_plan_executor_replays_prefix_concat_update_branches`, proving
+  `prefix_payload_concat` and `prefix_root_concat` through
+  `run_plan_root_scalar_scenario`, with zero runtime AST eval, zero executable
+  string-path fallback, and zero unknown plan ops.
+
+Focused evidence:
+
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_prefix_concat_update_branches`
+  passed.
+- `cargo test -q -p boon_runtime source_event_propagates_through_derived_hold_trigger_in_same_turn`
+  still passes through the quarantined old harness; direct migration remains
+  blocked by PlanExecutor arbitrary-fixture state-summary coverage, not by
+  missing prefix concat execution.
+- `cargo test -q -p boon_plan_executor --lib --no-run`,
+  `cargo test -q -p boon_plan --lib --no-run`,
+  `cargo test -q -p boon_compiler --lib --no-run`, and
+  `cargo test -q -p boon_runtime --lib --no-run` passed.
+
+Remaining migration blockers from the last cut:
+
+- PlanExecutor document/state summaries do not yet expose every arbitrary small
+  test fixture shape that the old generic runtime summary exposed. This blocks
+  direct migration of list-filter/join, list user-key lookup, structured root,
+  range-list, nested row field, and derived-list chunk behavior tests even when
+  the underlying product semantics may be partially present.
+- One row structured-parent fixture fails during PlanExecutor construction with
+  a missing typed field id for an initial row field.
+- One root-derived cascade fixture fails PlanExecutor construction because a
+  root initial field copy source is unresolved (`store.cursor <- cursor_default`).
+
 ## 2026-07-05 Legacy Runtime Test-Island Cut
 
 Status: implemented as a cleanup checkpoint; broad native/product performance
@@ -52,9 +101,9 @@ What changed:
 
 Important gaps exposed while attempting migration:
 
-- PlanExecutor still does not support at least one old root update branch shape:
-  `PrefixPayloadConcat`; a follow-up migration attempt also exposed
-  `PrefixRootConcat`.
+- PlanExecutor did not support prefix concat root update branch shapes at the
+  time of this cut; that blocker is now addressed in the later
+  `2026-07-05 Prefix Concat PlanExecutor Support` checkpoint.
 - PlanExecutor document/state summaries do not yet expose every arbitrary small
   test fixture shape that the old generic runtime summary exposed. This blocks
   direct migration of list-filter/join, list user-key lookup, structured root,

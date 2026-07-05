@@ -36263,3 +36263,34 @@ Current interpretation:
 - The next runtime cleanup should either fix that PlanExecutor gap or continue
   quarantining/removing legacy comparison surfaces. Do not reintroduce default
   constructor ambiguity.
+
+## 2026-07-05 - Default-Engine Legacy Pre-Switch Contract Cut
+
+Status: implemented and verified in this slice.
+
+What changed:
+
+- `verify-bytes-default-engine-readiness` no longer has a pre-switch
+  `legacy` default branch. The required check list is the PlanExecutor
+  post-switch list, and source drift back to `let mut engine = "legacy"` now
+  fails the gate instead of selecting the old report shape.
+- `boon_report_schema` now rejects
+  `readiness_mode=pre-switch-legacy-default`; only
+  `readiness_mode=post-switch-plan-default` with `default_engine=plan`,
+  `default_switch_allowed=true`, and a null default-switch blocker is valid.
+
+Evidence:
+
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `jq -c '{status, readiness_mode, default_engine, default_switch_allowed, blocker_count: ((.blockers // []) | length), child_reports: [.child_reports[]? | {id, engine, command, status, schema_valid}]}' target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  `{"status":"pass","readiness_mode":"post-switch-plan-default","default_engine":"plan","default_switch_allowed":true,"blocker_count":0,"child_reports":[{"id":"todomvc-default-plan","engine":"default","command":"run-plan-scenario-events","status":"pass","schema_valid":true},{"id":"cells-default-plan","engine":"default","command":"run-plan-scenario-events","status":"pass","schema_valid":true},{"id":"explicit-legacy-semantic","engine":"legacy","command":"semantic","status":"pass","schema_valid":true},{"id":"todomvc-compare","engine":"compare","command":"run-plan-scenario-events","status":"pass","schema_valid":true},{"id":"cells-compare","engine":"compare","command":"run-plan-scenario-events","status":"pass","schema_valid":true}]}`.
+
+Current interpretation:
+
+- The CLI default-engine control-plane is now PlanExecutor-only.
+- The remaining explicit legacy child is a diagnostic smoke case, not the
+  default execution path. It should be removed or replaced once the remaining
+  legacy oracle/report compatibility surfaces are retired.

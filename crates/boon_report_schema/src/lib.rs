@@ -1016,17 +1016,6 @@ fn expected_bytes_type_system_check_ids() -> &'static [&'static str] {
 fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
     &[
         "bytes-default-engine:cli-build",
-        "bytes-default-engine:source-default-legacy",
-        "bytes-default-engine:default-run-semantic",
-        "bytes-default-engine:todomvc-compare",
-        "bytes-default-engine:cells-compare",
-        "bytes-default-engine:phase10-switch-still-blocked",
-    ]
-}
-
-fn expected_bytes_default_engine_post_switch_check_ids() -> &'static [&'static str] {
-    &[
-        "bytes-default-engine:cli-build",
         "bytes-default-engine:source-default-plan",
         "bytes-default-engine:todomvc-default-plan",
         "bytes-default-engine:cells-default-plan",
@@ -1204,13 +1193,20 @@ fn verify_bytes_default_engine_readiness_report(
     let readiness_mode = report
         .get("readiness_mode")
         .and_then(JsonValue::as_str)
-        .unwrap_or("pre-switch-legacy-default");
-    let post_switch = readiness_mode == "post-switch-plan-default";
-    let expected = if post_switch {
-        expected_bytes_default_engine_post_switch_check_ids()
-    } else {
-        expected_bytes_default_engine_check_ids()
-    };
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness readiness_mode is missing",
+                report_path.display()
+            )
+        })?;
+    if readiness_mode != "post-switch-plan-default" {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness readiness_mode `{readiness_mode}` is obsolete; only post-switch PlanExecutor default is accepted",
+            report_path.display()
+        )
+        .into());
+    }
+    let expected = expected_bytes_default_engine_check_ids();
     let required = report
         .get("required_check_ids")
         .and_then(JsonValue::as_array)
@@ -1291,40 +1287,30 @@ fn verify_bytes_default_engine_readiness_report(
         .into());
     }
 
-    let expected_default_engine = if post_switch { "plan" } else { "legacy" };
-    if report.get("default_engine").and_then(JsonValue::as_str) != Some(expected_default_engine) {
+    if report.get("default_engine").and_then(JsonValue::as_str) != Some("plan") {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_engine must be `{expected_default_engine}` for readiness_mode `{readiness_mode}`",
+            "{} verify-bytes-default-engine-readiness default_engine must be `plan` for readiness_mode `{readiness_mode}`",
             report_path.display(),
         )
         .into());
     }
-    let expected_switch_allowed = post_switch;
     if report
         .get("default_switch_allowed")
         .and_then(JsonValue::as_bool)
-        != Some(expected_switch_allowed)
+        != Some(true)
     {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_switch_allowed must be {expected_switch_allowed}",
+            "{} verify-bytes-default-engine-readiness default_switch_allowed must be true",
             report_path.display()
         )
         .into());
     }
-    let blocker_valid = if post_switch {
-        report
-            .get("default_switch_blocker")
-            .is_none_or(JsonValue::is_null)
-    } else {
-        !report
-            .get("default_switch_blocker")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .is_empty()
-    };
-    if !blocker_valid {
+    if !report
+        .get("default_switch_blocker")
+        .is_none_or(JsonValue::is_null)
+    {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness default_switch_blocker is invalid for readiness_mode `{readiness_mode}`",
+            "{} verify-bytes-default-engine-readiness default_switch_blocker must be null for readiness_mode `{readiness_mode}`",
             report_path.display(),
         )
         .into());
@@ -1350,25 +1336,17 @@ fn verify_bytes_default_engine_readiness_report(
                 report_path.display()
             )
         })?;
-    let expected_children = if post_switch {
-        vec![
-            (
-                "todomvc-default-plan",
-                "default",
-                "run-plan-scenario-events",
-            ),
-            ("cells-default-plan", "default", "run-plan-scenario-events"),
-            ("explicit-legacy-semantic", "legacy", "semantic"),
-            ("todomvc-compare", "compare", "run-plan-scenario-events"),
-            ("cells-compare", "compare", "run-plan-scenario-events"),
-        ]
-    } else {
-        vec![
-            ("default-run-semantic", "default", "semantic"),
-            ("todomvc-compare", "compare", "run-plan-scenario-events"),
-            ("cells-compare", "compare", "run-plan-scenario-events"),
-        ]
-    };
+    let expected_children = vec![
+        (
+            "todomvc-default-plan",
+            "default",
+            "run-plan-scenario-events",
+        ),
+        ("cells-default-plan", "default", "run-plan-scenario-events"),
+        ("explicit-legacy-semantic", "legacy", "semantic"),
+        ("todomvc-compare", "compare", "run-plan-scenario-events"),
+        ("cells-compare", "compare", "run-plan-scenario-events"),
+    ];
     if children.len() != expected_children.len() {
         return Err(format!(
             "{} verify-bytes-default-engine-readiness child_reports length is wrong",

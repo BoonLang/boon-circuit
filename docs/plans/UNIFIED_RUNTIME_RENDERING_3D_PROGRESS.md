@@ -35870,9 +35870,11 @@ Evidence:
   `status=fail`, `checked_report_count=18`, `failed_report_count=18`,
   `refresh_debt_child_count=18`, `true_blocker_child_count=0`,
   `product_contract_child_count=0`, `identity_fast_refresh_child_count=18`.
-- The aggregate emitted `22` refresh commands, including the three
-  PlanExecutor source replay dependencies and native preview E2E/product
-  reports.
+- After the refresh-command dedupe cleanup, the aggregate records
+  `refresh_command_count_before_dedup=22`,
+  `refresh_command_deduplicated_count=1`, and emits `21` unique refresh
+  commands, including the three PlanExecutor source replay dependencies and
+  native preview E2E/product reports.
 
 Current interpretation:
 
@@ -35883,3 +35885,33 @@ Current interpretation:
   queue has been executed and the aggregate rerun from fresh children.
 - If refreshed children still fail, classify those failures by product contract
   versus verifier/proof-lane debt before returning to Cells micro-optimization.
+
+## 2026-07-05 - Native Handoff Refresh Command Dedupe
+
+Status: implemented a small control-plane cleanup.
+
+What changed:
+
+- `verify-native-gpu-all` now deduplicates emitted `refresh_commands` by label
+  before serializing the aggregate report.
+- The report keeps `refresh_debt_child_count` as the child-debt count, and now
+  also records `refresh_command_count_before_dedup` plus
+  `refresh_command_deduplicated_count` so queue shape is explicit.
+
+Evidence:
+
+- `cargo check -q -p xtask`: pass.
+- `cargo fmt -- --check`: pass.
+- `cargo run -q -p xtask -- verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail, schema-valid after `verify-report-schema`.
+- `jq -c '{status, refresh_debt_child_count, refresh_count: (.refresh_commands|length), before: .refresh_command_count_before_dedup, deduped: .refresh_command_deduplicated_count, labels: [.refresh_commands[]?.label]}' target/reports/native-gpu-all.json`:
+  `{"status":"fail","refresh_debt_child_count":18,"refresh_count":21,"before":22,"deduped":1,...}`.
+- `jq -r '.refresh_commands[]?.label' target/reports/native-gpu-all.json | sort | uniq -d`:
+  no duplicate labels.
+
+Current interpretation:
+
+- The native refresh queue is cheaper and less noisy: duplicate upstream/child
+  refresh rows no longer make the operator rerun the same label twice.
+- This does not refresh the children; it only makes the next refresh execution
+  deterministic and bounded.

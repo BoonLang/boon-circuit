@@ -11456,9 +11456,16 @@ impl LiveRuntime {
                 state_summary_ms: state_summary.1,
             });
         }
-        let step = event.into_step(self.next_step);
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step(&step)
+        #[cfg(test)]
+        {
+            let step = event.into_step(self.next_step);
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step(&step);
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_for_document(
@@ -11491,9 +11498,16 @@ impl LiveRuntime {
                 state_summary_ms: state_summary.1,
             });
         }
-        let step = event.into_step(self.next_step);
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step_with_document_summary(&step)
+        #[cfg(test)]
+        {
+            let step = event.into_step(self.next_step);
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step_with_document_summary(&step);
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_for_document_window(
@@ -11535,15 +11549,22 @@ impl LiveRuntime {
                 state_summary_ms: state_summary.1,
             });
         }
-        let step = event.into_step(self.next_step);
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step_with_document_window(
-            &step,
-            row_start,
-            row_count,
-            column_start,
-            column_count,
-        )
+        #[cfg(test)]
+        {
+            let step = event.into_step(self.next_step);
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step_with_document_window(
+                &step,
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            );
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_turn(
@@ -11560,9 +11581,16 @@ impl LiveRuntime {
                 runtime_elapsed_ms(apply_started),
             );
         }
-        let step = event.into_step(self.next_step);
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step_turn(&step)
+        #[cfg(test)]
+        {
+            let step = event.into_step(self.next_step);
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step_turn(&step);
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_batch_turn(&mut self, batch: SourceBatch) -> RuntimeResult<LiveTurnOutput> {
@@ -11634,83 +11662,90 @@ impl LiveRuntime {
                 recomputed_field_samples: Vec::new(),
             });
         }
-        let mut previous_event_id = None;
-        let mut semantic_deltas = Vec::new();
-        let mut render_patches = Vec::new();
-        let mut apply_step_ms = 0.0;
-        let mut dirty_key_count = 0usize;
-        let mut recomputed_field_count = 0usize;
-        let mut recompute_candidate_count = 0usize;
-        let mut list_scan_counters = LiveRuntimeListScanCounters::default();
-        let mut source_route_scan_summary = LiveRuntimeSourceRouteScanSummary::default();
-        let mut root_materialization_stats = LiveRuntimeRootMaterializationStats::default();
-        let mut function_call_stats = LiveRuntimeFunctionCallStats::default();
-        let mut runtime_step_profile = LiveRuntimeStepProfile::default();
-        let mut recompute_candidate_samples = Vec::new();
-        let mut recomputed_field_samples = Vec::new();
+        #[cfg(not(test))]
+        {
+            return Err("LiveRuntime product build has no PlanExecutor session".into());
+        }
+        #[cfg(test)]
+        {
+            let mut previous_event_id = None;
+            let mut semantic_deltas = Vec::new();
+            let mut render_patches = Vec::new();
+            let mut apply_step_ms = 0.0;
+            let mut dirty_key_count = 0usize;
+            let mut recomputed_field_count = 0usize;
+            let mut recompute_candidate_count = 0usize;
+            let mut list_scan_counters = LiveRuntimeListScanCounters::default();
+            let mut source_route_scan_summary = LiveRuntimeSourceRouteScanSummary::default();
+            let mut root_materialization_stats = LiveRuntimeRootMaterializationStats::default();
+            let mut function_call_stats = LiveRuntimeFunctionCallStats::default();
+            let mut runtime_step_profile = LiveRuntimeStepProfile::default();
+            let mut recompute_candidate_samples = Vec::new();
+            let mut recomputed_field_samples = Vec::new();
 
-        for batch_event in batch.events {
-            if let Some(previous) = previous_event_id
-                && batch_event.event_id <= previous
-            {
-                return Err(format!(
+            for batch_event in batch.events {
+                if let Some(previous) = previous_event_id
+                    && batch_event.event_id <= previous
+                {
+                    return Err(format!(
                     "source batch `{}` event IDs must be strictly increasing; got `{}` after `{previous}`",
                     batch.sequence_id, batch_event.event_id
                 )
                 .into());
+                }
+                previous_event_id = Some(batch_event.event_id);
+                let event = self.normalize_live_source_event(batch_event.event);
+                if event.source_id.is_none() {
+                    return Err(format!(
+                        "source batch `{}` event `{}` could not resolve source ID for `{}`",
+                        batch.sequence_id, batch_event.event_id, event.source
+                    )
+                    .into());
+                }
+                let step = event.into_step(self.next_step);
+                self.next_step = self.next_step.saturating_add(1);
+                let output = self.apply_checked_step_turn(&step)?;
+                semantic_deltas.extend(output.semantic_deltas);
+                render_patches.extend(output.render_patches);
+                apply_step_ms += output.apply_step_ms;
+                runtime_step_profile.saturating_add_assign(output.runtime_step_profile);
+                dirty_key_count = dirty_key_count.saturating_add(output.dirty_key_count);
+                recomputed_field_count =
+                    recomputed_field_count.saturating_add(output.recomputed_field_count);
+                recompute_candidate_count =
+                    recompute_candidate_count.saturating_add(output.recompute_candidate_count);
+                list_scan_counters.saturating_add_assign(output.list_scan_counters);
+                source_route_scan_summary.saturating_add_assign(output.source_route_scan_summary);
+                root_materialization_stats.saturating_add_assign(output.root_materialization_stats);
+                function_call_stats.saturating_add_assign(output.function_call_stats);
+                extend_sample_limit(
+                    &mut recompute_candidate_samples,
+                    output.recompute_candidate_samples,
+                    32,
+                );
+                extend_sample_limit(
+                    &mut recomputed_field_samples,
+                    output.recomputed_field_samples,
+                    32,
+                );
             }
-            previous_event_id = Some(batch_event.event_id);
-            let event = self.normalize_live_source_event(batch_event.event);
-            if event.source_id.is_none() {
-                return Err(format!(
-                    "source batch `{}` event `{}` could not resolve source ID for `{}`",
-                    batch.sequence_id, batch_event.event_id, event.source
-                )
-                .into());
-            }
-            let step = event.into_step(self.next_step);
-            self.next_step = self.next_step.saturating_add(1);
-            let output = self.apply_checked_step_turn(&step)?;
-            semantic_deltas.extend(output.semantic_deltas);
-            render_patches.extend(output.render_patches);
-            apply_step_ms += output.apply_step_ms;
-            runtime_step_profile.saturating_add_assign(output.runtime_step_profile);
-            dirty_key_count = dirty_key_count.saturating_add(output.dirty_key_count);
-            recomputed_field_count =
-                recomputed_field_count.saturating_add(output.recomputed_field_count);
-            recompute_candidate_count =
-                recompute_candidate_count.saturating_add(output.recompute_candidate_count);
-            list_scan_counters.saturating_add_assign(output.list_scan_counters);
-            source_route_scan_summary.saturating_add_assign(output.source_route_scan_summary);
-            root_materialization_stats.saturating_add_assign(output.root_materialization_stats);
-            function_call_stats.saturating_add_assign(output.function_call_stats);
-            extend_sample_limit(
-                &mut recompute_candidate_samples,
-                output.recompute_candidate_samples,
-                32,
-            );
-            extend_sample_limit(
-                &mut recomputed_field_samples,
-                output.recomputed_field_samples,
-                32,
-            );
+            self.last_source_batch_sequence = Some(batch.sequence_id);
+            Ok(LiveTurnOutput {
+                semantic_deltas,
+                render_patches,
+                apply_step_ms,
+                runtime_step_profile,
+                dirty_key_count,
+                recomputed_field_count,
+                recompute_candidate_count,
+                list_scan_counters,
+                source_route_scan_summary,
+                root_materialization_stats,
+                function_call_stats,
+                recompute_candidate_samples,
+                recomputed_field_samples,
+            })
         }
-        self.last_source_batch_sequence = Some(batch.sequence_id);
-        Ok(LiveTurnOutput {
-            semantic_deltas,
-            render_patches,
-            apply_step_ms,
-            runtime_step_profile,
-            dirty_key_count,
-            recomputed_field_count,
-            recompute_candidate_count,
-            list_scan_counters,
-            source_route_scan_summary,
-            root_materialization_stats,
-            function_call_stats,
-            recompute_candidate_samples,
-            recomputed_field_samples,
-        })
     }
 
     fn accept_single_source_event_batch(
@@ -11755,20 +11790,27 @@ impl LiveRuntime {
             }
             return event;
         }
-        let Ok(runtime) = self.legacy_runtime() else {
-            return event;
-        };
-        if let Some(source) = runtime.canonical_source_path(&event.source)
-            && source != event.source
+        #[cfg(not(test))]
         {
-            event.source = source;
+            return event;
         }
-        if event.source_id.is_none() {
-            event.source_id = runtime
-                .source_id(&event.source)
-                .map(|source_id| source_id.as_usize() as u64);
+        #[cfg(test)]
+        {
+            let Ok(runtime) = self.legacy_runtime() else {
+                return event;
+            };
+            if let Some(source) = runtime.canonical_source_path(&event.source)
+                && source != event.source
+            {
+                event.source = source;
+            }
+            if event.source_id.is_none() {
+                event.source_id = runtime
+                    .source_id(&event.source)
+                    .map(|source_id| source_id.as_usize() as u64);
+            }
+            event
         }
-        event
     }
 
     fn validate_source_batch_sequence(&self, batch: &SourceBatch) -> RuntimeResult<()> {
@@ -11805,11 +11847,18 @@ impl LiveRuntime {
         if self.plan_session().is_some() {
             return self.apply_source_event(event);
         }
-        let mut live_step = step.clone();
-        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
-        live_step.expected_source_event = Some(event.into_expected_source_event());
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step(&live_step)
+        #[cfg(test)]
+        {
+            let mut live_step = step.clone();
+            live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+            live_step.expected_source_event = Some(event.into_expected_source_event());
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step(&live_step);
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_for_step_value_summaries(
@@ -11828,11 +11877,18 @@ impl LiveRuntime {
                 value_summaries,
             });
         }
-        let mut live_step = step.clone();
-        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
-        live_step.expected_source_event = Some(event.into_expected_source_event());
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step_with_value_summaries(&live_step, paths)
+        #[cfg(test)]
+        {
+            let mut live_step = step.clone();
+            live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+            live_step.expected_source_event = Some(event.into_expected_source_event());
+            self.next_step = self.next_step.saturating_add(1);
+            return self.apply_checked_step_with_value_summaries(&live_step, paths);
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_for_step_projected_value_summaries(
@@ -11851,18 +11907,25 @@ impl LiveRuntime {
                 value_summaries,
             });
         }
-        let mut live_step = step.clone();
-        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
-        live_step.expected_source_event = Some(event.into_expected_source_event());
-        self.next_step = self.next_step.saturating_add(1);
-        let runtime = self.legacy_runtime_mut()?;
-        let counts = runtime.apply_source_action_only_counted_step(&live_step)?;
-        let value_summaries = runtime.runtime_value_summaries(paths, 3, 8, 4);
-        Ok(LiveSparseStepOutput {
-            semantic_delta_count: counts.semantic_delta_count,
-            render_patch_count: counts.render_patch_count,
-            value_summaries,
-        })
+        #[cfg(test)]
+        {
+            let mut live_step = step.clone();
+            live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+            live_step.expected_source_event = Some(event.into_expected_source_event());
+            self.next_step = self.next_step.saturating_add(1);
+            let runtime = self.legacy_runtime_mut()?;
+            let counts = runtime.apply_source_action_only_counted_step(&live_step)?;
+            let value_summaries = runtime.runtime_value_summaries(paths, 3, 8, 4);
+            Ok(LiveSparseStepOutput {
+                semantic_delta_count: counts.semantic_delta_count,
+                render_patch_count: counts.render_patch_count,
+                value_summaries,
+            })
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
     pub fn apply_source_event_for_step_with_document_window(
@@ -11884,23 +11947,32 @@ impl LiveRuntime {
                 column_count,
             );
         }
-        let mut live_step = step.clone();
-        live_step.user_action = Some(event.live_source_user_action_with_occurrence());
-        live_step.expected_source_event = Some(event.into_expected_source_event());
-        self.next_step = self.next_step.saturating_add(1);
-        self.apply_checked_step_with_document_window(
-            &live_step,
-            row_start,
-            row_count,
-            column_start,
-            column_count,
-        )
+        #[cfg(test)]
+        {
+            let mut live_step = step.clone();
+            live_step.user_action = Some(event.live_source_user_action_with_occurrence());
+            live_step.expected_source_event = Some(event.into_expected_source_event());
+            self.next_step = self.next_step.saturating_add(1);
+            self.apply_checked_step_with_document_window(
+                &live_step,
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )
+        }
+        #[cfg(not(test))]
+        {
+            Err("LiveRuntime product build has no PlanExecutor session".into())
+        }
     }
 
+    #[cfg(test)]
     fn apply_checked_step(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveStepOutput> {
         self.apply_checked_step_with_summary_mode(step, false)
     }
 
+    #[cfg(test)]
     fn apply_checked_step_with_document_summary(
         &mut self,
         step: &ScenarioStep,
@@ -11908,6 +11980,7 @@ impl LiveRuntime {
         self.apply_checked_step_with_summary_mode(step, true)
     }
 
+    #[cfg(test)]
     fn apply_checked_step_turn(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveTurnOutput> {
         let mut semantic_deltas = Vec::new();
         let mut render_patches = Vec::new();
@@ -11939,6 +12012,7 @@ impl LiveRuntime {
         })
     }
 
+    #[cfg(test)]
     fn apply_checked_step_with_document_window(
         &mut self,
         step: &ScenarioStep,
@@ -11976,6 +12050,7 @@ impl LiveRuntime {
         })
     }
 
+    #[cfg(test)]
     fn apply_checked_step_with_summary_mode(
         &mut self,
         step: &ScenarioStep,
@@ -12012,6 +12087,7 @@ impl LiveRuntime {
         })
     }
 
+    #[cfg(test)]
     fn apply_checked_step_with_value_summaries(
         &mut self,
         step: &ScenarioStep,
@@ -12050,30 +12126,51 @@ impl LiveRuntime {
         if let Some(plan_session) = self.plan_session() {
             return plan_session.state_summary();
         }
-        self.legacy_runtime_mut()
-            .map(LoadedRuntime::state_summary)
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        #[cfg(test)]
+        {
+            self.legacy_runtime_mut()
+                .map(LoadedRuntime::state_summary)
+                .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        }
+        #[cfg(not(test))]
+        {
+            json!({"error": "LiveRuntime product build has no PlanExecutor session"})
+        }
     }
 
     pub fn engine_provenance_report(&self) -> JsonValue {
-        self.plan_session().map_or_else(
-            || {
-                json!({
-                    "engine": "legacy_generic_runtime",
-                    "session_kind": "loaded-runtime",
-                    "generic_fallback_enabled": true,
-                })
-            },
-            PlanExecutorLiveSession::provenance_report,
-        )
+        if let Some(plan_session) = self.plan_session() {
+            return plan_session.provenance_report();
+        }
+        #[cfg(test)]
+        {
+            json!({
+                "engine": "legacy_generic_runtime",
+                "session_kind": "loaded-runtime",
+                "generic_fallback_enabled": true,
+            })
+        }
+        #[cfg(not(test))]
+        {
+            json!({
+                "engine": "missing_plan_executor_session",
+                "session_kind": "invalid-product-runtime",
+                "generic_fallback_enabled": false,
+            })
+        }
     }
 
     pub fn refresh_candidate_defer_probe_profile(&mut self, profile: &mut LiveRuntimeStepProfile) {
         if self.plan_session().is_some() {
             return;
         }
+        #[cfg(test)]
         if let Ok(runtime) = self.legacy_runtime_mut() {
             runtime.copy_candidate_defer_probe_to_profile(profile);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = profile;
         }
     }
 
@@ -12081,6 +12178,7 @@ impl LiveRuntime {
         if self.plan_session().is_some() {
             return;
         }
+        #[cfg(test)]
         if let Ok(runtime) = self.legacy_runtime_mut() {
             runtime.clear_candidate_defer_probe();
         }
@@ -12101,43 +12199,81 @@ impl LiveRuntime {
                 max_list_items,
             );
         }
-        self.legacy_runtime_mut()
-            .expect("legacy runtime should be present")
-            .runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
+        #[cfg(test)]
+        {
+            self.legacy_runtime_mut()
+                .expect("legacy runtime should be present")
+                .runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
+        }
+        #[cfg(not(test))]
+        {
+            json!({"error": "LiveRuntime product build has no PlanExecutor session"})
+        }
     }
 
     pub fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
         if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.document_state_values(paths);
         }
-        self.legacy_runtime_mut()
-            .expect("legacy runtime should be present")
-            .document_state_values(paths)
+        #[cfg(test)]
+        {
+            self.legacy_runtime_mut()
+                .expect("legacy runtime should be present")
+                .document_state_values(paths)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = paths;
+            json!({"error": "LiveRuntime product build has no PlanExecutor session"})
+        }
     }
 
     pub fn document_state_summary(&mut self) -> JsonValue {
         if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.document_state_summary(SummaryLimits::document_preview());
         }
-        self.legacy_runtime_mut()
-            .expect("legacy runtime should be present")
-            .document_state_summary()
+        #[cfg(test)]
+        {
+            self.legacy_runtime_mut()
+                .expect("legacy runtime should be present")
+                .document_state_summary()
+        }
+        #[cfg(not(test))]
+        {
+            json!({"error": "LiveRuntime product build has no PlanExecutor session"})
+        }
     }
 
     pub fn source_payload_has_text(&self, source: &str) -> bool {
         if let Some(plan_session) = self.plan_session() {
             return plan_session.source_payload_has_text(source);
         }
-        self.legacy_runtime()
-            .is_ok_and(|runtime| runtime.source_payload_has_text(source))
+        #[cfg(test)]
+        {
+            self.legacy_runtime()
+                .is_ok_and(|runtime| runtime.source_payload_has_text(source))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = source;
+            false
+        }
     }
 
     pub fn has_source_path(&self, source: &str) -> bool {
         if let Some(plan_session) = self.plan_session() {
             return plan_session.has_source_path(source);
         }
-        self.legacy_runtime()
-            .is_ok_and(|runtime| runtime.has_source_path(source))
+        #[cfg(test)]
+        {
+            self.legacy_runtime()
+                .is_ok_and(|runtime| runtime.has_source_path(source))
+        }
+        #[cfg(not(test))]
+        {
+            let _ = source;
+            false
+        }
     }
 
     pub fn document_state_summary_for_window(
@@ -12155,9 +12291,16 @@ impl LiveRuntime {
                 column_count,
             ));
         }
-        self.legacy_runtime_mut()
-            .expect("legacy runtime should be present")
-            .document_state_summary_for_window(row_start, row_count, column_start, column_count)
+        #[cfg(test)]
+        {
+            self.legacy_runtime_mut()
+                .expect("legacy runtime should be present")
+                .document_state_summary_for_window(row_start, row_count, column_start, column_count)
+        }
+        #[cfg(not(test))]
+        {
+            json!({"error": "LiveRuntime product build has no PlanExecutor session"})
+        }
     }
 }
 
@@ -89444,22 +89587,24 @@ expected_source_event = {{ source = "store.decode" }}
     }
 
     #[test]
-    fn live_runtime_default_constructor_rejects_world_output_hidden_fallback() {
-        let error = match LiveRuntime::from_source(
+    fn live_runtime_default_constructor_keeps_world_output_on_plan_executor() {
+        let mut runtime = LiveRuntime::from_source(
             "examples/hello_3d/RUN.bn",
             include_str!("../../../examples/hello_3d/RUN.bn"),
-        ) {
-            Ok(_) => {
-                panic!("default LiveRuntime must not silently construct legacy for world output")
-            }
-            Err(error) => error.to_string(),
-        };
+        )
+        .expect("default LiveRuntime should initialize through PlanExecutor");
 
-        assert!(
-            error.contains("requires a legacy world/manufacturing output runtime")
-                && error.contains("refusing hidden fallback"),
-            "unexpected default runtime error: {error}"
+        assert_eq!(
+            runtime.engine_provenance_report()["engine"],
+            "plan_executor"
         );
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+        runtime
+            .world_scene_output()
+            .expect("world output should execute through default PlanExecutor runtime");
 
         let mut runtime = LiveRuntime::from_source_legacy(
             "examples/hello_3d/RUN.bn",

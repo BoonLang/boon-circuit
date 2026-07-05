@@ -44,8 +44,11 @@ Current checkpoint:
   and native/source replay refresh commands now exercise the default
   PlanExecutor-backed `boon_cli run` path without `--engine plan`. In normal
   builds `LiveRuntimeEngine` can no longer hold `LoadedRuntime`; the legacy
-  variant and legacy constructors are `#[cfg(test)]` quarantined while old
-  runtime coverage is migrated or deleted. The remaining legacy cuts are the
+  variant, legacy constructors, and `apply_checked_step*` legacy fallback helpers
+  are `#[cfg(test)]` quarantined while old runtime coverage is migrated or
+  deleted. Default `hello_3d` world-output construction now proves PlanExecutor
+  provenance rather than expecting a hidden fallback rejection. The remaining
+  legacy cuts are the
   `LoadedRuntime` / `GenericScheduledRuntime` implementation island itself and
   any native legacy negative counters that are no longer useful as removal
   guards.

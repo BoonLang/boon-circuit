@@ -12191,66 +12191,69 @@ impl LiveRuntime {
 }
 
 #[cfg(test)]
-struct LegacyRuntimeHarness;
+#[derive(Clone)]
+struct LegacyRuntimeHarness {
+    runtime: LiveRuntime,
+}
 
 #[cfg(test)]
 impl LegacyRuntimeHarness {
-    fn new(
-        source_label: &str,
-        source_text: &str,
-        scenario_path: &Path,
-    ) -> RuntimeResult<LiveRuntime> {
+    fn from_live_runtime(runtime: LiveRuntime) -> Self {
+        Self { runtime }
+    }
+
+    fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let scenario = parse_scenario(scenario_path)?;
         let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
-        Ok(LiveRuntime {
+        Ok(Self::from_live_runtime(LiveRuntime {
             engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
-        })
+        }))
     }
 
     fn new_from_project(
         source_label: &str,
         units: &[RuntimeSourceUnit],
         scenario_path: &Path,
-    ) -> RuntimeResult<LiveRuntime> {
+    ) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let scenario = parse_scenario(scenario_path)?;
         let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         runtime.prepare_for_scenario(&scenario)?;
-        Ok(LiveRuntime {
+        Ok(Self::from_live_runtime(LiveRuntime {
             engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
-        })
+        }))
     }
 
-    fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<LiveRuntime> {
+    fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        Ok(LiveRuntime {
+        Ok(Self::from_live_runtime(LiveRuntime {
             engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
-        })
+        }))
     }
 
-    fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<LiveRuntime> {
+    fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        Ok(LiveRuntime {
+        Ok(Self::from_live_runtime(LiveRuntime {
             engine: LiveRuntimeEngine::Legacy(runtime),
             next_step: 1,
             last_source_batch_sequence: None,
-        })
+        }))
     }
 
     fn from_project_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<(LiveRuntime, JsonValue)> {
+    ) -> RuntimeResult<(Self, JsonValue)> {
         let total_started = Instant::now();
         let source_key = source_units_hash(units);
         if let Some(runtime) = initialized_live_runtime_cache()
@@ -12259,7 +12262,7 @@ impl LegacyRuntimeHarness {
             .and_then(|cache| cache.get(&source_key).cloned())
         {
             return Ok((
-                runtime,
+                Self::from_live_runtime(runtime),
                 json!({
                     "initialized_runtime_cache_hit": true,
                     "plan": {
@@ -12298,7 +12301,7 @@ impl LegacyRuntimeHarness {
             cache.insert(source_key, live_runtime.clone());
         }
         Ok((
-            live_runtime,
+            Self::from_live_runtime(live_runtime),
             json!({
                 "initialized_runtime_cache_hit": false,
                 "plan": plan_profile,
@@ -12310,6 +12313,190 @@ impl LegacyRuntimeHarness {
                 "total_ms": runtime_elapsed_ms(total_started)
             }),
         ))
+    }
+
+    fn legacy_runtime_for_test(&self) -> &LoadedRuntime {
+        self.runtime.legacy_runtime_for_test()
+    }
+
+    fn legacy_runtime_for_test_mut(&mut self) -> &mut LoadedRuntime {
+        self.runtime.legacy_runtime_for_test_mut()
+    }
+
+    fn engine_provenance_report(&self) -> JsonValue {
+        self.runtime.engine_provenance_report()
+    }
+
+    fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        self.runtime.world_scene_output()
+    }
+
+    fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        self.runtime.solid_model_output()
+    }
+
+    fn state_summary(&mut self) -> JsonValue {
+        self.runtime.state_summary()
+    }
+
+    fn document_state_summary(&mut self) -> JsonValue {
+        self.runtime.document_state_summary()
+    }
+
+    fn document_state_summary_for_window(
+        &mut self,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> JsonValue {
+        self.runtime.document_state_summary_for_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
+    }
+
+    fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
+        self.runtime.document_state_values(paths)
+    }
+
+    fn runtime_value_summaries(
+        &mut self,
+        paths: &[String],
+        max_depth: usize,
+        max_fields: usize,
+        max_list_items: usize,
+    ) -> JsonValue {
+        self.runtime
+            .runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
+    }
+
+    fn source_payload_has_text(&self, source: &str) -> bool {
+        self.runtime.source_payload_has_text(source)
+    }
+
+    fn has_source_path(&self, source: &str) -> bool {
+        self.runtime.has_source_path(source)
+    }
+
+    fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_source_event(event)
+    }
+
+    fn apply_source_event_for_document(
+        &mut self,
+        event: LiveSourceEvent,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_source_event_for_document(event)
+    }
+
+    fn apply_source_event_for_document_window(
+        &mut self,
+        event: LiveSourceEvent,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_source_event_for_document_window(
+            event,
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
+    }
+
+    fn apply_source_event_turn(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveTurnOutput> {
+        self.runtime.apply_source_event_turn(event)
+    }
+
+    fn apply_source_batch_turn(&mut self, batch: SourceBatch) -> RuntimeResult<LiveTurnOutput> {
+        self.runtime.apply_source_batch_turn(batch)
+    }
+
+    fn apply_source_event_for_step(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_source_event_for_step(step, event)
+    }
+
+    fn apply_source_event_for_step_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        self.runtime
+            .apply_source_event_for_step_value_summaries(step, event, paths)
+    }
+
+    fn apply_source_event_for_step_projected_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        self.runtime
+            .apply_source_event_for_step_projected_value_summaries(step, event, paths)
+    }
+
+    fn apply_source_event_for_step_with_document_window(
+        &mut self,
+        step: &ScenarioStep,
+        event: LiveSourceEvent,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.runtime
+            .apply_source_event_for_step_with_document_window(
+                step,
+                event,
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )
+    }
+
+    fn apply_checked_step(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_checked_step(step)
+    }
+
+    fn apply_checked_step_turn(&mut self, step: &ScenarioStep) -> RuntimeResult<LiveTurnOutput> {
+        self.runtime.apply_checked_step_turn(step)
+    }
+
+    fn apply_checked_step_with_document_window(
+        &mut self,
+        step: &ScenarioStep,
+        row_start: usize,
+        row_count: usize,
+        column_start: usize,
+        column_count: usize,
+    ) -> RuntimeResult<LiveStepOutput> {
+        self.runtime.apply_checked_step_with_document_window(
+            step,
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        )
+    }
+
+    fn apply_checked_step_with_value_summaries(
+        &mut self,
+        step: &ScenarioStep,
+        paths: &[String],
+    ) -> RuntimeResult<LiveSparseStepOutput> {
+        self.runtime
+            .apply_checked_step_with_value_summaries(step, paths)
     }
 }
 
@@ -78648,7 +78835,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
     }
 
-    fn novywave_runtime_from_run(project: &str) -> LiveRuntime {
+    fn novywave_runtime_from_run(project: &str) -> LegacyRuntimeHarness {
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
@@ -78657,7 +78844,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     fn novywave_apply_source(
-        runtime: &mut LiveRuntime,
+        runtime: &mut LegacyRuntimeHarness,
         source: &str,
         key: Option<&str>,
     ) -> JsonValue {
@@ -80101,7 +80288,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime = LegacyRuntimeHarness::from_project("novywave-timeline-pan-zoom", &units)
             .expect("NovyWave runtime should initialize from manifest units");
-        let apply = |runtime: &mut LiveRuntime, source: &str, key: Option<&str>| {
+        let apply = |runtime: &mut LegacyRuntimeHarness, source: &str, key: Option<&str>| {
             runtime
                 .apply_source_event(LiveSourceEvent {
                     source: source.to_owned(),
@@ -80377,7 +80564,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             }
         }
 
-        fn apply_sparse(runtime: &mut LiveRuntime, step: ScenarioStep) -> LiveSparseStepOutput {
+        fn apply_sparse(
+            runtime: &mut LegacyRuntimeHarness,
+            step: ScenarioStep,
+        ) -> LiveSparseStepOutput {
             let expected = step.expected_source_event.as_ref().unwrap();
             let source = expected
                 .get("source")
@@ -80539,7 +80729,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     fn apply_novywave_scenario_until(
-        runtime: &mut LiveRuntime,
+        runtime: &mut LegacyRuntimeHarness,
         scenario: &Scenario,
         target_step_id: &str,
         target_paths: &[&str],
@@ -84484,7 +84674,7 @@ document: Document/new(root: Element/label(element: [], label: store.labels))
         let mut runtime =
             LegacyRuntimeHarness::from_source("numeric-retain-stability-guard", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["labels"], "middle");
-        let field_cache_hits = |runtime: &LiveRuntime| {
+        let field_cache_hits = |runtime: &LegacyRuntimeHarness| {
             runtime
                 .legacy_runtime_for_test()
                 .generic
@@ -84492,7 +84682,7 @@ document: Document/new(root: Element/label(element: [], label: store.labels))
                 .map(|generic| generic.root_list_view_field_cache_hits)
                 .unwrap_or_default()
         };
-        let field_cache_misses = |runtime: &LiveRuntime| {
+        let field_cache_misses = |runtime: &LegacyRuntimeHarness| {
             runtime
                 .legacy_runtime_for_test()
                 .generic
@@ -90773,7 +90963,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             &cells_project_source_for_test(),
         )
         .unwrap();
-        commit_cell(&mut runtime, "A3", "20");
+        commit_legacy_cell(&mut runtime, "A3", "20");
 
         let output = runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -91488,6 +91678,25 @@ manufacturing: Assembly/new(
     }
 
     fn commit_cell(runtime: &mut LiveRuntime, address: &str, text: &str) -> LiveStepOutput {
+        let mut output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "cell.sources.editor.commit".to_owned(),
+                text: Some(text.to_owned()),
+                address: Some(address.to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .unwrap();
+        if output.state_summary.get("cells").is_none() {
+            output.state_summary = runtime.document_state_summary();
+        }
+        output
+    }
+
+    fn commit_legacy_cell(
+        runtime: &mut LegacyRuntimeHarness,
+        address: &str,
+        text: &str,
+    ) -> LiveStepOutput {
         let mut output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.commit".to_owned(),

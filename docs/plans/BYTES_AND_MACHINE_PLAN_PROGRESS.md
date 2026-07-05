@@ -37596,3 +37596,32 @@ Important failed migration attempt:
   show `theme_options.name = Professional`.
 - Treat that as a real PlanExecutor summary/performance migration task, not as
   a reason to reintroduce native/product legacy fallback or to hide the tests.
+
+## 2026-07-05 - Legacy Runtime Harness Split From Product LiveRuntime Type
+
+Status: tightened the runtime boundary around the remaining legacy execution
+island. `LegacyRuntimeHarness` is now an explicit test wrapper that owns a
+`LiveRuntime` instead of a zero-sized constructor namespace returning product
+`LiveRuntime` values directly.
+
+What changed:
+
+- Legacy test constructors now return `LegacyRuntimeHarness`, not
+  `LiveRuntime`.
+- Legacy-only tests that still need `LoadedRuntime` behavior must go through
+  explicit wrapper methods on `LegacyRuntimeHarness`.
+- PlanExecutor Cells tests continue to use product `LiveRuntime`; the shared
+  `commit_cell` helper remains PlanExecutor-facing, with a separate
+  `commit_legacy_cell` helper for the one legacy recompute-metrics test.
+- `verify-compiler-boundaries` now checks that `LegacyRuntimeHarness` owns a
+  `runtime: LiveRuntime` field and that its constructors return `Self`, so the
+  old shape cannot quietly return product runtime values again.
+
+Why this is not the final legacy cleanup:
+
+- `LiveRuntimeEngine::Legacy(LoadedRuntime)` still exists under `#[cfg(test)]`
+  because many old runtime unit tests still exercise legacy storage internals,
+  route tables, cache counters, and historical recompute metrics.
+- The next cut should delete or rewrite obsolete legacy tests and move any
+  still-useful coverage to PlanExecutor semantics. Avoid preserving the
+  wrapper as another permanent compatibility layer.

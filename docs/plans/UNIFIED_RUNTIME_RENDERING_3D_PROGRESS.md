@@ -35832,3 +35832,26 @@ Current interpretation:
 - Future native GPU architecture failures should point at current retained
   scene/render-graph issues rather than the removed compatibility migration
   stage.
+
+## 2026-07-05 - Default Engine Readiness Refresh
+
+Status: verified current default-engine state; no code change in this slice.
+
+Evidence:
+
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `jq -c '{status, default_engine, default_switch_allowed, blocker_count: ((.blockers // []) | length), failed_checks: [.per_step_pass_fail[]? | select(.pass == false) | .id], child_reports: [.child_reports[]? | {id, engine, command, status}]}' target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  `{"status":"pass","default_engine":"plan","default_switch_allowed":true,"blocker_count":0,"failed_checks":[],"child_reports":[{"id":"todomvc-default-plan","engine":"default","command":"run-plan-scenario-events","status":"pass"},{"id":"cells-default-plan","engine":"default","command":"run-plan-scenario-events","status":"pass"},{"id":"explicit-legacy-semantic","engine":"legacy","command":"semantic","status":"pass"},{"id":"todomvc-compare","engine":"compare","command":"run-plan-scenario-events","status":"pass"},{"id":"cells-compare","engine":"compare","command":"run-plan-scenario-events","status":"pass"}]}`.
+
+Current interpretation:
+
+- Current `boon_cli run` default execution is PlanExecutor-backed and the
+  focused default-engine readiness gate is green.
+- Old ledger paragraphs saying `boon_cli run` still defaults to legacy are
+  historical evidence from before the switch, not current blocker state.
+- This does not by itself complete the unified goal; native handoff,
+  retained-render/proof-lane cleanup, and broad aggregate freshness still need
+  current evidence.

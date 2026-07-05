@@ -25,6 +25,16 @@ Current checkpoint:
   This is not complete legacy removal: `LoadedRuntime`/`GenericScheduledRuntime`,
   explicit diagnostic legacy comparison report surfaces, and native legacy
   negative counters still need deletion or quarantine in later slices.
+- Scenario-events product reports are now PlanExecutor-only. The
+  `ScenarioEventsCommandOutputInput` / `ScenarioEventsCommandReportInput`
+  structs no longer accept `legacy_comparison`, `legacy_comparison_acceptance`,
+  or `compare_legacy`; `run_plan_scenario_events(...)` no longer constructs
+  disabled legacy placeholders; the report schema rejects `legacy_comparison*`
+  fields on `run-plan-scenario-events`; and `verify-compiler-boundaries` has a
+  dedicated check that this product path cannot regain legacy comparison
+  plumbing. Do not reintroduce disabled legacy fields to make old reports pass.
+  The next legacy cuts are root-scalar/source-route diagnostic report contracts
+  and the `LoadedRuntime` / `GenericScheduledRuntime` implementation island.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

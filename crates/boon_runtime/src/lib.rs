@@ -95,8 +95,6 @@ use boon_plan_executor::{
     commit_ordered_root_update_candidates as commit_plan_ordered_root_update_candidates,
     commit_source_derived_values_to_root_state as commit_plan_source_derived_values_to_root_state,
     decode_expected_source_event as decode_plan_expected_source_event,
-    demand_current_field_paths as plan_demand_current_field_paths,
-    demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
     derived_field_label as plan_derived_field_label, eval_plan_row_expression,
     evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
@@ -3927,16 +3925,6 @@ pub fn run_plan_scenario_events(
         .map(|index| &scenario.step[*index])
         .collect::<Vec<_>>();
     let output = execute_machine_plan_root_scenario_inner(&plan, &all_steps, source_path.parent())?;
-    let legacy_comparison = json!({
-        "enabled": false,
-        "passed": true,
-        "reason": "legacy comparison was removed from the product scenario-event path"
-    });
-    let demand_current_field_paths = plan_demand_current_field_paths(&plan);
-    let legacy_comparison_acceptance = plan_demand_current_semantic_delta_acceptance_policy(
-        &legacy_comparison,
-        &demand_current_field_paths,
-    );
     let coverage_report = assemble_plan_root_scenario_coverage_report(
         scenario.step.len(),
         selected_steps.len(),
@@ -3971,9 +3959,6 @@ pub fn run_plan_scenario_events(
             state_summary: output.state_summary.clone(),
             semantic_delta_signatures: output.semantic_delta_signatures.clone(),
             semantic_deltas: output.semantic_deltas.clone(),
-            legacy_comparison,
-            legacy_comparison_acceptance,
-            compare_legacy: false,
             plan_executor_coverage,
             assertion_only_covered,
             plan_executor: output.executor_report.clone(),
@@ -86061,9 +86046,13 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 )
                 .expect("Cells expected-source-event scenario should run through PlanExecutor");
 
-                assert_eq!(
-                    output.report["legacy_comparison"]["enabled"], false,
-                    "Cells product scenario events must not execute legacy comparison"
+                assert!(
+                    output.report.get("legacy_comparison").is_none(),
+                    "Cells product scenario events must not emit legacy comparison"
+                );
+                assert!(
+                    output.report.get("legacy_comparison_acceptance").is_none(),
+                    "Cells product scenario events must not emit legacy acceptance policy"
                 );
                 assert_eq!(
                     output.report["comparison_status"], "not-requested",

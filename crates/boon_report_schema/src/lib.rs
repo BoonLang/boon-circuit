@@ -4966,7 +4966,6 @@ fn verify_run_plan_scenario_events_report(
         "state_summary",
         "semantic_delta_signatures",
         "semantic_deltas",
-        "legacy_comparison",
         "plan_executor_coverage",
         "plan_executor",
     ] {
@@ -4977,6 +4976,36 @@ fn verify_run_plan_scenario_events_report(
             )
             .into());
         }
+    }
+    for key in ["legacy_comparison", "legacy_comparison_acceptance"] {
+        if report.get(key).is_some() {
+            return Err(format!(
+                "{} run-plan-scenario-events product report must not emit `{key}`",
+                report_path.display()
+            )
+            .into());
+        }
+    }
+    if report
+        .get("plan_executor_status")
+        .and_then(JsonValue::as_str)
+        != Some("pass")
+        || report
+            .get("accepted_for_product_status")
+            .and_then(JsonValue::as_str)
+            != Some("pass")
+        || report.get("comparison_status").and_then(JsonValue::as_str) != Some("not-requested")
+        || report
+            .get("report_status_basis")
+            .and_then(JsonValue::as_str)
+            != Some("plan-executor-product-plus-assertion-coverage")
+        || report.get("measurement_mode").and_then(JsonValue::as_str) != Some("proof")
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events product status fields are invalid",
+            report_path.display()
+        )
+        .into());
     }
     if report.get("source_replay_identity").is_some()
         && !report_source_replay_identity_matches_report(report)
@@ -5235,177 +5264,6 @@ fn verify_run_plan_scenario_events_report(
         }
     }
 
-    let legacy = report
-        .get("legacy_comparison")
-        .and_then(JsonValue::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{} run-plan-scenario-events legacy_comparison is not an object",
-                report_path.display()
-            )
-        })?;
-    verify_legacy_required_is_diagnostic_only(report, report_path, "run-plan-scenario-events")?;
-    let legacy_enabled = legacy.get("enabled").and_then(JsonValue::as_bool) == Some(true);
-    if !legacy_enabled {
-        let command_argv = report
-            .get("command_argv")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| {
-                format!(
-                    "{} run-plan-scenario-events command_argv is not an array",
-                    report_path.display()
-                )
-            })?;
-        if command_argv_value_after(command_argv, "--engine") == Some("compare") {
-            return Err(format!(
-                "{} run-plan-scenario-events compare-mode report must enable legacy comparison",
-                report_path.display()
-            )
-            .into());
-        }
-        let legacy_acceptance = report
-            .get("legacy_comparison_acceptance")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| {
-                format!(
-                    "{} run-plan-scenario-events legacy_comparison_acceptance is not an object",
-                    report_path.display()
-                )
-            })?;
-        if legacy.get("passed").and_then(JsonValue::as_bool) != Some(true)
-            || legacy.get("reason").and_then(JsonValue::as_str)
-                != Some("legacy comparison was not requested")
-            || legacy_acceptance
-                .get("accepted")
-                .and_then(JsonValue::as_bool)
-                != Some(false)
-            || legacy_acceptance.get("kind").and_then(JsonValue::as_str) != Some("not-applicable")
-        {
-            return Err(format!(
-                "{} run-plan-scenario-events disabled legacy comparison has invalid proof shape",
-                report_path.display()
-            )
-            .into());
-        }
-        return Ok(());
-    }
-    for key in ["state_match"] {
-        if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} run-plan-scenario-events legacy_comparison.{key} must be true",
-                report_path.display()
-            )
-            .into());
-        }
-    }
-    let legacy_exact_match = legacy.get("passed").and_then(JsonValue::as_bool) == Some(true)
-        && legacy
-            .get("semantic_delta_match")
-            .and_then(JsonValue::as_bool)
-            == Some(true);
-    let legacy_acceptance = report
-        .get("legacy_comparison_acceptance")
-        .and_then(JsonValue::as_object);
-    let legacy_demand_current_coalesced = legacy_acceptance
-        .and_then(|acceptance| acceptance.get("accepted"))
-        .and_then(JsonValue::as_bool)
-        == Some(true)
-        && legacy_acceptance
-            .and_then(|acceptance| acceptance.get("kind"))
-            .and_then(JsonValue::as_str)
-            == Some("demand-current-coalesced-semantic-deltas");
-    if !(legacy_exact_match || legacy_demand_current_coalesced) {
-        return Err(format!(
-            "{} run-plan-scenario-events legacy comparison must either match exactly or pass the demand-current coalescing policy",
-            report_path.display()
-        )
-        .into());
-    }
-    let accepted_demand_current_field_paths = legacy_acceptance
-        .and_then(|acceptance| acceptance.get("accepted_demand_current_field_paths"))
-        .and_then(JsonValue::as_array)
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(JsonValue::as_str)
-                .map(str::to_owned)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    if legacy.get("plan_state_summary") != report.get("state_summary")
-        || legacy.get("legacy_state_summary") != report.get("state_summary")
-    {
-        return Err(format!(
-            "{} run-plan-scenario-events legacy state projection does not match report state",
-            report_path.display()
-        )
-        .into());
-    }
-    let legacy_steps = legacy
-        .get("step_comparisons")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} run-plan-scenario-events legacy step_comparisons is not an array",
-                report_path.display()
-            )
-        })?;
-    if legacy_steps.len() != executor_steps.len() {
-        return Err(format!(
-            "{} run-plan-scenario-events legacy step count does not match executor steps",
-            report_path.display()
-        )
-        .into());
-    }
-    for ((legacy_step, executor_step), expected_step_id) in legacy_steps
-        .iter()
-        .zip(executor_steps)
-        .zip(expected_event_step_ids.iter())
-    {
-        let step_semantic_match = legacy_step
-            .get("semantic_delta_match")
-            .and_then(JsonValue::as_bool)
-            == Some(true);
-        if legacy_step.get("state_match").and_then(JsonValue::as_bool) != Some(true)
-            || legacy_step.get("step_id") != Some(expected_step_id)
-            || executor_step.get("step_id") != Some(expected_step_id)
-            || legacy_step.get("touched_state_summary")
-                != executor_step.get("touched_state_summary")
-            || legacy_step.get("plan_semantic_delta_signatures")
-                != executor_step.get("semantic_delta_signatures")
-            || legacy_step.get("plan_semantic_deltas") != executor_step.get("semantic_deltas")
-        {
-            return Err(format!(
-                "{} run-plan-scenario-events legacy step comparison does not match executor step",
-                report_path.display()
-            )
-            .into());
-        }
-        if step_semantic_match {
-            if legacy_step.get("legacy_semantic_delta_signatures")
-                != executor_step.get("semantic_delta_signatures")
-                || legacy_step.get("legacy_semantic_deltas") != executor_step.get("semantic_deltas")
-            {
-                return Err(format!(
-                    "{} run-plan-scenario-events exact legacy step comparison does not match executor step",
-                    report_path.display()
-                )
-                .into());
-            }
-        } else if !legacy_demand_current_coalesced
-            || !run_plan_step_matches_demand_current_delta_policy(
-                legacy_step,
-                &accepted_demand_current_field_paths,
-            )
-        {
-            return Err(format!(
-                "{} run-plan-scenario-events legacy step `{}` does not satisfy demand-current coalescing policy",
-                report_path.display(),
-                expected_step_id
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 
@@ -5440,59 +5298,6 @@ fn verify_run_plan_scenario_events_top_level_deltas(
         .into());
     }
     Ok(())
-}
-
-fn run_plan_step_matches_demand_current_delta_policy(
-    step: &JsonValue,
-    accepted_demand_current_field_paths: &BTreeSet<String>,
-) -> bool {
-    if step.get("state_match").and_then(JsonValue::as_bool) != Some(true) {
-        return false;
-    }
-    let Some(legacy_deltas) = step
-        .get("legacy_semantic_deltas")
-        .and_then(JsonValue::as_array)
-    else {
-        return false;
-    };
-    let Some(plan_deltas) = step
-        .get("plan_semantic_deltas")
-        .and_then(JsonValue::as_array)
-    else {
-        return false;
-    };
-    let mut remaining_legacy = legacy_deltas.clone();
-    let mut extra_plan_deltas = Vec::new();
-    for plan_delta in plan_deltas {
-        if let Some(index) = remaining_legacy
-            .iter()
-            .position(|legacy_delta| legacy_delta == plan_delta)
-        {
-            remaining_legacy.remove(index);
-        } else {
-            extra_plan_deltas.push(plan_delta);
-        }
-    }
-    if remaining_legacy.is_empty() && extra_plan_deltas.is_empty() {
-        return false;
-    }
-    remaining_legacy
-        .iter()
-        .chain(extra_plan_deltas)
-        .all(|delta| {
-            run_plan_delta_matches_demand_current_policy(delta, accepted_demand_current_field_paths)
-        })
-}
-
-fn run_plan_delta_matches_demand_current_policy(
-    delta: &JsonValue,
-    accepted_demand_current_field_paths: &BTreeSet<String>,
-) -> bool {
-    delta.get("kind").and_then(JsonValue::as_str) == Some("FieldSet")
-        && delta
-            .get("field_path")
-            .and_then(JsonValue::as_str)
-            .is_some_and(|field_path| accepted_demand_current_field_paths.contains(field_path))
 }
 
 fn scenario_assertion_checkpoint_expectation_names(

@@ -36674,3 +36674,51 @@ Evidence:
   pass.
 - `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
   pass, zero blockers.
+
+## 2026-07-05 - Scenario Events Product Reports Cut Legacy Comparison
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Removed `legacy_comparison`, `legacy_comparison_acceptance`, and
+  `compare_legacy` from `ScenarioEventsCommandOutputInput` and
+  `ScenarioEventsCommandReportInput`.
+- `run_plan_scenario_events(...)` no longer constructs disabled legacy
+  comparison placeholder JSON or demand-current legacy acceptance policy.
+- `run-plan-scenario-events` reports now emit product-only PlanExecutor status:
+  `comparison_status=not-requested`,
+  `report_status_basis=plan-executor-product-plus-assertion-coverage`, and
+  `measurement_mode=proof`.
+- The scenario-events report schema now rejects `legacy_comparison` and
+  `legacy_comparison_acceptance` when they appear on product scenario-events
+  reports, instead of requiring disabled legacy proof shape.
+- Removed the scenario-events legacy-step comparison schema block and its
+  dead demand-current legacy-delta policy helpers.
+- Removed native source-action replay summary fields that read
+  `/legacy_comparison/*` from scenario-events reports.
+- Added a compiler-boundary check proving the scenario-events product report
+  path does not regain legacy comparison plumbing.
+
+Current interpretation:
+
+- This is a control-plane/report-contract cut. It removes an executable product
+  report dependency on legacy comparison for scenario events.
+- It is not a Cells runtime speed fix. The focused Cells product scenario-events
+  test still takes minutes, so runtime/currentness/render performance work
+  remains open.
+- Root-scalar/source-route report contracts and explicit diagnostic legacy
+  comparison surfaces still exist and need separate deletion or quarantine.
+- `LoadedRuntime` / `GenericScheduledRuntime` still remain as an implementation
+  island and are not removed by this slice.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_report_schema -p xtask`:
+  pass.
+- `cargo test -q -p boon_plan_executor scenario_events -- --nocapture`:
+  pass, `2` tests.
+- `cargo test -q -p boon_report_schema --lib -- --nocapture`:
+  pass, `70` tests.
+- `cargo test -q -p boon_runtime cells_plan_executor_scenario_events_are_product_only -- --nocapture`:
+  pass in `197.26s`.

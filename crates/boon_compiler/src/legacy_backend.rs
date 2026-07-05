@@ -2030,9 +2030,6 @@ fn row_expression_for_value(
     if derived.kind != DerivedValueKind::Pure {
         return None;
     }
-    if !derived.indexed && !row_statement_calls_router_route(program, &derived.statement) {
-        return None;
-    }
     let mut local_constants = constants.clone();
     let mut local_inputs = inputs.clone();
     let mut env = BTreeMap::new();
@@ -2053,16 +2050,6 @@ fn row_expression_for_value(
     *constants = local_constants;
     *inputs = local_inputs;
     Some(PlanDerivedExpression::RowExpression { expression })
-}
-
-fn row_statement_calls_router_route(program: &TypedProgram, statement: &AstStatement) -> bool {
-    super::compiler_statement_ast_exprs(statement, &program.expressions)
-        .iter()
-        .any(|expr| match &expr.kind {
-            AstExprKind::Pipe { op, .. } => op == "Router/route",
-            AstExprKind::Call { function, .. } => function == "Router/route",
-            _ => false,
-        })
 }
 
 fn lower_row_expr(
@@ -5215,6 +5202,81 @@ mod tests {
             ],
         )
         .expect("checked-in Cells project should parse")
+    }
+
+    #[test]
+    fn root_pure_fields_lower_to_row_expressions_without_router_dependency() {
+        let parsed = boon_parser::parse_project(
+            "examples/root_pure_expression_test.bn",
+            [(
+                "examples/root_pure_expression_test.bn".to_owned(),
+                r#"
+store: [
+    sources: [
+        noop: [
+            events: [
+                change: SOURCE
+            ]
+        ]
+    ]
+    active_file:
+        TEXT { wave.vcd } |> HOLD active_file {
+            LATEST {
+                sources.noop.events.change |> THEN { active_file }
+            }
+        }
+    selected_file: active_file
+]
+"#
+                .to_owned(),
+            )],
+        )
+        .expect("root pure expression fixture should parse");
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let selected_file_id = debug_entry_id(
+            &plan.debug_map.derived_values,
+            "field",
+            "store.selected_file",
+        );
+        let selected_file = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+            .flat_map(|region| region.ops.iter())
+            .find(|op| {
+                matches!(
+                    op.output,
+                    Some(ValueRef::Field(field_id)) if field_id.0 == selected_file_id
+                )
+            })
+            .expect("store.selected_file should have a derived op");
+
+        assert!(
+            matches!(
+                &selected_file.kind,
+                PlanOpKind::DerivedValue {
+                    derived_kind: PlanDerivedKind::Pure,
+                    expression: Some(PlanDerivedExpression::RowExpression {
+                        expression: PlanRowExpression::Field { .. }
+                    }),
+                    ..
+                }
+            ),
+            "root pure field aliases should lower to executable row expressions"
+        );
+        assert!(
+            cpu_plan_executor_supports_whole_plan_op(
+                &plan.storage_layout.scalar_slots,
+                &plan.storage_layout.list_slots,
+                &plan.constants,
+                selected_file,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            ),
+            "root pure field alias should be executable by the generic CPU PlanExecutor"
+        );
     }
 
     #[test]

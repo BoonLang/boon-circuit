@@ -36522,3 +36522,57 @@ Current interpretation:
   is compiler/executor expression coverage for NovyWave's currently expression-
   less derived/list-view fields, or deletion/replacement of the obsolete bridge
   verifier if it is no longer product evidence.
+
+## 2026-07-05 - Root Pure Expression And Startup Lookup Coverage
+
+Status: added a generic compiler/executor slice for root pure expressions and
+root startup list lookup. This reduces one concrete PlanExecutor coverage gap
+without adding a NovyWave-specific branch.
+
+What changed:
+
+- Compiler lowering now attempts `PlanDerivedExpression::RowExpression` for all
+  pure derived fields, not only indexed fields or root fields that call
+  `Router/route`.
+- PlanExecutor's root row-expression evaluator now supports:
+  - `Text/to_number` over textlike root startup values;
+  - `List/find_value` over typed `ListStorageSlot.initial_rows`;
+  - `List/find_value` fallback expressions that read already-initialized root
+    derived fields.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler root_pure_fields_lower_to_row_expressions_without_router_dependency`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_row_expression_`: pass.
+- `cargo check -q -p boon_compiler -p boon_plan_executor -p boon_runtime -p boon_cli`:
+  pass.
+
+NovyWave measurement:
+
+- A fresh `dump-plan examples/novywave/RUN.bn` summary after the compiler change
+  shows the named startup copy sources now carry expressions:
+  `store.startup_selected_file`, `store.startup_selected_file_path`,
+  `store.startup_selected_family`, `store.startup_selected_scope_key`,
+  `store.startup_primary_signal`,
+  `store.selected_waveform_metadata_canvas_width`,
+  `store.selected_timeline_cursor_default`, and
+  `store.selected_timeline_zoom_center_default`.
+- The same plan still reports `cpu_plan_executor_complete=false`,
+  `cpu_plan_executor_unsupported_op_count=605`, and
+  `unresolved_executable_ref_count=7`.
+- `boon_cli run examples/novywave/RUN.bn --engine plan --report
+  target/reports/novywave-plan-run.json` still stops at
+  `MachinePlan verification failed with 1 error(s)`, so NovyWave PlanExecutor
+  authority remains incomplete.
+
+Current interpretation:
+
+- The root startup expression slice is useful generic progress and should stay.
+- Do not treat this as NovyWave bridge migration completion. The next NovyWave
+  PlanExecutor cut must first identify and fix the remaining MachinePlan
+  verification failure, then reduce unsupported derived/list/update coverage
+  deliberately.
+- Because `verify-novywave-bridge-scenario` is not in the native handoff
+  manifest, keep it classified as an explicit legacy regression harness until
+  replacement evidence exists.

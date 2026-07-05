@@ -3714,6 +3714,18 @@ fn eval_root_source_transform_row_expression(
                     .to_owned(),
             ))
         }
+        PlanRowExpression::TextToNumber { input } => {
+            let value = eval_root_source_transform_row_expression(plan, root_state, input)?;
+            if let Some(number) = value.as_i64() {
+                return Ok(json!(number));
+            }
+            let text = json_scalar_textlike(&value)
+                .ok_or("source-transform Text/to_number input is not textlike")?;
+            let number = text.trim().parse::<i64>().map_err(|error| {
+                format!("source-transform Text/to_number input `{text}` is not a number: {error}")
+            })?;
+            Ok(json!(number))
+        }
         PlanRowExpression::TextConcat { parts } => {
             let mut text = String::new();
             for part in parts {
@@ -3731,6 +3743,40 @@ fn eval_root_source_transform_row_expression(
                 .get(field)
                 .cloned()
                 .ok_or_else(|| format!("source-transform object is missing field `{field}`").into())
+        }
+        PlanRowExpression::ListFindValue {
+            list_id,
+            field,
+            value,
+            target,
+            fallback,
+        } => {
+            let selector = eval_root_source_transform_row_expression(plan, root_state, value)?;
+            let list_slot = plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.list_id == *list_id)
+                .ok_or_else(|| format!("source-transform list {} is missing", list_id.0))?;
+            for row in &list_slot.initial_rows {
+                let Some(candidate) = initial_row_field_json_value(row, *field)? else {
+                    continue;
+                };
+                if row_json_values_equal(Some(&candidate), &selector) {
+                    return initial_row_field_json_value(row, *target)?.ok_or_else(|| {
+                        format!(
+                            "source-transform List/find_value target field {} is missing in list {}",
+                            target.0, list_id.0
+                        )
+                        .into()
+                    });
+                }
+            }
+            if let Some(fallback) = fallback {
+                eval_root_source_transform_row_expression(plan, root_state, fallback)
+            } else {
+                Ok(JsonValue::Null)
+            }
         }
         PlanRowExpression::BuiltinCall {
             function,
@@ -3754,6 +3800,22 @@ fn eval_root_source_transform_row_expression(
         )
         .into()),
     }
+}
+
+fn initial_row_field_json_value(
+    row: &boon_plan::PlanInitialListRow,
+    field_id: FieldId,
+) -> PlanExecutorResult<Option<JsonValue>> {
+    row.fields
+        .iter()
+        .find(|field| field.field_id == Some(field_id))
+        .map(|field| {
+            plan_constant_value_json_value(
+                &field.value,
+                &format!("initial list row field `{}`", field.name),
+            )
+        })
+        .transpose()
 }
 
 fn row_select_pattern_matches_json(
@@ -19668,6 +19730,126 @@ mod tests {
             root.executor_report["bytes_initialization_core"]["executor"],
             "cpu-plan-root-bytes-storage-initializer-v1"
         );
+    }
+
+    #[test]
+    fn root_row_expression_finds_initial_list_value_and_converts_number() {
+        let mut plan = empty_executor_test_plan();
+        plan.constants = vec![boon_plan::PlanConstant {
+            id: PlanConstantId(0),
+            value: PlanConstantValue::Text {
+                value: "A".to_owned(),
+            },
+        }];
+        plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(0),
+            list_id: boon_plan::ListId(0),
+            scope_id: None,
+            row_field_ids: vec![FieldId(1), FieldId(2)],
+            capacity: None,
+            hidden_key_type: "none".to_owned(),
+            has_generation: false,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![
+                    boon_plan::PlanInitialListField {
+                        name: "key".to_owned(),
+                        field_id: Some(FieldId(1)),
+                        value: PlanConstantValue::Text {
+                            value: "A".to_owned(),
+                        },
+                    },
+                    boon_plan::PlanInitialListField {
+                        name: "width".to_owned(),
+                        field_id: Some(FieldId(2)),
+                        value: PlanConstantValue::Text {
+                            value: "120".to_owned(),
+                        },
+                    },
+                ],
+            }],
+        }];
+
+        let expression = PlanRowExpression::TextToNumber {
+            input: Box::new(PlanRowExpression::ListFindValue {
+                list_id: boon_plan::ListId(0),
+                field: FieldId(1),
+                value: Box::new(PlanRowExpression::Constant {
+                    constant_id: PlanConstantId(0),
+                }),
+                target: FieldId(2),
+                fallback: None,
+            }),
+        };
+
+        let value = eval_root_source_transform_row_expression(&plan, &JsonMap::new(), &expression)
+            .expect("root evaluator should read initial list rows");
+        assert_eq!(value, json!(120));
+    }
+
+    #[test]
+    fn root_row_expression_list_find_uses_fallback_derived_field() {
+        let mut plan = empty_executor_test_plan();
+        plan.constants = vec![boon_plan::PlanConstant {
+            id: PlanConstantId(0),
+            value: PlanConstantValue::Text {
+                value: "missing".to_owned(),
+            },
+        }];
+        plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
+            id: boon_plan::PlanStorageId(0),
+            list_id: boon_plan::ListId(0),
+            scope_id: None,
+            row_field_ids: vec![FieldId(1), FieldId(2)],
+            capacity: None,
+            hidden_key_type: "none".to_owned(),
+            has_generation: false,
+            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
+            range: None,
+            initial_rows: vec![boon_plan::PlanInitialListRow {
+                fields: vec![
+                    boon_plan::PlanInitialListField {
+                        name: "key".to_owned(),
+                        field_id: Some(FieldId(1)),
+                        value: PlanConstantValue::Text {
+                            value: "present".to_owned(),
+                        },
+                    },
+                    boon_plan::PlanInitialListField {
+                        name: "width".to_owned(),
+                        field_id: Some(FieldId(2)),
+                        value: PlanConstantValue::Text {
+                            value: "120".to_owned(),
+                        },
+                    },
+                ],
+            }],
+        }];
+        plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
+            id: "field:4".to_owned(),
+            label: "store.default_width".to_owned(),
+        }];
+        let root_state = JsonMap::from_iter([(
+            "store.default_width".to_owned(),
+            JsonValue::String("88".to_owned()),
+        )]);
+
+        let expression = PlanRowExpression::ListFindValue {
+            list_id: boon_plan::ListId(0),
+            field: FieldId(1),
+            value: Box::new(PlanRowExpression::Constant {
+                constant_id: PlanConstantId(0),
+            }),
+            target: FieldId(2),
+            fallback: Some(Box::new(PlanRowExpression::Field {
+                input: ValueRef::Field(FieldId(4)),
+            })),
+        };
+
+        let value = eval_root_source_transform_row_expression(&plan, &root_state, &expression)
+            .expect("root evaluator should use fallback when no initial row matches");
+        assert_eq!(value, json!("88"));
     }
 
     #[test]

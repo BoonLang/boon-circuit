@@ -643,6 +643,9 @@ pub enum PlanRowExpression {
         from: Box<PlanRowExpression>,
         to: Box<PlanRowExpression>,
     },
+    ListLiteral {
+        items: Vec<PlanRowExpression>,
+    },
     ListMap {
         input: Box<PlanRowExpression>,
         binding: String,
@@ -5147,6 +5150,9 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
         PlanRowExpression::ListRange { from, to } => {
             row_expression_refs_resolve(op, from) && row_expression_refs_resolve(op, to)
         }
+        PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .all(|item| row_expression_refs_resolve(op, item)),
         PlanRowExpression::ListMap { input, value, .. } => {
             row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, value)
         }
@@ -5363,6 +5369,9 @@ fn row_expression_list_fields_resolve_inner(
             row_expression_list_fields_resolve_inner(plan, from)
                 && row_expression_list_fields_resolve_inner(plan, to)
         }
+        PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .all(|item| row_expression_list_fields_resolve_inner(plan, item)),
         PlanRowExpression::ListMap { input, value, .. } => {
             row_expression_list_fields_resolve_inner(plan, input)
                 && row_expression_list_fields_resolve_inner(plan, value)
@@ -5405,6 +5414,7 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListRange { .. }
         | PlanRowExpression::ListMapItem { .. } => true,
+        PlanRowExpression::ListLiteral { items } => items.iter().all(row_expression_cpu_evaluable),
         PlanRowExpression::Object { fields } => fields
             .iter()
             .all(|field| row_expression_cpu_evaluable(&field.value)),

@@ -2266,6 +2266,19 @@ fn lower_row_expr(
                     }
                 };
             }
+            let object = (|| {
+                let (parent, _) = derived.path.rsplit_once('.')?;
+                let (grandparent, _) = parent.rsplit_once('.')?;
+                let candidate = format!("{grandparent}.{}", parts[0]);
+                row_field_expression(program, derived, index, inputs, &candidate)
+            })()
+            .or_else(|| row_field_expression(program, derived, index, inputs, &parts[0]));
+            if let Some(object) = object {
+                return Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
+                    object: Box::new(object),
+                    field: parts[1].clone(),
+                }));
+            }
             let path = parts.join(".");
             row_field_expression(program, derived, index, inputs, &path)
                 .map(LoweredRowValue::Scalar)
@@ -2334,6 +2347,27 @@ fn lower_row_expr(
             }
             Some(LoweredRowValue::Scalar(PlanRowExpression::Object {
                 fields: object_fields,
+            }))
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            let mut lowered_items = Vec::with_capacity(items.len());
+            for item in items {
+                lowered_items.push(
+                    lower_row_expr(
+                        program,
+                        derived,
+                        index,
+                        constants,
+                        inputs,
+                        env,
+                        expr_value_types,
+                        *item,
+                    )
+                    .and_then(lowered_scalar)?,
+                );
+            }
+            Some(LoweredRowValue::Scalar(PlanRowExpression::ListLiteral {
+                items: lowered_items,
             }))
         }
         AstExprKind::Infix { left, op, right } if op == "+" => {
@@ -2645,6 +2679,7 @@ fn row_expression_value_type(
         }
         PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListRange { .. }
+        | PlanRowExpression::ListLiteral { .. }
         | PlanRowExpression::ListMap { .. }
         | PlanRowExpression::ListMapItem { .. }
         | PlanRowExpression::Object { .. }
@@ -2750,6 +2785,31 @@ fn lower_row_statement_value(
             expr_id,
         ) {
             return Some(value);
+        }
+        if matches!(
+            expr_by_id(program, expr_id)?.kind,
+            AstExprKind::ListLiteral { .. }
+        ) && !statement.children.is_empty()
+        {
+            let mut items = Vec::with_capacity(statement.children.len());
+            for child in &statement.children {
+                items.push(
+                    lower_row_statement_value(
+                        program,
+                        derived,
+                        index,
+                        constants,
+                        inputs,
+                        env,
+                        expr_value_types,
+                        child,
+                    )
+                    .and_then(lowered_scalar)?,
+                );
+            }
+            return Some(LoweredRowValue::Scalar(PlanRowExpression::ListLiteral {
+                items,
+            }));
         }
         return lower_row_expr(
             program,
@@ -3134,6 +3194,7 @@ fn row_text_builtin(function: &str) -> bool {
             | "Text/starts_with"
             | "Text/length"
             | "Text/to_number"
+            | "Text/concat"
             | "Text/substring"
     )
 }
@@ -3875,6 +3936,43 @@ fn lower_row_text_builtin(
         "Text/to_number" => PlanRowExpression::TextToNumber {
             input: Box::new(input),
         },
+        "Text/concat" => {
+            let with_expr = args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("with"))
+                .or_else(|| args.iter().filter(|arg| arg.name.is_none()).nth(1))
+                .map(|arg| arg.value)?;
+            let with = lower_row_expr(
+                program,
+                derived,
+                index,
+                constants,
+                inputs,
+                env,
+                expr_value_types,
+                with_expr,
+            )?;
+            let mut parts = vec![input];
+            if let Some(separator_expr) = args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("separator"))
+                .map(|arg| arg.value)
+            {
+                let separator = lower_row_expr(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    env,
+                    expr_value_types,
+                    separator_expr,
+                )?;
+                parts.push(lowered_scalar(separator)?);
+            }
+            parts.push(lowered_scalar(with)?);
+            PlanRowExpression::TextConcat { parts }
+        }
         "Text/substring" => {
             let start_expr = args
                 .iter()
@@ -4142,10 +4240,21 @@ fn row_field_expression(
     inputs: &mut Vec<ValueRef>,
     path: &str,
 ) -> Option<PlanRowExpression> {
-    let canonical = canonical_sibling_path(&derived.path, path);
-    let value_ref = index.resolve(&canonical).or_else(|| {
-        synthetic_range_row_field_ref(program, plan_scope_id(derived.scope_id), path)
-    })?;
+    let mut candidates = scoped_resolution_candidates(&derived.path, path);
+    if let Some((parent, _)) = derived.path.rsplit_once('.') {
+        candidates.push(format!("{parent}.{path}"));
+        if let Some((grandparent, _)) = parent.rsplit_once('.') {
+            candidates.push(format!("{grandparent}.{path}"));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let value_ref = candidates
+        .iter()
+        .find_map(|candidate| index.resolve(candidate))
+        .or_else(|| {
+            synthetic_range_row_field_ref(program, plan_scope_id(derived.scope_id), path)
+        })?;
     inputs.push(value_ref.clone());
     Some(PlanRowExpression::Field { input: value_ref })
 }
@@ -10416,6 +10525,9 @@ payload:
                     replace_first_row_bytes_builtin(from, function)
                         || replace_first_row_bytes_builtin(to, function)
                 }
+                PlanRowExpression::ListLiteral { items } => items
+                    .iter_mut()
+                    .any(|item| replace_first_row_bytes_builtin(item, function)),
                 PlanRowExpression::ListMap { input, value, .. } => {
                     replace_first_row_bytes_builtin(input, function)
                         || replace_first_row_bytes_builtin(value, function)
@@ -10798,6 +10910,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     expression_contains_function(from, function_name)
                         || expression_contains_function(to, function_name)
                 }
+                PlanRowExpression::ListLiteral { items } => items
+                    .iter()
+                    .any(|item| expression_contains_function(item, function_name)),
                 PlanRowExpression::ListMap { input, value, .. } => {
                     expression_contains_function(input, function_name)
                         || expression_contains_function(value, function_name)
@@ -10981,6 +11096,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 PlanRowExpression::ListRange { from, to } => {
                     contains_direct_bytes_find_text_concat(from)
                         || contains_direct_bytes_find_text_concat(to)
+                }
+                PlanRowExpression::ListLiteral { items } => {
+                    items.iter().any(contains_direct_bytes_find_text_concat)
                 }
                 PlanRowExpression::ListMap { input, value, .. } => {
                     contains_direct_bytes_find_text_concat(input)
@@ -11167,6 +11285,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 PlanRowExpression::ListRange { from, to } => {
                     contains_bytes_find_numeric_plus(from) || contains_bytes_find_numeric_plus(to)
                 }
+                PlanRowExpression::ListLiteral { items } => {
+                    items.iter().any(contains_bytes_find_numeric_plus)
+                }
                 PlanRowExpression::ListMap { input, value, .. } => {
                     contains_bytes_find_numeric_plus(input)
                         || contains_bytes_find_numeric_plus(value)
@@ -11323,6 +11444,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 PlanRowExpression::ListRange { from, to } => {
                     contains_typed_bytes_slice(from) || contains_typed_bytes_slice(to)
                 }
+                PlanRowExpression::ListLiteral { items } => {
+                    items.iter().any(contains_typed_bytes_slice)
+                }
                 PlanRowExpression::ListMap { input, value, .. } => {
                     contains_typed_bytes_slice(input) || contains_typed_bytes_slice(value)
                 }
@@ -11421,6 +11545,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 }
                 PlanRowExpression::ListRange { from, to } => {
                     contains_typed_byte_scanner_ops(from) || contains_typed_byte_scanner_ops(to)
+                }
+                PlanRowExpression::ListLiteral { items } => {
+                    items.iter().any(contains_typed_byte_scanner_ops)
                 }
                 PlanRowExpression::ListMap { input, value, .. } => {
                     contains_typed_byte_scanner_ops(input) || contains_typed_byte_scanner_ops(value)
@@ -11621,6 +11748,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     matches_generic_row_builtin_function(from, function_name)
                         || matches_generic_row_builtin_function(to, function_name)
                 }
+                PlanRowExpression::ListLiteral { items } => items
+                    .iter()
+                    .any(|item| matches_generic_row_builtin_function(item, function_name)),
                 PlanRowExpression::ListMap { input, value, .. } => {
                     matches_generic_row_builtin_function(input, function_name)
                         || matches_generic_row_builtin_function(value, function_name)
@@ -12057,6 +12187,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                     replace_first_typed_byte_scanner_with_generic(from)
                         || replace_first_typed_byte_scanner_with_generic(to)
                 }
+                PlanRowExpression::ListLiteral { items } => items
+                    .iter_mut()
+                    .any(replace_first_typed_byte_scanner_with_generic),
                 PlanRowExpression::ListMap { input, value, .. } => {
                     replace_first_typed_byte_scanner_with_generic(input)
                         || replace_first_typed_byte_scanner_with_generic(value)
@@ -12312,6 +12445,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { row bytes 
                 PlanRowExpression::ListRange { from, to } => {
                     tamper_first_row_lookup(from, invalid) || tamper_first_row_lookup(to, invalid)
                 }
+                PlanRowExpression::ListLiteral { items } => items
+                    .iter_mut()
+                    .any(|item| tamper_first_row_lookup(item, invalid)),
                 PlanRowExpression::ListMap { input, value, .. } => {
                     tamper_first_row_lookup(input, invalid)
                         || tamper_first_row_lookup(value, invalid)

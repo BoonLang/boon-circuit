@@ -21265,6 +21265,9 @@ fn expected_plan_row_expression_contains_state(
             expected_plan_row_expression_contains_state(from, state_id)
                 || expected_plan_row_expression_contains_state(to, state_id)
         }
+        boon_plan::PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .any(|item| expected_plan_row_expression_contains_state(item, state_id)),
         boon_plan::PlanRowExpression::ListMap { input, value, .. } => {
             expected_plan_row_expression_contains_state(input, state_id)
                 || expected_plan_row_expression_contains_state(value, state_id)
@@ -24374,6 +24377,20 @@ fn expected_eval_plan_row_expression_with_stack(
             } else {
                 Vec::new()
             };
+            Ok(JsonValue::Array(values))
+        }
+        boon_plan::PlanRowExpression::ListLiteral { items } => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(expected_eval_plan_row_expression_with_stack(
+                    plan,
+                    list_state,
+                    row,
+                    item,
+                    report_path,
+                    stack,
+                )?);
+            }
             Ok(JsonValue::Array(values))
         }
         boon_plan::PlanRowExpression::ListMap {

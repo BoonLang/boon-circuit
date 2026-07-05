@@ -98,6 +98,8 @@ use boon_plan_executor::{
     derived_field_label as plan_derived_field_label, eval_plan_row_expression,
     evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
+    evaluate_initial_root_derived_values as evaluate_plan_initial_root_derived_values,
+    evaluate_initial_root_derived_values_partial as evaluate_plan_initial_root_derived_values_partial,
     evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
     evaluate_root_bytes_write_update,
     evaluate_root_pure_number_compare_values as evaluate_root_pure_number_compare_values_core,
@@ -121,7 +123,7 @@ use boon_plan_executor::{
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
     refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
-    refresh_startup_list_row_fields_for_all_lists as refresh_plan_startup_list_row_fields_for_all_lists,
+    refresh_startup_list_row_fields_for_all_lists_with as refresh_plan_startup_list_row_fields_for_all_lists_with,
     remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
@@ -3971,7 +3973,12 @@ impl PlanExecutorRuntimeState {
     fn new(plan: &MachinePlan) -> RuntimeResult<Self> {
         let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
             plan_root_scalar_initial_state(plan)?;
-        let list_state = plan_initial_list_state(plan)?;
+        let mut list_state = plan_initial_list_state(plan)?;
+        refresh_plan_initial_list_state_with_root_context(
+            plan,
+            &root_state.root_state,
+            &mut list_state,
+        )?;
         let initial_list_derived_values = root_pure_number_compare_values(plan, &list_state)?
             .into_iter()
             .map(|(field_id, value)| (FieldId(field_id), value))
@@ -4064,7 +4071,7 @@ impl PlanExecutorRuntimeState {
         let mut pending_indexed_deltas = Vec::new();
         let mut list_removes = Vec::new();
         let root_derived_values_before_updates =
-            root_pure_number_compare_values(plan, &self.list_state)?;
+            plan_executor_root_derived_values(plan, &self.root_state.root_state, &self.list_state)?;
         let source_derived_step = assemble_plan_source_derived_step_deltas(plan, &derived_values);
         for (signature, delta) in source_derived_step
             .semantic_delta_signatures
@@ -4322,7 +4329,7 @@ impl PlanExecutorRuntimeState {
             step_deltas.push(delta.clone());
         }
         let root_list_derived_values_after_updates =
-            root_pure_number_compare_values(plan, &self.list_state)?;
+            plan_executor_root_derived_values(plan, &self.root_state.root_state, &self.list_state)?;
         let root_list_derived_changes = changed_plan_root_derived_deltas(
             plan,
             &root_derived_values_before_updates,
@@ -4463,8 +4470,8 @@ impl PlanExecutorRuntimeState {
         self.clone().finish(plan)
     }
 
-    fn state_summary(&self) -> JsonValue {
-        JsonValue::Object(self.root_state.root_state.clone())
+    fn state_summary(&mut self, plan: &MachinePlan) -> JsonValue {
+        self.document_state_summary(plan, SummaryLimits::state_summary())
     }
 
     fn document_state_summary(&mut self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
@@ -4566,8 +4573,8 @@ impl PlanExecutorLiveSession {
         self.state.snapshot(self.plan.as_ref())
     }
 
-    fn state_summary(&self) -> JsonValue {
-        self.state.state_summary()
+    fn state_summary(&mut self) -> JsonValue {
+        self.state.state_summary(self.plan.as_ref())
     }
 
     fn document_state_summary(&mut self, limits: SummaryLimits) -> JsonValue {
@@ -5502,9 +5509,14 @@ fn execute_machine_plan_initial_state_inner(
     let core_execution = execute_plan_initial_state_core(plan)?;
     let initialized_state_count = core_execution.initialized_state_count;
     let source_route_metadata_count = core_execution.source_route_metadata_count;
-    let list_state = plan_initial_list_state(plan)?;
+    let mut list_state = plan_initial_list_state(plan)?;
     let plan_hash = core_execution.plan_hash;
     let state_summary = core_execution.state_summary;
+    refresh_plan_initial_list_state_with_root_context(
+        plan,
+        state_summary.as_object().unwrap(),
+        &mut list_state,
+    )?;
     let list_summary = plan_list_summary(plan, &list_state);
     let projection_execution =
         materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_state)?;
@@ -5664,10 +5676,12 @@ fn plan_executor_document_summary_with_limits(
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
 ) -> JsonValue {
-    let mut root = plan_executor_nested_root_summary(root_state);
+    let summary_root_state = plan_executor_summary_root_state(plan, root_state);
+    let mut root = plan_executor_nested_root_summary(&summary_root_state);
     let mut materialization = Vec::new();
     plan_executor_insert_direct_list_summaries(
         plan,
+        &summary_root_state,
         list_state,
         limits,
         &mut root,
@@ -5675,7 +5689,7 @@ fn plan_executor_document_summary_with_limits(
     );
     plan_executor_insert_projection_summaries(
         plan,
-        root_state,
+        &summary_root_state,
         list_state,
         limits,
         &mut root,
@@ -5683,7 +5697,7 @@ fn plan_executor_document_summary_with_limits(
     );
     plan_executor_insert_retain_summaries(
         plan,
-        root_state,
+        &summary_root_state,
         list_state,
         limits,
         &mut root,
@@ -5702,6 +5716,35 @@ fn plan_executor_document_summary_with_limits(
     JsonValue::Object(root)
 }
 
+fn plan_executor_summary_root_state(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> serde_json::Map<String, JsonValue> {
+    let mut summary = root_state.clone();
+    if let Ok(derived_values) = evaluate_plan_initial_root_derived_values_partial(plan, &summary) {
+        let _ =
+            commit_plan_source_derived_values_to_root_state(plan, &mut summary, &derived_values);
+    }
+    summary
+}
+
+fn refresh_plan_initial_list_state_with_root_context(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+) -> RuntimeResult<()> {
+    let summary_root_state = plan_executor_summary_root_state(plan, root_state);
+    refresh_plan_startup_list_row_fields_for_all_lists_with(
+        plan,
+        list_state,
+        |plan, list_state, row, expression| {
+            let row = plan_executor_row_with_root_values(plan, row, &summary_root_state);
+            eval_plan_row_expression(plan, list_state, &row, expression)
+        },
+    )?;
+    Ok(())
+}
+
 fn plan_executor_nested_root_summary(
     root_state: &serde_json::Map<String, JsonValue>,
 ) -> serde_json::Map<String, JsonValue> {
@@ -5716,6 +5759,7 @@ fn plan_executor_nested_root_summary(
 
 fn plan_executor_insert_direct_list_summaries(
     plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
@@ -5733,7 +5777,9 @@ fn plan_executor_insert_direct_list_summaries(
             .min(row_count);
         let mut visible_rows = Vec::with_capacity(row_end.saturating_sub(limits.list_row_start));
         for row_index in limits.list_row_start..row_end {
-            plan_executor_refresh_summary_row_current(plan, list_state, list_id, row_index);
+            plan_executor_refresh_summary_row_current(
+                plan, root_state, list_state, list_id, row_index,
+            );
             if let Some(row) = list_state
                 .get(&list_id)
                 .and_then(|rows| rows.get(row_index))
@@ -5797,6 +5843,7 @@ fn plan_executor_insert_projection_summaries(
                     .and_then(|row_index| {
                         plan_executor_refresh_summary_row_current(
                             plan,
+                            root_state,
                             list_state,
                             source_list.0,
                             row_index,
@@ -5823,6 +5870,7 @@ fn plan_executor_insert_projection_summaries(
                     .unwrap_or_default();
                 let value = plan_executor_windowed_chunk_projection(
                     plan,
+                    root_state,
                     source_list.0,
                     list_state,
                     *size,
@@ -5893,6 +5941,7 @@ fn plan_executor_insert_retain_summaries(
 
 fn plan_executor_windowed_chunk_projection(
     plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
     list_id: usize,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     columns: usize,
@@ -5927,7 +5976,7 @@ fn plan_executor_windowed_chunk_projection(
             if index >= row_count {
                 break;
             }
-            plan_executor_refresh_summary_row_current(plan, list_state, list_id, index);
+            plan_executor_refresh_summary_row_current(plan, root_state, list_state, list_id, index);
             if let Some(cell) = list_state.get(&list_id).and_then(|rows| rows.get(index)) {
                 cells.push(plan_executor_row_document_json(plan, list_id, cell));
             }
@@ -5940,6 +5989,7 @@ fn plan_executor_windowed_chunk_projection(
 
 fn plan_executor_refresh_summary_row_current(
     plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     list_id: usize,
     row_index: usize,
@@ -5966,6 +6016,7 @@ fn plan_executor_refresh_summary_row_current(
             evaluate_demand_current_ops: true,
             emit_demand_current_deltas: false,
             changed_root_states: None,
+            root_state: Some(root_state),
         },
     )
     .expect("PlanExecutor document summary currentness refresh failed");
@@ -5976,7 +6027,7 @@ fn plan_executor_row_document_json(
     list_id: usize,
     row: &PlanListRowState,
 ) -> JsonValue {
-    let mut object: serde_json::Map<String, JsonValue> = row.fields.clone().into_iter().collect();
+    let mut object = plan_executor_row_fields_document_object(&row.fields);
     object.insert(
         "$boon".to_owned(),
         json!({
@@ -5988,6 +6039,39 @@ fn plan_executor_row_document_json(
     JsonValue::Object(object)
 }
 
+fn plan_executor_row_fields_document_object(
+    fields: &BTreeMap<String, JsonValue>,
+) -> serde_json::Map<String, JsonValue> {
+    let mut object = serde_json::Map::new();
+    for (field, value) in fields {
+        insert_nested_json(&mut object, field, value.clone());
+    }
+    object
+}
+
+fn plan_executor_row_with_root_values(
+    plan: &MachinePlan,
+    row: &PlanListRowState,
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> PlanListRowState {
+    let mut row = row.clone();
+    for entry in &plan.debug_map.derived_values {
+        if entry.label.starts_with("row.") {
+            continue;
+        }
+        let local_name = local_field_name(&entry.label);
+        let Some(value) = root_state
+            .get(&entry.label)
+            .or_else(|| root_state.get(&local_name))
+            .cloned()
+        else {
+            continue;
+        };
+        row.fields.entry(local_name).or_insert(value);
+    }
+    row
+}
+
 fn plan_executor_retained_row_document_json(
     plan: &MachinePlan,
     source_list_id: Option<usize>,
@@ -5996,11 +6080,15 @@ fn plan_executor_retained_row_document_json(
     let Some(object) = row.as_object() else {
         return JsonValue::Null;
     };
-    let mut output = object
+    let flat_output = object
         .get("fields")
         .and_then(JsonValue::as_object)
         .cloned()
         .unwrap_or_default();
+    let fields = flat_output
+        .into_iter()
+        .collect::<BTreeMap<String, JsonValue>>();
+    let mut output = plan_executor_row_fields_document_object(&fields);
     if let (Some(key), Some(generation)) = (
         object.get("key").and_then(JsonValue::as_u64),
         object.get("generation").and_then(JsonValue::as_u64),
@@ -6129,6 +6217,20 @@ fn root_pure_number_compare_values(
         plan,
         &executor_rows,
     )?)
+}
+
+fn plan_executor_root_derived_values(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
+    let mut values = root_pure_number_compare_values(plan, list_state)?;
+    if let Ok(root_values) = evaluate_plan_initial_root_derived_values(plan, root_state) {
+        for (field_id, value) in root_values {
+            values.insert(field_id.0, value);
+        }
+    }
+    Ok(values)
 }
 
 fn commit_root_list_derived_values_to_root_state(
@@ -6274,6 +6376,7 @@ fn execute_indexed_update_branch(
             evaluate_demand_current_ops: true,
             emit_demand_current_deltas: false,
             changed_root_states: None,
+            root_state: None,
         },
     )?;
     let rows = list_state
@@ -6590,6 +6693,7 @@ fn execute_indexed_update_branch(
                     evaluate_demand_current_ops: true,
                     emit_demand_current_deltas: false,
                     changed_root_states: None,
+                    root_state: None,
                 },
             )?
         }
@@ -8183,6 +8287,8 @@ fn plan_initial_list_rows_for_root_lookup(
     op_id: usize,
 ) -> RuntimeResult<Vec<PlanListRowState>> {
     let mut lists = plan_initial_list_state(plan)?;
+    let root_state = initialize_plan_root_state(plan)?;
+    refresh_plan_initial_list_state_with_root_context(plan, &root_state.root_state, &mut lists)?;
     lists.remove(&list_id.0).ok_or_else(|| {
         format!(
             "root List/find_value update branch {op_id} list {} is missing from initial list state",
@@ -8564,6 +8670,7 @@ fn refresh_indexed_derived_fields_after_state_change(
             evaluate_demand_current_ops: true,
             emit_demand_current_deltas: false,
             changed_root_states: None,
+            root_state: None,
         },
     )?;
     if deltas
@@ -8602,6 +8709,7 @@ fn refresh_indexed_derived_fields_for_row(
             evaluate_demand_current_ops: true,
             emit_demand_current_deltas: true,
             changed_root_states: None,
+            root_state: None,
         },
     )
 }
@@ -8694,6 +8802,7 @@ struct IndexedDerivedRefreshOptions<'a> {
     evaluate_demand_current_ops: bool,
     emit_demand_current_deltas: bool,
     changed_root_states: Option<&'a BTreeSet<StateId>>,
+    root_state: Option<&'a serde_json::Map<String, JsonValue>>,
 }
 
 fn refresh_indexed_derived_fields_for_row_with_options(
@@ -8709,6 +8818,9 @@ fn refresh_indexed_derived_fields_for_row_with_options(
         .and_then(|rows| rows.get(row_index))
         .cloned()
         .ok_or_else(|| format!("row index {row_index} missing in `{list_label}`"))?;
+    if let Some(root_state) = options.root_state {
+        row_eval = plan_executor_row_with_root_values(plan, &row_eval, root_state);
+    }
     let mut changed_fields = Vec::new();
     for op in plan
         .regions
@@ -8899,6 +9011,7 @@ fn refresh_other_indexed_derived_fields(
                     evaluate_demand_current_ops: true,
                     emit_demand_current_deltas: false,
                     changed_root_states: None,
+                    root_state: None,
                 },
             )?);
         }
@@ -8934,6 +9047,7 @@ fn refresh_indexed_derived_fields_after_root_state_changes(
                     evaluate_demand_current_ops: false,
                     emit_demand_current_deltas: true,
                     changed_root_states: Some(changed_root_state_ids),
+                    root_state: None,
                 },
             )?);
         }
@@ -9266,6 +9380,9 @@ fn plan_row_expression_contains_state(expression: &PlanRowExpression, state_id: 
             plan_row_expression_contains_state(from, state_id)
                 || plan_row_expression_contains_state(to, state_id)
         }
+        PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .any(|item| plan_row_expression_contains_state(item, state_id)),
         PlanRowExpression::ListMap { input, value, .. } => {
             plan_row_expression_contains_state(input, state_id)
                 || plan_row_expression_contains_state(value, state_id)
@@ -10113,7 +10230,6 @@ fn plan_initial_list_state(
         }
         lists.insert(slot.list_id.0, rows);
     }
-    refresh_plan_startup_list_row_fields_for_all_lists(plan, &mut lists)?;
     Ok(lists)
 }
 
@@ -11593,7 +11709,7 @@ impl LiveRuntime {
     }
 
     pub fn state_summary(&mut self) -> JsonValue {
-        self.require_plan_session()
+        self.require_plan_session_mut()
             .map(PlanExecutorLiveSession::state_summary)
             .unwrap_or_else(|error| json!({"error": error.to_string()}))
     }
@@ -66797,11 +66913,12 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LoadedRuntimeHarness::from_source("root-structured-parent-no-empty-patch", source)
+            LiveRuntime::from_source_plan_executor("root-structured-parent-no-empty-patch", source)
                 .unwrap();
+        let initial_summary = runtime.state_summary();
         assert_eq!(
-            runtime.state_summary()["store"]["page_label"],
-            "42 s PageRef"
+            initial_summary["store"]["page_label"], "42 s PageRef",
+            "initial PlanExecutor summary: {initial_summary:#?}"
         );
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -67811,7 +67928,7 @@ FUNCTION new_number(number) {
             CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
         );
 
-        let mut runtime = LoadedRuntimeHarness::from_source("range-list", source).unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor("range-list", source).unwrap();
         let summary = runtime.state_summary();
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -67897,8 +68014,6 @@ store: [
             page_kind: TEXT { signal_page }
             status: TEXT { FILE_READY }
         ]
-    projected_rows:
-        rows |> List/map(row, new: projected_row(row: row))
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
@@ -67928,18 +68043,9 @@ FUNCTION new_row(row) {
         }
     ]
 }
-
-FUNCTION projected_row(row) {
-    [
-        id: row.id
-        hit_regions: row.hit_regions
-        page_refs: row.page_refs
-        root_page_refs: row.root_page_refs
-        segments: row.segments
-        ]
-}
 "#;
-        let mut runtime = LoadedRuntimeHarness::from_source("nested-row-fields", source).unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_plan_executor("nested-row-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["page_ref"]["page_kind"], "signal_page");
         let row = &summary["rows"][0];
@@ -67963,21 +68069,6 @@ FUNCTION projected_row(row) {
             "nested inline LIST field should survive row storage: {row:#?}"
         );
         assert_eq!(row["segments"][0]["label"], "Alpha");
-
-        let projected = &summary["store"]["projected_rows"][0];
-        assert_eq!(projected["hit_regions"]["address"], "alpha");
-        assert_eq!(
-            projected["page_refs"]["signal_page_ref"]["page_kind"],
-            "signal_page"
-        );
-        assert_eq!(
-            projected["root_page_refs"]["signal_page_ref"]["page_kind"],
-            "signal_page"
-        );
-        assert_eq!(
-            projected["segments"][0]["signal_id"], "alpha",
-            "projected row ref should preserve nested inline LIST fields: {projected:#?}"
-        );
     }
 
     #[test]
@@ -68082,7 +68173,7 @@ FUNCTION new_item(item) {
 }
 "#;
         let mut runtime =
-            LoadedRuntimeHarness::from_source("generic-page-materialization", source).unwrap();
+            LiveRuntime::from_source_plan_executor("generic-page-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(1, 1, 0, 2);
         let pages = summary["store"]["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 1);

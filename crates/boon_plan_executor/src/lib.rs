@@ -3553,6 +3553,15 @@ fn eval_plan_row_expression_with_stack(
             };
             Ok(JsonValue::Array(values))
         }
+        PlanRowExpression::ListLiteral { items } => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(eval_plan_row_expression_with_stack(
+                    plan, list_state, row, item, stack,
+                )?);
+            }
+            Ok(JsonValue::Array(values))
+        }
         PlanRowExpression::ListMap {
             input,
             binding,
@@ -4031,22 +4040,30 @@ fn eval_plan_row_field_ref(
     input: &ValueRef,
     stack: &[PlanRowEvalKey],
 ) -> PlanExecutorResult<JsonValue> {
-    let field_name = match input {
-        ValueRef::Field(field_id) => local_field_name(&semantic_field_label(plan, field_id.0)),
-        ValueRef::State(state_id) => local_field_name(&state_label(plan, *state_id)),
+    let field_names = match input {
+        ValueRef::Field(field_id) => {
+            let semantic_name = local_field_name(&semantic_field_label(plan, field_id.0));
+            let derived_name = local_field_name(&derived_field_label(plan, field_id.0));
+            if semantic_name == derived_name {
+                vec![semantic_name]
+            } else {
+                vec![semantic_name, derived_name]
+            }
+        }
+        ValueRef::State(state_id) => vec![local_field_name(&state_label(plan, *state_id))],
         _ => {
             return Err(format!("row expression input `{input:?}` is not a row field").into());
         }
     };
-    row.fields
-        .get(&field_name)
-        .cloned()
+    field_names
+        .iter()
+        .find_map(|field_name| row.fields.get(field_name).cloned())
         .or_else(|| row_initial_state_fallback(plan, row, input))
         .ok_or_else(|| {
             let available = row.fields.keys().cloned().collect::<Vec<_>>().join(", ");
             format!(
-                "row expression input `{input:?}` field `{field_name}` is missing from row key {} stack {:?}; available fields: [{}]",
-                row.key, stack, available
+                "row expression input `{input:?}` fields `{}` are missing from row key {} stack {:?}; available fields: [{}]",
+                field_names.join("`, `"), row.key, stack, available
             )
             .into()
         })
@@ -4106,7 +4123,17 @@ pub fn row_expression_row_input_missing(
                 ValueRef::State(input_id) => local_field_name(&state_label(plan, *input_id)),
                 _ => return false,
             };
-            !row.fields.contains_key(&input_name)
+            if row.fields.contains_key(&input_name) {
+                return false;
+            }
+            if let ValueRef::Field(input_id) = input
+                && !plan_field_is_row_owned(plan, *input_id)
+            {
+                let derived_name = local_field_name(&derived_field_label(plan, input_id.0));
+                return !row.fields.contains_key(&derived_name)
+                    && derived_field_label(plan, input_id.0).starts_with("row.");
+            }
+            true
         }
         PlanRowExpression::TextTrim { input }
         | PlanRowExpression::TextIsEmpty { input }
@@ -4234,6 +4261,9 @@ pub fn row_expression_row_input_missing(
             row_expression_row_input_missing(plan, row, from)
                 || row_expression_row_input_missing(plan, row, to)
         }
+        PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .any(|item| row_expression_row_input_missing(plan, row, item)),
         PlanRowExpression::ListMap { input, value, .. } => {
             row_expression_row_input_missing(plan, row, input)
                 || row_expression_row_input_missing(plan, row, value)
@@ -4256,6 +4286,13 @@ pub fn row_expression_row_input_missing(
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListMapItem { .. } => false,
     }
+}
+
+fn plan_field_is_row_owned(plan: &MachinePlan, field_id: FieldId) -> bool {
+    plan.storage_layout
+        .list_slots
+        .iter()
+        .any(|slot| slot.row_field_ids.contains(&field_id))
 }
 
 fn row_expression_reads_list(expression: &PlanRowExpression, list_id: boon_plan::ListId) -> bool {
@@ -4283,6 +4320,9 @@ fn row_expression_reads_list(expression: &PlanRowExpression, list_id: boon_plan:
         PlanRowExpression::ListRange { from, to } => {
             row_expression_reads_list(from, list_id) || row_expression_reads_list(to, list_id)
         }
+        PlanRowExpression::ListLiteral { items } => items
+            .iter()
+            .any(|item| row_expression_reads_list(item, list_id)),
         PlanRowExpression::ListMap { input, value, .. } => {
             row_expression_reads_list(input, list_id) || row_expression_reads_list(value, list_id)
         }
@@ -4426,6 +4466,9 @@ pub fn row_expression_applies_to_list(
     list_slot: &boon_plan::ListStorageSlot,
     output_id: FieldId,
 ) -> bool {
+    if list_slot.row_field_ids.contains(&output_id) {
+        return true;
+    }
     semantic_field_label(plan, output_id.0)
         .rsplit_once('.')
         .map(|(scope_name, _)| scope_name.to_owned())
@@ -4660,6 +4703,9 @@ fn row_expression_reads_router_route(expression: &PlanRowExpression) -> bool {
         PlanRowExpression::ListRange { from, to } => {
             row_expression_reads_router_route(from) || row_expression_reads_router_route(to)
         }
+        PlanRowExpression::ListLiteral { items } => {
+            items.iter().any(row_expression_reads_router_route)
+        }
         PlanRowExpression::ListMap { input, value, .. } => {
             row_expression_reads_router_route(input) || row_expression_reads_router_route(value)
         }
@@ -4712,7 +4758,7 @@ pub fn evaluate_initial_root_derived_values(
     evaluate_initial_root_derived_values_with_policy(plan, root_state, false)
 }
 
-fn evaluate_initial_root_derived_values_partial(
+pub fn evaluate_initial_root_derived_values_partial(
     plan: &MachinePlan,
     root_state: &JsonMap<String, JsonValue>,
 ) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {

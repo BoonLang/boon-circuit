@@ -27,9 +27,9 @@ Current checkpoint:
   `xtask run-report-refresh-queue ... --rerun-aggregate --label ... --limit ...`
   and compact `jq` summaries instead of inspecting large child reports
   manually. Dry-runs are schema-valid and report that the aggregate rerun was
-  intentionally skipped. The Cells
-  compare refresh queue preserves the real `boon_cli run examples/cells.bn
-  --scenario examples/cells.scn --engine compare` shape.
+  intentionally skipped. Cells legacy-compare refreshes must now use the
+  explicit diagnostic shape `boon_cli diagnose-plan-legacy-compare
+  examples/cells.bn --scenario examples/cells.scn`.
 - Hidden native-preview source replay side reports have been pulled into the
   BYTES aggregate. TodoMVC, Cells, and physical TodoMVC native-preview replay
   children refresh with canonical `boon_cli run ... --engine plan` commands and

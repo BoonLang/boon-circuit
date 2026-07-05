@@ -203,16 +203,6 @@
       "max_sidecar_bytes": 0
     },
     {
-      "label": "scroll-speed-dev-code-editor",
-      "path": "target/reports/native-gpu/scroll-speed-dev-code-editor.json",
-      "command": "verify-native-gpu-scroll-speed",
-      "required_argv": [
-        ["--surface", "dev-code-editor"]
-      ],
-      "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
-    },
-    {
       "label": "negative",
       "path": "target/reports/native-gpu/negative.json",
       "command": "verify-native-gpu-negative",

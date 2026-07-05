@@ -37853,3 +37853,50 @@ Remaining cleanup:
   currentness coverage plus explicit diagnostics. Next cuts should migrate
   essential engine semantics to PlanExecutor/MachinePlan tests or delete
   obsolete storage-runtime tests rather than preserving the old harness.
+
+## 2026-07-05 - Physical TodoMVC LoadedRuntime Live Tests Removed
+
+Status: removed four more project-level physical TodoMVC tests that kept
+product evidence tied to the old runtime.
+
+What changed:
+
+- Deleted `live_runtime_routes_physical_todomvc_row_edit_events_by_target_text`.
+  It mixed old generic route internals with product edit-flow assertions.
+  Physical TodoMVC source replay is already represented by the PlanExecutor
+  scenario-events report, and the compiler/route shape has separate focused
+  tests.
+- Deleted `live_runtime_applies_physical_todomvc_theme_source_events`. Theme
+  source replay is covered by PlanExecutor source replay/native content
+  evidence and lower-level compiler route checks; the old unit was slow because
+  it initialized the generic runtime.
+- Deleted `live_runtime_physical_todomvc_toggle_all_recomputes_all_completed_between_clicks`.
+  The physical TodoMVC scenario includes `toggle-all` and `toggle-all-active`
+  steps on the PlanExecutor product path.
+- Deleted `list_append_enter_key_reads_same_source_text_payload`. The physical
+  TodoMVC scenario includes `add-todo` and `reject-empty-todo` steps on the
+  PlanExecutor product path.
+
+Evidence checked during the cut:
+
+- Fresh `cargo run -q -p boon_cli -- run examples/todo_mvc_physical/RUN.bn
+  --scenario examples/todo_mvc_physical.scn --report
+  target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`
+  completed successfully.
+- Fresh `target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`
+  reports `status=pass`, `plan_status=pass`,
+  `accepted_for_product_status=pass`, and 22 selected scenario steps including
+  `add-todo`, `reject-empty-todo`, `toggle-all`, `toggle-all-active`, edit,
+  clear, and theme events.
+- `cargo xtask verify-report-schema
+  target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`
+  completed successfully.
+- Existing `target/reports/native-gpu/preview-e2e-todo_mvc_physical.json`
+  is not a readiness proof because the report itself is `status=fail`, but its
+  physical TodoMVC source-replay bridge evidence reports `status=pass`.
+- `cargo test -q -p boon_runtime --lib --no-run`
+
+Remaining cleanup:
+
+- `LoadedRuntimeHarness::from_project` dropped again, but NovyWave and
+  lower-level runtime tests still construct old runtimes explicitly.

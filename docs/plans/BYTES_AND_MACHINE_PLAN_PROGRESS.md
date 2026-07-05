@@ -37335,3 +37335,25 @@ Remaining legacy implementation:
 - `xtask` still carries removed-command negative/audit strings for old Ply
   command names; these now reject the paths rather than execute or validate
   them.
+
+## 2026-07-05 - Retired Stale Ply Plan Documents
+
+Status: removed active-looking instructions that still told agents to run the
+deleted Ply playground, Xvfb headed aliases, operator-e2e reports, and manual
+JSON evidence.
+
+What changed:
+
+- Replaced `MANUAL_TESTING_RUNBOOK.md` with a native-GPU-only manual follow-up
+  runbook.
+- Replaced old Ply/example/headed plan files with short retired tombstones that
+  point to `NATIVE_GPU_PIPELINE.md`, the native GPU handoff manifest, and the
+  PlanExecutor/native GPU paths.
+- Left historical append-only logs and decision history intact; those may
+  mention old paths as history but are not current execution instructions.
+
+Remaining cleanup:
+
+- `xtask` still keeps negative/audit strings for removed command names.
+- `boon_runtime` still has raw legacy runtime internals/tests and explicit
+  legacy-output callers that need a separate code retirement slice.

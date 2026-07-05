@@ -36913,3 +36913,25 @@ Evidence:
   `planexecutor-list-row-expression-refresh-extracted=true`.
 - The only remaining compiler-boundary blocker is live runtime constructors
   still requiring a `TypedProgram` instead of the compiled runtime program.
+
+## 2026-07-06 - Compiler Boundary Back To Pass
+
+Status: implemented and verified for the compiler-boundary gate.
+
+What changed:
+
+- Updated the live-constructor audit to the post-LoadedRuntime contract:
+  cached live runtime plans keep `CompiledProgram`, PlanExecutor live sessions
+  use compiled runtime data, and stale typed-IR/LoadedRuntime constructor forms
+  remain rejected.
+- Removed the stale expectation that product construction must call
+  `GenericScheduledRuntime::new_profiled(compiled)` after the LoadedRuntime
+  shell was deleted.
+
+Evidence:
+
+- `cargo check -q -p xtask`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.

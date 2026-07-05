@@ -53,6 +53,14 @@ Current checkpoint:
   row-expression iteration. Fresh `verify-compiler-boundaries` now reports
   `planexecutor-list-row-expression-refresh-extracted=true`; the only remaining
   blocker is `runtime-live-constructors-use-compiled-program=false`.
+- Latest compiler-boundary control-plane cleanup updated the live-constructor
+  audit to match the post-LoadedRuntime architecture: `CachedRuntimePlan` keeps
+  `CompiledProgram`, live PlanExecutor sessions consume compiled runtime data,
+  and the old typed-IR/LoadedRuntime constructor shapes remain rejected. Fresh
+  `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json` now passes, and
+  `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json` passes.
 - Latest architecture cleanup checkpoint moved root branch state and startup
   row-expression refresh behind the PlanExecutor boundary. Runtime no longer
   owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private

@@ -38137,3 +38137,38 @@ Next cut:
 
 - Make live runtime constructors use the compiled runtime program instead of
   keeping TypedProgram as a parallel constructor input.
+
+## 2026-07-06 - Compiler Boundary Back To Pass
+
+Status: implemented and verified for the compiler-boundary control-plane gate.
+
+What changed:
+
+- Updated the live-constructor boundary audit to match the current architecture
+  after `LoadedRuntime` deletion. The check now enforces that cached live
+  runtime plans retain `CompiledProgram`, PlanExecutor live sessions consume
+  compiled runtime data, and old typed-IR/LoadedRuntime constructor shapes stay
+  absent.
+- This did not add a fallback or compatibility path; it removed stale verifier
+  expectations that still assumed a `GenericScheduledRuntime::new_profiled`
+  product call after the loaded-runtime shell was deleted.
+
+Evidence:
+
+- `cargo check -q -p xtask`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh report key checks:
+  `runtime-live-constructors-use-compiled-program=true`,
+  `planexecutor-list-row-expression-refresh-extracted=true`, and
+  `loaded-runtime-shell-removed=true`.
+
+Next cut:
+
+- Return to the larger goal: native/product performance and remaining
+  `GenericScheduledRuntime` test-island deletion, without reopening
+  LoadedRuntime compatibility.

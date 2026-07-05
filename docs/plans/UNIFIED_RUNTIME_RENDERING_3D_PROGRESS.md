@@ -36571,3 +36571,57 @@ Evidence:
   legacy-comparison/source-unit rebuild blocker from this slice is gone.
 - `cargo check -q -p boon_runtime -p boon_cli -p xtask -p boon_report_schema`:
   pass.
+
+## 2026-07-05 - Compiler Boundary And List Row Startup Refresh Cut
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Tightened the compiler-boundary verifier so direct `boon_plan` backend calls
+  are still rejected, but legitimate `boon_compiler::compile_typed_program`
+  facade calls are no longer counted as direct plan usage.
+- Moved startup list-row expression refresh iteration out of `boon_runtime`
+  into `boon_plan_executor` via
+  `refresh_startup_list_row_fields_for_all_lists_with(...)`.
+- Replaced the runtime-owned two-pass list-slot/row startup expression refresh
+  loop with a single PlanExecutor helper call.
+- Fixed a generic indexed read-path evaluator gap: scoped row read-path
+  updates with no explicit state/field input now read the output slot's
+  `initial_row_field_path` from the resolved row.
+- Routed scoped or explicitly targeted indexed updates through the direct
+  row-resolving branch instead of the unscoped bulk-update selector.
+
+Current interpretation:
+
+- `verify-compiler-boundaries` dropped the direct compile facade false positive
+  and the list-row expression-refresh blocker. It still fails on five broader
+  blockers:
+  - PlanExecutor does not yet own list row initial-state refresh/mirror policy;
+  - runtime root scenario execution still passes loose root state/BYTES maps;
+  - runtime root scenario execution does not yet carry `PlanExecutorRootState`
+    directly through the fallback branch evaluator;
+  - runtime still owns root-state update helper methods;
+  - runtime still owns non-indexed root update branch candidate collection and
+    staged-state mutation.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor indexed_json_update_evaluator_handles_bool_not_and_text_trim -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime live_runtime_applies_observed_cells_source_events -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_runs_single_file_scenario_after_source_is_deleted -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime compiled_artifact_runs_representative_scenarios_through_plan_executor -- --nocapture`:
+  pass in `410.27s`.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
+  expected fail with five remaining root-state/list-initial-refresh extraction
+  blockers.

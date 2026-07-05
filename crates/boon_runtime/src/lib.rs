@@ -123,9 +123,7 @@ use boon_plan_executor::{
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
     refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
-    refresh_list_row_initial_state_fields as refresh_plan_list_row_initial_state_fields,
-    refresh_startup_list_row_expression_fields_best_effort_with as refresh_plan_startup_list_row_expression_fields_best_effort_with,
-    refresh_startup_list_row_expression_fields_with as refresh_plan_startup_list_row_expression_fields_with,
+    refresh_startup_list_row_fields_for_all_lists_with as refresh_plan_startup_list_row_fields_for_all_lists_with,
     remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
@@ -4229,6 +4227,35 @@ impl PlanExecutorRuntimeState {
                 continue;
             }
             if op.indexed {
+                let targeted_or_scoped_indexed_update = source_route_slot.scoped
+                    || generic_event.target_key.is_some()
+                    || generic_event.target_text.is_some()
+                    || generic_event.address.is_some();
+                if targeted_or_scoped_indexed_update {
+                    let indexed = execute_indexed_update_branch(
+                        plan,
+                        op,
+                        source_id,
+                        source_route_slot,
+                        &generic_event,
+                        &mut self.list_state,
+                        &mut row_resolution_cache,
+                        &root_derived_values_before_updates,
+                        host_file_root,
+                    )
+                    .map_err(|error| -> Box<dyn std::error::Error> {
+                        format!(
+                            "PlanExecutor indexed update op {} for source {}: {error}",
+                            op.id.0, source_id.0
+                        )
+                        .into()
+                    })?;
+                    pending_indexed_deltas.extend(indexed.semantic_deltas);
+                    self.executed_update_branch_count += indexed.updated_row_count;
+                    self.executed_indexed_update_count += indexed.updated_row_count;
+                    indexed_updates.extend(indexed.report_rows);
+                    continue;
+                }
                 let indexed_target_rows =
                     plan_executor_list_state_for_materialization(&self.list_state);
                 let indexed_batch = execute_plan_indexed_update_batch_with(
@@ -10020,54 +10047,11 @@ fn plan_initial_list_state(
         }
         lists.insert(slot.list_id.0, rows);
     }
-    let list_slots = plan.storage_layout.list_slots.clone();
-    for slot in &list_slots {
-        let list_id = slot.list_id.0;
-        let Some(mut rows) = lists.remove(&list_id) else {
-            continue;
-        };
-        let mut row_expression_list_state = lists.clone();
-        row_expression_list_state.insert(list_id, rows.clone());
-        for row in &mut rows {
-            refresh_plan_startup_list_row_expression_fields_best_effort_with(
-                plan,
-                slot,
-                &row_expression_list_state,
-                row,
-                eval_plan_row_expression,
-            );
-            refresh_plan_list_row_initial_state_fields(plan, slot, row);
-            if let Some(current_rows) = row_expression_list_state.get_mut(&list_id) {
-                if let Some(current_row) = current_rows
-                    .iter_mut()
-                    .find(|current_row| current_row.key == row.key)
-                {
-                    *current_row = row.clone();
-                }
-            }
-        }
-        let mut row_expression_list_state = lists.clone();
-        row_expression_list_state.insert(list_id, rows.clone());
-        for row in &mut rows {
-            refresh_plan_startup_list_row_expression_fields_with(
-                plan,
-                slot,
-                &row_expression_list_state,
-                row,
-                eval_plan_row_expression,
-            )?;
-            refresh_plan_list_row_initial_state_fields(plan, slot, row);
-            let _ = refresh_plan_list_row_bool_not_fields(
-                plan,
-                slot,
-                &plan_list_label(plan, slot.list_id.0),
-                row.key,
-                row.generation,
-                &mut row.fields,
-            )?;
-        }
-        lists.insert(list_id, rows);
-    }
+    refresh_plan_startup_list_row_fields_for_all_lists_with(
+        plan,
+        &mut lists,
+        eval_plan_row_expression,
+    )?;
     Ok(lists)
 }
 

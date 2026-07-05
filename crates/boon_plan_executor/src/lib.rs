@@ -3032,6 +3032,69 @@ pub fn refresh_startup_list_row_expression_fields_best_effort_with<E>(
     );
 }
 
+pub fn refresh_startup_list_row_fields_for_all_lists_with<E>(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    mut evaluator: E,
+) -> PlanExecutorResult<()>
+where
+    E: FnMut(
+        &MachinePlan,
+        &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+        &PlanExecutorListRowState,
+        &PlanRowExpression,
+    ) -> PlanExecutorResult<JsonValue>,
+{
+    let list_slots = plan.storage_layout.list_slots.clone();
+    for slot in &list_slots {
+        let list_id = slot.list_id.0;
+        let Some(mut rows) = list_state.remove(&list_id) else {
+            continue;
+        };
+        let mut row_expression_list_state = list_state.clone();
+        row_expression_list_state.insert(list_id, rows.clone());
+        for row in &mut rows {
+            refresh_startup_list_row_expression_fields_best_effort_with(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                &mut evaluator,
+            );
+            refresh_list_row_initial_state_fields(plan, slot, row);
+            if let Some(current_rows) = row_expression_list_state.get_mut(&list_id)
+                && let Some(current_row) = current_rows
+                    .iter_mut()
+                    .find(|current_row| current_row.key == row.key)
+            {
+                *current_row = row.clone();
+            }
+        }
+        let mut row_expression_list_state = list_state.clone();
+        row_expression_list_state.insert(list_id, rows.clone());
+        for row in &mut rows {
+            refresh_startup_list_row_expression_fields_with(
+                plan,
+                slot,
+                &row_expression_list_state,
+                row,
+                &mut evaluator,
+            )?;
+            refresh_list_row_initial_state_fields(plan, slot, row);
+            let _ = refresh_list_row_bool_not_fields(
+                plan,
+                slot,
+                &list_label(plan, slot.list_id.0),
+                row.key,
+                row.generation,
+                &mut row.fields,
+            )?;
+        }
+        list_state.insert(list_id, rows);
+    }
+    Ok(())
+}
+
 fn refresh_list_row_expression_fields_best_effort_with_startup_filter<E>(
     plan: &MachinePlan,
     list_slot: &boon_plan::ListStorageSlot,
@@ -9341,8 +9404,21 @@ pub fn evaluate_indexed_json_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let input = indexed_single_state_or_field_input(op, output_state_id)?;
-            let value = indexed_row_read_path_value(plan, row, &input, op.id)?;
+            let value = match indexed_single_state_or_field_input(op, output_state_id) {
+                Ok(input) => indexed_row_read_path_value(plan, row, &input, op.id)?,
+                Err(error) => {
+                    let Some(row_field_path) = output_slot.initial_row_field_path.as_deref() else {
+                        return Err(error);
+                    };
+                    let row_field = local_field_name(row_field_path);
+                    row.fields.get(&row_field).cloned().ok_or_else(|| {
+                        format!(
+                            "indexed read_path update branch {} could not read row field `{row_field}`",
+                            op.id.0
+                        )
+                    })?
+                }
+            };
             if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
                 return Ok(indexed_json_update_outcome(
                     op.id,
@@ -22512,6 +22588,35 @@ mod tests {
             text_eval.source_payload_field,
             serde_json::to_value(SourcePayloadField::Named("title".to_owned())).unwrap()
         );
+
+        plan.storage_layout.scalar_slots[0].initial_row_field_path = Some("title".to_owned());
+        let read_path_op = PlanOp {
+            id: PlanOpId(13),
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::ReadPath,
+                ordered_inputs: Vec::new(),
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: Vec::new(),
+            output: Some(ValueRef::State(StateId(30))),
+            indexed: true,
+            unresolved_executable_ref_count: 0,
+        };
+        let read_path_eval = evaluate_indexed_json_update_branch(
+            &plan,
+            &read_path_op,
+            SourceId(1),
+            &plan.source_routes[0],
+            &RootJsonSourceEvent::default(),
+            &row,
+            &BTreeMap::new(),
+        )
+        .expect("indexed ReadPath should read the output row initializer field");
+        assert!(read_path_eval.supported);
+        assert_eq!(read_path_eval.expression_kind, Some("read_path"));
+        assert_eq!(read_path_eval.value, Some(json!("Old")));
 
         let match_op = PlanOp {
             id: PlanOpId(12),

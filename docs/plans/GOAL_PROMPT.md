@@ -173,6 +173,11 @@ Current checkpoint:
   steps through `LoadedRuntime`; scenario-event reports may still carry
   schema-compatible `legacy_comparison.enabled=false` fields until the report
   schema migration removes them.
+- `verify-compiler-boundaries` is down to five known blockers after removing
+  the direct compile facade false positive and moving startup list-row
+  expression refresh iteration into PlanExecutor. The remaining cluster is
+  list row initial-state refresh/mirror ownership plus root-state/update
+  ownership in the runtime scenario fallback path.
 - The native aggregate now treats a fresh child report whose own `blockers[]`
   are freshness-only as refresh debt, not a true product blocker. This fixed the
   physical TodoMVC reference parity false blocker: after refreshing only

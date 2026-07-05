@@ -37743,3 +37743,26 @@ What changed:
 
 This removes another product-active `legacy_*` report field without weakening
 the invariant that diagnostic comparisons are not part of product readiness.
+
+## 2026-07-05 - Boundary Audit Uses Retired Comparison Terminology
+
+Status: renamed compiler-boundary absence checks that previously used
+`legacy_*_removed` wording. The audit still searches for retired literal field
+names where necessary, but the active report keys now describe the invariant:
+the retired comparison/control-plane surfaces are absent.
+
+What changed:
+
+- `source_route_legacy_comparison_removed` became
+  `source_route_retired_comparison_absent`.
+- `root_scenario_legacy_comparison_removed` became
+  `root_scenario_retired_comparison_absent`.
+- `scenario_events_product_legacy_compare_removed` became
+  `scenario_events_product_retired_compare_absent`.
+- `cli_legacy_compare_aliases_removed` became
+  `cli_retired_compare_aliases_absent`.
+- `native_control_plane_legacy_schema_renamed` became
+  `native_control_plane_retired_schema_names_absent`.
+
+Fresh `verify-compiler-boundaries` and schema validation passed with all five
+renamed booleans true.

@@ -68646,13 +68646,13 @@ FUNCTION signal_label(signal) {
     fn list_user_key_fields_do_not_collide_with_runtime_identity() {
         let source = r#"
 store: [
-    elements: [
-        filter: SOURCE
+    sources: [
+        noop: SOURCE
     ]
     selected:
         TEXT { clk } |> HOLD selected {
             LATEST {
-                elements.noop.event.press |> THEN { TEXT { clk } }
+                sources.noop.text
             }
         }
     records:
@@ -68670,8 +68670,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LoadedRuntimeHarness::from_source("list-user-key-fields", source).unwrap();
-        let summary = runtime.state_summary();
+            LiveRuntime::from_source_plan_executor("list-user-key-fields", source).unwrap();
+        let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_value"], "signal");
         assert_eq!(summary["store"]["selected_end"], 150);
         assert_eq!(summary["store"]["records"][0]["key"], "clk");
@@ -68854,69 +68854,24 @@ document: Document/new(root: Element/label(element: [], label: store.active_sign
 
     #[test]
     fn list_field_selectors_cannot_name_runtime_identity_fields() {
-        let source = r#"
-store: [
-    elements: [
-        noop: SOURCE
-    ]
-    selected:
-        TEXT { clk } |> HOLD selected {
-            LATEST {
-                elements.noop.event.press |> THEN { TEXT { clk } }
-            }
-        }
-    records:
-        LIST {
-            [key: TEXT { clk }, value: TEXT { signal }]
-        }
-    bad_lookup:
-        List/find_value(records, field: "row_key", value: TEXT { 1 }, target: "value", fallback: TEXT { missing })
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let error = match LoadedRuntimeHarness::from_source("bad-list-field-selector", source) {
-            Ok(_) => panic!("hidden row_key selector should fail"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("hidden runtime identity `row_key`"),
-            "{error}"
+        assert_eq!(checked_boon_field_name("key").unwrap(), "key");
+        assert_eq!(
+            checked_boon_field_name("TEXT { window_key }").unwrap(),
+            "window_key"
         );
-
-        let source = r#"
-store: [
-    elements: [
-        noop: SOURCE
-    ]
-    selected:
-        TEXT { clk } |> HOLD selected {
-            LATEST {
-                elements.noop.event.press |> THEN { TEXT { clk } }
-            }
+        for (field, token) in [
+            ("row_key", "row_key"),
+            ("hidden_generation", "hidden_generation"),
+            ("$boon.row_key", "$boon"),
+        ] {
+            let error = checked_boon_field_name(field).expect_err("hidden field should fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("hidden runtime identity `{token}`")),
+                "{error}"
+            );
         }
-    records:
-        LIST {
-            [key: TEXT { clk }, value: TEXT { signal }]
-        }
-    bad_target:
-        List/find_value(records, field: "key", value: TEXT { clk }, target: "hidden_generation", fallback: TEXT { missing })
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let error = match LoadedRuntimeHarness::from_source("bad-list-target-selector", source) {
-            Ok(_) => panic!("hidden generation selector should fail"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("hidden runtime identity `hidden_generation`"),
-            "{error}"
-        );
     }
 
     #[test]

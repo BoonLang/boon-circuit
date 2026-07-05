@@ -37124,3 +37124,36 @@ Current interpretation:
   switch.
 - Remaining legacy comparison is concentrated in explicit scenario-event
   diagnostics and older xtask semantic/metamorphic harness callers.
+
+## 2026-07-05 - Raw Legacy Scenario CLI Removed
+
+Status: removed the direct `boon_cli diagnose-legacy-scenario` command. The
+CLI no longer exposes a raw `LoadedRuntime` scenario execution surface; the
+only remaining CLI diagnostic that touches legacy comparison is
+`diagnose-plan-legacy-compare`, which starts from PlanExecutor scenario-event
+replay and labels legacy parity as diagnostic.
+
+What changed:
+
+- Removed `diagnose-legacy-scenario` from CLI help and dispatch.
+- Removed the direct `run_legacy_scenario` import and wrapper from
+  `boon_cli`.
+- `run --engine legacy` / `run --engine semantic` now point users at
+  PlanExecutor product commands or `diagnose-plan-legacy-compare`, not raw
+  legacy execution.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_cli`: pass.
+- `cargo test -q -p boon_cli`: pass.
+- Fresh CLI rejection check:
+  `boon_cli diagnose-legacy-scenario examples/counter.bn` exits nonzero with
+  `unknown command`.
+
+Current interpretation:
+
+- There is no public `boon_cli` command that directly runs the legacy scenario
+  runtime.
+- Remaining raw `run_legacy_scenario` callers are in xtask verifier/diagnostic
+  code and runtime tests. Those are the next cleanup target before deleting
+  the `LoadedRuntime` implementation island.

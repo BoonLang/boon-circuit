@@ -3,9 +3,8 @@
 use boon_compiler::{compile_source_path_to_full_ir, compile_typed_program};
 use boon_plan::{TargetProfile, verify_plan};
 use boon_runtime::{
-    VerificationLayer, emit_compiled_artifact, inspect_compiled_artifact_report,
-    run_legacy_scenario, run_plan_initial_state, run_plan_root_scalar_scenario,
-    run_plan_scenario_events, run_plan_source_route, write_json,
+    emit_compiled_artifact, inspect_compiled_artifact_report, run_plan_initial_state,
+    run_plan_root_scalar_scenario, run_plan_scenario_events, run_plan_source_route, write_json,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -20,7 +19,6 @@ usage:
   boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli run-plan-root-scalar-scenario <source> --scenario <path> --steps <id[,id...]> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
-  boon_cli diagnose-legacy-scenario <source> [--scenario <path>] [--report <path>] [--print-report]
   boon_cli diagnose-plan-legacy-compare <source> [--scenario <path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
   boon_cli compile <source> --out <path.boonc> [--report <path>]
   boon_cli inspect-artifact <path.boonc> [--report <path>]
@@ -51,7 +49,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "run" => run_program(&args),
         "scenario" => run_program(&args),
-        "diagnose-legacy-scenario" => run_legacy_scenario_diagnostic(&args),
         "diagnose-plan-legacy-compare" => run_plan_legacy_compare_diagnostic(&args),
         "run-plan" => run_plan(&args),
         "run-plan-route" => run_plan_route(&args),
@@ -147,7 +144,7 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         "legacy" | "semantic" => {
             return Err(
-                "normal `run` no longer exposes the legacy runtime; use `diagnose-legacy-scenario`"
+                "normal `run` no longer exposes the legacy runtime; use PlanExecutor product commands or `diagnose-plan-legacy-compare`"
                     .into(),
             );
         }
@@ -158,54 +155,6 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         other => return Err(format!("unknown run engine `{other}`").into()),
-    }
-    Ok(())
-}
-
-fn run_legacy_scenario_diagnostic(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let source = args.first().ok_or("missing source path")?;
-    let mut scenario = None;
-    let mut report = None;
-    let mut explicit_report = false;
-    let mut print_report = false;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--scenario" => {
-                scenario = args.get(index + 1).cloned();
-                index += 2;
-            }
-            "--report" => {
-                report = args.get(index + 1).map(PathBuf::from);
-                explicit_report = true;
-                index += 2;
-            }
-            "--print-report" => {
-                print_report = true;
-                index += 1;
-            }
-            other if other.ends_with(".scn") => {
-                scenario = Some(other.to_owned());
-                index += 1;
-            }
-            other => {
-                return Err(format!("unknown diagnose-legacy-scenario argument `{other}`").into());
-            }
-        }
-    }
-    let scenario = match scenario {
-        Some(scenario) => scenario,
-        None => default_scenario(source)?,
-    };
-    let report = report.or_else(|| default_cli_report(source, &scenario));
-    let output = run_legacy_scenario(
-        Path::new(source),
-        Path::new(&scenario),
-        VerificationLayer::Semantic,
-        report.as_deref(),
-    )?;
-    if print_report || !explicit_report {
-        println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
     }
     Ok(())
 }
@@ -1254,7 +1203,6 @@ mod tests {
     fn help_advertises_supported_commands() {
         for command in [
             "run",
-            "diagnose-legacy-scenario",
             "diagnose-plan-legacy-compare",
             "run-plan",
             "run-plan-route",

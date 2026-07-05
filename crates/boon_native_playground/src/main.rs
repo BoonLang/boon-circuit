@@ -8249,12 +8249,6 @@ fn native_preview_live_runtime_from_project(
     source_label: &str,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
-    if boon_runtime::project_requires_legacy_output_runtime(source_label, units)? {
-        return Ok(boon_runtime::LiveRuntime::from_project_legacy(
-            source_label,
-            units,
-        )?);
-    }
     Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
         source_label,
         units,
@@ -8267,16 +8261,13 @@ fn native_preview_live_runtime_from_project_profiled(
 ) -> Result<(boon_runtime::LiveRuntime, Value), Box<dyn std::error::Error>> {
     let requires_legacy_output_runtime =
         boon_runtime::project_requires_legacy_output_runtime(source_label, units)?;
-    let (runtime, mut profile) = if requires_legacy_output_runtime {
-        boon_runtime::LiveRuntime::from_project_legacy_profiled(source_label, units)?
-    } else {
-        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(source_label, units)?
-    };
+    let (runtime, mut profile) =
+        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(source_label, units)?;
     if let Some(object) = profile.as_object_mut() {
         object.insert(
             "native_preview_runtime_selection".to_owned(),
             json!(if requires_legacy_output_runtime {
-                "explicit_legacy_output_runtime"
+                "plan_executor_output_root_runtime"
             } else {
                 "plan_executor_document_runtime"
             }),
@@ -66715,7 +66706,7 @@ mod tests {
     }
 
     #[test]
-    fn native_preview_runtime_selector_keeps_world_outputs_on_explicit_legacy() {
+    fn native_preview_runtime_selector_uses_plan_executor_for_world_outputs() {
         let source_path = repo_path("examples/hello_3d/RUN.bn");
         let units = boon_runtime::source_units_for_path(&source_path).unwrap();
         assert!(
@@ -66726,20 +66717,24 @@ mod tests {
         let (mut runtime, profile) =
             native_preview_live_runtime_from_project_profiled("native-hello-3d-world", &units)
                 .unwrap();
-        assert_eq!(profile["engine"], "legacy_generic_runtime");
+        assert_eq!(profile["engine"], "plan_executor");
         assert_eq!(
             profile["native_preview_runtime_selection"],
-            "explicit_legacy_output_runtime"
+            "plan_executor_output_root_runtime"
         );
         assert_eq!(profile["requires_legacy_output_runtime"], true);
         assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
-            "legacy_generic_runtime"
+            "plan_executor"
+        );
+        assert_eq!(
+            runtime.engine_provenance_report()["output_root_evaluator"],
+            "plan_executor_generic_output_program"
         );
         runtime
             .world_scene_output()
-            .expect("world output remains available through explicit legacy runtime");
+            .expect("world output remains available through PlanExecutor output-root evaluator");
     }
 
     #[test]
@@ -82977,7 +82972,7 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_legacy(
+            boon_runtime::LiveRuntime::from_project_plan_executor(
                 "preview-world-editor-visible-car",
                 &units,
             )
@@ -83054,8 +83049,11 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_legacy("preview-hello-3d-world-scene", &units)
-                .expect("hello_3d runtime should build"),
+            boon_runtime::LiveRuntime::from_project_plan_executor(
+                "preview-hello-3d-world-scene",
+                &units,
+            )
+            .expect("hello_3d runtime should build"),
         ));
         let world_scene = preview_world_scene_for_live_runtime(&source_hash, Some(&live_runtime))
             .expect("hello_3d runtime should expose a world scene");
@@ -83077,7 +83075,7 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_legacy(
+            boon_runtime::LiveRuntime::from_project_plan_executor(
                 "preview-hello-3d-world-scene-orbit",
                 &units,
             )
@@ -83186,8 +83184,11 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_legacy("preview-world-editor-host-car", &units)
-                .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project_plan_executor(
+                "preview-world-editor-host-car",
+                &units,
+            )
+            .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))
@@ -83423,7 +83424,7 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_legacy(
+            boon_runtime::LiveRuntime::from_project_plan_executor(
                 "preview-world-editor-click-car",
                 &units,
             )

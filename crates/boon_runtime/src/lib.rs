@@ -4054,6 +4054,7 @@ struct PlanExecutorRuntimeState {
 #[derive(Clone)]
 struct PlanExecutorLiveSession {
     plan: Arc<MachinePlan>,
+    generic_output_plan: RuntimeGenericDerivedPlan,
     state: PlanExecutorRuntimeState,
     host_file_root: Option<PathBuf>,
     next_step: usize,
@@ -4548,9 +4549,14 @@ impl PlanExecutorLiveSession {
         source_text: &str,
         target_profile: TargetProfile,
     ) -> RuntimeResult<Self> {
+        let runtime_plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let compiled =
             compile_source_text_to_machine_plan(source_label, source_text, target_profile)?;
-        Self::from_machine_plan(compiled.plan, None)
+        Self::from_machine_plan(
+            compiled.plan,
+            runtime_plan.compiled.generic_derived_runtime.clone(),
+            None,
+        )
     }
 
     fn from_project(
@@ -4558,29 +4564,47 @@ impl PlanExecutorLiveSession {
         units: &[RuntimeSourceUnit],
         target_profile: TargetProfile,
     ) -> RuntimeResult<Self> {
+        let runtime_plan = cached_runtime_plan_from_project(source_label, units)?;
         let compiler_units = compiler_source_units_from_runtime_units(units);
         let compiled =
             compile_source_units_to_machine_plan(source_label, &compiler_units, target_profile)?;
-        Self::from_machine_plan(compiled.plan, None)
+        Self::from_machine_plan(
+            compiled.plan,
+            runtime_plan.compiled.generic_derived_runtime.clone(),
+            None,
+        )
     }
 
     fn from_source_path(source_path: &Path, target_profile: TargetProfile) -> RuntimeResult<Self> {
+        let source_text = std::fs::read_to_string(source_path)?;
+        let runtime_plan =
+            cached_runtime_plan_from_source(&source_path.display().to_string(), &source_text)?;
         let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
-        Self::from_machine_plan(compiled.plan, source_path.parent().map(Path::to_path_buf))
+        Self::from_machine_plan(
+            compiled.plan,
+            runtime_plan.compiled.generic_derived_runtime.clone(),
+            source_path.parent().map(Path::to_path_buf),
+        )
     }
 
     fn from_compiled_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
-        Self::from_machine_plan(artifact.machine_plan()?, None)
+        Self::from_machine_plan(
+            artifact.machine_plan()?,
+            artifact.runtime_generic_derived_plan()?,
+            None,
+        )
     }
 
     fn from_machine_plan(
         plan: MachinePlan,
+        generic_output_plan: RuntimeGenericDerivedPlan,
         host_file_root: Option<PathBuf>,
     ) -> RuntimeResult<Self> {
         let plan = Arc::new(plan);
         let state = PlanExecutorRuntimeState::new(plan.as_ref())?;
         Ok(Self {
             plan,
+            generic_output_plan,
             state,
             host_file_root,
             next_step: 1,
@@ -4726,8 +4750,681 @@ impl PlanExecutorLiveSession {
             "runtime_ast_eval_count": 0,
             "executable_string_path_count": 0,
             "unknown_plan_op_count": 0,
+            "output_root_evaluator": "plan_executor_generic_output_program",
+            "output_root_count": self.generic_output_plan.output_roots.len(),
             "generic_fallback_enabled": false,
         })
+    }
+
+    fn world_scene_output(&self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        let mut evaluator = PlanExecutorOutputEvaluator::new(
+            self.plan.as_ref(),
+            &self.generic_output_plan,
+            &self.state.root_state.root_state,
+            &self.state.list_state,
+        );
+        evaluator.world_scene_output()
+    }
+
+    fn solid_model_output(&self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        let mut evaluator = PlanExecutorOutputEvaluator::new(
+            self.plan.as_ref(),
+            &self.generic_output_plan,
+            &self.state.root_state.root_state,
+            &self.state.list_state,
+        );
+        evaluator.solid_model_output()
+    }
+}
+
+struct PlanExecutorOutputEvaluator<'a> {
+    plan: &'a MachinePlan,
+    generic_output_plan: &'a RuntimeGenericDerivedPlan,
+    root_state: &'a serde_json::Map<String, JsonValue>,
+    list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
+}
+
+impl<'a> PlanExecutorOutputEvaluator<'a> {
+    fn new(
+        plan: &'a MachinePlan,
+        generic_output_plan: &'a RuntimeGenericDerivedPlan,
+        root_state: &'a serde_json::Map<String, JsonValue>,
+        list_state: &'a BTreeMap<usize, Vec<PlanListRowState>>,
+    ) -> Self {
+        Self {
+            plan,
+            generic_output_plan,
+            root_state,
+            list_state,
+        }
+    }
+
+    fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
+        let mut frame = GenericEvalFrame::root();
+        let output = self
+            .generic_output_plan
+            .output_root_plan("world")
+            .ok_or("PlanExecutor world output requires a top-level `world:` value")?
+            .clone();
+        if output.output_kind != "world"
+            || !output.generic_output_port
+            || !output.typed_contract_known
+        {
+            return Err(format!(
+                "PlanExecutor world output root has unsupported contract kind={} generic={} typed={}",
+                output.output_kind, output.generic_output_port, output.typed_contract_known
+            )
+            .into());
+        }
+        let statement = output.statement.as_ref().ok_or_else(|| {
+            output
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "PlanExecutor world output root is not executable".to_owned())
+        })?;
+        let value = self.eval_statement(statement, &mut frame)?;
+        let scene = lower_world_scene_from_boon_value(&value)?;
+        Ok(RuntimeWorldSceneOutput {
+            output_root: "world".to_owned(),
+            scene,
+            read_count: frame.reads.len(),
+        })
+    }
+
+    fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
+        let mut frame = GenericEvalFrame::root();
+        let output = self
+            .generic_output_plan
+            .output_root_plan("manufacturing")
+            .ok_or("PlanExecutor solid model output requires a top-level `manufacturing:` value")?
+            .clone();
+        if output.output_kind != "manufacturing"
+            || !output.generic_output_port
+            || !output.typed_contract_known
+        {
+            return Err(format!(
+                "PlanExecutor manufacturing output root has unsupported contract kind={} generic={} typed={}",
+                output.output_kind, output.generic_output_port, output.typed_contract_known
+            )
+            .into());
+        }
+        let statement = output.statement.as_ref().ok_or_else(|| {
+            output.unsupported_reason.clone().unwrap_or_else(|| {
+                "PlanExecutor manufacturing output root is not executable".to_owned()
+            })
+        })?;
+        let value = self.eval_statement(statement, &mut frame)?;
+        let value = self.resolve_solid_model_root_refs(value, &mut frame)?;
+        let bundle = lower_solid_model_from_boon_value(&value)?;
+        Ok(RuntimeSolidModelOutput {
+            output_root: "manufacturing".to_owned(),
+            bundle,
+            read_count: frame.reads.len(),
+        })
+    }
+
+    fn eval_statement(
+        &mut self,
+        statement: &RuntimeGenericStatement,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        match statement {
+            RuntimeGenericStatement::Empty => Ok(BoonValue::Empty),
+            RuntimeGenericStatement::Expr(expr) => self.eval_expr(expr, frame),
+            RuntimeGenericStatement::Binding { name, value } => {
+                let value = self.eval_statement(value, frame)?;
+                frame.env.insert(name.clone(), value.clone());
+                Ok(value)
+            }
+            RuntimeGenericStatement::ExprWithChildren { expr, children } => {
+                self.eval_expr_with_children(expr, children, frame)
+            }
+            RuntimeGenericStatement::Block(statements) => {
+                self.eval_statement_block(statements, frame)
+            }
+            RuntimeGenericStatement::List(statements) => {
+                let mut values = Vec::new();
+                for statement in statements {
+                    if self.statement_is_pipe_continuation(statement) {
+                        continue;
+                    }
+                    let value = self.eval_statement(statement, frame)?;
+                    if !matches!(value, BoonValue::Empty) {
+                        values.push(value);
+                    }
+                }
+                Ok(BoonValue::List(values))
+            }
+            RuntimeGenericStatement::Record(fields) => {
+                let mut record = BTreeMap::new();
+                for field in fields {
+                    record.insert(
+                        field.name.clone(),
+                        self.eval_statement(&field.value, frame)?,
+                    );
+                }
+                Ok(BoonValue::Record(record))
+            }
+            RuntimeGenericStatement::Latest(statements) => {
+                for statement in statements {
+                    let value = self.eval_statement(statement, frame)?;
+                    if !matches!(value, BoonValue::Empty | BoonValue::Error(_)) {
+                        return Ok(value);
+                    }
+                }
+                Ok(BoonValue::Empty)
+            }
+        }
+    }
+
+    fn eval_statement_block(
+        &mut self,
+        statements: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut last = BoonValue::Empty;
+        for statement in statements {
+            if self.statement_is_pipe_continuation(statement) {
+                last = self.eval_pipe_continuation_statement(statement, last, frame)?;
+            } else {
+                last = self.eval_statement(statement, frame)?;
+            }
+        }
+        Ok(last)
+    }
+
+    fn eval_expr_with_children(
+        &mut self,
+        expr: &RuntimeGenericExpr,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match expr {
+            RuntimeGenericExpr::Identifier(name) if name == "BLOCK" => {
+                self.eval_statement_block(children, frame)
+            }
+            RuntimeGenericExpr::Call { function, args }
+                if runtime_generic_constructor_accepts_children(function) =>
+            {
+                let value = self.eval_call(function, args, None, frame)?;
+                self.eval_constructor_children(value, children, frame)
+            }
+            _ => self.eval_expr(expr, frame),
+        }
+    }
+
+    fn eval_constructor_children(
+        &mut self,
+        value: BoonValue,
+        children: &[RuntimeGenericStatement],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let BoonValue::Record(mut record) = value else {
+            return Ok(value);
+        };
+        for child in children {
+            if self.statement_is_pipe_continuation(child) {
+                continue;
+            }
+            match child {
+                RuntimeGenericStatement::Binding { name, value } => {
+                    record.insert(name.clone(), self.eval_statement(value, frame)?);
+                }
+                _ => {
+                    let value = self.eval_statement(child, frame)?;
+                    if !matches!(value, BoonValue::Empty) {
+                        record.insert(format!("child_{}", record.len()), value);
+                    }
+                }
+            }
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn eval_expr(
+        &mut self,
+        expr: &RuntimeGenericExpr,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        frame.consume_budget()?;
+        match expr {
+            RuntimeGenericExpr::Identifier(name) => self.eval_identifier(name, frame),
+            RuntimeGenericExpr::Path(parts) => self.eval_path(parts, frame),
+            RuntimeGenericExpr::Text(value) => Ok(BoonValue::Text(value.clone())),
+            RuntimeGenericExpr::Number(value) => Ok(BoonValue::Number(*value)),
+            RuntimeGenericExpr::NaN => Ok(BoonValue::NaN),
+            RuntimeGenericExpr::Bool(value) => Ok(BoonValue::Bool(*value)),
+            RuntimeGenericExpr::Enum(value) => Ok(BoonValue::Enum(value.clone())),
+            RuntimeGenericExpr::TaggedObject { tag, fields } => {
+                let mut body = Vec::new();
+                for field in fields {
+                    if field.spread {
+                        continue;
+                    }
+                    let value = self.eval_expr(&field.value, frame)?;
+                    body.push(format!("{}:{}", field.name, boon_value_scalar_text(&value)));
+                }
+                Ok(BoonValue::Text(format!("{tag}[{}]", body.join(","))))
+            }
+            RuntimeGenericExpr::Call { function, args } => {
+                self.eval_call(function, args, None, frame)
+            }
+            RuntimeGenericExpr::Pipe { input, op, args } => {
+                let input = if matches!(input.as_ref(), RuntimeGenericExpr::Delimiter) {
+                    BoonValue::Empty
+                } else {
+                    self.eval_expr(input, frame)?
+                };
+                self.eval_call(op, args, Some(input), frame)
+            }
+            RuntimeGenericExpr::Infix { left, op, right } => {
+                let left = self.eval_expr(left, frame)?;
+                let right = self.eval_expr(right, frame)?;
+                Ok(generic_infix_value(left, op, right))
+            }
+            RuntimeGenericExpr::Record(fields) => self.eval_record_expr(fields, frame),
+            RuntimeGenericExpr::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(item, frame)?);
+                }
+                Ok(BoonValue::List(values))
+            }
+            RuntimeGenericExpr::Bytes { size, items } => {
+                let mut bytes = Vec::with_capacity(items.len());
+                for item in items {
+                    push_bytes_constructor_value(&mut bytes, self.eval_expr(item, frame)?)?;
+                }
+                finish_bytes_constructor(size, items.len(), bytes)
+            }
+            RuntimeGenericExpr::Then { input, output } => {
+                let input = self.eval_expr(input, frame)?;
+                if matches!(input, BoonValue::Empty | BoonValue::Error(_)) {
+                    return Ok(BoonValue::Empty);
+                }
+                output
+                    .as_deref()
+                    .map(|output| self.eval_expr(output, frame))
+                    .unwrap_or(Ok(input))
+            }
+            RuntimeGenericExpr::When { .. }
+            | RuntimeGenericExpr::MatchArm { .. }
+            | RuntimeGenericExpr::Delimiter => Ok(BoonValue::Empty),
+        }
+    }
+
+    fn eval_record_expr(
+        &mut self,
+        fields: &[RuntimeGenericRecordExprField],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        for field in fields {
+            let value = self.eval_expr(&field.value, frame)?;
+            if field.spread {
+                match value {
+                    BoonValue::Record(fields) => record.extend(fields),
+                    BoonValue::RecordColumns(columns) => {
+                        record.extend(boon_record_from_value_columns(&columns));
+                    }
+                    BoonValue::Empty => {}
+                    _ => return Ok(BoonValue::Error("type_error".to_owned())),
+                }
+            } else {
+                record.insert(field.name.clone(), value);
+            }
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn eval_call(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if is_generic_render_constructor(function)
+            || is_generic_world_constructor(function)
+            || is_generic_solid_constructor(function)
+            || is_light_constructor(function)
+        {
+            return self.eval_constructor(function, args, input, frame);
+        }
+        if bytes_runtime_builtin(function) {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    Ok(EvaluatedCallArg {
+                        name: arg.name.clone(),
+                        value: self.eval_expr(&arg.value, frame)?,
+                    })
+                })
+                .collect::<RuntimeResult<Vec<_>>>()?;
+            return eval_bytes_builtin(function, input, &args);
+        }
+        if let Some(definition) = self.generic_output_plan.function(function).cloned() {
+            return self.eval_user_function(&definition, args, input, frame);
+        }
+        match function {
+            "SOURCE" => self.call_input_or_first(input, args, frame),
+            "Text/empty" => Ok(BoonValue::Text(String::new())),
+            "Text/concat" => {
+                let left = self.call_input_or_first(input, args, frame)?;
+                let right = self.named_or_positional_arg_value(args, "with", 0, frame)?;
+                let separator = self
+                    .named_arg_value(args, "separator", frame)
+                    .map(BoonValue::into_text_or_default)
+                    .unwrap_or_default();
+                Ok(BoonValue::Text(format!(
+                    "{}{}{}",
+                    left.into_text_or_default(),
+                    separator,
+                    right.into_text_or_default()
+                )))
+            }
+            "List/range" => {
+                let from = self
+                    .named_arg_value(args, "from", frame)?
+                    .number()
+                    .unwrap_or(0);
+                let to = self
+                    .named_arg_value(args, "to", frame)?
+                    .number()
+                    .unwrap_or(-1);
+                Ok(BoonValue::List(if from <= to {
+                    (from..=to).map(BoonValue::Number).collect()
+                } else {
+                    Vec::new()
+                }))
+            }
+            _ => Ok(BoonValue::Error("parse_error".to_owned())),
+        }
+    }
+
+    fn eval_constructor(
+        &mut self,
+        function: &str,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let mut record = BTreeMap::new();
+        record.insert(
+            "kind".to_owned(),
+            BoonValue::Text(generic_constructor_kind(function).to_owned()),
+        );
+        record.insert(
+            "constructor".to_owned(),
+            BoonValue::Text(function.to_owned()),
+        );
+        if let Some(input) = input {
+            record.insert("input".to_owned(), input);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let value = self.eval_expr(&arg.value, frame)?;
+            let name = arg.name.clone().unwrap_or_else(|| format!("arg_{index}"));
+            record.insert(name, value);
+        }
+        Ok(BoonValue::Record(record))
+    }
+
+    fn eval_user_function(
+        &mut self,
+        definition: &RuntimeGenericFunction,
+        args: &[RuntimeGenericArg],
+        input: Option<BoonValue>,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if frame.call_depth > 128 {
+            return Err(format!(
+                "generic output function `{}` call budget exhausted",
+                definition.name
+            )
+            .into());
+        }
+        let mut child = frame.child();
+        child.call_depth += 1;
+        if let Some(input) = input
+            && let Some(first) = definition.args.first()
+        {
+            child.env.insert(first.clone(), input);
+        }
+        for (position, arg) in args.iter().enumerate() {
+            let value = self.eval_expr(&arg.value, frame)?;
+            let name = arg
+                .name
+                .clone()
+                .or_else(|| definition.args.get(position).cloned())
+                .ok_or_else(|| {
+                    format!(
+                        "generic output function `{}` has too many arguments",
+                        definition.name
+                    )
+                })?;
+            child.env.insert(name, value);
+        }
+        let value = self.eval_statement(&definition.statement, &mut child)?;
+        frame.reads.extend(child.reads);
+        Ok(value)
+    }
+
+    fn eval_identifier(
+        &mut self,
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(value) = frame.env.get(name) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = self.root_value(name) {
+            frame.reads.insert(GenericReadKey::Root {
+                field: name.to_owned(),
+            });
+            return Ok(value);
+        }
+        if let Some(value) = self.root_derived_boon_value(name, frame)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.list_value(name, frame) {
+            return Ok(value);
+        }
+        Ok(BoonValue::Enum(name.to_owned()))
+    }
+
+    fn eval_path(
+        &mut self,
+        parts: &[String],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let Some((first, rest)) = parts.split_first() else {
+            return Ok(BoonValue::Empty);
+        };
+        let mut value = self.eval_identifier(first, frame)?;
+        for part in rest {
+            value = match value {
+                BoonValue::Record(fields) => fields.get(part).cloned().unwrap_or(BoonValue::Empty),
+                BoonValue::RecordColumns(columns) => columns
+                    .value_ref_id(&FieldSlotId::from_path(part))
+                    .map(field_ref_to_boon)
+                    .unwrap_or(BoonValue::Empty),
+                _ => BoonValue::Empty,
+            };
+        }
+        Ok(value)
+    }
+
+    fn root_value(&self, path: &str) -> Option<BoonValue> {
+        if let Some(value) = self.root_state.get(path) {
+            return Some(json_to_boon_value(value));
+        }
+        let root = JsonValue::Object(self.root_state.clone());
+        runtime_value_at_path(&root, path).map(json_to_boon_value)
+    }
+
+    fn root_derived_boon_value(
+        &mut self,
+        path: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<Option<BoonValue>> {
+        if frame.root_stack.iter().any(|active| active == path) {
+            return Ok(Some(BoonValue::Error("cycle".to_owned())));
+        }
+        let Some(plan) = self.generic_output_plan.root_field_plan(path).cloned() else {
+            return Ok(None);
+        };
+        let Some(statement) = plan.statement else {
+            return Err(plan
+                .unsupported_reason
+                .unwrap_or_else(|| {
+                    format!("PlanExecutor output root field `{path}` is not executable")
+                })
+                .into());
+        };
+        frame.root_stack.push(path.to_owned());
+        let value = self.eval_statement(&statement, frame)?;
+        frame.root_stack.pop();
+        Ok(Some(value))
+    }
+
+    fn list_value(&self, name: &str, frame: &mut GenericEvalFrame) -> Option<BoonValue> {
+        let list_id = self.plan.debug_map.list_slots.iter().find_map(|entry| {
+            if entry.label != name {
+                return None;
+            }
+            entry
+                .id
+                .parse::<usize>()
+                .ok()
+                .or_else(|| entry.id.rsplit(':').next()?.parse::<usize>().ok())
+        })?;
+        let rows = self.list_state.get(&list_id)?;
+        frame.reads.insert(GenericReadKey::ListColumn {
+            list: name.to_owned(),
+            field: "*".to_owned(),
+        });
+        Some(BoonValue::List(
+            rows.iter()
+                .map(|row| {
+                    BoonValue::Record(
+                        row.fields
+                            .iter()
+                            .map(|(field, value)| (field.clone(), json_to_boon_value(value)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn resolve_solid_model_root_refs(
+        &mut self,
+        value: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match value {
+            BoonValue::Record(mut fields) => {
+                for key in ["geometry", "base", "child"] {
+                    if let Some(referenced) =
+                        fields.get(key).and_then(solid_model_structural_ref_name)
+                        && let Some(resolved) = self.root_derived_boon_value(&referenced, frame)?
+                    {
+                        fields.insert(
+                            key.to_owned(),
+                            self.resolve_solid_model_root_refs(resolved, frame)?,
+                        );
+                    }
+                }
+                if let Some(BoonValue::List(values)) = fields.remove("tools") {
+                    let values = values
+                        .into_iter()
+                        .map(|value| self.resolve_solid_model_root_refs(value, frame))
+                        .collect::<RuntimeResult<Vec<_>>>()?;
+                    fields.insert("tools".to_owned(), BoonValue::List(values));
+                }
+                Ok(BoonValue::Record(fields))
+            }
+            BoonValue::List(values) => Ok(BoonValue::List(
+                values
+                    .into_iter()
+                    .map(|value| self.resolve_solid_model_root_refs(value, frame))
+                    .collect::<RuntimeResult<Vec<_>>>()?,
+            )),
+            other => Ok(other),
+        }
+    }
+
+    fn call_input_or_first(
+        &mut self,
+        input: Option<BoonValue>,
+        args: &[RuntimeGenericArg],
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match input {
+            Some(value) => Ok(value),
+            None => args
+                .first()
+                .ok_or_else(|| "generic output call requires an input argument".into())
+                .and_then(|arg| self.eval_expr(&arg.value, frame)),
+        }
+    }
+
+    fn named_arg_value(
+        &mut self,
+        args: &[RuntimeGenericArg],
+        name: &str,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        let arg = args
+            .iter()
+            .find(|arg| arg.name.as_deref() == Some(name))
+            .ok_or_else(|| format!("generic output call requires `{name}`"))?;
+        self.eval_expr(&arg.value, frame)
+    }
+
+    fn named_or_positional_arg_value(
+        &mut self,
+        args: &[RuntimeGenericArg],
+        name: &str,
+        position: usize,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        if let Some(arg) = args.iter().find(|arg| arg.name.as_deref() == Some(name)) {
+            return self.eval_expr(&arg.value, frame);
+        }
+        let arg = args
+            .iter()
+            .filter(|arg| arg.name.is_none())
+            .nth(position)
+            .ok_or_else(|| format!("generic output call requires `{name}`"))?;
+        self.eval_expr(&arg.value, frame)
+    }
+
+    fn statement_is_pipe_continuation(&self, statement: &RuntimeGenericStatement) -> bool {
+        match statement {
+            RuntimeGenericStatement::Expr(expr)
+            | RuntimeGenericStatement::ExprWithChildren { expr, .. } => {
+                runtime_generic_expr_is_pipe_continuation(expr)
+            }
+            _ => false,
+        }
+    }
+
+    fn eval_pipe_continuation_statement(
+        &mut self,
+        statement: &RuntimeGenericStatement,
+        input: BoonValue,
+        frame: &mut GenericEvalFrame,
+    ) -> RuntimeResult<BoonValue> {
+        match statement {
+            RuntimeGenericStatement::Expr(RuntimeGenericExpr::Pipe { op, args, .. })
+            | RuntimeGenericStatement::ExprWithChildren {
+                expr: RuntimeGenericExpr::Pipe { op, args, .. },
+                ..
+            } => self.eval_call(op, args, Some(input), frame),
+            _ => Ok(input),
+        }
     }
 }
 
@@ -11738,13 +12435,6 @@ fn source_requires_legacy_output_runtime(
     project_requires_legacy_output_runtime(source_label, &[unit])
 }
 
-fn default_runtime_rejects_legacy_output_error(source_label: &str) -> Box<dyn std::error::Error> {
-    format!(
-        "default LiveRuntime construction for `{source_label}` requires a legacy world/manufacturing output runtime; refusing hidden fallback. Use an explicit legacy constructor for diagnostic/output-root verifiers until PlanExecutor supports this output."
-    )
-    .into()
-}
-
 fn cached_runtime_parsed_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
@@ -11814,9 +12504,6 @@ impl LiveRuntime {
 
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let _scenario = parse_scenario(scenario_path)?;
-        if source_requires_legacy_output_runtime(source_label, source_text)? {
-            return Err(default_runtime_rejects_legacy_output_error(source_label));
-        }
         Self::from_source_plan_executor(source_label, source_text)
     }
 
@@ -11842,9 +12529,6 @@ impl LiveRuntime {
         scenario_path: &Path,
     ) -> RuntimeResult<Self> {
         let _scenario = parse_scenario(scenario_path)?;
-        if project_requires_legacy_output_runtime(source_label, units)? {
-            return Err(default_runtime_rejects_legacy_output_error(source_label));
-        }
         Self::from_project_plan_executor(source_label, units)
     }
 
@@ -11865,9 +12549,6 @@ impl LiveRuntime {
     }
 
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
-        if source_requires_legacy_output_runtime(source_label, source_text)? {
-            return Err(default_runtime_rejects_legacy_output_error(source_label));
-        }
         Self::from_source_plan_executor(source_label, source_text)
     }
 
@@ -11895,9 +12576,6 @@ impl LiveRuntime {
     }
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
-        if project_requires_legacy_output_runtime(source_label, units)? {
-            return Err(default_runtime_rejects_legacy_output_error(source_label));
-        }
         Self::from_project_plan_executor(source_label, units)
     }
 
@@ -11971,9 +12649,6 @@ impl LiveRuntime {
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
-        if project_requires_legacy_output_runtime(source_label, units)? {
-            return Err(default_runtime_rejects_legacy_output_error(source_label));
-        }
         let (runtime, mut profile) =
             Self::from_project_plan_executor_profiled(source_label, units)?;
         if let Some(object) = profile.as_object_mut() {
@@ -12051,11 +12726,17 @@ impl LiveRuntime {
     }
 
     pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
-        self.legacy_runtime_mut()?.world_scene_output()
+        match &mut self.engine {
+            LiveRuntimeEngine::PlanExecutor(session) => session.world_scene_output(),
+            LiveRuntimeEngine::Legacy(runtime) => runtime.world_scene_output(),
+        }
     }
 
     pub fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
-        self.legacy_runtime_mut()?.solid_model_output()
+        match &mut self.engine {
+            LiveRuntimeEngine::PlanExecutor(session) => session.solid_model_output(),
+            LiveRuntimeEngine::Legacy(runtime) => runtime.solid_model_output(),
+        }
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
@@ -91830,8 +92511,9 @@ world: World/new(
     }
 )
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("world-output-runtime-lowering", source)
-            .expect("world output source should compile");
+        let mut runtime =
+            LiveRuntime::from_source_plan_executor("world-output-runtime-lowering", source)
+                .expect("world output source should compile");
         let output = runtime
             .world_scene_output()
             .expect("world output should lower into a WorldScene");
@@ -91897,7 +92579,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("manufacturing-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("manufacturing-output-runtime-lowering", source)
                 .expect("manufacturing output source should compile");
         let output = runtime
             .solid_model_output()
@@ -91946,7 +92628,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("curved-solid-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("curved-solid-output-runtime-lowering", source)
                 .expect("curved solid output source should compile");
         let output = runtime
             .solid_model_output()
@@ -92008,7 +92690,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("shell-solid-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("shell-solid-output-runtime-lowering", source)
                 .expect("shell solid output source should compile");
         let output = runtime
             .solid_model_output()
@@ -92066,7 +92748,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("extrude-solid-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("extrude-solid-output-runtime-lowering", source)
                 .expect("extrude solid output source should compile");
         let output = runtime
             .solid_model_output()
@@ -92130,7 +92812,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("revolve-solid-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("revolve-solid-output-runtime-lowering", source)
                 .expect("revolve solid output source should compile");
         let output = runtime
             .solid_model_output()
@@ -92194,7 +92876,7 @@ manufacturing: Assembly/new(
 )
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("loft-solid-output-runtime-lowering", source)
+            LiveRuntime::from_source_plan_executor("loft-solid-output-runtime-lowering", source)
                 .expect("loft solid output source should compile");
         let output = runtime
             .solid_model_output()

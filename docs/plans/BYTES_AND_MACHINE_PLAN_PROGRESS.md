@@ -37489,3 +37489,62 @@ Remaining cleanup:
   lowering/materialization or indexed row routing/update semantics. Do not
   patch NovyWave-specific bridge constants or re-enable legacy comparison to
   pass this verifier.
+
+## 2026-07-05 - Output Roots Moved To PlanExecutor Runtime Boundary
+
+Status: removed the native/product output-root fallback to `LoadedRuntime` for
+`world:` and `manufacturing:` projects. PlanExecutor live sessions now carry the
+compiled AST-free generic output-root program beside the MachinePlan and expose
+`world_scene_output` / `solid_model_output` through the active PlanExecutor
+engine.
+
+What changed:
+
+- `PlanExecutorLiveSession` stores the compiled generic output-root program and
+  reports `output_root_evaluator=plan_executor_generic_output_program`.
+- `LiveRuntime::world_scene_output` and `solid_model_output` dispatch through
+  the active engine; PlanExecutor no longer fails by forcing
+  `legacy_runtime_mut()`.
+- Native preview project construction always uses
+  `from_project_plan_executor`; output-root projects are labeled
+  `plan_executor_output_root_runtime` instead of
+  `explicit_legacy_output_runtime`.
+- Native 3D/world-editor helper tests now construct PlanExecutor runtimes.
+- The main 3D/manufacturing xtask gates now construct PlanExecutor runtimes and
+  include compact runtime provenance in their reports.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime -p boon_native_playground`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p boon_runtime output_lowers -- --nocapture`: pass
+  (`7` output-root lowering tests).
+- `cargo test -q -p boon_native_playground native_preview_runtime_selector --
+  --nocapture`: pass (`2` tests).
+- `cargo test -q -p boon_native_playground preview_world_scene --
+  --nocapture`: pass (`2` tests).
+- `cargo test -q -p boon_native_playground preview_host_world_editor --
+  --nocapture`: pass (`3` tests).
+- `cargo xtask verify-3d-hello-cube --report
+  target/reports/unified/3d-hello-cube-planexecutor.json`: pass with
+  `runtime_provenance.engine=plan_executor`,
+  `generic_fallback_enabled=false`, and
+  `output_root_evaluator=plan_executor_generic_output_program`.
+- `cargo xtask verify-3d-printable-bracket --report
+  target/reports/unified/3d-printable-bracket-planexecutor.json`: pass with
+  the same PlanExecutor provenance and `three_mf_status=Pass`.
+- `cargo xtask verify-3d-parametric-car --report
+  target/reports/unified/3d-parametric-car-planexecutor.json`: pass with the
+  same PlanExecutor provenance and `solid_validation_status=Pass`.
+
+Remaining cleanup:
+
+- `LiveRuntimeEngine::Legacy`, explicit legacy constructors, and many old
+  `boon_runtime` unit tests still exist as diagnostic/old-runtime coverage.
+  They are no longer used by native preview or the migrated 3D/manufacturing
+  xtask gates, but they are not deleted yet.
+- The new output-root evaluator intentionally covers compiled generic output
+  programs over PlanExecutor state. If future output roots need broader
+  spreadsheet/list/currentness semantics, extend this evaluator or move the
+  output-root program into MachinePlan proper; do not reintroduce hidden
+  `LoadedRuntime` fallback.

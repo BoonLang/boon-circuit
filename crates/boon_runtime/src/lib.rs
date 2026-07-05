@@ -11198,23 +11198,6 @@ impl LiveRuntime {
         Self::from_source_plan_executor(source_label, source_text)
     }
 
-    #[cfg(test)]
-    fn new_legacy(
-        source_label: &str,
-        source_text: &str,
-        scenario_path: &Path,
-    ) -> RuntimeResult<Self> {
-        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
-        let scenario = parse_scenario(scenario_path)?;
-        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        runtime.prepare_for_scenario(&scenario)?;
-        Ok(Self {
-            engine: LiveRuntimeEngine::Legacy(runtime),
-            next_step: 1,
-            last_source_batch_sequence: None,
-        })
-    }
-
     pub fn new_from_project(
         source_label: &str,
         units: &[RuntimeSourceUnit],
@@ -11224,36 +11207,8 @@ impl LiveRuntime {
         Self::from_project_plan_executor(source_label, units)
     }
 
-    #[cfg(test)]
-    fn new_from_project_legacy(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-        scenario_path: &Path,
-    ) -> RuntimeResult<Self> {
-        let plan = cached_runtime_plan_from_project(source_label, units)?;
-        let scenario = parse_scenario(scenario_path)?;
-        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        runtime.prepare_for_scenario(&scenario)?;
-        Ok(Self {
-            engine: LiveRuntimeEngine::Legacy(runtime),
-            next_step: 1,
-            last_source_batch_sequence: None,
-        })
-    }
-
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         Self::from_source_plan_executor(source_label, source_text)
-    }
-
-    #[cfg(test)]
-    fn from_source_legacy(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
-        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
-        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        Ok(Self {
-            engine: LiveRuntimeEngine::Legacy(runtime),
-            next_step: 1,
-            last_source_batch_sequence: None,
-        })
     }
 
     pub fn from_source_plan_executor(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
@@ -11271,17 +11226,6 @@ impl LiveRuntime {
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         Self::from_project_plan_executor(source_label, units)
-    }
-
-    #[cfg(test)]
-    fn from_project_legacy(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
-        let plan = cached_runtime_plan_from_project(source_label, units)?;
-        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
-        Ok(Self {
-            engine: LiveRuntimeEngine::Legacy(runtime),
-            next_step: 1,
-            last_source_batch_sequence: None,
-        })
     }
 
     pub fn from_project_plan_executor(
@@ -11350,72 +11294,6 @@ impl LiveRuntime {
             );
         }
         Ok((runtime, profile))
-    }
-
-    #[cfg(test)]
-    fn from_project_legacy_profiled(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<(Self, JsonValue)> {
-        let total_started = Instant::now();
-        let source_key = source_units_hash(units);
-        if let Some(runtime) = initialized_live_runtime_cache()
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&source_key).cloned())
-        {
-            return Ok((
-                runtime,
-                json!({
-                    "initialized_runtime_cache_hit": true,
-                    "plan": {
-                        "cache_hit": true,
-                        "source_unit_count": units.len(),
-                        "total_ms": runtime_elapsed_ms(total_started)
-                    },
-                    "runtime": {
-                        "engine": "legacy_generic_runtime",
-                        "session_kind": "loaded-runtime",
-                        "generic_fallback_enabled": true,
-                        "initialized_runtime_cache_hit": true,
-                        "total_ms": 0.0
-                    },
-                    "engine": "legacy_generic_runtime",
-                    "session_kind": "loaded-runtime",
-                    "generic_fallback_enabled": true,
-                    "runtime_total_ms": 0.0,
-                    "total_ms": runtime_elapsed_ms(total_started)
-                }),
-            ));
-        }
-        let (plan, plan_profile) = cached_runtime_plan_from_project_profiled(source_label, units)?;
-        let runtime_started = Instant::now();
-        let (runtime, runtime_profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref())?;
-        let runtime_ms = runtime_elapsed_ms(runtime_started);
-        let live_runtime = Self {
-            engine: LiveRuntimeEngine::Legacy(runtime),
-            next_step: 1,
-            last_source_batch_sequence: None,
-        };
-        if let Ok(mut cache) = initialized_live_runtime_cache().lock() {
-            if cache.len() > 16 {
-                cache.clear();
-            }
-            cache.insert(source_key, live_runtime.clone());
-        }
-        Ok((
-            live_runtime,
-            json!({
-                "initialized_runtime_cache_hit": false,
-                "plan": plan_profile,
-                "runtime": runtime_profile,
-                "engine": "legacy_generic_runtime",
-                "session_kind": "loaded-runtime",
-                "generic_fallback_enabled": true,
-                "runtime_total_ms": runtime_ms,
-                "total_ms": runtime_elapsed_ms(total_started)
-            }),
-        ))
     }
 
     pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
@@ -12318,7 +12196,15 @@ impl LegacyRuntimeHarness {
         source_text: &str,
         scenario_path: &Path,
     ) -> RuntimeResult<LiveRuntime> {
-        LiveRuntime::new_legacy(source_label, source_text, scenario_path)
+        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
+        let scenario = parse_scenario(scenario_path)?;
+        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
+        runtime.prepare_for_scenario(&scenario)?;
+        Ok(LiveRuntime {
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
     }
 
     fn new_from_project(
@@ -12326,22 +12212,100 @@ impl LegacyRuntimeHarness {
         units: &[RuntimeSourceUnit],
         scenario_path: &Path,
     ) -> RuntimeResult<LiveRuntime> {
-        LiveRuntime::new_from_project_legacy(source_label, units, scenario_path)
+        let plan = cached_runtime_plan_from_project(source_label, units)?;
+        let scenario = parse_scenario(scenario_path)?;
+        let mut runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
+        runtime.prepare_for_scenario(&scenario)?;
+        Ok(LiveRuntime {
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
     }
 
     fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<LiveRuntime> {
-        LiveRuntime::from_source_legacy(source_label, source_text)
+        let plan = cached_runtime_plan_from_source(source_label, source_text)?;
+        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
+        Ok(LiveRuntime {
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
     }
 
     fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<LiveRuntime> {
-        LiveRuntime::from_project_legacy(source_label, units)
+        let plan = cached_runtime_plan_from_project(source_label, units)?;
+        let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
+        Ok(LiveRuntime {
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        })
     }
 
     fn from_project_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(LiveRuntime, JsonValue)> {
-        LiveRuntime::from_project_legacy_profiled(source_label, units)
+        let total_started = Instant::now();
+        let source_key = source_units_hash(units);
+        if let Some(runtime) = initialized_live_runtime_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&source_key).cloned())
+        {
+            return Ok((
+                runtime,
+                json!({
+                    "initialized_runtime_cache_hit": true,
+                    "plan": {
+                        "cache_hit": true,
+                        "source_unit_count": units.len(),
+                        "total_ms": runtime_elapsed_ms(total_started)
+                    },
+                    "runtime": {
+                        "engine": "legacy_generic_runtime",
+                        "session_kind": "loaded-runtime",
+                        "generic_fallback_enabled": true,
+                        "initialized_runtime_cache_hit": true,
+                        "total_ms": 0.0
+                    },
+                    "engine": "legacy_generic_runtime",
+                    "session_kind": "loaded-runtime",
+                    "generic_fallback_enabled": true,
+                    "runtime_total_ms": 0.0,
+                    "total_ms": runtime_elapsed_ms(total_started)
+                }),
+            ));
+        }
+        let (plan, plan_profile) = cached_runtime_plan_from_project_profiled(source_label, units)?;
+        let runtime_started = Instant::now();
+        let (runtime, runtime_profile) = LoadedRuntime::new_profiled(plan.compiled.as_ref())?;
+        let runtime_ms = runtime_elapsed_ms(runtime_started);
+        let live_runtime = LiveRuntime {
+            engine: LiveRuntimeEngine::Legacy(runtime),
+            next_step: 1,
+            last_source_batch_sequence: None,
+        };
+        if let Ok(mut cache) = initialized_live_runtime_cache().lock() {
+            if cache.len() > 16 {
+                cache.clear();
+            }
+            cache.insert(source_key, live_runtime.clone());
+        }
+        Ok((
+            live_runtime,
+            json!({
+                "initialized_runtime_cache_hit": false,
+                "plan": plan_profile,
+                "runtime": runtime_profile,
+                "engine": "legacy_generic_runtime",
+                "session_kind": "loaded-runtime",
+                "generic_fallback_enabled": true,
+                "runtime_total_ms": runtime_ms,
+                "total_ms": runtime_elapsed_ms(total_started)
+            }),
+        ))
     }
 }
 

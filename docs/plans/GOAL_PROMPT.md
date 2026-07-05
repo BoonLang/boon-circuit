@@ -51,9 +51,10 @@ Current checkpoint:
   and `GenericScheduledRuntime` themselves are now `#[cfg(test)]`, with the
   remaining production utility (`List` count predicate row-field extraction)
   pulled into a free helper. Old-runtime tests now construct the legacy engine
-  through `LegacyRuntimeHarness`; `verify-compiler-boundaries` rejects direct
-  test calls to `LiveRuntime::*_legacy` outside that harness. The remaining
-  legacy cuts are deleting or migrating the test-only `LoadedRuntime` /
+  through `LegacyRuntimeHarness`; the `LiveRuntime::*_legacy` constructor
+  methods have been deleted, and `verify-compiler-boundaries` rejects
+  reintroducing those constructor methods or direct `LiveRuntime::*_legacy`
+  calls. The remaining legacy cuts are deleting or migrating the test-only `LoadedRuntime` /
   `GenericScheduledRuntime` coverage island and any native legacy negative
   counters that are no longer useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,

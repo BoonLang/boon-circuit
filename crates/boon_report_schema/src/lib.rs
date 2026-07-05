@@ -1019,9 +1019,6 @@ fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
         "bytes-default-engine:source-default-plan",
         "bytes-default-engine:todomvc-default-plan",
         "bytes-default-engine:cells-default-plan",
-        "bytes-default-engine:explicit-legacy-semantic",
-        "bytes-default-engine:todomvc-compare",
-        "bytes-default-engine:cells-compare",
         "bytes-default-engine:phase10-switch-ready",
     ]
 }
@@ -1316,12 +1313,23 @@ fn verify_bytes_default_engine_readiness_report(
         .into());
     }
     if report
-        .get("explicit_compare_case_count")
-        .and_then(JsonValue::as_u64)
-        != Some(2)
+        .get("legacy_diagnostic_mode")
+        .and_then(JsonValue::as_str)
+        != Some("not-run-not-required-for-product-readiness")
     {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness must prove exactly two explicit compare cases",
+            "{} verify-bytes-default-engine-readiness must keep legacy diagnostics out of product readiness",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("explicit_compare_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(0)
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness must not run explicit compare cases",
             report_path.display()
         )
         .into());
@@ -1343,9 +1351,6 @@ fn verify_bytes_default_engine_readiness_report(
             "run-plan-scenario-events",
         ),
         ("cells-default-plan", "default", "run-plan-scenario-events"),
-        ("explicit-legacy-semantic", "legacy", "semantic"),
-        ("todomvc-compare", "compare", "run-plan-scenario-events"),
-        ("cells-compare", "compare", "run-plan-scenario-events"),
     ];
     if children.len() != expected_children.len() {
         return Err(format!(

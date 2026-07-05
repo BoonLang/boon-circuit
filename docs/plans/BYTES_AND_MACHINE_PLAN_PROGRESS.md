@@ -36978,3 +36978,29 @@ Current interpretation:
 - Remaining compare coupling is concentrated in
   `verify-bytes-default-engine-readiness` and schema handling for explicit
   compare-mode reports; those should be rewritten as diagnostic-only next.
+
+## 2026-07-05 - Default Engine Readiness Made Product-Only
+
+Status: removed the default-engine readiness dependency on legacy semantic and
+explicit compare cases. The verifier now proves only that normal `boon_cli run`
+defaults to PlanExecutor product source replay for TodoMVC and Cells.
+
+What changed:
+
+- Removed the `explicit-legacy-semantic`, `todomvc-compare`, and
+  `cells-compare` readiness checks.
+- Removed `--engine legacy` and `--engine compare` child executions from
+  `verify-bytes-default-engine-readiness`.
+- The report now records
+  `legacy_diagnostic_mode=not-run-not-required-for-product-readiness` and
+  `explicit_compare_case_count=0`.
+- The schema now requires the product-only readiness shape and rejects default
+  readiness reports that run explicit compare cases.
+
+Current interpretation:
+
+- Default-engine readiness now proves normal product behavior, not legacy
+  availability or legacy parity.
+- Remaining legacy ambiguity after this cut is mostly explicit diagnostic
+  schema acceptance plus public runtime helpers whose names still hide
+  `LoadedRuntime` execution.

@@ -108,6 +108,8 @@ What changed:
 - The product hover/selection sync helpers now use indexed source-intent value
   evidence directly, and the old scan-capable source-intent-by-value helper was
   deleted instead of left as dead compatibility code.
+- The selected-overlay helper no longer exposes an `allow_fallback_scan` branch;
+  the only product lookup path is indexed source-intent identity.
 
 Fresh evidence:
 
@@ -152,6 +154,10 @@ Fresh Cells report summary:
 - After deleting the scan-capable helper from the product path, the refreshed
   release report still passes: product-only UX `p95=11.508ms`,
   `max=11.955ms`, `legacy_selection_fallback_count=0`, and
+  `runtime_work_contract.total_list_find_rows_scanned=0`.
+- After removing the dead `allow_fallback_scan` branch, the refreshed release
+  report still passes: product-only UX `p95=12.134ms`, `max=12.615ms`,
+  `legacy_selection_fallback_count=0`, and
   `runtime_work_contract.total_list_find_rows_scanned=0`.
 
 Remaining work:

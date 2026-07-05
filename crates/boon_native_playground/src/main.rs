@@ -44904,12 +44904,8 @@ fn preview_apply_selection_proxy_focus_overlay(
     if selected_nodes.is_empty()
         && let Some(address) = selected_address.as_deref()
     {
-        let address_nodes = preview_selected_overlay_nodes_for_row_lookup_value(
-            layout_proof,
-            layout_frame_override.as_deref(),
-            address,
-            false,
-        );
+        let address_nodes =
+            preview_selected_overlay_nodes_for_row_lookup_value(layout_proof, address);
         if address_nodes.is_empty() {
             if let Some(frame) = layout_frame_override.as_deref() {
                 target_nodes.extend(preview_current_selected_display_nodes(frame));
@@ -45154,28 +45150,13 @@ fn preview_apply_selected_overlay_to_item(
 
 fn preview_selected_overlay_nodes_for_row_lookup_value(
     layout_proof: &Value,
-    frame: Option<&boon_document::LayoutFrame>,
     selected_row_lookup_value: &str,
-    allow_fallback_scan: bool,
 ) -> BTreeSet<String> {
-    let indexed_nodes = source_intent_value_index_nodes_for_value(
+    source_intent_value_index_nodes_for_value(
         layout_proof,
         ROW_LOOKUP_SOURCE_INTENT_KINDS,
         selected_row_lookup_value,
-    );
-    if !indexed_nodes.is_empty() || !allow_fallback_scan {
-        return indexed_nodes;
-    }
-    frame
-        .into_iter()
-        .flat_map(|frame| frame.display_list.iter())
-        .filter(|item| item.style.contains_key("selected"))
-        .filter(|item| {
-            focused_row_lookup_value(layout_proof, &item.node.0).as_deref()
-                == Some(selected_row_lookup_value)
-        })
-        .map(|item| item.node.0.clone())
-        .collect()
+    )
 }
 
 fn preview_current_selected_display_nodes(frame: &boon_document::LayoutFrame) -> BTreeSet<String> {

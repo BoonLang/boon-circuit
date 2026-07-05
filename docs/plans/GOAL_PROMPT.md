@@ -16,6 +16,15 @@ Primary source of truth:
 
 Current checkpoint:
 
+- Latest architecture cleanup checkpoint moved root branch state and startup
+  row-expression refresh behind the PlanExecutor boundary. Runtime no longer
+  owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private
+  BYTES/fixed-bank maps into `execute_root_scalar_update_branch(...)`, and no
+  longer owns the startup row-expression evaluator. Fresh
+  `verify-compiler-boundaries` now reports `status=pass` with zero blockers.
+  This is not complete legacy removal: `LoadedRuntime`/`GenericScheduledRuntime`,
+  explicit diagnostic legacy comparison report surfaces, and native legacy
+  negative counters still need deletion or quarantine in later slices.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

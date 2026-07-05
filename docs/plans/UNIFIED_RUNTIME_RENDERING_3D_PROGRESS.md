@@ -36625,3 +36625,52 @@ Evidence:
 - `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
   expected fail with five remaining root-state/list-initial-refresh extraction
   blockers.
+
+## 2026-07-05 - Root Branch State and Row Refresh Moved Behind PlanExecutor Boundary
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- `execute_root_scalar_update_branch(...)` now receives
+  `PlanExecutorRootState` directly instead of loose root JSON, private BYTES,
+  and fixed-byte-bank maps.
+- Removed the runtime-local `RootBytesRuntimeEnvironment` wrapper. Root BYTES
+  read/write update evaluators now consume the `PlanExecutorRootState`
+  capability directly.
+- Moved the row-expression startup evaluator into `boon_plan_executor`.
+  Runtime now calls self-contained
+  `refresh_startup_list_row_fields_for_all_lists(...)` instead of owning or
+  passing startup row-expression refresh policy.
+- Exported the PlanExecutor row-expression helpers still needed by non-startup
+  runtime update paths, while keeping the evaluator implementation in
+  PlanExecutor.
+- Rewrote stale root BYTES/root-scalar tests to assert product-only
+  `comparison_status=not-requested` and `legacy_comparison.enabled=false`
+  instead of requiring legacy parity to pass.
+- Tightened `verify-compiler-boundaries` to enforce the new boundary: startup
+  list row refresh and root BYTES state ownership must be PlanExecutor-owned,
+  not runtime-owned.
+
+Current interpretation:
+
+- The compiler-boundary gate is now green for this slice:
+  `target/reports/compiler-boundaries.json` reports `status=pass` and zero
+  blockers.
+- This is a real architecture cut: runtime lost the large row-expression
+  evaluator implementation and the root BYTES environment wrapper. It is not
+  complete legacy removal; `LoadedRuntime`/`GenericScheduledRuntime`, explicit
+  diagnostic legacy comparison report surfaces, and native legacy negative
+  counters still need later deletion or quarantine.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_bytes -- --nocapture`:
+  pass, `10` tests.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_indexed_bytes -- --nocapture`:
+  pass, `3` tests.
+- `cargo test -q -p boon_runtime root_scalar_plan_executor_replays_todomvc_multi_event_subset -- --nocapture`:
+  pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
+  pass, zero blockers.

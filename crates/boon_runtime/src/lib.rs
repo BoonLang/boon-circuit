@@ -59,8 +59,8 @@ use boon_ir::{lower, lower_profiled};
 use boon_plan::{
     FieldId, InitialValueKind as PlanInitialValueKind, ListId, MachinePlan, PlanConstantId,
     PlanConstantValue, PlanDerivedExpression, PlanExpressionKind, PlanListProjection, PlanOpKind,
-    PlanRowExpression, PlanRowSelectPattern, PlanValueType, RegionKind, SourceId,
-    SourcePayloadField, StateId, TargetProfile, ValueRef, plan_sha256, verify_plan,
+    PlanRowExpression, PlanValueType, RegionKind, SourceId, SourcePayloadField, StateId,
+    TargetProfile, ValueRef, plan_sha256, verify_plan,
 };
 use boon_plan_executor::{
     IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
@@ -69,11 +69,11 @@ use boon_plan_executor::{
     PlanExecutorListRowState, PlanExecutorLiveSourceEvent, PlanExecutorLiveSourceEventExpectedToml,
     PlanExecutorRootState, PlanExecutorScenarioCheckpointCellExpectation,
     PlanExecutorScenarioCheckpointErrorExpectation, PlanExecutorScenarioCheckpointInput,
-    PlanExecutorScenarioStepMeta, RootBytesEnvironment, RootBytesFixedMutation,
-    RootBytesUpdateDispatchKind, RootExecutedUpdate, RootJsonSourceEvent,
-    RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput, RootUpdateCandidateTracker,
-    ScenarioEventsCommandOutputInput, SourceRouteCommandOutputInput, SourceRouteExecutionContext,
-    SourceRouteExecutionSurface, SourceRouteFullExecution, SourceRouteRuntimeBranchExecutionInput,
+    PlanExecutorScenarioStepMeta, RootBytesFixedMutation, RootBytesUpdateDispatchKind,
+    RootExecutedUpdate, RootJsonSourceEvent, RootRuntimeBranchUpdateInput,
+    RootScenarioCommandOutputInput, RootUpdateCandidateTracker, ScenarioEventsCommandOutputInput,
+    SourceRouteCommandOutputInput, SourceRouteExecutionContext, SourceRouteExecutionSurface,
+    SourceRouteFullExecution, SourceRouteRuntimeBranchExecutionInput,
     SourceRouteSourceEventReportInput,
     append_list_rows_for_derived_values_with as append_plan_list_rows_for_derived_values_with,
     assemble_initial_state_report as assemble_plan_initial_state_report,
@@ -97,8 +97,8 @@ use boon_plan_executor::{
     decode_expected_source_event as decode_plan_expected_source_event,
     demand_current_field_paths as plan_demand_current_field_paths,
     demand_current_semantic_delta_acceptance_policy as plan_demand_current_semantic_delta_acceptance_policy,
-    derived_field_label as plan_derived_field_label, evaluate_indexed_bytes_read_update,
-    evaluate_indexed_bytes_write_update,
+    derived_field_label as plan_derived_field_label, eval_plan_row_expression,
+    evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
     evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
     evaluate_root_bytes_write_update,
@@ -123,11 +123,13 @@ use boon_plan_executor::{
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
     refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
-    refresh_startup_list_row_fields_for_all_lists_with as refresh_plan_startup_list_row_fields_for_all_lists_with,
+    refresh_startup_list_row_fields_for_all_lists as refresh_plan_startup_list_row_fields_for_all_lists,
     remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
-    row_source_binding_id as plan_row_source_binding_id_core,
+    row_expression_row_input_missing as plan_row_expression_row_input_missing,
+    row_json_values_equal, row_source_binding_id as plan_row_source_binding_id_core,
+    row_value_is_cycle_error,
     select_explicit_root_scenario_steps as select_plan_explicit_root_scenario_steps,
     select_scenario_event_steps as select_plan_scenario_event_steps,
     semantic_delta_signature as plan_json_delta_signature,
@@ -3739,9 +3741,7 @@ pub fn run_plan_source_route(
                 &route_context.source_route_slot,
                 &event,
                 None,
-                &root_state.root_state,
-                &root_state.private_bytes,
-                &root_state.fixed_byte_banks,
+                &root_state,
                 host_file_root,
             )?
             .ok_or_else(|| {
@@ -4340,9 +4340,7 @@ impl PlanExecutorRuntimeState {
                     source_route_slot,
                     &event,
                     Some(&self.list_state),
-                    &staged_state.root_state,
-                    &staged_state.private_bytes,
-                    &staged_state.fixed_byte_banks,
+                    staged_state,
                     host_file_root,
                 )
                 .map_err(|error| -> Box<dyn std::error::Error> {
@@ -5717,13 +5715,6 @@ fn plan_executor_list_row_report_fields(
     row: &PlanListRowState,
 ) -> RuntimeResult<BTreeMap<String, JsonValue>> {
     Ok(plan_list_row_state_report_fields(row))
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PlanRowEvalKey {
-    list_id: usize,
-    row_key: u64,
-    field_id: usize,
 }
 
 fn materialize_plan_list_projections(
@@ -9387,11 +9378,13 @@ fn execute_root_scalar_update_branch(
     source_route_slot: &boon_plan::SourceRoute,
     event: &LiveSourceEvent,
     list_state: Option<&BTreeMap<usize, Vec<PlanListRowState>>>,
-    root_state: &serde_json::Map<String, JsonValue>,
-    root_bytes_state: &RootBytesState,
-    root_fixed_bytes_banks: &RootFixedBytesBanks,
+    root_state: &PlanExecutorRootState,
     host_file_root: Option<&Path>,
 ) -> RuntimeResult<Option<RootExecutedUpdate>> {
+    let root_environment = root_state;
+    let root_bytes_state = &root_environment.private_bytes;
+    let root_fixed_bytes_banks = &root_environment.fixed_byte_banks;
+    let root_state = &root_environment.root_state;
     let source_guard = match &op.kind {
         PlanOpKind::UpdateBranch { source_guard, .. } => source_guard,
         _ => {
@@ -9426,12 +9419,21 @@ fn execute_root_scalar_update_branch(
             host_effect,
         ) = match bytes_dispatch {
             RootBytesUpdateDispatchKind::Read => {
-                let bytes_environment = RootBytesRuntimeEnvironment::new(
-                    root_bytes_state,
-                    root_fixed_bytes_banks,
+                let evaluation = evaluate_root_bytes_read_update(
+                    plan,
+                    op,
+                    root_state,
+                    root_environment,
                     host_file_root,
-                );
-                let evaluation = bytes_environment.evaluate_read(plan, op, root_state)?;
+                )?;
+                if !evaluation.supported {
+                    return Err(evaluation
+                        .unsupported_reason
+                        .unwrap_or_else(|| {
+                            "root BYTES read evaluator did not support branch".to_owned()
+                        })
+                        .into());
+                }
                 let value = evaluation.value.ok_or_else(|| {
                     format!(
                         "root BYTES read evaluator reported supported branch {} without a value",
@@ -9457,12 +9459,22 @@ fn execute_root_scalar_update_branch(
                 )
             }
             RootBytesUpdateDispatchKind::Write => {
-                let bytes_environment = RootBytesRuntimeEnvironment::new(
-                    root_bytes_state,
-                    root_fixed_bytes_banks,
+                let evaluation = evaluate_root_bytes_write_update(
+                    plan,
+                    op,
+                    root_state,
+                    root_environment,
                     host_file_root,
-                );
-                let evaluation = bytes_environment.evaluate_write(plan, op, root_state)?;
+                )?;
+                if !evaluation.supported {
+                    return Err(evaluation
+                        .unsupported_reason
+                        .unwrap_or_else(|| {
+                            "root BYTES write evaluator did not support branch".to_owned()
+                        })
+                        .into());
+                }
+                record_runtime_bytes_executor_copy_cost(&evaluation.executor_report);
                 let value = evaluation.value.ok_or_else(|| {
                     format!(
                         "root BYTES write evaluator reported supported branch {} without a value",
@@ -10047,1244 +10059,8 @@ fn plan_initial_list_state(
         }
         lists.insert(slot.list_id.0, rows);
     }
-    refresh_plan_startup_list_row_fields_for_all_lists_with(
-        plan,
-        &mut lists,
-        eval_plan_row_expression,
-    )?;
+    refresh_plan_startup_list_row_fields_for_all_lists(plan, &mut lists)?;
     Ok(lists)
-}
-
-fn eval_plan_row_expression(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<JsonValue> {
-    eval_plan_row_expression_with_stack(plan, list_state, row, expression, &[])
-}
-
-fn eval_plan_row_expression_with_stack(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<JsonValue> {
-    match expression {
-        PlanRowExpression::Field { input } => eval_plan_row_field_ref(plan, row, input, stack),
-        PlanRowExpression::Constant { constant_id } => {
-            let constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == *constant_id)
-                .ok_or_else(|| format!("row expression constant {} is missing", constant_id.0))?;
-            plan_executor_constant_json_value(constant)
-        }
-        PlanRowExpression::TextTrim { input } => Ok(JsonValue::String(
-            eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?
-                .trim()
-                .to_owned(),
-        )),
-        PlanRowExpression::TextIsEmpty { input } => Ok(JsonValue::Bool(
-            eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?.is_empty(),
-        )),
-        PlanRowExpression::TextStartsWith { input, prefix } => Ok(JsonValue::Bool(
-            eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?.starts_with(
-                &eval_plan_row_text_with_stack(plan, list_state, row, prefix, stack)?,
-            ),
-        )),
-        PlanRowExpression::TextLength { input } => Ok(json!(
-            eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?
-                .chars()
-                .count() as i64
-        )),
-        PlanRowExpression::TextToNumber { input } => {
-            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
-            Ok(text
-                .parse::<i64>()
-                .map(JsonValue::from)
-                .unwrap_or_else(|_| JsonValue::String("NaN".to_owned())))
-        }
-        PlanRowExpression::TextSubstring {
-            input,
-            start,
-            length,
-        } => {
-            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
-            let start = eval_plan_row_number_with_stack(plan, list_state, row, start, stack)?.max(0)
-                as usize;
-            let length = eval_plan_row_number_with_stack(plan, list_state, row, length, stack)?
-                .max(0) as usize;
-            Ok(JsonValue::String(
-                text.chars().skip(start).take(length).collect(),
-            ))
-        }
-        PlanRowExpression::TextToBytes { input, encoding } => {
-            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
-            let encoding = match encoding.as_deref() {
-                Some(encoding) => {
-                    eval_plan_row_text_with_stack(plan, list_state, row, encoding, stack)?
-                }
-                None => return Err("row Text/to_bytes requires explicit encoding".into()),
-            };
-            match row_text_to_bytes(&text, &encoding) {
-                Ok(bytes) => Ok(row_private_bytes_json(&bytes)),
-                Err(_) => Ok(row_error_json("parse_error")),
-            }
-        }
-        PlanRowExpression::BytesToText { input, encoding } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let encoding = match encoding.as_deref() {
-                Some(encoding) => {
-                    eval_plan_row_text_with_stack(plan, list_state, row, encoding, stack)?
-                }
-                None => return Err("row Bytes/to_text requires explicit encoding".into()),
-            };
-            runtime_bytes_to_text(&bytes, &encoding)
-                .map(JsonValue::String)
-                .map_err(|error| format!("row Bytes/to_text {error}").into())
-        }
-        PlanRowExpression::BytesToHex { input } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            Ok(JsonValue::String(bytes_encode_hex(&bytes)))
-        }
-        PlanRowExpression::BytesToBase64 { input } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            Ok(JsonValue::String(bytes_encode_base64(&bytes)))
-        }
-        PlanRowExpression::BytesFromHex { input } => {
-            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
-            let bytes = bytes_decode_hex(&text).map_err(|error| match error {
-                BoonValue::Error(code) => format!("row Bytes/from_hex failed: {code}"),
-                _ => "row Bytes/from_hex failed".to_owned(),
-            })?;
-            Ok(row_private_bytes_json(&bytes))
-        }
-        PlanRowExpression::BytesFromBase64 { input } => {
-            let text = eval_plan_row_text_with_stack(plan, list_state, row, input, stack)?;
-            let bytes = bytes_decode_base64(&text).map_err(|error| match error {
-                BoonValue::Error(code) => format!("row Bytes/from_base64 failed: {code}"),
-                _ => "row Bytes/from_base64 failed".to_owned(),
-            })?;
-            Ok(row_private_bytes_json(&bytes))
-        }
-        PlanRowExpression::BytesIsEmpty { input } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            Ok(JsonValue::Bool(bytes.is_empty()))
-        }
-        PlanRowExpression::BytesLength { input } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            i64::try_from(bytes.len())
-                .map(JsonValue::from)
-                .map_err(|_| "row Bytes/length exceeds Boon NUMBER".into())
-        }
-        PlanRowExpression::BytesGet { input, index } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let index = eval_plan_row_number_with_stack(plan, list_state, row, index, stack)?.max(0)
-                as usize;
-            bytes
-                .get(index)
-                .copied()
-                .map(JsonValue::from)
-                .ok_or_else(|| format!("row Bytes/get index {index} is out of bounds").into())
-        }
-        PlanRowExpression::BytesSlice {
-            input,
-            offset,
-            byte_count,
-        } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let slice = bytes
-                .get(offset..offset.saturating_add(byte_count))
-                .ok_or_else(|| "row Bytes/slice out of bounds".to_owned())?
-                .to_vec();
-            Ok(row_private_bytes_json(&slice))
-        }
-        PlanRowExpression::BytesTake { input, byte_count } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let slice = bytes
-                .get(0..byte_count)
-                .ok_or_else(|| "row Bytes/take out of bounds".to_owned())?
-                .to_vec();
-            Ok(row_private_bytes_json(&slice))
-        }
-        PlanRowExpression::BytesDrop { input, byte_count } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            if byte_count > bytes.len() {
-                return Err("row Bytes/drop out of bounds".into());
-            }
-            Ok(row_private_bytes_json(&bytes[byte_count..]))
-        }
-        PlanRowExpression::BytesZeros { byte_count } => {
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let mut output = Vec::new();
-            output
-                .try_reserve_exact(byte_count)
-                .map_err(|_| format!("row Bytes/zeros could not allocate {byte_count} bytes"))?;
-            output.resize(byte_count, 0);
-            Ok(row_private_bytes_json(&output))
-        }
-        PlanRowExpression::BytesReadUnsigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-        } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
-            let endian = row_bytes_endian(&endian_text)?;
-            match bytes_read_unsigned(&bytes, offset, byte_count, endian) {
-                Ok(value) if value <= i64::MAX as u64 => Ok(json!(value as i64)),
-                Ok(_) => Err("row Bytes/read_unsigned overflows Boon NUMBER".into()),
-                Err(BoonValue::Error(code)) => {
-                    Err(format!("row Bytes/read_unsigned failed: {code}").into())
-                }
-                Err(error) => Err(format!("row Bytes/read_unsigned failed: {error:?}").into()),
-            }
-        }
-        PlanRowExpression::BytesReadSigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-        } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
-            let endian = row_bytes_endian(&endian_text)?;
-            match bytes_read_signed(&bytes, offset, byte_count, endian) {
-                Ok(value) => Ok(json!(value)),
-                Err(BoonValue::Error(code)) => {
-                    Err(format!("row Bytes/read_signed failed: {code}").into())
-                }
-                Err(error) => Err(format!("row Bytes/read_signed failed: {error:?}").into()),
-            }
-        }
-        PlanRowExpression::BytesSet {
-            input,
-            index,
-            value,
-        } => {
-            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let index = eval_plan_row_number_with_stack(plan, list_state, row, index, stack)?.max(0)
-                as usize;
-            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
-            let value = u8::try_from(value)
-                .map_err(|_| format!("row Bytes/set value {value} is outside BYTE range"))?;
-            let slot = bytes
-                .get_mut(index)
-                .ok_or_else(|| format!("row Bytes/set index {index} is out of bounds"))?;
-            *slot = value;
-            Ok(row_private_bytes_json(&bytes))
-        }
-        PlanRowExpression::BytesWriteUnsigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-            value,
-        } => {
-            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
-            let endian = row_bytes_endian(&endian_text)?;
-            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
-            bytes_write_unsigned(&mut bytes, offset, byte_count, endian, value).map_err(
-                |error| match error {
-                    BoonValue::Error(code) => {
-                        format!("row Bytes/write_unsigned failed: {code}")
-                    }
-                    error => format!("row Bytes/write_unsigned failed: {error:?}"),
-                },
-            )?;
-            Ok(row_private_bytes_json(&bytes))
-        }
-        PlanRowExpression::BytesWriteSigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-            value,
-        } => {
-            let mut bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let offset = eval_plan_row_number_with_stack(plan, list_state, row, offset, stack)?
-                .max(0) as usize;
-            let byte_count =
-                eval_plan_row_number_with_stack(plan, list_state, row, byte_count, stack)?.max(0)
-                    as usize;
-            let endian_text = eval_plan_row_text_with_stack(plan, list_state, row, endian, stack)?;
-            let endian = row_bytes_endian(&endian_text)?;
-            let value = eval_plan_row_number_with_stack(plan, list_state, row, value, stack)?;
-            bytes_write_signed(&mut bytes, offset, byte_count, endian, value).map_err(|error| {
-                match error {
-                    BoonValue::Error(code) => {
-                        format!("row Bytes/write_signed failed: {code}")
-                    }
-                    error => format!("row Bytes/write_signed failed: {error:?}"),
-                }
-            })?;
-            Ok(row_private_bytes_json(&bytes))
-        }
-        PlanRowExpression::BytesFind { input, needle } => {
-            let haystack = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let needle = eval_plan_row_bytes_with_stack(plan, list_state, row, needle, stack)?;
-            Ok(bytes_find(&haystack, &needle)
-                .map(|index| json!(index as i64))
-                .unwrap_or_else(|| JsonValue::String("NaN".to_owned())))
-        }
-        PlanRowExpression::BytesStartsWith { input, prefix } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let prefix = eval_plan_row_bytes_with_stack(plan, list_state, row, prefix, stack)?;
-            Ok(JsonValue::Bool(bytes.starts_with(&prefix)))
-        }
-        PlanRowExpression::BytesEndsWith { input, suffix } => {
-            let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
-            let suffix = eval_plan_row_bytes_with_stack(plan, list_state, row, suffix, stack)?;
-            Ok(JsonValue::Bool(bytes.ends_with(&suffix)))
-        }
-        PlanRowExpression::BytesConcat { left, right } => {
-            let mut left = eval_plan_row_bytes_with_stack(plan, list_state, row, left, stack)?;
-            let right = eval_plan_row_bytes_with_stack(plan, list_state, row, right, stack)?;
-            left.extend_from_slice(&right);
-            Ok(row_private_bytes_json(&left))
-        }
-        PlanRowExpression::BytesEqual { left, right } => {
-            let left = eval_plan_row_bytes_with_stack(plan, list_state, row, left, stack)?;
-            let right = eval_plan_row_bytes_with_stack(plan, list_state, row, right, stack)?;
-            Ok(JsonValue::Bool(left == right))
-        }
-        PlanRowExpression::NumberInfix { op, left, right } => {
-            let left_value =
-                eval_plan_row_expression_with_stack(plan, list_state, row, left, stack)?;
-            let right_value =
-                eval_plan_row_expression_with_stack(plan, list_state, row, right, stack)?;
-            if row_value_is_cycle_error(&left_value) || row_value_is_cycle_error(&right_value) {
-                return Ok(row_cycle_error_json());
-            }
-            if row_value_is_nan(&left_value) || row_value_is_nan(&right_value) {
-                return Ok(JsonValue::String("NaN".to_owned()));
-            }
-            if op == "+"
-                && (json_number_value(&left_value).is_none()
-                    || json_number_value(&right_value).is_none())
-            {
-                return Ok(JsonValue::String(format!(
-                    "{}{}",
-                    row_value_to_text(&left_value)?,
-                    row_value_to_text(&right_value)?
-                )));
-            }
-            let left = row_value_to_number(&left_value)?;
-            let right = row_value_to_number(&right_value)?;
-            let value = match op.as_str() {
-                "+" => left + right,
-                "-" => left - right,
-                "*" => left * right,
-                "/" => {
-                    if right == 0 {
-                        return Ok(row_error_json("div_by_zero"));
-                    }
-                    left / right
-                }
-                "%" => {
-                    if right == 0 {
-                        return Ok(row_error_json("mod_by_zero"));
-                    }
-                    left % right
-                }
-                _ => return Err(format!("unsupported row numeric op `{op}`").into()),
-            };
-            Ok(json!(value))
-        }
-        PlanRowExpression::TextConcat { parts } => {
-            let mut text = String::new();
-            for part in parts {
-                text.push_str(&eval_plan_row_text_with_stack(
-                    plan, list_state, row, part, stack,
-                )?);
-            }
-            Ok(JsonValue::String(text))
-        }
-        PlanRowExpression::ListGetField {
-            list_id,
-            index,
-            field,
-        } => {
-            let index = eval_plan_row_number_with_stack(plan, list_state, row, index, stack)?;
-            let index = usize::try_from(index)
-                .map_err(|_| format!("row expression List/get index {index} is negative"))?;
-            let rows = list_state
-                .get(&list_id.0)
-                .ok_or_else(|| format!("row expression list {} is not materialized", list_id.0))?;
-            let row = rows
-                .get(index)
-                .ok_or_else(|| format!("row expression List/get index {index} is out of range"))?;
-            eval_plan_row_lookup_field(plan, list_state, *list_id, row, *field, stack)
-        }
-        PlanRowExpression::ListRef { list_id } => eval_plan_row_list_ref(list_state, *list_id),
-        PlanRowExpression::ListFindValue {
-            list_id,
-            field,
-            value,
-            target,
-            fallback,
-        } => {
-            let value = eval_plan_row_expression_with_stack(plan, list_state, row, value, stack)?;
-            let field_name = plan_row_field_local_name(plan, *field);
-            let rows = list_state
-                .get(&list_id.0)
-                .ok_or_else(|| format!("row expression list {} is not materialized", list_id.0))?;
-            if let Some(found) = rows
-                .iter()
-                .find(|candidate| row_json_values_equal(candidate.fields.get(&field_name), &value))
-            {
-                return eval_plan_row_lookup_field(
-                    plan, list_state, *list_id, found, *target, stack,
-                );
-            }
-            match fallback {
-                Some(fallback) => {
-                    eval_plan_row_expression_with_stack(plan, list_state, row, fallback, stack)
-                }
-                None => Ok(JsonValue::String("NaN".to_owned())),
-            }
-        }
-        PlanRowExpression::ListRange { from, to } => {
-            let from = eval_plan_row_number_with_stack(plan, list_state, row, from, stack)?;
-            let to = eval_plan_row_number_with_stack(plan, list_state, row, to, stack)?;
-            let values = if from <= to {
-                (from..=to).map(JsonValue::from).collect()
-            } else {
-                Vec::new()
-            };
-            Ok(JsonValue::Array(values))
-        }
-        PlanRowExpression::ListMap {
-            input,
-            binding,
-            value,
-        } => {
-            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
-            let mut output = Vec::with_capacity(items.len());
-            let binding_key = row_map_binding_key(binding);
-            for item in items {
-                let mut bound_row = row.clone();
-                bound_row.fields.insert(binding_key.clone(), item);
-                output.push(eval_plan_row_expression_with_stack(
-                    plan, list_state, &bound_row, value, stack,
-                )?);
-            }
-            Ok(JsonValue::Array(output))
-        }
-        PlanRowExpression::ListMapItem { binding } => {
-            let binding_key = row_map_binding_key(binding);
-            row.fields.get(&binding_key).cloned().ok_or_else(|| {
-                format!("row expression List/map binding `{binding}` is missing").into()
-            })
-        }
-        PlanRowExpression::ListSum { input } => {
-            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
-            let mut total = 0i64;
-            for item in items {
-                if let Some(value) = json_number_value(&item) {
-                    total += value;
-                }
-            }
-            Ok(JsonValue::from(total))
-        }
-        PlanRowExpression::Object { fields } => {
-            let mut object = serde_json::Map::with_capacity(fields.len());
-            for field in fields {
-                object.insert(
-                    field.name.clone(),
-                    eval_plan_row_expression_with_stack(
-                        plan,
-                        list_state,
-                        row,
-                        &field.value,
-                        stack,
-                    )?,
-                );
-            }
-            Ok(JsonValue::Object(object))
-        }
-        PlanRowExpression::ObjectField { object, field } => {
-            let object = eval_plan_row_expression_with_stack(plan, list_state, row, object, stack)?;
-            object
-                .as_object()
-                .and_then(|object| object.get(field))
-                .cloned()
-                .ok_or_else(|| format!("row expression object field `{field}` is missing").into())
-        }
-        PlanRowExpression::BuiltinCall {
-            function,
-            input,
-            args,
-        } => eval_plan_row_builtin_call(
-            plan,
-            list_state,
-            row,
-            function,
-            input.as_deref(),
-            args,
-            stack,
-        ),
-        PlanRowExpression::Select { input, arms } => {
-            let input_value =
-                eval_plan_row_expression_with_stack(plan, list_state, row, input, stack)?;
-            for arm in arms {
-                if row_select_pattern_matches(&arm.pattern, &input_value) {
-                    return eval_plan_row_expression_with_stack(
-                        plan, list_state, row, &arm.value, stack,
-                    );
-                }
-            }
-            Err(format!("row expression select has no matching arm for `{input_value}`").into())
-        }
-    }
-}
-
-fn row_value_is_nan(value: &JsonValue) -> bool {
-    value.as_str() == Some("NaN")
-}
-
-fn row_value_is_cycle_error(value: &JsonValue) -> bool {
-    value.as_str() == Some("cycle_error")
-}
-
-fn row_cycle_error_json() -> JsonValue {
-    JsonValue::String("cycle_error".to_owned())
-}
-
-fn row_error_json(code: &str) -> JsonValue {
-    json!({
-        "$boon_type": "ERROR",
-        "code": code,
-    })
-}
-
-fn row_value_to_number(value: &JsonValue) -> RuntimeResult<i64> {
-    if row_value_is_nan(value) {
-        return Ok(0);
-    }
-    if let Some(value) = value.as_i64() {
-        return Ok(value);
-    }
-    if let Some(text) = value.as_str() {
-        return text
-            .parse::<i64>()
-            .map_err(|_| format!("row expression value `{text}` is not a number").into());
-    }
-    Err(format!("row expression value `{value}` is not a number").into())
-}
-
-fn row_value_to_text(value: &JsonValue) -> RuntimeResult<String> {
-    if let Some(code) = row_error_code(value) {
-        return Ok(code.to_owned());
-    }
-    if let Some(text) = value.as_str() {
-        return Ok(text.to_owned());
-    }
-    if let Some(number) = value.as_i64() {
-        return Ok(number.to_string());
-    }
-    if let Some(bool_value) = value.as_bool() {
-        return Ok(if bool_value { "True" } else { "False" }.to_owned());
-    }
-    Err(format!("row expression value `{value}` is not text-convertible").into())
-}
-
-fn row_error_code(value: &JsonValue) -> Option<&str> {
-    value
-        .get("$boon_type")
-        .and_then(JsonValue::as_str)
-        .filter(|kind| *kind == "ERROR")
-        .and_then(|_| value.get("code"))
-        .and_then(JsonValue::as_str)
-}
-
-fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -> String {
-    local_field_name(&plan_semantic_field_label(plan, field_id.0))
-}
-
-fn plan_row_expression_row_input_missing(
-    plan: &MachinePlan,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> bool {
-    match expression {
-        PlanRowExpression::Field { input } => {
-            let input_name = match input {
-                ValueRef::Field(field_id) => {
-                    local_field_name(&plan_semantic_field_label(plan, field_id.0))
-                }
-                ValueRef::State(state_id) => local_field_name(&plan_state_label(plan, state_id.0)),
-                _ => return false,
-            };
-            !row.fields.contains_key(&input_name)
-        }
-        PlanRowExpression::TextTrim { input }
-        | PlanRowExpression::TextIsEmpty { input }
-        | PlanRowExpression::TextLength { input }
-        | PlanRowExpression::TextToNumber { input }
-        | PlanRowExpression::TextToBytes { input, .. }
-        | PlanRowExpression::BytesToText { input, .. }
-        | PlanRowExpression::BytesToHex { input }
-        | PlanRowExpression::BytesToBase64 { input }
-        | PlanRowExpression::BytesFromHex { input }
-        | PlanRowExpression::BytesFromBase64 { input }
-        | PlanRowExpression::BytesIsEmpty { input }
-        | PlanRowExpression::BytesLength { input }
-        | PlanRowExpression::BytesZeros { byte_count: input }
-        | PlanRowExpression::BytesTake { input, .. }
-        | PlanRowExpression::BytesDrop { input, .. }
-        | PlanRowExpression::ListSum { input }
-        | PlanRowExpression::ObjectField { object: input, .. } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-        }
-        PlanRowExpression::TextStartsWith { input, prefix } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, prefix)
-        }
-        PlanRowExpression::TextSubstring {
-            input,
-            start,
-            length,
-        }
-        | PlanRowExpression::BytesSlice {
-            input,
-            offset: start,
-            byte_count: length,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, start)
-                || plan_row_expression_row_input_missing(plan, row, length)
-        }
-        PlanRowExpression::BytesGet { input, index }
-        | PlanRowExpression::BytesFind {
-            input,
-            needle: index,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, index)
-        }
-        PlanRowExpression::BytesStartsWith { input, prefix }
-        | PlanRowExpression::BytesEndsWith {
-            input,
-            suffix: prefix,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, prefix)
-        }
-        PlanRowExpression::BytesSet {
-            input,
-            index,
-            value,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, index)
-                || plan_row_expression_row_input_missing(plan, row, value)
-        }
-        PlanRowExpression::BytesReadUnsigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-        }
-        | PlanRowExpression::BytesReadSigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, offset)
-                || plan_row_expression_row_input_missing(plan, row, byte_count)
-                || plan_row_expression_row_input_missing(plan, row, endian)
-        }
-        PlanRowExpression::BytesWriteUnsigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-            value,
-        }
-        | PlanRowExpression::BytesWriteSigned {
-            input,
-            offset,
-            byte_count,
-            endian,
-            value,
-        } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, offset)
-                || plan_row_expression_row_input_missing(plan, row, byte_count)
-                || plan_row_expression_row_input_missing(plan, row, endian)
-                || plan_row_expression_row_input_missing(plan, row, value)
-        }
-        PlanRowExpression::BytesConcat { left, right }
-        | PlanRowExpression::BytesEqual { left, right }
-        | PlanRowExpression::NumberInfix { left, right, .. } => {
-            plan_row_expression_row_input_missing(plan, row, left)
-                || plan_row_expression_row_input_missing(plan, row, right)
-        }
-        PlanRowExpression::TextConcat { parts } => parts
-            .iter()
-            .any(|part| plan_row_expression_row_input_missing(plan, row, part)),
-        PlanRowExpression::Object { fields } => fields
-            .iter()
-            .any(|field| plan_row_expression_row_input_missing(plan, row, &field.value)),
-        PlanRowExpression::ListGetField { index, .. } => {
-            plan_row_expression_row_input_missing(plan, row, index)
-        }
-        PlanRowExpression::ListFindValue {
-            value, fallback, ..
-        } => {
-            plan_row_expression_row_input_missing(plan, row, value)
-                || fallback.as_deref().is_some_and(|fallback| {
-                    plan_row_expression_row_input_missing(plan, row, fallback)
-                })
-        }
-        PlanRowExpression::ListRange { from, to } => {
-            plan_row_expression_row_input_missing(plan, row, from)
-                || plan_row_expression_row_input_missing(plan, row, to)
-        }
-        PlanRowExpression::ListMap { input, value, .. } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || plan_row_expression_row_input_missing(plan, row, value)
-        }
-        PlanRowExpression::BuiltinCall { input, args, .. } => {
-            input
-                .as_deref()
-                .is_some_and(|input| plan_row_expression_row_input_missing(plan, row, input))
-                || args
-                    .iter()
-                    .any(|arg| plan_row_expression_row_input_missing(plan, row, &arg.value))
-        }
-        PlanRowExpression::Select { input, arms } => {
-            plan_row_expression_row_input_missing(plan, row, input)
-                || arms
-                    .iter()
-                    .any(|arm| plan_row_expression_row_input_missing(plan, row, &arm.value))
-        }
-        PlanRowExpression::Constant { .. }
-        | PlanRowExpression::ListRef { .. }
-        | PlanRowExpression::ListMapItem { .. } => false,
-    }
-}
-
-fn eval_plan_row_lookup_field(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    list_id: boon_plan::ListId,
-    row: &PlanListRowState,
-    field: boon_plan::FieldId,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<JsonValue> {
-    let target_name = plan_row_field_local_name(plan, field);
-    let key = PlanRowEvalKey {
-        list_id: list_id.0,
-        row_key: row.key,
-        field_id: field.0,
-    };
-    if let Some((expression, demand_current)) = plan_indexed_row_expression_for_field(plan, field) {
-        if !demand_current && let Some(value) = row.fields.get(&target_name).cloned() {
-            return Ok(value);
-        }
-        if stack.contains(&key) {
-            return Ok(row_cycle_error_json());
-        }
-        let mut nested_stack = stack.to_vec();
-        nested_stack.push(key);
-        return eval_plan_row_expression_with_stack(
-            plan,
-            list_state,
-            row,
-            expression,
-            &nested_stack,
-        );
-    }
-    row.fields.get(&target_name).cloned().ok_or_else(|| {
-        format!(
-            "row expression lookup target `{target_name}` missing from list {}",
-            list_id.0
-        )
-        .into()
-    })
-}
-
-fn plan_indexed_row_expression_for_field(
-    plan: &MachinePlan,
-    field: boon_plan::FieldId,
-) -> Option<(&PlanRowExpression, bool)> {
-    plan.regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-        .find_map(|op| {
-            if !op.indexed || op.output != Some(ValueRef::Field(field)) {
-                return None;
-            }
-            let PlanOpKind::DerivedValue {
-                derived_kind: boon_plan::PlanDerivedKind::Pure,
-                expression: Some(PlanDerivedExpression::RowExpression { expression }),
-                ..
-            } = &op.kind
-            else {
-                return None;
-            };
-            Some((expression, plan_indexed_derived_op_is_demand_current(op)))
-        })
-}
-
-fn eval_plan_row_list_ref(
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    list_id: boon_plan::ListId,
-) -> RuntimeResult<JsonValue> {
-    let rows = list_state
-        .get(&list_id.0)
-        .ok_or_else(|| format!("row expression list {} is not materialized", list_id.0))?;
-    Ok(JsonValue::Array(
-        rows.iter()
-            .map(|row| {
-                JsonValue::Object(
-                    row.fields
-                        .iter()
-                        .map(|(field, value)| (field.clone(), value.clone()))
-                        .collect(),
-                )
-            })
-            .collect(),
-    ))
-}
-
-fn eval_plan_row_list(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<Vec<JsonValue>> {
-    eval_plan_row_list_with_stack(plan, list_state, row, expression, &[])
-}
-
-fn eval_plan_row_list_with_stack(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<Vec<JsonValue>> {
-    let value = eval_plan_row_expression_with_stack(plan, list_state, row, expression, stack)?;
-    match value {
-        JsonValue::Array(values) => Ok(values),
-        other => Err(format!("row expression value `{other}` is not a list").into()),
-    }
-}
-
-fn row_map_binding_key(binding: &str) -> String {
-    format!("$boon$row_map_binding${binding}")
-}
-
-fn row_json_values_equal(left: Option<&JsonValue>, right: &JsonValue) -> bool {
-    let Some(left) = left else {
-        return false;
-    };
-    left == right || json_text_value(left).as_deref() == json_text_value(right).as_deref()
-}
-
-fn json_text_value(value: &JsonValue) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_owned());
-    }
-    if let Some(number) = value.as_i64() {
-        return Some(number.to_string());
-    }
-    if let Some(bool_value) = value.as_bool() {
-        return Some(if bool_value { "True" } else { "False" }.to_owned());
-    }
-    None
-}
-
-fn json_number_value(value: &JsonValue) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
-}
-
-fn eval_plan_row_builtin_call(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    function: &str,
-    input: Option<&PlanRowExpression>,
-    args: &[boon_plan::PlanRowCallArg],
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<JsonValue> {
-    match function {
-        "Text/empty" => Ok(JsonValue::String(String::new())),
-        "Error/new" => {
-            let code = eval_plan_row_text_arg(plan, list_state, row, args, "code", stack)
-                .unwrap_or_else(|_| "error".to_owned());
-            Ok(json!({
-                "$boon_type": "ERROR",
-                "code": code,
-            }))
-        }
-        "Error/text" => {
-            let value = match input {
-                Some(input) => {
-                    eval_plan_row_expression_with_stack(plan, list_state, row, input, stack)?
-                }
-                None => {
-                    eval_plan_row_named_or_first_arg(plan, list_state, row, args, "value", stack)?
-                }
-            };
-            if row_value_is_cycle_error(&value) {
-                return Ok(row_cycle_error_json());
-            }
-            Ok(JsonValue::String(
-                value
-                    .get("$boon_type")
-                    .and_then(JsonValue::as_str)
-                    .filter(|kind| *kind == "ERROR")
-                    .and_then(|_| value.get("code"))
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            ))
-        }
-        _ => Err(format!("unsupported row builtin `{function}`").into()),
-    }
-}
-
-fn row_text_to_bytes(text: &str, encoding: &str) -> RuntimeResult<Vec<u8>> {
-    match encoding.to_ascii_lowercase().as_str() {
-        "utf8" => Ok(text.as_bytes().to_vec()),
-        "ascii" if text.is_ascii() => Ok(text.as_bytes().to_vec()),
-        "ascii" => Err("row Text/to_bytes input is not ASCII for Ascii encoding".into()),
-        _ => Err(format!("row Text/to_bytes unsupported encoding `{encoding}`").into()),
-    }
-}
-
-fn row_bytes_endian(text: &str) -> RuntimeResult<BytesEndian> {
-    match text {
-        "Little" => Ok(BytesEndian::Little),
-        "Big" => Ok(BytesEndian::Big),
-        _ => Err(format!("row BYTES endian `{text}` is unsupported").into()),
-    }
-}
-
-fn row_private_bytes_json(bytes: &[u8]) -> JsonValue {
-    json!({
-        "$boon_type": "BYTES",
-        "storage": "row_inline",
-        "byte_len": bytes.len(),
-        "inline_bytes": bytes,
-    })
-}
-
-fn eval_plan_row_text_input_or_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    input: Option<&PlanRowExpression>,
-    args: &[boon_plan::PlanRowCallArg],
-    name: &str,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<String> {
-    match input {
-        Some(input) => eval_plan_row_text_with_stack(plan, list_state, row, input, stack),
-        None => eval_plan_row_text_arg(plan, list_state, row, args, name, stack),
-    }
-}
-
-fn eval_plan_row_text_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    args: &[boon_plan::PlanRowCallArg],
-    name: &str,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<String> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some(name))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
-        .ok_or_else(|| format!("row builtin missing text arg `{name}`"))?;
-    eval_plan_row_text_with_stack(plan, list_state, row, &arg.value, stack)
-}
-
-fn eval_plan_row_number_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    args: &[boon_plan::PlanRowCallArg],
-    name: &str,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<i64> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some(name))
-        .ok_or_else(|| format!("row builtin missing number arg `{name}`"))?;
-    eval_plan_row_number_with_stack(plan, list_state, row, &arg.value, stack)
-}
-
-fn eval_plan_row_named_or_first_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    args: &[boon_plan::PlanRowCallArg],
-    name: &str,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<JsonValue> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some(name))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
-        .ok_or_else(|| format!("row builtin missing arg `{name}`"))?;
-    eval_plan_row_expression_with_stack(plan, list_state, row, &arg.value, stack)
-}
-
-fn eval_plan_row_bytes_input_or_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    input: Option<&PlanRowExpression>,
-    args: &[boon_plan::PlanRowCallArg],
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<Vec<u8>> {
-    match input {
-        Some(input) => eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack),
-        None => eval_plan_row_bytes_arg(plan, list_state, row, args, "input", stack),
-    }
-}
-
-fn eval_plan_row_bytes_arg(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    args: &[boon_plan::PlanRowCallArg],
-    name: &str,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<Vec<u8>> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some(name))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))
-        .ok_or_else(|| format!("row builtin missing bytes arg `{name}`"))?;
-    eval_plan_row_bytes_with_stack(plan, list_state, row, &arg.value, stack)
-}
-
-fn eval_plan_row_bytes(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<Vec<u8>> {
-    eval_plan_row_bytes_with_stack(plan, list_state, row, expression, &[])
-}
-
-fn eval_plan_row_bytes_with_stack(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<Vec<u8>> {
-    match expression {
-        PlanRowExpression::Constant { constant_id } => {
-            let constant = plan
-                .constants
-                .iter()
-                .find(|constant| constant.id == *constant_id)
-                .ok_or_else(|| format!("row bytes constant {} is missing", constant_id.0))?;
-            let PlanConstantValue::Bytes {
-                inline_bytes: Some(bytes),
-                ..
-            } = &constant.value
-            else {
-                return Err("row expression constant is not inline BYTES".into());
-            };
-            Ok(bytes.clone())
-        }
-        _ => {
-            if let Some(bytes) = eval_plan_row_private_bytes_ref(plan, row, expression)? {
-                return Ok(bytes.inline_bytes().to_vec());
-            }
-            let value =
-                eval_plan_row_expression_with_stack(plan, list_state, row, expression, stack)?;
-            value
-                .get("inline_bytes")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| "row expression value is not private BYTES".to_owned())?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|value| u8::try_from(value).ok())
-                        .ok_or_else(|| "row private BYTES payload is invalid".into())
-                })
-                .collect()
-        }
-    }
-}
-
-fn eval_plan_row_private_bytes_ref(
-    plan: &MachinePlan,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<Option<PlanExecutorBytes>> {
-    let PlanRowExpression::Field { input } = expression else {
-        return Ok(None);
-    };
-    let field_name = match input {
-        ValueRef::Field(field_id) => local_field_name(&plan_semantic_field_label(plan, field_id.0)),
-        ValueRef::State(state_id) => local_field_name(&plan_state_label(plan, state_id.0)),
-        _ => return Ok(None),
-    };
-    let Some(bytes) = row.private_bytes.get(&field_name) else {
-        return Ok(None);
-    };
-    let public_value = row.fields.get(&field_name).ok_or_else(|| {
-        format!("row BYTES field `{field_name}` has private bytes but no public summary")
-    })?;
-    if &bytes.report_json() != public_value && &bytes.artifact_json() != public_value {
-        return Err(format!(
-            "row BYTES field `{field_name}` public summary does not match private bytes"
-        )
-        .into());
-    }
-    if let Some(fixed_bytes) = row.fixed_bytes_banks.get(&field_name)
-        && root_fixed_bytes_report_json(fixed_bytes) != *public_value
-    {
-        return Err(format!(
-            "row BYTES field `{field_name}` public summary does not match fixed byte bank"
-        )
-        .into());
-    }
-    Ok(Some(bytes.clone()))
-}
-
-fn row_select_pattern_matches(pattern: &PlanRowSelectPattern, value: &JsonValue) -> bool {
-    match pattern {
-        PlanRowSelectPattern::Bool { value: expected } => value.as_bool() == Some(*expected),
-        PlanRowSelectPattern::Text { value: expected } => value.as_str() == Some(expected.as_str()),
-        PlanRowSelectPattern::Number { value: expected } => value.as_i64() == Some(*expected),
-        PlanRowSelectPattern::NaN => value.as_str() == Some("NaN"),
-        PlanRowSelectPattern::Wildcard => true,
-    }
-}
-
-fn eval_plan_row_field_ref(
-    plan: &MachinePlan,
-    row: &PlanListRowState,
-    input: &ValueRef,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<JsonValue> {
-    let field_name = match input {
-        ValueRef::Field(field_id) => local_field_name(&plan_semantic_field_label(plan, field_id.0)),
-        ValueRef::State(state_id) => local_field_name(&plan_state_label(plan, state_id.0)),
-        _ => {
-            return Err(format!("row expression input `{input:?}` is not a row field").into());
-        }
-    };
-    row.fields
-        .get(&field_name)
-        .cloned()
-        .or_else(|| row_initial_state_fallback(plan, row, input))
-        .ok_or_else(|| {
-            let available = row.fields.keys().cloned().collect::<Vec<_>>().join(", ");
-            format!(
-                "row expression input `{input:?}` field `{field_name}` is missing from row key {} stack {:?}; available fields: [{}]",
-                row.key, stack, available
-            )
-            .into()
-        })
-}
-
-fn row_initial_state_fallback(
-    plan: &MachinePlan,
-    row: &PlanListRowState,
-    input: &ValueRef,
-) -> Option<JsonValue> {
-    let ValueRef::State(state_id) = input else {
-        return None;
-    };
-    let slot = plan
-        .storage_layout
-        .scalar_slots
-        .iter()
-        .find(|slot| slot.state_id == *state_id)?;
-    let source = slot.initial_row_field_path.as_deref()?;
-    let source_name = local_field_name(source);
-    row.fields.get(&source_name).cloned()
-}
-
-fn eval_plan_row_number(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<i64> {
-    eval_plan_row_number_with_stack(plan, list_state, row, expression, &[])
-}
-
-fn eval_plan_row_number_with_stack(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<i64> {
-    let value = eval_plan_row_expression_with_stack(plan, list_state, row, expression, stack)?;
-    row_value_to_number(&value)
-}
-
-fn eval_plan_row_text(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-) -> RuntimeResult<String> {
-    eval_plan_row_text_with_stack(plan, list_state, row, expression, &[])
-}
-
-fn eval_plan_row_text_with_stack(
-    plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-    row: &PlanListRowState,
-    expression: &PlanRowExpression,
-    stack: &[PlanRowEvalKey],
-) -> RuntimeResult<String> {
-    let value = eval_plan_row_expression_with_stack(plan, list_state, row, expression, stack)?;
-    row_value_to_text(&value)
 }
 
 fn plan_executor_list_row_default_fields_to_runtime(
@@ -11299,6 +10075,10 @@ fn plan_executor_list_row_default_fields_to_runtime(
         defaults.private_bytes,
         defaults.fixed_byte_banks,
     )
+}
+
+fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -> String {
+    local_field_name(&plan_semantic_field_label(plan, field_id.0))
 }
 
 fn plan_list_summary(
@@ -11636,71 +10416,6 @@ fn evaluate_indexed_bytes_write_update_for_runtime(
             .into());
     }
     Ok(evaluation)
-}
-
-struct RootBytesRuntimeEnvironment<'a> {
-    private_bytes: &'a RootBytesState,
-    fixed_byte_banks: &'a RootFixedBytesBanks,
-    host_file_root: Option<&'a Path>,
-}
-
-impl RootBytesEnvironment for RootBytesRuntimeEnvironment<'_> {
-    fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
-        self.private_bytes.get(&state_id.0)
-    }
-
-    fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
-        self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
-    }
-}
-
-impl<'a> RootBytesRuntimeEnvironment<'a> {
-    fn new(
-        private_bytes: &'a RootBytesState,
-        fixed_byte_banks: &'a RootFixedBytesBanks,
-        host_file_root: Option<&'a Path>,
-    ) -> Self {
-        Self {
-            private_bytes,
-            fixed_byte_banks,
-            host_file_root,
-        }
-    }
-
-    fn evaluate_read(
-        &self,
-        plan: &MachinePlan,
-        op: &boon_plan::PlanOp,
-        root_state: &serde_json::Map<String, JsonValue>,
-    ) -> RuntimeResult<boon_plan_executor::RootBytesReadEvaluation> {
-        let evaluation =
-            evaluate_root_bytes_read_update(plan, op, root_state, self, self.host_file_root)?;
-        if !evaluation.supported {
-            return Err(evaluation
-                .unsupported_reason
-                .unwrap_or_else(|| "root BYTES read evaluator did not support branch".to_owned())
-                .into());
-        }
-        Ok(evaluation)
-    }
-
-    fn evaluate_write(
-        &self,
-        plan: &MachinePlan,
-        op: &boon_plan::PlanOp,
-        root_state: &serde_json::Map<String, JsonValue>,
-    ) -> RuntimeResult<boon_plan_executor::RootBytesWriteEvaluation> {
-        let evaluation =
-            evaluate_root_bytes_write_update(plan, op, root_state, self, self.host_file_root)?;
-        if !evaluation.supported {
-            return Err(evaluation
-                .unsupported_reason
-                .unwrap_or_else(|| "root BYTES write evaluator did not support branch".to_owned())
-                .into());
-        }
-        record_runtime_bytes_executor_copy_cost(&evaluation.executor_report);
-        Ok(evaluation)
-    }
 }
 
 fn json_value_at_dotted_path<'a>(root: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
@@ -87128,6 +85843,11 @@ payload:
         );
     }
 
+    fn assert_root_scenario_product_only(report: &JsonValue) {
+        assert_eq!(report["comparison_status"], "not-requested");
+        assert_eq!(report["legacy_comparison"]["enabled"], false);
+    }
+
     #[test]
     fn root_scalar_plan_executor_replays_typed_root_expression_kinds() {
         let pid = std::process::id();
@@ -87196,7 +85916,7 @@ expected_source_event = {{ source = "store.input.change", text = "Typed payload"
         .expect("root scalar typed expression kinds should replay through PlanExecutor");
 
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(output.state_summary["store.flag"], true);
         assert_eq!(output.state_summary["store.mirrored"], "Seed");
         assert_eq!(output.state_summary["store.copied"], "Typed payload");
@@ -87469,12 +86189,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             1
@@ -87536,12 +86251,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.state_summary["store.received"]["digest"],
             "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             3
@@ -87587,12 +86297,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         .expect("indexed BYTES source payload fixture should execute through PlanExecutor");
 
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
             3
@@ -87675,12 +86380,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         .expect("indexed Bytes/equal fixture should execute through PlanExecutor");
 
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
             3
@@ -87768,12 +86468,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         .expect("indexed Bytes search fixture should execute through PlanExecutor");
 
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
             22
@@ -88182,12 +86877,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         .expect("indexed same-event BYTES dependency fixture should execute through PlanExecutor");
 
         assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_indexed_update_count"],
             5
@@ -88376,12 +87066,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             2
@@ -88472,12 +87157,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             1
@@ -88530,12 +87210,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             2
@@ -88635,12 +87310,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             8
@@ -88768,10 +87438,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(output.state_summary["store.zeros_len"], 4);
         assert_eq!(output.state_summary["store.decoded_hex_byte"], 3);
         assert_eq!(output.state_summary["store.decoded_base64_hex"], "01020304");
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             9
@@ -88876,12 +87543,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         );
         assert_eq!(output.state_summary["store.written_unsigned_read"], 4660);
         assert_eq!(output.state_summary["store.written_signed_read"], -129);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             10
@@ -89064,12 +87726,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             2
@@ -89142,12 +87799,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.state_summary["store.joined_again"],
             joined_again_summary
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             4
@@ -89245,12 +87897,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
             0
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             3
@@ -89357,12 +88004,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(output.state_summary["store.sliced_len"], 3);
         assert_eq!(output.state_summary["store.taken_byte"], 19);
         assert_eq!(output.state_summary["store.dropped_joined"], joined_summary);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             6
@@ -89610,12 +88252,7 @@ expected_source_event = {{ source = "store.decode" }}
         assert_eq!(output.state_summary["store.patched_byte"], 170);
         assert_eq!(output.state_summary["store.patched_len"], 4);
         assert_eq!(output.state_summary["store.patched_joined"], joined_summary);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
             4
@@ -89723,12 +88360,7 @@ expected_source_event = {{ source = "store.decode" }}
         assert_eq!(output.state_summary["store.patched"], patched_summary);
         assert_eq!(output.state_summary["store.patched_byte"], 170);
         assert_eq!(output.state_summary["store.patched_len"], 4);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
+        assert_root_scenario_product_only(&output.report);
 
         let updates = output.report["plan_executor"]["per_step"][0]["updates"]
             .as_array()

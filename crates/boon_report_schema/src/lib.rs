@@ -4076,6 +4076,14 @@ fn verify_run_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResu
     Ok(())
 }
 
+fn legacy_required_for_status(report: &JsonValue) -> bool {
+    report
+        .get("command_report_assembly_core")
+        .and_then(|core| core.get("legacy_required_for_status"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+}
+
 fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     for key in [
         "target_profile",
@@ -4411,6 +4419,19 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
                 report_path.display()
             )
         })?;
+    if !legacy_required_for_status(report) {
+        if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
+            || legacy.get("reason").and_then(JsonValue::as_str)
+                != Some("legacy comparison was not requested")
+        {
+            return Err(format!(
+                "{} run-plan-route product report must keep legacy comparison disabled and non-gating",
+                report_path.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
     for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
         if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!(
@@ -4530,13 +4551,24 @@ fn verify_run_plan_root_scalar_scenario_report(
         )
         .into());
     }
-    if report
+    let report_status_basis = report
         .get("report_status_basis")
         .and_then(JsonValue::as_str)
-        != Some("legacy-comparison-plus-assertion-coverage-compat")
-    {
+        .ok_or_else(|| {
+            format!(
+                "{} run-plan-scenario-events report_status_basis is not a string",
+                report_path.display()
+            )
+        })?;
+    if !matches!(
+        report_status_basis,
+        "plan-executor-product-plus-assertion-coverage"
+            | "plan-executor-plus-explicit-legacy-comparison-and-assertion-coverage"
+            | "plan-executor-product"
+            | "plan-executor-plus-explicit-legacy-comparison"
+    ) {
         return Err(format!(
-            "{} run-plan-scenario-events report_status_basis must be legacy-comparison-plus-assertion-coverage-compat",
+            "{} run-plan-scenario-events report_status_basis has invalid PlanExecutor basis `{report_status_basis}`",
             report_path.display()
         )
         .into());
@@ -4852,6 +4884,19 @@ fn verify_run_plan_root_scalar_scenario_report(
                 report_path.display()
             )
         })?;
+    if !legacy_required_for_status(report) {
+        if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
+            || legacy.get("reason").and_then(JsonValue::as_str)
+                != Some("legacy comparison was not requested")
+        {
+            return Err(format!(
+                "{} run-plan-root-scalar-scenario product report must keep legacy comparison disabled and non-gating",
+                report_path.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
     for key in ["enabled", "passed", "state_match", "semantic_delta_match"] {
         if legacy.get(key).and_then(JsonValue::as_bool) != Some(true) {
             return Err(format!(

@@ -36751,3 +36751,63 @@ Fresh NovyWave evidence:
   unsupported work is now more concentrated in expression-less pure/list-view
   derived fields, `ListFindValue` update branches, indexed numeric match
   branches, and the unresolved `store.variable_rows` projection.
+
+## 2026-07-05 - PlanExecutor Product Status Decoupled From Legacy Parity
+
+Status: cut one normal-path legacy control-plane dependency. PlanExecutor
+route/root/scenario reports now use PlanExecutor product status as the default
+top-level status basis; legacy parity gates status only when explicit compare
+mode requested it.
+
+What changed:
+
+- `run-plan-route`, `run-plan-root-scalar-scenario`, and scenario-event report
+  assembly now emit `legacy_required_for_status`.
+- Product reports use `report_status_basis=plan-executor-product` or
+  `plan-executor-product-plus-assertion-coverage` and pass with legacy
+  comparison disabled.
+- Explicit comparison reports use
+  `plan-executor-plus-explicit-legacy-comparison` variants and still require
+  legacy parity/accepted currentness policy.
+- Report schema accepts both product and explicit-comparison PlanExecutor bases
+  and rejects product reports whose legacy comparison is not disabled and
+  non-gating.
+- `changed_root_derived_deltas` now filters to fields declared in
+  `debug_map.derived_values`, so intermediate aggregate scratch fields no
+  longer appear as user-level derived deltas.
+
+Evidence:
+
+- `cargo test -q -p boon_plan_executor`: pass.
+- `cargo check -q -p boon_runtime -p boon_plan_executor -p boon_report_schema -p
+  boon_cli`: pass.
+- Product smoke:
+  `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario
+  examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn
+  --steps measure-bytes --report
+  target/reports/plan-executor-product-no-legacy-smoke.json`
+  produced `status=pass`, `report_status_basis=plan-executor-product`,
+  `comparison_status=not-requested`, and `legacy_required_for_status=false`.
+- Explicit comparison smoke:
+  `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario
+  examples/bytes_length_plan_ops.bn --scenario examples/bytes_length_plan_ops.scn
+  --steps measure-bytes --compare-legacy --report
+  target/reports/plan-executor-explicit-legacy-compare-smoke.json`
+  produced `status=pass`,
+  `report_status_basis=plan-executor-plus-explicit-legacy-comparison`,
+  `comparison_status=pass`, and `legacy_required_for_status=true`.
+- `cargo xtask verify-report-schema
+  target/reports/plan-executor-product-no-legacy-smoke.json`: pass.
+- `cargo xtask verify-report-schema
+  target/reports/plan-executor-explicit-legacy-compare-smoke.json`: pass.
+
+Current interpretation:
+
+- This does not remove `LoadedRuntime`, `GenericScheduledRuntime`, or the
+  explicit diagnostic comparison path. It removes one product-status dependency
+  on those paths.
+- Fresh NovyWave coverage remains `status=fail`,
+  `cpu_plan_executor_unsupported_op_count=432`, and
+  `unresolved_executable_ref_count=7`; the remaining work is PlanExecutor
+  expression/list coverage plus CLI/native/xtask quarantine of explicit legacy
+  compare surfaces.

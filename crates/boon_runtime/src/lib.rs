@@ -3982,7 +3982,7 @@ pub fn run_plan_root_scalar_scenario(
         json!({
             "enabled": false,
             "passed": false,
-            "reason": "legacy comparison is required for accepted root-scenario proof reports"
+            "reason": "legacy comparison was not requested"
         })
     };
     let demand_current_field_paths = plan_demand_current_field_paths(&plan);

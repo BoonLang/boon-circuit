@@ -36811,3 +36811,64 @@ Current interpretation:
   `unresolved_executable_ref_count=7`; the remaining work is PlanExecutor
   expression/list coverage plus CLI/native/xtask quarantine of explicit legacy
   compare surfaces.
+
+## 2026-07-05 - CLI Legacy Compare Surface Quarantined
+
+Status: moved the public CLI away from treating legacy execution/comparison as a
+normal product path.
+
+What changed:
+
+- `boon_cli run` now accepts only the PlanExecutor product path. `--engine
+  legacy`, `--engine semantic`, and `--engine compare` fail loudly and point at
+  diagnostic commands.
+- Added explicit diagnostic commands:
+  `diagnose-legacy-scenario` for the old semantic runtime and
+  `diagnose-plan-legacy-compare` for PlanExecutor plus legacy parity.
+- `run-plan-route` and `run-plan-root-scalar-scenario` no longer accept
+  `--compare-legacy`; the explicit spelling is now
+  `--diagnostic-compare-legacy`.
+- PlanExecutor command argv assembly now emits
+  `--diagnostic-compare-legacy`, so fresh reports no longer advertise the old
+  product-surface flag.
+- `docs/plans/GOAL_PROMPT.md` now describes the diagnostic quarantine instead
+  of telling future work to use `run --engine compare`.
+
+Evidence:
+
+- `cargo test -q -p boon_cli`: pass.
+- `cargo test -q -p boon_plan_executor
+  source_route_command_argv_prefers_artifact_paths_and_preserves_live_invocation`:
+  pass.
+- `cargo check -q -p boon_cli -p boon_plan_executor -p boon_runtime`: pass.
+- Product CLI smoke:
+  `cargo run -q -p boon_cli -- run examples/bytes_length_plan_ops.bn --scenario
+  examples/bytes_length_plan_ops.scn --report
+  target/reports/cli-run-plan-product-smoke.json --print-report`
+  produced `status=pass`,
+  `report_status_basis=plan-executor-product-plus-assertion-coverage`,
+  `comparison_status=not-requested`, and `legacy_required_for_status=false`.
+- Old normal legacy path rejection:
+  `boon_cli run ... --engine legacy` fails with
+  `normal run no longer exposes the legacy runtime`.
+- Old product flag rejection:
+  `boon_cli run-plan-root-scalar-scenario ... --compare-legacy` fails with
+  `--compare-legacy was retired from the product proof surface`.
+- Diagnostic flag smoke:
+  `boon_cli run-plan-root-scalar-scenario ... --diagnostic-compare-legacy`
+  produced `status=pass`,
+  `report_status_basis=plan-executor-plus-explicit-legacy-comparison`,
+  `comparison_status=pass`, and `legacy_required_for_status=true`.
+- Diagnostic command smoke:
+  `boon_cli diagnose-plan-legacy-compare ...` produced `status=pass`,
+  `report_status_basis=plan-executor-plus-explicit-legacy-comparison-and-assertion-coverage`,
+  `comparison_status=pass`, and `legacy_required_for_status=true`.
+
+Current interpretation:
+
+- This still does not delete the legacy runtime implementation. It makes normal
+  CLI execution/product proof harder to confuse with diagnostic legacy parity.
+- Next cuts should move xtask/BYTES aggregate refresh cases that still set
+  `compare_legacy=true` into diagnostic-only accounting, then continue
+  replacing remaining `LoadedRuntime`/`GenericScheduledRuntime` coverage with
+  PlanExecutor or deleting obsolete comparison reports.

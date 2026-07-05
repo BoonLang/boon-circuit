@@ -464,7 +464,7 @@ pub fn build_source_route_command_argv(input: SourceRouteCommandArgvInput) -> Ve
         }
     }
     if input.compare_legacy {
-        argv.push("--compare-legacy".to_owned());
+        argv.push("--diagnostic-compare-legacy".to_owned());
     }
     if input.target_profile != "software-default" {
         argv.push("--target".to_owned());
@@ -17592,7 +17592,7 @@ mod tests {
                 "mode=replace",
                 "--payload-bytes-file",
                 "bytes=target/reports/event-bytes.bin",
-                "--compare-legacy",
+                "--diagnostic-compare-legacy",
                 "--report",
                 "target/reports/route.json",
             ]

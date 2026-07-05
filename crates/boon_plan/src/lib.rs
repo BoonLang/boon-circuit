@@ -1831,6 +1831,10 @@ fn cpu_plan_executor_supports_derived_value_op(
             row_expression_refs_resolve(op, expression)
                 && root_row_expression_cpu_evaluable(expression)
         }
+        (false, PlanDerivedKind::ListView, PlanDerivedExpression::RowExpression { expression }) => {
+            row_expression_refs_resolve(op, expression)
+                && root_row_expression_cpu_evaluable(expression)
+        }
         (false, PlanDerivedKind::Pure, expression) => {
             root_bool_expression_cpu_supported(op, expression, supported_list_count_outputs)
         }

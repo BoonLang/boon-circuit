@@ -2185,7 +2185,10 @@ fn row_expression_for_value(
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
 ) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::Pure {
+    if !matches!(
+        derived.kind,
+        DerivedValueKind::Pure | DerivedValueKind::ListView
+    ) {
         return None;
     }
     let mut local_constants = constants.clone();

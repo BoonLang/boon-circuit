@@ -5687,6 +5687,14 @@ fn plan_executor_document_summary_with_limits(
         &mut root,
         &mut materialization,
     );
+    plan_executor_insert_root_row_expression_summaries(
+        plan,
+        &summary_root_state,
+        list_state,
+        limits,
+        &mut root,
+        &mut materialization,
+    );
     plan_executor_insert_projection_summaries(
         plan,
         &summary_root_state,
@@ -5714,6 +5722,119 @@ fn plan_executor_document_summary_with_limits(
         );
     }
     JsonValue::Object(root)
+}
+
+fn plan_executor_insert_root_row_expression_summaries(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    limits: SummaryLimits,
+    root: &mut serde_json::Map<String, JsonValue>,
+    materialization: &mut Vec<JsonValue>,
+) {
+    let root_eval_row = plan_executor_root_eval_row(root_state);
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if op.indexed {
+            continue;
+        }
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let PlanOpKind::DerivedValue {
+            derived_kind,
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if !matches!(
+            derived_kind,
+            boon_plan::PlanDerivedKind::Pure | boon_plan::PlanDerivedKind::ListView
+        ) {
+            continue;
+        }
+        let Ok(value) = eval_plan_row_expression(plan, list_state, &root_eval_row, expression)
+        else {
+            continue;
+        };
+        let target = plan_derived_field_label(plan, output_id.0);
+        let value = plan_executor_document_summary_value(value);
+        if let Some(rows) = value.as_array() {
+            let row_count = rows.len();
+            let row_end = limits
+                .list_rows
+                .map_or(row_count, |limit| {
+                    limits.list_row_start.saturating_add(limit)
+                })
+                .min(row_count);
+            let windowed = rows
+                .get(limits.list_row_start..row_end)
+                .unwrap_or(&[])
+                .to_vec();
+            materialization.push(materialization_report_for_rows(
+                &target,
+                row_count,
+                limits.list_row_start,
+                &windowed,
+            ));
+            let value = JsonValue::Array(windowed);
+            insert_nested_json(root, &target, value.clone());
+            root.entry(row_field_name(&target).to_owned())
+                .or_insert(value);
+        } else {
+            insert_nested_json(root, &target, value.clone());
+            root.entry(row_field_name(&target).to_owned())
+                .or_insert(value);
+        }
+    }
+}
+
+fn plan_executor_root_eval_row(
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> PlanListRowState {
+    let mut fields = BTreeMap::new();
+    for (path, value) in root_state {
+        fields.insert(path.clone(), value.clone());
+        fields
+            .entry(local_field_name(path).to_owned())
+            .or_insert_with(|| value.clone());
+    }
+    PlanListRowState {
+        key: 0,
+        generation: 0,
+        fields,
+        private_bytes: BTreeMap::new(),
+        fixed_bytes_banks: BTreeMap::new(),
+    }
+}
+
+fn plan_executor_document_summary_value(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(plan_executor_document_summary_value)
+                .collect(),
+        ),
+        JsonValue::Object(object) => {
+            let mut output = serde_json::Map::new();
+            for (field, value) in object {
+                insert_nested_json(
+                    &mut output,
+                    &field,
+                    plan_executor_document_summary_value(value),
+                );
+            }
+            JsonValue::Object(output)
+        }
+        value => value,
+    }
 }
 
 fn plan_executor_summary_root_state(
@@ -86322,6 +86443,94 @@ expected_source_event = {{ source = "store.decode" }}
         assert!(
             visible.iter().all(|row| row["completed"] == false),
             "Active filter document summary should expose only active visible rows: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_document_summary_exposes_root_list_map_projection() {
+        let source = r#"
+store: [
+    sources: [
+        noop: SOURCE
+    ]
+    noop:
+        TEXT { ready } |> HOLD noop {
+            LATEST {
+                sources.noop.text
+            }
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }]
+            [id: TEXT { b }, name: TEXT { B }]
+        }
+    projected:
+        rows |> List/map(row, new: projected_row(row: row))
+]
+
+FUNCTION projected_row(row) {
+    [
+        id: row.id
+        label: row.id |> Text/concat(with: row.name, separator: "=")
+        nested: [
+            label: row.name |> Text/concat(with: TEXT { nested }, separator: "/")
+        ]
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
+"#;
+        let compiled = compile_source_text_to_machine_plan(
+            "root-list-map-summary",
+            source,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("root List/map fixture should compile to a MachinePlan");
+        let projected_field = compiled
+            .plan
+            .debug_map
+            .derived_values
+            .iter()
+            .find(|entry| entry.label == "store.projected")
+            .and_then(|entry| entry.id.strip_prefix("field:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .expect("store.projected should be a derived field");
+        let projected_op = compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| region.ops.iter())
+            .find(|op| op.output == Some(ValueRef::Field(FieldId(projected_field))))
+            .expect("store.projected should have a plan op");
+        assert!(
+            matches!(
+                &projected_op.kind,
+                PlanOpKind::DerivedValue {
+                    derived_kind: boon_plan::PlanDerivedKind::ListView,
+                    expression: Some(PlanDerivedExpression::RowExpression { .. }),
+                    ..
+                }
+            ),
+            "root List/map ListView must carry an executable row expression: {projected_op:#?}"
+        );
+
+        let mut runtime = LiveRuntime::from_source_plan_executor("root-list-map-summary", source)
+            .expect("root List/map projection should initialize through PlanExecutor");
+
+        let summary = runtime.document_state_summary();
+        let projected = summary["store"]["projected"]
+            .as_array()
+            .expect("root List/map projection should be a document array");
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["id"], "a");
+        assert_eq!(projected[0]["label"], "a=A");
+        assert_eq!(projected[0]["nested"]["label"], "A/nested");
+        assert_eq!(projected[1]["id"], "b");
+        assert_eq!(projected[1]["label"], "b=B");
+        assert_eq!(projected[1]["nested"]["label"], "B/nested");
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
         );
     }
 

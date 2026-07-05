@@ -36167,3 +36167,99 @@ Current interpretation:
   refresh rows no longer make the operator rerun the same label twice.
 - This does not refresh the children; it only makes the next refresh execution
   deterministic and bounded.
+
+## 2026-07-05 - U1 Hidden Legacy Runtime Fallback Cut
+
+Status: implemented and committed the default LiveRuntime authority cut.
+
+What changed:
+
+- Default `LiveRuntime::{new,new_from_project,from_source,from_project,
+  from_project_profiled}` now rejects world/manufacturing output projects
+  instead of silently constructing `LoadedRuntime` / `GenericScheduledRuntime`.
+- World/manufacturing output verifiers and native world-editor tests now opt
+  into `*_legacy` constructors explicitly while PlanExecutor lacks those output
+  roots.
+- TodoMVC PlanExecutor list tests now assert state parity plus the explicit
+  demand-current semantic-delta acceptance contract instead of requiring raw
+  legacy semantic-delta equality for current list-derived root fields.
+
+Evidence:
+
+- Commit: `b5c98b5 Reject hidden legacy output runtime fallback`.
+- `cargo test -q -p boon_runtime --lib`: pass, 361 tests.
+- `cargo check -q -p xtask -p boon_native_playground`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Current interpretation:
+
+- Hidden default fallback for unsupported output roots is cut.
+- Remaining legacy references are not all gone. They are explicit output
+  diagnostics, explicit legacy comparison/oracle coverage, or stale harness
+  cleanup targets. Do not treat a text search for `legacy` as proof that the
+  product/default path still falls back silently.
+
+## 2026-07-05 - Native Handoff Dev-Editor Alias Removal
+
+Status: implemented and committed a handoff manifest cleanup.
+
+What changed:
+
+- Removed the superseded `scroll-speed-dev-code-editor` compatibility wrapper
+  report from `native_gpu_handoff_manifest.json`.
+- Replaced the old unit test that required the wrapper report as a handoff
+  child with a guard that keeps it out of the handoff required list.
+
+Evidence:
+
+- Commit: `f3bd8e4 Drop stale dev editor scroll handoff child`.
+- `cargo test -q -p xtask native_gpu_handoff -- --nocapture`: pass.
+- `cargo test -q -p xtask dev_editor_scroll_speed_alias_is_not_handoff_child -- --nocapture`:
+  pass.
+- `cargo run -q -p xtask -- verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail with `required_report_count=17`, `refresh_debt_child_count=17`,
+  `true_blocker_child_count=0`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu-all.json`:
+  pass.
+
+Current interpretation:
+
+- The native handoff aggregate no longer spends refresh debt on the old
+  dev-editor scroll alias. The dedicated dev-editor scroll verifier can remain
+  outside the handoff path as a recovery/regression gate.
+
+## 2026-07-05 - Explicit Runtime Authority Call Sites
+
+Status: implemented and committed a production/helper call-site cleanup.
+
+What changed:
+
+- Native interaction-speed and dev-window validation helpers now construct
+  document runtimes through explicit PlanExecutor constructors.
+- NovyWave bridge verifier helpers now use explicit legacy constructors because
+  direct PlanExecutor construction currently fails that path with
+  `state initializer is missing a typed constant id`.
+- `crates/xtask/src/main.rs` now has no remaining default
+  `LiveRuntime::from_source`, `from_project`, `new`, or `new_from_project`
+  call sites.
+
+Evidence:
+
+- Commit: `6b224ae Name runtime authority at production call sites`.
+- `cargo check -q -p xtask -p boon_native_playground`: pass.
+- `cargo run -q -p xtask -- verify-novywave-bridge-scenario --report target/reports/novywave-bridge-scenario.json`:
+  pass.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/novywave-bridge-scenario.json`:
+  pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Current interpretation:
+
+- Normal/native document helper paths name PlanExecutor directly.
+- NovyWave bridge remains an explicit legacy diagnostic surface until the
+  PlanExecutor typed-constant initializer gap is fixed.
+- The next runtime cleanup should either fix that PlanExecutor gap or continue
+  quarantining/removing legacy comparison surfaces. Do not reintroduce default
+  constructor ambiguity.

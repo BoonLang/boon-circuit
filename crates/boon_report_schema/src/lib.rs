@@ -1258,12 +1258,12 @@ fn verify_bytes_default_engine_readiness_report(
         .into());
     }
     if report
-        .get("legacy_diagnostic_mode")
+        .get("diagnostic_comparison_mode")
         .and_then(JsonValue::as_str)
         != Some("not-run-not-required-for-product-readiness")
     {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness must keep legacy diagnostics out of product readiness",
+            "{} verify-bytes-default-engine-readiness must keep diagnostic comparisons out of product readiness",
             report_path.display()
         )
         .into());

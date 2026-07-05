@@ -36992,7 +36992,7 @@ What changed:
 - Removed `--engine legacy` and `--engine compare` child executions from
   `verify-bytes-default-engine-readiness`.
 - The report now records
-  `legacy_diagnostic_mode=not-run-not-required-for-product-readiness` and
+  `diagnostic_comparison_mode=not-run-not-required-for-product-readiness` and
   `explicit_compare_case_count=0`.
 - The schema now requires the product-only readiness shape and rejects default
   readiness reports that run explicit compare cases.
@@ -37725,3 +37725,21 @@ Why it matters:
   only the retired compatibility shape.
 - The ledger now tracks current product fields instead of preserving old
   `legacy_*` report names as if they were the active contract.
+
+## 2026-07-05 - Default Engine Readiness Uses Neutral Diagnostic Field
+
+Status: renamed the active BYTES default-engine readiness report field from
+`legacy_diagnostic_mode` to `diagnostic_comparison_mode`.
+
+What changed:
+
+- `verify-bytes-default-engine-readiness` now emits
+  `diagnostic_comparison_mode`.
+- The report schema now requires `diagnostic_comparison_mode` with value
+  `not-run-not-required-for-product-readiness`.
+- A fresh default-engine readiness report passes with
+  `default_engine=plan`, `default_switch_allowed=true`, and
+  `explicit_compare_case_count=0`.
+
+This removes another product-active `legacy_*` report field without weakening
+the invariant that diagnostic comparisons are not part of product readiness.

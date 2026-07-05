@@ -37012,12 +37012,12 @@ execute through `LoadedRuntime` / `GenericScheduledRuntime`.
 
 What changed:
 
-- Renamed `run_scenario` to `run_legacy_scenario`.
-- Renamed project/source scenario helpers to `run_legacy_scenario_project`,
-  `run_legacy_scenario_source`, and related step-limited variants.
-- Renamed `run_source_initial_state` to `run_legacy_source_initial_state`.
+- Renamed `run_scenario` to `run_loaded_runtime_scenario`.
+- Renamed project/source scenario helpers to `run_loaded_runtime_scenario_project`,
+  `run_loaded_runtime_scenario_source`, and related step-limited variants.
+- Renamed `run_source_initial_state` to `run_loaded_runtime_source_initial_state`.
 - Renamed the internal loaded-scenario helper to
-  `run_legacy_loaded_scenario_with_compiled`.
+  `run_loaded_runtime_scenario_with_compiled`.
 - Deleted the unused private `run_artifact_runtime_scenario`; compiled artifact
   scenario execution remains PlanExecutor-backed through MachinePlan.
 - Updated CLI diagnostic, xtask legacy/semantic verifiers, Ply playground, and
@@ -37136,7 +37136,7 @@ replay and labels legacy parity as diagnostic.
 What changed:
 
 - Removed `diagnose-legacy-scenario` from CLI help and dispatch.
-- Removed the direct `run_legacy_scenario` import and wrapper from
+- Removed the direct `run_loaded_runtime_scenario` import and wrapper from
   `boon_cli`.
 - `run --engine legacy` / `run --engine semantic` now point users at
   PlanExecutor product commands or `diagnose-plan-legacy-compare`, not raw
@@ -37154,7 +37154,7 @@ Current interpretation:
 
 - There is no public `boon_cli` command that directly runs the legacy scenario
   runtime.
-- Remaining raw `run_legacy_scenario` callers are in xtask verifier/diagnostic
+- Remaining raw `run_loaded_runtime_scenario` callers are in xtask verifier/diagnostic
   code and runtime tests. Those are the next cleanup target before deleting
   the `LoadedRuntime` implementation island.
 
@@ -37184,11 +37184,11 @@ Fresh evidence:
   `crates/boon_report_schema/src/lib.rs` finds no
   `verify-example-semantic`, `verify-todomvc-semantic`,
   `verify-cells-semantic`, `verify-metamorphic-hidden-fixtures`,
-  `run_legacy_scenario_project`, or `metamorphic` references.
+  `run_loaded_runtime_scenario_project`, or `metamorphic` references.
 
 Remaining legacy callers:
 
-- `xtask` still calls `run_legacy_scenario` for old speed/benchmark and
+- `xtask` still calls `run_loaded_runtime_scenario` for old speed/benchmark and
   large-list scan commands, BoonDriver E2E, and schema fixture generation.
 - `boon_runtime` still contains the `LoadedRuntime` /
   `GenericScheduledRuntime` implementation island. The next cleanup slice
@@ -37198,7 +37198,7 @@ Remaining legacy callers:
 ## 2026-07-05 - Obsolete xtask Legacy Speed Wrappers Removed
 
 Status: removed the old `xtask` speed/benchmark wrapper commands that still
-ran `run_legacy_scenario` and produced stale benchmark proof artifacts. Native
+ran `run_loaded_runtime_scenario` and produced stale benchmark proof artifacts. Native
 GPU interaction-speed gates and PlanExecutor reports are now the active
 performance evidence; the deleted wrappers are no longer accepted as current
 control-plane commands.
@@ -37224,14 +37224,14 @@ Fresh evidence:
 - `cargo test -q -p xtask`: pass.
 - `cargo test -q -p boon_report_schema`: pass.
 - `rg` over `crates/xtask/src/main.rs` finds no removed speed/benchmark
-  command names and only two remaining `run_legacy_scenario` callers:
+  command names and only two remaining `run_loaded_runtime_scenario` callers:
   BoonDriver E2E and runtime schema fixture generation.
 
 Remaining legacy callers:
 
-- `verify-boon-driver-e2e` still uses `run_legacy_scenario` and is still part
+- `verify-boon-driver-e2e` still uses `run_loaded_runtime_scenario` and is still part
   of `verify-boon-driver-all`.
-- `runtime_schema_fixture` still uses `run_legacy_scenario` to build negative
+- `runtime_schema_fixture` still uses `run_loaded_runtime_scenario` to build negative
   schema fixtures.
 - Runtime implementation/tests still contain `LoadedRuntime` and
   `GenericScheduledRuntime`; those should be cut only after the remaining
@@ -37240,7 +37240,7 @@ Remaining legacy callers:
 ## 2026-07-05 - xtask Raw Legacy Scenario Callers Removed
 
 Status: replaced the two remaining direct `xtask` calls to
-`run_legacy_scenario` with PlanExecutor scenario replay. `xtask` no longer
+`run_loaded_runtime_scenario` with PlanExecutor scenario replay. `xtask` no longer
 imports or invokes the raw legacy scenario APIs; remaining references are audit
 strings or report-schema support for historical reports.
 
@@ -37248,23 +37248,23 @@ What changed:
 
 - `verify-boon-driver-e2e` now generates its fresh scenario report with
   `run_plan_scenario_events(..., compare_legacy=false)` instead of
-  `run_legacy_scenario`.
+  `run_loaded_runtime_scenario`.
 - The BoonDriver E2E report now records `plan_scenario_report` /
   `plan_scenario_report_sha256` rather than `runtime_scenario_report`.
 - `runtime_schema_fixture` now uses a PlanExecutor scenario-events report as
   its base fixture before overlaying negative runtime-schema fields.
-- Removed the `run_legacy_scenario` import from `xtask`.
+- Removed the `run_loaded_runtime_scenario` import from `xtask`.
 
 Fresh evidence:
 
 - `cargo check -q -p xtask`: pass.
 - `cargo test -q -p xtask`: pass.
 - `rg` over `crates/xtask/src/main.rs` finds no direct
-  `run_legacy_scenario` or `run_legacy_scenario_project` calls.
+  `run_loaded_runtime_scenario` or `run_loaded_runtime_scenario_project` calls.
 
 Remaining legacy implementation:
 
-- `boon_runtime` still exposes and tests `run_legacy_scenario`,
+- `boon_runtime` still exposes and tests `run_loaded_runtime_scenario`,
   `LoadedRuntime`, and `GenericScheduledRuntime`.
 - `boon_cli diagnose-plan-legacy-compare` still owns the explicit diagnostic
   legacy comparison island.
@@ -37292,7 +37292,7 @@ Fresh evidence:
   pass.
 - `cargo metadata --no-deps --format-version=1`: pass.
 - `rg` over active Cargo files and crates finds no `boon_ply_playground`
-  package or external `run_legacy_scenario` callers. Remaining matches are
+  package or external `run_loaded_runtime_scenario` callers. Remaining matches are
   `boon_runtime` implementation/tests and report-schema/xtask historical audit
   strings.
 
@@ -37330,7 +37330,7 @@ Fresh evidence:
 
 Remaining legacy implementation:
 
-- `boon_runtime` still owns raw `run_legacy_scenario`, `LoadedRuntime`, and
+- `boon_runtime` still owns raw `run_loaded_runtime_scenario`, `LoadedRuntime`, and
   `GenericScheduledRuntime` internals/tests for the next retirement slice.
 - `xtask` still carries removed-command negative/audit strings for old Ply
   command names; these now reject the paths rather than execute or validate
@@ -37360,14 +37360,14 @@ Remaining cleanup:
 
 ## 2026-07-05 - Legacy Scenario Runner API Quarantined
 
-Status: removed the public `run_legacy_scenario*` runtime scenario helpers from
+Status: removed the public `run_loaded_runtime_scenario*` runtime scenario helpers from
 normal crate builds. They now compile only as private `#[cfg(test)]` helpers for
 remaining legacy-runtime unit coverage.
 
 What changed:
 
-- `run_legacy_scenario`, `run_legacy_scenario_project`,
-  `run_legacy_scenario_source*`, `run_legacy_source_initial_state`, and the
+- `run_loaded_runtime_scenario`, `run_loaded_runtime_scenario_project`,
+  `run_loaded_runtime_scenario_source*`, `run_loaded_runtime_source_initial_state`, and the
   compiled legacy scenario runner are no longer public runtime API.
 - Cross-crate product/control-plane builds cannot call those scenario helpers.
 - Remaining references are confined to `boon_runtime` tests.
@@ -37377,7 +37377,7 @@ Fresh evidence:
 - `cargo check -q -p boon_runtime -p boon_cli -p boon_native_playground -p xtask`:
   pass.
 - `cargo test -q -p boon_runtime --no-run`: pass.
-- `rg` over `crates` finds no public `run_legacy_scenario*` API and only
+- `rg` over `crates` finds no public `run_loaded_runtime_scenario*` API and only
   runtime-test callers of the private helper.
 
 Remaining cleanup:
@@ -37504,7 +37504,7 @@ What changed:
   reports `output_root_evaluator=plan_executor_generic_output_program`.
 - `LiveRuntime::world_scene_output` and `solid_model_output` dispatch through
   the active engine; PlanExecutor no longer fails by forcing
-  `legacy_runtime_mut()`.
+  `loaded_runtime_mut()`.
 - Native preview project construction always uses
   `from_project_plan_executor`; output-root projects are labeled
   `plan_executor_output_root_runtime` instead of
@@ -37539,7 +37539,7 @@ Fresh evidence:
 
 Remaining cleanup:
 
-- `LiveRuntimeEngine::Legacy`, explicit legacy constructors, and many old
+- `LiveRuntimeEngine::LoadedRuntime`, explicit legacy constructors, and many old
   `boon_runtime` unit tests still exist as diagnostic/old-runtime coverage.
   They are no longer used by native preview or the migrated 3D/manufacturing
   xtask gates, but they are not deleted yet.
@@ -37553,20 +37553,20 @@ Remaining cleanup:
 
 Status: tightened the output-root boundary after the PlanExecutor output-root
 migration. `LiveRuntime::world_scene_output` and
-`LiveRuntime::solid_model_output` now refuse the test-only `Legacy` engine
+`LiveRuntime::solid_model_output` now refuse the test-only `LoadedRuntime` engine
 instead of serving native/product output roots through explicit legacy
 diagnostics.
 
 What changed:
 
 - The public output-root methods now return a PlanExecutor-only error for
-  `LiveRuntimeEngine::Legacy`.
+  `LiveRuntimeEngine::LoadedRuntime`.
 - The default world-output constructor test now proves both sides: the default
-  constructor uses PlanExecutor successfully, and explicit legacy diagnostics do
+  constructor uses PlanExecutor successfully, and explicit LoadedRuntime diagnostics do
   not satisfy product output-root calls.
 - `verify-compiler-boundaries` now has
   `live-runtime-product-output-roots-planexecutor-only` so the old
-  `LiveRuntimeEngine::Legacy(runtime) => runtime.world_scene_output()` /
+  `LiveRuntimeEngine::LoadedRuntime(runtime) => runtime.world_scene_output()` /
   `solid_model_output()` fallback cannot return silently.
 
 Fresh evidence:
@@ -37600,26 +37600,26 @@ Important failed migration attempt:
 ## 2026-07-05 - Legacy Runtime Harness Split From Product LiveRuntime Type
 
 Status: tightened the runtime boundary around the remaining legacy execution
-island. `LegacyRuntimeHarness` is now an explicit test wrapper that owns a
+island. `LoadedRuntimeHarness` is now an explicit test wrapper that owns a
 `LiveRuntime` instead of a zero-sized constructor namespace returning product
 `LiveRuntime` values directly.
 
 What changed:
 
-- Legacy test constructors now return `LegacyRuntimeHarness`, not
+- Legacy test constructors now return `LoadedRuntimeHarness`, not
   `LiveRuntime`.
 - Legacy-only tests that still need `LoadedRuntime` behavior must go through
-  explicit wrapper methods on `LegacyRuntimeHarness`.
+  explicit wrapper methods on `LoadedRuntimeHarness`.
 - PlanExecutor Cells tests continue to use product `LiveRuntime`; the shared
   `commit_cell` helper remains PlanExecutor-facing, with a separate
-  `commit_legacy_cell` helper for the one legacy recompute-metrics test.
-- `verify-compiler-boundaries` now checks that `LegacyRuntimeHarness` owns a
+  `commit_loaded_runtime_cell` helper for the one legacy recompute-metrics test.
+- `verify-compiler-boundaries` now checks that `LoadedRuntimeHarness` owns a
   `runtime: LiveRuntime` field and that its constructors return `Self`, so the
   old shape cannot quietly return product runtime values again.
 
 Why this is not the final legacy cleanup:
 
-- `LiveRuntimeEngine::Legacy(LoadedRuntime)` still exists under `#[cfg(test)]`
+- `LiveRuntimeEngine::LoadedRuntime(LoadedRuntime)` still exists under `#[cfg(test)]`
   because many old runtime unit tests still exercise legacy storage internals,
   route tables, cache counters, and historical recompute metrics.
 - The next cut should delete or rewrite obsolete legacy tests and move any
@@ -37640,7 +37640,7 @@ What changed:
   summary/inspection methods.
 - Moved legacy source normalization, single-event acceptance, batch replay,
   scenario-step adapters, summaries, value summaries, and provenance reporting
-  into `LegacyRuntimeHarness`.
+  into `LoadedRuntimeHarness`.
 - Product-facing candidate-defer probe hooks are now no-ops until PlanExecutor
   owns equivalent profiling data; they no longer read legacy runtime state.
 - `verify-compiler-boundaries` now fails if public `LiveRuntime` source APIs
@@ -37649,7 +37649,7 @@ What changed:
 Remaining cleanup:
 
 - The private checked-step helpers and `LoadedRuntime` / `GenericScheduledRuntime`
-  still exist for old unit coverage behind `LegacyRuntimeHarness`.
+  still exist for old unit coverage behind `LoadedRuntimeHarness`.
 - The next destructive cleanup should delete or migrate obsolete legacy tests
   in groups, starting with tests that assert public LiveRuntime behavior rather
   than storage-engine internals.
@@ -37673,3 +37673,28 @@ What changed:
 
 This is a terminology/control-plane cleanup only. It does not delete the
 remaining test-only `LoadedRuntime` island.
+
+## 2026-07-05 - Runtime Test Island Renamed To LoadedRuntime
+
+Status: removed misleading `legacy` names from the active runtime test island.
+The remaining old engine path is still test-only, but active code now names it
+for the concrete implementation: `LoadedRuntime`.
+
+What changed:
+
+- Renamed `LiveRuntimeEngine::Legacy` to
+  `LiveRuntimeEngine::LoadedRuntime`.
+- Renamed `LegacyRuntimeHarness` to `LoadedRuntimeHarness`.
+- Renamed `legacy_runtime*` helper methods to `loaded_runtime*`.
+- Renamed `run_legacy_scenario*` helpers to `run_loaded_runtime_scenario*`.
+- Renamed profile/provenance strings from `legacy_generic_runtime` to
+  `loaded_generic_runtime`.
+- Updated compiler-boundary report/schema fields so the active guard now checks
+  `loaded_runtime_harness_owns_loaded_runtime_constructors`.
+
+Remaining cleanup:
+
+- This still does not delete the old `LoadedRuntime` / `GenericScheduledRuntime`
+  tests. It removes the misleading fallback vocabulary and makes the next
+  destructive step easier to review: migrate or delete obsolete test groups
+  without confusing them with product runtime behavior.

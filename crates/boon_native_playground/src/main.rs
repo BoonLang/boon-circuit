@@ -238,7 +238,7 @@ fn run_layout_proof(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         json!({
             "status": "pass",
-            "render_backend_trait": "boon_native_gpu::render_app_owned_pixels",
+            "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
             "proof": render_proof
         })
     } else {
@@ -14010,6 +14010,27 @@ fn render_scene_hash(scene: &boon_document::RenderScene) -> String {
     boon_runtime::sha256_bytes(&bytes)
 }
 
+fn render_scene_with_viewport_background(
+    frame: &boon_document::LayoutFrame,
+    width: u32,
+    height: u32,
+) -> (
+    boon_document::LayoutFrame,
+    boon_document::RenderScene,
+    String,
+) {
+    let render_frame = preview_frame_with_viewport_background(frame, width as f32, height as f32);
+    let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+    let render_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+        &render_frame,
+        width,
+        height,
+        &mut columns,
+    );
+    let render_scene_identity = render_scene_hash(&render_scene);
+    (render_frame, render_scene, render_scene_identity)
+}
+
 fn render_layout_proof_app_owned(
     layout_frame: &boon_document::LayoutFrame,
     width: u32,
@@ -14017,8 +14038,8 @@ fn render_layout_proof_app_owned(
     artifact_dir: &Path,
     artifact_label: &str,
 ) -> Result<boon_native_gpu::RenderProof, Box<dyn std::error::Error>> {
-    let render_frame =
-        preview_frame_with_viewport_background(layout_frame, width as f32, height as f32);
+    let (_render_frame, render_scene, render_scene_identity) =
+        render_scene_with_viewport_background(layout_frame, width, height);
     futures::executor::block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
@@ -14039,11 +14060,12 @@ fn render_layout_proof_app_owned(
                 experimental_features: wgpu::ExperimentalFeatures::default(),
             })
             .await?;
-        Ok::<_, Box<dyn std::error::Error>>(boon_native_gpu::render_app_owned_pixels(
-            boon_native_gpu::AppOwnedRenderRequest {
+        Ok::<_, Box<dyn std::error::Error>>(boon_native_gpu::render_app_owned_scene_pixels(
+            boon_native_gpu::AppOwnedRenderSceneRequest {
                 device: &device,
                 queue: &queue,
-                frame: &render_frame,
+                scene: &render_scene,
+                render_identity_hash: &render_scene_identity,
                 surface_id: boon_host::SurfaceId(format!("layout-proof-{artifact_label}")),
                 surface_epoch: 0,
                 width,
@@ -39143,6 +39165,7 @@ fn preview_input_has_pending_source_work(input_state: &PreviewNativeInputState) 
     !input_state.pending_live_events.is_empty()
 }
 
+#[cfg(test)]
 fn preview_input_is_unhandled_primary_press_only(
     input: &boon_native_app_window::NativeInputAdapterProof,
     input_state: &PreviewNativeInputState,
@@ -53750,19 +53773,6 @@ impl PreviewHitRouteTable {
         Some(event)
     }
 
-    fn click_candidate_for_hit(
-        &self,
-        hit: &boon_document::HitSideTableEntry,
-        prefer_double_click: bool,
-    ) -> Option<PreviewHoveredClickCandidate> {
-        let source_intents = if prefer_double_click {
-            &["double_click", "press", "click", "source"][..]
-        } else {
-            &["press", "click", "source", "double_click"][..]
-        };
-        self.click_candidate_for_hit_with_intents(hit, source_intents)
-    }
-
     fn click_candidate_for_hit_with_intents(
         &self,
         hit: &boon_document::HitSideTableEntry,
@@ -62895,6 +62905,7 @@ fn preview_replace_code_already_current_response(
     })))
 }
 
+#[cfg(test)]
 fn preview_operator_host_input_response(
     state: &PreviewIpcState,
     request: &serde_json::Value,
@@ -64843,17 +64854,6 @@ fn preview_loop_readback_artifact_is_valid(artifact: &serde_json::Value) -> bool
             == Some("wgpu-visible-surface-copy-src-readback")
 }
 
-fn preview_loop_readback_artifact_advanced(
-    previous: &serde_json::Value,
-    next: &serde_json::Value,
-) -> bool {
-    preview_loop_readback_artifact_advanced_for_requirement(
-        previous,
-        next,
-        PreviewReadbackRequirement::default(),
-    )
-}
-
 fn preview_loop_readback_artifact_advanced_for_requirement(
     previous: &serde_json::Value,
     next: &serde_json::Value,
@@ -65145,6 +65145,7 @@ fn operator_host_input_probe_requests(path: &Path, code: &str) -> Option<Vec<ser
     operator_host_input_probe_requests_from_events(path, code, source_events, None)
 }
 
+#[cfg(test)]
 fn operator_host_input_smoke_probe_requests(
     path: &Path,
     code: &str,
@@ -65156,6 +65157,7 @@ fn operator_host_input_smoke_probe_requests(
     )
 }
 
+#[cfg(test)]
 fn operator_host_input_smoke_probe_requests_with_limit(
     path: &Path,
     code: &str,
@@ -65301,6 +65303,7 @@ fn sample_operator_host_input_source_events(
         .collect()
 }
 
+#[cfg(test)]
 fn operator_host_input_probe_requests_from_events(
     path: &Path,
     code: &str,
@@ -74415,16 +74418,18 @@ label:
                 "Classic dark app-owned readback layout",
             );
 
-            let render_frame = preview_frame_with_viewport_background(
-                &layout,
-                PHYSICAL_TODOMVC_PREVIEW_WIDTH,
-                PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
-            );
-            let proof =
-                boon_native_gpu::render_app_owned_pixels(boon_native_gpu::AppOwnedRenderRequest {
+            let (_render_frame, render_scene, render_scene_identity) =
+                render_scene_with_viewport_background(
+                    &layout,
+                    PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                    PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
+                );
+            let proof = boon_native_gpu::render_app_owned_scene_pixels(
+                boon_native_gpu::AppOwnedRenderSceneRequest {
                     device: &device,
                     queue: &queue,
-                    frame: &render_frame,
+                    scene: &render_scene,
+                    render_identity_hash: &render_scene_identity,
                     surface_id: boon_host::SurfaceId(
                         "physical-todomvc-classic-dark-test".to_owned(),
                     ),
@@ -74433,18 +74438,24 @@ label:
                     height: PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
                     artifact_dir: Path::new("target/artifacts/native-gpu/tests"),
                     artifact_label: "physical-todomvc-classic-dark",
-                })
-                .expect("Classic dark frame should render to app-owned pixels");
+                },
+            )
+            .expect("Classic dark frame should render to app-owned pixels");
             let artifact_path = match &proof.artifact {
                 boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
                     artifact_path,
                     layout_frame_hash,
+                    render_scene_identity_hash,
                     ..
                 } => {
                     assert_eq!(
-                        layout_frame_hash,
-                        &render_frame_hash(&render_frame),
-                        "app-owned readback proof should bind to the rendered Classic dark frame"
+                        layout_frame_hash, &render_scene_identity,
+                        "app-owned readback proof should bind to the rendered Classic dark scene"
+                    );
+                    assert_eq!(
+                        render_scene_identity_hash.as_deref(),
+                        Some(render_scene_identity.as_str()),
+                        "app-owned readback proof should expose the rendered Classic dark scene identity"
                     );
                     PathBuf::from(artifact_path)
                 }
@@ -74589,16 +74600,18 @@ label:
                     &format!("{theme} Light app-owned readback layout"),
                 );
 
-                let render_frame = preview_frame_with_viewport_background(
-                    &layout,
-                    PHYSICAL_TODOMVC_PREVIEW_WIDTH,
-                    PHYSICAL_TODOMVC_PREVIEW_HEIGHT,
-                );
-                let proof = boon_native_gpu::render_app_owned_pixels(
-                    boon_native_gpu::AppOwnedRenderRequest {
+                let (_render_frame, render_scene, render_scene_identity) =
+                    render_scene_with_viewport_background(
+                        &layout,
+                        PHYSICAL_TODOMVC_PREVIEW_WIDTH as u32,
+                        PHYSICAL_TODOMVC_PREVIEW_HEIGHT as u32,
+                    );
+                let proof = boon_native_gpu::render_app_owned_scene_pixels(
+                    boon_native_gpu::AppOwnedRenderSceneRequest {
                         device: &device,
                         queue: &queue,
-                        frame: &render_frame,
+                        scene: &render_scene,
+                        render_identity_hash: &render_scene_identity,
                         surface_id: boon_host::SurfaceId(format!(
                             "physical-todomvc-{}-light-test",
                             theme.to_ascii_lowercase()
@@ -74620,13 +74633,18 @@ label:
                     boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
                         artifact_path,
                         layout_frame_hash,
+                        render_scene_identity_hash,
                         nonblank_samples,
                         ..
                     } => {
                         assert_eq!(
-                            layout_frame_hash,
-                            &render_frame_hash(&render_frame),
-                            "{theme} Light app-owned readback proof should bind to the rendered frame"
+                            layout_frame_hash, &render_scene_identity,
+                            "{theme} Light app-owned readback proof should bind to the rendered scene"
+                        );
+                        assert_eq!(
+                            render_scene_identity_hash.as_deref(),
+                            Some(render_scene_identity.as_str()),
+                            "{theme} Light app-owned readback proof should expose the rendered scene identity"
                         );
                         assert!(
                             *nonblank_samples > 100_000,
@@ -92492,13 +92510,18 @@ document:
         viewport_height: f32,
     ) -> RenderedFrameImage {
         let artifact_dir = repo_path("target/artifacts/native-gpu/tests");
-        let render_frame =
-            preview_frame_with_viewport_background(frame, viewport_width, viewport_height);
-        let proof = boon_native_gpu::render_app_owned_pixels(
-            boon_native_gpu::AppOwnedRenderRequest {
+        let (_render_frame, render_scene, render_scene_identity) =
+            render_scene_with_viewport_background(
+                frame,
+                viewport_width as u32,
+                viewport_height as u32,
+            );
+        let proof = boon_native_gpu::render_app_owned_scene_pixels(
+            boon_native_gpu::AppOwnedRenderSceneRequest {
                 device,
                 queue,
-                frame: &render_frame,
+                scene: &render_scene,
+                render_identity_hash: &render_scene_identity,
                 surface_id: boon_host::SurfaceId(format!("visual-readback-{artifact_label}")),
                 surface_epoch: 0,
                 width: viewport_width as u32,
@@ -92516,13 +92539,18 @@ document:
             boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
                 artifact_path,
                 layout_frame_hash,
+                render_scene_identity_hash,
                 nonblank_samples,
                 ..
             } => {
                 assert_eq!(
-                    layout_frame_hash,
-                    &render_frame_hash(&render_frame),
-                    "{artifact_label} app-owned readback proof should bind to the rendered frame"
+                    layout_frame_hash, &render_scene_identity,
+                    "{artifact_label} app-owned readback proof should bind to the rendered scene"
+                );
+                assert_eq!(
+                    render_scene_identity_hash.as_deref(),
+                    Some(render_scene_identity.as_str()),
+                    "{artifact_label} app-owned readback proof should expose the rendered scene identity"
                 );
                 assert!(
                     *nonblank_samples > 100_000,

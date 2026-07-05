@@ -2492,6 +2492,11 @@ What changed:
 - Added a focused native GPU unit test proving the provenance field serializes
   into report-shaped JSON.
 
+2026-07-05 supersession: the `SurfaceRenderRequest<LayoutFrame>` and
+`render_app_owned_pixels(LayoutFrame)` compatibility adapters described here
+were deleted in the later cleanup slice. Current native GPU product/proof code
+must use pre-lowered document `RenderScene` requests.
+
 Commands run:
 
 | Command | Status | Evidence / Notes |
@@ -35684,3 +35689,44 @@ Current interpretation:
   architectural chunk should delete or quarantine legacy/default fallbacks and
   obsolete verifier paths, then move product rendering toward the typed
   ProductFrameGraph/ProofLane boundary.
+
+## 2026-07-05 - Legacy LayoutFrame Rasterizer And Readback Adapter Cut
+
+Status: implemented a cleanup cut toward a single document-render-scene native
+GPU proof path.
+
+What changed:
+
+- Deleted the unused native GPU compatibility lowerer that converted
+  `LayoutFrame` display items inside `boon_native_gpu`.
+- Deleted obsolete native GPU unit tests that exercised the removed
+  LayoutFrame style rasterizer instead of the active document render-scene
+  boundary.
+- Removed `boon_native_gpu::render_app_owned_pixels(LayoutFrame)` and its
+  `AppOwnedRenderRequest` API. App-owned proof callers now use
+  `render_app_owned_scene_pixels` with a render-scene identity.
+- Converted playground layout-proof/readback helpers and physical TodoMVC
+  visual readback tests to lower to a document render scene before proof.
+- Gated test-only playground helpers with `#[cfg(test)]` and removed unused
+  wrappers so product builds do not carry warning-only control-plane code.
+
+Evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p boon_native_gpu -p boon_native_playground`: pass with no
+  warnings after the cut.
+- `cargo test -q -p boon_native_gpu --lib`: pass, `52 passed`.
+- `cargo test -q -p boon_native_playground physical_todomvc_classic_dark_app_owned_readback_paints_dark_viewport_regions -- --test-threads=1`:
+  pass, `1 passed`, `281 filtered out`, finished in `106.84s`.
+- `cargo test -q -p boon_native_playground physical_todomvc_non_classic_app_owned_readbacks_render_text_naturally -- --test-threads=1`:
+  pass, `1 passed`, `281 filtered out`, finished in `107.74s`.
+
+Current interpretation:
+
+- Native GPU product/proof code no longer has a public LayoutFrame surface or
+  app-owned proof adapter. Callers must lower through the document
+  `RenderScene` boundary and pass a render-scene identity into native GPU.
+- The next high-leverage harness cut is to consolidate PlanExecutor source
+  replay freshness into one `xtask` classifier so native preview evidence,
+  native aggregates, and BYTES aggregates stop disagreeing on stale full
+  fingerprints versus fresh scoped replay identity.

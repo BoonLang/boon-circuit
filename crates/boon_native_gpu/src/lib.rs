@@ -261,13 +261,9 @@ pub struct FrameMetrics {
 }
 
 const RENDER_SCENE_SOURCE_COPY_TO_PRESENT_SCAFFOLD: &str = "copy-to-present-scaffold";
-const RENDER_SCENE_SOURCE_LAYOUT_FRAME_COMPAT_ADAPTER: &str =
-    "layout-frame-document-render-scene-compat-adapter";
 const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE: &str = "document-render-scene";
 const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE_PATCH: &str = "document-render-scene-patch";
 const RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE: &str = "internal-render-scene";
-const RENDER_SCENE_SOURCE_APP_OWNED_LAYOUT_FRAME_COMPAT_ADAPTER: &str =
-    "app-owned-layout-frame-document-render-scene-compat-adapter";
 const RENDER_SCENE_SOURCE_APP_OWNED_DOCUMENT_RENDER_SCENE: &str = "app-owned-document-render-scene";
 const RENDER_SCENE_SOURCE_APP_OWNED_WORLD_SCENE_PROJECTION: &str =
     "app-owned-world-scene-projection";
@@ -729,19 +725,6 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
 }
 
 #[derive(Clone, Debug)]
-pub struct AppOwnedRenderRequest<'a> {
-    pub device: &'a wgpu::Device,
-    pub queue: &'a wgpu::Queue,
-    pub frame: &'a LayoutFrame,
-    pub surface_id: SurfaceId,
-    pub surface_epoch: u64,
-    pub width: u32,
-    pub height: u32,
-    pub artifact_dir: &'a Path,
-    pub artifact_label: &'a str,
-}
-
-#[derive(Clone, Debug)]
 pub struct AppOwnedRenderSceneRequest<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
@@ -943,17 +926,6 @@ pub struct WorldSceneMeshPipelineProof {
     pub small_pick_readback_pick_id: Option<u32>,
     pub small_pick_readback_matches_full_pick: bool,
     pub render_identity_hash: String,
-}
-
-pub struct SurfaceRenderRequest<'a> {
-    pub device: &'a wgpu::Device,
-    pub queue: &'a wgpu::Queue,
-    pub encoder: &'a mut wgpu::CommandEncoder,
-    pub view: &'a wgpu::TextureView,
-    pub frame: &'a LayoutFrame,
-    pub format: wgpu::TextureFormat,
-    pub width: u32,
-    pub height: u32,
 }
 
 pub struct SurfaceRenderSceneRequest<'a> {
@@ -1988,26 +1960,6 @@ impl VisibleLayoutRenderer {
         }
     }
 
-    pub fn encode(
-        &mut self,
-        request: SurfaceRenderRequest<'_>,
-    ) -> Result<FrameMetrics, RenderError> {
-        self.frame_seq += 1;
-        encode_layout_to_surface_with_pipeline(
-            request,
-            &self.pipeline,
-            Some(&mut self.text),
-            &mut self.textures,
-            None,
-            Some(&mut self.quad_buffers),
-            Some(&mut self.quad_upload_ring),
-            Some(&mut self.prepared_quads),
-            Some(&mut self.previous_chunk_ids),
-            Some(&mut self.product_frame_graph),
-            self.frame_seq,
-        )
-    }
-
     pub fn encode_scene(
         &mut self,
         request: SurfaceRenderSceneRequest<'_>,
@@ -2047,13 +1999,6 @@ impl VisibleLayoutRenderer {
             self.frame_seq,
         )
     }
-}
-
-pub fn encode_layout_to_surface(
-    request: SurfaceRenderRequest<'_>,
-) -> Result<FrameMetrics, RenderError> {
-    let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, request.format);
-    renderer.encode(request)
 }
 
 pub fn encode_render_scene_to_surface(
@@ -2108,58 +2053,6 @@ fn evict_internal_scene_cache_if_needed(
     {
         cache.remove(&oldest_key);
     }
-}
-
-fn encode_layout_to_surface_with_pipeline(
-    request: SurfaceRenderRequest<'_>,
-    pipeline: &wgpu::RenderPipeline,
-    text: Option<&mut GlyphonTextState>,
-    textures: &mut TextureState,
-    internal_scene_cache: Option<&mut BTreeMap<InternalRenderSceneCacheKey, RenderScene>>,
-    quad_buffers: Option<&mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>>,
-    quad_upload_ring: Option<&mut QuadUploadRing>,
-    prepared_quads: Option<&mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>>,
-    previous_chunk_ids: Option<&mut BTreeSet<String>>,
-    product_frame_graph: Option<&mut ProductFrameGraphState>,
-    frame_seq: u64,
-) -> Result<FrameMetrics, RenderError> {
-    let width = request.width.clamp(1, 1920);
-    let height = request.height.clamp(1, 1080);
-    let mut columns = GlyphonRenderTextColumnMeasurer::new();
-    let document_scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
-        request.frame,
-        width,
-        height,
-        &mut columns,
-    );
-    let scene = render_scene_from_document_scene(&document_scene, width, height);
-    let mut metrics = encode_internal_scene_to_surface(
-        SceneEncodeRequest {
-            device: request.device,
-            queue: request.queue,
-            encoder: request.encoder,
-            view: request.view,
-            width,
-            height,
-        },
-        &scene,
-        pipeline,
-        text,
-        textures,
-        quad_buffers,
-        quad_upload_ring,
-        prepared_quads,
-        previous_chunk_ids,
-        product_frame_graph,
-        None,
-        frame_seq,
-    )?;
-    metrics.document_scene_convert_ms = 0.0;
-    metrics.document_scene_cache_hit = false;
-    metrics.document_scene_cache_entry_count =
-        internal_scene_cache.map_or(0, |cache| cache.len() as u32);
-    metrics.render_scene_source = RENDER_SCENE_SOURCE_LAYOUT_FRAME_COMPAT_ADAPTER.to_owned();
-    Ok(metrics)
 }
 
 fn encode_render_scene_to_surface_with_pipeline(
@@ -4150,202 +4043,6 @@ fn stable_text_hash(text: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-pub fn render_app_owned_pixels(
-    request: AppOwnedRenderRequest<'_>,
-) -> Result<RenderProof, RenderError> {
-    std::fs::create_dir_all(request.artifact_dir).map_err(|error| RenderError {
-        message: format!(
-            "create native GPU artifact directory `{}`: {error}",
-            request.artifact_dir.display()
-        ),
-    })?;
-    let width = request.width.clamp(1, 1920);
-    let height = request.height.clamp(1, 1080);
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let texture = request.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("boon-native-gpu-app-owned-texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let unpadded_bytes_per_row = width * 4;
-    let padded_bytes_per_row = align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-    let readback_size = padded_bytes_per_row as u64 * height as u64;
-    let readback = request.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("boon-native-gpu-readback-buffer"),
-        size: readback_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = request
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("boon-native-gpu-app-owned-encoder"),
-        });
-    let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, format);
-    let mut columns = GlyphonRenderTextColumnMeasurer::new();
-    let scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
-        request.frame,
-        width,
-        height,
-        &mut columns,
-    );
-    let mut metrics = renderer.encode_scene(SurfaceRenderSceneRequest {
-        device: request.device,
-        queue: request.queue,
-        encoder: &mut encoder,
-        view: &view,
-        scene: &scene,
-        scene_identity: None,
-        format,
-        width,
-        height,
-    })?;
-    metrics.render_scene_source =
-        RENDER_SCENE_SOURCE_APP_OWNED_LAYOUT_FRAME_COMPAT_ADAPTER.to_owned();
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let submission_index = request.queue.submit(Some(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    request
-        .device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission_index.clone()),
-            timeout: Some(APP_OWNED_READBACK_TIMEOUT),
-        })
-        .map_err(|error| RenderError {
-            message: readback_failure_message(
-                "poll",
-                &request,
-                width,
-                height,
-                Some(format!("{submission_index:?}")),
-                &error.to_string(),
-            ),
-        })?;
-    receiver
-        .recv_timeout(APP_OWNED_READBACK_TIMEOUT)
-        .map_err(|error| RenderError {
-            message: readback_failure_message(
-                "callback",
-                &request,
-                width,
-                height,
-                Some(format!("{submission_index:?}")),
-                &error.to_string(),
-            ),
-        })?
-        .map_err(|error| RenderError {
-            message: readback_failure_message(
-                "map",
-                &request,
-                width,
-                height,
-                Some(format!("{submission_index:?}")),
-                &error.to_string(),
-            ),
-        })?;
-
-    let mapped = slice.get_mapped_range();
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height as usize {
-        let start = row * padded_bytes_per_row as usize;
-        let end = start + unpadded_bytes_per_row as usize;
-        pixels.extend_from_slice(&mapped[start..end]);
-    }
-    drop(mapped);
-    readback.unmap();
-
-    let nonblank_samples = pixels
-        .chunks_exact(4)
-        .filter(|rgba| rgba[0] != 0 || rgba[1] != 0 || rgba[2] != 0 || rgba[3] != 0)
-        .count();
-    let unique_rgba_values = pixels
-        .chunks_exact(4)
-        .map(|rgba| [rgba[0], rgba[1], rgba[2], rgba[3]])
-        .collect::<BTreeSet<_>>()
-        .len();
-    let layout_frame_hash = layout_frame_hash(request.frame);
-    let layout_hash_prefix = layout_frame_hash
-        .get(..16)
-        .unwrap_or(layout_frame_hash.as_str());
-    let artifact_path = request.artifact_dir.join(format!(
-        "{}-{}-{}x{}-{}-{}.png",
-        std::process::id(),
-        request.artifact_label,
-        width,
-        height,
-        request.frame.display_list.len(),
-        layout_hash_prefix
-    ));
-    image::save_buffer(
-        &artifact_path,
-        &pixels,
-        width,
-        height,
-        image::ColorType::Rgba8,
-    )
-    .map_err(|error| RenderError {
-        message: format!(
-            "save native GPU artifact `{}`: {error}",
-            artifact_path.display()
-        ),
-    })?;
-    let artifact_sha256 = sha256_file(&artifact_path)?;
-    Ok(RenderProof {
-        artifact: RenderProofArtifact::AppOwnedPixels {
-            artifact_path: artifact_path.display().to_string(),
-            artifact_sha256,
-            capture_method: "wgpu-generated-shader-app-owned-readback".to_owned(),
-            surface_id: request.surface_id,
-            surface_epoch: request.surface_epoch,
-            frame_seq: 1,
-            layout_frame_hash,
-            render_scene_identity_hash: None,
-            width,
-            height,
-            nonblank_samples,
-            unique_rgba_values,
-            readback_deadline_ms: APP_OWNED_READBACK_TIMEOUT.as_millis() as u64,
-            readback_poll_status: "completed_before_deadline".to_owned(),
-        },
-        metrics: FrameMetrics { ..metrics },
-    })
 }
 
 pub fn render_app_owned_scene_pixels(
@@ -7228,24 +6925,6 @@ fn world_style_identity(
     }
 }
 
-fn readback_failure_message(
-    phase: &str,
-    request: &AppOwnedRenderRequest<'_>,
-    width: u32,
-    height: u32,
-    submission_index: Option<String>,
-    reason: &str,
-) -> String {
-    format!(
-        "native GPU readback {phase} failed before deadline: backend=wgpu adapter=unavailable frame_id={} surface={} requested_rect=0,0,{width},{height} submission={}; report_context=app_owned_render_pixels artifact_label={} deadline_ms={} reason={reason}",
-        layout_frame_hash(request.frame),
-        request.surface_id.0,
-        submission_index.unwrap_or_else(|| "unsubmitted".to_owned()),
-        request.artifact_label,
-        APP_OWNED_READBACK_TIMEOUT.as_millis(),
-    )
-}
-
 fn readback_scene_failure_message(
     phase: &str,
     request: &AppOwnedRenderSceneRequest<'_>,
@@ -9285,6 +8964,25 @@ mod tests {
             font_id: 5,
             pseudo_state_id: 6,
         }
+    }
+
+    fn test_document_scene_from_layout_frame(
+        frame: &LayoutFrame,
+        width: u32,
+        height: u32,
+    ) -> (DocumentRenderScene, String) {
+        let mut columns = GlyphonRenderTextColumnMeasurer::new();
+        let scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+            frame,
+            width,
+            height,
+            &mut columns,
+        );
+        let scene_identity = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&scene).expect("scene should serialize"))
+        );
+        (scene, scene_identity)
     }
 
     fn flatten_quad_batches(batches: &[QuadBatch]) -> (Vec<f32>, Vec<u8>) {
@@ -11491,10 +11189,22 @@ mod tests {
                 metrics: LayoutMetrics::default(),
             };
             let artifact_dir = Path::new("target/artifacts/native-gpu/tests");
-            let proof = render_app_owned_pixels(AppOwnedRenderRequest {
+            let mut columns = GlyphonRenderTextColumnMeasurer::new();
+            let scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
+                &frame,
+                80,
+                80,
+                &mut columns,
+            );
+            let render_identity_hash = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&scene).expect("scene should serialize"))
+            );
+            let proof = render_app_owned_scene_pixels(AppOwnedRenderSceneRequest {
                 device: &device,
                 queue: &queue,
-                frame: &frame,
+                scene: &scene,
+                render_identity_hash: &render_identity_hash,
                 surface_id: SurfaceId("svg-asset-test".to_owned()),
                 surface_epoch: 1,
                 width: 80,
@@ -11628,18 +11338,20 @@ mod tests {
             });
             let view = target.create_view(&wgpu::TextureViewDescriptor::default());
             let mut renderer = VisibleLayoutRenderer::new(&device, &queue, format);
+            let (scene, scene_identity) = test_document_scene_from_layout_frame(&frame, 80, 80);
 
             let mut first_encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("boon-native-gpu-svg-asset-cache-first"),
                 });
             let first = renderer
-                .encode(SurfaceRenderRequest {
+                .encode_scene(SurfaceRenderSceneRequest {
                     device: &device,
                     queue: &queue,
                     encoder: &mut first_encoder,
                     view: &view,
-                    frame: &frame,
+                    scene: &scene,
+                    scene_identity: Some(&scene_identity),
                     format,
                     width: 80,
                     height: 80,
@@ -11652,12 +11364,13 @@ mod tests {
                     label: Some("boon-native-gpu-svg-asset-cache-second"),
                 });
             let second = renderer
-                .encode(SurfaceRenderRequest {
+                .encode_scene(SurfaceRenderSceneRequest {
                     device: &device,
                     queue: &queue,
                     encoder: &mut second_encoder,
                     view: &view,
-                    frame: &frame,
+                    scene: &scene,
+                    scene_identity: Some(&scene_identity),
                     format,
                     width: 80,
                     height: 80,
@@ -13094,13 +12807,6 @@ mod tests {
 
 fn align_to(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
-}
-
-fn layout_frame_hash(frame: &LayoutFrame) -> String {
-    let bytes = serde_json::to_vec(frame).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn sha256_file(path: &Path) -> Result<String, RenderError> {

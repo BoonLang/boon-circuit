@@ -522,12 +522,19 @@ Remediation direction:
 
 Confirmed by reading:
 
-- `crates/boon_native_playground/src/main.rs:4430` uses a persistent visible
+- Native preview presentation uses a persistent visible
   `VisibleLayoutRenderer`.
-- `crates/boon_native_playground/src/main.rs:4446` can call
-  `render_app_owned_pixels` with a separate fresh renderer.
-- `crates/boon_native_gpu/src/lib.rs:943` builds offscreen textures, blocks on
-  `device.poll`, writes PNG, and returns `frame_seq: 1`.
+- App-owned proof/readback can use a separate offscreen target and renderer.
+- `render_app_owned_scene_pixels` builds an offscreen texture, blocks on
+  `device.poll`, writes PNG, and returns a proof tied to the supplied render
+  scene identity.
+
+2026-07-05 update:
+
+- The old `boon_native_gpu::render_app_owned_pixels(LayoutFrame)` API was
+  removed. Playground app-owned proofs now lower to a document render scene and
+  call `render_app_owned_scene_pixels`, so proof identity is render-scene based
+  rather than LayoutFrame-compat-adapter based.
 
 Risk or hypothesis:
 
@@ -838,4 +845,3 @@ observation and proof:
 - remediation does not weaken native GPU or scenario evidence;
 - follow-up work adds targeted tests or metrics before large refactors;
 - proof/report changes make evidence harder to fake, not easier to pass.
-

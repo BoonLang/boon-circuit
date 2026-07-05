@@ -78849,7 +78849,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
-    fn list_index_find_value_uses_text_lookup_index_for_runtime_list_ref() {
+    fn plan_executor_root_find_value_resolves_runtime_list_ref() {
         let source = r#"
 store: [
     sources: [
@@ -78873,89 +78873,66 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let runtime = LoadedRuntimeHarness::from_source("list-index-find-value", source).unwrap();
-        let generic = runtime.loaded_runtime_for_test().generic.as_ref().unwrap();
+        let mut runtime =
+            LiveRuntime::from_source_plan_executor("plan-executor-list-find-value", source)
+                .unwrap();
+        let summary = runtime.document_state_summary();
         assert_eq!(
-            generic
-                .storage
-                .root_textlike_ref("store.selected_value")
-                .unwrap(),
-            "second"
+            summary["store"]["selected_value"], "second",
+            "PlanExecutor root List/find_value should expose the first matching target value"
         );
-        assert!(
-            generic.list_scan_counters.text_lookup_index_hits > 0,
-            "List/find_value should use the exact text lookup index for ListRef rows"
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
         );
-        assert!(generic.list_scan_counters.text_lookup_index_candidates >= 2);
     }
 
     #[test]
-    fn list_index_find_uses_text_lookup_index_for_runtime_list_ref() {
+    fn plan_executor_root_find_projection_resolves_runtime_list_ref() {
         let source = r#"
 store: [
     sources: [
         noop: SOURCE
     ]
-    ready:
-        TEXT { ready } |> HOLD ready { LATEST {} }
+    selected:
+        TEXT { row-2 } |> HOLD selected {
+            LATEST {
+                sources.noop.text
+            }
+        }
     records:
         LIST {
             [key: TEXT { row-1 }, value: TEXT { first }]
             [key: TEXT { row-2 }, value: TEXT { second }]
             [key: TEXT { row-2 }, value: TEXT { duplicate }]
         }
+    selected_record:
+        List/find(records, field: "key", value: selected)
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LoadedRuntimeHarness::from_source("list-index-find", source).unwrap();
-        let generic = runtime
-            .loaded_runtime_for_test_mut()
-            .generic
-            .as_mut()
-            .unwrap();
-        let list = generic
-            .storage
-            .list_name_for_path("store.records")
-            .unwrap()
-            .to_owned();
-        generic.reset_list_scan_counters();
-        let mut frame = GenericEvalFrame::root();
-        let value = generic
-            .list_find(
-                BoonValue::ListRef(list.clone()),
-                "key",
-                BoonValue::Text("row-2".to_owned()),
-                &mut frame,
-            )
-            .unwrap();
+        let compiled = compile_source_text_to_machine_plan(
+            "plan-executor-list-find",
+            source,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("root List/find fixture should compile to a MachinePlan");
+        let initial = execute_machine_plan_initial_state(&compiled.plan)
+            .expect("PlanExecutor initial state should materialize root List/find projection");
         assert_eq!(
-            value,
-            BoonValue::RowRef {
-                list: list.clone(),
-                index: 1
-            }
+            initial.report["executed_list_projection_find_count"], 1,
+            "root List/find should lower to a PlanExecutor list projection"
         );
-        assert!(
-            generic.list_scan_counters.text_lookup_index_hits >= 1,
-            "List/find should use the exact text lookup index; counters={:?}",
-            generic.list_scan_counters
-        );
-        assert!(generic.list_scan_counters.text_lookup_index_candidates >= 2);
+
+        let mut runtime =
+            LiveRuntime::from_source_plan_executor("plan-executor-list-find", source).unwrap();
+        let summary = runtime.document_state_summary();
+        assert_eq!(summary["store"]["selected_record"]["key"], "row-2");
+        assert_eq!(summary["store"]["selected_record"]["value"], "second");
         assert_eq!(
-            generic.list_scan_counters.list_find_rows_scanned, 0,
-            "indexed List/find must not scan rows on exact text hits"
-        );
-        assert!(
-            frame
-                .reads
-                .contains(&list_lookup_text_read_key(&list, "key", "row-2")),
-            "List/find should register the exact lookup dependency for formula/currentness fanout"
-        );
-        assert!(
-            !frame.reads.contains(&list_column_read_key(&list, "key")),
-            "indexed List/find should not retain a broad column dependency; reads={:?}",
-            frame.reads
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
         );
     }
 

@@ -68375,8 +68375,8 @@ FUNCTION new_entry(entry) {
         }));
 
         let mut runtime =
-            LoadedRuntimeHarness::from_source("generic-list-projections", source).unwrap();
-        let summary = runtime.state_summary();
+            LiveRuntime::from_source_plan_executor("generic-list-projections", source).unwrap();
+        let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "B0");
         assert_eq!(summary["store"]["selected_input"]["value"], "2");
         assert_eq!(summary["store"]["visible_rows"][0]["row_number"], "0");

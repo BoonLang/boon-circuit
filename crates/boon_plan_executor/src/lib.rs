@@ -4844,29 +4844,54 @@ pub fn evaluate_root_row_expression_derived_values(
     plan: &MachinePlan,
     root_state: &JsonMap<String, JsonValue>,
 ) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
-    let mut values = BTreeMap::new();
-    for op in plan
+    let mut evaluation_state = root_state.clone();
+    evaluation_state
+        .entry("Router/route".to_owned())
+        .or_insert_with(|| json!("/"));
+    let derived_ops = plan
         .regions
         .iter()
         .filter(|region| region.kind == RegionKind::DerivedEvaluation)
         .flat_map(|region| region.ops.iter())
-    {
-        if op.indexed {
-            continue;
+        .filter_map(|op| {
+            if op.indexed {
+                return None;
+            }
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                return None;
+            };
+            let PlanOpKind::DerivedValue {
+                derived_kind: boon_plan::PlanDerivedKind::Pure,
+                expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            Some((op, output_id, expression))
+        })
+        .collect::<Vec<_>>();
+
+    let mut values = BTreeMap::new();
+    let mut resolved = BTreeSet::new();
+    while resolved.len() < derived_ops.len() {
+        let mut progressed = false;
+        for (op, output_id, expression) in &derived_ops {
+            if resolved.contains(&op.id) {
+                continue;
+            }
+            let Ok(value) =
+                eval_root_source_transform_row_expression(plan, &evaluation_state, expression)
+            else {
+                continue;
+            };
+            evaluation_state.insert(derived_field_label(plan, output_id.0), value.clone());
+            values.insert(*output_id, value);
+            resolved.insert(op.id);
+            progressed = true;
         }
-        let Some(ValueRef::Field(output_id)) = op.output else {
-            continue;
-        };
-        let PlanOpKind::DerivedValue {
-            derived_kind: boon_plan::PlanDerivedKind::Pure,
-            expression: Some(PlanDerivedExpression::RowExpression { expression }),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        if let Ok(value) = eval_root_source_transform_row_expression(plan, root_state, expression) {
-            values.insert(output_id, value);
+        if !progressed {
+            break;
         }
     }
     Ok(values)

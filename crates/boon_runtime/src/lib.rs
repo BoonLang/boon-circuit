@@ -4286,7 +4286,7 @@ impl PlanExecutorRuntimeState {
                     .into()
                 })
             };
-            collect_plan_root_update_candidate_for_step(
+            let collection = collect_plan_root_update_candidate_for_step(
                 plan,
                 op,
                 source_id,
@@ -4298,6 +4298,12 @@ impl PlanExecutorRuntimeState {
                 &mut touched_updates,
                 &mut runtime_branch,
             )?;
+            if collection.inserted_update {
+                refresh_plan_root_row_expression_derived_values_in_state(
+                    plan,
+                    &mut staged_root_state.root_state,
+                );
+            }
         }
 
         let root_update_commit_batch = commit_plan_ordered_root_update_candidates(
@@ -5764,11 +5770,16 @@ fn plan_executor_insert_root_row_expression_summaries(
         ) {
             continue;
         }
-        let Ok(value) = eval_plan_row_expression(plan, list_state, &root_eval_row, expression)
-        else {
-            continue;
-        };
         let target = plan_derived_field_label(plan, output_id.0);
+        let value = if let Some(value) = root_state.get(&target).cloned() {
+            value
+        } else {
+            let Ok(value) = eval_plan_row_expression(plan, list_state, &root_eval_row, expression)
+            else {
+                continue;
+            };
+            value
+        };
         let value = plan_executor_document_summary_value(value);
         if let Some(rows) = value.as_array() {
             let row_count = rows.len();
@@ -6384,6 +6395,17 @@ fn plan_executor_root_derived_values(
         }
     }
     Ok(values)
+}
+
+fn refresh_plan_root_row_expression_derived_values_in_state(
+    plan: &MachinePlan,
+    root_state: &mut serde_json::Map<String, JsonValue>,
+) {
+    if let Ok(root_values) = evaluate_plan_root_row_expression_derived_values(plan, root_state) {
+        for (field_id, value) in root_values {
+            root_state.insert(plan_derived_field_label(plan, field_id.0), value);
+        }
+    }
 }
 
 fn commit_root_list_derived_values_to_root_state(
@@ -8348,6 +8370,10 @@ fn root_update_value_ref_json(
             Ok(root_state_value(plan, root_state, *state_id, op_id)?.clone())
         }
         ValueRef::Field(field_id) => {
+            let derived_label = plan_derived_field_label(plan, field_id.0);
+            if let Some(value) = root_state.get(&derived_label).cloned() {
+                return Ok(value);
+            }
             let semantic_label = plan_semantic_field_label(plan, field_id.0);
             if let Some(value) = root_state.get(&semantic_label).cloned() {
                 return Ok(value);
@@ -66949,17 +66975,23 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.cursor))
 "#;
-        let mut runtime =
-            LoadedRuntimeHarness::from_source("root-scalar-same-event-flush", source).unwrap();
+        let mut runtime = PlanExecutorLiveSession::from_source(
+            "root-scalar-same-event-flush",
+            source,
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap();
         assert_eq!(runtime.state_summary()["store"]["cursor"], "A:ready");
 
-        let output = runtime
-            .apply_source_event_turn(LiveSourceEvent {
+        let step_report = runtime
+            .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select".to_owned(),
                 text: Some("b".to_owned()),
                 ..LiveSourceEvent::default()
             })
             .unwrap();
+        let output = plan_executor_step_report_to_live_turn_output(&step_report, 0.0)
+            .expect("step report should convert to live output");
 
         let state_summary = runtime.state_summary();
         assert_eq!(state_summary["store"]["active"], "b");
@@ -66970,12 +67002,13 @@ document: Document/new(root: Element/label(element: [], label: store.cursor))
             "cursor must read the same-event recomputed default_label, not the stale initial value"
         );
         assert!(
-            output
-                .runtime_step_profile
-                .source_action_root_dependency_flush_count
-                >= 1,
-            "reading a dirty derived root in the same source action must still force an intermediate root flush: {:?}",
-            output.runtime_step_profile
+            output.semantic_deltas.iter().any(|delta| {
+                delta.kind == "FieldSet"
+                    && delta.field_path.as_deref() == Some("store.cursor")
+                    && matches!(&delta.value, ProtocolValue::Text(value) if value == "B:ready")
+            }),
+            "cursor update should be emitted from the PlanExecutor same-turn currentness path: {:#?}",
+            output.semantic_deltas
         );
     }
 

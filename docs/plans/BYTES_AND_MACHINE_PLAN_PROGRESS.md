@@ -37302,3 +37302,36 @@ Remaining legacy implementation:
 - `boon_report_schema` still validates historical Ply/manual report shapes.
   That is schema-history support, not an executable playground, but should be
   cut in a later schema-history cleanup if those reports are no longer kept.
+
+## 2026-07-05 - Retired Ply And Manual Report Schema Acceptance
+
+Status: removed the old Ply/headed/manual proof layers from the runtime
+verification enum and from report-schema validation. The deleted
+`boon_ply_playground` path is no longer accepted as a valid fresh evidence
+shape.
+
+What changed:
+
+- Removed `HeadlessPly`, `HeadedPly`, `OperatorE2e`, and `Human` from
+  `boon_runtime::VerificationLayer`.
+- Runtime scenario reports now describe only semantic/speed runtime execution;
+  Ply patch timing and headed presentation timing are explicitly unavailable
+  because native GPU reports own visible-surface evidence.
+- Removed report-schema dispatch and validators for `headed-ply`, `human`,
+  and the old `os-input-probe`/`focused_ply_element` proof path.
+- Kept only generic command-argv helper utilities that are still used by
+  current report validators.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass.
+- `cargo test -q -p boon_report_schema`: pass.
+- `cargo test -q -p boon_runtime --no-run`: pass.
+
+Remaining legacy implementation:
+
+- `boon_runtime` still owns raw `run_legacy_scenario`, `LoadedRuntime`, and
+  `GenericScheduledRuntime` internals/tests for the next retirement slice.
+- `xtask` still carries removed-command negative/audit strings for old Ply
+  command names; these now reject the paths rather than execute or validate
+  them.

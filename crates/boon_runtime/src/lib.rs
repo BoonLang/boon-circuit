@@ -625,10 +625,6 @@ pub struct CellErrorExpectation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerificationLayer {
     Semantic,
-    HeadlessPly,
-    HeadedPly,
-    OperatorE2e,
-    Human,
     Speed,
     Negative,
     All,
@@ -638,10 +634,6 @@ impl VerificationLayer {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Semantic => "semantic",
-            Self::HeadlessPly => "ply-headless",
-            Self::HeadedPly => "headed-ply",
-            Self::OperatorE2e => "operator-e2e",
-            Self::Human => "human",
             Self::Speed => "speed",
             Self::Negative => "negative",
             Self::All => "all",
@@ -651,7 +643,6 @@ impl VerificationLayer {
     pub fn measurement_mode(self) -> &'static str {
         match self {
             Self::Speed => "interaction",
-            Self::HeadlessPly | Self::HeadedPly | Self::OperatorE2e | Self::Human => "proof",
             Self::Semantic | Self::Negative | Self::All => "proof",
         }
     }
@@ -22515,27 +22506,12 @@ fn base_example_report(
         "sample_count": latencies.len() as u64,
         "included_in_semantic_tick": true
     });
-    let ply_patch_apply_latency = if matches!(
-        layer,
-        VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly
-    ) {
-        json!({
-            "unavailable_reason": "Ply patch application is exercised by this layer but not separately timed from the scenario tick"
-        })
-    } else {
-        json!({
-            "unavailable_reason": "semantic/runtime speed layer does not open Ply; headed reports cover the real Ply surface"
-        })
-    };
-    let frame_time_latency = if matches!(layer, VerificationLayer::HeadedPly) {
-        json!({
-            "unavailable_reason": "headed verifier records window/display/screenshot evidence but does not instrument presented frame timing"
-        })
-    } else {
-        json!({
-            "unavailable_reason": "this runtime verification layer has no presented frame timing"
-        })
-    };
+    let ply_patch_apply_latency = json!({
+        "unavailable_reason": "legacy Ply verification layers have been removed; native GPU reports own visible-surface timing"
+    });
+    let frame_time_latency = json!({
+        "unavailable_reason": "this runtime verification layer has no presented frame timing"
+    });
     let dirty_as_f64 = dirty_counts
         .iter()
         .map(|value| *value as f64)
@@ -22782,7 +22758,7 @@ fn base_example_report(
         "capacities": capacity_report,
         "compiled_schedule": compiled.report(),
         "runtime_execution": runtime_execution,
-        "renderer": if matches!(layer, VerificationLayer::HeadlessPly | VerificationLayer::HeadedPly) { "ply-engine" } else { "semantic" },
+        "renderer": "semantic",
         "display_scale": std::env::var("GDK_SCALE").unwrap_or_else(|_| "1".to_owned()),
         "window_size": runtime_window_size(layer),
         "framebuffer_size": runtime_framebuffer_size(layer),
@@ -23637,12 +23613,6 @@ fn enrich_report(
             json!(report_path.display().to_string()),
         );
     }
-    if matches!(
-        layer,
-        VerificationLayer::HeadedPly | VerificationLayer::Human
-    ) {
-        boon_report_schema::enrich_headed_runtime_surface(object, "generic");
-    }
     Ok(())
 }
 
@@ -23875,33 +23845,19 @@ fn runtime_change_batches_for_step_counts<T: Clone>(
 
 fn runtime_window_size(layer: VerificationLayer) -> JsonValue {
     match layer {
-        VerificationLayer::HeadedPly
-        | VerificationLayer::Human
-        | VerificationLayer::HeadlessPly => {
-            json!([1280, 820])
-        }
         VerificationLayer::Semantic | VerificationLayer::Speed => {
             json!({"unavailable_reason": "semantic/runtime layer does not open a window"})
         }
-        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
-            json!("not-applicable")
-        }
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
     }
 }
 
 fn runtime_framebuffer_size(layer: VerificationLayer) -> JsonValue {
     match layer {
-        VerificationLayer::HeadedPly
-        | VerificationLayer::Human
-        | VerificationLayer::HeadlessPly => {
-            json!([1280, 820])
-        }
         VerificationLayer::Semantic | VerificationLayer::Speed => {
             json!({"unavailable_reason": "semantic/runtime layer does not capture a framebuffer"})
         }
-        VerificationLayer::OperatorE2e | VerificationLayer::Negative | VerificationLayer::All => {
-            json!("not-applicable")
-        }
+        VerificationLayer::Negative | VerificationLayer::All => json!("not-applicable"),
     }
 }
 

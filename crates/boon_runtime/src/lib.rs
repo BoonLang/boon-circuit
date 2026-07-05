@@ -10784,6 +10784,7 @@ pub struct LiveRuntime {
 
 #[derive(Clone)]
 enum LiveRuntimeEngine {
+    #[cfg(test)]
     Legacy(LoadedRuntime),
     PlanExecutor(PlanExecutorLiveSession),
 }
@@ -10819,6 +10820,7 @@ fn runtime_plan_cache() -> &'static Mutex<BTreeMap<String, CachedRuntimePlan>> {
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+#[cfg(test)]
 fn initialized_live_runtime_cache() -> &'static Mutex<BTreeMap<String, LiveRuntime>> {
     static CACHE: OnceLock<Mutex<BTreeMap<String, LiveRuntime>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -11141,6 +11143,7 @@ fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<St
 impl LiveRuntime {
     fn legacy_runtime(&self) -> RuntimeResult<&LoadedRuntime> {
         match &self.engine {
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(runtime) => Ok(runtime),
             LiveRuntimeEngine::PlanExecutor(_) => Err(
                 "PlanExecutor LiveRuntime has no LoadedRuntime; refusing hidden fallback".into(),
@@ -11150,6 +11153,7 @@ impl LiveRuntime {
 
     fn legacy_runtime_mut(&mut self) -> RuntimeResult<&mut LoadedRuntime> {
         match &mut self.engine {
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(runtime) => Ok(runtime),
             LiveRuntimeEngine::PlanExecutor(_) => Err(
                 "PlanExecutor LiveRuntime has no LoadedRuntime; refusing hidden fallback".into(),
@@ -11160,6 +11164,7 @@ impl LiveRuntime {
     fn plan_session(&self) -> Option<&PlanExecutorLiveSession> {
         match &self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => Some(session),
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(_) => None,
         }
     }
@@ -11167,6 +11172,7 @@ impl LiveRuntime {
     fn plan_session_mut(&mut self) -> Option<&mut PlanExecutorLiveSession> {
         match &mut self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => Some(session),
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(_) => None,
         }
     }
@@ -11188,6 +11194,7 @@ impl LiveRuntime {
         Self::from_source_plan_executor(source_label, source_text)
     }
 
+    #[cfg(test)]
     fn new_legacy(
         source_label: &str,
         source_text: &str,
@@ -11213,6 +11220,7 @@ impl LiveRuntime {
         Self::from_project_plan_executor(source_label, units)
     }
 
+    #[cfg(test)]
     fn new_from_project_legacy(
         source_label: &str,
         units: &[RuntimeSourceUnit],
@@ -11233,6 +11241,7 @@ impl LiveRuntime {
         Self::from_source_plan_executor(source_label, source_text)
     }
 
+    #[cfg(test)]
     fn from_source_legacy(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
@@ -11260,6 +11269,7 @@ impl LiveRuntime {
         Self::from_project_plan_executor(source_label, units)
     }
 
+    #[cfg(test)]
     fn from_project_legacy(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
@@ -11338,6 +11348,7 @@ impl LiveRuntime {
         Ok((runtime, profile))
     }
 
+    #[cfg(test)]
     fn from_project_legacy_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
@@ -11406,6 +11417,7 @@ impl LiveRuntime {
     pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
         match &mut self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => session.world_scene_output(),
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(runtime) => runtime.world_scene_output(),
         }
     }
@@ -11413,6 +11425,7 @@ impl LiveRuntime {
     pub fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
         match &mut self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => session.solid_model_output(),
+            #[cfg(test)]
             LiveRuntimeEngine::Legacy(runtime) => runtime.solid_model_output(),
         }
     }

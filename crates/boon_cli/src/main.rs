@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 const CLI_HELP: &str = "\
 usage:
-  boon_cli run <source> [--scenario <path>] [--engine <plan>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
+  boon_cli run <source> [--scenario <path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
@@ -63,7 +63,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("missing source path")?;
     let mut scenario = None;
-    let mut engine = "plan".to_owned();
     let mut target = "software_default".to_owned();
     let mut report = None;
     let mut explicit_report = false;
@@ -73,13 +72,6 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[index].as_str() {
             "--scenario" => {
                 scenario = args.get(index + 1).cloned();
-                index += 2;
-            }
-            "--engine" => {
-                engine = args
-                    .get(index + 1)
-                    .ok_or("missing value for --engine")?
-                    .clone();
                 index += 2;
             }
             "--target" | "--profile" => {
@@ -110,45 +102,31 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => default_scenario(source)?,
     };
     let report = report.or_else(|| default_cli_report(source, &scenario));
-    match engine.as_str() {
-        "plan" => {
-            let target_profile = TargetProfile::from_name(&target)?;
-            let output = run_plan_scenario_events(
-                Path::new(source),
-                Path::new(&scenario),
-                target_profile,
-                report.as_deref(),
-            )?;
-            if print_report || !explicit_report {
-                println!("{}", serde_json::to_string_pretty(&output.report)?);
-            }
-            if output
+    let target_profile = TargetProfile::from_name(&target)?;
+    let output = run_plan_scenario_events(
+        Path::new(source),
+        Path::new(&scenario),
+        target_profile,
+        report.as_deref(),
+    )?;
+    if print_report || !explicit_report {
+        println!("{}", serde_json::to_string_pretty(&output.report)?);
+    }
+    if output
+        .report
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("pass")
+    {
+        return Err(format!(
+            "run report status is `{}`",
+            output
                 .report
                 .get("status")
                 .and_then(serde_json::Value::as_str)
-                != Some("pass")
-            {
-                return Err(format!(
-                    "run --engine {engine} report status is `{}`",
-                    output
-                        .report
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
-                )
-                .into());
-            }
-        }
-        "legacy" | "semantic" => {
-            return Err(
-                "normal `run` no longer exposes the legacy runtime; use PlanExecutor product commands"
-                    .into(),
-            );
-        }
-        "compare" => {
-            return Err("normal `run` no longer exposes legacy comparison".into());
-        }
-        other => return Err(format!("unknown run engine `{other}`").into()),
+                .unwrap_or("unknown")
+        )
+        .into());
     }
     Ok(())
 }
@@ -285,9 +263,6 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 index += 2;
             }
-            "--diagnostic-compare-legacy" | "--compare-legacy" => {
-                return Err("run-plan-route no longer exposes legacy comparison".into());
-            }
             "--target" | "--profile" => {
                 target_profile = args
                     .get(index + 1)
@@ -374,11 +349,6 @@ fn run_plan_root_scalar_scenario_cmd(args: &[String]) -> Result<(), Box<dyn std:
                         .clone(),
                 );
                 index += 2;
-            }
-            "--diagnostic-compare-legacy" | "--compare-legacy" => {
-                return Err(
-                    "run-plan-root-scalar-scenario no longer exposes legacy comparison".into(),
-                );
             }
             "--target" | "--profile" => {
                 target_profile = args
@@ -1137,10 +1107,7 @@ mod tests {
         assert!(CLI_HELP.contains("target/reports/<example>-cli-run.json"));
         assert!(CLI_HELP.contains("--scenario <path>"));
         assert!(CLI_HELP.contains("--report <path>"));
-        assert!(!CLI_HELP.contains("diagnose-plan-legacy-compare"));
-        assert!(!CLI_HELP.contains("[--diagnostic-compare-legacy]"));
-        assert!(!CLI_HELP.contains("--engine <legacy|plan|compare>"));
-        assert!(!CLI_HELP.contains("[--compare-legacy]"));
+        assert!(!CLI_HELP.contains("--engine <"));
     }
 
     #[test]

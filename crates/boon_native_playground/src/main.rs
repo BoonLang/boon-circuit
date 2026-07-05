@@ -22964,7 +22964,7 @@ impl DevWindowShell {
         value["custom_source_persistence"] = self.persist_selected_custom_source("EditorTextInput");
         value["host_synthetic_activation"] = activation;
         value["input_evidence_tier"] = json!("boon-driver");
-        value["legacy_input_evidence_tier"] = json!("host-synthetic");
+        value["host_synthetic_input_evidence_tier"] = json!("host-synthetic");
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] =
             json!("Document SourceBinding -> DevWindowShell -> CodeEditorModel");
@@ -22999,7 +22999,7 @@ impl DevWindowShell {
         let mut value = self.dispatch_source_path(source_path);
         value["host_synthetic_activation"] = activation;
         value["input_evidence_tier"] = json!("boon-driver");
-        value["legacy_input_evidence_tier"] = json!("host-synthetic");
+        value["host_synthetic_input_evidence_tier"] = json!("host-synthetic");
         value["activation_boundary"] =
             json!("HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell");
         value["direct_dispatch_without_hit_test"] = json!(false);
@@ -23033,7 +23033,7 @@ impl DevWindowShell {
                 return json!({
                     "status": "fail",
                     "evidence_tier": "boon-driver",
-                    "legacy_evidence_tier": "host-synthetic",
+                    "host_synthetic_evidence_tier": "host-synthetic",
                     "requested_source_path": source_path,
                     "typed_index_error": error.to_string(),
                     "hit_test_performed": false
@@ -23056,7 +23056,7 @@ impl DevWindowShell {
                 return json!({
                     "status": "fail",
                     "evidence_tier": "boon-driver",
-                    "legacy_evidence_tier": "host-synthetic",
+                    "host_synthetic_evidence_tier": "host-synthetic",
                     "requested_source_path": source_path,
                     "typed_layout_error": error.to_string(),
                     "hit_test_performed": false
@@ -23069,7 +23069,7 @@ impl DevWindowShell {
                 return json!({
                     "status": "fail",
                     "evidence_tier": "boon-driver",
-                    "legacy_evidence_tier": "host-synthetic",
+                    "host_synthetic_evidence_tier": "host-synthetic",
                     "requested_source_path": source_path,
                     "typed_hit_table_error": error.to_string(),
                     "hit_test_performed": false
@@ -23087,7 +23087,7 @@ impl DevWindowShell {
         json!({
             "status": if pass { "pass" } else { "fail" },
             "evidence_tier": "boon-driver",
-            "legacy_evidence_tier": "host-synthetic",
+            "host_synthetic_evidence_tier": "host-synthetic",
             "requested_source_path": source_path,
             "source_binding_resolved": source_intent.is_some(),
             "target_source_intent": source_intent.unwrap_or_else(|| json!(null)),
@@ -23766,7 +23766,7 @@ impl DevWindowShell {
         } else {
             "boon-driver"
         });
-        probe["legacy_evidence_tier"] = json!("host-synthetic");
+        probe["host_synthetic_evidence_tier"] = json!("host-synthetic");
         probe["visible_window_input"] = json!(real_window_input_observed);
         probe["app_owned_window_input"] = json!(app_owned_window_input_observed);
         probe["input_injection_method"] = json!(input_method);

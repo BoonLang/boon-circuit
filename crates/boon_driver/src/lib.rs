@@ -8,7 +8,7 @@ pub const TIER_RUNTIME: &str = "runtime";
 pub const TIER_BOON_DRIVER: &str = "boon-driver";
 pub const TIER_REAL_WINDOW: &str = "real-window";
 pub const TIER_HUMAN: &str = "human";
-pub const LEGACY_TIER_HOST_SYNTHETIC: &str = "host-synthetic";
+pub const TIER_HOST_SYNTHETIC: &str = "host-synthetic";
 
 pub const METHOD_APP_OWNED_HOST_INPUT: &str = "boon-driver-app-owned-host-input";
 pub const METHOD_LINUX_HUMAN_LIKE: &str = "linux-human-like-isolated-compositor";
@@ -412,7 +412,7 @@ impl DriverEvidenceTier {
 pub fn evidence_tier_rank(tier: &str) -> Option<u8> {
     match tier {
         TIER_RUNTIME => Some(0),
-        TIER_BOON_DRIVER | LEGACY_TIER_HOST_SYNTHETIC => Some(1),
+        TIER_BOON_DRIVER | TIER_HOST_SYNTHETIC => Some(1),
         TIER_REAL_WINDOW => Some(2),
         TIER_HUMAN => Some(3),
         _ => None,
@@ -585,7 +585,7 @@ pub fn app_owned_preview_proof(report: &Value) -> Value {
     json!({
         "status": if pass { "pass" } else { "fail" },
         "evidence_tier": TIER_BOON_DRIVER,
-        "legacy_evidence_tier": LEGACY_TIER_HOST_SYNTHETIC,
+        "host_synthetic_evidence_tier": TIER_HOST_SYNTHETIC,
         "method": METHOD_APP_OWNED_HOST_INPUT,
         "real_window_claimed": false,
         "human_observation_claimed": false,
@@ -695,8 +695,8 @@ pub fn app_owned_dev_window_proof(report: &Value) -> Value {
     json!({
         "status": if pass { "pass" } else { "fail" },
         "evidence_tier": TIER_BOON_DRIVER,
-        "legacy_evidence_tier": probe.get("evidence_tier").and_then(Value::as_str)
-            .unwrap_or(LEGACY_TIER_HOST_SYNTHETIC),
+        "host_synthetic_evidence_tier": probe.get("evidence_tier").and_then(Value::as_str)
+            .unwrap_or(TIER_HOST_SYNTHETIC),
         "method": METHOD_APP_OWNED_HOST_INPUT,
         "real_window_claimed": false,
         "command_proofs": command_proofs,
@@ -746,8 +746,8 @@ pub fn app_owned_speed_proof(report: &Value) -> Value {
     json!({
         "status": if pass { "pass" } else { "fail" },
         "evidence_tier": TIER_BOON_DRIVER,
-        "legacy_evidence_tier": report.get("evidence_tier").and_then(Value::as_str)
-            .unwrap_or(LEGACY_TIER_HOST_SYNTHETIC),
+        "host_synthetic_evidence_tier": report.get("evidence_tier").and_then(Value::as_str)
+            .unwrap_or(TIER_HOST_SYNTHETIC),
         "method": METHOD_APP_OWNED_HOST_INPUT,
         "real_window_claimed": false,
         "budget_pass": budget_pass,
@@ -875,7 +875,7 @@ mod tests {
     fn boon_driver_tier_does_not_satisfy_real_window() {
         assert!(evidence_tier_satisfies(
             TIER_BOON_DRIVER,
-            LEGACY_TIER_HOST_SYNTHETIC
+            TIER_HOST_SYNTHETIC
         ));
         assert!(evidence_tier_satisfies(TIER_REAL_WINDOW, TIER_BOON_DRIVER));
         assert!(!evidence_tier_satisfies(TIER_BOON_DRIVER, TIER_REAL_WINDOW));

@@ -35798,3 +35798,37 @@ Current interpretation:
 - Remaining proof-lane cleanup is to remove the legacy fields themselves from
   product reports once all report schemas and native UX gates consume the
   post-present proof identity instead of compatibility booleans/counters.
+
+## 2026-07-05 - Native GPU Architecture Audit Adapter Expectation Cut
+
+Status: implemented a verifier/harness cleanup slice.
+
+What changed:
+
+- Updated `verify-native-gpu-architecture` so it no longer expects the deleted
+  `SurfaceRenderRequest` / `encode_layout_to_surface*` compatibility adapter to
+  exist.
+- The architecture audit now checks that the LayoutFrame surface/proof adapter
+  is absent and that native GPU visible rendering accepts pre-lowered document
+  `RenderScene` requests.
+- Removed the stale check that treated the old compatibility adapter as a
+  required architecture milestone.
+
+Evidence:
+
+- `cargo check -q -p xtask`: pass.
+- `cargo fmt -- --check`: pass.
+- `cargo run -q -p xtask -- verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`:
+  pass, wrote `target/reports/native-gpu/architecture.json`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu/architecture.json`:
+  pass.
+- `jq -c '{status, command, blocker_count: (.blockers|length), failed_checks: [.checks[]? | select(.pass == false) | .id]}' target/reports/native-gpu/architecture.json`:
+  `{"status":"pass","command":"verify-native-gpu-architecture","blocker_count":0,"failed_checks":[]}`.
+
+Current interpretation:
+
+- The harness no longer preserves the deleted LayoutFrame compatibility
+  adapter by accident.
+- Future native GPU architecture failures should point at current retained
+  scene/render-graph issues rather than the removed compatibility migration
+  stage.

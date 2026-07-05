@@ -36714,3 +36714,40 @@ Current interpretation:
 - Next high-leverage cuts are either root/indexed `ListFindValue` update branch
   support plus typed operands, or compiler lowering for the expression-less
   pure/list-view fields that dominate the unsupported count.
+
+## 2026-07-05 - Root ReadPath Derived-Field Support
+
+Status: added generic root `ReadPath` support for derived-field inputs. This
+continues replacing legacy root update behavior with PlanExecutor-owned JSON
+execution and support predicates.
+
+What changed:
+
+- Root `ReadPath` update evaluation now accepts a single non-output state or
+  root derived field input.
+- Root derived-field values are read through the same `root_update_json_value`
+  barrier used by `MatchConst`/`MatchValueConst`, with BYTES values still
+  rejected from the JSON surface.
+- MachinePlan support checks now accept a declared field input for root
+  `ReadPath` when the output is not BYTES.
+
+Evidence:
+
+- `cargo test -q -p boon_plan root_read_path_supports_declared_derived_field_input`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_read_path_update_reads_derived_field_value`:
+  pass.
+- `cargo check -q -p boon_plan -p boon_plan_executor -p boon_compiler -p boon_cli`:
+  pass.
+
+Fresh NovyWave evidence:
+
+- `cargo run -q -p boon_cli -- dump-plan examples/novywave/RUN.bn --report
+  target/reports/novywave-plan-dump.json` completed.
+- Compact summary: `status=fail`, `cpu_plan_executor_unsupported_op_count=432`,
+  `unresolved_executable_ref_count=7`, failing verification checks `[]`.
+- The fresh plan still has 77 `read_path` update branches in total, but the
+  unsupported count moved by 64 after root field-read support. Remaining
+  unsupported work is now more concentrated in expression-less pure/list-view
+  derived fields, `ListFindValue` update branches, indexed numeric match
+  branches, and the unresolved `store.variable_rows` projection.

@@ -12632,8 +12632,35 @@ pub fn evaluate_root_json_update_branch(
                     )),
                 )
             } else {
-                let input_state_id = root_single_state_input(op)?;
-                let value = root_state_value(plan, root_state, input_state_id, op.id.0)?.clone();
+                let input = root_single_state_or_field_input(op, output_state_id)?;
+                let Some(value) = root_update_json_value_for_ref(
+                    plan,
+                    event,
+                    root_state,
+                    &input,
+                    source_id,
+                    op.id,
+                    "read-path input",
+                )?
+                else {
+                    return Ok(root_json_update_outcome(
+                        op.id,
+                        true,
+                        true,
+                        None,
+                        Some(output_state_id),
+                        None,
+                        Some((
+                            "read_path",
+                            json!({
+                                "input_missing": true,
+                                "skip": true,
+                            }),
+                            JsonValue::Null,
+                            JsonValue::Null,
+                        )),
+                    ));
+                };
                 if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
                     return Ok(root_json_update_outcome(
                         op.id,
@@ -14147,6 +14174,30 @@ fn root_single_state_input(op: &PlanOp) -> PlanExecutorResult<StateId> {
         .into());
     };
     Ok(*input)
+}
+
+fn root_single_state_or_field_input(
+    op: &PlanOp,
+    output_state_id: StateId,
+) -> PlanExecutorResult<ValueRef> {
+    let inputs = op
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            ValueRef::State(state_id) if *state_id != output_state_id => Some(input.clone()),
+            ValueRef::Field(_) => Some(input.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return Err(format!(
+            "root update branch {} expected one non-output state or derived-field input, found {}",
+            op.id.0,
+            inputs.len()
+        )
+        .into());
+    };
+    Ok(input.clone())
 }
 
 fn root_text_bytes_conversion_operands(
@@ -18488,6 +18539,129 @@ mod tests {
         assert!(skipped.supported);
         assert!(skipped.skipped_by_guard);
         assert_eq!(skipped.value, None);
+    }
+
+    #[test]
+    fn root_read_path_update_reads_derived_field_value() {
+        let source_id = SourceId(12);
+        let output_state_id = StateId(13);
+        let field_id = FieldId(14);
+        let update_op = PlanOp {
+            id: PlanOpId(15),
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::ReadPath,
+                ordered_inputs: Vec::new(),
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: vec![ValueRef::Source(source_id), ValueRef::Field(field_id)],
+            output: Some(ValueRef::State(output_state_id)),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        };
+        let source_route = SourceRoute {
+            id: boon_plan::PlanSourceRouteId(0),
+            source_id,
+            path: "store.trigger".to_owned(),
+            scoped: false,
+            scope_id: None,
+            payload_schema: boon_plan::SourcePayloadSchema {
+                fields: Vec::new(),
+                typed_fields: Vec::new(),
+                row_lookup_field: None,
+                address_lookup_field: None,
+            },
+        };
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants: Vec::new(),
+            source_routes: vec![source_route.clone()],
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: vec![boon_plan::ScalarStorageSlot {
+                    id: boon_plan::PlanStorageId(0),
+                    state_id: output_state_id,
+                    value_type: PlanValueType::Text,
+                    scope_id: None,
+                    indexed: false,
+                    initial_value_kind: InitialValueKind::Text,
+                    initial_constant_id: None,
+                    initial_root_field_path: None,
+                    initial_row_field_path: None,
+                }],
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: vec![boon_plan::OperationRegion {
+                id: boon_plan::PlanRegionId(3),
+                kind: RegionKind::UpdateBranches,
+                ops: vec![update_op.clone()],
+            }],
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 1,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 0,
+                source_route_count: 1,
+                scalar_storage_count: 1,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 1,
+                typed_value_ref_count: 4,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: vec![boon_plan::DebugEntry {
+                    id: "source:12".to_owned(),
+                    label: "store.trigger".to_owned(),
+                }],
+                state_slots: vec![boon_plan::DebugEntry {
+                    id: "state:13".to_owned(),
+                    label: "store.selected".to_owned(),
+                }],
+                list_slots: Vec::new(),
+                derived_values: vec![boon_plan::DebugEntry {
+                    id: "field:14".to_owned(),
+                    label: "store.derived_selected".to_owned(),
+                }],
+                fields: Vec::new(),
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+        let root_state = JsonMap::from_iter([
+            ("store.selected".to_owned(), json!("old")),
+            ("store.derived_selected".to_owned(), json!("new")),
+        ]);
+        let evaluation = evaluate_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &root_state,
+        )
+        .expect("root ReadPath should read root derived fields");
+
+        assert!(evaluation.supported);
+        assert_eq!(evaluation.value, Some(json!("new")));
+        assert_eq!(evaluation.expression_kind, Some("read_path"));
     }
 
     #[test]

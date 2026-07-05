@@ -3236,10 +3236,18 @@ fn read_path_inputs_supported(scalar_slots: &[ScalarStorageSlot], op: &PlanOp) -
     if let Some(output_type) = output_state_type(scalar_slots, op) {
         if source_payload_input_ids(op).is_empty() {
             let state_inputs = state_input_ids(op);
-            let [state_id] = state_inputs.as_slice() else {
-                return false;
-            };
-            plan_value_type_for_state_slots(scalar_slots, *state_id) == Some(output_type)
+            let field_inputs = op
+                .inputs
+                .iter()
+                .filter(|input| matches!(input, ValueRef::Field(_)))
+                .count();
+            match (state_inputs.as_slice(), field_inputs) {
+                ([state_id], 0) => {
+                    plan_value_type_for_state_slots(scalar_slots, *state_id) == Some(output_type)
+                }
+                ([], 1) => !matches!(output_type, PlanValueType::Bytes { .. }),
+                _ => false,
+            }
         } else {
             source_payload_input_ids(op).len() == 1
                 && state_input_ids(op).is_empty()
@@ -5689,6 +5697,37 @@ mod tests {
             }),
         };
         assert!(!root_row_expression_cpu_evaluable(&unsupported));
+    }
+
+    #[test]
+    fn root_read_path_supports_declared_derived_field_input() {
+        let scalar_slots = vec![ScalarStorageSlot {
+            id: PlanStorageId(0),
+            state_id: StateId(1),
+            value_type: PlanValueType::Text,
+            scope_id: None,
+            indexed: false,
+            initial_value_kind: InitialValueKind::Text,
+            initial_constant_id: None,
+            initial_root_field_path: None,
+            initial_row_field_path: None,
+        }];
+        let op = PlanOp {
+            id: PlanOpId(2),
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::ReadPath,
+                ordered_inputs: Vec::new(),
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: vec![ValueRef::Source(SourceId(3)), ValueRef::Field(FieldId(4))],
+            output: Some(ValueRef::State(StateId(1))),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        };
+
+        assert!(read_path_inputs_supported(&scalar_slots, &op));
     }
 
     #[test]

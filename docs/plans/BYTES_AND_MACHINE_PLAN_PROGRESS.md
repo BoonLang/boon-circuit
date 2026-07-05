@@ -36667,3 +36667,50 @@ Follow-up predicate alignment:
 - Fresh NovyWave compact summary after the predicate cut:
   `status=fail`, `cpu_plan_executor_unsupported_op_count=536`,
   `unresolved_executable_ref_count=7`, failing verification checks `[]`.
+
+## 2026-07-05 - Root MatchValueConst PlanExecutor Cut
+
+Status: added generic root `MatchValueConst` lowering/execution support. This
+reduces another update-branch bucket without allowing a legacy fallback or
+special-casing NovyWave.
+
+What changed:
+
+- Compiler lowering now serializes root `MatchValueConst` ordered inputs as
+  match input plus pattern/value pairs, where arm values may be constants,
+  states, source payloads, or other root-readable refs.
+- MachinePlan support predicates now recognize root `MatchValueConst` when the
+  ordered operands are well formed and value arms are compatible with the output
+  state.
+- PlanExecutor root JSON update evaluation now executes `MatchValueConst` with
+  JSON scalar matching, read-path arm values, fallback arm handling, `SKIP`
+  no-op semantics, and BYTES rejection on the JSON surface.
+
+Evidence:
+
+- `cargo test -q -p boon_compiler match_value_const_lowers_ordered_input_and_arm_pairs`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_match_value_const_update_executes_read_path_arms`:
+  pass.
+- `cargo check -q -p boon_compiler -p boon_plan -p boon_plan_executor -p boon_cli`:
+  pass.
+
+Fresh NovyWave evidence:
+
+- `cargo run -q -p boon_cli -- dump-plan examples/novywave/RUN.bn --report
+  target/reports/novywave-plan-dump.json` completed.
+- Compact summary: `status=fail`, `cpu_plan_executor_unsupported_op_count=496`,
+  `unresolved_executable_ref_count=7`, failing verification checks `[]`.
+- The remaining root update buckets still include `read_path=77`,
+  `list_find_value=14`, `match_number_infix_const=11`,
+  `prefix_payload_concat=2`, and `project_time=2`; expression-less pure/list
+  derived fields remain the largest overall unsupported class.
+
+Current interpretation:
+
+- The old NovyWave bridge still cannot be made authoritative by toggling a
+  runtime flag. The active path needs more generic PlanExecutor coverage or a
+  deliberate replacement/quarantine of the legacy bridge verifier.
+- Next high-leverage cuts are either root/indexed `ListFindValue` update branch
+  support plus typed operands, or compiler lowering for the expression-less
+  pure/list-view fields that dominate the unsupported count.

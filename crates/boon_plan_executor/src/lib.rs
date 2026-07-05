@@ -12873,6 +12873,183 @@ pub fn evaluate_root_json_update_branch(
             )
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::MatchValueConst,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [input_ref, arm_operands @ ..] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "root MatchValueConst update branch {} has no match input",
+                    op.id.0
+                )
+                .into());
+            };
+            if arm_operands.is_empty() || arm_operands.len() % 2 != 0 {
+                return Err(format!(
+                    "root MatchValueConst update branch {} has malformed arm operands",
+                    op.id.0
+                )
+                .into());
+            }
+            let Some(input_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                input_ref,
+                source_id,
+                op.id,
+                "match-value input",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_value_const",
+                        json!({
+                            "input_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            if input_value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    false,
+                    false,
+                    Some("BYTES match-value input requires runtime byte storage".to_owned()),
+                    Some(output_state_id),
+                    None,
+                    None,
+                ));
+            }
+            let input_text = json_scalar_textlike(&input_value).ok_or_else(|| {
+                format!(
+                    "root MatchValueConst update branch {} match input is not scalar text-like",
+                    op.id.0
+                )
+            })?;
+            let mut fallback = None;
+            let mut selected = None;
+            for (arm_index, pair) in arm_operands.chunks_exact(2).enumerate() {
+                let pattern = root_match_const_pattern(plan, &pair[0], op.id, arm_index)?;
+                if pattern == "__" {
+                    fallback = Some((arm_index, &pair[1]));
+                } else if pattern == input_text {
+                    selected = Some((arm_index, &pair[1]));
+                    break;
+                }
+            }
+            let Some((selected_arm_index, selected_ref)) = selected.or(fallback) else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_value_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                selected_ref,
+                source_id,
+                op.id,
+                "match-value selected arm",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_value_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_index": selected_arm_index,
+                            "selected_value_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            if value.as_str() == Some("SKIP") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_value_const",
+                        json!({
+                            "input": input_text,
+                            "selected_arm_index": selected_arm_index,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            }
+            if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    false,
+                    false,
+                    Some("BYTES match-value arm values require runtime byte storage".to_owned()),
+                    Some(output_state_id),
+                    None,
+                    None,
+                ));
+            }
+            root_json_update_outcome(
+                op.id,
+                true,
+                false,
+                None,
+                Some(output_state_id),
+                Some(value),
+                Some((
+                    "match_value_const",
+                    json!({
+                        "input": input_text,
+                        "selected_arm_index": selected_arm_index,
+                        "skip": false,
+                    }),
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            )
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::TextTrimOrPrevious,
             source_payload_field,
             update_constant_id: None,
@@ -18094,6 +18271,223 @@ mod tests {
         .expect("root MatchConst should read root derived fields");
         assert!(field_evaluation.supported);
         assert_eq!(field_evaluation.value, Some(json!("Dark")));
+    }
+
+    #[test]
+    fn root_match_value_const_update_executes_read_path_arms() {
+        let source_id = SourceId(7);
+        let selector_state_id = StateId(8);
+        let value_a_state_id = StateId(9);
+        let output_state_id = StateId(10);
+        let update_op_id = PlanOpId(11);
+        let constants = vec![
+            boon_plan::PlanConstant {
+                id: PlanConstantId(0),
+                value: PlanConstantValue::Text {
+                    value: "A".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(1),
+                value: PlanConstantValue::Text {
+                    value: "__".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(2),
+                value: PlanConstantValue::Text {
+                    value: "SKIP".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(3),
+                value: PlanConstantValue::Text {
+                    value: "old".to_owned(),
+                },
+            },
+            boon_plan::PlanConstant {
+                id: PlanConstantId(4),
+                value: PlanConstantValue::Text {
+                    value: "alpha".to_owned(),
+                },
+            },
+        ];
+        let source_route = SourceRoute {
+            id: boon_plan::PlanSourceRouteId(0),
+            source_id,
+            path: "store.trigger".to_owned(),
+            scoped: false,
+            scope_id: None,
+            payload_schema: boon_plan::SourcePayloadSchema {
+                fields: Vec::new(),
+                typed_fields: Vec::new(),
+                row_lookup_field: None,
+                address_lookup_field: None,
+            },
+        };
+        let update_op = PlanOp {
+            id: update_op_id,
+            kind: PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::MatchValueConst,
+                ordered_inputs: vec![
+                    ValueRef::State(selector_state_id),
+                    ValueRef::Constant(PlanConstantId(0)),
+                    ValueRef::State(value_a_state_id),
+                    ValueRef::Constant(PlanConstantId(1)),
+                    ValueRef::Constant(PlanConstantId(2)),
+                ],
+                source_payload_field: None,
+                update_constant_id: None,
+                source_guard: None,
+            },
+            inputs: vec![
+                ValueRef::Source(source_id),
+                ValueRef::State(selector_state_id),
+                ValueRef::State(value_a_state_id),
+            ],
+            output: Some(ValueRef::State(output_state_id)),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        };
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants,
+            source_routes: vec![source_route.clone()],
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: vec![
+                    boon_plan::ScalarStorageSlot {
+                        id: boon_plan::PlanStorageId(0),
+                        state_id: selector_state_id,
+                        value_type: PlanValueType::Text,
+                        scope_id: None,
+                        indexed: false,
+                        initial_value_kind: InitialValueKind::Text,
+                        initial_constant_id: Some(PlanConstantId(0)),
+                        initial_root_field_path: None,
+                        initial_row_field_path: None,
+                    },
+                    boon_plan::ScalarStorageSlot {
+                        id: boon_plan::PlanStorageId(1),
+                        state_id: value_a_state_id,
+                        value_type: PlanValueType::Text,
+                        scope_id: None,
+                        indexed: false,
+                        initial_value_kind: InitialValueKind::Text,
+                        initial_constant_id: Some(PlanConstantId(4)),
+                        initial_root_field_path: None,
+                        initial_row_field_path: None,
+                    },
+                    boon_plan::ScalarStorageSlot {
+                        id: boon_plan::PlanStorageId(2),
+                        state_id: output_state_id,
+                        value_type: PlanValueType::Text,
+                        scope_id: None,
+                        indexed: false,
+                        initial_value_kind: InitialValueKind::Text,
+                        initial_constant_id: Some(PlanConstantId(3)),
+                        initial_root_field_path: None,
+                        initial_row_field_path: None,
+                    },
+                ],
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: vec![boon_plan::OperationRegion {
+                id: boon_plan::PlanRegionId(3),
+                kind: RegionKind::UpdateBranches,
+                ops: vec![update_op.clone()],
+            }],
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 1,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 5,
+                source_route_count: 1,
+                scalar_storage_count: 3,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 1,
+                typed_value_ref_count: 8,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: vec![boon_plan::DebugEntry {
+                    id: "source:7".to_owned(),
+                    label: "store.trigger".to_owned(),
+                }],
+                state_slots: vec![
+                    boon_plan::DebugEntry {
+                        id: "state:8".to_owned(),
+                        label: "store.selector".to_owned(),
+                    },
+                    boon_plan::DebugEntry {
+                        id: "state:9".to_owned(),
+                        label: "store.value_a".to_owned(),
+                    },
+                    boon_plan::DebugEntry {
+                        id: "state:10".to_owned(),
+                        label: "store.selected".to_owned(),
+                    },
+                ],
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: Vec::new(),
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+
+        let root_state = JsonMap::from_iter([
+            ("store.selector".to_owned(), json!("A")),
+            ("store.value_a".to_owned(), json!("alpha")),
+            ("store.selected".to_owned(), json!("old")),
+        ]);
+        let evaluation = evaluate_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &root_state,
+        )
+        .expect("root MatchValueConst should evaluate");
+        assert!(evaluation.supported);
+        assert_eq!(evaluation.value, Some(json!("alpha")));
+        assert_eq!(evaluation.expression_kind, Some("match_value_const"));
+
+        let skipped_root_state = JsonMap::from_iter([
+            ("store.selector".to_owned(), json!("B")),
+            ("store.value_a".to_owned(), json!("alpha")),
+            ("store.selected".to_owned(), json!("old")),
+        ]);
+        let skipped = evaluate_root_json_update_branch(
+            &plan,
+            &update_op,
+            source_id,
+            &source_route,
+            &RootJsonSourceEvent::default(),
+            &skipped_root_state,
+        )
+        .expect("root MatchValueConst fallback SKIP should evaluate");
+        assert!(skipped.supported);
+        assert!(skipped.skipped_by_guard);
+        assert_eq!(skipped.value, None);
     }
 
     #[test]

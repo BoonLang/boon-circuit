@@ -1566,11 +1566,16 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && update_branch_source_ids(op).len() == 1
                         && root_match_const_inputs_supported(scalar_slots, constants, op)
                 }
+                PlanExpressionKind::MatchValueConst => {
+                    source_payload_field.is_none()
+                        && update_constant_id.is_none()
+                        && update_branch_source_ids(op).len() == 1
+                        && root_match_value_const_inputs_supported(scalar_slots, constants, op)
+                }
                 PlanExpressionKind::NumberInfix
                 | PlanExpressionKind::ProjectTime
                 | PlanExpressionKind::PrefixPayloadConcat
                 | PlanExpressionKind::PrefixRootConcat
-                | PlanExpressionKind::MatchValueConst
                 | PlanExpressionKind::MatchTextIsEmptyConst
                 | PlanExpressionKind::MatchNumberInfixConst
                 | PlanExpressionKind::ListFindValue
@@ -3328,6 +3333,67 @@ fn root_match_const_inputs_supported(
         match_const_pattern_ref_supported(constants, &pair[0])
             && match_const_output_ref_supported(constants, output_type, &pair[1])
     })
+}
+
+fn root_match_value_const_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let Some(output_type) = output_state_type(scalar_slots, op) else {
+        return false;
+    };
+    if matches!(
+        output_type,
+        PlanValueType::Bytes { .. } | PlanValueType::Unknown
+    ) {
+        return false;
+    }
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [input, arm_operands @ ..] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    if arm_operands.is_empty() || arm_operands.len() % 2 != 0 {
+        return false;
+    }
+    if !match_const_input_ref_supported(scalar_slots, op, input) {
+        return false;
+    }
+    arm_operands.chunks_exact(2).all(|pair| {
+        match_const_pattern_ref_supported(constants, &pair[0])
+            && root_update_value_ref_supported(scalar_slots, constants, op, output_type, &pair[1])
+    })
+}
+
+fn root_update_value_ref_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    output_type: &PlanValueType,
+    value_ref: &ValueRef,
+) -> bool {
+    match value_ref {
+        ValueRef::State(state_id) => {
+            op.inputs.contains(value_ref)
+                && plan_value_type_for_state_slots(scalar_slots, *state_id) == Some(output_type)
+        }
+        ValueRef::SourcePayload { field, .. } => {
+            op.inputs.contains(value_ref)
+                && match field {
+                    SourcePayloadField::Bytes => false,
+                    SourcePayloadField::Named(name) if name == "press" => {
+                        output_type == &PlanValueType::Bool || output_type == &PlanValueType::Text
+                    }
+                    _ => output_type == &PlanValueType::Text,
+                }
+        }
+        ValueRef::Constant(constant_id) => plan_constant_by_id(constants, *constant_id)
+            .is_some_and(|constant| constant_value_matches_plan_type(&constant.value, output_type)),
+        ValueRef::Field(_) => op.inputs.contains(value_ref),
+        ValueRef::Source(_) | ValueRef::List(_) => false,
+    }
 }
 
 fn match_const_input_ref_supported(

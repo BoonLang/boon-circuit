@@ -4746,16 +4746,29 @@ fn ordered_update_expression_inputs(
             }
             refs
         }
-        UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
+        UpdateExpression::MatchValueConst { input, arms }
+        | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
             let Some(input_ref) = resolve_update_value_ref(index, source, target, indexed, input)
             else {
                 return Vec::new();
             };
             let mut refs = vec![input_ref];
-            for pattern in ["True", "False", "__"] {
+            let patterns = match &expression {
+                UpdateExpression::MatchTextIsEmptyConst { .. } => {
+                    vec!["True".to_owned(), "False".to_owned(), "__".to_owned()]
+                }
+                _ => arms.iter().map(|arm| arm.pattern.clone()).collect(),
+            };
+            for pattern in patterns {
                 let Some(arm) = arms.iter().find(|arm| arm.pattern == pattern) else {
                     continue;
                 };
+                let pattern_constant_id = push_plan_constant(
+                    constants,
+                    PlanConstantValue::Text {
+                        value: pattern.clone(),
+                    },
+                );
                 let Some(output_ref) = update_value_expression_value_ref(
                     index,
                     constants,
@@ -4766,6 +4779,7 @@ fn ordered_update_expression_inputs(
                 ) else {
                     continue;
                 };
+                refs.push(ValueRef::Constant(pattern_constant_id));
                 refs.push(output_ref);
             }
             refs
@@ -4784,12 +4798,13 @@ fn update_value_expression_value_ref(
 ) -> Option<ValueRef> {
     match expression {
         UpdateValueExpression::Const { value } => {
-            let constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Text {
+            let constant_value = index
+                .state_value_type(target)
+                .and_then(|target_type| update_constant_value(value, target_type))
+                .unwrap_or_else(|| PlanConstantValue::Text {
                     value: value.clone(),
-                },
-            );
+                });
+            let constant_id = push_plan_constant(constants, constant_value);
             Some(ValueRef::Constant(constant_id))
         }
         UpdateValueExpression::ReadPath { path } => {
@@ -5496,6 +5511,84 @@ document: Document/new(root: Element/label(element: [], label: store.active_file
             Some("startup_file")
         );
         assert_eq!(verify_plan(&plan).unwrap().status, "pass");
+    }
+
+    #[test]
+    fn match_value_const_lowers_ordered_input_and_arm_pairs() {
+        let parsed = boon_parser::parse_project(
+            "examples/match-value-const-plan.bn",
+            [(
+                "examples/match-value-const-plan.bn".to_owned(),
+                r#"
+store: [
+    trigger: SOURCE
+    selector:
+        TEXT { A } |> HOLD selector { LATEST {} }
+    value_a:
+        TEXT { alpha } |> HOLD value_a { LATEST {} }
+    value_b:
+        TEXT { beta } |> HOLD value_b { LATEST {} }
+    selected:
+        TEXT { old } |> HOLD selected {
+            LATEST {
+                trigger |> THEN {
+                    selector |> WHEN {
+                        TEXT { A } => value_a
+                        __ => value_b
+                    }
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: store.selected))
+"#
+                .to_owned(),
+            )],
+        )
+        .expect("match-value fixture should parse");
+        let ir = boon_ir::lower(&parsed).unwrap();
+        let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+        let selected_state = debug_entry_id(&plan.debug_map.state_slots, "state", "store.selected");
+        let update = plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::UpdateBranches)
+            .flat_map(|region| region.ops.iter())
+            .find(|op| matches!(op.output, Some(ValueRef::State(state_id)) if state_id.0 == selected_state))
+            .expect("store.selected should have an update op");
+        let PlanOpKind::UpdateBranch {
+            expression_kind,
+            ordered_inputs,
+            ..
+        } = &update.kind
+        else {
+            panic!("selected update should be an update branch");
+        };
+
+        assert_eq!(*expression_kind, PlanExpressionKind::MatchValueConst);
+        assert_eq!(
+            ordered_inputs.len(),
+            5,
+            "ordered inputs should be input plus two pattern/value pairs"
+        );
+        assert!(matches!(ordered_inputs[0], ValueRef::State(_)));
+        assert!(ordered_inputs[1..].chunks_exact(2).all(|pair| {
+            matches!(pair[0], ValueRef::Constant(_))
+                && matches!(pair[1], ValueRef::State(_) | ValueRef::Constant(_))
+        }));
+        assert!(
+            cpu_plan_executor_supports_whole_plan_op(
+                &plan.storage_layout.scalar_slots,
+                &plan.storage_layout.list_slots,
+                &plan.constants,
+                update,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            ),
+            "root MatchValueConst should be CPU PlanExecutor-supported"
+        );
     }
 
     #[test]

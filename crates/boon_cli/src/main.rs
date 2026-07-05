@@ -119,7 +119,9 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 VerificationLayer::Semantic,
                 report.as_deref(),
             )?;
-            println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
+            if print_report || !explicit_report {
+                println!("{}", serde_json::to_string_pretty(&output.state_summary)?);
+            }
         }
         "plan" | "compare" => {
             let target_profile = TargetProfile::from_name(&target)?;

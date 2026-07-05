@@ -36342,3 +36342,30 @@ Current interpretation:
   stays in the separate post-present request lane.
 - Fresh native source/baseline report regeneration is still required before
   claiming native handoff readiness.
+
+## 2026-07-05 - Explicit-Report CLI Legacy Output Noise Cut
+
+Status: implemented and verified in this slice.
+
+What changed:
+
+- `boon_cli run --engine legacy --report ...` no longer prints the full legacy
+  state summary to stdout unless `--print-report` is requested or no explicit
+  report path was supplied.
+- This keeps explicit legacy smoke children from flooding verifier output while
+  they remain as diagnostic compatibility cases.
+
+Evidence:
+
+- `cargo check -q -p boon_cli`: pass.
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass with bounded stdout.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/bytes-plan/bytes-default-engine-readiness.json`:
+  pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Current interpretation:
+
+- The remaining explicit legacy smoke path is still present, but it no longer
+  pollutes normal verifier output with a large state-summary dump.

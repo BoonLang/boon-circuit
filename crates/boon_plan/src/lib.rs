@@ -4105,44 +4105,6 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
                         }
                     }
                 }
-                PlanExpressionKind::BytesFind
-                | PlanExpressionKind::BytesStartsWith
-                | PlanExpressionKind::BytesEndsWith => {
-                    if source_payload_field.is_some() || update_constant_id.is_some() {
-                        return false;
-                    }
-                    let ordered_inputs = update_branch_ordered_inputs(op);
-                    let [ValueRef::State(left), ValueRef::State(right)] = ordered_inputs else {
-                        return false;
-                    };
-                    if !op.inputs.contains(&ValueRef::State(*left))
-                        || !op.inputs.contains(&ValueRef::State(*right))
-                    {
-                        return false;
-                    }
-                    for state_id in [left, right] {
-                        let Some(value_type) = plan_value_type_for_state(plan, *state_id) else {
-                            return false;
-                        };
-                        if !matches!(value_type, PlanValueType::Bytes { .. }) {
-                            return false;
-                        }
-                    }
-                    if let Some(ValueRef::State(state_id)) = op.output {
-                        let Some(value_type) = plan_value_type_for_state(plan, state_id) else {
-                            return false;
-                        };
-                        let expected = match expression_kind {
-                            PlanExpressionKind::BytesFind => &PlanValueType::Number,
-                            PlanExpressionKind::BytesStartsWith
-                            | PlanExpressionKind::BytesEndsWith => &PlanValueType::Bool,
-                            _ => unreachable!(),
-                        };
-                        if value_type != expected {
-                            return false;
-                        }
-                    }
-                }
                 PlanExpressionKind::BytesConcat => {
                     if source_payload_field.is_some() || update_constant_id.is_some() {
                         return false;

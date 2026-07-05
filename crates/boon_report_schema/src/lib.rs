@@ -18810,28 +18810,6 @@ fn expected_indexed_single_state_input(
     Ok(*input)
 }
 
-fn expected_indexed_row_text_state(
-    plan: &boon_plan::MachinePlan,
-    row: &ExpectedPlanListRowState,
-    state_id: boon_plan::StateId,
-    op: &boon_plan::PlanOp,
-    report_path: &Path,
-) -> RuntimeResult<String> {
-    let field_name = local_field_name(&plan_state_label(plan, state_id.0));
-    row.fields
-        .get(&field_name)
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "{} indexed update branch {} state field `{field_name}` is missing or not TEXT",
-                report_path.display(),
-                op.id.0
-            )
-            .into()
-        })
-}
-
 fn expected_indexed_single_text_input(
     op: &boon_plan::PlanOp,
     output_state_id: boon_plan::StateId,

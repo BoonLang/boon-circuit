@@ -27,6 +27,48 @@ MachinePlan migration.
 | Phase 9 - Verification and Performance | Complete | The current gate set requires `verify-bytes-machine-plan-all --check-existing`, default-engine readiness, Cells full compare, Cells release benchmark, TodoMVC release benchmark reproduction, adversarial tamper checks, runtime hardening/finality, machine-readiness, and recursive schema evidence. |
 | Phase 10 - Default Switch | Complete | `boon_cli run` now defaults to PlanExecutor/default-engine mode. Explicit `--engine legacy` still runs the semantic runtime, and `--engine compare` still runs PlanExecutor with the legacy comparison oracle. |
 
+## 2026-07-05 Legacy Runtime Test-Island Cut
+
+Status: implemented as a cleanup checkpoint; broad native/product performance
+goals remain incomplete.
+
+What changed:
+
+- Deleted the first obsolete `LoadedRuntimeHarness::from_source` behavior slice
+  instead of keeping old-runtime-only product assertions alive through hidden
+  compatibility: source text payload summary, source payload concat updates,
+  root-derived dependency materialization, root-derived revisit, and
+  root-list-view identity-only tests.
+- Deleted old GenericRuntime currentness/list internals that manually mutated
+  caches or called private invalidation/windowing helpers:
+  root-currentness cache refresh/invalidation tests, exact lookup changed-read
+  invalidation, and lazy chunk summary scan-counter proof.
+- Migrated `materialization_windowed_list_summary_reports_logical_and_stable_rows`
+  to `LiveRuntime::from_source_plan_executor`; it now proves the product
+  PlanExecutor window-summary path for that fixture.
+- Direct `LoadedRuntimeHarness::from_source` calls in
+  `crates/boon_runtime/src/lib.rs` dropped from 119 at the start of this
+  continuation to 106.
+
+Important gaps exposed while attempting migration:
+
+- PlanExecutor still does not support at least one old root update branch shape:
+  `PrefixPayloadConcat`.
+- PlanExecutor document/state summaries do not yet expose every arbitrary small
+  test fixture shape that the old generic runtime summary exposed.
+- One row structured-parent fixture fails during PlanExecutor construction with
+  a missing typed field id for an initial row field.
+- Do not restore the deleted tests through `LoadedRuntimeHarness`. Add
+  PlanExecutor/product tests only after the missing executor semantics or
+  diagnostics exist.
+
+Focused evidence:
+
+- `cargo test -q -p boon_runtime materialization_windowed_list_summary_reports_logical_and_stable_rows`
+  passed.
+- `cargo test -q -p boon_runtime --lib --no-run` passed after the deletion
+  slice.
+
 ## 2026-07-04 PlanExecutor Currentness And Harness Taxonomy Slice
 
 Status: implemented and focused-verified; broad aggregates still require child

@@ -72,7 +72,24 @@ Current checkpoint:
   `status=pass`, `plan_status=pass`, `accepted_for_product_status=pass`, and 22
   selected source-event steps, and its schema check passes; the current native
   physical preview report is still not readiness evidence because its visual
-  content status is fail. The remaining legacy cuts are deleting or migrating
+  content status is fail. The first generic `LoadedRuntimeHarness::from_source`
+  behavior/internal-test slice has also been cut instead of preserved through hidden
+  old-runtime execution: source text payload summary, source payload concat
+  update, root-derived dependency materialization, root-derived revisit, and
+  root-list-view identity-only behavior tests were removed, along with
+  old-GenericRuntime-only currentness cache-corruption tests, exact lookup
+  invalidation helper tests, and lazy chunk summary scan-counter tests. One
+  windowed materialization summary test now runs through
+  `LiveRuntime::from_source_plan_executor`. Direct PlanExecutor migration
+  attempts exposed real unsupported product gaps (`PrefixPayloadConcat` root
+  update branches, incomplete arbitrary-fixture document summary/state
+  surfaces, and missing typed field ids for a row structured-parent fixture).
+  Do not reintroduce the deleted tests through
+  `LoadedRuntimeHarness`; replace them only with PlanExecutor/product tests
+  after the missing executor semantics/diagnostics are implemented. This cut
+  reduced direct `LoadedRuntimeHarness::from_source` calls in
+  `crates/boon_runtime/src/lib.rs` from 119 to 106. The remaining legacy
+  cuts are deleting or migrating
   the test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage island, now
   mostly lower-level runtime/list/currentness diagnostics plus explicit
   `LoadedRuntimeHarness::from_*` diagnostics, and any native legacy negative

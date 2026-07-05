@@ -36860,3 +36860,34 @@ Evidence:
 - Focused PlanExecutor/default-runtime tests passed for sparse summaries,
   root currentness, default constructors, profiled provenance, and hello_3d
   world output.
+
+## 2026-07-06 - LoadedRuntime Report Labels Removed
+
+Status: implemented and focused-verified for the report/control-plane naming
+slice.
+
+What changed:
+
+- Removed `loaded_runtime_from_artifact` and
+  `legacy_loaded_runtime_from_artifact` from compiled-artifact inspection
+  report schema and tests.
+- Renamed generic runtime slice flags away from `generic_loaded_runtime*` and
+  `loaded_runtime_owns_generic_schedule_storage`.
+- Updated compiler-boundary checks from "test-quarantined" wording to hard
+  removal checks for the loaded-runtime engine branch, shell, harness, and
+  product legacy fallback helpers. `GenericScheduledRuntime` remains as the
+  explicit next test island to cut.
+
+Evidence:
+
+- `cargo check -q -p xtask -p boon_runtime -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema --lib`: pass.
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- Focused runtime artifact/slice tests pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: schema-valid `status=fail` on two
+  broader PlanExecutor migration blockers: indexed list row expression refresh
+  iteration is not yet PlanExecutor-owned, and live runtime constructors still
+  require a `TypedProgram` instead of the compiled runtime program.

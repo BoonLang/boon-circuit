@@ -3410,8 +3410,6 @@ pub fn inspect_compiled_artifact_report(
         "inspection_result": {
             "artifact_valid": true,
             "runtime_engine": "plan_executor",
-            "loaded_runtime_from_artifact": false,
-            "legacy_loaded_runtime_from_artifact": false,
             "plan_executor_runtime_from_artifact": true,
             "plan_executor_provenance": plan_executor_provenance,
             "runtime_instantiated_from_artifact": true,
@@ -20887,7 +20885,7 @@ fn generic_runtime_slices_report(
         "unsupported_update_branch_count": compiled.unsupported_update_branch_count,
         "generic_scenario_loop_executor": update_branches_loaded && list_initializers_loaded,
         "generic_schedule_instantiated_before_adapter": program_metadata.static_schedule_verified,
-        "loaded_runtime_owns_generic_schedule_storage": state_initializers_loaded && list_initializers_loaded,
+        "generic_runtime_owns_schedule_storage": state_initializers_loaded && list_initializers_loaded,
         "surface_driver_borrows_generic_storage_for_tick": false,
         "generic_source_event_ingest": source_routes_dense,
         "generic_source_binding_store": has_list_source_bindings,
@@ -20901,7 +20899,7 @@ fn generic_runtime_slices_report(
         "generic_source_unbind_semantic_delta_emitter": list_remove_operation_count > 0,
         "generic_render_lowering_plan": has_render_bindings,
         "generic_common_render_patch_lowering": has_render_bindings,
-        "generic_loaded_runtime_shell": state_initializers_loaded && source_routes_dense,
+        "generic_runtime_shell": state_initializers_loaded && source_routes_dense,
         "generic_source_route_action_executor": route_action_count > 0,
         "generic_source_effects_through_action_executor": route_action_count > 0,
         "generic_root_text_tick_executor": root_scalar_route_count > 0,
@@ -20916,7 +20914,7 @@ fn generic_runtime_slices_report(
         "generic_list_move_semantic_delta_emitter": inventory_counts.list_initializer_count > 0,
         "generic_list_count_retain_executor": list_count_retain_operation_count > 0,
         "generic_summary_reads_authoritative_storage": state_initializers_loaded || list_initializers_loaded,
-        "generic_loaded_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
+        "generic_runtime_state_summary_projection": state_initializers_loaded && list_initializers_loaded,
         "generic_root_holds_no_mirror": state_initializers_loaded,
         "generic_rows_hold_no_mirror": list_initializers_loaded,
         "generic_delta_identities_from_authoritative_storage": route_action_count > 0,
@@ -20935,12 +20933,12 @@ fn generic_runtime_slices_report(
         "generic_list_index_action_input_resolution": has_indexed_routes,
         "generic_scenario_expectation_assertions": true,
         "generic_scenario_preparation": true,
-        "generic_loaded_runtime_root_step_executor": root_scalar_route_count > 0,
-        "generic_loaded_runtime_row_toggle_delete_executor": indexed_bool_route_count > 0 || list_remove_operation_count > 0,
-        "generic_loaded_runtime_row_edit_source_executor": indexed_text_route_count > 0,
-        "generic_loaded_runtime_render_only_hover_executor": false,
-        "generic_loaded_runtime_assertion_executor": true,
-        "generic_loaded_runtime_stress_profile_executor": false,
+        "generic_runtime_root_step_executor": root_scalar_route_count > 0,
+        "generic_runtime_row_toggle_delete_executor": indexed_bool_route_count > 0 || list_remove_operation_count > 0,
+        "generic_runtime_row_edit_source_executor": indexed_text_route_count > 0,
+        "generic_runtime_render_only_hover_executor": false,
+        "generic_runtime_assertion_executor": true,
+        "generic_runtime_stress_profile_executor": false,
         "generic_bound_source_target_resolution": has_list_source_bindings,
         "generic_stale_source_key_generation_bind_epoch_rejection": has_list_source_bindings,
         "generic_source_action_batch_executor": route_action_count > 0,
@@ -21119,13 +21117,13 @@ fn derive_generic_interpreter_complete(
         && compiled.update_branch_count > 0
         && generic_runtime_slices.as_object().is_some_and(|slices| {
             [
-                "generic_loaded_runtime_shell",
+                "generic_runtime_shell",
                 "generic_source_event_ingest",
                 "generic_source_route_action_executor",
                 "generic_root_source_dispatch",
                 "generic_semantic_delta_emitter",
                 "generic_render_lowering_plan",
-                "generic_loaded_runtime_state_summary_projection",
+                "generic_runtime_state_summary_projection",
             ]
             .iter()
             .all(|key| slice_bool(slices, key).unwrap_or(false))
@@ -21141,7 +21139,7 @@ fn derive_example_behavior_adapter(
     };
     slice_bool(slices, "surface_driver_borrows_generic_storage_for_tick").unwrap_or(true)
         || !slice_bool(slices, "generic_schedule_instantiated_before_adapter").unwrap_or(false)
-        || !slice_bool(slices, "loaded_runtime_owns_generic_schedule_storage").unwrap_or(false)
+        || !slice_bool(slices, "generic_runtime_owns_schedule_storage").unwrap_or(false)
         || !slice_bool(slices, "generic_source_action_batch_executor").unwrap_or(false)
 }
 
@@ -63398,10 +63396,6 @@ FUNCTION decorate(value) {
             json!(true)
         );
         assert_eq!(
-            loaded["inspection_result"]["loaded_runtime_from_artifact"],
-            json!(false)
-        );
-        assert_eq!(
             loaded["inspection_result"]["runtime_engine"],
             json!("plan_executor")
         );
@@ -63685,7 +63679,7 @@ FUNCTION decorate(value) {
         );
 
         let mut incomplete_slices = slices.clone();
-        incomplete_slices["generic_loaded_runtime_shell"] = json!(false);
+        incomplete_slices["generic_runtime_shell"] = json!(false);
         assert!(
             !derive_generic_interpreter_complete(&program_metadata, &compiled, &incomplete_slices),
             "generic_interpreter_complete must fail when a required current-example slice fails"

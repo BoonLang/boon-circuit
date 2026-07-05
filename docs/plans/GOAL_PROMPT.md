@@ -30,13 +30,28 @@ Current checkpoint:
   projection fixtures, broad BYTES builtin summary shape, and Cells recompute
   sample accounting. Replace those only with PlanExecutor/product tests after
   the missing executor semantics are deliberately implemented.
+- Latest report/control-plane cleanup removed stale
+  `loaded_runtime_from_artifact` / `legacy_loaded_runtime_from_artifact`
+  inspection requirements and renamed generic runtime slice labels away from
+  `generic_loaded_runtime*`. The compiler-boundary audit now checks that the
+  loaded-runtime engine branch, shell, harness, and legacy fallback helpers are
+  removed, while keeping the remaining `GenericScheduledRuntime` test island
+  explicit. Fresh focused evidence for this slice: `cargo check -q -p xtask -p
+  boon_runtime -p boon_report_schema`, `cargo test -q -p boon_report_schema
+  --lib`, `cargo test -q -p boon_runtime --lib --no-run`, focused runtime
+  artifact/slice tests, and `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json` pass. Fresh
+  `verify-compiler-boundaries` is schema-valid but still reports `status=fail`
+  because two broader PlanExecutor migration blockers remain:
+  PlanExecutor core does not yet own indexed list row expression refresh
+  iteration, and `boon_runtime` live runtime constructors still require a
+  `TypedProgram` instead of the compiled runtime program.
 - Latest architecture cleanup checkpoint moved root branch state and startup
   row-expression refresh behind the PlanExecutor boundary. Runtime no longer
   owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private
   BYTES/fixed-bank maps into `execute_root_scalar_update_branch(...)`, and no
-  longer owns the startup row-expression evaluator. Fresh
-  `verify-compiler-boundaries` now reports `status=pass` with zero blockers.
-  This is not complete legacy removal: `GenericScheduledRuntime`,
+  longer owns the startup row-expression evaluator. This is not complete legacy
+  removal: `GenericScheduledRuntime`,
   explicit diagnostic legacy comparison report surfaces, and native legacy
   negative counters still need deletion or replacement in later slices.
 - Scenario-events product reports are now PlanExecutor-only. The

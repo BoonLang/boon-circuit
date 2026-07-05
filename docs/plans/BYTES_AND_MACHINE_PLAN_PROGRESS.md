@@ -38055,3 +38055,52 @@ Evidence:
   and `live_runtime_default_constructor_keeps_world_output_on_plan_executor`.
 - `cargo test -q -p boon_runtime --lib
   live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner`: pass.
+
+## 2026-07-06 - LoadedRuntime Report Labels Removed
+
+Status: implemented and focused-verified for the touched report/schema/runtime
+surfaces.
+
+What changed:
+
+- Removed the obsolete `loaded_runtime_from_artifact` and
+  `legacy_loaded_runtime_from_artifact` inspection-result fields from compiled
+  artifact inspection reports and schema requirements. Artifact loading is now
+  described by `runtime_engine=plan_executor`,
+  `plan_executor_runtime_from_artifact`, `plan_executor_provenance`, and
+  `runtime_instantiated_from_artifact`.
+- Renamed generic runtime slice labels away from `loaded_runtime` wording:
+  `generic_runtime_owns_schedule_storage`, `generic_runtime_shell`,
+  `generic_runtime_state_summary_projection`,
+  `generic_runtime_assertion_executor`, and related executor labels.
+- Updated `verify-compiler-boundaries` from quarantine semantics to removal
+  semantics: it now checks that the loaded-runtime engine branch, shell,
+  harness, raw scenario helpers, and product legacy fallback helpers are gone.
+  The remaining `GenericScheduledRuntime` wrapper is reported as an explicit
+  test island rather than as a compatibility destination.
+
+Evidence:
+
+- `cargo check -q -p xtask -p boon_runtime -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema --lib`: pass, `70` tests.
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- `cargo test -q -p boon_runtime --lib
+  compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_load`:
+  pass.
+- `cargo test -q -p boon_runtime --lib
+  runtime_completeness_and_adapter_flags_are_derived_from_slices`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: schema-valid `status=fail`. The
+  remaining blockers are not from the loaded-runtime cleanup: PlanExecutor core
+  does not yet own indexed list row expression refresh iteration, and
+  `boon_runtime` live runtime constructors still require a `TypedProgram`
+  instead of the compiled runtime program.
+
+Next cut:
+
+- Move indexed list row expression refresh iteration fully behind the
+  PlanExecutor boundary.
+- Make live runtime constructors take/use the compiled runtime program so the
+  runtime no longer needs a parallel typed-program construction/control path.

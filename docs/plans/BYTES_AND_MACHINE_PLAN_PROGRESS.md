@@ -36464,3 +36464,61 @@ Current interpretation:
   reports stale once. Refresh them through the aggregate refresh queue before
   interpreting native preview failures as product/runtime failures.
 - Remaining BYTES aggregate failures are refresh debt, not true blockers.
+
+## 2026-07-05 - PlanExecutor Root Initializer Cut Exposes NovyWave Expression Gap
+
+Status: fixed a generic PlanExecutor root-initializer gap, but did not switch
+the NovyWave bridge verifier to PlanExecutor because the current MachinePlan is
+missing expression payloads for the derived/list-view fields that NovyWave
+startup needs.
+
+What changed:
+
+- `ScalarStorageSlot` now carries `initial_root_field_path` separately from
+  `initial_row_field_path`.
+- Compiler lowering fills root-initial paths for `RootInitialField` slots.
+- Plan verification now requires root-initial and row-initial slots to carry
+  the matching source path and rejects mixed root/row initializer metadata.
+- PlanExecutor root initialization now:
+  1. initializes constant-backed root state;
+  2. evaluates available root derived defaults;
+  3. copies root-initial fields from exact or `store.`-prefixed root paths;
+  4. reevaluates root derived values after those copies.
+- Initial derived startup evaluation now resolves source-transform and pure row
+  expressions in dependency order instead of relying on a fixed source-first
+  ordering.
+
+Evidence:
+
+- `cargo test -q -p boon_plan root_initial_field_paths_resolve`: pass.
+- `cargo test -q -p boon_plan_executor root_state_initializer_copies_root_initial_fields_without_constants`:
+  pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass.
+
+NovyWave cut attempt:
+
+- Switching `verify-novywave-bridge-scenario` from
+  `LiveRuntime::from_project_legacy` to `LiveRuntime::from_project_plan_executor`
+  first failed on missing root typed constants.
+- After the generic initializer fix it progressed to derived startup, then
+  stalled because required startup copy sources such as
+  `store.startup_selected_file`, `store.startup_selected_file_path`,
+  `store.selected_waveform_metadata_canvas_width`,
+  `store.selected_timeline_cursor_default`, and
+  `store.selected_timeline_zoom_center_default` are pure derived fields with no
+  `PlanDerivedExpression` payload.
+- The same plan has hundreds of `pure` derived fields and several `list_view`
+  fields marked executable but carrying no expression payload, so a clean
+  NovyWave PlanExecutor switch requires compiler/MachinePlan expression
+  coverage for those fields, not a runtime fallback.
+
+Current interpretation:
+
+- The root-initializer engine gap is fixed generically and should stay.
+- The NovyWave bridge verifier remains on the explicit legacy runtime until
+  MachinePlan can represent and PlanExecutor can evaluate the missing pure and
+  list-view derived startup fields.
+- Do not add a PlanExecutor-to-legacy fallback for this path. The next real cut
+  is compiler/executor expression coverage for NovyWave's currently expression-
+  less derived/list-view fields, or deletion/replacement of the obsolete bridge
+  verifier if it is no longer product evidence.

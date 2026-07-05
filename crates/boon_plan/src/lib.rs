@@ -247,6 +247,8 @@ pub struct ScalarStorageSlot {
     pub initial_value_kind: InitialValueKind,
     pub initial_constant_id: Option<PlanConstantId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_root_field_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_row_field_path: Option<String>,
 }
 
@@ -993,9 +995,9 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         detail: "initial and update constant refs resolve to compatible typed constants".to_owned(),
     });
     checks.push(PlanCheck {
-        id: "row-initial-field-paths-resolve".to_owned(),
-        pass: row_initial_field_paths_resolve(plan),
-        detail: "row-initial scalar slots carry source row field paths".to_owned(),
+        id: "initial-field-paths-resolve".to_owned(),
+        pass: initial_field_paths_resolve(plan),
+        detail: "root-initial and row-initial scalar slots carry source field paths".to_owned(),
     });
     checks.push(PlanCheck {
         id: "list-initial-row-fields-resolve".to_owned(),
@@ -4177,16 +4179,24 @@ fn constant_refs_resolve_and_match_storage_types(plan: &MachinePlan) -> bool {
     true
 }
 
-fn row_initial_field_paths_resolve(plan: &MachinePlan) -> bool {
+fn initial_field_paths_resolve(plan: &MachinePlan) -> bool {
     plan.storage_layout
         .scalar_slots
         .iter()
         .all(|slot| match slot.initial_value_kind {
-            InitialValueKind::RowInitialField => slot
-                .initial_row_field_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty()),
-            _ => slot.initial_row_field_path.is_none(),
+            InitialValueKind::RootInitialField => {
+                slot.initial_root_field_path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+                    && slot.initial_row_field_path.is_none()
+            }
+            InitialValueKind::RowInitialField => {
+                slot.initial_row_field_path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
+                    && slot.initial_root_field_path.is_none()
+            }
+            _ => slot.initial_root_field_path.is_none() && slot.initial_row_field_path.is_none(),
         })
 }
 
@@ -5388,6 +5398,76 @@ mod tests {
         assert_eq!(decoded.address_lookup_field, None);
     }
 
+    #[test]
+    fn root_initial_field_paths_resolve() {
+        let mut plan = MachinePlan {
+            version: PlanVersion::default(),
+            target_profile: TargetProfile::SoftwareDefault,
+            constants: Vec::new(),
+            source_routes: Vec::new(),
+            storage_layout: StorageLayout {
+                scalar_slots: vec![ScalarStorageSlot {
+                    id: PlanStorageId(0),
+                    state_id: StateId(1),
+                    value_type: PlanValueType::RootInitialField,
+                    scope_id: None,
+                    indexed: false,
+                    initial_value_kind: InitialValueKind::RootInitialField,
+                    initial_constant_id: None,
+                    initial_root_field_path: Some("input".to_owned()),
+                    initial_row_field_path: None,
+                }],
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: Vec::new(),
+            dirty_plan: DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: CommitPlan {
+                update_branch_count: 0,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: DeltaPlan { deltas: Vec::new() },
+            capability_summary: CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 0,
+                source_route_count: 0,
+                scalar_storage_count: 1,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 0,
+                typed_value_ref_count: 0,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: DebugMap {
+                source_units: Vec::new(),
+                source_routes: Vec::new(),
+                state_slots: Vec::new(),
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: Vec::new(),
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+
+        assert!(initial_field_paths_resolve(&plan));
+        plan.storage_layout.scalar_slots[0].initial_root_field_path = None;
+        assert!(!initial_field_paths_resolve(&plan));
+        plan.storage_layout.scalar_slots[0].initial_root_field_path = Some("input".to_owned());
+        plan.storage_layout.scalar_slots[0].initial_row_field_path = Some("row.input".to_owned());
+        assert!(!initial_field_paths_resolve(&plan));
+    }
+
     fn bytes_guarded_const_update_op() -> PlanOp {
         PlanOp {
             id: PlanOpId(7),
@@ -5432,6 +5512,7 @@ mod tests {
             indexed: false,
             initial_value_kind: InitialValueKind::Text,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         let PlanOpKind::UpdateBranch { source_guard, .. } = &op.kind else {
@@ -5478,6 +5559,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::RowInitialField,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: Some("row.payload".to_owned()),
             },
             ScalarStorageSlot {
@@ -5488,6 +5570,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::RowInitialField,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: Some("row.patched".to_owned()),
             },
         ];

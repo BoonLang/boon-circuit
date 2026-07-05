@@ -3559,10 +3559,65 @@ pub fn evaluate_initial_root_derived_values(
     evaluation_state
         .entry("Router/route".to_owned())
         .or_insert_with(|| json!("/"));
-    let mut values = evaluate_initial_root_source_event_transforms(plan, &evaluation_state)?;
-    commit_source_derived_values_to_root_state(plan, &mut evaluation_state, &values);
-    for (field_id, value) in evaluate_root_row_expression_derived_values(plan, &evaluation_state)? {
-        values.insert(field_id, value);
+    let derived_ops = plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            if op.indexed {
+                return None;
+            }
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                return None;
+            };
+            match &op.kind {
+                PlanOpKind::DerivedValue {
+                    derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                    expression: Some(PlanDerivedExpression::SourceEventTransform { default, .. }),
+                    ..
+                } => Some((op, output_id, default.as_ref())),
+                PlanOpKind::DerivedValue {
+                    derived_kind: boon_plan::PlanDerivedKind::Pure,
+                    expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                    ..
+                } => Some((op, output_id, expression)),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut values = BTreeMap::new();
+    let mut resolved = BTreeSet::new();
+    while resolved.len() < derived_ops.len() {
+        let mut progressed = false;
+        let mut deferred_errors = Vec::new();
+        for (op, output_id, expression) in &derived_ops {
+            if resolved.contains(&op.id) {
+                continue;
+            }
+            match eval_root_source_transform_row_expression(plan, &evaluation_state, expression) {
+                Ok(value) => {
+                    evaluation_state.insert(derived_field_label(plan, output_id.0), value.clone());
+                    values.insert(*output_id, value);
+                    resolved.insert(op.id);
+                    progressed = true;
+                }
+                Err(error) => {
+                    deferred_errors.push(format!(
+                        "field {}: {error}",
+                        derived_field_label(plan, output_id.0)
+                    ));
+                }
+            }
+        }
+        if !progressed {
+            return Err(format!(
+                "initial root derived value dependency resolution stalled: {}",
+                deferred_errors.join("; ")
+            )
+            .into());
+        }
     }
     Ok(values)
 }
@@ -4636,13 +4691,15 @@ pub fn execute_initial_state(plan: &MachinePlan) -> PlanExecutorResult<InitialSt
                         .into());
                     }
                     if !slot.indexed {
-                        let value = initial_value(
-                            plan,
-                            slot.initial_constant_id,
-                            &slot.value_type,
-                            slot.initial_value_kind,
-                        )?;
-                        state_summary.insert(state_label(plan, state_id), value);
+                        if slot.initial_value_kind != InitialValueKind::RootInitialField {
+                            let value = initial_value(
+                                plan,
+                                slot.initial_constant_id,
+                                &slot.value_type,
+                                slot.initial_value_kind,
+                            )?;
+                            state_summary.insert(state_label(plan, state_id), value);
+                        }
                     }
                     initialized_state_count += 1;
                 }
@@ -4709,20 +4766,29 @@ pub fn execute_initial_state(plan: &MachinePlan) -> PlanExecutorResult<InitialSt
         .into());
     }
 
-    let initial_source_event_transforms =
+    let pre_copy_initial_source_event_transforms =
         evaluate_initial_root_derived_values(plan, &state_summary)?;
-    let initialized_source_event_transform_count = initial_source_event_transforms.len();
-    let source_event_transform_commits = commit_source_derived_values_to_root_state(
+    let mut source_event_transform_commits = commit_source_derived_values_to_root_state(
         plan,
         &mut state_summary,
-        &initial_source_event_transforms,
+        &pre_copy_initial_source_event_transforms,
     );
+    let root_initial_field_copy_count = copy_root_initial_fields(plan, &mut state_summary)?;
+    let post_copy_initial_source_event_transforms =
+        evaluate_initial_root_derived_values(plan, &state_summary)?;
+    source_event_transform_commits.extend(commit_source_derived_values_to_root_state(
+        plan,
+        &mut state_summary,
+        &post_copy_initial_source_event_transforms,
+    ));
+    let initialized_source_event_transform_count = source_event_transform_commits.len();
 
     let plan_hash = plan_sha256(plan)?;
     let state_summary = JsonValue::Object(state_summary);
     let executor_report = json!({
         "executor": "cpu-plan-executor-core-v1",
         "initialized_state_count": initialized_state_count,
+        "root_initial_field_copy_count": root_initial_field_copy_count,
         "initialized_root_source_event_transform_count": initialized_source_event_transform_count,
         "root_source_event_transform_commits": source_event_transform_commits,
         "source_route_metadata_count": source_route_metadata_count,
@@ -5102,11 +5168,78 @@ pub fn initialize_root_bytes_storage(
     })
 }
 
+fn copy_root_initial_fields(
+    plan: &MachinePlan,
+    root_state: &mut JsonMap<String, JsonValue>,
+) -> PlanExecutorResult<usize> {
+    let mut pending = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .filter(|slot| {
+            !slot.indexed && slot.initial_value_kind == InitialValueKind::RootInitialField
+        })
+        .collect::<Vec<_>>();
+    let mut copied = 0usize;
+
+    while !pending.is_empty() {
+        let pending_before = pending.len();
+        let mut still_pending = Vec::new();
+        for slot in pending {
+            let target_label = state_label(plan, slot.state_id);
+            let source_path = slot
+                .initial_root_field_path
+                .as_deref()
+                .ok_or_else(|| format!("root initial field `{target_label}` has no source path"))?;
+            if let Some(value) = resolve_root_initial_field_value(root_state, source_path) {
+                root_state.insert(target_label, value);
+                copied += 1;
+            } else {
+                still_pending.push(slot);
+            }
+        }
+        if still_pending.len() == pending_before {
+            let unresolved = still_pending
+                .iter()
+                .map(|slot| {
+                    let target_label = state_label(plan, slot.state_id);
+                    let source_path = slot
+                        .initial_root_field_path
+                        .as_deref()
+                        .unwrap_or("<missing>");
+                    format!("{target_label} <- {source_path}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(
+                format!("root initial field copy source(s) unresolved: {unresolved}").into(),
+            );
+        }
+        pending = still_pending;
+    }
+
+    Ok(copied)
+}
+
+fn resolve_root_initial_field_value(
+    root_state: &JsonMap<String, JsonValue>,
+    source_path: &str,
+) -> Option<JsonValue> {
+    root_state.get(source_path).cloned().or_else(|| {
+        (!source_path.contains('.'))
+            .then(|| root_state.get(&format!("store.{source_path}")).cloned())
+            .flatten()
+    })
+}
+
 pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecutorRootState> {
     let mut root_state = JsonMap::new();
     let mut initialized_state_count = 0usize;
     for slot in &plan.storage_layout.scalar_slots {
         if slot.indexed {
+            continue;
+        }
+        if slot.initial_value_kind == InitialValueKind::RootInitialField {
             continue;
         }
         let value = initial_value(
@@ -5118,17 +5251,28 @@ pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecu
         root_state.insert(state_label(plan, slot.state_id), value);
         initialized_state_count += 1;
     }
-    let initial_source_event_transforms = evaluate_initial_root_derived_values(plan, &root_state)?;
-    let initialized_source_event_transform_count = initial_source_event_transforms.len();
-    let source_event_transform_commits = commit_source_derived_values_to_root_state(
+    let pre_copy_initial_source_event_transforms =
+        evaluate_initial_root_derived_values(plan, &root_state)?;
+    let mut source_event_transform_commits = commit_source_derived_values_to_root_state(
         plan,
         &mut root_state,
-        &initial_source_event_transforms,
+        &pre_copy_initial_source_event_transforms,
     );
+    let root_initial_field_copy_count = copy_root_initial_fields(plan, &mut root_state)?;
+    initialized_state_count += root_initial_field_copy_count;
+    let post_copy_initial_source_event_transforms =
+        evaluate_initial_root_derived_values(plan, &root_state)?;
+    source_event_transform_commits.extend(commit_source_derived_values_to_root_state(
+        plan,
+        &mut root_state,
+        &post_copy_initial_source_event_transforms,
+    ));
+    let initialized_source_event_transform_count = source_event_transform_commits.len();
     let bytes_initialization = initialize_root_bytes_storage(plan, &root_state)?;
     let executor_report = json!({
         "executor": "cpu-plan-root-state-initializer-v1",
         "initialized_state_count": initialized_state_count,
+        "root_initial_field_copy_count": root_initial_field_copy_count,
         "initialized_root_source_event_transform_count": initialized_source_event_transform_count,
         "root_source_event_transform_commits": source_event_transform_commits,
         "initialized_bytes_state_count": bytes_initialization.initialized_bytes_state_count,
@@ -16906,6 +17050,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: InitialValueKind::Text,
                     initial_constant_id: Some(PlanConstantId(0)),
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -17722,6 +17867,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: InitialValueKind::Enum,
                     initial_constant_id: Some(PlanConstantId(0)),
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -17861,6 +18007,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: InitialValueKind::Text,
                     initial_constant_id: Some(PlanConstantId(0)),
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -18648,6 +18795,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Text,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: Some("todo.title".to_owned()),
             },
             boon_plan::ScalarStorageSlot {
@@ -18658,6 +18806,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Bytes,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: Some("todo.payload".to_owned()),
             },
         ];
@@ -18734,6 +18883,7 @@ mod tests {
             indexed: true,
             initial_value_kind: InitialValueKind::Bool,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         plan.regions = vec![boon_plan::OperationRegion {
@@ -19441,6 +19591,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: InitialValueKind::Bytes,
                     initial_constant_id: Some(PlanConstantId(1)),
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -19519,6 +19670,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn root_state_initializer_copies_root_initial_fields_without_constants() {
+        let plan = MachinePlan {
+            version: boon_plan::PlanVersion::default(),
+            target_profile: boon_plan::TargetProfile::SoftwareDefault,
+            constants: vec![boon_plan::PlanConstant {
+                id: PlanConstantId(0),
+                value: PlanConstantValue::Text {
+                    value: "draft.txt".to_owned(),
+                },
+            }],
+            source_routes: Vec::new(),
+            storage_layout: boon_plan::StorageLayout {
+                scalar_slots: vec![
+                    boon_plan::ScalarStorageSlot {
+                        id: boon_plan::PlanStorageId(0),
+                        state_id: StateId(1),
+                        value_type: PlanValueType::Text,
+                        scope_id: None,
+                        indexed: false,
+                        initial_value_kind: InitialValueKind::Text,
+                        initial_constant_id: Some(PlanConstantId(0)),
+                        initial_root_field_path: None,
+                        initial_row_field_path: None,
+                    },
+                    boon_plan::ScalarStorageSlot {
+                        id: boon_plan::PlanStorageId(1),
+                        state_id: StateId(2),
+                        value_type: PlanValueType::RootInitialField,
+                        scope_id: None,
+                        indexed: false,
+                        initial_value_kind: InitialValueKind::RootInitialField,
+                        initial_constant_id: None,
+                        initial_root_field_path: Some("active_file".to_owned()),
+                        initial_row_field_path: None,
+                    },
+                ],
+                list_slots: Vec::new(),
+                byte_banks: Vec::new(),
+            },
+            regions: vec![boon_plan::OperationRegion {
+                id: boon_plan::PlanRegionId(0),
+                kind: RegionKind::StateInitialization,
+                ops: vec![
+                    PlanOp {
+                        id: PlanOpId(0),
+                        kind: PlanOpKind::StateInitialize {
+                            initial_value_kind: InitialValueKind::Text,
+                            initial_constant_id: Some(PlanConstantId(0)),
+                        },
+                        inputs: Vec::new(),
+                        output: Some(ValueRef::State(StateId(1))),
+                        indexed: false,
+                        unresolved_executable_ref_count: 0,
+                    },
+                    PlanOp {
+                        id: PlanOpId(1),
+                        kind: PlanOpKind::StateInitialize {
+                            initial_value_kind: InitialValueKind::RootInitialField,
+                            initial_constant_id: None,
+                        },
+                        inputs: Vec::new(),
+                        output: Some(ValueRef::State(StateId(2))),
+                        indexed: false,
+                        unresolved_executable_ref_count: 0,
+                    },
+                ],
+            }],
+            dirty_plan: boon_plan::DirtyPlan {
+                dependency_edges: 0,
+                unresolved_dependency_edges: 0,
+            },
+            commit_plan: boon_plan::CommitPlan {
+                update_branch_count: 0,
+                unresolved_update_branch_count: 0,
+            },
+            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
+            capability_summary: boon_plan::CapabilitySummary {
+                executable: true,
+                typed_lowering_executable: true,
+                cpu_plan_executor_complete: true,
+                constant_count: 1,
+                source_route_count: 0,
+                scalar_storage_count: 2,
+                list_storage_count: 0,
+                byte_bank_storage_count: 0,
+                operation_count: 2,
+                typed_value_ref_count: 2,
+                executable_string_path_count: 0,
+                unresolved_executable_ref_count: 0,
+                unknown_plan_op_count: 0,
+                cpu_plan_executor_unsupported_op_count: 0,
+                runtime_ast_dependency_count: 0,
+                graph_rebuild_count: 0,
+                graph_clones_per_item: 0,
+            },
+            debug_map: boon_plan::DebugMap {
+                source_units: Vec::new(),
+                source_routes: Vec::new(),
+                state_slots: vec![
+                    boon_plan::DebugEntry {
+                        id: "state:1".to_owned(),
+                        label: "store.active_file".to_owned(),
+                    },
+                    boon_plan::DebugEntry {
+                        id: "state:2".to_owned(),
+                        label: "store.selected_file".to_owned(),
+                    },
+                ],
+                list_slots: Vec::new(),
+                derived_values: Vec::new(),
+                fields: Vec::new(),
+                unresolved_executable_refs: Vec::new(),
+            },
+        };
+
+        let root = initialize_root_state(&plan).expect("root state should initialize");
+        assert_eq!(root.root_state["store.active_file"], "draft.txt");
+        assert_eq!(root.root_state["store.selected_file"], "draft.txt");
+        assert_eq!(root.initialized_state_count, 2);
+        assert_eq!(root.executor_report["root_initial_field_copy_count"], 1);
+
+        let executed =
+            execute_initial_state(&plan).expect("initial-state execution should initialize copies");
+        assert_eq!(
+            executed.executor_report["state_summary"]["store.selected_file"],
+            "draft.txt"
+        );
+        assert_eq!(executed.executor_report["root_initial_field_copy_count"], 1);
+    }
+
     fn empty_executor_test_plan() -> MachinePlan {
         MachinePlan {
             version: boon_plan::PlanVersion::default(),
@@ -19589,6 +19871,7 @@ mod tests {
                     indexed: true,
                     initial_value_kind: InitialValueKind::Bytes,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: vec![boon_plan::ListStorageSlot {
@@ -19722,6 +20005,7 @@ mod tests {
                         indexed: true,
                         initial_value_kind: InitialValueKind::Text,
                         initial_constant_id: Some(PlanConstantId(1)),
+                        initial_root_field_path: None,
                         initial_row_field_path: None,
                     },
                     boon_plan::ScalarStorageSlot {
@@ -19732,6 +20016,7 @@ mod tests {
                         indexed: true,
                         initial_value_kind: InitialValueKind::Bytes,
                         initial_constant_id: Some(PlanConstantId(2)),
+                        initial_root_field_path: None,
                         initial_row_field_path: None,
                     },
                 ],
@@ -20067,6 +20352,7 @@ mod tests {
                     indexed: true,
                     initial_value_kind: boon_plan::InitialValueKind::Text,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: vec![list_slot.clone()],
@@ -20239,6 +20525,7 @@ mod tests {
             indexed: true,
             initial_value_kind: InitialValueKind::Text,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
@@ -20358,6 +20645,7 @@ mod tests {
             indexed: true,
             initial_value_kind: InitialValueKind::Text,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
@@ -20489,6 +20777,7 @@ mod tests {
             indexed: true,
             initial_value_kind: InitialValueKind::Text,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         plan.debug_map.list_slots = vec![boon_plan::DebugEntry {
@@ -20765,6 +21054,7 @@ mod tests {
             indexed: true,
             initial_value_kind: InitialValueKind::Bool,
             initial_constant_id: None,
+            initial_root_field_path: None,
             initial_row_field_path: None,
         }];
         plan.debug_map.list_slots = vec![boon_plan::DebugEntry {
@@ -20906,6 +21196,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Text,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: None,
             },
             boon_plan::ScalarStorageSlot {
@@ -20916,6 +21207,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Bool,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: None,
             },
             boon_plan::ScalarStorageSlot {
@@ -20926,6 +21218,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Text,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: None,
             },
             boon_plan::ScalarStorageSlot {
@@ -20936,6 +21229,7 @@ mod tests {
                 indexed: true,
                 initial_value_kind: InitialValueKind::Text,
                 initial_constant_id: None,
+                initial_root_field_path: None,
                 initial_row_field_path: None,
             },
         ];
@@ -21333,6 +21627,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: boon_plan::InitialValueKind::Text,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -21445,6 +21740,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: boon_plan::InitialValueKind::Text,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -21871,6 +22167,7 @@ mod tests {
                     indexed: false,
                     initial_value_kind: boon_plan::InitialValueKind::Text,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: Vec::new(),
@@ -22088,6 +22385,7 @@ mod tests {
                     indexed: true,
                     initial_value_kind: InitialValueKind::Bool,
                     initial_constant_id: None,
+                    initial_root_field_path: None,
                     initial_row_field_path: None,
                 }],
                 list_slots: vec![boon_plan::ListStorageSlot {

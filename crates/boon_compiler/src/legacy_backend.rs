@@ -205,6 +205,7 @@ pub fn compile_typed_program(
             indexed: state.indexed,
             initial_value_kind: initial_value_kind_from_ir(&state.initial_value),
             initial_constant_id: initial_constant_ids[slot_id],
+            initial_root_field_path: initial_root_field_path(&state.initial_value),
             initial_row_field_path: initial_row_field_path(&state.initial_value),
         })
         .collect::<Vec<_>>();
@@ -821,6 +822,13 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
 fn initial_row_field_path(value: &InitialValue) -> Option<String> {
     match value {
         InitialValue::RowInitialField { path } => Some(path.clone()),
+        _ => None,
+    }
+}
+
+fn initial_root_field_path(value: &InitialValue) -> Option<String> {
+    match value {
+        InitialValue::RootInitialField { path } => Some(path.clone()),
         _ => None,
     }
 }

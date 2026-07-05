@@ -2883,7 +2883,7 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "workspace_dependency",
         "facade_exports_compile_typed_program",
         "facade_delegates_to_plan_backend",
-        "compiler_owns_legacy_backend_source",
+        "compiler_owns_machine_plan_backend_source",
     ] {
         if compiler.get(key).and_then(JsonValue::as_bool).is_none() {
             return Err(format!(
@@ -2999,10 +2999,10 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "plan_schema_still_uses_ir_ids",
         "plan_schema_still_uses_ir_source_schema",
         "boon_plan_frontend_dependencies_optional_only",
-        "boon_plan_legacy_ir_adapter_feature_present",
-        "boon_plan_legacy_backend_feature_present",
-        "boon_compiler_enables_legacy_backend_feature",
-        "boon_compiler_enables_legacy_ir_adapter_feature",
+        "boon_plan_old_ir_adapter_feature_present",
+        "boon_plan_old_backend_feature_present",
+        "boon_compiler_enables_old_backend_feature",
+        "boon_compiler_enables_old_ir_adapter_feature",
         "boon_plan_default_build_schema_only",
         "parser_ast_still_in_plan_lowering",
         "plan_executor_core_still_frontend_coupled",
@@ -3122,7 +3122,7 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "boon_plan_depends_on_boon_parser",
         "boon_plan_optionally_depends_on_boon_parser",
         "boon_plan_optionally_depends_on_boon_typecheck",
-        "boon_plan_legacy_ir_adapter_feature_present",
+        "boon_plan_old_ir_adapter_feature_present",
         "boon_plan_imports_parser_ast",
     ] {
         if direction.get(key).and_then(JsonValue::as_bool).is_none() {

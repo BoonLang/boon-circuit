@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-mod legacy_backend;
+mod machine_plan_backend;
 
 pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -5246,7 +5246,7 @@ pub fn compile_typed_program(
     program: &TypedProgram,
     target_profile: TargetProfile,
 ) -> Result<MachinePlan, PlanError> {
-    legacy_backend::compile_typed_program(program, target_profile)
+    machine_plan_backend::compile_typed_program(program, target_profile)
 }
 
 pub fn compiler_parsed_document(parsed: &ParsedProgram) -> Option<DocumentAst> {

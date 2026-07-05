@@ -24016,7 +24016,7 @@ legacy TypedProgram-to-MachinePlan backend and its tests now live in
 
 What changed:
 
-- Added `crates/boon_compiler/src/legacy_backend.rs` with the moved
+- Added `crates/boon_compiler/src/machine_plan_backend.rs` with the moved
   TypedProgram-to-MachinePlan lowering implementation and the former plan
   backend tests.
 - `boon_compiler::compile_typed_program` now calls its local legacy backend
@@ -24053,12 +24053,12 @@ Current compiler-boundary report:
 - `status="fail"`.
 - Only blocker:
   `PlanExecutor core is not extracted; boon_runtime still depends on parser/IR/typecheck crates`.
-- `boon_compiler.compiler_owns_legacy_backend_source=true`.
+- `boon_compiler.compiler_owns_machine_plan_backend_source=true`.
 - `boundary_decomposition.lowering_still_owned_by_plan_backend=false`.
 - `boundary_decomposition.parser_ast_still_in_plan_lowering=false`.
 - `boundary_decomposition.boon_plan_default_build_schema_only=true`.
-- `boundary_decomposition.boon_plan_legacy_backend_feature_present=false`.
-- `boundary_decomposition.boon_plan_legacy_ir_adapter_feature_present=false`.
+- `boundary_decomposition.boon_plan_old_backend_feature_present=false`.
+- `boundary_decomposition.boon_plan_old_ir_adapter_feature_present=false`.
 - `dependency_direction.boon_plan_depends_on_boon_ir=false`.
 - `dependency_direction.boon_plan_optionally_depends_on_boon_ir=false`.
 - `dependency_direction.boon_plan_depends_on_boon_parser=false`.
@@ -37653,3 +37653,23 @@ Remaining cleanup:
 - The next destructive cleanup should delete or migrate obsolete legacy tests
   in groups, starting with tests that assert public LiveRuntime behavior rather
   than storage-engine internals.
+
+## 2026-07-05 - Compiler Backend Renamed To MachinePlan Backend
+
+Status: removed a misleading `legacy_backend` name from the active compiler
+path. The module is the current compiler-owned TypedProgram-to-MachinePlan
+backend, so it now lives at `crates/boon_compiler/src/machine_plan_backend.rs`.
+
+What changed:
+
+- Renamed the compiler module from `legacy_backend` to
+  `machine_plan_backend`.
+- Updated the compiler facade to call `machine_plan_backend`.
+- Renamed compiler-boundary report/schema fields from
+  `compiler_owns_legacy_backend_source` to
+  `compiler_owns_machine_plan_backend_source`.
+- Renamed old compatibility-feature probes in the boundary report/schema from
+  `legacy_*` feature names to `old_*` feature names.
+
+This is a terminology/control-plane cleanup only. It does not delete the
+remaining test-only `LoadedRuntime` island.

@@ -22993,7 +22993,7 @@ current `verify-compiler-boundaries` blocker.
 
 What changed:
 
-- `crates/boon_compiler/src/legacy_backend.rs` now owns the moved legacy
+- `crates/boon_compiler/src/machine_plan_backend.rs` now owns the moved legacy
   TypedProgram-to-MachinePlan lowering implementation and its tests.
 - `boon_compiler::compile_typed_program` calls the compiler-owned backend.
 - `boon_plan` no longer depends on `boon_ir`, `boon_parser`, or

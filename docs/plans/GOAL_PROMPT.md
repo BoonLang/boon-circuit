@@ -16,15 +16,29 @@ Primary source of truth:
 
 Current checkpoint:
 
+- Latest runtime cleanup cut removed the test-only `LiveRuntimeEngine::LoadedRuntime`
+  branch, the `LoadedRuntimeHarness` wrapper, the `LoadedRuntime` shell, and the
+  private `apply_checked_step*` helpers that duplicated product event execution.
+  `crates/boon_runtime/src/lib.rs` now has no `LoadedRuntime` or
+  `LoadedRuntimeHarness` code references. The remaining runtime implementation
+  island is `GenericScheduledRuntime`; do not recreate a `LoadedRuntime`
+  wrapper or quarantine bucket to keep old tests alive. Several
+  `LoadedRuntimeHarness::from_source` tests were deleted rather than migrated
+  because direct PlanExecutor runs exposed unsupported old-fixture semantics
+  rather than current product evidence: unqualified root initial copies, row
+  latest/source-leaf summaries, arbitrary derived chunk summaries, old render
+  projection fixtures, broad BYTES builtin summary shape, and Cells recompute
+  sample accounting. Replace those only with PlanExecutor/product tests after
+  the missing executor semantics are deliberately implemented.
 - Latest architecture cleanup checkpoint moved root branch state and startup
   row-expression refresh behind the PlanExecutor boundary. Runtime no longer
   owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private
   BYTES/fixed-bank maps into `execute_root_scalar_update_branch(...)`, and no
   longer owns the startup row-expression evaluator. Fresh
   `verify-compiler-boundaries` now reports `status=pass` with zero blockers.
-  This is not complete legacy removal: `LoadedRuntime`/`GenericScheduledRuntime`,
+  This is not complete legacy removal: `GenericScheduledRuntime`,
   explicit diagnostic legacy comparison report surfaces, and native legacy
-  negative counters still need deletion or quarantine in later slices.
+  negative counters still need deletion or replacement in later slices.
 - Scenario-events product reports are now PlanExecutor-only. The
   `ScenarioEventsCommandOutputInput` / `ScenarioEventsCommandReportInput`
   structs no longer accept `legacy_comparison`, `legacy_comparison_acceptance`,

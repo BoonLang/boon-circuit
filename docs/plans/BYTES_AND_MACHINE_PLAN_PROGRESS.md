@@ -37997,3 +37997,61 @@ Remaining cleanup:
 
 - `LoadedRuntimeHarness::from_project` dropped again, but NovyWave and
   lower-level runtime tests still construct old runtimes explicitly.
+
+## 2026-07-06 - LoadedRuntime Shell And Harness Deleted
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Removed the test-only `LiveRuntimeEngine::LoadedRuntime` variant from
+  `LiveRuntime`.
+- Deleted `LoadedRuntimeHarness`, the `LoadedRuntime` shell, its initialized
+  runtime cache, and the private `apply_checked_step*` methods that duplicated
+  source-event execution outside the PlanExecutor product path.
+- Deleted remaining `LoadedRuntimeHarness::from_source` tests that could not be
+  honestly migrated to PlanExecutor in this cleanup slice. Direct migration
+  attempts exposed unsupported or obsolete fixture behavior rather than current
+  product proof: unqualified root initial copies, row latest/source-leaf
+  summaries, arbitrary derived chunk summaries, old render-projection fixtures,
+  broad BYTES builtin summary shape, and Cells recompute-sample accounting.
+- Kept the migrated product tests that pass on PlanExecutor:
+  sparse value-summary path count, pure root dependency summary currentness,
+  root revisit currentness, default constructor provenance, and PlanExecutor
+  world-output construction.
+
+Current interpretation:
+
+- `crates/boon_runtime/src/lib.rs` no longer contains `LoadedRuntime` or
+  `LoadedRuntimeHarness` code references.
+- `GenericScheduledRuntime` remains as the next implementation island. A first
+  deletion attempt showed that its surrounding block still owns shared helper
+  definitions used by PlanExecutor and report code, so the next slice should
+  separate shared helpers from the old wrapper before deleting it.
+- Report/status labels still contain old `loaded_runtime` names in a few
+  compiler-boundary slices. Those labels should be renamed or removed in the
+  next report-schema/control-plane cleanup, not used as a reason to recreate
+  `LoadedRuntime`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- `cargo test -q -p boon_runtime --lib`: attempted. The run completed after
+  about 11 minutes with 193 passing tests and two stale live-surface equality
+  failures. The direct batch equality test was fixed to compare compact
+  root-scenario paths against the richer live document state and now passes.
+  The broader representative live-surfaces test was started after the fix but
+  interrupted after several minutes without a result; rerun it before claiming
+  full `boon_runtime` suite green.
+- Focused product/default-runtime tests passed:
+  `runtime_value_summaries_return_every_requested_path`,
+  `derived_root_summary_recomputes_pure_dependency_before_stored_scalar_alias`,
+  `root_derived_revisits_earlier_dependent_after_later_dependency_changes`,
+  `live_runtime_default_source_constructor_uses_plan_executor_for_document_programs`,
+  `live_runtime_default_project_constructor_uses_plan_executor_for_document_programs`,
+  `live_runtime_default_scenario_constructor_uses_plan_executor_for_document_programs`,
+  `live_runtime_default_project_scenario_constructor_uses_plan_executor`,
+  `live_runtime_default_profiled_constructor_reports_plan_executor_selection`,
+  and `live_runtime_default_constructor_keeps_world_output_on_plan_executor`.
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner`: pass.

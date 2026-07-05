@@ -36826,3 +36826,37 @@ Evidence:
   pass; fresh report has zero `legacy_comparison` fields.
 - `cargo run -q -p xtask -- verify-bytes-file-write-plan --report target/reports/bytes-plan/bytes-file-write-plan.json`:
   pass; fresh report has zero `legacy_comparison` fields.
+
+## 2026-07-06 - LoadedRuntime Execution Shell Removed
+
+Status: implemented and focused-verified for `boon_runtime`.
+
+What changed:
+
+- Deleted the `LoadedRuntime` shell and `LoadedRuntimeHarness` from
+  `crates/boon_runtime/src/lib.rs`.
+- Removed the `LiveRuntimeEngine::LoadedRuntime` branch, initialized
+  LoadedRuntime cache, and private checked-step helpers that kept an alternate
+  source-event execution path alive beside PlanExecutor.
+- Removed stale `LoadedRuntimeHarness::from_source` tests instead of preserving
+  them through another compatibility wrapper. The deleted tests either inspected
+  old generic runtime internals or failed on direct PlanExecutor execution due
+  to missing/non-product fixture semantics.
+
+Current interpretation:
+
+- Product `LiveRuntime` is now PlanExecutor-only in code shape, not just by
+  provenance report.
+- This is still not the end of runtime cleanup. `GenericScheduledRuntime`
+  remains and must be separated from shared generic helper definitions before
+  it can be deleted cleanly. Report labels containing `loaded_runtime` also
+  remain as cleanup debt.
+- This slice does not claim Cells 60 FPS readiness. It removes one large source
+  of ambiguous old-runtime evidence before the next performance/runtime cut.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- Focused PlanExecutor/default-runtime tests passed for sparse summaries,
+  root currentness, default constructors, profiled provenance, and hello_3d
+  world output.

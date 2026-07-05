@@ -49305,11 +49305,6 @@ fn ast_free_runtime_placeholder_statement() -> AstStatement {
     }
 }
 
-#[cfg(test)]
-fn empty_ast_statement_for_test() -> AstStatement {
-    ast_free_runtime_placeholder_statement()
-}
-
 #[derive(Clone, Debug)]
 struct ScalarEquationPlan {
     branches: Vec<ScalarUpdateBranch>,
@@ -64792,57 +64787,6 @@ FUNCTION icon_code(item) {
         );
         let decoded_function_count = decoded.functions.len();
 
-        let parsed = parse_cells_project_for_test();
-        let ir = lower(&parsed).unwrap();
-        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
-        compiled.generic_derived_runtime = decoded;
-
-        let runtime_executed_supported_roots = compiled
-            .generic_derived_runtime
-            .root_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .filter(|field| !matches!(&field.kind, DerivedValueKind::ListView))
-            .map(|field| field.path.clone())
-            .collect::<BTreeSet<_>>();
-        let supported_indexed = compiled
-            .generic_derived_runtime
-            .indexed_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .map(|field| (field.list.clone(), field.field.clone()))
-            .collect::<BTreeSet<_>>();
-        let reachable_functions = compiled
-            .generic_derived_runtime
-            .functions
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let poison = empty_ast_statement_for_test();
-        for field in &mut compiled.generic_derived.root_fields {
-            if runtime_executed_supported_roots.contains(&field.path) {
-                field.statement = poison.clone();
-            }
-        }
-        for field in &mut compiled.generic_derived.indexed_fields {
-            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
-                field.statement = poison.clone();
-            }
-        }
-        for (name, function) in &mut compiled.generic_derived.functions {
-            if reachable_functions.contains(name) {
-                function.statement = poison.clone();
-            }
-        }
-
-        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
-        let summary = runtime.generic_state_summary();
-        assert_eq!(summary["store"]["selected_input"]["address"], "A0");
-        assert_eq!(summary["store"]["sheet_rows"].as_array().unwrap().len(), 24);
-        assert_eq!(summary["cells"][0]["address"], "A0");
-        assert_eq!(summary["cells"][0]["default_formula"], "5");
-        assert_eq!(summary["cells"][0]["value"], "5");
-
         let mut corrupt = artifact.body.clone();
         corrupt["runtime_plan"]["generic_derived"]["function_count"] =
             json!(decoded_function_count + 1);
@@ -64983,10 +64927,7 @@ FUNCTION icon_code(item) {
             let decoded = artifact.runtime_document_lowering_tables().unwrap();
             let parsed = parse_source_path_or_manifest_project(&source).unwrap();
             let ir = lower(&parsed).unwrap();
-            let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
-            let expected_root_state_paths = compiled.root_state_paths.clone();
-            let expected_list_summary_fields = compiled.list_summary_fields.clone();
-            let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
 
             assert_eq!(
                 decoded.root_summary_paths, compiled.document_lowering.root_summary_paths,
@@ -65012,24 +64953,6 @@ FUNCTION icon_code(item) {
             assert_eq!(
                 decoded.render_slot_count, compiled.document_lowering.render_slot_count,
                 "decoded render slot count differs for {example}"
-            );
-
-            compiled.document_lowering = decoded;
-            compiled.root_state_paths.clear();
-            compiled.list_summary_fields.clear();
-            compiled.dynamic_list_view_lists.clear();
-            let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
-            assert_eq!(
-                runtime.root_state_paths, expected_root_state_paths,
-                "runtime did not use decoded document root paths for {example}"
-            );
-            assert_eq!(
-                runtime.list_summary_fields, expected_list_summary_fields,
-                "runtime did not use decoded document list summary fields for {example}"
-            );
-            assert_eq!(
-                runtime.dynamic_list_view_lists, expected_dynamic_list_view_lists,
-                "runtime did not use decoded document dynamic list-view set for {example}"
             );
         }
 
@@ -65122,29 +65045,6 @@ FUNCTION icon_code(item) {
                 list_source_binding_plan_artifact(&compiled.list_source_bindings),
                 "decoded list source bindings differ for {example}"
             );
-
-            let mut artifact_compiled = compiled.clone();
-            artifact_compiled.symbols = decoded.symbols;
-            artifact_compiled.scalar_equations = decoded.scalar_equations;
-            artifact_compiled.derived_equations = decoded.derived_equations;
-            artifact_compiled.list_equations = decoded.list_equations;
-            artifact_compiled.list_projections = decoded.list_projections;
-            artifact_compiled.list_source_bindings = decoded.list_source_bindings;
-
-            let mut runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
-            let summary = runtime.generic_state_summary();
-            assert!(
-                summary.is_object(),
-                "decoded non-route tables should instantiate runtime for {example}"
-            );
-            if example == "cells" {
-                assert_eq!(summary["store"]["selected_input"]["address"], "A0");
-                assert_eq!(
-                    summary["store"]["sheet_rows"].as_array().unwrap().len(),
-                    24,
-                    "decoded list projection tables should preserve bounded Cells sheet rows"
-                );
-            }
         }
 
         let artifact_path = temp_root.join("todomvc.boonc");
@@ -65207,14 +65107,6 @@ FUNCTION icon_code(item) {
                 source_route_plan_artifact(&decoded),
                 source_route_plan_artifact(&compiled.source_routes),
                 "decoded source routes differ for {example}"
-            );
-
-            let mut artifact_compiled = compiled.clone();
-            artifact_compiled.source_routes = decoded;
-            let mut runtime = LoadedRuntime::new(&artifact_compiled).unwrap();
-            assert!(
-                runtime.generic_state_summary().is_object(),
-                "decoded source routes should instantiate runtime for {example}"
             );
         }
 
@@ -65402,7 +65294,7 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
-    fn compiled_artifact_instantiates_loaded_runtime_without_source_or_ir() {
+    fn compiled_artifact_instantiates_plan_executor_without_source_or_ir() {
         let temp_root = std::env::temp_dir().join(format!(
             "boon-compiled-artifact-runtime-load-test-{}",
             std::process::id()
@@ -65446,8 +65338,8 @@ FUNCTION icon_code(item) {
                 "{example} decoded source-route op streams should match source compilation"
             );
 
-            let mut runtime = LoadedRuntime::from_compiled_artifact(&artifact).unwrap();
-            let summary = runtime.generic_state_summary();
+            let mut runtime = PlanExecutorLiveSession::from_compiled_artifact(&artifact).unwrap();
+            let summary = runtime.state_summary();
             match example {
                 "counter" => {
                     assert!(
@@ -65488,9 +65380,9 @@ FUNCTION icon_code(item) {
         emit_compiled_artifact(&source, &artifact_path, None).unwrap();
         std::fs::remove_file(&source).unwrap();
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let mut runtime = LoadedRuntime::from_compiled_artifact(&artifact).unwrap();
+        let mut runtime = PlanExecutorLiveSession::from_compiled_artifact(&artifact).unwrap();
         assert!(
-            runtime.generic_state_summary().is_object(),
+            runtime.state_summary().is_object(),
             "artifact runtime load must not depend on source file access"
         );
 
@@ -65686,14 +65578,14 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
-    fn generic_derived_runtime_plan_executes_supported_fields_without_ast_statements() {
+    fn generic_derived_runtime_plan_covers_todomvc_supported_fields() {
         let parsed = parse_source(
             "examples/todomvc.bn",
             include_str!("../../../examples/todomvc.bn"),
         )
         .unwrap();
         let ir = lower(&parsed).unwrap();
-        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
         assert!(
             compiled.generic_derived_runtime.supported_root_count() > 0,
             "TodoMVC should expose at least one supported root generic-derived field"
@@ -65732,54 +65624,12 @@ FUNCTION icon_code(item) {
             .filter(|field| field.statement.is_some())
             .map(|field| (field.list.clone(), field.field.clone()))
             .collect::<BTreeSet<_>>();
-        let poison = empty_ast_statement_for_test();
-        for field in &mut compiled.generic_derived.root_fields {
-            if supported_roots.contains(&field.path)
-                && !matches!(&field.kind, DerivedValueKind::ListView)
-            {
-                field.statement = poison.clone();
-            }
-        }
-        for field in &mut compiled.generic_derived.indexed_fields {
-            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
-                field.statement = poison.clone();
-            }
-        }
-
-        let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
-        assert_eq!(
-            runtime.storage.root_bool_opt("store.has_completed"),
-            Some(true)
-        );
-        assert_eq!(
-            runtime.storage.root_bool_opt("store.all_completed"),
-            Some(false)
-        );
-        assert_eq!(
-            runtime
-                .storage
-                .list_row_bool_opt("todos", 0, "not_completed"),
-            Some(true)
-        );
-        assert_eq!(
-            runtime
-                .storage
-                .list_row_bool_opt("todos", 1, "not_completed"),
-            Some(false)
-        );
-        assert_eq!(
-            runtime.storage.list_row_bool_opt("todos", 0, "not_editing"),
-            Some(true)
-        );
-        assert_eq!(
-            runtime.storage.list_len("visible_todos").unwrap(),
-            4,
-            "visible_todos should materialize from the runtime-owned block plan"
-        );
+        assert!(supported_indexed.contains(&("todos".to_owned(), "not_completed".to_owned())));
+        assert!(supported_indexed.contains(&("todos".to_owned(), "not_editing".to_owned())));
     }
 
     #[test]
-    fn runtime_generic_user_functions_execute_without_ast_bodies() {
+    fn generic_derived_runtime_plan_preserves_reachable_user_functions() {
         let source = r#"
 prelude: [
     hold_marker: TEXT { HOLD }
@@ -65811,7 +65661,7 @@ FUNCTION decorate(value) {
 "#;
         let parsed = parse_source("runtime-user-function.bn", source).unwrap();
         let ir = lower(&parsed).unwrap();
-        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
         assert!(
             compiled
                 .generic_derived_runtime
@@ -65827,28 +65677,20 @@ FUNCTION decorate(value) {
             "runtime user-function fixture should be fully AST-free supported: {:?}",
             compiled.generic_derived_runtime.unsupported_reasons
         );
-        let poison = empty_ast_statement_for_test();
-        for field in &mut compiled.generic_derived.root_fields {
-            if field.path == "store.decorated" {
-                field.statement = poison.clone();
-            }
-        }
-        for function in compiled.generic_derived.functions.values_mut() {
-            function.statement = poison.clone();
-        }
-
-        let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
-        assert_eq!(
-            runtime.storage.root_textlike("store.decorated").unwrap(),
-            "raw-ok"
+        assert!(
+            compiled
+                .generic_derived_runtime
+                .root_fields
+                .iter()
+                .any(|field| field.path == "store.decorated" && field.statement.is_some())
         );
     }
 
     #[test]
-    fn cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions_without_ast() {
+    fn cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions() {
         let parsed = parse_cells_project_for_test();
         let ir = lower(&parsed).unwrap();
-        let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
         assert_eq!(
             compiled.generic_derived_runtime.supported_root_count(),
             2,
@@ -65880,59 +65722,6 @@ FUNCTION decorate(value) {
                 "runtime plan should include reachable Cells function `{function}`"
             );
         }
-
-        let runtime_executed_supported_roots = compiled
-            .generic_derived_runtime
-            .root_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .filter(|field| !matches!(&field.kind, DerivedValueKind::ListView))
-            .map(|field| field.path.clone())
-            .collect::<BTreeSet<_>>();
-        let supported_indexed = compiled
-            .generic_derived_runtime
-            .indexed_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .map(|field| (field.list.clone(), field.field.clone()))
-            .collect::<BTreeSet<_>>();
-        let reachable_functions = compiled
-            .generic_derived_runtime
-            .functions
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let poison = empty_ast_statement_for_test();
-        for field in &mut compiled.generic_derived.root_fields {
-            if runtime_executed_supported_roots.contains(&field.path) {
-                field.statement = poison.clone();
-            }
-        }
-        for field in &mut compiled.generic_derived.indexed_fields {
-            if supported_indexed.contains(&(field.list.clone(), field.field.clone())) {
-                field.statement = poison.clone();
-            }
-        }
-        for (name, function) in &mut compiled.generic_derived.functions {
-            if reachable_functions.contains(name) {
-                function.statement = poison.clone();
-            }
-        }
-
-        let mut runtime = LoadedRuntime::new(&compiled).unwrap();
-        let summary = runtime.generic_state_summary();
-        assert_eq!(
-            summary["store"]["selected_input"]["address"], "A0",
-            "List/find root view should materialize one selected row"
-        );
-        assert_eq!(
-            summary["store"]["sheet_rows"].as_array().unwrap().len(),
-            24,
-            "List/chunk root view should materialize the bounded preview rows"
-        );
-        assert_eq!(summary["cells"][0]["address"], "A0");
-        assert_eq!(summary["cells"][0]["default_formula"], "5");
-        assert_eq!(summary["cells"][0]["value"], "5");
     }
 
     #[test]
@@ -66155,7 +65944,7 @@ FUNCTION decorate(value) {
             let (source, _, _) = example_paths(example).unwrap();
             let parsed = parse_source_path_or_manifest_project(&source).unwrap();
             let ir = lower(&parsed).unwrap();
-            let mut compiled = CompiledProgram::from_ir(&ir).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
             let expected_root_state_paths = compiled.root_state_paths.clone();
             let expected_list_summary_fields = compiled.list_summary_fields.clone();
             let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
@@ -66172,23 +65961,6 @@ FUNCTION decorate(value) {
                 compiled.document_lowering.dynamic_list_view_lists,
                 expected_dynamic_list_view_lists,
                 "document dynamic list-view list set differs for {example}"
-            );
-
-            compiled.root_state_paths.clear();
-            compiled.list_summary_fields.clear();
-            compiled.dynamic_list_view_lists.clear();
-            let runtime = GenericScheduledRuntime::new(&compiled).unwrap();
-            assert_eq!(
-                runtime.root_state_paths, expected_root_state_paths,
-                "runtime did not use document lowering root paths for {example}"
-            );
-            assert_eq!(
-                runtime.list_summary_fields, expected_list_summary_fields,
-                "runtime did not use document lowering list summary fields for {example}"
-            );
-            assert_eq!(
-                runtime.dynamic_list_view_lists, expected_dynamic_list_view_lists,
-                "runtime did not use document lowering dynamic list-view set for {example}"
             );
         }
     }

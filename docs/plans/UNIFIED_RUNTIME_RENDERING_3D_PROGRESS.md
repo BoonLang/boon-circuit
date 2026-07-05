@@ -35763,3 +35763,38 @@ Current interpretation:
 - The next cleanup should continue deleting ambiguous legacy comparison/default
   fallback paths, then rerun native/BYTES aggregates from fresh child reports
   before interpreting any remaining blocker as a product bug.
+
+## 2026-07-05 - Product Pre-Present Proof Env Switch Cut
+
+Status: implemented a product-path proof-lane cleanup slice; dev diagnostic
+pre-present report debt remains explicit and tracked separately.
+
+What changed:
+
+- Removed the `BOON_NATIVE_LEGACY_PRE_PRESENT_RENDER_PROOF` switch from the
+  preview product render hook.
+- Product preview frames now always defer product proof/report materialization
+  out of the render hook path.
+- Product proof request summaries collapse to either no UX-path proof requests
+  or post-present `VisibleBoundText` / `RetainedBoundSync` subscriber requests.
+- The product path no longer creates legacy pre-present request summaries for
+  render-hook JSON, proof history, artifact hash, or external app-owned
+  readback.
+- The stale-path ledger now records that the env-enabled product branch was
+  removed while keeping negative gates for legacy boolean/counter fields until
+  schemas and reports stop carrying those compatibility fields.
+
+Evidence:
+
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p boon_native_playground deferred_product_proof_requests_are_not_legacy -- --nocapture`:
+  pass, `1 passed`, `281 filtered out`.
+
+Current interpretation:
+
+- A user or verifier can no longer opt the product preview back into
+  pre-present proof/report work with an environment variable.
+- Remaining proof-lane cleanup is to remove the legacy fields themselves from
+  product reports once all report schemas and native UX gates consume the
+  post-present proof identity instead of compatibility booleans/counters.

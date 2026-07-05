@@ -14,7 +14,7 @@
       "expected": false,
       "positive_gate": "post_present_proof_isolation.status=pass",
       "negative_gate": "legacy_product_proof_built_pre_present must be false in the linked preview-loop report",
-      "removal_condition": "delete legacy product proof construction once all native UX release gates use post-present proof subscribers"
+      "removal_condition": "2026-07-05 product env switch to legacy pre-present proof was removed; keep this negative gate until product reports no longer carry the legacy boolean field"
     },
     {
       "id": "cells-visible-click-no-legacy-pre-present-proof-requests",
@@ -28,7 +28,7 @@
       "expected": 0,
       "positive_gate": "post_present_proof_isolation.legacy_pre_present_request_count=0",
       "negative_gate": "legacy_pre_present_proof_request_count must be zero for release UX",
-      "removal_condition": "remove LegacyAlreadyBuiltPrePresent compatibility once proof-only gates cover all requested proof kinds"
+      "removal_condition": "2026-07-05 product proof request summaries were collapsed to empty or post-present subscribers only; keep this negative gate until product reports no longer carry the legacy counter field"
     },
     {
       "id": "cells-visible-click-no-hot-report-serialization",

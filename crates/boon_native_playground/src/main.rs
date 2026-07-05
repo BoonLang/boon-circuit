@@ -6010,8 +6010,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         || args
             .iter()
             .any(|arg| arg == "--skip-render-hook-app-owned-proof");
-    let lightweight_product_render_report =
-        proof_mode == boon_native_app_window::NativeProofMode::Counters;
     let connect = value_arg(args, "--connect").map(PathBuf::from);
     let (initial_width, initial_height) = preview_viewport_for_source_path(Path::new(&code_file));
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
@@ -6955,9 +6953,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|world_scene| world_scene.lock().ok().map(|state| state.clone()));
             let render_hook_outer_world_snapshot_ms = elapsed_ms(world_snapshot_started);
             let core_started = Instant::now();
-            let defer_product_render_report = !preview_legacy_pre_present_render_proof_enabled()
-                || lightweight_product_render_report
-                || context.input.real_os_events_observed;
+            let defer_product_render_report = true;
             let emit_deferred_post_present_proof = defer_product_render_report
                 && proof_mode == boon_native_app_window::NativeProofMode::Readback
                 && matches!(
@@ -12457,11 +12453,7 @@ fn native_gpu_app_owned_render_hook(
         !defer_product_render_report,
         Some(&visible_metrics),
         Some(product_patch_summary.clone()),
-        preview_post_present_proof_request_summaries_for_mode(
-            skip_app_owned_scene_proof,
-            defer_product_render_report,
-            emit_deferred_post_present_proof,
-        ),
+        preview_post_present_proof_request_summaries_for_mode(emit_deferred_post_present_proof),
     );
     render_frame_metrics.render_hook_phase_timings = Some(render_hook_phase_timings_ms.clone());
     preview_set_product_render_graph_encode_time_ms(
@@ -13006,13 +12998,6 @@ fn preview_post_present_proof_subscribers_for_mode(
     ]
 }
 
-fn legacy_pre_present_proof_request(
-    kind: boon_native_app_window::NativePostPresentProofRequestKind,
-    frame_local_snapshot_required: bool,
-) -> boon_native_app_window::NativePostPresentProofRequestSummary {
-    proof_request_summary(kind, frame_local_snapshot_required, true)
-}
-
 fn deferred_post_present_proof_request(
     kind: boon_native_app_window::NativePostPresentProofRequestKind,
     frame_local_snapshot_required: bool,
@@ -13033,60 +13018,28 @@ fn proof_request_summary(
 }
 
 fn preview_post_present_proof_request_summaries_for_mode(
-    skip_app_owned_scene_proof: bool,
-    defer_product_render_report: bool,
     emit_deferred_post_present_proof: bool,
 ) -> Vec<boon_native_app_window::NativePostPresentProofRequestSummary> {
-    if defer_product_render_report && !emit_deferred_post_present_proof {
+    if !emit_deferred_post_present_proof {
         return Vec::new();
     }
-    if defer_product_render_report {
-        return vec![
-            deferred_post_present_proof_request(
-                boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText,
-                true,
-            ),
-            deferred_post_present_proof_request(
-                boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync,
-                true,
-            ),
-        ];
-    }
-    let mut requests = vec![
-        legacy_pre_present_proof_request(
+    vec![
+        deferred_post_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText,
             true,
         ),
-        legacy_pre_present_proof_request(
+        deferred_post_present_proof_request(
             boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync,
             true,
         ),
-        legacy_pre_present_proof_request(
-            boon_native_app_window::NativePostPresentProofRequestKind::RenderHookReportJson,
-            true,
-        ),
-        legacy_pre_present_proof_request(
-            boon_native_app_window::NativePostPresentProofRequestKind::ProofHistory,
-            true,
-        ),
-        legacy_pre_present_proof_request(
-            boon_native_app_window::NativePostPresentProofRequestKind::ArtifactHash,
-            true,
-        ),
-    ];
-    if !skip_app_owned_scene_proof && !defer_product_render_report {
-        requests.push(legacy_pre_present_proof_request(
-            boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback,
-            true,
-        ));
-    }
-    requests
+    ]
 }
 
 fn dev_post_present_proof_request_summaries()
 -> Vec<boon_native_app_window::NativePostPresentProofRequestSummary> {
-    vec![legacy_pre_present_proof_request(
+    vec![proof_request_summary(
         boon_native_app_window::NativePostPresentProofRequestKind::DevRenderReportJson,
+        true,
         true,
     )]
 }
@@ -40044,15 +39997,6 @@ fn preview_first_frame_runtime_defer_enabled() -> bool {
     )
 }
 
-fn preview_legacy_pre_present_render_proof_enabled() -> bool {
-    matches!(
-        std::env::var("BOON_NATIVE_LEGACY_PRE_PRESENT_RENDER_PROOF")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
-}
-
 fn preview_simple_source_click_can_defer_runtime_first_frame(
     events: &[boon_runtime::LiveSourceEvent],
     input_state: &PreviewNativeInputState,
@@ -66529,63 +66473,41 @@ mod tests {
 
     #[test]
     fn deferred_product_proof_requests_are_not_legacy() {
-        let product_requests =
-            preview_post_present_proof_request_summaries_for_mode(true, true, false);
+        let product_requests = preview_post_present_proof_request_summaries_for_mode(false);
         assert!(
             product_requests.is_empty(),
             "deferred product frames should not enqueue proof requests on the UX path"
         );
 
-        let counters_requests =
-            preview_post_present_proof_request_summaries_for_mode(true, true, true);
-        assert!(!counters_requests.is_empty());
+        let post_present_requests = preview_post_present_proof_request_summaries_for_mode(true);
+        assert!(!post_present_requests.is_empty());
         assert!(
-            counters_requests
+            post_present_requests
                 .iter()
                 .all(|request| !request.currently_legacy_pre_present),
-            "deferred product mode must not report proof subscribers as pre-present debt"
+            "product proof subscribers must not report proof subscribers as pre-present debt"
         );
         assert!(
-            counters_requests.iter().all(|request| request.kind
+            post_present_requests.iter().all(|request| request.kind
                 != boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback),
-            "deferred product mode skips render-hook app-owned readback"
+            "product proof subscribers skip render-hook app-owned readback"
         );
         assert!(
-            counters_requests.iter().all(|request| matches!(
+            post_present_requests.iter().all(|request| matches!(
                 request.kind,
                 boon_native_app_window::NativePostPresentProofRequestKind::VisibleBoundText
                     | boon_native_app_window::NativePostPresentProofRequestKind::RetainedBoundSync
             )),
-            "deferred product proof requests stay limited to exact retained visual proof"
+            "product proof requests stay limited to exact retained visual proof"
         );
 
-        let readback_requests =
-            preview_post_present_proof_request_summaries_for_mode(false, true, true);
-        assert!(!readback_requests.is_empty());
+        let dev_requests = dev_post_present_proof_request_summaries();
         assert!(
-            readback_requests
-                .iter()
-                .all(|request| !request.currently_legacy_pre_present),
-            "deferred readback product frames must use post-present proof requests"
-        );
-        assert!(
-            readback_requests.iter().all(|request| request.kind
-                != boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback),
-            "deferred product frames must not request render-hook app-owned readback"
-        );
-
-        let full_proof_requests =
-            preview_post_present_proof_request_summaries_for_mode(false, false, false);
-        assert!(
-            full_proof_requests
+            dev_requests
                 .iter()
                 .all(|request| request.currently_legacy_pre_present),
-            "non-deferred diagnostic render-hook proof still reports legacy debt"
+            "dev render reports still label their diagnostic pre-present proof debt explicitly"
         );
-        assert!(full_proof_requests.iter().any(|request| {
-            request.kind
-            == boon_native_app_window::NativePostPresentProofRequestKind::ExternalAppOwnedReadback
-        }));
     }
 
     #[test]

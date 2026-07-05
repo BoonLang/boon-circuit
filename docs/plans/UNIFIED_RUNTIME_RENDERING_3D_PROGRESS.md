@@ -178,6 +178,74 @@ Remaining work:
   renderer-owned `ProductFrameGraph` from retained evidence into a fuller dirty
   resource/pass scheduler.
 
+## 2026-07-05 - Renderer ProductFrameGraph Schedule Decision Slice
+
+Status: first renderer-owned schedule decision slice implemented and freshly
+verified; broader ProductFrameGraph scheduling remains in progress.
+
+What changed:
+
+- `boon_native_gpu::FrameMetrics` now carries a bounded renderer-owned
+  schedule summary: scheduler kind, schedule hash, total decision count, dirty
+  resource decision count, clean reuse decision count, and per-present resource
+  decision count.
+- The native GPU renderer now emits typed per-resource schedule decisions for
+  retained resources: dirty first use, dirty upload, dirty signature change,
+  clean reuse, per-present color target, and per-frame metrics.
+- The preview product render graph summary propagates the bounded scheduler
+  scalars while keeping proof/readback in the post-present lane.
+- `xtask` product render graph contracts now require scheduler evidence for
+  both the focused product-graph verifier and the Cells product interaction
+  lane.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_native_gpu -p boon_native_app_window -p
+  boon_native_playground -p xtask`: pass.
+- `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`:
+  pass, `3 passed`.
+- `cargo test -q -p boon_native_playground
+  product_render_graph_plan_hash_ignores_workload_and_proof_subscribers
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask
+  cells_visible_click_lane_contracts_accept_split_product_and_proof_paths
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask product_render_graph -- --nocapture`: pass.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release
+  --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `cargo xtask verify-report-schema
+  target/reports/native-gpu/cells-visible-click-e2e-release.json`: pass.
+- `cargo xtask verify-native-gpu-stale-path-ledger
+  --report target/reports/native-gpu/stale-path-ledger.json`: pass.
+
+Fresh Cells report summary:
+
+- Product-only UX remains in budget:
+  `input_to_present_ms.p95=11.161ms`, `max=11.361ms`,
+  `sample_count=60`.
+- Product graph coverage remains present for all measured product samples:
+  `product_render_graph_count=60`.
+- Scheduler evidence is present in product graph samples with
+  `renderer_graph_scheduler_kind=retained_resource_decision_v1`,
+  `renderer_graph_schedule_decision_count=7`, and a valid schedule hash.
+- Runtime/list work remains bounded:
+  `runtime_work_contract.total_list_find_rows_scanned=0` and
+  `total_recomputed_fields=64`.
+- Proof remains separate from product UX:
+  `proof_lag_max_frames=0`, while the readback lane still reports about
+  `264ms` after product present.
+
+Remaining work:
+
+- The scheduler slice records decisions but does not yet skip or reorder GPU
+  work from the decision plan. The next ProductFrameGraph step should make the
+  retained resource/pass scheduler own dirty upload, clean reuse, surface epoch
+  reset, and proof-subscriber-only decisions before execution.
+- Native aggregate handoff still needs a final report refresh once code stops
+  changing; current aggregate failures remain refresh debt unless a fresh child
+  report proves otherwise.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

@@ -12865,7 +12865,7 @@ fn preview_compile_product_render_graph(
         .map(|patch| patch.touched_node_count)
         .unwrap_or(0);
     let graph_fingerprint = format!(
-        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}",
+        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{}",
         active_scene_identity,
         render_scene_identity,
         product_patch.map(|patch| patch.patch_kind.as_str()),
@@ -12879,15 +12879,19 @@ fn preview_compile_product_render_graph(
                 .renderer_render_graph_resource_lifetime_hash
                 .as_str()
         }),
-        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_resource_count)
+        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_resource_count),
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_scheduler_kind.as_str()),
+        renderer_metrics.map_or(0, |metrics| metrics
+            .renderer_render_graph_schedule_decision_count)
     );
     let plan_hash = boon_runtime::sha256_bytes(graph_fingerprint.as_bytes());
     let workload_fingerprint = format!(
-        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{}|{:?}",
+        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{}|{:?}|{:?}",
         active_scene_identity,
         render_scene_identity,
         u8::from(cache_hit),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_workload_hash.as_str())
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_workload_hash.as_str()),
+        renderer_metrics.map(|metrics| metrics.renderer_render_graph_schedule_hash.as_str())
     );
     let workload_hash = boon_runtime::sha256_bytes(workload_fingerprint.as_bytes());
     let proof_subscriber_fingerprint =
@@ -12940,6 +12944,24 @@ fn preview_compile_product_render_graph(
         }),
         renderer_graph_retained_reused_resource_count: renderer_metrics.map_or(0, |metrics| {
             metrics.renderer_render_graph_retained_reused_resource_count
+        }),
+        renderer_graph_scheduler_kind: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_scheduler_kind.clone())
+            .filter(|kind| !kind.is_empty()),
+        renderer_graph_schedule_hash: renderer_metrics
+            .map(|metrics| metrics.renderer_render_graph_schedule_hash.clone())
+            .filter(|hash| !hash.is_empty()),
+        renderer_graph_schedule_decision_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_schedule_decision_count
+        }),
+        renderer_graph_dirty_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_dirty_resource_decision_count
+        }),
+        renderer_graph_reuse_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_reuse_resource_decision_count
+        }),
+        renderer_graph_per_present_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
+            metrics.renderer_render_graph_per_present_resource_decision_count
         }),
         active_scene_identity,
         render_scene_identity,

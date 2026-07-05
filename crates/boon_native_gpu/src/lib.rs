@@ -143,6 +143,18 @@ pub struct RendererRenderGraphResourceMetric {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RendererRenderGraphScheduleDecisionMetric {
+    pub schema_version: u32,
+    pub resource_id: String,
+    pub resource_kind: String,
+    pub decision_kind: String,
+    pub reason: String,
+    pub retained_epoch: u64,
+    pub product_visible: bool,
+    pub proof_or_readback: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameMetrics {
     pub frame_seq: u64,
     #[serde(default)]
@@ -176,9 +188,23 @@ pub struct FrameMetrics {
     #[serde(default)]
     pub renderer_render_graph_retained_state_resource_count: u32,
     #[serde(default)]
+    pub renderer_render_graph_scheduler_kind: String,
+    #[serde(default)]
+    pub renderer_render_graph_schedule_hash: String,
+    #[serde(default)]
+    pub renderer_render_graph_schedule_decision_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_dirty_resource_decision_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_reuse_resource_decision_count: u32,
+    #[serde(default)]
+    pub renderer_render_graph_per_present_resource_decision_count: u32,
+    #[serde(default)]
     pub renderer_render_graph_passes: Vec<RendererRenderGraphPassMetric>,
     #[serde(default)]
     pub renderer_render_graph_resources: Vec<RendererRenderGraphResourceMetric>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renderer_render_graph_schedule_decisions: Vec<RendererRenderGraphScheduleDecisionMetric>,
     #[serde(default)]
     pub document_scene_convert_ms: f64,
     #[serde(default)]
@@ -651,8 +677,15 @@ impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
                 renderer_render_graph_retained_dirty_resource_count: 0,
                 renderer_render_graph_retained_reused_resource_count: 0,
                 renderer_render_graph_retained_state_resource_count: 0,
+                renderer_render_graph_scheduler_kind: String::new(),
+                renderer_render_graph_schedule_hash: String::new(),
+                renderer_render_graph_schedule_decision_count: 0,
+                renderer_render_graph_dirty_resource_decision_count: 0,
+                renderer_render_graph_reuse_resource_decision_count: 0,
+                renderer_render_graph_per_present_resource_decision_count: 0,
                 renderer_render_graph_passes: Vec::new(),
                 renderer_render_graph_resources: Vec::new(),
+                renderer_render_graph_schedule_decisions: Vec::new(),
                 document_scene_convert_ms: 0.0,
                 document_scene_cache_hit: false,
                 document_scene_cache_entry_count: 0,
@@ -2403,6 +2436,15 @@ struct ProductFrameGraphStateMetrics {
     resource_epoch_hash: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProductFrameGraphScheduleMetrics {
+    decision_count: u32,
+    dirty_resource_decision_count: u32,
+    reuse_resource_decision_count: u32,
+    per_present_resource_decision_count: u32,
+    schedule_hash: String,
+}
+
 impl ProductFrameGraphState {
     fn update_resources(
         &mut self,
@@ -2467,6 +2509,106 @@ impl ProductFrameGraphState {
             reused_resource_count,
             resource_epoch_hash: format!("{:x}", hasher.finalize()),
         }
+    }
+}
+
+fn product_frame_graph_schedule_decisions(
+    resources: &[RendererRenderGraphResourceMetric],
+    dirty_upload_chunk_ids: &[String],
+) -> Vec<RendererRenderGraphScheduleDecisionMetric> {
+    resources
+        .iter()
+        .map(|resource| {
+            let (decision_kind, reason) =
+                product_frame_graph_resource_decision(resource, dirty_upload_chunk_ids);
+            RendererRenderGraphScheduleDecisionMetric {
+                schema_version: 1,
+                resource_id: resource.resource_id.clone(),
+                resource_kind: resource.resource_kind.clone(),
+                decision_kind: decision_kind.to_owned(),
+                reason,
+                retained_epoch: resource.retained_epoch,
+                product_visible: resource.product_visible,
+                proof_or_readback: resource.proof_or_readback,
+            }
+        })
+        .collect()
+}
+
+fn product_frame_graph_resource_decision(
+    resource: &RendererRenderGraphResourceMetric,
+    dirty_upload_chunk_ids: &[String],
+) -> (&'static str, String) {
+    match resource.resource_id.as_str() {
+        "ColorTarget" => (
+            "per_present_target",
+            "visible color target is acquired and presented per frame".to_owned(),
+        ),
+        "FrameMetrics" => (
+            "per_frame_metrics",
+            "CPU metrics are produced for each frame".to_owned(),
+        ),
+        "RetainedGpuBuffers" if resource.retained_dirty && !dirty_upload_chunk_ids.is_empty() => (
+            "dirty_upload",
+            format!("dirty_upload_chunks={}", dirty_upload_chunk_ids.len()),
+        ),
+        _ if resource.retained_dirty && resource.retained_epoch <= 1 => (
+            "dirty_first_use",
+            "retained resource was initialized for this graph".to_owned(),
+        ),
+        _ if resource.retained_dirty => (
+            "dirty_signature_changed",
+            "retained resource signature changed".to_owned(),
+        ),
+        _ if resource.retained_reused => (
+            "clean_reuse",
+            "retained resource signature is unchanged".to_owned(),
+        ),
+        _ => (
+            "unknown",
+            "retained resource state was unavailable".to_owned(),
+        ),
+    }
+}
+
+fn product_frame_graph_schedule_metrics(
+    decisions: &[RendererRenderGraphScheduleDecisionMetric],
+) -> ProductFrameGraphScheduleMetrics {
+    let mut dirty_resource_decision_count = 0_u32;
+    let mut reuse_resource_decision_count = 0_u32;
+    let mut per_present_resource_decision_count = 0_u32;
+    let mut hasher = Sha256::new();
+    for decision in decisions {
+        dirty_resource_decision_count =
+            dirty_resource_decision_count.saturating_add(u32::from(matches!(
+                decision.decision_kind.as_str(),
+                "dirty_first_use" | "dirty_signature_changed" | "dirty_upload"
+            )));
+        reuse_resource_decision_count = reuse_resource_decision_count
+            .saturating_add(u32::from(decision.decision_kind == "clean_reuse"));
+        per_present_resource_decision_count =
+            per_present_resource_decision_count.saturating_add(u32::from(matches!(
+                decision.decision_kind.as_str(),
+                "per_present_target" | "per_frame_metrics"
+            )));
+        hasher.update(decision.resource_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(decision.resource_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(decision.decision_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(decision.retained_epoch.to_le_bytes());
+        hasher.update([
+            u8::from(decision.product_visible),
+            u8::from(decision.proof_or_readback),
+        ]);
+    }
+    ProductFrameGraphScheduleMetrics {
+        decision_count: decisions.len() as u32,
+        dirty_resource_decision_count,
+        reuse_resource_decision_count,
+        per_present_resource_decision_count,
+        schedule_hash: format!("{:x}", hasher.finalize()),
     }
 }
 
@@ -2896,6 +3038,12 @@ fn encode_internal_scene_to_surface(
             &mut renderer_render_graph_resources,
             &renderer_render_graph_resource_signatures,
         );
+    let renderer_render_graph_schedule_decisions = product_frame_graph_schedule_decisions(
+        &renderer_render_graph_resources,
+        &dirty_upload_chunk_ids,
+    );
+    let schedule_metrics =
+        product_frame_graph_schedule_metrics(&renderer_render_graph_schedule_decisions);
     let renderer_render_graph_plan_hash =
         renderer_render_graph_plan_hash(&renderer_render_graph_passes);
     let renderer_render_graph_workload_hash =
@@ -2931,8 +3079,18 @@ fn encode_internal_scene_to_surface(
         renderer_render_graph_retained_reused_resource_count: retained_state_metrics
             .reused_resource_count,
         renderer_render_graph_retained_state_resource_count: retained_state_metrics.resource_count,
+        renderer_render_graph_scheduler_kind: "retained_resource_decision_v1".to_owned(),
+        renderer_render_graph_schedule_hash: schedule_metrics.schedule_hash,
+        renderer_render_graph_schedule_decision_count: schedule_metrics.decision_count,
+        renderer_render_graph_dirty_resource_decision_count: schedule_metrics
+            .dirty_resource_decision_count,
+        renderer_render_graph_reuse_resource_decision_count: schedule_metrics
+            .reuse_resource_decision_count,
+        renderer_render_graph_per_present_resource_decision_count: schedule_metrics
+            .per_present_resource_decision_count,
         renderer_render_graph_passes,
         renderer_render_graph_resources,
+        renderer_render_graph_schedule_decisions,
         document_scene_convert_ms: 0.0,
         document_scene_cache_hit: false,
         document_scene_cache_entry_count: 0,
@@ -9156,6 +9314,95 @@ mod tests {
                 .iter()
                 .all(|resource| resource.retained_epoch == 2)
         );
+    }
+
+    #[test]
+    fn product_frame_graph_scheduler_classifies_resource_decisions() {
+        let decisions = product_frame_graph_schedule_decisions(
+            &[
+                RendererRenderGraphResourceMetric {
+                    schema_version: 1,
+                    resource_id: "RetainedGpuBuffers".to_owned(),
+                    resource_kind: "gpu_buffer".to_owned(),
+                    first_pass_index: 1,
+                    last_pass_index: 2,
+                    producer_pass_id: Some("renderer-quad-prepare-upload".to_owned()),
+                    consumer_pass_ids: vec!["renderer-ui-draw".to_owned()],
+                    product_visible: true,
+                    proof_or_readback: false,
+                    retained_epoch: 2,
+                    retained_dirty: true,
+                    retained_reused: false,
+                    last_used_frame_seq: 7,
+                },
+                RendererRenderGraphResourceMetric {
+                    schema_version: 1,
+                    resource_id: "RenderScene".to_owned(),
+                    resource_kind: "cpu_scene".to_owned(),
+                    first_pass_index: 0,
+                    last_pass_index: 3,
+                    producer_pass_id: None,
+                    consumer_pass_ids: vec!["renderer-scene-key".to_owned()],
+                    product_visible: true,
+                    proof_or_readback: false,
+                    retained_epoch: 1,
+                    retained_dirty: false,
+                    retained_reused: true,
+                    last_used_frame_seq: 7,
+                },
+                RendererRenderGraphResourceMetric {
+                    schema_version: 1,
+                    resource_id: "ColorTarget".to_owned(),
+                    resource_kind: "gpu_color_target".to_owned(),
+                    first_pass_index: 2,
+                    last_pass_index: 4,
+                    producer_pass_id: Some("renderer-ui-draw".to_owned()),
+                    consumer_pass_ids: vec!["renderer-text-draw".to_owned()],
+                    product_visible: true,
+                    proof_or_readback: false,
+                    retained_epoch: 7,
+                    retained_dirty: true,
+                    retained_reused: false,
+                    last_used_frame_seq: 7,
+                },
+                RendererRenderGraphResourceMetric {
+                    schema_version: 1,
+                    resource_id: "FrameMetrics".to_owned(),
+                    resource_kind: "cpu_metrics".to_owned(),
+                    first_pass_index: 3,
+                    last_pass_index: 3,
+                    producer_pass_id: Some("renderer-retained-metrics".to_owned()),
+                    consumer_pass_ids: Vec::new(),
+                    product_visible: false,
+                    proof_or_readback: false,
+                    retained_epoch: 7,
+                    retained_dirty: true,
+                    retained_reused: false,
+                    last_used_frame_seq: 7,
+                },
+            ],
+            &["chunk:right".to_owned()],
+        );
+        let by_resource = decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.resource_id.as_str(),
+                    decision.decision_kind.as_str(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_resource["RetainedGpuBuffers"], "dirty_upload");
+        assert_eq!(by_resource["RenderScene"], "clean_reuse");
+        assert_eq!(by_resource["ColorTarget"], "per_present_target");
+        assert_eq!(by_resource["FrameMetrics"], "per_frame_metrics");
+
+        let metrics = product_frame_graph_schedule_metrics(&decisions);
+        assert_eq!(metrics.decision_count, 4);
+        assert_eq!(metrics.dirty_resource_decision_count, 1);
+        assert_eq!(metrics.reuse_resource_decision_count, 1);
+        assert_eq!(metrics.per_present_resource_decision_count, 2);
+        assert_eq!(metrics.schedule_hash.len(), 64);
     }
 
     #[test]

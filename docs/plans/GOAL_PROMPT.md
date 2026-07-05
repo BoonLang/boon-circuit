@@ -50,10 +50,12 @@ Current checkpoint:
   provenance rather than expecting a hidden fallback rejection. `LoadedRuntime`
   and `GenericScheduledRuntime` themselves are now `#[cfg(test)]`, with the
   remaining production utility (`List` count predicate row-field extraction)
-  pulled into a free helper. The remaining legacy cuts are deleting or migrating
-  the test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage island and
-  any native legacy negative counters that are no longer useful as removal
-  guards.
+  pulled into a free helper. Old-runtime tests now construct the legacy engine
+  through `LegacyRuntimeHarness`; `verify-compiler-boundaries` rejects direct
+  test calls to `LiveRuntime::*_legacy` outside that harness. The remaining
+  legacy cuts are deleting or migrating the test-only `LoadedRuntime` /
+  `GenericScheduledRuntime` coverage island and any native legacy negative
+  counters that are no longer useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

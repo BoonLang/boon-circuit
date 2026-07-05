@@ -12308,6 +12308,43 @@ impl LiveRuntime {
     }
 }
 
+#[cfg(test)]
+struct LegacyRuntimeHarness;
+
+#[cfg(test)]
+impl LegacyRuntimeHarness {
+    fn new(
+        source_label: &str,
+        source_text: &str,
+        scenario_path: &Path,
+    ) -> RuntimeResult<LiveRuntime> {
+        LiveRuntime::new_legacy(source_label, source_text, scenario_path)
+    }
+
+    fn new_from_project(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        scenario_path: &Path,
+    ) -> RuntimeResult<LiveRuntime> {
+        LiveRuntime::new_from_project_legacy(source_label, units, scenario_path)
+    }
+
+    fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<LiveRuntime> {
+        LiveRuntime::from_source_legacy(source_label, source_text)
+    }
+
+    fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<LiveRuntime> {
+        LiveRuntime::from_project_legacy(source_label, units)
+    }
+
+    fn from_project_profiled(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<(LiveRuntime, JsonValue)> {
+        LiveRuntime::from_project_legacy_profiled(source_label, units)
+    }
+}
+
 impl LiveSourceEvent {
     fn assert_matches_step(&self, step: &ScenarioStep) -> RuntimeResult<()> {
         assert_plan_live_source_event_matches_expected(
@@ -66015,7 +66052,7 @@ FUNCTION icon_code(item) {
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("physical-todomvc-toggle-all-live", &units)
+            LegacyRuntimeHarness::from_project("physical-todomvc-toggle-all-live", &units)
                 .expect("physical TodoMVC live runtime should initialize");
 
         let initial = runtime.document_state_summary();
@@ -68562,7 +68599,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.path))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("source-text-then-update-expression", source).unwrap();
+            LegacyRuntimeHarness::from_source("source-text-then-update-expression", source)
+                .unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/path"),
             Some(&json!("default-path"))
@@ -68585,9 +68623,11 @@ document: Document/new(root: Element/label(element: [], label: store.path))
 
         let source_with_path_default =
             source.replace("default-path", "~/repos/NovyWave/test_files/simple.vcd");
-        let mut runtime =
-            LiveRuntime::from_source_legacy("source-text-path-default", &source_with_path_default)
-                .unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source(
+            "source-text-path-default",
+            &source_with_path_default,
+        )
+        .unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/path"),
             Some(&json!("~/repos/NovyWave/test_files/simple.vcd"))
@@ -68618,7 +68658,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.external_file_tree_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("source-payload-concat-latest-runtime", source)
+            LegacyRuntimeHarness::from_source("source-payload-concat-latest-runtime", source)
                 .unwrap();
         assert_eq!(
             runtime
@@ -68687,7 +68727,8 @@ FUNCTION new_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("row-lookup-payload-without-address", source).unwrap();
+            LegacyRuntimeHarness::from_source("row-lookup-payload-without-address", source)
+                .unwrap();
         let route = runtime
             .legacy_runtime_for_test()
             .generic
@@ -68749,7 +68790,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-derived-dependencies", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-derived-dependencies", source).unwrap();
         assert_eq!(
             runtime.document_state_summary().pointer("/store/label"),
             Some(&json!("Path: default-path"))
@@ -68814,7 +68855,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.cursor))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-scalar-same-event-flush", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-scalar-same-event-flush", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["cursor"], "A:ready");
 
         let output = runtime
@@ -68869,7 +68910,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-scalar-direct-read-defers-flush", source)
+            LegacyRuntimeHarness::from_source("root-scalar-direct-read-defers-flush", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["label"], "old/old");
 
@@ -68928,7 +68969,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-currentness-scalar", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-currentness-scalar", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["consumer"],
             "consumer:value:old"
@@ -69029,7 +69070,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer_a))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-currentness-dependent-cache", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-currentness-dependent-cache", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["consumer_a"], "A:value:old");
         assert_eq!(initial["store"]["consumer_b"], "B:value:old");
@@ -69110,7 +69151,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-currentness-structured-parent", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-currentness-structured-parent", source)
+                .unwrap();
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
 
         runtime
@@ -69175,7 +69217,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.consumer))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-currentness-root-child-cache", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-currentness-root-child-cache", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["consumer"], "child:old");
 
         runtime
@@ -69255,7 +69297,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-structured-parent-no-empty-patch", source)
+            LegacyRuntimeHarness::from_source("root-structured-parent-no-empty-patch", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["page_label"],
@@ -69311,7 +69353,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-structured-parent-prune-child", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-structured-parent-prune-child", source)
+                .unwrap();
         {
             let generic = runtime
                 .legacy_runtime_for_test()
@@ -69401,7 +69444,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "root-structured-child-no-leaf-alias-collision",
             source,
         )
@@ -69594,7 +69637,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.a_summary))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("root-derived-revisit", source).unwrap();
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("root-derived-revisit", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["a_summary"], "old/old");
 
         let output = runtime
@@ -69628,7 +69672,7 @@ document: Document/new(root: Element/label(element: [], label: store.a_summary))
     fn live_runtime_applies_observed_todomvc_source_events() {
         let source = include_str!("../../../examples/todomvc.bn");
         let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -69692,7 +69736,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }))
 "#;
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:key-payload",
             source,
             Path::new("../../examples/counter.scn"),
@@ -69754,7 +69798,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
             })
             .map(|branch| format!("{:?}", branch.expression))
             .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project_legacy("plain-latest-key-match", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("plain-latest-key-match", &units)
             .expect("runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -69814,7 +69858,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
 
     #[test]
     fn source_batch_dispatches_ordered_events_and_rejects_equal_sequence_conflict() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "examples/counter.bn",
             include_str!("../../../examples/counter.bn"),
         )
@@ -69898,7 +69942,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     fn live_runtime_applies_numeric_counter_hold_updates_generically() {
         let source = include_str!("../../../examples/counter.bn");
         let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:counter",
             source,
             Path::new("../../examples/counter.scn"),
@@ -69966,7 +70010,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_runtime_routes_duplicate_todo_title_events_by_occurrence() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -70014,7 +70058,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_runtime_prefers_bound_row_identity_over_target_text() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -70086,7 +70130,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn live_source_event_preserves_bound_row_identity() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -70129,7 +70173,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     #[test]
     fn row_identity_live_source_event_carries_list_and_source_epoch() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -70184,7 +70228,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }
     fn document_summary_uses_source_identity_for_filtered_todomvc_rows() {
         let source = include_str!("../../../examples/todomvc.bn");
         let mut runtime =
-            LiveRuntime::from_source_legacy("todomvc-filtered-document-source-identity", source)
+            LegacyRuntimeHarness::from_source("todomvc-filtered-document-source-identity", source)
                 .unwrap();
         for event in [
             LiveSourceEvent {
@@ -70278,7 +70322,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-identity-only-change", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-identity-only-change", source)
+                .unwrap();
         let first_summary = runtime.document_state_summary();
         let first_visible = first_summary["store"]["visible"]
             .as_array()
@@ -70317,7 +70362,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     #[test]
     fn live_runtime_keeps_one_todomvc_row_in_edit_mode() {
         let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LegacyRuntimeHarness::new(
             "playground-live:todomvc",
             source,
             Path::new("../../examples/todomvc.scn"),
@@ -70360,7 +70405,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("physical-todomvc-live-row-routing", &units)
+            LegacyRuntimeHarness::from_project("physical-todomvc-live-row-routing", &units)
                 .expect("physical TodoMVC runtime should initialize from manifest units");
         {
             let generic = runtime
@@ -70573,7 +70618,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("physical-todomvc-live-theme-events", &units)
+            LegacyRuntimeHarness::from_project("physical-todomvc-live-theme-events", &units)
                 .expect("physical TodoMVC runtime should initialize from manifest units");
 
         assert_eq!(
@@ -71366,7 +71411,7 @@ FUNCTION new_number(number) {
             CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
         );
 
-        let mut runtime = LiveRuntime::from_source_legacy("range-list", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("range-list", source).unwrap();
         let summary = runtime.state_summary();
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -71405,7 +71450,7 @@ FUNCTION new_number(number) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("generic-window-materialization", source).unwrap();
+            LegacyRuntimeHarness::from_source("generic-window-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(4, 3, 0, 1);
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -71493,7 +71538,7 @@ FUNCTION projected_row(row) {
         ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("nested-row-fields", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("nested-row-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["page_ref"]["page_kind"], "signal_page");
         let row = &summary["rows"][0];
@@ -71569,7 +71614,7 @@ FUNCTION new_row_with_ref(row) {
 
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("row-structured-parent-no-empty-patch", source)
+            LegacyRuntimeHarness::from_source("row-structured-parent-no-empty-patch", source)
                 .unwrap();
         let initial_summary = runtime.state_summary();
         assert_eq!(
@@ -71636,7 +71681,7 @@ FUNCTION new_item(item) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("generic-page-materialization", source).unwrap();
+            LegacyRuntimeHarness::from_source("generic-page-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(1, 1, 0, 2);
         let pages = summary["store"]["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 1);
@@ -71717,7 +71762,7 @@ FUNCTION new_entry(entry) {
         }));
 
         let mut runtime =
-            LiveRuntime::from_source_legacy("generic-list-projections", source).unwrap();
+            LegacyRuntimeHarness::from_source("generic-list-projections", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "B0");
         assert_eq!(summary["store"]["selected_input"]["value"], "2");
@@ -71772,7 +71817,8 @@ FUNCTION new_record(record) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("generic-root-find-projection-cache", source).unwrap();
+            LegacyRuntimeHarness::from_source("generic-root-find-projection-cache", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["selected_record"]["key"],
             "row-1"
@@ -71875,7 +71921,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Records }))
 "#;
         let runtime =
-            LiveRuntime::from_source_legacy("generic-root-list-diff-exact-lookup", source).unwrap();
+            LegacyRuntimeHarness::from_source("generic-root-list-diff-exact-lookup", source)
+                .unwrap();
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         let mut previous = RuntimeRowSnapshot::default();
         previous
@@ -71983,7 +72030,7 @@ FUNCTION signal_label(signal) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("derived-list-search", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("derived-list-search", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["search_results_count"], 2);
         assert_eq!(
@@ -72083,7 +72130,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("list-user-key-fields", source).unwrap();
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("list-user-key-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["selected_value"], "signal");
         assert_eq!(summary["store"]["selected_end"], 150);
@@ -72125,8 +72173,9 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.response))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("derived-hold-trigger-same-turn", source)
-            .expect("runtime should initialize");
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("derived-hold-trigger-same-turn", source)
+                .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select_next".to_owned(),
@@ -72173,7 +72222,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.cursor))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-derived-cascade-unqualified", source)
+            LegacyRuntimeHarness::from_source("root-derived-cascade-unqualified", source)
                 .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -72241,7 +72290,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.active_signal_key))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-latest-row-source-derived-leaf", source)
+            LegacyRuntimeHarness::from_source("list-latest-row-source-derived-leaf", source)
                 .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -72287,7 +72336,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let error = match LiveRuntime::from_source_legacy("bad-list-field-selector", source) {
+        let error = match LegacyRuntimeHarness::from_source("bad-list-field-selector", source) {
             Ok(_) => panic!("hidden row_key selector should fail"),
             Err(error) => error,
         };
@@ -72319,7 +72368,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let error = match LiveRuntime::from_source_legacy("bad-list-target-selector", source) {
+        let error = match LegacyRuntimeHarness::from_source("bad-list-target-selector", source) {
             Ok(_) => panic!("hidden generation selector should fail"),
             Err(error) => error,
         };
@@ -72368,7 +72417,7 @@ FUNCTION new_signal(signal) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("derived-list-chunk", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("derived-list-chunk", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(
             summary["store"]["search_results"].as_array().unwrap().len(),
@@ -72428,7 +72477,7 @@ FUNCTION new_signal(signal) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-chunk-direct", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-chunk-direct", source).unwrap();
         let initial = runtime.state_summary();
         let initial_rows = initial["store"]["visible_rows"].as_array().unwrap();
         assert_eq!(initial_rows.len(), 2);
@@ -72509,7 +72558,7 @@ FUNCTION new_item(item) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("lazy-runtime-list-chunk", source).unwrap();
+            LegacyRuntimeHarness::from_source("lazy-runtime-list-chunk", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -72594,7 +72643,7 @@ FUNCTION new_item(item) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("lazy-chunk-window-summary", source).unwrap();
+            LegacyRuntimeHarness::from_source("lazy-chunk-window-summary", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -72697,7 +72746,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Selected rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("selected-list-transforms", source).unwrap();
+            LegacyRuntimeHarness::from_source("selected-list-transforms", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["selected_rows_order_label"],
             "none"
@@ -72773,7 +72822,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Text concat }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("text-concat-labels", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("text-concat-labels", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["scoped_label"], "4 results in top.cpu");
         assert_eq!(
@@ -72812,8 +72861,9 @@ FUNCTION new_marker(marker, store) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("indexed-text-const-row-update", source)
-            .expect("runtime should load const indexed text source");
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("indexed-text-const-row-update", source)
+                .expect("runtime should load const indexed text source");
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         action.insert(
@@ -72917,7 +72967,7 @@ FUNCTION new_marker(marker) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("source-const-append-row", source)
+        let mut runtime = LegacyRuntimeHarness::from_source("source-const-append-row", source)
             .expect("runtime should load const append source");
         let mut create_expected = BTreeMap::new();
         create_expected.insert(
@@ -73035,7 +73085,7 @@ FUNCTION rendered_row(row) {
     Element/label(element: [], label: row.label)
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("render-label-projection-row", source)
+        let mut runtime = LegacyRuntimeHarness::from_source("render-label-projection-row", source)
             .expect("runtime should load render label projection source");
         let mut add_expected = BTreeMap::new();
         add_expected.insert(
@@ -73087,8 +73137,9 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("append-sibling-derived-values", source)
-            .expect("runtime should load sibling-derived append source");
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("append-sibling-derived-values", source)
+                .expect("runtime should load sibling-derived append source");
         let mut add_expected = BTreeMap::new();
         add_expected.insert(
             "source".to_owned(),
@@ -73120,7 +73171,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units =
             source_units_for_path(&source_path).expect("physical TodoMVC source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("physical-append-enter-key-source-text", &units)
+            LegacyRuntimeHarness::from_project("physical-append-enter-key-source-text", &units)
                 .expect("physical TodoMVC runtime should initialize from manifest units");
         runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -74256,7 +74307,7 @@ FUNCTION fake_todomvc_app() {
 
     #[test]
     fn runtime_value_summaries_are_path_bounded_for_inspector() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "examples/todomvc.bn",
             include_str!("../../../examples/todomvc.bn"),
         )
@@ -74331,7 +74382,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.one))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("value-summary-path-count", source).unwrap();
+            LegacyRuntimeHarness::from_source("value-summary-path-count", source).unwrap();
         let paths = [
             "store.one",
             "store.two",
@@ -74377,7 +74428,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("root-pure-bool", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("root-pure-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["ready"], true);
         assert_eq!(summary["ready"], true);
@@ -74422,7 +74473,7 @@ FUNCTION new_row(row) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("indexed-plain-latest-bool", source).unwrap();
+            LegacyRuntimeHarness::from_source("indexed-plain-latest-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["rows"][0]["selected_once"], false);
 
@@ -74454,7 +74505,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-plain-latest-bool", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-plain-latest-bool", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["ready"], true);
 
@@ -74486,7 +74537,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Ready }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-event-plain-latest-bool", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-event-plain-latest-bool", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["ready"], false);
 
         runtime
@@ -74541,7 +74592,8 @@ FUNCTION new_signal(signal, store) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("top-level-indexed-bool-row-context", source).unwrap();
+            LegacyRuntimeHarness::from_source("top-level-indexed-bool-row-context", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["signals"][0]["selected"], true);
         assert_eq!(summary["signals"][1]["selected"], false);
@@ -74612,7 +74664,8 @@ FUNCTION new_signal(signal) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("row-scoped-source-needs-row-context", source).unwrap();
+            LegacyRuntimeHarness::from_source("row-scoped-source-needs-row-context", source)
+                .unwrap();
         let error = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "signal.signal_elements.select_signal".to_owned(),
@@ -74665,7 +74718,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-numeric-infix-when-clamp", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-numeric-infix-when-clamp", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["zoom_step"], json!(0));
 
         for expected in [1, 2, 3, 3] {
@@ -74707,7 +74760,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Zoom }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-key-match-nested-numeric-infix-clamp", source)
+            LegacyRuntimeHarness::from_source("root-key-match-nested-numeric-infix-clamp", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["zoom_step"], json!(0));
 
@@ -74765,7 +74818,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-shared-key-skip-noop", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-shared-key-skip-noop", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["cursor_position"],
             "Cursor42"
@@ -74833,7 +74886,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.selected_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-predicate-store-derived-number", source)
+            LegacyRuntimeHarness::from_source("root-list-predicate-store-derived-number", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["selected_label"], "middle");
 
@@ -74875,7 +74928,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-materialization-profile", source)
+            LegacyRuntimeHarness::from_source("root-list-view-materialization-profile", source)
                 .unwrap();
         let output = runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -74999,7 +75052,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-identity-list-ref", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-identity-list-ref", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["visible"][0]["label"], "A");
 
         let generic = runtime
@@ -75065,7 +75118,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-identity-selection", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-identity-selection", source).unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["visible"][0]["label"], "A");
         assert_eq!(initial["store"]["visible"][1]["label"], "C");
@@ -75164,7 +75217,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-cursor", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-cursor", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["cursor"],
             "A/1"
@@ -75419,7 +75472,8 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-in-place-source-rows", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-in-place-source-rows", source)
+                .unwrap();
         let generic = runtime
             .legacy_runtime_for_test()
             .generic
@@ -75574,7 +75628,7 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-branch-field-only", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-branch-field-only", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A/1"
@@ -75704,7 +75758,7 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-branch-field-scope-skip", source)
+            LegacyRuntimeHarness::from_source("root-list-view-branch-field-scope-skip", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
@@ -75800,7 +75854,7 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-branch-selector-dirty", source)
+            LegacyRuntimeHarness::from_source("root-list-view-branch-selector-dirty", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["variable_only"],
@@ -75898,7 +75952,8 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-filtered-source-rows", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-filtered-source-rows", source)
+                .unwrap();
         let generic = runtime
             .legacy_runtime_for_test()
             .generic
@@ -76028,7 +76083,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-row-independent", source)
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-row-independent", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["shared_meta"]["label"],
@@ -76109,7 +76164,7 @@ FUNCTION projected_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-compiled-frontier", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-compiled-frontier", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A=old"
@@ -76215,7 +76270,7 @@ FUNCTION group_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-compiled-branch-frontier", source)
+            LegacyRuntimeHarness::from_source("root-list-view-compiled-branch-frontier", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
@@ -76310,7 +76365,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-same-pass-dirty", source)
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-same-pass-dirty", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["shared_meta"]["label"],
@@ -76393,7 +76448,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-dirty-guard", source)
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-dirty-guard", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["stable"],
@@ -76526,7 +76581,7 @@ FUNCTION selected_segment(segment) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-forward-list-dependency", source)
+            LegacyRuntimeHarness::from_source("root-list-view-forward-list-dependency", source)
                 .unwrap();
         let summary = runtime.state_summary();
         let lanes = summary["store"]["lanes"]
@@ -76610,7 +76665,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-row-field-shadowing", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-row-field-shadowing", source)
+                .unwrap();
         let _ = runtime.state_summary();
         let generic = runtime
             .legacy_runtime_for_test_mut()
@@ -76673,7 +76729,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-root-child-stack-cache", source)
+            LegacyRuntimeHarness::from_source("root-list-view-root-child-stack-cache", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
@@ -76762,7 +76818,7 @@ FUNCTION dependent_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-mutual-cycle", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-mutual-cycle", source).unwrap();
         let warm = runtime.state_summary();
         assert_eq!(
             warm["store"]["lanes"][0]["dependency"], "selected_segments",
@@ -76841,7 +76897,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-deferred-clean-hit", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-deferred-clean-hit", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"][0]["label"],
             "A/value:old",
@@ -76938,7 +76994,7 @@ FUNCTION signal_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-numeric-guard", source)
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-numeric-guard", source)
                 .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["signals"][0]["value"],
@@ -77104,7 +77160,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: store.projected_count))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-length-row-field-skip", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-length-row-field-skip", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["projected_count"], 2);
         {
             let generic = runtime
@@ -77190,7 +77246,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-same-count-reorder", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-same-count-reorder", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["projected"]
                 .as_array()
@@ -77287,7 +77343,7 @@ FUNCTION projected_row(row) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-remove-append-no-stale-row", source)
+            LegacyRuntimeHarness::from_source("root-list-view-remove-append-no-stale-row", source)
                 .unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["projected"][0]["label"], "a=A");
@@ -77448,7 +77504,7 @@ FUNCTION detail_row(row, suffix) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-field-cache-caller-env", source)
+            LegacyRuntimeHarness::from_source("root-list-view-field-cache-caller-env", source)
                 .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["projected"][0]["flavor_id"], "left");
@@ -77532,7 +77588,7 @@ FUNCTION cursor_probe_row(signal) {
 document: Document/new(root: Element/label(element: [], label: store.row_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("mapped-root-list-function-store-cursor", source)
+            LegacyRuntimeHarness::from_source("mapped-root-list-function-store-cursor", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["row_labels"], "A=middle");
 
@@ -77577,7 +77633,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { ok }))
 "#;
         let runtime =
-            LiveRuntime::from_source_legacy("root-list-view-row-field-diff", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-row-field-diff", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test()
             .generic
@@ -77686,7 +77742,7 @@ FUNCTION pair_label(mode, side) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-when-derived", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-when-derived", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["derived_pair_label"],
             "compact primary"
@@ -77731,7 +77787,7 @@ FUNCTION selected_value(format) {
 document: Document/new(root: Element/label(element: [], label: store.rendered_value))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("derived-root-summary-flat-alias", source)
+            LegacyRuntimeHarness::from_source("derived-root-summary-flat-alias", source)
                 .expect("runtime should initialize");
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["rendered_value"], "0x2a");
@@ -77778,7 +77834,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("derived-root-summary-byte-length", source)
+            LegacyRuntimeHarness::from_source("derived-root-summary-byte-length", source)
                 .expect("runtime should initialize");
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["descriptor_file"], "simple.vcd");
@@ -77883,7 +77939,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.a_output))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("root-derived-revisit", source)
+        let mut runtime = LegacyRuntimeHarness::from_source("root-derived-revisit", source)
             .expect("runtime should initialize");
         assert_eq!(runtime.state_summary()["store"]["a_output"], "cold-output");
 
@@ -77922,7 +77978,7 @@ document: Document/new(root: Element/label(element: [], label: store.a_output))
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("derived-root-list-alias-summary", source)
+            LegacyRuntimeHarness::from_source("derived-root-list-alias-summary", source)
                 .expect("runtime should initialize");
         let initial = runtime.document_state_summary();
         assert_eq!(initial["store"]["row_alias"][0]["label"], "first");
@@ -77950,8 +78006,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-format-cycle-runtime", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LegacyRuntimeHarness::from_project("novywave-format-cycle-runtime", &units)
+                .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.load_default_file".to_owned(),
@@ -77992,7 +78049,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-initial-format-runtime", &units)
+            LegacyRuntimeHarness::from_project("novywave-initial-format-runtime", &units)
                 .expect("NovyWave runtime should initialize");
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["value_format"], "Hexadecimal");
@@ -78081,7 +78138,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             ),
             ("store.elements.format_ascii", "ASCII", "ASCII", "DATA_ASC"),
         ] {
-            let mut runtime = LiveRuntime::from_project_legacy(
+            let mut runtime = LegacyRuntimeHarness::from_project(
                 "novywave-top-format-selected-row-runtime",
                 &units,
             )
@@ -78145,7 +78202,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-row-format-runtime", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("novywave-row-format-runtime", &units)
             .expect("NovyWave runtime should initialize");
         let visible_row_by_id = |summary: &JsonValue, id: &str| -> JsonValue {
             summary["store"]["selected_visible_items"]
@@ -78223,7 +78280,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-row-signal-select-runtime", &units)
+            LegacyRuntimeHarness::from_project("novywave-row-signal-select-runtime", &units)
                 .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -78307,8 +78364,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-scope-expand-runtime", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LegacyRuntimeHarness::from_project("novywave-scope-expand-runtime", &units)
+                .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.scope_analog".to_owned(),
@@ -78341,7 +78399,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let runtime = LiveRuntime::from_project_legacy("novywave-scope-route-runtime", &units)
+        let runtime = LegacyRuntimeHarness::from_project("novywave-scope-route-runtime", &units)
             .expect("NovyWave runtime should initialize");
         let generic = runtime
             .legacy_runtime_for_test()
@@ -78371,7 +78429,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-hover-width-noop-runtime", &units)
+            LegacyRuntimeHarness::from_project("novywave-hover-width-noop-runtime", &units)
                 .expect("NovyWave runtime should initialize");
         runtime
             .apply_source_event(LiveSourceEvent {
@@ -78413,8 +78471,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-waveform-click-route", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LegacyRuntimeHarness::from_project("novywave-waveform-click-route", &units)
+                .expect("NovyWave runtime should initialize");
         let route = runtime
             .legacy_runtime_for_test()
             .generic
@@ -78520,8 +78579,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-click-internal-roots", &units)
-            .expect("NovyWave runtime should initialize");
+        let mut runtime =
+            LegacyRuntimeHarness::from_project("novywave-click-internal-roots", &units)
+                .expect("NovyWave runtime should initialize");
         for time in [150, 50] {
             runtime
                 .apply_source_event_turn(LiveSourceEvent {
@@ -78624,7 +78684,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        LiveRuntime::from_project_legacy(project, &units)
+        LegacyRuntimeHarness::from_project(project, &units)
             .expect("NovyWave runtime should initialize")
     }
 
@@ -78850,7 +78910,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-cursor-rows-alias", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("novywave-cursor-rows-alias", &units)
             .expect("NovyWave runtime should initialize");
         assert_eq!(
             runtime.state_summary()["store"]["bridge_cursor_values"]["rows"][0]["label"],
@@ -78907,7 +78967,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-external-name-payload", &units)
+            LegacyRuntimeHarness::from_project("novywave-external-name-payload", &units)
                 .expect("NovyWave runtime should initialize");
         {
             let generic = runtime
@@ -79053,7 +79113,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let mut turn_runtime =
-            LiveRuntime::from_project_legacy("novywave-external-metadata-turns", &units)
+            LegacyRuntimeHarness::from_project("novywave-external-metadata-turns", &units)
                 .expect("NovyWave runtime should initialize for live turns");
         for (source, text) in [
             (
@@ -79102,7 +79162,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-generic-file-row-select", &units)
+            LegacyRuntimeHarness::from_project("novywave-generic-file-row-select", &units)
                 .expect("NovyWave runtime should initialize");
         let route = runtime
             .legacy_runtime_for_test()
@@ -79203,8 +79263,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(ghw_scope["store"]["active_signal"], "ghw_counter");
         assert_eq!(ghw_scope["store"]["selected_signal_family"], "ghw");
 
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-external-row-select", &units)
-            .expect("NovyWave runtime should initialize for external rows");
+        let mut runtime =
+            LegacyRuntimeHarness::from_project("novywave-external-row-select", &units)
+                .expect("NovyWave runtime should initialize for external rows");
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.external_file_loaded_name".to_owned(),
@@ -79287,7 +79348,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "external file row route should clear signal, route={external_file_route_debug}"
         );
         let mut fallback_runtime =
-            LiveRuntime::from_project_legacy("novywave-virtual-external-row-select", &units)
+            LegacyRuntimeHarness::from_project("novywave-virtual-external-row-select", &units)
                 .expect("NovyWave runtime should initialize for virtual external rows");
         fallback_runtime
             .apply_source_event(LiveSourceEvent {
@@ -79415,7 +79476,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-selected-visible-items", &units)
+            LegacyRuntimeHarness::from_project("novywave-selected-visible-items", &units)
                 .expect("NovyWave runtime should initialize");
 
         let initial = runtime.document_state_summary();
@@ -79794,7 +79855,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "viewport labels should compose numeric metadata and the selected file unit"
         );
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-waveform-metadata", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("novywave-waveform-metadata", &units)
             .expect("NovyWave runtime should initialize");
 
         let initial = runtime.state_summary();
@@ -80070,7 +80131,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-timeline-pan-zoom", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("novywave-timeline-pan-zoom", &units)
             .expect("NovyWave runtime should initialize from manifest units");
         let apply = |runtime: &mut LiveRuntime, source: &str, key: Option<&str>| {
             runtime
@@ -80244,7 +80305,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-hover-zoom-current-viewport", &units)
+            LegacyRuntimeHarness::from_project("novywave-hover-zoom-current-viewport", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
 
         let zoomed = runtime
@@ -80376,7 +80437,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let source_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let mut runtime = LiveRuntime::from_project_legacy("novywave-sparse-timeline", &units)
+        let mut runtime = LegacyRuntimeHarness::from_project("novywave-sparse-timeline", &units)
             .expect("NovyWave runtime should initialize from manifest units");
 
         apply_sparse(
@@ -80557,7 +80618,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let route_probe_runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-file-row-route-probe", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-file-row-route-probe", &units)
                 .expect("NovyWave route probe runtime should initialize from manifest units");
         let file_row_route = route_probe_runtime
             .legacy_runtime_for_test()
@@ -80580,7 +80641,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             file_row_route.actions
         );
         let mut direct_runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-file-row-direct-compare", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-file-row-direct-compare", &units)
                 .expect("NovyWave direct runtime should initialize from manifest units");
         let direct = direct_runtime
             .apply_source_event(LiveSourceEvent {
@@ -80600,7 +80661,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             direct["store"].get("file_tree_selected_file")
         );
         let mut counted_runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-file-counted-compare", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-file-counted-compare", &units)
                 .expect("NovyWave counted runtime should initialize from manifest units");
         let mut counted_expected = BTreeMap::new();
         counted_expected.insert(
@@ -80638,7 +80699,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "counted compare source should update active_signal_key"
         );
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-file-row-scenario", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-file-row-scenario", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
         let compare_route = runtime
             .legacy_runtime_for_test()
@@ -80770,7 +80831,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-reload-default-scenario", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-reload-default-scenario", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
 
         let output = apply_novywave_scenario_until(
@@ -80863,7 +80924,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
         let mut runtime =
-            LiveRuntime::from_project_legacy("novywave-bridge-format-sequence-scenario", &units)
+            LegacyRuntimeHarness::from_project("novywave-bridge-format-sequence-scenario", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
 
         let output = apply_novywave_scenario_until(
@@ -80910,8 +80971,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
         let scenario = parse_scenario(&scenario_path).expect("NovyWave scenario should parse");
 
-        let mut add_runtime = LiveRuntime::from_project_legacy("novywave-marker-count-add", &units)
-            .expect("NovyWave runtime should initialize from manifest units");
+        let mut add_runtime =
+            LegacyRuntimeHarness::from_project("novywave-marker-count-add", &units)
+                .expect("NovyWave runtime should initialize from manifest units");
         let added = apply_novywave_scenario_until(
             &mut add_runtime,
             &scenario,
@@ -80933,7 +80995,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         );
 
         let mut remove_runtime =
-            LiveRuntime::from_project_legacy("novywave-marker-count-remove", &units)
+            LegacyRuntimeHarness::from_project("novywave-marker-count-remove", &units)
                 .expect("NovyWave runtime should initialize from manifest units");
         let removed = apply_novywave_scenario_until(
             &mut remove_runtime,
@@ -82404,7 +82466,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let runtime = LiveRuntime::from_source_legacy("list-index-find-value", source).unwrap();
+        let runtime = LegacyRuntimeHarness::from_source("list-index-find-value", source).unwrap();
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic
@@ -82439,7 +82501,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("list-index-find", source).unwrap();
+        let mut runtime = LegacyRuntimeHarness::from_source("list-index-find", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82578,7 +82640,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("indexed-cache-field-invalidation", source).unwrap();
+            LegacyRuntimeHarness::from_source("indexed-cache-field-invalidation", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82668,7 +82730,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-find-value-selection-index", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-find-value-selection-index", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82730,7 +82792,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-find-selection-index", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-find-selection-index", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82798,7 +82860,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("list-selection-length", source).unwrap();
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("list-selection-length", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82847,7 +82910,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-move-field-list-ref-view", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-move-field-list-ref-view", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82916,7 +82979,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-move-field-selection-view", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-move-field-selection-view", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -82991,7 +83054,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-direct-access-row-index-view", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-direct-access-row-index-view", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -83094,7 +83157,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-selection-storage-mode-oracle", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-selection-storage-mode-oracle", source)
+                .unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -83293,7 +83357,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-map-identity-view", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-map-identity-view", source).unwrap();
         let generic = runtime
             .legacy_runtime_for_test_mut()
             .generic
@@ -83419,7 +83483,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-filter-field-equal-index", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-filter-field-equal-index", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "second,duplicate");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -83462,7 +83526,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label_a))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("repeated-indexed-text-filter-cache", source).unwrap();
+            LegacyRuntimeHarness::from_source("repeated-indexed-text-filter-cache", source)
+                .unwrap();
 
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["label_a"], "second-a,second-b");
@@ -83504,7 +83569,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("path-qualified-root-list-filter-index", source)
+            LegacyRuntimeHarness::from_source("path-qualified-root-list-filter-index", source)
                 .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "second,duplicate");
@@ -83548,7 +83613,7 @@ FUNCTION lookup_value(key) {
 }
 "#;
         let runtime =
-            LiveRuntime::from_source_legacy("repeated-user-function-cache", source).unwrap();
+            LegacyRuntimeHarness::from_source("repeated-user-function-cache", source).unwrap();
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic.storage.root_textlike_ref("store.combined").unwrap(),
@@ -83613,7 +83678,7 @@ FUNCTION lookup_value(key) {
 }
 "#;
         let runtime =
-            LiveRuntime::from_source_legacy("function-cache-unreferenced-env", source).unwrap();
+            LegacyRuntimeHarness::from_source("function-cache-unreferenced-env", source).unwrap();
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
         assert_eq!(
             generic.storage.root_textlike_ref("store.labels").unwrap(),
@@ -83677,7 +83742,7 @@ FUNCTION pair_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("function-cache-row-arg-access-fields", source)
+            LegacyRuntimeHarness::from_source("function-cache-row-arg-access-fields", source)
                 .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["lane_rows"][0]["label"], "hit");
@@ -83738,7 +83803,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("map-join-field-fusion", source).unwrap();
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("map-join-field-fusion", source).unwrap();
 
         assert_eq!(runtime.state_summary()["store"]["labels"], "tx0,tx1");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -83822,7 +83888,8 @@ FUNCTION two_direct_empty() {
 
 document: Document/new(root: Element/label(element: [], label: store.two_direct))
 "#;
-        let mut runtime = LiveRuntime::from_source_legacy("join-field-lazy-args", source).unwrap();
+        let mut runtime =
+            LegacyRuntimeHarness::from_source("join-field-lazy-args", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["single_direct"], "one");
         assert_eq!(summary["store"]["single_fused"], "one");
@@ -83890,7 +83957,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("map-join-field-fusion-reads", source).unwrap();
+            LegacyRuntimeHarness::from_source("map-join-field-fusion-reads", source).unwrap();
 
         assert_eq!(runtime.state_summary()["store"]["labels"], "a!,b!");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -83938,7 +84005,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-filter-row-ref-index", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-filter-row-ref-index", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "tx0,tx1");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -83981,7 +84048,8 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-filter-not-equal-row-ref-index", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-filter-not-equal-row-ref-index", source)
+                .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "segment-a,segment-b");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -84020,7 +84088,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.filtered_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-filter-bool-fallback", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-filter-bool-fallback", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["filtered_labels"], "first,third");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -84076,7 +84144,8 @@ FUNCTION new_record(record) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("indexed-filter-column-read-dirties", source).unwrap();
+            LegacyRuntimeHarness::from_source("indexed-filter-column-read-dirties", source)
+                .unwrap();
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["filtered_labels"], "second");
         let edit_source = {
@@ -84149,7 +84218,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.active_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-retain-numeric-row-field-compare", source)
+            LegacyRuntimeHarness::from_source("list-retain-numeric-row-field-compare", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["active_label"], "mid");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -84165,7 +84234,7 @@ document: Document/new(root: Element/label(element: [], label: store.active_labe
 
         let source = source.replace("75 |> HOLD cursor", "125 |> HOLD cursor");
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-retain-numeric-row-field-compare-125", &source)
+            LegacyRuntimeHarness::from_source("list-retain-numeric-row-field-compare-125", &source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["active_label"], "new");
         let generic = runtime.legacy_runtime_for_test().generic.as_ref().unwrap();
@@ -84224,7 +84293,7 @@ FUNCTION cursor_value(signal) {
 document: Document/new(root: Element/label(element: [], label: store.value))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("indexed-filter-retain-map-join-pipeline", source)
+            LegacyRuntimeHarness::from_source("indexed-filter-retain-map-join-pipeline", source)
                 .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["value"], "mid-a|mid-b");
@@ -84296,7 +84365,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.direct_labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("list-selection-view-direct-join", source).unwrap();
+            LegacyRuntimeHarness::from_source("list-selection-view-direct-join", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["direct_labels"], "old|mid-a|mid-b");
         assert_eq!(summary["store"]["fused_labels"], "old|mid-a|mid-b");
@@ -84380,7 +84449,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         ]
         .concat();
         let mut runtime =
-            LiveRuntime::from_source_legacy("indexed-pipeline-reorders-text-equality", &source)
+            LegacyRuntimeHarness::from_source("indexed-pipeline-reorders-text-equality", &source)
                 .unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["value"], "hit-a|hit-b");
@@ -84445,7 +84514,7 @@ FUNCTION signal_row(signal) {
 document: Document/new(root: Element/label(element: [], label: store.labels))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("numeric-retain-stability-guard", source).unwrap();
+            LegacyRuntimeHarness::from_source("numeric-retain-stability-guard", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["labels"], "middle");
         let field_cache_hits = |runtime: &LiveRuntime| {
             runtime
@@ -84562,7 +84631,7 @@ FUNCTION selected_cursor_pair_row(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-numeric-stability-guard", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-numeric-stability-guard", source).unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["bridge_cursor_values"]["rows"][0]["label"],
             "A=middle"
@@ -84699,7 +84768,8 @@ FUNCTION row_b(signal) {
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_legacy("root-list-view-function-cache-reuse", source).unwrap();
+            LegacyRuntimeHarness::from_source("root-list-view-function-cache-reuse", source)
+                .unwrap();
         assert_eq!(
             runtime.state_summary()["store"]["rows_a"][0]["label"],
             "old"
@@ -85436,7 +85506,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 
     #[test]
     fn bytes_runtime_builtins_execute_through_live_runtime() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "bytes-runtime-builtins",
             r#"
 source: SOURCE
@@ -89618,7 +89688,7 @@ expected_source_event = {{ source = "store.decode" }}
             .world_scene_output()
             .expect("world output should execute through default PlanExecutor runtime");
 
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "examples/hello_3d/RUN.bn",
             include_str!("../../../examples/hello_3d/RUN.bn"),
         )
@@ -90736,7 +90806,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn cells_source_event_recompute_samples_accumulate_source_action_followups() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LegacyRuntimeHarness::from_source(
             "cells-recompute-accounting",
             &cells_project_source_for_test(),
         )

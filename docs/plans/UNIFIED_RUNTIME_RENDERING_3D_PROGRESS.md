@@ -100,6 +100,11 @@ What changed:
   evidence when the patch is direct, retained, non-full-scene, and carries text
   plus style touched-node evidence. This is still generic product-frame proof,
   not a Cells-specific renderer shortcut.
+- Follow-up cleanup removed the retained selection overlay's old layout-proof
+  scan fallback. The retained click path now uses the generic
+  `source_intent_value_index` row lookup evidence; if that identity is absent,
+  the product path must report that no retained indexed patch was available
+  instead of guessing from legacy source-intent scans.
 
 Fresh evidence:
 
@@ -128,7 +133,7 @@ Fresh Cells report summary:
 - Product-only UX: `pass`, `input_to_present_ms.p95=11.071ms`,
   `max=13.387ms`, `sample_count=60`.
 - Retained update contract: `pass`, with all `64` samples using
-  `product_frame_retained_bound_sync`.
+  `product_frame_retained_bound_sync` and zero legacy selection fallback.
 - Runtime work contract: `pass`, with `64` targeted currentness samples,
   `64` total recomputed fields, and no broad scan/root materialization
   regression.
@@ -137,6 +142,10 @@ Fresh Cells report summary:
 - Proof remains deliberately separate from UX latency: the headed proof/readback
   lane still reports about `264ms` after product present for the slow readback
   proof, while the product accepted-input-to-formula path is about `11ms`.
+- After cutting the fallback scan, the refreshed release report still passes:
+  product-only UX `p95=11.395ms`, `max=15.187ms`, all `64` retained update
+  samples use `product_frame_retained_bound_sync`, and
+  `legacy_selection_fallback_count=0`.
 
 Remaining work:
 

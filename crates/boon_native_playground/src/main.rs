@@ -45354,42 +45354,19 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         .get("layout_frame_hash")
         .and_then(Value::as_str)
         .and_then(cached_document_render_snapshot);
-    let overlay_lookup = cached_preview_render_overlay_lookup(&shared.layout_proof);
+    let overlay_lookup =
+        PreviewRenderOverlayLookup::from_source_intent_value_index(&shared.layout_proof);
     let snapshot_selected_nodes =
         overlay_lookup.nodes_for_row_lookup_value(selected_row_lookup_value);
+    if snapshot_selected_nodes.is_empty() {
+        return Ok(false);
+    }
     let snapshot_previous_nodes = previous_selected_row_lookup_value
         .map(|previous| overlay_lookup.nodes_for_row_lookup_value(previous))
         .unwrap_or_default();
     let mut target_nodes = previous_selected_nodes.clone();
-    let needs_previous_node_fallback =
-        previous_selected_row_lookup_value.is_some() && snapshot_previous_nodes.is_empty();
-    let needs_selected_node_fallback = snapshot_selected_nodes.is_empty();
-    let mut layout_proof_fallback = (needs_previous_node_fallback || needs_selected_node_fallback)
-        .then(|| shared.layout_proof.clone());
-    if let Some(previous_selected_row_lookup_value) = previous_selected_row_lookup_value {
-        if snapshot_previous_nodes.is_empty() {
-            if let Some(layout_proof) = layout_proof_fallback.as_ref() {
-                target_nodes.extend(source_intent_nodes_for_value(
-                    layout_proof,
-                    ROW_LOOKUP_SOURCE_INTENT_KINDS,
-                    previous_selected_row_lookup_value,
-                ));
-            }
-        } else {
-            target_nodes.extend(snapshot_previous_nodes.iter().cloned());
-        }
-    }
-    if snapshot_selected_nodes.is_empty() {
-        if let Some(layout_proof) = layout_proof_fallback.as_ref() {
-            target_nodes.extend(source_intent_nodes_for_value(
-                layout_proof,
-                ROW_LOOKUP_SOURCE_INTENT_KINDS,
-                selected_row_lookup_value,
-            ));
-        }
-    } else {
-        target_nodes.extend(snapshot_selected_nodes.iter().cloned());
-    }
+    target_nodes.extend(snapshot_previous_nodes.iter().cloned());
+    target_nodes.extend(snapshot_selected_nodes.iter().cloned());
     if target_nodes.is_empty()
         && let Some(frame) = shared.layout_frame_override.as_deref()
     {
@@ -45397,15 +45374,6 @@ fn preview_patch_retained_selected_row_lookup_overlay(
     }
     if target_nodes.is_empty() {
         return Ok(false);
-    }
-    let mut snapshot_selection_nodes = snapshot_previous_nodes.clone();
-    snapshot_selection_nodes.extend(snapshot_selected_nodes.iter().cloned());
-    let needs_item_address_fallback = snapshot_selection_nodes.is_empty()
-        || target_nodes
-            .iter()
-            .any(|node| !snapshot_selection_nodes.contains(node));
-    if needs_item_address_fallback && layout_proof_fallback.is_none() {
-        layout_proof_fallback = Some(shared.layout_proof.clone());
     }
     let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
         return Ok(false);
@@ -45419,8 +45387,6 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         frame,
         &target_nodes,
     );
-    let snapshot_has_selection_nodes =
-        !snapshot_selected_nodes.is_empty() || !snapshot_previous_nodes.is_empty();
     for index in item_indexes {
         let Some(item) = frame.display_list.get_mut(index) else {
             continue;
@@ -45430,28 +45396,18 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         }
         let item_in_snapshot_selection = snapshot_previous_nodes.contains(&item.node.0)
             || snapshot_selected_nodes.contains(&item.node.0);
-        let item_address = (!snapshot_has_selection_nodes || !item_in_snapshot_selection)
-            .then(|| {
-                overlay_lookup
-                    .row_lookup_value_for_node(&item.node.0)
-                    .map(str::to_owned)
-                    .or_else(|| {
+        let item_address = overlay_lookup
+            .row_lookup_value_for_node(&item.node.0)
+            .map(str::to_owned)
+            .or_else(|| {
+                item_in_snapshot_selection
+                    .then(|| {
                         snapshot.as_deref().and_then(|snapshot| {
                             focused_raw_row_lookup_value_from_snapshot(snapshot, &item.node.0)
                         })
                     })
-                    .or_else(|| {
-                        layout_proof_fallback.as_ref().and_then(|layout_proof| {
-                            focused_raw_row_lookup_value(layout_proof, &item.node.0)
-                        })
-                    })
-                    .or_else(|| {
-                        layout_proof_fallback.as_ref().and_then(|layout_proof| {
-                            focused_row_lookup_value(layout_proof, &item.node.0)
-                        })
-                    })
-            })
-            .flatten();
+                    .flatten()
+            });
         let affected = style_bool(&item.style, "selected")
             || previous_selected_nodes.contains(&item.node.0)
             || item_in_snapshot_selection
@@ -45464,12 +45420,7 @@ fn preview_patch_retained_selected_row_lookup_overlay(
         if !style_patch_nodes.iter().any(|node| node == &item.node.0) {
             style_patch_nodes.push(item.node.0.clone());
         }
-        let selected = if !snapshot_selected_nodes.is_empty() || !snapshot_previous_nodes.is_empty()
-        {
-            snapshot_selected_nodes.contains(&item.node.0)
-        } else {
-            item_address.as_deref() == Some(selected_row_lookup_value)
-        };
+        let selected = snapshot_selected_nodes.contains(&item.node.0);
         if selected {
             selected_style_nodes.push(item.node.0.clone());
             let lookup_value = overlay_lookup
@@ -45491,21 +45442,15 @@ fn preview_patch_retained_selected_row_lookup_overlay(
     if style_patch_nodes.is_empty() {
         return Ok(false);
     }
-    let used_legacy_selection_fallback = layout_proof_fallback.is_some();
     shared.update_count = shared.update_count.saturating_add(1);
     shared.last_error = None;
     shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
         status: "pass",
         reason: None,
-        selection_overlay_source: Some(if used_legacy_selection_fallback {
-            "legacy-row-lookup-source-intent"
-        } else {
-            "indexed-row-lookup-overlay"
-        }),
-        legacy_selection_fallback_count: usize::from(used_legacy_selection_fallback),
-        legacy_selection_fallback_reason: used_legacy_selection_fallback
-            .then(|| "generic selected-node binding evidence was unavailable".to_owned()),
+        selection_overlay_source: Some("indexed-row-lookup-overlay"),
+        legacy_selection_fallback_count: 0,
+        legacy_selection_fallback_reason: None,
         target_node_count: target_nodes.len(),
         item_index_count: target_nodes.len(),
         source_intent_update_count: 0,
@@ -52270,6 +52215,30 @@ impl PreviewRenderOverlayLookup {
                         .row_lookup_value_by_node
                         .entry(node.to_owned())
                         .or_insert_with(|| lookup_value.clone());
+                }
+            }
+        }
+        lookup
+    }
+
+    fn from_source_intent_value_index(layout_proof: &Value) -> Self {
+        let mut lookup = Self::default();
+        for intent in ROW_LOOKUP_SOURCE_INTENT_KINDS {
+            let Some(value_index) = layout_proof
+                .get("source_intent_value_index")
+                .and_then(|index| index.get(*intent))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (lookup_value, nodes) in value_index {
+                for node in nodes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    lookup.insert_node_row_lookup_value(node, lookup_value.clone());
                 }
             }
         }
@@ -68964,7 +68933,13 @@ mod tests {
                 "source_intent_assertions": [
                     {"node": "legacy-alpha", "intent": "address", "source_path": "alpha"},
                     {"node": "legacy-beta", "intent": "address", "source_path": "beta"}
-                ]
+                ],
+                "source_intent_value_index": {
+                    "address": {
+                        "alpha": ["legacy-alpha"],
+                        "beta": ["legacy-beta"]
+                    }
+                }
             }),
             layout_frame_override: Some(Arc::new(layout_frame)),
             update_count: 0,

@@ -37030,3 +37030,48 @@ Current interpretation:
 - Legacy runtime execution remains available only through names that make the
   diagnostic/legacy nature visible. The implementation island still exists and
   can be shrunk further, but callers no longer look product-neutral.
+
+## 2026-07-05 - Diagnostic Legacy Compare Split From Product Proof
+
+Status: removed another proof/control-plane ambiguity. PlanExecutor product
+reports remain `measurement_mode=proof`, but reports that explicitly run
+legacy comparison now identify themselves as `measurement_mode=diagnostic`.
+
+What changed:
+
+- `run-plan-route`, `run-plan-root-scalar-scenario`, and
+  `run-plan-scenario-events` command report assembly now choose
+  `measurement_mode=diagnostic` whenever `--diagnostic-compare-legacy` is
+  active.
+- Report schema rejects any PlanExecutor proof report whose
+  `command_report_assembly_core.legacy_required_for_status` is true.
+- Schema acceptance for status-gating legacy parity now requires both
+  `measurement_mode=diagnostic` and the explicit
+  `--diagnostic-compare-legacy` command argument.
+- Schema fixtures were updated so they no longer encode diagnostic legacy
+  compare as product proof.
+
+Fresh evidence:
+
+- `cargo test -q -p boon_plan_executor`: pass.
+- `cargo test -q -p boon_report_schema`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_report_schema -p boon_cli`:
+  pass.
+- Fresh root-scalar product report:
+  `target/reports/bytes-plan/root-scalar-product-proof.json` passed schema
+  with `measurement_mode=proof`,
+  `report_status_basis=plan-executor-product`,
+  `legacy_required_for_status=false`, and `legacy_comparison.enabled=false`.
+- Fresh root-scalar diagnostic legacy report:
+  `target/reports/bytes-plan/root-scalar-diagnostic-legacy.json` passed schema
+  with `measurement_mode=diagnostic`,
+  `report_status_basis=plan-executor-plus-explicit-legacy-comparison`,
+  `legacy_required_for_status=true`, and `legacy_comparison.enabled=true`.
+
+Current interpretation:
+
+- Explicit legacy parity can still exist as a diagnostic tool, but it no
+  longer masquerades as product proof.
+- Remaining legacy work is now mostly the actual `LoadedRuntime` /
+  `GenericScheduledRuntime` implementation island plus xtask diagnostic and
+  obsolete semantic/metamorphic harness callers.

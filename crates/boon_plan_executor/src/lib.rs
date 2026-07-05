@@ -11054,6 +11054,11 @@ pub fn assemble_source_route_command_report(
     } else {
         "plan-executor-product"
     };
+    let measurement_mode = if input.compare_legacy {
+        "diagnostic"
+    } else {
+        "proof"
+    };
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
         "legacy_passed": legacy_passed,
@@ -11079,7 +11084,7 @@ pub fn assemble_source_route_command_report(
         "report_version": 1,
         "command": "run-plan-route",
         "command_argv": input.command_argv,
-        "measurement_mode": "proof",
+        "measurement_mode": measurement_mode,
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
@@ -11254,6 +11259,11 @@ pub fn assemble_root_scenario_command_report(
     } else {
         "plan-executor-product"
     };
+    let measurement_mode = if input.compare_legacy {
+        "diagnostic"
+    } else {
+        "proof"
+    };
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
         "legacy_passed": legacy_passed,
@@ -11280,7 +11290,7 @@ pub fn assemble_root_scenario_command_report(
         "report_version": 1,
         "command": "run-plan-root-scalar-scenario",
         "command_argv": input.command_argv,
-        "measurement_mode": "proof",
+        "measurement_mode": measurement_mode,
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
@@ -11436,6 +11446,11 @@ pub fn assemble_scenario_events_command_report(
     } else {
         "plan-executor-product-plus-assertion-coverage"
     };
+    let measurement_mode = if input.compare_legacy {
+        "diagnostic"
+    } else {
+        "proof"
+    };
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-scenario-events-command-report-assembly-v1",
         "legacy_passed": legacy_passed,
@@ -11468,7 +11483,7 @@ pub fn assemble_scenario_events_command_report(
         "report_version": 1,
         "command": "run-plan-scenario-events",
         "command_argv": input.command_argv,
-        "measurement_mode": "proof",
+        "measurement_mode": measurement_mode,
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,

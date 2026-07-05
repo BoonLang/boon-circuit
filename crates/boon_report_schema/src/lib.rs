@@ -4089,6 +4089,43 @@ fn legacy_required_for_status(report: &JsonValue) -> bool {
         .unwrap_or(false)
 }
 
+fn verify_legacy_required_is_diagnostic_only(
+    report: &JsonValue,
+    report_path: &Path,
+    command_name: &str,
+) -> RuntimeResult<()> {
+    if !legacy_required_for_status(report) {
+        return Ok(());
+    }
+    if report.get("measurement_mode").and_then(JsonValue::as_str) != Some("diagnostic") {
+        return Err(format!(
+            "{} {command_name} report cannot require legacy comparison for status in proof mode",
+            report_path.display()
+        )
+        .into());
+    }
+    let command_argv = report
+        .get("command_argv")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} {command_name} command_argv is not an array",
+                report_path.display()
+            )
+        })?;
+    if !command_argv
+        .iter()
+        .any(|arg| arg.as_str() == Some("--diagnostic-compare-legacy"))
+    {
+        return Err(format!(
+            "{} {command_name} legacy-required diagnostic report is missing --diagnostic-compare-legacy",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     for key in [
         "target_profile",
@@ -4424,6 +4461,7 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
                 report_path.display()
             )
         })?;
+    verify_legacy_required_is_diagnostic_only(report, report_path, "run-plan-route")?;
     if !legacy_required_for_status(report) {
         if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
             || legacy.get("reason").and_then(JsonValue::as_str)
@@ -4889,6 +4927,11 @@ fn verify_run_plan_root_scalar_scenario_report(
                 report_path.display()
             )
         })?;
+    verify_legacy_required_is_diagnostic_only(
+        report,
+        report_path,
+        "run-plan-root-scalar-scenario",
+    )?;
     if !legacy_required_for_status(report) {
         if legacy.get("enabled").and_then(JsonValue::as_bool) != Some(false)
             || legacy.get("reason").and_then(JsonValue::as_str)
@@ -5257,6 +5300,7 @@ fn verify_run_plan_scenario_events_report(
                 report_path.display()
             )
         })?;
+    verify_legacy_required_is_diagnostic_only(report, report_path, "run-plan-scenario-events")?;
     let legacy_enabled = legacy.get("enabled").and_then(JsonValue::as_bool) == Some(true);
     if !legacy_enabled {
         let command_argv = report
@@ -35453,7 +35497,7 @@ mod tests {
             "report_version": 1,
             "command": "run-plan-route",
             "command_argv": ["boon_cli", "run-plan-route", source_path_string, "--diagnostic-compare-legacy"],
-            "measurement_mode": "proof",
+            "measurement_mode": "diagnostic",
             "exit_status": 0,
             "generated_at_utc": SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -35590,6 +35634,7 @@ mod tests {
             "per_step": expected.per_step
         });
         let mut report = base_report();
+        report["measurement_mode"] = json!("diagnostic");
         report["command"] = json!("run-plan-root-scalar-scenario");
         report["command_argv"] = json!([
             "boon_cli",

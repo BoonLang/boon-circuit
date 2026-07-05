@@ -60,8 +60,12 @@ Current checkpoint:
   the old `run_generic_scenario` report loop, `base_example_report`,
   `enrich_report`, retired runtime change-batch protocol helpers, and the
   obsolete `RuntimeProfile` report enum. Do not recreate them to make stale
-  report tests pass. The remaining legacy cuts are deleting or migrating the
-  test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage island and any
+  report tests pass. The old product-style `LoadedRuntimeHarness` live-source
+  cluster for TodoMVC/Counter/NovyWave has also been cut, with PlanExecutor
+  replacement tests for source-batch sequence/event-id rejection and duplicate
+  TodoMVC occurrence routing. The remaining legacy cuts are deleting or
+  migrating the test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage
+  island, now mostly lower-level runtime/list/currentness diagnostics, and any
   native legacy negative counters that are no longer useful as removal guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit

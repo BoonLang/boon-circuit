@@ -37811,3 +37811,40 @@ Remaining cleanup:
   tests to PlanExecutor/direct MachinePlan coverage, or delete obsolete
   storage-runtime tests outright. Do not recreate raw scenario helpers to make
   old report surfaces pass.
+
+## 2026-07-05 - LoadedRuntime Product-Style Live Test Cluster Cut
+
+Status: removed the next product-like `LoadedRuntimeHarness` evidence island.
+This is still not complete old-runtime deletion; it narrows the remaining debt
+to explicit diagnostics and lower-level old runtime/list/currentness tests.
+
+What changed:
+
+- Deleted the old TodoMVC/Counter/NovyWave live-source tests that proved
+  product behavior through `LoadedRuntimeHarness::new` or explicit
+  `LoadedRuntimeHarness::from_project`.
+- Added PlanExecutor-owned tests for the two behaviors from that cluster that
+  still needed direct product coverage:
+  - source-batch equal-sequence and duplicate-event-id rejection;
+  - duplicate TodoMVC title routing by `target_occurrence`.
+- Removed the now-unused `lower_profiled` runtime test import that only existed
+  for the deleted NovyWave debug assertion.
+
+Verification:
+
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_plan_executor_rejects_batch_sequence_and_event_id_conflicts`
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_plan_executor_routes_duplicate_todo_title_by_occurrence`
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner`
+
+Remaining cleanup:
+
+- Current `boon_runtime` old-runtime references still include
+  `LoadedRuntimeHarness::from_source`, `LoadedRuntimeHarness::from_project`,
+  `LoadedRuntime`, and `GenericScheduledRuntime`.
+- The remaining old runtime island is now mostly lower-level runtime/list/
+  currentness coverage plus explicit diagnostics. Next cuts should migrate
+  essential engine semantics to PlanExecutor/MachinePlan tests or delete
+  obsolete storage-runtime tests rather than preserving the old harness.

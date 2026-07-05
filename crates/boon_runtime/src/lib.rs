@@ -55,7 +55,7 @@ use boon_compiler::{
 #[cfg(test)]
 use boon_ir::TypedProgram;
 #[cfg(test)]
-use boon_ir::{lower, lower_profiled};
+use boon_ir::lower;
 use boon_plan::{
     FieldId, InitialValueKind as PlanInitialValueKind, ListId, MachinePlan, PlanConstantId,
     PlanConstantValue, PlanDerivedExpression, PlanExpressionKind, PlanListProjection, PlanOpKind,
@@ -67587,633 +67587,6 @@ document: Document/new(root: Element/label(element: [], label: store.a_summary))
     }
 
     #[test]
-    fn live_runtime_applies_observed_todomvc_source_events() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn")).unwrap();
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        let change = runtime
-            .apply_source_event_for_step(
-                &scenario.step[1],
-                LiveSourceEvent {
-                    source: "store.sources.new_todo_input.change".to_owned(),
-                    text: Some("Test todo".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(change.state_summary["new_todo_text"], "Test todo");
-        let submit = runtime
-            .apply_source_event_for_step(
-                &scenario.step[2],
-                LiveSourceEvent {
-                    source: "store.sources.new_todo_input.key_down".to_owned(),
-                    text: None,
-                    key: Some("Enter".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(submit.state_summary["todos"].as_array().unwrap().len(), 5);
-        assert!(
-            submit
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta.kind == "ListInsert")
-        );
-    }
-
-    #[test]
-    fn live_runtime_applies_root_text_key_payload_source_events() {
-        let source = r#"
-store: [
-    sources: [
-        keyboard: SOURCE
-    ]
-    last_key:
-        Text/empty() |> HOLD last_key {
-            LATEST {
-                sources.keyboard.key
-            }
-        }
-    pan_window:
-        Center |> HOLD pan_window {
-            LATEST {
-                sources.keyboard.key |> WHEN {
-                    A => LeftWindow
-                    D => RightWindow
-                    __ => SKIP
-                }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Keyboard }))
-"#;
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:key-payload",
-            source,
-            Path::new("../../examples/counter.scn"),
-        )
-        .unwrap();
-
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.sources.keyboard".to_owned()),
-        );
-        expected.insert("key".to_owned(), toml::Value::String("D".to_owned()));
-        let step = ScenarioStep {
-            id: "keyboard-root-text".to_owned(),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-
-        let output = runtime
-            .apply_source_event_for_step(
-                &step,
-                LiveSourceEvent {
-                    source: "store.sources.keyboard".to_owned(),
-                    key: Some("D".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-
-        assert_eq!(output.state_summary["store"]["last_key"], "D");
-        assert_eq!(output.state_summary["store"]["pan_window"], "RightWindow");
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.last_key")
-        }));
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.pan_window")
-        }));
-    }
-
-    #[test]
-    fn live_runtime_applies_plain_latest_key_payload_match() {
-        let source_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
-        let units = source_units_for_path(&source_path).expect("NovyWave source units should load");
-        let parsed = parse_project(
-            "plain-latest-key-match-debug".to_owned(),
-            units
-                .iter()
-                .map(|unit| (unit.path.clone(), unit.source.clone())),
-        )
-        .expect("NovyWave project should parse");
-        let (ir, _) = lower_profiled(&parsed).expect("NovyWave project should lower");
-        let cursor_branch_debug = ir
-            .update_branches
-            .iter()
-            .filter(|branch| {
-                branch.target == "store.cursor_position"
-                    && branch.source == "store.elements.keyboard_capture"
-            })
-            .map(|branch| format!("{:?}", branch.expression))
-            .collect::<Vec<_>>();
-        let mut runtime = LoadedRuntimeHarness::from_project("plain-latest-key-match", &units)
-            .expect("runtime should initialize");
-        runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.load_default_file".to_owned(),
-                target_text: Some("Open default".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("default file load should apply");
-        runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.select_data".to_owned(),
-                target_text: Some("data_bus[7:0]".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("data_bus selection should apply");
-        assert_eq!(
-            runtime.state_summary()["store"]["cursor_position"],
-            "Cursor42"
-        );
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.keyboard_capture".to_owned(),
-                key: Some("Q".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("keyboard source event should apply");
-        assert!(
-            output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "FieldSet"
-                    && delta.field_path.as_deref() == Some("store.cursor_position")
-                    && matches!(&delta.value, ProtocolValue::Text(value) if value == "Cursor36")
-            }),
-            "cursor_position branch debug: {cursor_branch_debug:#?}; deltas: {:#?}",
-            output.semantic_deltas
-        );
-        assert_eq!(output.state_summary["store"]["cursor_position"], "Cursor36");
-        assert_eq!(output.state_summary["cursor_position"], "Cursor36");
-        assert_eq!(
-            output.state_summary["store"]["bridge_request_descriptor_label"],
-            "SIMPLE_TB_S/DATA_BUS/Fit/RightWindow/Cursor36/Hexadecimal"
-        );
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.keyboard_capture".to_owned(),
-                key: Some("W".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("keyboard source event should apply");
-        assert_eq!(output.state_summary["store"]["cursor_position"], "Cursor36");
-        assert_eq!(
-            output.state_summary["store"]["bridge_request_descriptor_label"],
-            "SIMPLE_TB_S/DATA_BUS/Close/RightWindow/Cursor36/Hexadecimal"
-        );
-    }
-
-    #[test]
-    fn source_batch_dispatches_ordered_events_and_rejects_equal_sequence_conflict() {
-        let mut runtime = LoadedRuntimeHarness::from_source(
-            "examples/counter.bn",
-            include_str!("../../../examples/counter.bn"),
-        )
-        .unwrap();
-        let output = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 1,
-                events: vec![
-                    SourceBatchEvent {
-                        event_id: 1,
-                        event: LiveSourceEvent {
-                            source: "store.sources.increment_button.press".to_owned(),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                    SourceBatchEvent {
-                        event_id: 2,
-                        event: LiveSourceEvent {
-                            source: "store.sources.decrement_button.press".to_owned(),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                ],
-            })
-            .unwrap();
-
-        assert_eq!(output.semantic_deltas.len(), 2);
-        assert!(
-            output
-                .semantic_deltas
-                .iter()
-                .all(|delta| delta.field_path.as_deref() == Some("store.count")),
-            "ordered source batch must dispatch through public source events"
-        );
-
-        let error = runtime
-            .apply_source_batch_turn(SourceBatch::single(
-                1,
-                3,
-                LiveSourceEvent {
-                    source: "store.sources.increment_button.press".to_owned(),
-                    ..LiveSourceEvent::default()
-                },
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("sequence conflict"),
-            "equal-sequence LATEST conflicts must be rejected deterministically, got `{error}`"
-        );
-
-        let error = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 2,
-                events: vec![
-                    SourceBatchEvent {
-                        event_id: 9,
-                        event: LiveSourceEvent {
-                            source: "store.sources.increment_button.press".to_owned(),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                    SourceBatchEvent {
-                        event_id: 9,
-                        event: LiveSourceEvent {
-                            source: "store.sources.decrement_button.press".to_owned(),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                ],
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("event IDs must be strictly increasing"),
-            "batch event ID conflicts must be reported deterministically, got `{error}`"
-        );
-    }
-
-    #[test]
-    fn live_runtime_applies_numeric_counter_hold_updates_generically() {
-        let source = include_str!("../../../examples/counter.bn");
-        let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:counter",
-            source,
-            Path::new("../../examples/counter.scn"),
-        )
-        .unwrap();
-
-        let expected = [
-            (
-                "press-increment",
-                "store.sources.increment_button.press",
-                "+",
-                1,
-            ),
-            (
-                "press-increment-again",
-                "store.sources.increment_button.press",
-                "+",
-                2,
-            ),
-            (
-                "press-decrement",
-                "store.sources.decrement_button.press",
-                "-",
-                1,
-            ),
-            (
-                "press-reset",
-                "store.sources.reset_button.press",
-                "Reset",
-                0,
-            ),
-            (
-                "press-decrement-negative",
-                "store.sources.decrement_button.press",
-                "-",
-                -1,
-            ),
-            (
-                "press-increment-back-to-zero",
-                "store.sources.increment_button.press",
-                "+",
-                0,
-            ),
-        ];
-        for (step_id, source, target_text, count) in expected {
-            let step = scenario
-                .step
-                .iter()
-                .find(|step| step.id == step_id)
-                .expect("counter scenario includes expected step");
-            let output = runtime
-                .apply_source_event_for_step(
-                    step,
-                    LiveSourceEvent {
-                        source: source.to_owned(),
-                        target_text: Some(target_text.to_owned()),
-                        ..LiveSourceEvent::default()
-                    },
-                )
-                .unwrap();
-            assert_eq!(output.state_summary["store"]["count"], json!(count));
-        }
-    }
-
-    #[test]
-    fn live_runtime_routes_duplicate_todo_title_events_by_occurrence() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        for _ in 0..2 {
-            runtime
-                .apply_source_event(LiveSourceEvent {
-                    source: "store.sources.new_todo_input.change".to_owned(),
-                    text: Some("Duplicate".to_owned()),
-                    ..LiveSourceEvent::default()
-                })
-                .unwrap();
-            runtime
-                .apply_source_event(LiveSourceEvent {
-                    source: "store.sources.new_todo_input.key_down".to_owned(),
-                    text: None,
-                    key: Some("Enter".to_owned()),
-                    ..LiveSourceEvent::default()
-                })
-                .unwrap();
-        }
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "todo.sources.todo_checkbox.click".to_owned(),
-                target_text: Some("Duplicate".to_owned()),
-                target_occurrence: Some(2),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let duplicates = output
-            .state_summary
-            .get("todos")
-            .and_then(JsonValue::as_array)
-            .unwrap()
-            .iter()
-            .filter(|todo| todo["title"] == "Duplicate")
-            .collect::<Vec<_>>();
-        assert_eq!(duplicates.len(), 2);
-        assert_eq!(duplicates[0]["completed"], false);
-        assert_eq!(duplicates[1]["completed"], true);
-    }
-
-    #[test]
-    fn live_runtime_prefers_bound_row_identity_over_target_text() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
-            row.pointer(&format!("/$boon/{field}"))
-                .and_then(|value| {
-                    value
-                        .as_u64()
-                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                })
-                .unwrap_or_else(|| panic!("todo row missing numeric `{field}`: {row}"))
-        };
-        let initial = runtime.state_summary();
-        let first_todo = &initial["todos"][0];
-        let target_key = json_u64_field(first_todo, "row_key");
-        let target_generation = json_u64_field(first_todo, "generation");
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Buy groceries checkbox".to_owned()),
-        );
-        action.insert(
-            "target_key".to_owned(),
-            toml::Value::Integer(target_key as i64),
-        );
-        action.insert(
-            "target_generation".to_owned(),
-            toml::Value::Integer(target_generation as i64),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
-        );
-        expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Buy groceries".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "bound-row-identity-wins".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-
-        let output = runtime.apply_checked_step(&step).unwrap();
-        let todos = output
-            .state_summary
-            .get("todos")
-            .and_then(JsonValue::as_array)
-            .unwrap();
-        assert_eq!(todos[0]["title"], "Read documentation");
-        assert_eq!(todos[0]["completed"], true);
-        assert_eq!(todos[3]["title"], "Buy groceries");
-        assert_eq!(todos[3]["completed"], false);
-        assert_eq!(
-            output
-                .semantic_deltas
-                .iter()
-                .filter(|delta| delta.field_path.as_deref() == Some("completed"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn live_source_event_preserves_bound_row_identity() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
-            row.pointer(&format!("/$boon/{field}"))
-                .and_then(|value| {
-                    value
-                        .as_u64()
-                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                })
-                .unwrap_or_else(|| panic!("todo row missing numeric `{field}`: {row}"))
-        };
-        let initial = runtime.state_summary();
-        let first_todo = &initial["todos"][0];
-        let target_key = json_u64_field(first_todo, "row_key");
-        let target_generation = json_u64_field(first_todo, "generation");
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "todo.sources.todo_checkbox.click".to_owned(),
-                target_text: Some("Buy groceries".to_owned()),
-                target_key: Some(target_key),
-                target_generation: Some(target_generation),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let todos = output
-            .state_summary
-            .get("todos")
-            .and_then(JsonValue::as_array)
-            .unwrap();
-        assert_eq!(todos[0]["title"], "Read documentation");
-        assert_eq!(todos[0]["completed"], true);
-        assert_eq!(todos[3]["title"], "Buy groceries");
-        assert_eq!(todos[3]["completed"], false);
-    }
-
-    #[test]
-    fn row_identity_live_source_event_carries_list_and_source_epoch() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime = LoadedRuntimeHarness::new(
-            "playground-live:todomvc",
-            source,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .unwrap();
-        let json_u64_field = |row: &JsonValue, field: &str| -> u64 {
-            row.pointer(&format!("/$boon/{field}"))
-                .and_then(|value| {
-                    value
-                        .as_u64()
-                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                })
-                .unwrap_or_else(|| panic!("todo row missing numeric `{field}`: {row}"))
-        };
-        let initial = runtime.state_summary();
-        let first_todo = &initial["todos"][0];
-        let target_key = json_u64_field(first_todo, "row_key");
-        let target_generation = json_u64_field(first_todo, "generation");
-        let source_epoch = runtime
-            .loaded_runtime_for_test()
-            .generic
-            .as_ref()
-            .expect("generic runtime should be available")
-            .storage
-            .row_source_bindings("todos", target_key, target_generation)
-            .find(|source| source.source_path == "todo.sources.todo_checkbox.click")
-            .map(|source| source.bind_epoch)
-            .expect("todo checkbox binding should expose bind_epoch");
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "todo.sources.todo_checkbox.click".to_owned(),
-                list_id: Some("todos".to_owned()),
-                target_text: Some("Buy groceries".to_owned()),
-                target_key: Some(target_key),
-                target_generation: Some(target_generation),
-                source_epoch: Some(source_epoch),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-
-        assert_eq!(output.state_summary["todos"][0]["completed"], true);
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet"
-                && delta.list_id.as_deref() == Some("todos")
-                && delta.key == Some(target_key)
-                && delta.generation == Some(target_generation)
-        }));
-    }
-
-    #[test]
-    fn document_summary_uses_source_identity_for_filtered_todomvc_rows() {
-        let source = include_str!("../../../examples/todomvc.bn");
-        let mut runtime =
-            LoadedRuntimeHarness::from_source("todomvc-filtered-document-source-identity", source)
-                .unwrap();
-        for event in [
-            LiveSourceEvent {
-                source: "store.sources.new_todo_input.change".to_owned(),
-                text: Some("Test todo".to_owned()),
-                ..LiveSourceEvent::default()
-            },
-            LiveSourceEvent {
-                source: "store.sources.new_todo_input.key_down".to_owned(),
-                key: Some("Enter".to_owned()),
-                ..LiveSourceEvent::default()
-            },
-            LiveSourceEvent {
-                source: "store.sources.toggle_all_checkbox.click".to_owned(),
-                ..LiveSourceEvent::default()
-            },
-            LiveSourceEvent {
-                source: "store.sources.toggle_all_checkbox.click".to_owned(),
-                ..LiveSourceEvent::default()
-            },
-            LiveSourceEvent {
-                source: "todo.sources.todo_checkbox.click".to_owned(),
-                target_text: Some("Buy groceries".to_owned()),
-                ..LiveSourceEvent::default()
-            },
-            LiveSourceEvent {
-                source: "store.sources.filter_active.press".to_owned(),
-                ..LiveSourceEvent::default()
-            },
-        ] {
-            runtime
-                .apply_source_event_turn(event)
-                .expect("TodoMVC setup event should apply");
-        }
-
-        let summary = runtime.document_state_summary();
-        let visible = summary["store"]["visible_todos"]
-            .as_array()
-            .expect("visible_todos should be a document-summary array");
-        let test_todo = visible
-            .iter()
-            .find(|row| row.get("title").and_then(JsonValue::as_str) == Some("Test todo"))
-            .expect("filtered visible_todos should contain Test todo");
-        assert_eq!(
-            test_todo
-                .pointer("/$boon/row_key")
-                .and_then(JsonValue::as_u64),
-            Some(5),
-            "document-facing projected rows must expose the source todos key"
-        );
-        assert_eq!(
-            test_todo
-                .pointer("/sources/todo_checkbox/click/target_key")
-                .and_then(JsonValue::as_u64),
-            Some(5),
-            "row-scoped source binding must also point at the source todos key"
-        );
-        assert_eq!(
-            test_todo
-                .pointer("/sources/todo_checkbox/click/list_id")
-                .and_then(JsonValue::as_str),
-            Some("todos"),
-            "document source bindings should route to the source list, not the projection list"
-        );
-    }
-
-    #[test]
     fn root_list_view_identity_only_change_updates_document_identity() {
         let source = r#"
 store: [
@@ -87342,6 +86715,174 @@ expected_source_event = {{ source = "store.decode" }}
             output.render_patches.is_empty(),
             "PlanExecutor live turn must not synthesize legacy render patches during this slice"
         );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_rejects_batch_sequence_and_event_id_conflicts() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let mut runtime =
+            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
+                .expect("TodoMVC should initialize through PlanExecutor");
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+
+        let output = runtime
+            .apply_source_batch_turn(SourceBatch {
+                sequence_id: 1,
+                events: vec![
+                    SourceBatchEvent {
+                        event_id: 1,
+                        event: LiveSourceEvent {
+                            source: "store.sources.new_todo_input.change".to_owned(),
+                            text: Some("Batch todo".to_owned()),
+                            ..LiveSourceEvent::default()
+                        },
+                    },
+                    SourceBatchEvent {
+                        event_id: 2,
+                        event: LiveSourceEvent {
+                            source: "store.sources.new_todo_input.key_down".to_owned(),
+                            key: Some("Enter".to_owned()),
+                            ..LiveSourceEvent::default()
+                        },
+                    },
+                ],
+            })
+            .expect("PlanExecutor batch should dispatch ordered public source events");
+        assert!(
+            output.semantic_deltas.iter().any(
+                |delta| delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("todos")
+            ),
+            "ordered source batch must dispatch through public source events"
+        );
+
+        let error = runtime
+            .apply_source_batch_turn(SourceBatch::single(
+                1,
+                3,
+                LiveSourceEvent {
+                    source: "store.sources.new_todo_input.change".to_owned(),
+                    text: Some("stale sequence".to_owned()),
+                    ..LiveSourceEvent::default()
+                },
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("sequence conflict"),
+            "equal-sequence LATEST conflicts must be rejected deterministically, got `{error}`"
+        );
+
+        let error = runtime
+            .apply_source_batch_turn(SourceBatch {
+                sequence_id: 2,
+                events: vec![
+                    SourceBatchEvent {
+                        event_id: 9,
+                        event: LiveSourceEvent {
+                            source: "store.sources.new_todo_input.change".to_owned(),
+                            text: Some("duplicate event id".to_owned()),
+                            ..LiveSourceEvent::default()
+                        },
+                    },
+                    SourceBatchEvent {
+                        event_id: 9,
+                        event: LiveSourceEvent {
+                            source: "store.sources.new_todo_input.key_down".to_owned(),
+                            key: Some("Enter".to_owned()),
+                            ..LiveSourceEvent::default()
+                        },
+                    },
+                ],
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("event IDs must be strictly increasing"),
+            "batch event ID conflicts must be reported deterministically, got `{error}`"
+        );
+    }
+
+    #[test]
+    fn live_runtime_plan_executor_routes_duplicate_todo_title_by_occurrence() {
+        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
+            .expect("TodoMVC source units should load")
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let mut runtime =
+            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
+                .expect("TodoMVC should initialize through PlanExecutor");
+        assert_eq!(
+            runtime.engine_provenance_report()["generic_fallback_enabled"],
+            false
+        );
+
+        for sequence_id in 1..=2 {
+            runtime
+                .apply_source_batch_turn(SourceBatch {
+                    sequence_id,
+                    events: vec![
+                        SourceBatchEvent {
+                            event_id: 1,
+                            event: LiveSourceEvent {
+                                source: "store.sources.new_todo_input.change".to_owned(),
+                                text: Some("Duplicate".to_owned()),
+                                ..LiveSourceEvent::default()
+                            },
+                        },
+                        SourceBatchEvent {
+                            event_id: 2,
+                            event: LiveSourceEvent {
+                                source: "store.sources.new_todo_input.key_down".to_owned(),
+                                key: Some("Enter".to_owned()),
+                                ..LiveSourceEvent::default()
+                            },
+                        },
+                    ],
+                })
+                .expect("duplicate TodoMVC submit should apply through PlanExecutor");
+        }
+
+        let output = runtime
+            .apply_source_batch_turn(SourceBatch::single(
+                3,
+                1,
+                LiveSourceEvent {
+                    source: "todo.sources.todo_checkbox.click".to_owned(),
+                    target_text: Some("Duplicate".to_owned()),
+                    target_occurrence: Some(2),
+                    ..LiveSourceEvent::default()
+                },
+            ))
+            .expect("second duplicate checkbox click should route by occurrence");
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("completed")
+        }));
+
+        let state = runtime.document_state_summary();
+        let duplicates = state
+            .get("todos")
+            .and_then(JsonValue::as_array)
+            .expect("TodoMVC summary should include todos")
+            .iter()
+            .filter(|todo| todo["title"] == "Duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert_eq!(duplicates[0]["completed"], false);
+        assert_eq!(duplicates[1]["completed"], true);
     }
 
     #[test]

@@ -105,6 +105,9 @@ What changed:
   `source_intent_value_index` row lookup evidence; if that identity is absent,
   the product path must report that no retained indexed patch was available
   instead of guessing from legacy source-intent scans.
+- The product hover/selection sync helpers now use indexed source-intent value
+  evidence directly, and the old scan-capable source-intent-by-value helper was
+  deleted instead of left as dead compatibility code.
 
 Fresh evidence:
 
@@ -146,6 +149,10 @@ Fresh Cells report summary:
   product-only UX `p95=11.395ms`, `max=15.187ms`, all `64` retained update
   samples use `product_frame_retained_bound_sync`, and
   `legacy_selection_fallback_count=0`.
+- After deleting the scan-capable helper from the product path, the refreshed
+  release report still passes: product-only UX `p95=11.508ms`,
+  `max=11.955ms`, `legacy_selection_fallback_count=0`, and
+  `runtime_work_contract.total_list_find_rows_scanned=0`.
 
 Remaining work:
 

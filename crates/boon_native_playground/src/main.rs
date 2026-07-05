@@ -42457,7 +42457,7 @@ fn preview_try_apply_simple_source_click_input(
         && let Some(previous_selected_address) = legacy_previous_selected_address.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
-        let nodes = source_intent_nodes_for_value(
+        let nodes = source_intent_value_index_nodes_for_value(
             &shared.layout_proof,
             ROW_LOOKUP_SOURCE_INTENT_KINDS,
             previous_selected_address,
@@ -42476,7 +42476,7 @@ fn preview_try_apply_simple_source_click_input(
         && let Some(selected_address) = legacy_selected_address_for_style_patch.as_deref()
         && let Ok(shared) = shared_render_state.lock()
     {
-        let nodes = source_intent_nodes_for_value(
+        let nodes = source_intent_value_index_nodes_for_value(
             &shared.layout_proof,
             ROW_LOOKUP_SOURCE_INTENT_KINDS,
             selected_address,
@@ -45158,7 +45158,7 @@ fn preview_selected_overlay_nodes_for_row_lookup_value(
     selected_row_lookup_value: &str,
     allow_fallback_scan: bool,
 ) -> BTreeSet<String> {
-    let indexed_nodes = source_intent_nodes_for_value(
+    let indexed_nodes = source_intent_value_index_nodes_for_value(
         layout_proof,
         ROW_LOOKUP_SOURCE_INTENT_KINDS,
         selected_row_lookup_value,
@@ -47687,7 +47687,7 @@ fn preview_apply_hover_overlay(
         .hovered_target_text
         .as_deref()
         .map(|target| {
-            source_intent_nodes_for_value(
+            source_intent_value_index_nodes_for_value(
                 &shared.layout_proof,
                 &[
                     "target",
@@ -51039,7 +51039,7 @@ fn focused_target_text(layout_proof: &Value, node: &str) -> Option<String> {
         .or_else(|| focused_row_lookup_value(layout_proof, node))
 }
 
-fn source_intent_nodes_for_value(
+fn source_intent_value_index_nodes_for_value(
     layout_proof: &Value,
     intent_kinds: &[&str],
     source_path: &str,
@@ -51060,27 +51060,6 @@ fn source_intent_nodes_for_value(
                 );
             }
         }
-    }
-    nodes.extend(
-        layout_source_intent_entries(layout_proof)
-            .into_iter()
-            .filter_map(|intent| {
-                let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
-                let intent_source_path = source_intent_payload_value_field(intent)?;
-                let node = intent.get("node").and_then(serde_json::Value::as_str)?;
-                (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
-                    .then(|| node.to_owned())
-            }),
-    );
-    if nodes.is_empty() {
-        let artifact_entries = layout_artifact_source_intent_entries(layout_proof);
-        nodes.extend(artifact_entries.iter().filter_map(|intent| {
-            let intent_kind = intent.get("intent").and_then(serde_json::Value::as_str)?;
-            let intent_source_path = source_intent_payload_value_field(intent)?;
-            let node = intent.get("node").and_then(serde_json::Value::as_str)?;
-            (intent_source_path == source_path && intent_kinds.contains(&intent_kind))
-                .then(|| node.to_owned())
-        }));
     }
     nodes
 }

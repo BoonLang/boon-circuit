@@ -36918,3 +36918,34 @@ Current interpretation:
   report plumbing. Remaining legacy architecture work is mostly the explicit
   `LoadedRuntime`/`GenericScheduledRuntime` island plus broader xtask aggregate
   accounting and PlanExecutor expression/list coverage.
+
+## 2026-07-05 - Source-Replay Aggregates Use Product Split Status
+
+Status: cut another control-plane dependency on legacy/compatibility status.
+Native handoff upstream dependencies and the BYTES/MachinePlan aggregate now
+accept `run-plan-scenario-events` reports through PlanExecutor product status
+fields instead of top-level `status`.
+
+What changed:
+
+- Added a shared product-status helper:
+  `run-plan-scenario-events` passes product status only when
+  `plan_executor_status=pass` and `accepted_for_product_status=pass`.
+- Other commands still use top-level `status`, preserving non-PlanExecutor gate
+  semantics.
+- Native GPU upstream dependency summaries now report
+  `product_status_pass` and `product_status_basis`.
+- BYTES/MachinePlan aggregate child reports now report
+  `product_status_pass`, `product_status_basis`, `plan_executor_status`, and
+  `accepted_for_product_status`.
+- Added a unit guard proving source-replay product status ignores failing
+  diagnostic legacy comparison when PlanExecutor product status passes.
+
+Current interpretation:
+
+- Source-replay reports can keep diagnostic legacy comparison failures without
+  poisoning product/native aggregate truth.
+- This does not remove the legacy runtime implementation. The next large cut is
+  to retire or replace explicit `LoadedRuntime`/`GenericScheduledRuntime`
+  callers that are still product-adjacent, especially native preview helper
+  fallback and NovyWave bridge/runtime regression surfaces.

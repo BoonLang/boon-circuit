@@ -12775,7 +12775,7 @@ fn preview_compile_product_render_graph(
     active_scene_identity: Option<String>,
     render_scene_identity: Option<String>,
     product_patch: Option<&boon_native_app_window::NativeProductPatchSummary>,
-    post_present_proof_request_count: u32,
+    _post_present_proof_request_count: u32,
     upload_bytes: u64,
     renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
 ) -> (
@@ -12791,7 +12791,6 @@ fn preview_compile_product_render_graph(
             target: render_target_kind.to_owned(),
             product_visible: true,
             proof_or_readback: false,
-            post_present_subscriber: false,
         },
     ];
     if let Some(renderer_metrics) = renderer_metrics {
@@ -12808,7 +12807,6 @@ fn preview_compile_product_render_graph(
                         target: pass.output.clone(),
                         product_visible: pass.product_visible,
                         proof_or_readback: pass.proof_or_readback,
-                        post_present_subscriber: false,
                     },
                 ),
         );
@@ -12823,7 +12821,6 @@ fn preview_compile_product_render_graph(
                 target: render_target_kind.to_owned(),
                 product_visible: true,
                 proof_or_readback: false,
-                post_present_subscriber: false,
             },
         );
     }
@@ -12836,27 +12833,9 @@ fn preview_compile_product_render_graph(
             target: "visible_surface".to_owned(),
             product_visible: true,
             proof_or_readback: false,
-            post_present_subscriber: false,
         },
     );
-    if post_present_proof_request_count > 0 {
-        passes.push(
-            boon_native_app_window::NativeProductRenderGraphPassSummary {
-                schema_version: 1,
-                pass_id: "post-present-proof-subscribers".to_owned(),
-                pass_kind: "post_present_proof_subscribers".to_owned(),
-                source: "FrameEvidenceKey".to_owned(),
-                target: "proof_lane".to_owned(),
-                product_visible: false,
-                proof_or_readback: true,
-                post_present_subscriber: true,
-            },
-        );
-    }
-    let proof_pass_count = passes
-        .iter()
-        .filter(|pass| pass.proof_or_readback || pass.post_present_subscriber)
-        .count() as u32;
+    let proof_pass_count = passes.iter().filter(|pass| pass.proof_or_readback).count() as u32;
     let product_pass_count = passes.len() as u32 - proof_pass_count;
     let full_rebuild_fallback_count = product_patch
         .filter(|patch| patch.full_scene_build_before_present)
@@ -12896,9 +12875,6 @@ fn preview_compile_product_render_graph(
         renderer_metrics.map(|metrics| metrics.renderer_render_graph_schedule_hash.as_str())
     );
     let workload_hash = boon_runtime::sha256_bytes(workload_fingerprint.as_bytes());
-    let proof_subscriber_fingerprint =
-        format!("{post_present_proof_request_count}|{proof_pass_count}");
-    let proof_subscriber_hash = boon_runtime::sha256_bytes(proof_subscriber_fingerprint.as_bytes());
     let render_graph = boon_native_app_window::NativeProductRenderGraphSummary {
         schema_version: 1,
         status: "pass".to_owned(),
@@ -12970,7 +12946,6 @@ fn preview_compile_product_render_graph(
         pass_count: passes.len() as u32,
         product_pass_count,
         proof_pass_count,
-        post_present_subscriber_count: post_present_proof_request_count,
         dirty_chunk_count,
         upload_bytes,
         encode_time_ms: None,
@@ -12980,7 +12955,6 @@ fn preview_compile_product_render_graph(
         stale_epoch_rejection_count: 0,
         plan_hash: plan_hash.clone(),
         workload_hash: Some(workload_hash),
-        proof_subscriber_hash: Some(proof_subscriber_hash),
         passes,
     };
     let present_plan = boon_native_app_window::NativePresentPlanSummary {
@@ -12993,9 +12967,7 @@ fn preview_compile_product_render_graph(
         pass_count: render_graph.pass_count,
         product_pass_count,
         proof_pass_count,
-        post_present_subscriber_count: post_present_proof_request_count,
         proof_readback_in_product_passes: false,
-        proof_readback_post_present_subscriber: post_present_proof_request_count > 0,
         plan_hash,
     };
     (render_graph, present_plan)
@@ -66674,7 +66646,7 @@ mod tests {
     }
 
     #[test]
-    fn product_render_graph_plan_hash_ignores_workload_and_proof_subscribers() {
+    fn product_render_graph_plan_hash_ignores_workload_and_post_present_proof_requests() {
         let (low_work_graph, low_work_present) = preview_compile_product_render_graph(
             "surface-target",
             Some("active-scene".to_owned()),
@@ -66697,9 +66669,15 @@ mod tests {
         assert_eq!(low_work_graph.plan_hash, high_work_graph.plan_hash);
         assert_eq!(low_work_present.plan_hash, high_work_present.plan_hash);
         assert_ne!(low_work_graph.workload_hash, high_work_graph.workload_hash);
-        assert_ne!(
-            low_work_graph.proof_subscriber_hash,
-            high_work_graph.proof_subscriber_hash
+        assert_eq!(low_work_graph.pass_count, high_work_graph.pass_count);
+        assert_eq!(
+            low_work_graph.proof_pass_count,
+            high_work_graph.proof_pass_count
+        );
+        assert_eq!(low_work_present.pass_count, high_work_present.pass_count);
+        assert_eq!(
+            low_work_present.proof_pass_count,
+            high_work_present.proof_pass_count
         );
     }
 

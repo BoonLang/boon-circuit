@@ -3728,7 +3728,6 @@ pub struct NativeProductRenderGraphPassSummary {
     pub target: String,
     pub product_visible: bool,
     pub proof_or_readback: bool,
-    pub post_present_subscriber: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3784,7 +3783,6 @@ pub struct NativeProductRenderGraphSummary {
     pub pass_count: u32,
     pub product_pass_count: u32,
     pub proof_pass_count: u32,
-    pub post_present_subscriber_count: u32,
     pub dirty_chunk_count: u64,
     pub upload_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3796,8 +3794,6 @@ pub struct NativeProductRenderGraphSummary {
     pub plan_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof_subscriber_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub passes: Vec<NativeProductRenderGraphPassSummary>,
 }
@@ -3814,9 +3810,7 @@ pub struct NativePresentPlanSummary {
     pub pass_count: u32,
     pub product_pass_count: u32,
     pub proof_pass_count: u32,
-    pub post_present_subscriber_count: u32,
     pub proof_readback_in_product_passes: bool,
-    pub proof_readback_post_present_subscriber: bool,
     pub plan_hash: String,
 }
 
@@ -3831,9 +3825,7 @@ pub struct NativeProductRenderGraphExecutionSummary {
     pub present_plan_hash: String,
     pub product_pass_count: u32,
     pub proof_pass_count: u32,
-    pub post_present_subscriber_count: u32,
     pub proof_readback_in_product_graph: bool,
-    pub proof_readback_post_present_subscriber: bool,
     pub legacy_pre_present_proof_request_count: u32,
     pub legacy_product_proof_built_pre_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8062,7 +8054,6 @@ fn product_frame_commit_for_presented_frame(
         &frame_evidence_key,
         render_graph.as_ref(),
         present_plan.as_ref(),
-        post_present_proof_requests.len() as u32,
         legacy_pre_present_proof_request_count,
         legacy_product_proof_built_pre_present,
     );
@@ -8130,7 +8121,6 @@ fn product_render_graph_execution_for_commit(
     frame_evidence_key: &FrameEvidenceKey,
     render_graph: Option<&NativeProductRenderGraphSummary>,
     present_plan: Option<&NativePresentPlanSummary>,
-    post_present_subscriber_count: u32,
     legacy_pre_present_proof_request_count: u32,
     legacy_product_proof_built_pre_present: bool,
 ) -> Option<NativeProductRenderGraphExecutionSummary> {
@@ -8146,9 +8136,7 @@ fn product_render_graph_execution_for_commit(
         present_plan_hash: present_plan.plan_hash.clone(),
         product_pass_count: render_graph.product_pass_count,
         proof_pass_count: render_graph.proof_pass_count,
-        post_present_subscriber_count,
         proof_readback_in_product_graph: render_graph.proof_readback_in_product_graph,
-        proof_readback_post_present_subscriber: present_plan.proof_readback_post_present_subscriber,
         legacy_pre_present_proof_request_count,
         legacy_product_proof_built_pre_present,
         surface_acquire_call_ms: state.last_surface_acquire_call_ms,
@@ -8189,17 +8177,7 @@ fn add_post_present_proof_request_to_commit(
     if let Some(product_frame) = commit.product_frame.as_mut() {
         product_frame.post_present_proof_request_count = commit.post_present_proof_request_count;
     }
-    if let Some(render_graph) = commit.render_graph.as_mut() {
-        render_graph.post_present_subscriber_count = commit.post_present_proof_request_count;
-        render_graph.pass_count = render_graph
-            .product_pass_count
-            .saturating_add(render_graph.proof_pass_count);
-    }
-    if let Some(present_plan) = commit.present_plan.as_mut() {
-        present_plan.post_present_subscriber_count = commit.post_present_proof_request_count;
-    }
     if let Some(execution) = commit.render_graph_execution.as_mut() {
-        execution.post_present_subscriber_count = commit.post_present_proof_request_count;
         execution.legacy_pre_present_proof_request_count =
             commit.legacy_pre_present_proof_request_count;
         execution.legacy_product_proof_built_pre_present =

@@ -36294,3 +36294,41 @@ Current interpretation:
 - The remaining explicit legacy child is a diagnostic smoke case, not the
   default execution path. It should be removed or replaced once the remaining
   legacy oracle/report compatibility surfaces are retired.
+
+## 2026-07-05 - Product Graph Proof Subscriber Split
+
+Status: implemented and verified in this slice.
+
+What changed:
+
+- Product render graph pass summaries no longer expose
+  `post_present_subscriber`.
+- Product render graph, present plan, and product graph execution summaries no
+  longer carry post-present subscriber counts or proof-subscriber hashes.
+- `preview_compile_product_render_graph` no longer appends the synthetic
+  `post-present-proof-subscribers` pass. Product graph pass counts now describe
+  product/render work only.
+- Post-present proof availability is proven through
+  `NativeProductFrameCommit.post_present_proof_requests` plus
+  `post_present_proof_isolation`, not through a product present-plan field.
+- xtask visible-proof/product-graph contracts now reject a post-present proof
+  pass inside the product graph and require proof requests to be non-legacy
+  post-present requests.
+
+Evidence:
+
+- `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`:
+  pass.
+- `cargo test -q -p boon_native_playground product_render_graph_plan_hash_ignores_workload_and_post_present_proof_requests -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask cells_visible_click_lane_contracts_accept_split_product_and_proof_paths -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask product_render_graph -- --nocapture`: pass.
+- `cargo test -q -p boon_native_app_window post_present -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- Product render graph reports no longer model proof subscribers as graph
+  passes. The product path remains hot/retained, while proof/readback/reporting
+  stays in the separate post-present request lane.

@@ -37271,3 +37271,34 @@ Remaining legacy implementation:
 - Native/playground world/manufacturing paths still need review before the
   `LoadedRuntime` implementation can be deleted or isolated behind a smaller
   legacy-output module.
+
+## 2026-07-05 - Legacy Ply Crate And Runtime Bench Removed
+
+Status: removed executable workspace surfaces that still depended on the raw
+legacy runtime outside `boon_runtime` itself. Native GPU remains the active
+playground path.
+
+What changed:
+
+- Removed `crates/boon_ply_playground` from the workspace and deleted its
+  source/Cargo files.
+- Removed the `ply-engine` workspace dependency.
+- Removed the legacy TodoMVC runtime benchmark and its `[[bench]]` entry from
+  `boon_runtime`.
+
+Fresh evidence:
+
+- `cargo check -q -p xtask -p boon_runtime -p boon_cli -p boon_native_playground`:
+  pass.
+- `cargo metadata --no-deps --format-version=1`: pass.
+- `rg` over active Cargo files and crates finds no `boon_ply_playground`
+  package or external `run_legacy_scenario` callers. Remaining matches are
+  `boon_runtime` implementation/tests and report-schema/xtask historical audit
+  strings.
+
+Remaining legacy implementation:
+
+- `boon_runtime` still owns the raw legacy scenario APIs and their tests.
+- `boon_report_schema` still validates historical Ply/manual report shapes.
+  That is schema-history support, not an executable playground, but should be
+  cut in a later schema-history cleanup if those reports are no longer kept.

@@ -10,7 +10,6 @@ members = [
     "crates/boon_runtime",
     "crates/boon_report_schema",
     "crates/boon_cli",
-    "crates/boon_ply_playground",
     "crates/boon_document_model",
     "crates/boon_editor",
     "crates/boon_driver",
@@ -77,7 +76,6 @@ arboard = "3.6"
 image = { version = "0.24.9", default-features = false, features = ["png"] }
 flate2 = "1.1"
 resvg = { version = "0.47.0", default-features = false }
-ply-engine = { version = "1.1.1", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"
 app_window = { path = "vendor/app_window" }

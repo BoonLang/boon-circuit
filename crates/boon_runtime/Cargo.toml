@@ -23,7 +23,3 @@ toml.workspace = true
 
 [dev-dependencies]
 boon_ir.workspace = true
-
-[[bench]]
-name = "todomvc"
-harness = false

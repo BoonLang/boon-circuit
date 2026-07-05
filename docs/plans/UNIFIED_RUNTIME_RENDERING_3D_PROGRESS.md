@@ -36491,3 +36491,40 @@ Current interpretation:
   diagnostic constructors/tests, explicit legacy comparison/report fields, and
   native verifier negative gates/fallback counters must be cut or quarantined
   in larger follow-up slices.
+
+## 2026-07-05 - Public CLI Legacy Compare Command Removed
+
+Status: implemented and verified in this slice.
+
+What changed:
+
+- Removed `boon_cli diagnose-plan-legacy-compare` from CLI help and dispatch.
+- Removed the CLI wrapper that invoked `run_plan_scenario_events(...,
+  compare_legacy=true, ...)`.
+- Product command rejection messages no longer point users back to a public
+  legacy comparison command.
+- Updated the active goal prompt so future refresh guidance says public CLI
+  legacy compare refreshes are retired and normal refreshes stay
+  PlanExecutor/product-only.
+
+Current interpretation:
+
+- This closes the last public CLI legacy-comparison entrypoint. Internal
+  comparison assembly/report fields still exist as temporary runtime/schema
+  scaffolding and must be removed in a later schema/report migration rather
+  than exposed as product or verifier truth.
+
+Evidence:
+
+- `cargo test -q -p boon_cli -- --nocapture`: pass.
+- `cargo run -q -p boon_cli -- diagnose-plan-legacy-compare examples/counter.bn`:
+  expected fail with `unknown command`.
+- `cargo run -q -p boon_cli -- run-plan-root-scalar-scenario examples/root_scalar_plan_ops.bn --scenario examples/root_scalar_plan_ops.scn --steps toggle --compare-legacy`:
+  expected fail with `run-plan-root-scalar-scenario no longer exposes legacy
+  comparison`.
+- `cargo run -q -p boon_cli -- run examples/counter.bn --engine compare`:
+  expected fail with `normal run no longer exposes legacy comparison`.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_cli -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
+  pass.

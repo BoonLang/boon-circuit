@@ -10158,8 +10158,10 @@ fn eval_plan_row_expression_with_stack(
                 }
                 None => return Err("row Text/to_bytes requires explicit encoding".into()),
             };
-            let bytes = row_text_to_bytes(&text, &encoding)?;
-            Ok(row_private_bytes_json(&bytes))
+            match row_text_to_bytes(&text, &encoding) {
+                Ok(bytes) => Ok(row_private_bytes_json(&bytes)),
+                Err(_) => Ok(row_error_json("parse_error")),
+            }
         }
         PlanRowExpression::BytesToText { input, encoding } => {
             let bytes = eval_plan_row_bytes_with_stack(plan, list_state, row, input, stack)?;
@@ -10837,18 +10839,18 @@ fn eval_plan_row_lookup_field(
     stack: &[PlanRowEvalKey],
 ) -> RuntimeResult<JsonValue> {
     let target_name = plan_row_field_local_name(plan, field);
-    if let Some(value) = row.fields.get(&target_name).cloned() {
-        return Ok(value);
-    }
     let key = PlanRowEvalKey {
         list_id: list_id.0,
         row_key: row.key,
         field_id: field.0,
     };
-    if stack.contains(&key) {
-        return Ok(row_cycle_error_json());
-    }
-    if let Some(expression) = plan_indexed_row_expression_for_field(plan, field) {
+    if let Some((expression, demand_current)) = plan_indexed_row_expression_for_field(plan, field) {
+        if !demand_current && let Some(value) = row.fields.get(&target_name).cloned() {
+            return Ok(value);
+        }
+        if stack.contains(&key) {
+            return Ok(row_cycle_error_json());
+        }
         let mut nested_stack = stack.to_vec();
         nested_stack.push(key);
         return eval_plan_row_expression_with_stack(
@@ -10871,7 +10873,7 @@ fn eval_plan_row_lookup_field(
 fn plan_indexed_row_expression_for_field(
     plan: &MachinePlan,
     field: boon_plan::FieldId,
-) -> Option<&PlanRowExpression> {
+) -> Option<(&PlanRowExpression, bool)> {
     plan.regions
         .iter()
         .filter(|region| region.kind == RegionKind::DerivedEvaluation)
@@ -10888,7 +10890,7 @@ fn plan_indexed_row_expression_for_field(
             else {
                 return None;
             };
-            Some(expression)
+            Some((expression, plan_indexed_derived_op_is_demand_current(op)))
         })
 }
 
@@ -92236,9 +92238,11 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_helpers_support_documented_arithmetic_ops() {
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-arithmetic", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-arithmetic",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         for (formula, expected) in [
             ("=8+2", "10"),
             ("=8-2", "6"),
@@ -92298,7 +92302,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn cells_unrelated_row_commit_preserves_default_sum_until_formula_changes() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LiveRuntime::from_source_plan_executor(
             "cells-unrelated-row-commit",
             &cells_project_source_for_test(),
         )

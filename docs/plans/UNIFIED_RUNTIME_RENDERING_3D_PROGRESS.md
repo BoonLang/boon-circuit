@@ -36395,16 +36395,20 @@ What changed:
 - PlanExecutor row arithmetic now returns Boon error values for division/modulo
   by zero, and row text conversion can expose Boon error codes instead of
   aborting the evaluator.
+- PlanExecutor indexed row-field reads now recompute demand-current derived row
+  fields even when a stale stored value exists. This fixes formulas that read
+  cells outside the current materialization order, such as `C0=sum(A0:A2)`
+  reading A1/A2 before those rows have been separately refreshed.
+- PlanExecutor row `Text/to_bytes(Ascii)` now returns a Boon `parse_error`
+  value instead of aborting the evaluator, so `Error/text(...)` can observe the
+  intended formula parse error.
 - A focused Cells public-behavior slice now runs on PlanExecutor for selected
   input currentness, source rename/cancel behavior, hidden row-key deltas,
-  formula reference replacement, fanout visible values, and range visible
-  values.
+  formula arithmetic/error behavior, unrelated-row sum stability, formula
+  reference replacement, fanout visible values, and range visible values.
 
 What remains intentionally not claimed:
 
-- Broad Cells formula error/parse semantics are not fully migrated to
-  PlanExecutor. Non-ASCII formula parsing and some formula dependency/value
-  cases still need a dedicated formula-evaluator slice.
 - Legacy-style `recomputed_field_samples` accounting is not populated by
   PlanExecutor for demand-current summary reads; tests now assert current
   visible values and sparse/no-full-grid behavior where that is the product
@@ -36427,18 +36431,15 @@ Evidence:
   - `pure_boon_cells_replacing_reference_removes_stale_dependents`
   - `pure_boon_cells_fanout_recomputes_from_generic_read_index`
   - `pure_boon_cells_range_formula_updates_from_member_change`
-  - `pure_boon_cells_helpers_support_documented_arithmetic_ops` remains an
-    explicit legacy diagnostic until PlanExecutor formula error semantics are
-    completed.
+  - `pure_boon_cells_helpers_support_documented_arithmetic_ops`
   - `cells_unrelated_row_commit_preserves_default_sum_until_formula_changes`
-    remains an explicit legacy diagnostic until the PlanExecutor formula
-    dependency/value bug is fixed.
 
 Current interpretation:
 
 - Product/native construction is no longer depending on a legacy output-root
   path, and PlanExecutor document summaries no longer expose stale selected
-  Cells values.
+  Cells values or stale formula dependency values from rows that have not been
+  separately materialized yet.
 - The remaining visible `legacy` terms are not all equal: some are negative
   gates or historical docs, some are explicit diagnostics, and some are old
   runtime tests still waiting for PlanExecutor migration or deletion.

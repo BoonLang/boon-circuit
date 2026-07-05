@@ -18,8 +18,8 @@ usage:
   boon_cli run <source> [--scenario <path>] [--engine <plan>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
   boon_cli scenario <source> [--scenario <path>] [--report <path>]
   boon_cli run-plan <source> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
-  boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--diagnostic-compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
-  boon_cli run-plan-root-scalar-scenario <source> --scenario <path> --steps <id[,id...]> [--diagnostic-compare-legacy] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run-plan-route <source> --source <source-route> --target-state <state-path> [--text <text>] [--key <key>] [--target-key <row-key>] [--target-generation <generation>] [--address <address>] [--payload <name=value>] [--payload-bytes-hex <name=hex>] [--payload-bytes-file <name=path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
+  boon_cli run-plan-root-scalar-scenario <source> --scenario <path> --steps <id[,id...]> [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>]
   boon_cli diagnose-legacy-scenario <source> [--scenario <path>] [--report <path>] [--print-report]
   boon_cli diagnose-plan-legacy-compare <source> [--scenario <path>] [--target <software_default|software_bounded|fpga_todomvc>] [--report <path>] [--print-report]
   boon_cli compile <source> --out <path.boonc> [--report <path>]
@@ -325,7 +325,6 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut target_generation = None;
     let mut payload = BTreeMap::new();
     let mut payload_bytes = BTreeMap::new();
-    let mut compare_legacy = false;
     let mut report = None;
     let mut index = 1;
     while index < args.len() {
@@ -419,13 +418,9 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 index += 2;
             }
-            "--diagnostic-compare-legacy" => {
-                compare_legacy = true;
-                index += 1;
-            }
-            "--compare-legacy" => {
+            "--diagnostic-compare-legacy" | "--compare-legacy" => {
                 return Err(
-                    "`--compare-legacy` was retired from the product proof surface; use `--diagnostic-compare-legacy`"
+                    "run-plan-route no longer exposes legacy comparison; use `diagnose-plan-legacy-compare`"
                         .into(),
                 );
             }
@@ -463,7 +458,6 @@ fn run_plan_route(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &source_route,
         &target_state,
         event,
-        compare_legacy,
         report.as_deref(),
     )?;
     println!("{}", serde_json::to_string_pretty(&output.report)?);
@@ -490,7 +484,6 @@ fn run_plan_root_scalar_scenario_cmd(args: &[String]) -> Result<(), Box<dyn std:
     let mut target_profile = "software_default".to_owned();
     let mut scenario = None;
     let mut selected_steps = Vec::new();
-    let mut compare_legacy = false;
     let mut report = None;
     let mut index = 1;
     while index < args.len() {
@@ -518,13 +511,9 @@ fn run_plan_root_scalar_scenario_cmd(args: &[String]) -> Result<(), Box<dyn std:
                 );
                 index += 2;
             }
-            "--diagnostic-compare-legacy" => {
-                compare_legacy = true;
-                index += 1;
-            }
-            "--compare-legacy" => {
+            "--diagnostic-compare-legacy" | "--compare-legacy" => {
                 return Err(
-                    "`--compare-legacy` was retired from the product proof surface; use `--diagnostic-compare-legacy`"
+                    "run-plan-root-scalar-scenario no longer exposes legacy comparison; use `diagnose-plan-legacy-compare`"
                         .into(),
                 );
             }
@@ -559,7 +548,6 @@ fn run_plan_root_scalar_scenario_cmd(args: &[String]) -> Result<(), Box<dyn std:
         Path::new(&scenario),
         target_profile,
         &selected_steps,
-        compare_legacy,
         report.as_deref(),
     )?;
     println!("{}", serde_json::to_string_pretty(&output.report)?);
@@ -1288,7 +1276,8 @@ mod tests {
         assert!(CLI_HELP.contains("target/reports/<example>-cli-run.json"));
         assert!(CLI_HELP.contains("--scenario <path>"));
         assert!(CLI_HELP.contains("--report <path>"));
-        assert!(CLI_HELP.contains("--diagnostic-compare-legacy"));
+        assert!(CLI_HELP.contains("diagnose-plan-legacy-compare"));
+        assert!(!CLI_HELP.contains("[--diagnostic-compare-legacy]"));
         assert!(!CLI_HELP.contains("--engine <legacy|plan|compare>"));
         assert!(!CLI_HELP.contains("[--compare-legacy]"));
     }

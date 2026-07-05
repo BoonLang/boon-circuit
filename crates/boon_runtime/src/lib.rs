@@ -87,7 +87,6 @@ use boon_plan_executor::{
     assemble_scenario_events_command_output as assemble_plan_scenario_events_command_output,
     assemble_source_derived_step_deltas as assemble_plan_source_derived_step_deltas,
     assemble_source_route_command_output as assemble_plan_source_route_command_output,
-    assemble_source_route_legacy_comparison as assemble_plan_source_route_legacy_comparison,
     assemble_source_route_runtime_branch_execution as assemble_plan_source_route_runtime_branch_execution,
     assert_live_source_event_matches_expected as assert_plan_live_source_event_matches_expected,
     assert_scenario_checkpoint as assert_plan_scenario_checkpoint,
@@ -3728,7 +3727,6 @@ pub fn run_plan_source_route(
     source_route: &str,
     target_state: &str,
     event: LiveSourceEvent,
-    compare_legacy: bool,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRouteOutput> {
     validate_live_source_event_payload_bytes_fields(&event, "run-plan-route source event")?;
@@ -3791,62 +3789,6 @@ pub fn run_plan_source_route(
             })
         },
     )?;
-    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
-    let legacy_comparison = if compare_legacy {
-        let mut legacy_runtime =
-            LiveRuntime::from_project_legacy(&source_path.display().to_string(), &units)?;
-        let legacy_output = legacy_runtime.apply_source_event(event.clone())?;
-        let route_is_indexed = output
-            .route_surface
-            .get("selected_op_indexed")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false);
-        let legacy_value = if route_is_indexed {
-            legacy_indexed_route_value_from_deltas(
-                &legacy_output.semantic_deltas,
-                target_state,
-                &event,
-            )?
-        } else {
-            json_value_at_dotted_path(&legacy_output.state_summary, target_state)
-                .cloned()
-                .ok_or_else(|| {
-                    format!("legacy runtime state summary does not contain `{target_state}`")
-                })?
-        };
-        let legacy_delta_signatures = legacy_output
-            .semantic_deltas
-            .iter()
-            .map(runtime_delta_signature)
-            .collect::<Vec<_>>();
-        let legacy_deltas = serde_json::to_value(&legacy_output.semantic_deltas)?;
-        let plan_delta_signatures = output.semantic_delta_signatures.clone();
-        let plan_deltas = output.semantic_deltas.clone();
-        let legacy_render_patch_kinds = legacy_output
-            .render_patches
-            .iter()
-            .map(|patch| patch.kind.to_owned())
-            .collect::<Vec<_>>();
-        assemble_plan_source_route_legacy_comparison(
-            target_state,
-            legacy_value,
-            output.value.clone(),
-            legacy_delta_signatures,
-            legacy_deltas,
-            plan_delta_signatures,
-            plan_deltas,
-            legacy_render_patch_kinds,
-            legacy_output.semantic_deltas.len(),
-            legacy_output.render_patches.len(),
-        )
-        .comparison
-    } else {
-        json!({
-            "enabled": false,
-            "passed": true,
-            "reason": "legacy comparison was not requested"
-        })
-    };
     let command_output =
         assemble_plan_source_route_command_output(SourceRouteCommandOutputInput {
             current_args: std::env::args().collect::<Vec<_>>(),
@@ -3887,7 +3829,6 @@ pub fn run_plan_source_route(
                 pointer_height: event.pointer_height.clone(),
             },
             payload_bytes: event.payload_bytes.clone(),
-            compare_legacy,
             report_path: report_path.map(Path::to_path_buf),
             plan_hash: output.plan_hash.clone(),
             plan_version: serde_json::to_value(plan.version)?,
@@ -3896,7 +3837,6 @@ pub fn run_plan_source_route(
             state_summary: output.state_summary.clone(),
             semantic_delta_signatures: output.semantic_delta_signatures.clone(),
             semantic_deltas: output.semantic_deltas.clone(),
-            legacy_comparison,
             plan_executor: output.executor_report.clone(),
             inline_byte_limit: SOURCE_EVENT_INLINE_BYTES_LIMIT,
         })?;
@@ -3911,44 +3851,11 @@ pub fn run_plan_source_route(
     })
 }
 
-fn legacy_indexed_route_value_from_deltas(
-    semantic_deltas: &[SemanticDelta<'_>],
-    target_state: &str,
-    event: &LiveSourceEvent,
-) -> RuntimeResult<JsonValue> {
-    let target_field = target_state
-        .rsplit_once('.')
-        .map(|(_, field)| field)
-        .unwrap_or(target_state);
-    let matches = semantic_deltas
-        .iter()
-        .filter(|delta| {
-            delta.kind == "FieldSet"
-                && delta.field_path.as_deref() == Some(target_field)
-                && event
-                    .target_key
-                    .is_none_or(|target_key| delta.key == Some(target_key))
-                && event
-                    .target_generation
-                    .is_none_or(|generation| delta.generation == Some(generation))
-        })
-        .collect::<Vec<_>>();
-    let [delta] = matches.as_slice() else {
-        return Err(format!(
-            "legacy runtime semantic deltas for indexed route `{target_state}` expected exactly one row field match, found {}",
-            matches.len()
-        )
-        .into());
-    };
-    Ok(serde_json::to_value(&delta.value)?)
-}
-
 pub fn run_plan_root_scalar_scenario(
     source_path: &Path,
     scenario_path: &Path,
     target_profile: TargetProfile,
     selected_step_ids: &[String],
-    compare_legacy: bool,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRootScalarScenarioOutput> {
     let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
@@ -3969,27 +3876,6 @@ pub fn run_plan_root_scalar_scenario(
 
     let output =
         execute_machine_plan_root_scenario_inner(&plan, &selected_steps, source_path.parent())?;
-    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
-    let legacy_comparison = if compare_legacy {
-        compare_plan_root_scenario_with_legacy(
-            source_path,
-            &units,
-            &selected_steps,
-            &output.state_summary,
-            &output.per_step,
-        )?
-    } else {
-        json!({
-            "enabled": false,
-            "passed": false,
-            "reason": "legacy comparison was not requested"
-        })
-    };
-    let demand_current_field_paths = plan_demand_current_field_paths(&plan);
-    let legacy_comparison_acceptance = plan_demand_current_semantic_delta_acceptance_policy(
-        &legacy_comparison,
-        &demand_current_field_paths,
-    );
     let command_output =
         assemble_plan_root_scenario_command_output(RootScenarioCommandOutputInput {
             command_argv: std::env::args().collect::<Vec<_>>(),
@@ -4016,9 +3902,6 @@ pub fn run_plan_root_scalar_scenario(
             state_summary: output.state_summary.clone(),
             semantic_delta_signatures: output.semantic_delta_signatures.clone(),
             semantic_deltas: output.semantic_deltas.clone(),
-            legacy_comparison,
-            legacy_comparison_acceptance,
-            compare_legacy,
             plan_executor: output.executor_report.clone(),
         });
     let report = command_output.report;
@@ -86300,7 +86183,6 @@ payload:
             Path::new("../../examples/todomvc.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("TodoMVC root scalar subset should execute through PlanExecutor");
@@ -86317,19 +86199,11 @@ payload:
         assert_eq!(output.state_summary["store.new_todo_text"], "Test todo");
         assert_eq!(output.state_summary["store.selected_filter"], "All");
         assert_eq!(output.state_summary["store.new_todo_focused"], true);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["executor"],
-            "cpu-plan-root-scenario-legacy-comparison-assembly-v1"
-        );
+        assert_eq!(output.report["comparison_status"], "not-requested");
+        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-root-scenario-command-report-assembly-v1"
-        );
-        assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
         );
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
@@ -86417,7 +86291,6 @@ expected_source_event = {{ source = "store.input.change", text = "Typed payload"
             &scenario_path,
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("root scalar typed expression kinds should replay through PlanExecutor");
@@ -86460,7 +86333,7 @@ expected_source_event = {{ source = "store.input.change", text = "Typed payload"
     }
 
     #[test]
-    fn run_plan_route_compares_full_source_event_delta_batch() {
+    fn run_plan_route_reports_full_source_event_delta_batch() {
         let pid = std::process::id();
         let source_path = std::env::temp_dir().join(format!("boon-route-full-event-{pid}.bn"));
         fs::write(
@@ -86498,22 +86371,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 source: "store.toggle".to_owned(),
                 ..LiveSourceEvent::default()
             },
-            true,
             None,
         )
         .expect("route proof should execute the full selected source event");
 
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.state_summary["store.flag"], true);
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
-        assert_eq!(
-            output.report["legacy_comparison"]["semantic_delta_match"],
-            true
-        );
-        assert_eq!(
-            output.report["legacy_comparison"]["executor"],
-            "cpu-plan-source-route-legacy-comparison-assembly-v1"
-        );
+        assert_eq!(output.report["comparison_status"], "not-requested");
+        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-source-route-command-report-assembly-v1"
@@ -86521,10 +86386,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(
             output.report["semantic_delta_signatures"],
             json!(["FieldSet:store.flag", "FieldSet:store.mirrored"])
-        );
-        assert_eq!(
-            output.report["legacy_comparison"]["legacy_semantic_deltas"],
-            output.report["legacy_comparison"]["plan_semantic_deltas"]
         );
         assert_eq!(
             output.report["plan_executor"]["executed_update_branch_count"],
@@ -86752,7 +86613,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_length_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/length root scalar fixture should execute through PlanExecutor");
@@ -86827,7 +86687,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_source_payload_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("BYTES source payload fixture should execute through PlanExecutor");
@@ -86885,7 +86744,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("indexed BYTES source payload fixture should execute through PlanExecutor");
@@ -86974,7 +86832,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_indexed_equal_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("indexed Bytes/equal fixture should execute through PlanExecutor");
@@ -87068,7 +86925,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_indexed_search_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("indexed Bytes search fixture should execute through PlanExecutor");
@@ -87483,7 +87339,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_indexed_same_event_dependency_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("indexed same-event BYTES dependency fixture should execute through PlanExecutor");
@@ -87612,7 +87467,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_indexed_duplicate_update_conflict_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            false,
             None,
         );
         let error = match result {
@@ -87647,7 +87501,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 payload_bytes,
                 ..LiveSourceEvent::default()
             },
-            false,
             None,
         )
         .map_err(|error| error.to_string());
@@ -87670,7 +87523,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_is_empty_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/is_empty root scalar fixture should execute through PlanExecutor");
@@ -87768,7 +87620,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_get_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/get root scalar fixture should execute through PlanExecutor");
@@ -87826,7 +87677,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_equal_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/equal root scalar fixture should execute through PlanExecutor");
@@ -87920,7 +87770,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_search_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/search root scalar fixture should execute through PlanExecutor");
@@ -88055,7 +87904,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_encoding_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/encoding root scalar fixture should execute through PlanExecutor");
@@ -88151,7 +87999,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_numeric_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/numeric root scalar fixture should execute through PlanExecutor");
@@ -88358,7 +88205,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_concat_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Bytes/concat root scalar fixture should execute through PlanExecutor");
@@ -88433,7 +88279,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_concat_chain_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("chained BYTES fixture should execute through PlanExecutor");
@@ -88539,7 +88384,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_text_conversion_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("text/BYTES conversion fixture should execute through PlanExecutor");
@@ -88639,7 +88483,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
             Path::new("../../examples/bytes_slice_take_drop_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("slice/take/drop BYTES fixture should execute through PlanExecutor");
@@ -88823,7 +88666,6 @@ expected_source_event = {{ source = "store.slice" }}
             &scenario_path,
             TargetProfile::SoftwareDefault,
             &["slice".to_owned()],
-            true,
             None,
         );
         let Err(error) = result else {
@@ -88885,7 +88727,6 @@ expected_source_event = {{ source = "store.decode" }}
             &scenario_path,
             TargetProfile::SoftwareDefault,
             &["decode".to_owned()],
-            true,
             None,
         );
         let Err(error) = result else {
@@ -88909,7 +88750,6 @@ expected_source_event = {{ source = "store.decode" }}
             Path::new("../../examples/bytes_set_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("chained Bytes/set fixture should execute through PlanExecutor");
@@ -89030,7 +88870,6 @@ expected_source_event = {{ source = "store.decode" }}
             Path::new("../../examples/bytes_same_event_dependency_plan_ops.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("same-event Bytes/set dependency fixture should execute through PlanExecutor");
@@ -89116,7 +88955,6 @@ expected_source_event = {{ source = "store.decode" }}
             Path::new("../../examples/todomvc.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("TodoMVC submit should execute through root-list PlanExecutor slice");
@@ -89258,7 +89096,6 @@ expected_source_event = {{ source = "store.decode" }}
             Path::new("../../examples/todomvc.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect(
@@ -90493,7 +90330,6 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             Path::new("../../examples/todomvc_plan_slices.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("TodoMVC row delete should execute through scoped list-remove PlanExecutor slice");
@@ -90611,7 +90447,6 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             Path::new("../../examples/todomvc.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("TodoMVC clear-completed should execute through row-field list-remove slice");
@@ -90715,7 +90550,6 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             Path::new("../../examples/todomvc.scn"),
             TargetProfile::SoftwareDefault,
             &steps,
-            true,
             None,
         )
         .expect("Whitespace Enter should execute without appending a row");

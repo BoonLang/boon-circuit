@@ -35432,30 +35432,19 @@ mod tests {
         });
         let semantic_deltas = expected.semantic_deltas.clone();
         let legacy_comparison = json!({
-            "enabled": true,
+            "enabled": false,
             "passed": true,
-            "state_match": true,
-            "semantic_delta_match": true,
-            "target_state": target_state,
-            "legacy_value": expected_value,
-            "plan_value": expected_value,
-            "legacy_semantic_delta_signatures": signatures,
-            "legacy_semantic_deltas": semantic_deltas,
-            "plan_semantic_delta_signatures": signatures,
-            "plan_semantic_deltas": semantic_deltas,
-            "legacy_render_patch_kinds": ["PatchRootField"],
-            "legacy_semantic_delta_count": semantic_deltas.as_array().map(Vec::len).unwrap_or_default(),
-            "legacy_render_patch_count": 1
+            "reason": "legacy comparison was not requested"
         });
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-source-route-command-report-assembly-v1",
-            "legacy_passed": true,
-            "legacy_required_for_status": true,
+            "legacy_passed": false,
+            "legacy_required_for_status": false,
             "plan_executor_status": "pass",
-            "comparison_status": "pass",
+            "comparison_status": "not-requested",
             "accepted_for_product_status": "pass",
             "status": "pass",
-            "report_status_basis": "plan-executor-plus-explicit-legacy-comparison",
+            "report_status_basis": "plan-executor-product",
             "exit_status": 0,
             "runtime_ast_eval_count": 0,
             "executable_string_path_count": 0,
@@ -35496,8 +35485,8 @@ mod tests {
             "status": "pass",
             "report_version": 1,
             "command": "run-plan-route",
-            "command_argv": ["boon_cli", "run-plan-route", source_path_string, "--diagnostic-compare-legacy"],
-            "measurement_mode": "diagnostic",
+            "command_argv": ["boon_cli", "run-plan-route", source_path_string],
+            "measurement_mode": "proof",
             "exit_status": 0,
             "generated_at_utc": SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -35560,45 +35549,27 @@ mod tests {
         )
         .unwrap();
         let expected_steps = expected.per_step.as_array().unwrap();
-        let legacy_steps = expected_steps
-            .iter()
-            .map(|step| {
-                json!({
-                    "step_id": step["step_id"],
-                    "state_match": true,
-                    "semantic_delta_match": true,
-                    "legacy_semantic_delta_signatures": step["semantic_delta_signatures"],
-                    "legacy_semantic_deltas": step["semantic_deltas"],
-                    "plan_semantic_delta_signatures": step["semantic_delta_signatures"],
-                    "plan_semantic_deltas": step["semantic_deltas"],
-                    "touched_state_summary": step["touched_state_summary"],
-                })
-            })
-            .collect::<Vec<_>>();
         let legacy_comparison = json!({
-            "enabled": true,
-            "passed": true,
-            "state_match": true,
-            "semantic_delta_match": true,
-            "plan_state_summary": expected.state_summary,
-            "legacy_state_summary": expected.state_summary,
-            "step_comparisons": legacy_steps,
+            "enabled": false,
+            "passed": false,
+            "reason": "legacy comparison was not requested"
         });
         let legacy_comparison_acceptance = json!({
             "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
             "accepted": false,
-            "reason": "exact legacy comparison passed"
+            "kind": "not-applicable",
+            "reason": "legacy comparison disabled"
         });
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
-            "legacy_passed": true,
-            "legacy_accepted": true,
-            "legacy_required_for_status": true,
+            "legacy_passed": false,
+            "legacy_accepted": false,
+            "legacy_required_for_status": false,
             "plan_executor_status": "pass",
-            "comparison_status": "pass",
+            "comparison_status": "not-requested",
             "accepted_for_product_status": "pass",
             "status": "pass",
-            "report_status_basis": "plan-executor-plus-explicit-legacy-comparison",
+            "report_status_basis": "plan-executor-product",
             "exit_status": 0,
             "runtime_ast_eval_count": 0,
             "executable_string_path_count": 0,
@@ -35634,18 +35605,17 @@ mod tests {
             "per_step": expected.per_step
         });
         let mut report = base_report();
-        report["measurement_mode"] = json!("diagnostic");
+        report["measurement_mode"] = json!("proof");
         report["command"] = json!("run-plan-root-scalar-scenario");
         report["command_argv"] = json!([
             "boon_cli",
             "run-plan-root-scalar-scenario",
-            source_path_string,
-            "--diagnostic-compare-legacy"
+            source_path_string
         ]);
         report["plan_executor_status"] = json!("pass");
         report["accepted_for_product_status"] = json!("pass");
-        report["comparison_status"] = json!("pass");
-        report["report_status_basis"] = json!("plan-executor-plus-explicit-legacy-comparison");
+        report["comparison_status"] = json!("not-requested");
+        report["report_status_basis"] = json!("plan-executor-product");
         report["source_path"] = json!(source_path.display().to_string());
         report["source_hash"] = json!(source_hash);
         report["source_files"] = json!([source_path.display().to_string()]);
@@ -35890,25 +35860,6 @@ mod tests {
             forged_executor_delta,
             "run-plan-route-forged-executor-delta"
         ));
-
-        let mut extra_legacy_signature = source_payload_report.clone();
-        extra_legacy_signature["legacy_comparison"]["legacy_semantic_delta_signatures"] =
-            json!(["FieldSet:store.new_todo_text", "FieldSet:forged"]);
-        assert!(!schema_accepts(
-            extra_legacy_signature,
-            "run-plan-route-extra-legacy-signature"
-        ));
-
-        let mut missing_legacy_deltas = source_payload_report.clone();
-        missing_legacy_deltas["legacy_comparison"]
-            .as_object_mut()
-            .unwrap()
-            .remove("legacy_semantic_deltas");
-        assert!(!schema_accepts(
-            missing_legacy_deltas,
-            "run-plan-route-missing-legacy-deltas"
-        ));
-
         let const_report = run_plan_route_report_for_source(
             &source_path,
             source,
@@ -35979,22 +35930,6 @@ mod tests {
             forged_semantic_delta,
             "run-plan-root-scalar-forged-semantic-delta"
         ));
-
-        let mut forged_legacy_delta = accepted_report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_delta_signatures"] =
-            json!(["FieldSet:store.new_todo_text", "Forged:extra"]);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-scalar-forged-legacy-delta"
-        ));
-
-        let mut missing_legacy = accepted_report.clone();
-        missing_legacy["legacy_comparison"]["enabled"] = json!(false);
-        assert!(!schema_accepts(
-            missing_legacy,
-            "run-plan-root-scalar-missing-legacy"
-        ));
-
         let submit_report = run_plan_root_scalar_scenario_report_for_source(
             &source_path,
             source,
@@ -36482,15 +36417,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_value,
             "run-plan-root-bytes-length-forged-value"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"] = json!(5);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-length-forged-legacy-delta-value"
-        ));
-
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
     }
@@ -36604,15 +36530,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_semantic_delta,
             "run-plan-root-bytes-is-empty-forged-semantic-delta-value"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"] = json!(false);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-is-empty-forged-legacy-delta-value"
-        ));
-
         let mut forged_update_count = report.clone();
         forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
         assert!(!schema_accepts(
@@ -36711,15 +36628,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_semantic_delta,
             "run-plan-root-bytes-get-forged-semantic-delta-value"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"] = json!(253);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-get-forged-legacy-delta-value"
-        ));
-
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
     }
@@ -36865,15 +36773,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_semantic_delta,
             "run-plan-root-bytes-equal-forged-semantic-delta-value"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"] = json!(false);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-equal-forged-legacy-delta-value"
-        ));
-
         let mut forged_update_count = report.clone();
         forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
         assert!(!schema_accepts(
@@ -37138,15 +37037,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_semantic_delta,
             "run-plan-root-bytes-search-forged-semantic-delta"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
-            [not_starts_index]["value"] = json!(true);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-search-forged-legacy-delta"
-        ));
-
         let mut forged_update_count = report.clone();
         forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(7);
         assert!(!schema_accepts(
@@ -37718,16 +37608,6 @@ expected_source_event = {{ source = "store.measure" }}
             forged_semantic_delta,
             "run-plan-root-bytes-concat-forged-semantic-delta-value"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"]["digest"] =
-            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-concat-forged-legacy-delta-value"
-        ));
-
         let mut forged_update_count = report.clone();
         forged_update_count["plan_executor"]["executed_update_branch_count"] = json!(1);
         assert!(!schema_accepts(
@@ -37867,16 +37747,6 @@ expected_source_event = {{ source = "store.inspect" }}
             forged_joined,
             "run-plan-root-bytes-slice-take-drop-forged-joined-byte-len"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
-            [joined_index]["value"]["digest"] =
-            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-slice-take-drop-forged-legacy-delta"
-        ));
-
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
     }
@@ -38006,11 +37876,6 @@ expected_source_event = {{ source = "store.inspect" }}
         assert_eq!(second_updates[concat_index]["value"], joined_summary);
         assert_eq!(report["semantic_deltas"][1]["value"], json!(170));
         assert_eq!(report["semantic_deltas"][2]["value"], json!(4));
-        assert_eq!(
-            report["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"][0]["value"],
-            json!(170)
-        );
-
         let mut forged_digest = report.clone();
         forged_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
             json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -38065,16 +37930,6 @@ expected_source_event = {{ source = "store.inspect" }}
             forged_semantic_delta,
             "run-plan-root-bytes-set-forged-semantic-delta"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][0]["legacy_semantic_deltas"]
-            [0]["value"]["digest"] =
-            json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-set-forged-legacy-delta"
-        ));
-
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
     }
@@ -38243,15 +38098,6 @@ expected_source_event = {{ source = "store.inspect" }}
             forged_again_digest,
             "run-plan-root-bytes-chain-forged-second-concat-digest"
         ));
-
-        let mut forged_legacy_delta = report.clone();
-        forged_legacy_delta["legacy_comparison"]["step_comparisons"][1]["legacy_semantic_deltas"]
-            [byte_index]["value"] = json!(0);
-        assert!(!schema_accepts(
-            forged_legacy_delta,
-            "run-plan-root-bytes-chain-forged-legacy-byte-delta"
-        ));
-
         let _ = fs::remove_file(source_path);
         let _ = fs::remove_file(scenario_path);
     }

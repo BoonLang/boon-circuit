@@ -178,8 +178,6 @@ pub struct SourceRouteCommandReportInput {
     pub state_summary: JsonValue,
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
-    pub legacy_comparison: JsonValue,
-    pub compare_legacy: bool,
     pub artifact_sha256s: Vec<JsonValue>,
     pub plan_executor: JsonValue,
 }
@@ -210,7 +208,6 @@ pub struct SourceRouteCommandOutputInput {
     pub target_state: String,
     pub event: SourceRouteSourceEventReportInput,
     pub payload_bytes: BTreeMap<String, Vec<u8>>,
-    pub compare_legacy: bool,
     pub report_path: Option<PathBuf>,
     pub plan_hash: String,
     pub plan_version: JsonValue,
@@ -219,7 +216,6 @@ pub struct SourceRouteCommandOutputInput {
     pub state_summary: JsonValue,
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
-    pub legacy_comparison: JsonValue,
     pub plan_executor: JsonValue,
     pub inline_byte_limit: usize,
 }
@@ -246,7 +242,6 @@ pub struct SourceRouteCommandArgvInput {
     pub payload: BTreeMap<String, String>,
     pub payload_bytes: BTreeMap<String, Vec<u8>>,
     pub payload_byte_artifact_paths: BTreeMap<String, String>,
-    pub compare_legacy: bool,
     pub report_path: Option<String>,
 }
 
@@ -463,9 +458,6 @@ pub fn build_source_route_command_argv(input: SourceRouteCommandArgvInput) -> Ve
             argv.push(format!("{name}={}", bytes_encode_hex(&bytes)));
         }
     }
-    if input.compare_legacy {
-        argv.push("--diagnostic-compare-legacy".to_owned());
-    }
     if input.target_profile != "software-default" {
         argv.push("--target".to_owned());
         argv.push(input.target_profile);
@@ -533,7 +525,6 @@ pub fn assemble_source_route_command_output(
             .unwrap_or_default(),
         payload_bytes: input.payload_bytes.clone(),
         payload_byte_artifact_paths,
-        compare_legacy: input.compare_legacy,
         report_path: input
             .report_path
             .as_ref()
@@ -583,8 +574,6 @@ pub fn assemble_source_route_command_output(
         state_summary: input.state_summary,
         semantic_delta_signatures: input.semantic_delta_signatures,
         semantic_deltas: input.semantic_deltas,
-        legacy_comparison: input.legacy_comparison,
-        compare_legacy: input.compare_legacy,
         artifact_sha256s: payload_report.artifacts.clone(),
         plan_executor,
     })
@@ -596,11 +585,6 @@ pub fn assemble_source_route_command_output(
         artifact_sha256s: payload_report.artifacts,
         executor_report: command_output_core,
     })
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SourceRouteLegacyComparisonAssembly {
-    pub comparison: JsonValue,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -645,9 +629,6 @@ pub struct RootScenarioCommandReportInput {
     pub state_summary: JsonValue,
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
-    pub legacy_comparison: JsonValue,
-    pub legacy_comparison_acceptance: JsonValue,
-    pub compare_legacy: bool,
     pub plan_executor: JsonValue,
 }
 
@@ -682,9 +663,6 @@ pub struct RootScenarioCommandOutputInput {
     pub state_summary: JsonValue,
     pub semantic_delta_signatures: Vec<String>,
     pub semantic_deltas: JsonValue,
-    pub legacy_comparison: JsonValue,
-    pub legacy_comparison_acceptance: JsonValue,
-    pub compare_legacy: bool,
     pub plan_executor: JsonValue,
 }
 
@@ -10766,47 +10744,6 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_source_route_legacy_comparison(
-    target_state: &str,
-    legacy_value: JsonValue,
-    plan_value: JsonValue,
-    legacy_semantic_delta_signatures: Vec<String>,
-    legacy_semantic_deltas: JsonValue,
-    plan_semantic_delta_signatures: Vec<String>,
-    plan_semantic_deltas: JsonValue,
-    legacy_render_patch_kinds: Vec<String>,
-    legacy_semantic_delta_count: usize,
-    legacy_render_patch_count: usize,
-) -> SourceRouteLegacyComparisonAssembly {
-    let state_match = legacy_value == plan_value;
-    let semantic_delta_match = legacy_semantic_delta_signatures == plan_semantic_delta_signatures
-        && legacy_semantic_deltas == plan_semantic_deltas;
-    let comparison = json!({
-        "executor": "cpu-plan-source-route-legacy-comparison-assembly-v1",
-        "enabled": true,
-        "passed": state_match && semantic_delta_match,
-        "state_match": state_match,
-        "semantic_delta_match": semantic_delta_match,
-        "target_state": target_state,
-        "legacy_value": legacy_value,
-        "plan_value": plan_value,
-        "legacy_semantic_delta_signatures": legacy_semantic_delta_signatures,
-        "legacy_semantic_deltas": legacy_semantic_deltas,
-        "plan_semantic_delta_signatures": plan_semantic_delta_signatures,
-        "plan_semantic_deltas": plan_semantic_deltas,
-        "legacy_render_patch_kinds": legacy_render_patch_kinds,
-        "legacy_semantic_delta_count": legacy_semantic_delta_count,
-        "legacy_render_patch_count": legacy_render_patch_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
-    SourceRouteLegacyComparisonAssembly { comparison }
-}
-
 pub fn assemble_root_scenario_legacy_comparison(
     plan_state_summary: &JsonValue,
     final_legacy_state_summary: &JsonValue,
@@ -11024,45 +10961,27 @@ pub fn assemble_source_route_report(
 pub fn assemble_source_route_command_report(
     input: SourceRouteCommandReportInput,
 ) -> SourceRouteCommandReportAssembly {
-    let legacy_passed = input
-        .legacy_comparison
-        .get("passed")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    let comparison_status = plan_executor_comparison_status(
-        &input.legacy_comparison,
-        legacy_passed,
-        input.compare_legacy,
-    );
+    let legacy_comparison = json!({
+        "enabled": false,
+        "passed": true,
+        "reason": "legacy comparison was not requested"
+    });
+    let comparison_status = "not-requested";
     let plan_executor_status = "pass";
     let accepted_for_product_status = "pass";
-    let legacy_required_passed = !input.compare_legacy || legacy_passed;
     let expression_kind = input
         .route_surface
         .get("expression_kind")
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown")
         .to_owned();
-    let report_status = if legacy_required_passed {
-        "pass"
-    } else {
-        "fail"
-    };
-    let exit_status = if legacy_required_passed { 0 } else { 1 };
-    let report_status_basis = if input.compare_legacy {
-        "plan-executor-plus-explicit-legacy-comparison"
-    } else {
-        "plan-executor-product"
-    };
-    let measurement_mode = if input.compare_legacy {
-        "diagnostic"
-    } else {
-        "proof"
-    };
+    let report_status = "pass";
+    let exit_status = 0;
+    let report_status_basis = "plan-executor-product";
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
-        "legacy_passed": legacy_passed,
-        "legacy_required_for_status": input.compare_legacy,
+        "legacy_passed": false,
+        "legacy_required_for_status": false,
         "plan_executor_status": plan_executor_status,
         "comparison_status": comparison_status,
         "accepted_for_product_status": accepted_for_product_status,
@@ -11084,7 +11003,7 @@ pub fn assemble_source_route_command_report(
         "report_version": 1,
         "command": "run-plan-route",
         "command_argv": input.command_argv,
-        "measurement_mode": measurement_mode,
+        "measurement_mode": "proof",
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
@@ -11110,7 +11029,7 @@ pub fn assemble_source_route_command_report(
         "state_summary": input.state_summary,
         "semantic_delta_signatures": input.semantic_delta_signatures,
         "semantic_deltas": input.semantic_deltas,
-        "legacy_comparison": input.legacy_comparison,
+        "legacy_comparison": legacy_comparison,
         "per_step_pass_fail": [
             {
                 "id": "machine-plan-verified",
@@ -11131,12 +11050,8 @@ pub fn assemble_source_route_command_report(
             },
             {
                 "id": "legacy-route-parity",
-                "pass": !input.compare_legacy || legacy_passed,
-                "detail": if input.compare_legacy {
-                    "legacy runtime produced matching target state and full semantic delta batch"
-                } else {
-                    "legacy runtime comparison was not requested and is not part of product report status"
-                }
+                "pass": true,
+                "detail": "legacy runtime comparison was not requested and is not part of product report status"
             }
         ],
         "artifact_sha256s": input.artifact_sha256s,
@@ -11173,7 +11088,7 @@ pub fn assemble_root_scenario_command_output(
     let command_output_core = json!({
         "executor": "cpu-plan-root-scenario-command-output-v1",
         "selected_step_count": input.selected_step_ids.len(),
-        "compare_legacy": input.compare_legacy,
+        "compare_legacy": false,
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
         "unknown_plan_op_count": 0,
@@ -11213,9 +11128,6 @@ pub fn assemble_root_scenario_command_output(
         state_summary: input.state_summary,
         semantic_delta_signatures: input.semantic_delta_signatures,
         semantic_deltas: input.semantic_deltas,
-        legacy_comparison: input.legacy_comparison,
-        legacy_comparison_acceptance: input.legacy_comparison_acceptance,
-        compare_legacy: input.compare_legacy,
         plan_executor,
     })
     .report;
@@ -11229,46 +11141,28 @@ pub fn assemble_root_scenario_command_output(
 pub fn assemble_root_scenario_command_report(
     input: RootScenarioCommandReportInput,
 ) -> RootScenarioCommandReportAssembly {
-    let legacy_passed = input
-        .legacy_comparison
-        .get("passed")
-        .and_then(JsonValue::as_bool)
-        == Some(true);
-    let legacy_accepted = legacy_passed
-        || input
-            .legacy_comparison_acceptance
-            .get("accepted")
-            .and_then(JsonValue::as_bool)
-            == Some(true);
-    let comparison_status = plan_executor_comparison_status(
-        &input.legacy_comparison,
-        legacy_accepted,
-        input.compare_legacy,
-    );
+    let legacy_comparison = json!({
+        "enabled": false,
+        "passed": false,
+        "reason": "legacy comparison was not requested"
+    });
+    let legacy_comparison_acceptance = json!({
+        "accepted": false,
+        "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
+        "kind": "not-applicable",
+        "reason": "legacy comparison disabled"
+    });
+    let comparison_status = "not-requested";
     let plan_executor_status = "pass";
     let accepted_for_product_status = "pass";
-    let legacy_required_accepted = !input.compare_legacy || legacy_accepted;
-    let report_status = if legacy_required_accepted {
-        "pass"
-    } else {
-        "fail"
-    };
-    let exit_status = if legacy_required_accepted { 0 } else { 1 };
-    let report_status_basis = if input.compare_legacy {
-        "plan-executor-plus-explicit-legacy-comparison"
-    } else {
-        "plan-executor-product"
-    };
-    let measurement_mode = if input.compare_legacy {
-        "diagnostic"
-    } else {
-        "proof"
-    };
+    let report_status = "pass";
+    let exit_status = 0;
+    let report_status_basis = "plan-executor-product";
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
-        "legacy_passed": legacy_passed,
-        "legacy_accepted": legacy_accepted,
-        "legacy_required_for_status": input.compare_legacy,
+        "legacy_passed": false,
+        "legacy_accepted": false,
+        "legacy_required_for_status": false,
         "plan_executor_status": plan_executor_status,
         "comparison_status": comparison_status,
         "accepted_for_product_status": accepted_for_product_status,
@@ -11290,7 +11184,7 @@ pub fn assemble_root_scenario_command_report(
         "report_version": 1,
         "command": "run-plan-root-scalar-scenario",
         "command_argv": input.command_argv,
-        "measurement_mode": measurement_mode,
+        "measurement_mode": "proof",
         "exit_status": exit_status,
         "generated_at_utc": input.generated_at_utc,
         "git_commit": input.git_commit,
@@ -11316,8 +11210,8 @@ pub fn assemble_root_scenario_command_report(
         "state_summary": input.state_summary,
         "semantic_delta_signatures": input.semantic_delta_signatures,
         "semantic_deltas": input.semantic_deltas,
-        "legacy_comparison": input.legacy_comparison,
-        "legacy_comparison_acceptance": input.legacy_comparison_acceptance,
+        "legacy_comparison": legacy_comparison,
+        "legacy_comparison_acceptance": legacy_comparison_acceptance,
         "per_step_pass_fail": [
             {
                 "id": "machine-plan-verified",
@@ -11331,12 +11225,8 @@ pub fn assemble_root_scenario_command_report(
             },
             {
                 "id": "legacy-root-scenario-parity",
-                "pass": !input.compare_legacy || legacy_accepted,
-                "detail": if input.compare_legacy {
-                    "legacy runtime produced matching touched root states and either exact semantic deltas or accepted currentness-only deltas"
-                } else {
-                    "legacy runtime comparison was not requested and is not part of product report status"
-                }
+                "pass": true,
+                "detail": "legacy runtime comparison was not requested and is not part of product report status"
             }
         ],
         "artifact_sha256s": [],
@@ -17564,7 +17454,6 @@ mod tests {
             payload: BTreeMap::new(),
             payload_bytes: BTreeMap::new(),
             payload_byte_artifact_paths: BTreeMap::new(),
-            compare_legacy: false,
             report_path: None,
         });
         assert_eq!(preserved, current);
@@ -17584,7 +17473,6 @@ mod tests {
                 "bytes".to_owned(),
                 "target/reports/event-bytes.bin".to_owned(),
             )]),
-            compare_legacy: true,
             report_path: Some("target/reports/route.json".to_owned()),
         });
         assert_eq!(
@@ -17607,7 +17495,6 @@ mod tests {
                 "mode=replace",
                 "--payload-bytes-file",
                 "bytes=target/reports/event-bytes.bin",
-                "--diagnostic-compare-legacy",
                 "--report",
                 "target/reports/route.json",
             ]
@@ -17775,7 +17662,6 @@ mod tests {
                 pointer_height: None,
             },
             payload_bytes: BTreeMap::from([("bytes".to_owned(), payload.clone())]),
-            compare_legacy: true,
             report_path: Some(report_path),
             plan_hash: "planhash".to_owned(),
             plan_version: json!({"major": 1}),
@@ -17784,7 +17670,6 @@ mod tests {
             state_summary: json!({"store": {"blob": "ok"}}),
             semantic_delta_signatures: vec!["FieldSet:store.blob".to_owned()],
             semantic_deltas: json!([{"kind": "FieldSet"}]),
-            legacy_comparison: json!({"enabled": true, "passed": true}),
             plan_executor: json!({"executor": "cpu-plan-source-route-v1"}),
             inline_byte_limit: 3,
         })
@@ -17793,7 +17678,7 @@ mod tests {
         let digest = sha256_bytes(&payload);
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.report["plan_executor_status"], "pass");
-        assert_eq!(output.report["comparison_status"], "pass");
+        assert_eq!(output.report["comparison_status"], "not-requested");
         assert_eq!(output.report["accepted_for_product_status"], "pass");
         assert_eq!(
             output.report["plan_executor"]["command_output_core"]["executor"],
@@ -17898,18 +17783,12 @@ mod tests {
             state_summary: json!({"store": {"count": 1}}),
             semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
             semantic_deltas: json!([{"kind": "FieldSet"}]),
-            legacy_comparison: json!({"enabled": true, "passed": true}),
-            legacy_comparison_acceptance: json!({
-                "accepted": false,
-                "kind": "not-needed"
-            }),
-            compare_legacy: true,
             plan_executor: json!({"executor": "cpu-plan-root-scenario-v1"}),
         });
 
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.report["plan_executor_status"], "pass");
-        assert_eq!(output.report["comparison_status"], "pass");
+        assert_eq!(output.report["comparison_status"], "not-requested");
         assert_eq!(output.report["accepted_for_product_status"], "pass");
         assert_eq!(output.report["command"], "run-plan-root-scalar-scenario");
         assert_eq!(
@@ -17929,7 +17808,7 @@ mod tests {
             output.executor_report["executor"],
             "cpu-plan-root-scenario-command-output-v1"
         );
-        assert_eq!(output.report["legacy_comparison"]["passed"], true);
+        assert_eq!(output.report["legacy_comparison"]["enabled"], false);
     }
 
     #[test]
@@ -18136,7 +18015,6 @@ mod tests {
             payload: BTreeMap::new(),
             payload_bytes: BTreeMap::from([("bytes".to_owned(), vec![0, 1, 2, 255])]),
             payload_byte_artifact_paths: BTreeMap::new(),
-            compare_legacy: false,
             report_path: None,
         });
         assert_eq!(

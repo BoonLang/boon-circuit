@@ -37075,3 +37075,52 @@ Current interpretation:
 - Remaining legacy work is now mostly the actual `LoadedRuntime` /
   `GenericScheduledRuntime` implementation island plus xtask diagnostic and
   obsolete semantic/metamorphic harness callers.
+
+## 2026-07-05 - Product Route/Root Commands Cannot Invoke Legacy Compare
+
+Status: cut the hidden legacy comparison switch out of the product
+PlanExecutor route/root command path. The dedicated
+`diagnose-plan-legacy-compare` command remains the explicit diagnostic island,
+but `run-plan-route` and `run-plan-root-scalar-scenario` can no longer invoke
+legacy parity through flags or runtime API booleans.
+
+What changed:
+
+- `boon_cli run-plan-route` and
+  `boon_cli run-plan-root-scalar-scenario` now reject both
+  `--diagnostic-compare-legacy` and `--compare-legacy`, pointing users to
+  `diagnose-plan-legacy-compare`.
+- Removed the `compare_legacy` parameter from product
+  `run_plan_source_route` and `run_plan_root_scalar_scenario`.
+- Removed source-route legacy comparison assembly and its runtime hook.
+- PlanExecutor route/root report assembly now emits product proof reports with
+  legacy comparison disabled internally instead of accepting legacy comparison
+  inputs from callers.
+- Updated schema fixtures and runtime tests so route/root product reports prove
+  PlanExecutor state/delta/command evidence, not legacy parity.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime -p boon_cli -p boon_plan_executor
+  -p boon_report_schema -p xtask`: pass.
+- `cargo test -q -p boon_plan_executor -p boon_cli -p xtask`: pass.
+- `cargo test -q -p boon_report_schema`: pass.
+- `cargo test -q -p boon_runtime --no-run`: pass.
+- Targeted runtime route/root tests passed:
+  `run_plan_route_reports_full_source_event_delta_batch` and
+  `root_scalar_plan_executor_replays_todomvc_multi_event_subset`.
+- Fresh product reports passed schema:
+  `target/reports/bytes-plan/root-scalar-product-proof.json` and
+  `target/reports/bytes-plan/root-scalar-route-product-proof.json` both report
+  `measurement_mode=proof`, `report_status_basis=plan-executor-product`,
+  `comparison_status=not-requested`, `legacy_required_for_status=false`, and
+  `legacy_comparison.enabled=false`.
+- Fresh CLI rejection checks prove product route/root commands reject legacy
+  comparison flags.
+
+Current interpretation:
+
+- Product route/root execution now has no direct `LoadedRuntime` comparison
+  switch.
+- Remaining legacy comparison is concentrated in explicit scenario-event
+  diagnostics and older xtask semantic/metamorphic harness callers.

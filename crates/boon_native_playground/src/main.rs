@@ -3883,7 +3883,7 @@ impl RuntimeDirtyFrontierCauseAggregate {
             if counters.dependent_demand_classification.is_empty() {
                 counters.dependent_demand_classification =
                     if frontier_sample.dependent_demand_classification.is_empty() {
-                        "unknown_legacy".to_owned()
+                        "unknown_unclassified".to_owned()
                     } else {
                         frontier_sample.dependent_demand_classification.clone()
                     };
@@ -3915,7 +3915,7 @@ impl RuntimeDirtyFrontierCauseAggregate {
                 .dependent_demand_classification
                 .is_empty()
             {
-                "unknown_legacy".to_owned()
+                "unknown_unclassified".to_owned()
             } else {
                 classification_sample
                     .dependent_demand_classification
@@ -3955,7 +3955,7 @@ impl RuntimeDirtyFrontierCauseAggregate {
                     root_kind: work_sample.root_kind.clone(),
                     root_demand_classification: if work_sample.root_demand_classification.is_empty()
                     {
-                        "unknown_legacy".to_owned()
+                        "unknown_unclassified".to_owned()
                     } else {
                         work_sample.root_demand_classification.clone()
                     },
@@ -8276,7 +8276,7 @@ fn native_preview_live_runtime_from_project_profiled(
             "has_world_or_manufacturing_output_root".to_owned(),
             json!(has_world_or_manufacturing_output_root),
         );
-        object.insert("legacy_runtime_fallback_hidden".to_owned(), json!(false));
+        object.insert("runtime_fallback_hidden".to_owned(), json!(false));
     }
     Ok((runtime, profile))
 }
@@ -9087,9 +9087,9 @@ type DocumentDataBindingIndex = BTreeMap<String, Vec<DocumentDataBindingTarget>>
 const DOCUMENT_SOURCE_INTENT_BINDING_ATTR_PREFIX: &str = "__source_intent:";
 const DOCUMENT_SOURCE_INTENT_BINDING_SELECTOR_ATTR_PREFIX: &str = "__source_intent_selector:";
 const ROW_LOOKUP_SOURCE_INTENT: &str = "row_lookup";
-const LEGACY_ROW_LOOKUP_SOURCE_INTENT: &str = "address";
+const ADDRESS_ROW_LOOKUP_SOURCE_INTENT: &str = "address";
 const ROW_LOOKUP_SOURCE_INTENT_KINDS: &[&str] =
-    &[ROW_LOOKUP_SOURCE_INTENT, LEGACY_ROW_LOOKUP_SOURCE_INTENT];
+    &[ROW_LOOKUP_SOURCE_INTENT, ADDRESS_ROW_LOOKUP_SOURCE_INTENT];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 struct DocumentSourceIntentBindingSelector {
@@ -9101,7 +9101,7 @@ struct DocumentSourceIntentBindingSelector {
 }
 
 impl DocumentSourceIntentBindingSelector {
-    fn legacy(intent: impl Into<String>) -> Self {
+    fn unscoped(intent: impl Into<String>) -> Self {
         Self {
             intent: intent.into(),
             binding_id: None,
@@ -9149,7 +9149,7 @@ struct DocumentSourceIntentUpdate {
 }
 
 impl DocumentSourceIntentUpdate {
-    fn legacy_index_tuple(&self) -> (String, String, String) {
+    fn index_tuple(&self) -> (String, String, String) {
         (
             self.node.clone(),
             self.selector.intent.clone(),
@@ -33533,7 +33533,7 @@ fn document_source_intent_binding_attr_for_selector(
         return document_source_intent_binding_attr(&selector.intent);
     }
     let encoded = serde_json::to_string(selector).unwrap_or_else(|_| {
-        serde_json::to_string(&DocumentSourceIntentBindingSelector::legacy(
+        serde_json::to_string(&DocumentSourceIntentBindingSelector::unscoped(
             &selector.intent,
         ))
         .unwrap_or_else(|_| format!("{{\"intent\":\"{}\"}}", selector.intent))
@@ -33562,7 +33562,7 @@ fn document_source_intent_selector_from_attr(
         return serde_json::from_str(encoded).ok();
     }
     attr.strip_prefix(DOCUMENT_SOURCE_INTENT_BINDING_ATTR_PREFIX)
-        .map(DocumentSourceIntentBindingSelector::legacy)
+        .map(DocumentSourceIntentBindingSelector::unscoped)
 }
 
 fn document_attr_is_source_intent_binding(attr: &str) -> bool {
@@ -38301,7 +38301,7 @@ fn preview_visible_bound_text_compact_report_from_retained_sync(
                 vec![json!({
                     "node": node,
                     "intent": ROW_LOOKUP_SOURCE_INTENT,
-                    "lookup_field": LEGACY_ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_field": ADDRESS_ROW_LOOKUP_SOURCE_INTENT,
                     "lookup_value": lookup_value
                 })]
             })
@@ -38333,7 +38333,7 @@ fn preview_visible_bound_text_compact_report_from_retained_sync(
                 vec![json!({
                     "node": node,
                     "intent": ROW_LOOKUP_SOURCE_INTENT,
-                    "lookup_field": LEGACY_ROW_LOOKUP_SOURCE_INTENT,
+                    "lookup_field": ADDRESS_ROW_LOOKUP_SOURCE_INTENT,
                     "lookup_value": lookup_value
                 })]
             })
@@ -47653,7 +47653,7 @@ fn preview_apply_hover_overlay(
                 &[
                     "target",
                     ROW_LOOKUP_SOURCE_INTENT,
-                    LEGACY_ROW_LOOKUP_SOURCE_INTENT,
+                    ADDRESS_ROW_LOOKUP_SOURCE_INTENT,
                 ],
                 target,
             )
@@ -50913,7 +50913,7 @@ fn patched_source_intent_indexes(
         .get("source_intent_value_index")?
         .clone();
     for update in updates {
-        let (node, intent, source_path) = update.legacy_index_tuple();
+        let (node, intent, source_path) = update.index_tuple();
         let old_source_path = by_node
             .get(&node)
             .and_then(|node_index| node_index.get(&intent))
@@ -62455,8 +62455,8 @@ where
                     .get("has_world_or_manufacturing_output_root")
                     .cloned()
                     .unwrap_or_else(|| json!(false));
-                summary["legacy_runtime_fallback_hidden"] = profile
-                    .get("legacy_runtime_fallback_hidden")
+                summary["runtime_fallback_hidden"] = profile
+                    .get("runtime_fallback_hidden")
                     .cloned()
                     .unwrap_or_else(|| json!(false));
                 (
@@ -66698,7 +66698,7 @@ mod tests {
             "plan_executor_document_runtime"
         );
         assert_eq!(profile["generic_fallback_enabled"], false);
-        assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
+        assert_eq!(profile["runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
             "plan_executor"
@@ -66730,7 +66730,7 @@ mod tests {
             "plan_executor_output_root_runtime"
         );
         assert_eq!(profile["has_world_or_manufacturing_output_root"], true);
-        assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
+        assert_eq!(profile["runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
             "plan_executor"
@@ -84562,7 +84562,7 @@ label:
 
         let legacy = source_project_payload_from_request(&json!({
             "kind": "replace-code",
-            "source_path": "memory://legacy-counter.bn",
+            "source_path": "memory://unscoped-counter.bn",
             "code": source.clone(),
             "expected_hash": boon_runtime::sha256_bytes(source.as_bytes()),
             "source_revision": 5
@@ -84570,9 +84570,9 @@ label:
         .unwrap();
         assert!(
             legacy.source_identity.starts_with("source:"),
-            "legacy replace-code must be normalized to an opaque source identity"
+            "unscoped replace-code must be normalized to an opaque source identity"
         );
-        assert_ne!(legacy.source_identity, "legacy-replace-code");
+        assert_ne!(legacy.source_identity, "unscoped-replace-code");
     }
 
     #[test]

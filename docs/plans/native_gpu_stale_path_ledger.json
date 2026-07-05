@@ -3,32 +3,32 @@
   "description": "Machine-readable ledger for stale native GPU product-path dependencies. Product-forbidden rows must stay absent from release UX product reports while typed replacements land.",
   "rows": [
     {
-      "id": "cells-visible-click-no-legacy-pre-present-proof",
+      "id": "cells-visible-click-no-pre-present-proof",
       "mode": "product-forbidden",
       "current_owner": "boon_native_app_window render-loop report",
       "typed_replacement": "PostPresentProofQueue keyed by FrameEvidenceKey",
       "report_path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
       "linked_report_path_pointer": "/preview_loop_report",
-      "symbol_or_field": "legacy_product_proof_built_pre_present",
-      "json_pointer": "/legacy_product_proof_built_pre_present",
+      "symbol_or_field": "product_proof_built_pre_present",
+      "json_pointer": "/product_proof_built_pre_present",
       "expected": false,
       "positive_gate": "post_present_proof_isolation.status=pass",
-      "negative_gate": "legacy_product_proof_built_pre_present must be false in the linked preview-loop report",
-      "removal_condition": "2026-07-05 product env switch to legacy pre-present proof was removed; keep this negative gate until product reports no longer carry the legacy boolean field"
+      "negative_gate": "product_proof_built_pre_present must be false in the linked preview-loop report",
+      "removal_condition": "keep this negative gate until product reports no longer carry the pre-present proof boolean field"
     },
     {
-      "id": "cells-visible-click-no-legacy-pre-present-proof-requests",
+      "id": "cells-visible-click-no-pre-present-proof-requests",
       "mode": "product-forbidden",
       "current_owner": "boon_native_app_window proof subscriber bridge",
       "typed_replacement": "post-present proof request handles registered after present",
       "report_path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
       "linked_report_path_pointer": "/preview_loop_report",
-      "symbol_or_field": "legacy_pre_present_proof_request_count",
-      "json_pointer": "/legacy_pre_present_proof_request_count",
+      "symbol_or_field": "pre_present_proof_request_count",
+      "json_pointer": "/pre_present_proof_request_count",
       "expected": 0,
-      "positive_gate": "post_present_proof_isolation.legacy_pre_present_request_count=0",
-      "negative_gate": "legacy_pre_present_proof_request_count must be zero for release UX",
-      "removal_condition": "2026-07-05 product proof request summaries were collapsed to empty or post-present subscribers only; keep this negative gate until product reports no longer carry the legacy counter field"
+      "positive_gate": "post_present_proof_isolation.pre_present_request_count=0",
+      "negative_gate": "pre_present_proof_request_count must be zero for release UX",
+      "removal_condition": "keep this negative gate until product reports no longer carry the pre-present request counter field"
     },
     {
       "id": "cells-visible-click-no-hot-report-serialization",
@@ -59,16 +59,16 @@
       "removal_condition": "remove synchronous product-frame report writes after async report freshness gates cover all native UX reports"
     },
     {
-      "id": "cells-visible-click-no-legacy-selection-fallback",
+      "id": "cells-visible-click-no-address-selection-fallback",
       "mode": "product-forbidden",
       "current_owner": "boon_native_playground retained source routing",
       "typed_replacement": "generic selected-node/source-binding route metadata",
       "report_path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
-      "symbol_or_field": "retained_update_contract.legacy_selection_fallback_count",
-      "json_pointer": "/retained_update_contract/legacy_selection_fallback_count",
+      "symbol_or_field": "retained_update_contract.address_selection_fallback_count",
+      "json_pointer": "/retained_update_contract/address_selection_fallback_count",
       "expected": 0,
       "positive_gate": "retained_update_contract.status=pass",
-      "negative_gate": "legacy_selection_fallback_count must be zero",
+      "negative_gate": "address_selection_fallback_count must be zero",
       "removal_condition": "remove address-specific compatibility after all examples use generic selected-node/source-binding route metadata"
     },
     {

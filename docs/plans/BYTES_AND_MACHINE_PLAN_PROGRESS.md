@@ -37698,3 +37698,30 @@ Remaining cleanup:
   tests. It removes the misleading fallback vocabulary and makes the next
   destructive step easier to review: migrate or delete obsolete test groups
   without confusing them with product runtime behavior.
+
+## 2026-07-05 - Native ReplaceCode Evidence Requires Source Protocol
+
+Status: removed the old native ReplaceCode evidence compatibility branch from
+the product verifier path. ReplaceCode evidence now has to prove the current
+replace-source protocol shape directly.
+
+What changed:
+
+- `native_gpu_replace_code_evidence_ok` now accepts only
+  `native_gpu_replace_source_protocol_evidence_ok`.
+- Removed the old compatibility helper that accepted only
+  `preview_command`, `hash_matches`, `document_layout_proof`, and
+  `preview_receives_example_name`.
+- Expanded failure diagnostics to mention required source-protocol fields:
+  `status`, `kind`, `replace_source_protocol`,
+  `bounded_latest_wins_worker`, `source_project_binary_frame`, and
+  `active_pending_snapshot_backpressure`.
+- Updated `docs/plans/native_gpu_stale_path_ledger.json` to use current neutral
+  field names for pre-present proof and address-selection fallback counters.
+
+Why it matters:
+
+- Stale reports can no longer pass the native ReplaceCode gate by satisfying
+  only the retired compatibility shape.
+- The ledger now tracks current product fields instead of preserving old
+  `legacy_*` report names as if they were the active contract.

@@ -11300,7 +11300,9 @@ impl LiveRuntime {
         match &mut self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => session.world_scene_output(),
             #[cfg(test)]
-            LiveRuntimeEngine::Legacy(runtime) => runtime.world_scene_output(),
+            LiveRuntimeEngine::Legacy(_) => {
+                Err("LiveRuntime world output is PlanExecutor-only; explicit legacy diagnostics must not serve product output roots".into())
+            }
         }
     }
 
@@ -11308,7 +11310,9 @@ impl LiveRuntime {
         match &mut self.engine {
             LiveRuntimeEngine::PlanExecutor(session) => session.solid_model_output(),
             #[cfg(test)]
-            LiveRuntimeEngine::Legacy(runtime) => runtime.solid_model_output(),
+            LiveRuntimeEngine::Legacy(_) => {
+                Err("LiveRuntime solid model output is PlanExecutor-only; explicit legacy diagnostics must not serve product output roots".into())
+            }
         }
     }
 
@@ -89652,22 +89656,18 @@ expected_source_event = {{ source = "store.decode" }}
             .world_scene_output()
             .expect("world output should execute through default PlanExecutor runtime");
 
-        let mut runtime = LegacyRuntimeHarness::from_source(
+        let mut legacy_runtime = LegacyRuntimeHarness::from_source(
             "examples/hello_3d/RUN.bn",
             include_str!("../../../examples/hello_3d/RUN.bn"),
         )
-        .expect("world output diagnostics should opt into explicit legacy runtime");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "legacy_generic_runtime"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            true
-        );
-        runtime.world_scene_output().expect(
-            "world output remains on explicit legacy output runtime until PlanExecutor supports it",
+        .expect("legacy diagnostics should still initialize explicitly");
+        let legacy_error = legacy_runtime
+            .world_scene_output()
+            .expect_err("LiveRuntime product output roots must not fall back to legacy diagnostics")
+            .to_string();
+        assert!(
+            legacy_error.contains("PlanExecutor-only"),
+            "unexpected legacy world output error: {legacy_error}"
         );
     }
 
@@ -89846,8 +89846,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             .expect_err("PlanExecutor mode must not fall back for world output")
             .to_string();
         assert!(
-            world_error.contains("has no LoadedRuntime")
-                && world_error.contains("refusing hidden fallback"),
+            world_error.contains("requires a top-level `world:` value"),
             "unexpected world output error: {world_error}"
         );
         let solid_error = runtime
@@ -89855,8 +89854,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             .expect_err("PlanExecutor mode must not fall back for solid output")
             .to_string();
         assert!(
-            solid_error.contains("has no LoadedRuntime")
-                && solid_error.contains("refusing hidden fallback"),
+            solid_error.contains("requires a top-level `manufacturing:` value"),
             "unexpected solid output error: {solid_error}"
         );
     }

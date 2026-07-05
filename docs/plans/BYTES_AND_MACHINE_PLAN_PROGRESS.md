@@ -37548,3 +37548,51 @@ Remaining cleanup:
   spreadsheet/list/currentness semantics, extend this evaluator or move the
   output-root program into MachinePlan proper; do not reintroduce hidden
   `LoadedRuntime` fallback.
+
+## 2026-07-05 - Product Output Roots Refuse Legacy Diagnostics
+
+Status: tightened the output-root boundary after the PlanExecutor output-root
+migration. `LiveRuntime::world_scene_output` and
+`LiveRuntime::solid_model_output` now refuse the test-only `Legacy` engine
+instead of serving native/product output roots through explicit legacy
+diagnostics.
+
+What changed:
+
+- The public output-root methods now return a PlanExecutor-only error for
+  `LiveRuntimeEngine::Legacy`.
+- The default world-output constructor test now proves both sides: the default
+  constructor uses PlanExecutor successfully, and explicit legacy diagnostics do
+  not satisfy product output-root calls.
+- `verify-compiler-boundaries` now has
+  `live-runtime-product-output-roots-planexecutor-only` so the old
+  `LiveRuntimeEngine::Legacy(runtime) => runtime.world_scene_output()` /
+  `solid_model_output()` fallback cannot return silently.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_default_constructor_keeps_world_output_on_plan_executor --
+  --nocapture`: pass.
+- `cargo test -q -p boon_runtime --lib
+  live_runtime_plan_executor_rejects_legacy_only_outputs_without_fallback --
+  --nocapture`: pass.
+- `cargo xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+
+Important failed migration attempt:
+
+- Directly switching the physical TodoMVC public-behavior legacy tests
+  `live_runtime_physical_todomvc_toggle_all_recomputes_all_completed_between_clicks`
+  and `live_runtime_applies_physical_todomvc_theme_source_events` to
+  `LiveRuntime::from_project_plan_executor` is not yet a safe cleanup. The
+  focused tests took about `211s` each and exposed PlanExecutor
+  document-summary shape mismatches: one assertion saw the `todos` array where
+  legacy exposed `store.active_count`, and the theme test got `Null` for
+  `output.state_summary["theme_options"]["name"]` while the semantic delta did
+  show `theme_options.name = Professional`.
+- Treat that as a real PlanExecutor summary/performance migration task, not as
+  a reason to reintroduce native/product legacy fallback or to hide the tests.

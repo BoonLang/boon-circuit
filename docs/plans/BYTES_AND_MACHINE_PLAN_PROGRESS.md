@@ -53,11 +53,17 @@ What changed:
 Important gaps exposed while attempting migration:
 
 - PlanExecutor still does not support at least one old root update branch shape:
-  `PrefixPayloadConcat`.
+  `PrefixPayloadConcat`; a follow-up migration attempt also exposed
+  `PrefixRootConcat`.
 - PlanExecutor document/state summaries do not yet expose every arbitrary small
-  test fixture shape that the old generic runtime summary exposed.
+  test fixture shape that the old generic runtime summary exposed. This blocks
+  direct migration of list-filter/join, list user-key lookup, structured root,
+  range-list, nested row field, and derived-list chunk behavior tests even when
+  the underlying product semantics may be partially present.
 - One row structured-parent fixture fails during PlanExecutor construction with
   a missing typed field id for an initial row field.
+- One root-derived cascade fixture fails PlanExecutor construction because a
+  root initial field copy source is unresolved (`store.cursor <- cursor_default`).
 - Do not restore the deleted tests through `LoadedRuntimeHarness`. Add
   PlanExecutor/product tests only after the missing executor semantics or
   diagnostics exist.

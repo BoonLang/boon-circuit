@@ -83,7 +83,9 @@ Current checkpoint:
   `LiveRuntime::from_source_plan_executor`. Direct PlanExecutor migration
   attempts exposed real unsupported product gaps (`PrefixPayloadConcat` root
   update branches, incomplete arbitrary-fixture document summary/state
-  surfaces, and missing typed field ids for a row structured-parent fixture).
+  surfaces, `PrefixRootConcat` root update branches, unresolved root initial
+  field copies, and missing typed field ids for a row structured-parent
+  fixture).
   Do not reintroduce the deleted tests through
   `LoadedRuntimeHarness`; replace them only with PlanExecutor/product tests
   after the missing executor semantics/diagnostics are implemented. This cut

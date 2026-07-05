@@ -36326,9 +36326,19 @@ Evidence:
 - `cargo test -q -p xtask product_render_graph -- --nocapture`: pass.
 - `cargo test -q -p boon_native_app_window post_present -- --nocapture`:
   pass.
+- `cargo run -q -p xtask -- verify-native-product-render-graph --example cells --report target/reports/native-gpu/product-render-graph-cells.json`:
+  expected fail from stale existing reports, but
+  `focused_contract_status=pass`, `before_after_contract_status=pass`, and
+  Cells `graph_contract_status=pass`. Blockers were stale source/baseline
+  fingerprints plus the stale graph-disabled baseline report not validating
+  against the current schema.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu/product-render-graph-cells.json`:
+  pass.
 
 Current interpretation:
 
 - Product render graph reports no longer model proof subscribers as graph
   passes. The product path remains hot/retained, while proof/readback/reporting
   stays in the separate post-present request lane.
+- Fresh native source/baseline report regeneration is still required before
+  claiming native handoff readiness.

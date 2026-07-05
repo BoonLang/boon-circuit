@@ -1291,7 +1291,7 @@ pub struct NativeRenderLoopState {
     #[serde(default)]
     pub post_present_proof_queue_deferred_count: u64,
     #[serde(default)]
-    pub post_present_proof_queue_legacy_pre_present_count: u64,
+    pub post_present_proof_queue_pre_present_count: u64,
     #[serde(default)]
     pub post_present_proof_queue_completed_count: u64,
     #[serde(default)]
@@ -1454,7 +1454,7 @@ impl NativeRenderLoopState {
             recent_post_present_proof_queue: VecDeque::new(),
             post_present_proof_queue_enqueued_count: 0,
             post_present_proof_queue_deferred_count: 0,
-            post_present_proof_queue_legacy_pre_present_count: 0,
+            post_present_proof_queue_pre_present_count: 0,
             post_present_proof_queue_completed_count: 0,
             post_present_subscriber_drain_deferred_count: 0,
             last_post_present_subscriber_drain_deferred_reason: None,
@@ -1859,11 +1859,11 @@ impl NativeRenderLoopState {
         enqueued_elapsed_ms: Option<f64>,
     ) {
         for request in requests {
-            let status = if request.currently_legacy_pre_present {
-                self.post_present_proof_queue_legacy_pre_present_count = self
-                    .post_present_proof_queue_legacy_pre_present_count
+            let status = if request.built_pre_present {
+                self.post_present_proof_queue_pre_present_count = self
+                    .post_present_proof_queue_pre_present_count
                     .saturating_add(1);
-                NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+                NativePostPresentProofQueueStatus::AlreadyBuiltPrePresent
             } else {
                 self.post_present_proof_queue_deferred_count = self
                     .post_present_proof_queue_deferred_count
@@ -3521,7 +3521,7 @@ pub enum NativePostPresentProofRequestKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePostPresentProofRequestSummary {
     pub kind: NativePostPresentProofRequestKind,
-    pub currently_legacy_pre_present: bool,
+    pub built_pre_present: bool,
     pub frame_local_snapshot_required: bool,
 }
 
@@ -3529,7 +3529,7 @@ pub struct NativePostPresentProofRequestSummary {
 #[serde(rename_all = "snake_case")]
 pub enum NativePostPresentProofQueueStatus {
     Queued,
-    LegacyAlreadyBuiltPrePresent,
+    AlreadyBuiltPrePresent,
     CompletedPostPresent,
 }
 
@@ -3688,8 +3688,8 @@ pub struct NativeRenderedProductFrame {
     pub layout_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_scene_identity: Option<String>,
-    pub legacy_proof_json_built_pre_present: bool,
-    pub legacy_render_hook_proof_built_pre_present: bool,
+    pub proof_json_built_pre_present: bool,
+    pub render_hook_proof_built_pre_present: bool,
     pub post_present_proof_request_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_patch: Option<NativeProductPatchSummary>,
@@ -3826,8 +3826,8 @@ pub struct NativeProductRenderGraphExecutionSummary {
     pub product_pass_count: u32,
     pub proof_pass_count: u32,
     pub proof_readback_in_product_graph: bool,
-    pub legacy_pre_present_proof_request_count: u32,
-    pub legacy_product_proof_built_pre_present: bool,
+    pub pre_present_proof_request_count: u32,
+    pub product_proof_built_pre_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_acquire_call_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3927,8 +3927,8 @@ pub struct NativeProductFrameCommit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
     pub post_present_proof_request_count: u32,
-    pub legacy_pre_present_proof_request_count: u32,
-    pub legacy_product_proof_built_pre_present: bool,
+    pub pre_present_proof_request_count: u32,
+    pub product_proof_built_pre_present: bool,
     pub product_result_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_result_owner: Option<String>,
@@ -4216,7 +4216,7 @@ pub struct AppWindowReadbackArtifact {
 fn artifact_hash_requested_post_present(commit: &NativeProductFrameCommit) -> bool {
     commit.post_present_proof_requests.iter().any(|request| {
         request.kind == NativePostPresentProofRequestKind::ArtifactHash
-            && !request.currently_legacy_pre_present
+            && !request.built_pre_present
     })
 }
 
@@ -8016,7 +8016,7 @@ fn product_frame_commit_for_presented_frame(
         .and_then(|metrics| metrics.product_frame.as_ref())
         .is_some()
     {
-        "legacy_render_frame_metrics"
+        "render_frame_metrics_product_frame"
     } else {
         "missing"
     };
@@ -8041,21 +8041,20 @@ fn product_frame_commit_for_presented_frame(
         .map(|result| result.post_present_proof_requests.clone())
         .or_else(|| render_frame_metrics.map(|metrics| metrics.post_present_proof_requests.clone()))
         .unwrap_or_default();
-    let legacy_pre_present_proof_request_count = post_present_proof_requests
+    let pre_present_proof_request_count = post_present_proof_requests
         .iter()
-        .filter(|request| request.currently_legacy_pre_present)
+        .filter(|request| request.built_pre_present)
         .count() as u32;
-    let legacy_product_proof_built_pre_present = product_frame.as_ref().is_some_and(|frame| {
-        frame.legacy_proof_json_built_pre_present
-            || frame.legacy_render_hook_proof_built_pre_present
+    let product_proof_built_pre_present = product_frame.as_ref().is_some_and(|frame| {
+        frame.proof_json_built_pre_present || frame.render_hook_proof_built_pre_present
     });
     let render_graph_execution = product_render_graph_execution_for_commit(
         state,
         &frame_evidence_key,
         render_graph.as_ref(),
         present_plan.as_ref(),
-        legacy_pre_present_proof_request_count,
-        legacy_product_proof_built_pre_present,
+        pre_present_proof_request_count,
+        product_proof_built_pre_present,
     );
     NativeProductFrameCommit {
         schema_version: 1,
@@ -8104,8 +8103,8 @@ fn product_frame_commit_for_presented_frame(
         role_dirty_reason,
         post_present_proof_request_count: post_present_proof_requests.len() as u32,
         post_present_proof_requests,
-        legacy_pre_present_proof_request_count,
-        legacy_product_proof_built_pre_present,
+        pre_present_proof_request_count,
+        product_proof_built_pre_present,
         product_result_source: product_result_source.to_owned(),
         product_result_owner,
         product_result_kind,
@@ -8121,8 +8120,8 @@ fn product_render_graph_execution_for_commit(
     frame_evidence_key: &FrameEvidenceKey,
     render_graph: Option<&NativeProductRenderGraphSummary>,
     present_plan: Option<&NativePresentPlanSummary>,
-    legacy_pre_present_proof_request_count: u32,
-    legacy_product_proof_built_pre_present: bool,
+    pre_present_proof_request_count: u32,
+    product_proof_built_pre_present: bool,
 ) -> Option<NativeProductRenderGraphExecutionSummary> {
     let render_graph = render_graph?;
     let present_plan = present_plan?;
@@ -8137,8 +8136,8 @@ fn product_render_graph_execution_for_commit(
         product_pass_count: render_graph.product_pass_count,
         proof_pass_count: render_graph.proof_pass_count,
         proof_readback_in_product_graph: render_graph.proof_readback_in_product_graph,
-        legacy_pre_present_proof_request_count,
-        legacy_product_proof_built_pre_present,
+        pre_present_proof_request_count,
+        product_proof_built_pre_present,
         surface_acquire_call_ms: state.last_surface_acquire_call_ms,
         encode_time_ms: render_graph.encode_time_ms,
         encoder_finish_ms: state.last_encoder_finish_ms,
@@ -8151,7 +8150,7 @@ fn product_render_graph_execution_for_commit(
 fn visible_surface_readback_post_present_request() -> NativePostPresentProofRequestSummary {
     NativePostPresentProofRequestSummary {
         kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
-        currently_legacy_pre_present: false,
+        built_pre_present: false,
         frame_local_snapshot_required: true,
     }
 }
@@ -8167,10 +8166,9 @@ fn add_post_present_proof_request_to_commit(
     {
         return;
     }
-    if request.currently_legacy_pre_present {
-        commit.legacy_pre_present_proof_request_count = commit
-            .legacy_pre_present_proof_request_count
-            .saturating_add(1);
+    if request.built_pre_present {
+        commit.pre_present_proof_request_count =
+            commit.pre_present_proof_request_count.saturating_add(1);
     }
     commit.post_present_proof_requests.push(request);
     commit.post_present_proof_request_count = commit.post_present_proof_requests.len() as u32;
@@ -8178,10 +8176,8 @@ fn add_post_present_proof_request_to_commit(
         product_frame.post_present_proof_request_count = commit.post_present_proof_request_count;
     }
     if let Some(execution) = commit.render_graph_execution.as_mut() {
-        execution.legacy_pre_present_proof_request_count =
-            commit.legacy_pre_present_proof_request_count;
-        execution.legacy_product_proof_built_pre_present =
-            commit.legacy_product_proof_built_pre_present;
+        execution.pre_present_proof_request_count = commit.pre_present_proof_request_count;
+        execution.product_proof_built_pre_present = commit.product_proof_built_pre_present;
     }
 }
 
@@ -8985,7 +8981,7 @@ fn post_present_proof_isolation_report(
 ) -> serde_json::Value {
     let mut queued_request_count = 0_u64;
     let mut completed_request_count = 0_u64;
-    let mut legacy_pre_present_request_count = 0_u64;
+    let mut pre_present_request_count = 0_u64;
     for entry in &state.recent_post_present_proof_queue {
         match entry.status {
             NativePostPresentProofQueueStatus::Queued => {
@@ -8994,9 +8990,8 @@ fn post_present_proof_isolation_report(
             NativePostPresentProofQueueStatus::CompletedPostPresent => {
                 completed_request_count = completed_request_count.saturating_add(1);
             }
-            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent => {
-                legacy_pre_present_request_count =
-                    legacy_pre_present_request_count.saturating_add(1);
+            NativePostPresentProofQueueStatus::AlreadyBuiltPrePresent => {
+                pre_present_request_count = pre_present_request_count.saturating_add(1);
             }
         }
     }
@@ -9031,7 +9026,7 @@ fn post_present_proof_isolation_report(
         "hot_path_report_serialization_count": 0,
         "queued_request_count": queued_request_count,
         "completed_request_count": completed_request_count,
-        "legacy_pre_present_request_count": legacy_pre_present_request_count,
+        "pre_present_request_count": pre_present_request_count,
         "worker_enqueued_batch_count": state.post_present_proof_subscriber_worker_enqueued_batch_count,
         "worker_enqueued_count": state.post_present_proof_subscriber_worker_enqueued_count,
         "worker_required_enqueued_count": state.post_present_proof_subscriber_worker_required_enqueued_count,
@@ -9376,15 +9371,13 @@ fn write_render_loop_state_report(
         .map(|metrics| metrics.post_present_proof_requests.clone())
         .unwrap_or_default();
     let post_present_proof_request_count = last_post_present_proof_requests.len();
-    let legacy_pre_present_proof_request_count = last_post_present_proof_requests
+    let pre_present_proof_request_count = last_post_present_proof_requests
         .iter()
-        .filter(|request| request.currently_legacy_pre_present)
+        .filter(|request| request.built_pre_present)
         .count();
-    let legacy_product_proof_built_pre_present =
-        last_product_render_frame.as_ref().is_some_and(|frame| {
-            frame.legacy_proof_json_built_pre_present
-                || frame.legacy_render_hook_proof_built_pre_present
-        });
+    let product_proof_built_pre_present = last_product_render_frame.as_ref().is_some_and(|frame| {
+        frame.proof_json_built_pre_present || frame.render_hook_proof_built_pre_present
+    });
     let last_product_frame_commit = state.last_product_frame_commit.clone();
     let product_frame_commit_matches_frame_evidence_key =
         last_product_frame_commit.as_ref().is_some_and(|commit| {
@@ -9603,7 +9596,7 @@ fn write_render_loop_state_report(
         "post_present_proof_queue_limit": RECENT_POST_PRESENT_PROOF_QUEUE_LIMIT,
         "post_present_proof_queue_enqueued_count": state.post_present_proof_queue_enqueued_count,
         "post_present_proof_queue_deferred_count": state.post_present_proof_queue_deferred_count,
-        "post_present_proof_queue_legacy_pre_present_count": state.post_present_proof_queue_legacy_pre_present_count,
+        "post_present_proof_queue_pre_present_count": state.post_present_proof_queue_pre_present_count,
         "post_present_proof_queue_completed_count": state.post_present_proof_queue_completed_count,
         "recent_post_present_proof_queue_count": state.recent_post_present_proof_queue.len(),
         "recent_post_present_proof_queue": state.recent_post_present_proof_queue.clone(),
@@ -9615,8 +9608,8 @@ fn write_render_loop_state_report(
         "recent_post_present_proof_artifacts": state.recent_post_present_proof_artifacts.clone(),
         "post_present_proof_requests": last_post_present_proof_requests,
         "post_present_proof_request_count": post_present_proof_request_count,
-        "legacy_pre_present_proof_request_count": legacy_pre_present_proof_request_count,
-        "legacy_product_proof_built_pre_present": legacy_product_proof_built_pre_present,
+        "pre_present_proof_request_count": pre_present_proof_request_count,
+        "product_proof_built_pre_present": product_proof_built_pre_present,
         "frame_evidence_key_issued_before_present": state.last_frame_evidence_key_issued_before_present,
         "preissued_frame_evidence_key": state.last_preissued_frame_evidence_key.clone(),
         "preissued_frame_evidence_elapsed_ms": state.last_preissued_frame_evidence_elapsed_ms,
@@ -11121,7 +11114,7 @@ mod tests {
     }
 
     #[test]
-    fn post_present_proof_queue_tracks_deferred_and_legacy_requests_by_frame_key() {
+    fn post_present_proof_queue_tracks_deferred_and_pre_present_requests_by_frame_key() {
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         let key = FrameEvidenceKey {
             frame_seq: 7,
@@ -11137,12 +11130,12 @@ mod tests {
         let requests = vec![
             NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             },
             NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::ExternalAppOwnedReadback,
-                currently_legacy_pre_present: true,
+                built_pre_present: true,
                 frame_local_snapshot_required: true,
             },
         ];
@@ -11151,7 +11144,7 @@ mod tests {
 
         assert_eq!(state.post_present_proof_queue_enqueued_count, 2);
         assert_eq!(state.post_present_proof_queue_deferred_count, 1);
-        assert_eq!(state.post_present_proof_queue_legacy_pre_present_count, 1);
+        assert_eq!(state.post_present_proof_queue_pre_present_count, 1);
         assert_eq!(state.recent_post_present_proof_queue.len(), 2);
         assert_eq!(
             state.recent_post_present_proof_queue[0].frame_evidence_key,
@@ -11163,7 +11156,7 @@ mod tests {
         );
         assert_eq!(
             state.recent_post_present_proof_queue[1].status,
-            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+            NativePostPresentProofQueueStatus::AlreadyBuiltPrePresent
         );
         assert_eq!(
             state.recent_post_present_proof_queue[0].enqueued_elapsed_ms,
@@ -11190,7 +11183,7 @@ mod tests {
         );
         assert_eq!(
             state.recent_post_present_proof_queue[1].status,
-            NativePostPresentProofQueueStatus::LegacyAlreadyBuiltPrePresent
+            NativePostPresentProofQueueStatus::AlreadyBuiltPrePresent
         );
     }
 
@@ -11216,14 +11209,14 @@ mod tests {
                 visible_present_path: true,
                 layout_identity: Some("layout:1".to_owned()),
                 render_scene_identity: Some("scene:1".to_owned()),
-                legacy_proof_json_built_pre_present: false,
-                legacy_render_hook_proof_built_pre_present: false,
+                proof_json_built_pre_present: false,
+                render_hook_proof_built_pre_present: false,
                 post_present_proof_request_count: 1,
                 product_patch: None,
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             ..NativeRenderFrameMetrics::default()
@@ -11251,10 +11244,10 @@ mod tests {
 
         assert_eq!(commit.post_present_proof_request_count, 2);
         assert_eq!(commit.post_present_proof_requests.len(), 2);
-        assert_eq!(commit.legacy_pre_present_proof_request_count, 0);
+        assert_eq!(commit.pre_present_proof_request_count, 0);
         assert!(commit.post_present_proof_requests.iter().any(|request| {
             request.kind == NativePostPresentProofRequestKind::VisibleSurfaceReadback
-                && !request.currently_legacy_pre_present
+                && !request.built_pre_present
                 && request.frame_local_snapshot_required
         }));
         assert_eq!(
@@ -11283,7 +11276,7 @@ mod tests {
     }
 
     #[test]
-    fn product_frame_commit_prefers_typed_product_result_over_legacy_metrics() {
+    fn product_frame_commit_prefers_typed_product_result_over_metrics_product_frame() {
         let key = FrameEvidenceKey {
             frame_seq: 9,
             content_revision: 11,
@@ -11302,8 +11295,8 @@ mod tests {
             visible_present_path: true,
             layout_identity: Some("layout:typed".to_owned()),
             render_scene_identity: Some("scene:typed".to_owned()),
-            legacy_proof_json_built_pre_present: false,
-            legacy_render_hook_proof_built_pre_present: false,
+            proof_json_built_pre_present: false,
+            render_hook_proof_built_pre_present: false,
             post_present_proof_request_count: 1,
             product_patch: Some(NativeProductPatchSummary {
                 schema_version: 1,
@@ -11325,16 +11318,16 @@ mod tests {
                 latest_report_required: false,
             }),
         };
-        let mut legacy_frame = typed_frame.clone();
-        legacy_frame.layout_identity = Some("layout:legacy".to_owned());
+        let mut metrics_frame = typed_frame.clone();
+        metrics_frame.layout_identity = Some("layout:metrics-product-frame".to_owned());
         let typed_requests = vec![NativePostPresentProofRequestSummary {
             kind: NativePostPresentProofRequestKind::VisibleBoundText,
-            currently_legacy_pre_present: false,
+            built_pre_present: false,
             frame_local_snapshot_required: true,
         }];
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
         state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
-            product_frame: Some(legacy_frame),
+            product_frame: Some(metrics_frame),
             product_result: Some(NativeProductFrameResult {
                 schema_version: 1,
                 owner: "preview_active_scene".to_owned(),
@@ -11347,7 +11340,7 @@ mod tests {
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::RenderHookReportJson,
-                currently_legacy_pre_present: true,
+                built_pre_present: true,
                 frame_local_snapshot_required: true,
             }],
             ..NativeRenderFrameMetrics::default()
@@ -11379,7 +11372,7 @@ mod tests {
                 .and_then(|frame| frame.layout_identity.as_deref()),
             Some("layout:typed")
         );
-        assert_eq!(commit.legacy_pre_present_proof_request_count, 0);
+        assert_eq!(commit.pre_present_proof_request_count, 0);
         assert_eq!(commit.post_present_proof_requests.len(), 1);
         assert_eq!(
             commit.post_present_proof_requests[0].kind,
@@ -11405,7 +11398,7 @@ mod tests {
             &key,
             &[NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::RetainedBoundSync,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             Some(50.0),
@@ -11470,7 +11463,7 @@ mod tests {
             &key,
             &[NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             Some(50.0),
@@ -11700,14 +11693,14 @@ mod tests {
                 visible_present_path: true,
                 layout_identity: Some("layout-proof-isolation".to_owned()),
                 render_scene_identity: Some("scene-proof-isolation".to_owned()),
-                legacy_proof_json_built_pre_present: false,
-                legacy_render_hook_proof_built_pre_present: false,
+                proof_json_built_pre_present: false,
+                render_hook_proof_built_pre_present: false,
                 post_present_proof_request_count: 1,
                 product_patch: None,
             }),
             post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             ..NativeRenderFrameMetrics::default()
@@ -11855,12 +11848,12 @@ mod tests {
             &[
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::ProofHistory,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::RenderHookReportJson,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
             ],
@@ -11944,7 +11937,7 @@ mod tests {
             &key,
             &[NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::ArtifactHash,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             Some(80.0),
@@ -12101,12 +12094,12 @@ mod tests {
             &[
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::ArtifactHash,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
             ],
@@ -12137,7 +12130,7 @@ mod tests {
             &key,
             &[NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::ArtifactHash,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             Some(90.0),
@@ -12360,20 +12353,20 @@ mod tests {
                 visible_present_path: true,
                 layout_identity: Some("layout-test".to_owned()),
                 render_scene_identity: Some("scene-test".to_owned()),
-                legacy_proof_json_built_pre_present: true,
-                legacy_render_hook_proof_built_pre_present: true,
+                proof_json_built_pre_present: true,
+                render_hook_proof_built_pre_present: true,
                 post_present_proof_request_count: 2,
                 product_patch: None,
             }),
             post_present_proof_requests: vec![
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                    currently_legacy_pre_present: true,
+                    built_pre_present: true,
                     frame_local_snapshot_required: true,
                 },
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::RenderHookReportJson,
-                    currently_legacy_pre_present: true,
+                    built_pre_present: true,
                     frame_local_snapshot_required: true,
                 },
             ],
@@ -12536,7 +12529,7 @@ mod tests {
             serde_json::json!("visible-surface-direct")
         );
         assert_eq!(
-            report["last_product_render_frame"]["legacy_proof_json_built_pre_present"],
+            report["last_product_render_frame"]["proof_json_built_pre_present"],
             serde_json::json!(true)
         );
         assert_eq!(
@@ -12544,11 +12537,11 @@ mod tests {
             serde_json::json!(2)
         );
         assert_eq!(
-            report["legacy_pre_present_proof_request_count"],
+            report["pre_present_proof_request_count"],
             serde_json::json!(2)
         );
         assert_eq!(
-            report["legacy_product_proof_built_pre_present"],
+            report["product_proof_built_pre_present"],
             serde_json::json!(true)
         );
         assert_eq!(report["product_frame_commit_count"], serde_json::json!(1));
@@ -12577,7 +12570,7 @@ mod tests {
             serde_json::json!(2)
         );
         assert_eq!(
-            report["last_product_frame_commit"]["legacy_pre_present_proof_request_count"],
+            report["last_product_frame_commit"]["pre_present_proof_request_count"],
             serde_json::json!(2)
         );
         assert_eq!(
@@ -12589,7 +12582,7 @@ mod tests {
             serde_json::json!(0)
         );
         assert_eq!(
-            report["post_present_proof_queue_legacy_pre_present_count"],
+            report["post_present_proof_queue_pre_present_count"],
             serde_json::json!(2)
         );
         assert_eq!(
@@ -12626,7 +12619,7 @@ mod tests {
         );
         assert_eq!(
             report["recent_post_present_proof_queue"][0]["status"],
-            serde_json::json!("legacy_already_built_pre_present")
+            serde_json::json!("already_built_pre_present")
         );
         assert_eq!(
             report["recent_product_frame_commits"][0]["frame_evidence_key"],
@@ -13010,7 +13003,7 @@ mod tests {
             &key,
             &[NativePostPresentProofRequestSummary {
                 kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
-                currently_legacy_pre_present: false,
+                built_pre_present: false,
                 frame_local_snapshot_required: true,
             }],
             Some(1.0),
@@ -13090,12 +13083,12 @@ mod tests {
             &[
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::ArtifactHash,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
             ],
@@ -13170,12 +13163,12 @@ mod tests {
             &[
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::VisibleSurfaceReadback,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
                 NativePostPresentProofRequestSummary {
                     kind: NativePostPresentProofRequestKind::ArtifactHash,
-                    currently_legacy_pre_present: false,
+                    built_pre_present: false,
                     frame_local_snapshot_required: true,
                 },
             ],
@@ -14469,7 +14462,7 @@ mod tests {
         };
         let requests = vec![NativePostPresentProofRequestSummary {
             kind: NativePostPresentProofRequestKind::VisibleBoundText,
-            currently_legacy_pre_present: false,
+            built_pre_present: false,
             frame_local_snapshot_required: true,
         }];
 

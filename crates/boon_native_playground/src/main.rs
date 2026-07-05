@@ -5872,7 +5872,7 @@ fn json_scalar_display_text(value: &serde_json::Value) -> String {
 
 fn native_proof_mode_arg(
     args: &[String],
-    readback_requested_by_legacy_flags: bool,
+    readback_requested_by_compat_flags: bool,
 ) -> Result<boon_native_app_window::NativeProofMode, Box<dyn std::error::Error>> {
     match value_arg(args, "--proof-mode").as_deref() {
         Some("counters") => Ok(boon_native_app_window::NativeProofMode::Counters),
@@ -5880,7 +5880,7 @@ fn native_proof_mode_arg(
         Some(value) => {
             Err(format!("unsupported --proof-mode `{value}`; expected counters|readback").into())
         }
-        None if readback_requested_by_legacy_flags => {
+        None if readback_requested_by_compat_flags => {
             Ok(boon_native_app_window::NativeProofMode::Readback)
         }
         None => Ok(boon_native_app_window::NativeProofMode::Counters),
@@ -12410,7 +12410,7 @@ fn native_gpu_app_owned_render_hook(
             "layout_render_scene_patch_direct_encode": direct_layout_render_scene_patch_enabled,
             "app_owned_readback_reused": app_owned_readback_reused,
             "offscreen_app_owned_scene_readback_skipped": skip_app_owned_scene_proof,
-            "product_render_report_mode": "structured_proof_legacy",
+            "product_render_report_mode": "structured_product_proof",
             "proof": proof.unwrap_or_else(|| json!(null)),
             "copy_to_present_limitation": serde_json::Value::Null
         })
@@ -12675,8 +12675,8 @@ fn preview_attach_product_proof_boundary(
     render_target_kind: &str,
     layout_identity: Option<String>,
     render_scene_identity: Option<String>,
-    legacy_proof_json_built_pre_present: bool,
-    legacy_render_hook_proof_built_pre_present: bool,
+    proof_json_built_pre_present: bool,
+    render_hook_proof_built_pre_present: bool,
     renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
     product_patch: Option<boon_native_app_window::NativeProductPatchSummary>,
     post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
@@ -12690,8 +12690,8 @@ fn preview_attach_product_proof_boundary(
         visible_present_path: true,
         layout_identity,
         render_scene_identity,
-        legacy_proof_json_built_pre_present,
-        legacy_render_hook_proof_built_pre_present,
+        proof_json_built_pre_present,
+        render_hook_proof_built_pre_present,
         post_present_proof_request_count,
         product_patch,
     };
@@ -12998,11 +12998,11 @@ fn deferred_post_present_proof_request(
 fn proof_request_summary(
     kind: boon_native_app_window::NativePostPresentProofRequestKind,
     frame_local_snapshot_required: bool,
-    currently_legacy_pre_present: bool,
+    built_pre_present: bool,
 ) -> boon_native_app_window::NativePostPresentProofRequestSummary {
     boon_native_app_window::NativePostPresentProofRequestSummary {
         kind,
-        currently_legacy_pre_present,
+        built_pre_present,
         frame_local_snapshot_required,
     }
 }
@@ -66741,7 +66741,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_product_proof_requests_are_not_legacy() {
+    fn deferred_product_proof_requests_are_not_built_pre_present() {
         let product_requests = preview_post_present_proof_request_summaries_for_mode(false);
         assert!(
             product_requests.is_empty(),
@@ -66753,7 +66753,7 @@ mod tests {
         assert!(
             post_present_requests
                 .iter()
-                .all(|request| !request.currently_legacy_pre_present),
+                .all(|request| !request.built_pre_present),
             "product proof subscribers must not report proof subscribers as pre-present debt"
         );
         assert!(
@@ -66772,9 +66772,7 @@ mod tests {
 
         let dev_requests = dev_post_present_proof_request_summaries();
         assert!(
-            dev_requests
-                .iter()
-                .all(|request| request.currently_legacy_pre_present),
+            dev_requests.iter().all(|request| request.built_pre_present),
             "dev render reports still label their diagnostic pre-present proof debt explicitly"
         );
     }

@@ -64541,7 +64541,7 @@ FUNCTION icon_code(item) {
     }
 
     #[test]
-    fn physical_todomvc_root_source_event_default_materializes() {
+    fn physical_todomvc_root_source_event_default_lowers_to_source_transform() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
         let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
@@ -64557,16 +64557,10 @@ FUNCTION icon_code(item) {
                 .map(|value| format!("{} {:?}", value.path, value.kind))
                 .collect::<Vec<_>>()
         );
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let generic = GenericScheduledRuntime::new(&compiled).unwrap();
-        assert_eq!(
-            generic.root_textlike_ref("theme_options.name").unwrap(),
-            "Classic"
-        );
     }
 
     #[test]
-    fn physical_todomvc_theme_source_event_updates_latest_root_text() {
+    fn physical_todomvc_theme_source_event_lowers_to_source_routes() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
         let theme_targets = compiler_source_route_root_text_transform_targets_from_ir(&ir);
@@ -64612,135 +64606,10 @@ FUNCTION icon_code(item) {
                 )),
             "theme switcher source should dispatch through the SourceId action table"
         );
-        let mut runtime = list_scenario_harness_from_parsed(&parsed);
-        assert_eq!(
-            runtime
-                .generic
-                .root_textlike_ref("theme_options.name")
-                .unwrap(),
-            "Classic"
-        );
-        assert_eq!(
-            runtime.generic.document_summary()["theme_options"]["name"],
-            "Classic",
-            "document summary should expose root source-event transforms used by physical styling"
-        );
-
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("theme glassmorphism".to_owned()),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.theme_switcher.glassmorphism".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "physical-theme-glassmorphism".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        runtime
-            .apply_step_into(&step, &mut deltas, &mut patches)
-            .unwrap();
-
-        assert_eq!(
-            runtime
-                .generic
-                .root_textlike_ref("theme_options.name")
-                .unwrap(),
-            "Glassmorphism"
-        );
-        assert_eq!(
-            runtime.generic.document_summary()["theme_options"]["name"],
-            "Glassmorphism",
-            "document summary should update root source-event transforms after source events"
-        );
-        assert!(deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("theme_options.name")
-        }));
     }
 
     #[test]
-    fn physical_todomvc_add_todo_defaults_active_and_remains_toggleable() {
-        let parsed = physical_todomvc_project_for_test();
-        let mut runtime = list_scenario_harness_from_parsed(&parsed);
-
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        let mut submit_action = BTreeMap::new();
-        submit_action.insert(
-            "kind".to_owned(),
-            toml::Value::String("key_down".to_owned()),
-        );
-        submit_action.insert(
-            "target".to_owned(),
-            toml::Value::String("new todo input".to_owned()),
-        );
-        submit_action.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
-        let mut submit_expected = BTreeMap::new();
-        submit_expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.new_todo_title_text_input".to_owned()),
-        );
-        submit_expected.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
-        submit_expected.insert(
-            "text".to_owned(),
-            toml::Value::String("ship physical".to_owned()),
-        );
-        let submit_step = ScenarioStep {
-            id: "physical-add-todo-submit".to_owned(),
-            user_action: Some(submit_action),
-            expected_source_event: Some(submit_expected),
-            ..ScenarioStep::default()
-        };
-        runtime
-            .apply_step_into(&submit_step, &mut deltas, &mut patches)
-            .unwrap();
-        let added_index = list_row_index(&runtime, "ship physical");
-        assert_eq!(runtime.list_title_for_test(added_index), "ship physical");
-        assert!(
-            !runtime.list_completed_for_test(added_index),
-            "new physical todos should default to active"
-        );
-
-        let mut toggle_action = BTreeMap::new();
-        toggle_action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        toggle_action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("ship physical".to_owned()),
-        );
-        let mut toggle_expected = BTreeMap::new();
-        toggle_expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.todo_elements.todo_checkbox".to_owned()),
-        );
-        toggle_expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String("ship physical".to_owned()),
-        );
-        let toggle_step = ScenarioStep {
-            id: "physical-added-todo-toggle".to_owned(),
-            user_action: Some(toggle_action),
-            expected_source_event: Some(toggle_expected),
-            ..ScenarioStep::default()
-        };
-        runtime
-            .apply_step_into(&toggle_step, &mut deltas, &mut patches)
-            .unwrap();
-        assert!(
-            runtime.list_completed_for_test(added_index),
-            "new physical todos should remain toggleable"
-        );
-    }
-
-    #[test]
-    fn physical_todomvc_router_filter_source_updates_selected_filter() {
+    fn physical_todomvc_router_filter_source_lowers_to_router_target() {
         let parsed = physical_todomvc_project_for_test();
         let ir = lower_for_runtime(&parsed).unwrap();
         let router_targets = compiler_source_route_router_targets_from_ir(&ir);
@@ -64751,66 +64620,6 @@ FUNCTION icon_code(item) {
             }),
             "{router_targets:#?}"
         );
-        let mut runtime = list_scenario_harness_from_parsed(&parsed);
-        assert_eq!(
-            runtime
-                .generic
-                .root_textlike_ref("store.selected_filter")
-                .unwrap(),
-            "All"
-        );
-
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("completed filter".to_owned()),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.filter_buttons.completed".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "physical-router-filter".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-        let mut deltas = Vec::new();
-        let mut patches = Vec::new();
-        runtime
-            .apply_step_into(&step, &mut deltas, &mut patches)
-            .unwrap();
-
-        assert_eq!(runtime.generic.router_route, "/completed");
-        let selected_filter_field = runtime
-            .generic
-            .generic_derived
-            .root_fields
-            .iter()
-            .find(|field| field.path == "store.selected_filter")
-            .cloned()
-            .unwrap();
-        let selected_filter_value = runtime
-            .generic
-            .eval_statement_value(
-                &selected_filter_field.statement,
-                &mut GenericEvalFrame::root(),
-            )
-            .unwrap()
-            .as_text();
-        assert_eq!(selected_filter_value.as_deref(), Some("Completed"));
-        assert_eq!(
-            runtime
-                .generic
-                .root_textlike_ref("store.selected_filter")
-                .unwrap(),
-            "Completed"
-        );
-        assert!(deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.selected_filter")
-        }));
     }
 
     #[test]

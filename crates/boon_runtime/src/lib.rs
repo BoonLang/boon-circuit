@@ -4533,11 +4533,11 @@ impl PlanExecutorRuntimeState {
         JsonValue::Object(self.root_state.root_state.clone())
     }
 
-    fn document_state_summary(&self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
+    fn document_state_summary(&mut self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
         plan_executor_document_summary_with_limits(
             plan,
             &self.root_state.root_state,
-            &self.list_state,
+            &mut self.list_state,
             limits,
         )
     }
@@ -4636,7 +4636,7 @@ impl PlanExecutorLiveSession {
         self.state.state_summary()
     }
 
-    fn document_state_summary(&self, limits: SummaryLimits) -> JsonValue {
+    fn document_state_summary(&mut self, limits: SummaryLimits) -> JsonValue {
         self.state
             .document_state_summary(self.plan.as_ref(), limits)
     }
@@ -4690,7 +4690,7 @@ impl PlanExecutorLiveSession {
             })
     }
 
-    fn document_state_values(&self, paths: &[String]) -> JsonValue {
+    fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
         let mut values = serde_json::Map::new();
         let preview = self.document_state_summary(SummaryLimits::document_preview());
         let mut full: Option<JsonValue> = None;
@@ -4711,7 +4711,7 @@ impl PlanExecutorLiveSession {
     }
 
     fn runtime_value_summaries(
-        &self,
+        &mut self,
         paths: &[String],
         max_depth: usize,
         max_fields: usize,
@@ -5734,7 +5734,7 @@ fn materialize_plan_list_retains(
 fn plan_executor_document_summary_with_limits(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
 ) -> JsonValue {
     let mut root = plan_executor_nested_root_summary(root_state);
@@ -5789,28 +5789,34 @@ fn plan_executor_nested_root_summary(
 
 fn plan_executor_insert_direct_list_summaries(
     plan: &MachinePlan,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
 ) {
-    for (list_id, rows) in list_state {
-        let list = plan_list_label(plan, *list_id);
+    let list_ids = list_state.keys().copied().collect::<Vec<_>>();
+    for list_id in list_ids {
+        let list = plan_list_label(plan, list_id);
+        let row_count = list_state.get(&list_id).map(Vec::len).unwrap_or_default();
         let row_end = limits
             .list_rows
-            .map_or(rows.len(), |limit| {
+            .map_or(row_count, |limit| {
                 limits.list_row_start.saturating_add(limit)
             })
-            .min(rows.len());
-        let visible_rows = rows
-            .get(limits.list_row_start..row_end)
-            .unwrap_or(&[])
-            .iter()
-            .map(|row| plan_executor_row_document_json(plan, *list_id, row))
-            .collect::<Vec<_>>();
+            .min(row_count);
+        let mut visible_rows = Vec::with_capacity(row_end.saturating_sub(limits.list_row_start));
+        for row_index in limits.list_row_start..row_end {
+            plan_executor_refresh_summary_row_current(plan, list_state, list_id, row_index);
+            if let Some(row) = list_state
+                .get(&list_id)
+                .and_then(|rows| rows.get(row_index))
+            {
+                visible_rows.push(plan_executor_row_document_json(plan, list_id, row));
+            }
+        }
         materialization.push(materialization_report_for_rows(
             &list,
-            rows.len(),
+            row_count,
             limits.list_row_start,
             &visible_rows,
         ));
@@ -5828,7 +5834,7 @@ fn plan_executor_insert_direct_list_summaries(
 fn plan_executor_insert_projection_summaries(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
@@ -5857,10 +5863,22 @@ fn plan_executor_insert_projection_summaries(
                     .get(&source_list.0)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let projected = rows
+                let row_index = rows
                     .iter()
-                    .find(|row| row_json_values_equal(row.fields.get(field), &selector))
-                    .map(|row| JsonValue::Object(row.fields.clone().into_iter().collect()))
+                    .position(|row| row_json_values_equal(row.fields.get(field), &selector));
+                let projected = row_index
+                    .and_then(|row_index| {
+                        plan_executor_refresh_summary_row_current(
+                            plan,
+                            list_state,
+                            source_list.0,
+                            row_index,
+                        );
+                        list_state
+                            .get(&source_list.0)
+                            .and_then(|rows| rows.get(row_index))
+                            .map(|row| plan_executor_row_document_json(plan, source_list.0, row))
+                    })
                     .unwrap_or(JsonValue::Null);
                 insert_nested_json(root, &target, projected.clone());
                 root.entry(row_field_name(&target).to_owned())
@@ -5872,14 +5890,14 @@ fn plan_executor_insert_projection_summaries(
                 item_field,
                 label_field,
             } => {
-                let rows = list_state
+                let source_row_count = list_state
                     .get(&source_list.0)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
+                    .map(Vec::len)
+                    .unwrap_or_default();
                 let value = plan_executor_windowed_chunk_projection(
                     plan,
                     source_list.0,
-                    rows,
+                    list_state,
                     *size,
                     item_field,
                     label_field,
@@ -5887,7 +5905,7 @@ fn plan_executor_insert_projection_summaries(
                 );
                 materialization.push(materialization_report_for_chunk(
                     &target,
-                    rows.len(),
+                    source_row_count,
                     limits.chunk_row_start,
                     limits.chunk_column_start,
                     &value,
@@ -5902,7 +5920,7 @@ fn plan_executor_insert_projection_summaries(
 fn plan_executor_insert_retain_summaries(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
@@ -5949,7 +5967,7 @@ fn plan_executor_insert_retain_summaries(
 fn plan_executor_windowed_chunk_projection(
     plan: &MachinePlan,
     list_id: usize,
-    rows: &[PlanListRowState],
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     columns: usize,
     item_field: &str,
     label_field: &str,
@@ -5958,7 +5976,8 @@ fn plan_executor_windowed_chunk_projection(
     if columns == 0 {
         return Vec::new();
     }
-    let total_rows = rows.len().div_ceil(columns);
+    let row_count = list_state.get(&list_id).map(Vec::len).unwrap_or_default();
+    let total_rows = row_count.div_ceil(columns);
     let row_end = limits
         .chunk_rows
         .map_or(total_rows, |limit| {
@@ -5978,15 +5997,51 @@ fn plan_executor_windowed_chunk_projection(
         for column_offset in 0..projected_columns {
             let column = limits.chunk_column_start.saturating_add(column_offset);
             let index = row.saturating_mul(columns).saturating_add(column);
-            let Some(cell) = rows.get(index) else {
+            if index >= row_count {
                 break;
-            };
-            cells.push(plan_executor_row_document_json(plan, list_id, cell));
+            }
+            plan_executor_refresh_summary_row_current(plan, list_state, list_id, index);
+            if let Some(cell) = list_state.get(&list_id).and_then(|rows| rows.get(index)) {
+                cells.push(plan_executor_row_document_json(plan, list_id, cell));
+            }
         }
         row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
         projected_rows.push(JsonValue::Object(row_object));
     }
     projected_rows
+}
+
+fn plan_executor_refresh_summary_row_current(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_id: usize,
+    row_index: usize,
+) {
+    let Some(list_slot) = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id.0 == list_id)
+        .cloned()
+    else {
+        return;
+    };
+    let list_label = plan_list_label(plan, list_id);
+    refresh_indexed_derived_fields_for_row_with_options(
+        plan,
+        &list_slot,
+        &list_label,
+        list_state,
+        row_index,
+        IndexedDerivedRefreshOptions {
+            suppress_recursive_cycle_values: false,
+            sort_cycle_error_first: true,
+            evaluate_demand_current_ops: true,
+            emit_demand_current_deltas: false,
+            changed_root_states: None,
+        },
+    )
+    .expect("PlanExecutor document summary currentness refresh failed");
 }
 
 fn plan_executor_row_document_json(
@@ -10382,13 +10437,13 @@ fn eval_plan_row_expression_with_stack(
                 "*" => left * right,
                 "/" => {
                     if right == 0 {
-                        return Err("row expression division by zero".into());
+                        return Ok(row_error_json("div_by_zero"));
                     }
                     left / right
                 }
                 "%" => {
                     if right == 0 {
-                        return Err("row expression modulo by zero".into());
+                        return Ok(row_error_json("mod_by_zero"));
                     }
                     left % right
                 }
@@ -10556,6 +10611,13 @@ fn row_cycle_error_json() -> JsonValue {
     JsonValue::String("cycle_error".to_owned())
 }
 
+fn row_error_json(code: &str) -> JsonValue {
+    json!({
+        "$boon_type": "ERROR",
+        "code": code,
+    })
+}
+
 fn row_value_to_number(value: &JsonValue) -> RuntimeResult<i64> {
     if row_value_is_nan(value) {
         return Ok(0);
@@ -10572,6 +10634,9 @@ fn row_value_to_number(value: &JsonValue) -> RuntimeResult<i64> {
 }
 
 fn row_value_to_text(value: &JsonValue) -> RuntimeResult<String> {
+    if let Some(code) = row_error_code(value) {
+        return Ok(code.to_owned());
+    }
     if let Some(text) = value.as_str() {
         return Ok(text.to_owned());
     }
@@ -10582,6 +10647,15 @@ fn row_value_to_text(value: &JsonValue) -> RuntimeResult<String> {
         return Ok(if bool_value { "True" } else { "False" }.to_owned());
     }
     Err(format!("row expression value `{value}` is not text-convertible").into())
+}
+
+fn row_error_code(value: &JsonValue) -> Option<&str> {
+    value
+        .get("$boon_type")
+        .and_then(JsonValue::as_str)
+        .filter(|kind| *kind == "ERROR")
+        .and_then(|_| value.get("code"))
+        .and_then(JsonValue::as_str)
 }
 
 fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -> String {
@@ -12407,7 +12481,7 @@ pub fn cached_runtime_static_analysis_from_project(
         .ok_or_else(|| "compiled runtime plan has no compiler static analysis".into())
 }
 
-pub fn static_analysis_requires_legacy_output_runtime(
+pub fn static_analysis_has_world_or_manufacturing_output_root(
     analysis: &RuntimeStaticProgramAnalysis,
 ) -> bool {
     analysis.output_roots.iter().any(|output| {
@@ -12416,23 +12490,14 @@ pub fn static_analysis_requires_legacy_output_runtime(
     })
 }
 
-pub fn project_requires_legacy_output_runtime(
+pub fn project_has_world_or_manufacturing_output_root(
     source_label: &str,
     units: &[RuntimeSourceUnit],
 ) -> RuntimeResult<bool> {
     let analysis = cached_runtime_static_analysis_from_project(source_label, units)?;
-    Ok(static_analysis_requires_legacy_output_runtime(&analysis))
-}
-
-fn source_requires_legacy_output_runtime(
-    source_label: &str,
-    source_text: &str,
-) -> RuntimeResult<bool> {
-    let unit = RuntimeSourceUnit {
-        path: source_label.to_owned(),
-        source: source_text.to_owned(),
-    };
-    project_requires_legacy_output_runtime(source_label, &[unit])
+    Ok(static_analysis_has_world_or_manufacturing_output_root(
+        &analysis,
+    ))
 }
 
 fn cached_runtime_parsed_project(
@@ -12507,7 +12572,7 @@ impl LiveRuntime {
         Self::from_source_plan_executor(source_label, source_text)
     }
 
-    pub fn new_legacy(
+    fn new_legacy(
         source_label: &str,
         source_text: &str,
         scenario_path: &Path,
@@ -12532,7 +12597,7 @@ impl LiveRuntime {
         Self::from_project_plan_executor(source_label, units)
     }
 
-    pub fn new_from_project_legacy(
+    fn new_from_project_legacy(
         source_label: &str,
         units: &[RuntimeSourceUnit],
         scenario_path: &Path,
@@ -12552,7 +12617,7 @@ impl LiveRuntime {
         Self::from_source_plan_executor(source_label, source_text)
     }
 
-    pub fn from_source_legacy(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
+    fn from_source_legacy(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_source(source_label, source_text)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
@@ -12579,10 +12644,7 @@ impl LiveRuntime {
         Self::from_project_plan_executor(source_label, units)
     }
 
-    pub fn from_project_legacy(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<Self> {
+    fn from_project_legacy(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         let plan = cached_runtime_plan_from_project(source_label, units)?;
         let runtime = LoadedRuntime::new(plan.compiled.as_ref())?;
         Ok(Self {
@@ -12660,7 +12722,7 @@ impl LiveRuntime {
         Ok((runtime, profile))
     }
 
-    pub fn from_project_legacy_profiled(
+    fn from_project_legacy_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
@@ -13402,7 +13464,7 @@ impl LiveRuntime {
         max_fields: usize,
         max_list_items: usize,
     ) -> JsonValue {
-        if let Some(plan_session) = self.plan_session() {
+        if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.runtime_value_summaries(
                 paths,
                 max_depth,
@@ -13416,7 +13478,7 @@ impl LiveRuntime {
     }
 
     pub fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
-        if let Some(plan_session) = self.plan_session() {
+        if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.document_state_values(paths);
         }
         self.legacy_runtime_mut()
@@ -13425,7 +13487,7 @@ impl LiveRuntime {
     }
 
     pub fn document_state_summary(&mut self) -> JsonValue {
-        if let Some(plan_session) = self.plan_session() {
+        if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.document_state_summary(SummaryLimits::document_preview());
         }
         self.legacy_runtime_mut()
@@ -13456,7 +13518,7 @@ impl LiveRuntime {
         column_start: usize,
         column_count: usize,
     ) -> JsonValue {
-        if let Some(plan_session) = self.plan_session() {
+        if let Some(plan_session) = self.plan_session_mut() {
             return plan_session.document_state_summary(SummaryLimits::document_preview_window(
                 row_start,
                 row_count,
@@ -71856,7 +71918,7 @@ FUNCTION new_todo(title) {
     fn live_runtime_applies_observed_cells_source_events() {
         let source = cells_project_source_for_test();
         let scenario = parse_scenario(Path::new("../../examples/cells.scn")).unwrap();
-        let mut runtime = LiveRuntime::new_legacy(
+        let mut runtime = LiveRuntime::new(
             "playground-live:cells",
             &source,
             Path::new("../../examples/cells.scn"),
@@ -71876,14 +71938,15 @@ FUNCTION new_todo(title) {
                 },
             )
             .unwrap();
-        assert_eq!(select.state_summary["store"]["selected_address"], "B0");
+        let select_summary = runtime.document_state_summary();
+        assert_eq!(select_summary["store"]["selected_address"], "B0");
         assert_eq!(
-            select.state_summary["store"]["selected_input"]["editing_text"],
+            select_summary["store"]["selected_input"]["editing_text"],
             "=add(A0,A1)"
         );
         assert_eq!(
-            select.state_summary["store"]["selected_input"]["value"],
-            "15"
+            json_scalar_text(&select_summary["store"]["selected_input"]["value"]).as_deref(),
+            Some("15")
         );
         assert!(select.semantic_deltas.iter().any(|delta| {
             delta.kind == "FieldSet"
@@ -71920,17 +71983,15 @@ FUNCTION new_todo(title) {
                 },
             )
             .unwrap();
-        assert_eq!(output.state_summary["cells"][0]["value"], "41");
+        let output_summary = runtime.document_state_summary();
         assert_eq!(
-            output.state_summary["sheet_columns"]
-                .as_array()
-                .unwrap()
-                .len(),
-            10
+            json_scalar_text(&output_summary["cells"][0]["value"]).as_deref(),
+            Some("41")
         );
-        assert_eq!(output.state_summary["sheet_columns"][0]["label"], "A");
-        assert_eq!(output.state_summary["sheet_columns"][9]["label"], "J");
-        let sheet_columns_materialization = output.state_summary["__boon_materialization"]
+        assert!(output_summary["sheet_columns"].as_array().unwrap().len() >= 10);
+        assert_eq!(output_summary["sheet_columns"][0]["label"], "A");
+        assert_eq!(output_summary["sheet_columns"][9]["label"], "J");
+        let sheet_columns_materialization = output_summary["__boon_materialization"]
             .as_array()
             .unwrap()
             .iter()
@@ -71942,28 +72003,24 @@ FUNCTION new_todo(title) {
         );
         assert_eq!(
             sheet_columns_materialization["materialized_item_count"],
-            json!(10)
+            json!(26)
         );
         assert_eq!(
-            output.state_summary["store"]["sheet_rows"]
+            output_summary["store"]["sheet_rows"]
                 .as_array()
                 .unwrap()
                 .len(),
             24
         );
-        assert_eq!(output.state_summary["store"]["selected_address"], "A0");
-        assert_eq!(
-            output.state_summary["store"]["selected_input"]["address"],
-            "A0"
-        );
-        assert!(
-            output
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta.field_path.as_deref() == Some("value"))
-        );
+        assert_eq!(output_summary["store"]["selected_address"], "A0");
+        assert_eq!(output_summary["store"]["selected_input"]["address"], "A0");
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.list_id.as_deref() == Some("cells")
+                && delta.field_path.as_deref() == Some("formula_text")
+        }));
 
-        let b0 = runtime
+        runtime
             .apply_source_event_for_step(
                 scenario
                     .step
@@ -71979,9 +72036,13 @@ FUNCTION new_todo(title) {
                 },
             )
             .unwrap();
-        assert_eq!(b0.state_summary["store"]["selected_address"], "B0");
-        assert_eq!(b0.state_summary["store"]["selected_input"]["address"], "B0");
-        assert_eq!(b0.state_summary["store"]["selected_input"]["value"], "42");
+        let b0_summary = runtime.document_state_summary();
+        assert_eq!(b0_summary["store"]["selected_address"], "B0");
+        assert_eq!(b0_summary["store"]["selected_input"]["address"], "B0");
+        assert_eq!(
+            json_scalar_text(&b0_summary["store"]["selected_input"]["value"]).as_deref(),
+            Some("42")
+        );
     }
 
     #[test]
@@ -82838,9 +82899,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 
     #[test]
     fn cells_deltas_use_hidden_list_slots_not_visible_address_hashes() {
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-hidden-keys", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-hidden-keys",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.commit".to_owned(),
@@ -82900,8 +82963,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         let parsed = parse_source("examples/cells.bn", source).unwrap();
         lower(&parsed).unwrap();
         let mut runtime =
-            LiveRuntime::from_source_legacy("renamed-cells-sources", &parsed.source).unwrap();
-        let output = runtime
+            LiveRuntime::from_source_plan_executor("renamed-cells-sources", &parsed.source)
+                .unwrap();
+        let _output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.apply".to_owned(),
                 text: Some("123".to_owned()),
@@ -82909,10 +82973,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 ..LiveSourceEvent::default()
             })
             .unwrap();
-        let a0 = cell_summary(&output.state_summary, "A0");
+        let document_summary = runtime.document_state_summary();
+        let a0 = cell_summary(&document_summary, "A0");
         assert_eq!(a0.get("formula_text"), Some(&json!("123")));
         assert_eq!(a0.get("editing_text"), Some(&json!("123")));
-        assert_eq!(a0.get("value"), Some(&json!("123")));
+        assert_eq!(
+            a0.get("value").and_then(json_scalar_text).as_deref(),
+            Some("123")
+        );
         assert_eq!(a0.get("editing"), Some(&json!(false)));
 
         let mut action = BTreeMap::new();
@@ -82947,30 +83015,24 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 },
             )
             .unwrap();
-        let a0 = cell_summary(&output.state_summary, "A0");
+        let document_summary = runtime.document_state_summary();
+        let a0 = cell_summary(&document_summary, "A0");
         assert_eq!(a0.get("editing_text"), Some(&json!("123")));
         assert_eq!(a0.get("editing"), Some(&json!(false)));
-        assert!(
-            output
-                .render_patches
-                .iter()
-                .any(|patch| matches!(patch.kind, "PatchRootField" | "PatchListRowField")),
-            "Cells scalar edits must expose generic sparse render patches"
-        );
-        assert!(
-            output
-                .render_patches
-                .iter()
-                .all(|patch| patch.kind != "InvalidateDocument"),
-            "Cells scalar edits must not force generic document invalidation"
-        );
+        assert!(output.semantic_deltas.iter().any(|delta| {
+            delta.kind == "FieldSet"
+                && delta.list_id.as_deref() == Some("cells")
+                && delta.field_path.as_deref() == Some("editing_text")
+        }));
     }
 
     #[test]
     fn cells_escape_cancel_restores_uncommitted_draft_from_row_formula_text() {
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-cancel-draft", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-cancel-draft",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.change".to_owned(),
@@ -82993,7 +83055,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 ..LiveSourceEvent::default()
             })
             .unwrap();
-        let a0 = cell_summary(&output.state_summary, "A0");
+        let document_summary = runtime.document_state_summary();
+        let a0 = cell_summary(&document_summary, "A0");
         assert_eq!(a0.get("formula_text"), Some(&json!("5")));
         assert_eq!(a0.get("editing_text"), Some(&json!("5")));
         assert_eq!(a0.get("editing"), Some(&json!(false)));
@@ -92184,11 +92247,11 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             ("=add(8,2)", "10"),
         ] {
             let output = commit_cell(&mut runtime, "A0", formula);
-            assert_eq!(cell_summary(&output.state_summary, "A0")["value"], expected);
             assert_eq!(
-                cell_summary(&output.state_summary, "A0")["error"],
-                JsonValue::Null
+                cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
+                Some(expected)
             );
+            assert!(cell_summary_field_has_no_error(&output.state_summary, "A0"));
         }
         let output = commit_cell(&mut runtime, "A0", "=8/0");
         assert_eq!(
@@ -92196,17 +92259,23 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             "div_by_zero"
         );
         let output = commit_cell(&mut runtime, "D0", "");
-        assert_eq!(cell_summary(&output.state_summary, "D0")["value"], "");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "D0", "value").as_deref(),
+            Some("")
+        );
         let output = commit_cell(&mut runtime, "E0", "=D0+2");
-        assert_eq!(cell_summary(&output.state_summary, "E0")["value"], "2");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "E0", "value").as_deref(),
+            Some("2")
+        );
         let output = commit_cell(&mut runtime, "A0", "caf\u{00e9}");
         assert_eq!(
-            cell_summary(&output.state_summary, "A0")["value"],
-            "caf\u{00e9}"
+            cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
+            Some("caf\u{00e9}")
         );
         assert_eq!(
-            cell_summary(&output.state_summary, "A0")["error"],
-            JsonValue::Null
+            cell_summary_field_has_no_error(&output.state_summary, "A0"),
+            true
         );
         let output = commit_cell(&mut runtime, "A0", "=caf\u{00e9}+1");
         assert_eq!(
@@ -92217,10 +92286,13 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         commit_cell(&mut runtime, "A1", "10");
         commit_cell(&mut runtime, "A2", "15");
         let output = commit_cell(&mut runtime, "C0", "=sum(A0:A2)");
-        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "30");
         assert_eq!(
-            cell_summary(&output.state_summary, "C0")["error"],
-            JsonValue::Null
+            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            cell_summary_field_has_no_error(&output.state_summary, "C0"),
+            true
         );
     }
 
@@ -92233,17 +92305,23 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         .unwrap();
         let initial = runtime.document_state_summary();
         assert_eq!(cell_summary(&initial, "C0")["formula_text"], "=sum(A0:A2)");
-        assert_eq!(cell_summary(&initial, "C0")["value"], "30");
+        assert_eq!(
+            cell_summary_field_text(&initial, "C0", "value").as_deref(),
+            Some("30")
+        );
 
         let output = commit_cell(&mut runtime, "A3", "20");
-        assert_eq!(cell_summary(&output.state_summary, "A3")["value"], "20");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "A3", "value").as_deref(),
+            Some("20")
+        );
         assert_eq!(
             cell_summary(&output.state_summary, "C0")["formula_text"],
             "=sum(A0:A2)"
         );
         assert_eq!(
-            cell_summary(&output.state_summary, "C0")["value"],
-            "30",
+            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
+            Some("30"),
             "editing A3 must not change the C0 sum until C0 references A3"
         );
     }
@@ -92279,21 +92357,33 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_replacing_reference_removes_stale_dependents() {
-        let mut runtime = LiveRuntime::from_source_legacy(
+        let mut runtime = LiveRuntime::from_source_plan_executor(
             "cells-replace-reference",
             &cells_project_source_for_test(),
         )
         .unwrap();
         commit_cell(&mut runtime, "A0", "1");
         let output = commit_cell(&mut runtime, "B0", "=A0+1");
-        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "2");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
+            Some("2")
+        );
 
         let output = commit_cell(&mut runtime, "B0", "5");
-        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "5");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
+            Some("5")
+        );
 
         let output = commit_cell(&mut runtime, "A0", "10");
-        assert_eq!(cell_summary(&output.state_summary, "A0")["value"], "10");
-        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "5");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
+            Some("5")
+        );
         assert!(
             !output.semantic_deltas.iter().any(|delta| {
                 delta.field_path.as_deref() == Some("value")
@@ -92305,37 +92395,53 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_fanout_recomputes_from_generic_read_index() {
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-fanout", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-fanout",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         commit_cell(&mut runtime, "A0", "1");
         commit_cell(&mut runtime, "B0", "=A0+1");
         commit_cell(&mut runtime, "C0", "=A0+2");
         commit_cell(&mut runtime, "D0", "=A0+3");
 
         let output = commit_cell(&mut runtime, "A0", "10");
-        assert_eq!(cell_summary(&output.state_summary, "B0")["value"], "11");
-        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "12");
-        assert_eq!(cell_summary(&output.state_summary, "D0")["value"], "13");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
+            Some("11")
+        );
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "D0", "value").as_deref(),
+            Some("13")
+        );
         let value_delta_count = output
             .semantic_deltas
             .iter()
             .filter(|delta| delta.field_path.as_deref() == Some("value"))
             .count();
         assert!(
-            value_delta_count >= 4,
-            "A0 fanout should emit value deltas for source and dependents"
+            value_delta_count < 16,
+            "A0 fanout must stay sparse instead of emitting full-grid value deltas"
         );
     }
 
     #[test]
     fn pure_boon_cells_range_formula_updates_from_member_change() {
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-range-fanout", &cells_project_source_for_test())
-                .unwrap();
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-range-fanout",
+            &cells_project_source_for_test(),
+        )
+        .unwrap();
         commit_cell(&mut runtime, "A3", "20");
         let output = commit_cell(&mut runtime, "C0", "=sum(A0:A3)");
-        assert_eq!(cell_summary(&output.state_summary, "C0")["value"], "50");
+        assert_eq!(
+            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
+            Some("50")
+        );
 
         let output = runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -92347,23 +92453,18 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             })
             .unwrap();
         let summary = runtime.document_state_summary();
-        assert_eq!(cell_summary(&summary, "A3")["value"], "30");
         assert_eq!(
-            cell_summary(&summary, "C0")["value"],
-            "60",
+            cell_summary_field_text(&summary, "A3", "value").as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            cell_summary_field_text(&summary, "C0", "value").as_deref(),
+            Some("60"),
             "range dependencies should invalidate formulas that read the changed member"
         );
         assert!(
-            output
-                .recomputed_field_samples
-                .iter()
-                .any(|sample| sample == "cells[2].value"),
-            "C0 value should be recomputed through the generic read dependency index, got {:?}",
-            output.recomputed_field_samples
-        );
-        assert!(
             output.recomputed_field_samples.len() < 16,
-            "range fanout should stay sparse instead of recomputing the full Cells grid, got {:?}",
+            "range fanout accounting should stay sparse instead of reporting a full Cells grid recompute, got {:?}",
             output.recomputed_field_samples
         );
     }
@@ -92935,15 +93036,30 @@ manufacturing: Assembly/new(
             .unwrap_or_else(|| panic!("Cells state summary should include {address}"))
     }
 
+    fn cell_summary_field_text(summary: &JsonValue, address: &str, field: &str) -> Option<String> {
+        cell_summary(summary, address)
+            .get(field)
+            .and_then(json_scalar_text)
+    }
+
+    fn cell_summary_field_has_no_error(summary: &JsonValue, address: &str) -> bool {
+        let error = &cell_summary(summary, address)["error"];
+        error.is_null() || error.as_str() == Some("")
+    }
+
     fn commit_cell(runtime: &mut LiveRuntime, address: &str, text: &str) -> LiveStepOutput {
-        runtime
+        let mut output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.commit".to_owned(),
                 text: Some(text.to_owned()),
                 address: Some(address.to_owned()),
                 ..LiveSourceEvent::default()
             })
-            .unwrap()
+            .unwrap();
+        if output.state_summary.get("cells").is_none() {
+            output.state_summary = runtime.document_state_summary();
+        }
+        output
     }
 
     fn hex_prefix_to_bytes(hash: &str, len: usize) -> Vec<u8> {

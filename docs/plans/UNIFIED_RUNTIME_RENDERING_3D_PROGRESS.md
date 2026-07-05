@@ -723,30 +723,31 @@ Subagent read-only reviews before implementation found:
   TodoMVC preview E2E/report debt rather than Cells product latency.
 - `ProductRenderGraph` remains an executor/reporting wrapper around retained
   renderer caches, not a full renderer-owned `ProductFrameGraph` yet.
-- The safest runtime slice was to split native construction by supported
-  surface instead of globally flipping `LiveRuntime::from_project`, because
-  `world:` and `manufacturing:` outputs still depend on explicit legacy
-  lowering.
+- Historical note: this slice originally split native construction because
+  `world:` and `manufacturing:` outputs still depended on explicit legacy
+  lowering. That dependency was later removed by the PlanExecutor output-root
+  evaluator; native construction should now stay PlanExecutor-backed for those
+  output roots.
 
 What changed:
 
 - `CompilerStaticProgramAnalysis` now includes typed output-root metadata:
   root name, output kind, typed-contract flag, and generic-output-port flag.
-- `boon_runtime` exposes
-  `project_requires_legacy_output_runtime(...)`, which classifies projects with
-  `world` or `manufacturing` output roots as requiring explicit legacy output
-  runtime for now. The classifier is generic output-root metadata, not example
-  names or source-string matching.
-- `LiveRuntime` now has explicit `from_source_legacy`,
-  `from_project_legacy`, and `from_project_legacy_profiled` constructors. The
-  old default constructor names still delegate to these legacy constructors for
-  compatibility, but profiles now report `engine=legacy_generic_runtime` and
-  `generic_fallback_enabled=true`.
+- `boon_runtime` now exposes
+  `project_has_world_or_manufacturing_output_root(...)`, which classifies
+  projects with `world` or `manufacturing` output roots without implying a
+  legacy runtime requirement. The classifier is generic output-root metadata,
+  not example names or source-string matching.
+- `LiveRuntime` keeps explicit private legacy constructors for in-crate
+  diagnostics and old oracle tests, while public/default constructors use
+  PlanExecutor. Legacy profiles report `engine=legacy_generic_runtime` and
+  `generic_fallback_enabled=true` only when those diagnostics are invoked
+  explicitly.
 - Native preview shared runtime construction, ReplaceCode runtime reinstall,
-  and operator-host request-local fallback now call a single native selector:
-  document-only projects use profiled PlanExecutor sessions, while `world:` /
-  `manufacturing:` projects use explicit legacy diagnostics with
-  `legacy_runtime_fallback_hidden=false`.
+  and operator-host request-local fallback now call the PlanExecutor runtime
+  path. Document projects and `world:` / `manufacturing:` output-root projects
+  both report PlanExecutor provenance; the output-root classifier no longer
+  implies a legacy runtime requirement.
 - Operator-host input ACKs now expose `runtime_provenance`,
   `runtime_engine`, and `runtime_generic_fallback_enabled`, and the native E2E
   schema/contract requires document-preview reports to prove
@@ -36369,3 +36370,75 @@ Current interpretation:
 
 - The remaining explicit legacy smoke path is still present, but it no longer
   pollutes normal verifier output with a large state-summary dump.
+
+## 2026-07-05 - PlanExecutor Output Roots And Cells Summary Currentness
+
+Status: implemented as a focused cleanup/currentness checkpoint. This is not
+full legacy removal.
+
+What changed:
+
+- Renamed the output-root classifier from legacy-requirement wording to
+  `project_has_world_or_manufacturing_output_root(...)`; world/manufacturing
+  output roots no longer imply a legacy runtime path.
+- Made `LiveRuntime` legacy constructors private to `boon_runtime`; public
+  construction and native preview construction stay PlanExecutor-backed.
+- Native preview profile/report fields now use
+  `has_world_or_manufacturing_output_root` plus
+  `legacy_runtime_fallback_hidden=false`, instead of claiming an output-root
+  legacy requirement.
+- PlanExecutor document-summary reads now act as a generic currentness barrier
+  for exposed indexed rows:
+  - direct list summaries refresh only the bounded summary window;
+  - `List/find` projections refresh only the matched row;
+  - `List/chunk` projections refresh only the visible chunk window.
+- PlanExecutor row arithmetic now returns Boon error values for division/modulo
+  by zero, and row text conversion can expose Boon error codes instead of
+  aborting the evaluator.
+- A focused Cells public-behavior slice now runs on PlanExecutor for selected
+  input currentness, source rename/cancel behavior, hidden row-key deltas,
+  formula reference replacement, fanout visible values, and range visible
+  values.
+
+What remains intentionally not claimed:
+
+- Broad Cells formula error/parse semantics are not fully migrated to
+  PlanExecutor. Non-ASCII formula parsing and some formula dependency/value
+  cases still need a dedicated formula-evaluator slice.
+- Legacy-style `recomputed_field_samples` accounting is not populated by
+  PlanExecutor for demand-current summary reads; tests now assert current
+  visible values and sparse/no-full-grid behavior where that is the product
+  contract.
+- Many old runtime tests still use private legacy constructors as explicit
+  diagnostics. They are no longer public API, but they are not deleted yet.
+
+Evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime -p boon_native_playground -p xtask`: pass.
+- `cargo test -q -p boon_native_playground native_preview_runtime_selector -- --nocapture`:
+  pass.
+- Focused runtime tests passed:
+  - `live_runtime_applies_observed_cells_source_events`
+  - `cells_deltas_use_hidden_list_slots_not_visible_address_hashes`
+  - `cells_edit_state_updates_are_derived_from_ir_branches`
+  - `cells_escape_cancel_restores_uncommitted_draft_from_row_formula_text`
+  - `pure_boon_cells_replacing_reference_removes_stale_dependents`
+  - `pure_boon_cells_fanout_recomputes_from_generic_read_index`
+  - `pure_boon_cells_range_formula_updates_from_member_change`
+  - `pure_boon_cells_helpers_support_documented_arithmetic_ops` remains an
+    explicit legacy diagnostic until PlanExecutor formula error semantics are
+    completed.
+  - `cells_unrelated_row_commit_preserves_default_sum_until_formula_changes`
+    remains an explicit legacy diagnostic until the PlanExecutor formula
+    dependency/value bug is fixed.
+
+Current interpretation:
+
+- Product/native construction is no longer depending on a legacy output-root
+  path, and PlanExecutor document summaries no longer expose stale selected
+  Cells values.
+- The remaining visible `legacy` terms are not all equal: some are negative
+  gates or historical docs, some are explicit diagnostics, and some are old
+  runtime tests still waiting for PlanExecutor migration or deletion.

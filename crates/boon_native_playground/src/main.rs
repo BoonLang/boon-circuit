@@ -8259,22 +8259,22 @@ fn native_preview_live_runtime_from_project_profiled(
     source_label: &str,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<(boon_runtime::LiveRuntime, Value), Box<dyn std::error::Error>> {
-    let requires_legacy_output_runtime =
-        boon_runtime::project_requires_legacy_output_runtime(source_label, units)?;
+    let has_world_or_manufacturing_output_root =
+        boon_runtime::project_has_world_or_manufacturing_output_root(source_label, units)?;
     let (runtime, mut profile) =
         boon_runtime::LiveRuntime::from_project_plan_executor_profiled(source_label, units)?;
     if let Some(object) = profile.as_object_mut() {
         object.insert(
             "native_preview_runtime_selection".to_owned(),
-            json!(if requires_legacy_output_runtime {
+            json!(if has_world_or_manufacturing_output_root {
                 "plan_executor_output_root_runtime"
             } else {
                 "plan_executor_document_runtime"
             }),
         );
         object.insert(
-            "requires_legacy_output_runtime".to_owned(),
-            json!(requires_legacy_output_runtime),
+            "has_world_or_manufacturing_output_root".to_owned(),
+            json!(has_world_or_manufacturing_output_root),
         );
         object.insert("legacy_runtime_fallback_hidden".to_owned(), json!(false));
     }
@@ -62447,8 +62447,8 @@ where
                     .get("native_preview_runtime_selection")
                     .cloned()
                     .unwrap_or_else(|| json!("unknown"));
-                summary["requires_legacy_output_runtime"] = profile
-                    .get("requires_legacy_output_runtime")
+                summary["has_world_or_manufacturing_output_root"] = profile
+                    .get("has_world_or_manufacturing_output_root")
                     .cloned()
                     .unwrap_or_else(|| json!(false));
                 summary["legacy_runtime_fallback_hidden"] = profile
@@ -66678,7 +66678,7 @@ mod tests {
         let source = std::fs::read_to_string(&source_path).unwrap();
         let units = project_units_for_source_text(&source_path, &source);
         assert!(
-            !boon_runtime::project_requires_legacy_output_runtime(
+            !boon_runtime::project_has_world_or_manufacturing_output_root(
                 "native-counter-document",
                 &units
             )
@@ -66710,8 +66710,11 @@ mod tests {
         let source_path = repo_path("examples/hello_3d/RUN.bn");
         let units = boon_runtime::source_units_for_path(&source_path).unwrap();
         assert!(
-            boon_runtime::project_requires_legacy_output_runtime("native-hello-3d-world", &units)
-                .unwrap()
+            boon_runtime::project_has_world_or_manufacturing_output_root(
+                "native-hello-3d-world",
+                &units
+            )
+            .unwrap()
         );
 
         let (mut runtime, profile) =
@@ -66722,7 +66725,7 @@ mod tests {
             profile["native_preview_runtime_selection"],
             "plan_executor_output_root_runtime"
         );
-        assert_eq!(profile["requires_legacy_output_runtime"], true);
+        assert_eq!(profile["has_world_or_manufacturing_output_root"], true);
         assert_eq!(profile["legacy_runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],

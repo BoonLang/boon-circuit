@@ -5719,22 +5719,13 @@ fn verify_bytes_storage_profile_report(
             )
             .into());
         }
-        let host_boundary_case = matches!(
-            id,
-            "fixed-bank-file-write-after-set-no-copy"
-                | "dynamic-file-write-source-payload-no-copy"
-                | "dynamic-large-file-write-source-payload-shared-no-copy"
-                | "indexed-file-write-source-payload-no-copy"
-                | "indexed-file-read-row-field-path-no-copy"
-        );
-        if !host_boundary_case
-            && case
-                .get("legacy_comparison_enabled")
-                .and_then(JsonValue::as_bool)
-                != Some(true)
+        if case
+            .get("legacy_comparison_enabled")
+            .and_then(JsonValue::as_bool)
+            != Some(false)
         {
             return Err(format!(
-                "{} verify-bytes-storage-profile case `{id}` must keep legacy comparison enabled",
+                "{} verify-bytes-storage-profile case `{id}` must keep legacy comparison disabled; this is a PlanExecutor storage proof",
                 report_path.display()
             )
             .into());
@@ -35421,6 +35412,22 @@ mod tests {
             "legacy_semantic_delta_count": semantic_deltas.as_array().map(Vec::len).unwrap_or_default(),
             "legacy_render_patch_count": 1
         });
+        let command_report_assembly_core = json!({
+            "executor": "cpu-plan-source-route-command-report-assembly-v1",
+            "legacy_passed": true,
+            "legacy_required_for_status": true,
+            "plan_executor_status": "pass",
+            "comparison_status": "pass",
+            "accepted_for_product_status": "pass",
+            "status": "pass",
+            "report_status_basis": "plan-executor-plus-explicit-legacy-comparison",
+            "exit_status": 0,
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "graph_rebuild_count": 0,
+            "graph_clones_per_item": 0
+        });
         let plan_executor = json!({
             "executor": "cpu-plan-source-route-v1",
             "source": source_route,
@@ -35454,7 +35461,7 @@ mod tests {
             "status": "pass",
             "report_version": 1,
             "command": "run-plan-route",
-            "command_argv": ["boon_cli", "run-plan-route", source_path_string],
+            "command_argv": ["boon_cli", "run-plan-route", source_path_string, "--diagnostic-compare-legacy"],
             "measurement_mode": "proof",
             "exit_status": 0,
             "generated_at_utc": SystemTime::now()
@@ -35490,7 +35497,8 @@ mod tests {
                 {"id": "legacy-route-parity", "pass": true}
             ],
             "artifact_sha256s": [],
-            "plan_executor": plan_executor
+            "plan_executor": plan_executor,
+            "command_report_assembly_core": command_report_assembly_core
         })
     }
 
@@ -35541,6 +35549,28 @@ mod tests {
             "legacy_state_summary": expected.state_summary,
             "step_comparisons": legacy_steps,
         });
+        let legacy_comparison_acceptance = json!({
+            "executor": "cpu-plan-root-scenario-demand-current-acceptance-v1",
+            "accepted": false,
+            "reason": "exact legacy comparison passed"
+        });
+        let command_report_assembly_core = json!({
+            "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
+            "legacy_passed": true,
+            "legacy_accepted": true,
+            "legacy_required_for_status": true,
+            "plan_executor_status": "pass",
+            "comparison_status": "pass",
+            "accepted_for_product_status": "pass",
+            "status": "pass",
+            "report_status_basis": "plan-executor-plus-explicit-legacy-comparison",
+            "exit_status": 0,
+            "runtime_ast_eval_count": 0,
+            "executable_string_path_count": 0,
+            "unknown_plan_op_count": 0,
+            "graph_rebuild_count": 0,
+            "graph_clones_per_item": 0
+        });
         let plan_executor = json!({
             "executor": "cpu-plan-root-list-scenario-v1",
             "selected_step_count": expected_steps.len(),
@@ -35573,8 +35603,13 @@ mod tests {
         report["command_argv"] = json!([
             "boon_cli",
             "run-plan-root-scalar-scenario",
-            source_path_string
+            source_path_string,
+            "--diagnostic-compare-legacy"
         ]);
+        report["plan_executor_status"] = json!("pass");
+        report["accepted_for_product_status"] = json!("pass");
+        report["comparison_status"] = json!("pass");
+        report["report_status_basis"] = json!("plan-executor-plus-explicit-legacy-comparison");
         report["source_path"] = json!(source_path.display().to_string());
         report["source_hash"] = json!(source_hash);
         report["source_files"] = json!([source_path.display().to_string()]);
@@ -35593,12 +35628,14 @@ mod tests {
         report["semantic_delta_signatures"] = plan_executor["semantic_delta_signatures"].clone();
         report["semantic_deltas"] = expected.semantic_deltas;
         report["legacy_comparison"] = legacy_comparison;
+        report["legacy_comparison_acceptance"] = legacy_comparison_acceptance;
         report["per_step_pass_fail"] = json!([
             {"id": "machine-plan-verified", "pass": true},
             {"id": "cpu-plan-root-list-scenario-executed", "pass": true},
             {"id": "legacy-root-scenario-parity", "pass": true}
         ]);
         report["plan_executor"] = plan_executor;
+        report["command_report_assembly_core"] = command_report_assembly_core;
         report
     }
 

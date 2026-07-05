@@ -36872,3 +36872,49 @@ Current interpretation:
   `compare_legacy=true` into diagnostic-only accounting, then continue
   replacing remaining `LoadedRuntime`/`GenericScheduledRuntime` coverage with
   PlanExecutor or deleting obsolete comparison reports.
+
+## 2026-07-05 - BYTES Storage Proofs Made Product-Only
+
+Status: removed another verifier/control-plane dependency on legacy comparison.
+BYTES storage-profile and fixed-warm-tick proof gates now run PlanExecutor
+product reports with legacy comparison disabled.
+
+What changed:
+
+- All `verify-bytes-storage-profile` cases now call
+  `run_plan_root_scalar_scenario(..., compare_legacy=false, ...)`.
+- `verify-bytes-fixed-warm-tick` now runs root and indexed warm-tick proofs with
+  `compare_legacy=false`.
+- The fixed-warm-tick gate no longer has legacy-parity checks in
+  `per_step_pass_fail`; it verifies no-fallback execution, zero byte-buffer
+  counters, fixed-bank access, and indexed execution counts.
+- Storage-profile schema now requires `legacy_comparison_enabled=false` for
+  every case, not only host-boundary cases.
+- Fixed-warm-tick reports include
+  `legacy_comparison_required_for_status=false` and
+  `legacy_comparison_mode=diagnostic-only-not-run`.
+
+Evidence:
+
+- `cargo xtask verify-bytes-storage-profile --report
+  target/reports/bytes-plan/bytes-storage-profile-product-only.json`: pass.
+- `cargo xtask verify-bytes-fixed-warm-tick --report
+  target/reports/bytes-plan/bytes-fixed-warm-tick-product-only.json`: pass.
+- `cargo xtask verify-report-schema
+  target/reports/bytes-plan/bytes-storage-profile-product-only.json`: pass.
+- `cargo xtask verify-report-schema
+  target/reports/bytes-plan/bytes-fixed-warm-tick-product-only.json`: pass.
+- Compact storage summary: all 14 storage cases report `status=pass` and
+  `legacy_comparison_enabled=false`.
+- Compact fixed-warm summary: `status=pass`,
+  `legacy_comparison_required_for_status=false`, and
+  `legacy_comparison_mode=diagnostic-only-not-run`.
+
+Current interpretation:
+
+- The BYTES storage proof path is now PlanExecutor/no-fallback evidence, not
+  legacy parity evidence.
+- Remaining `compare_legacy` fields in `boon_plan_executor` are diagnostic
+  report plumbing. Remaining legacy architecture work is mostly the explicit
+  `LoadedRuntime`/`GenericScheduledRuntime` island plus broader xtask aggregate
+  accounting and PlanExecutor expression/list coverage.

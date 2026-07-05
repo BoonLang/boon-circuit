@@ -5517,17 +5517,6 @@ fn verify_bytes_storage_profile_report(
             )
             .into());
         }
-        if case
-            .get("legacy_comparison_enabled")
-            .and_then(JsonValue::as_bool)
-            != Some(false)
-        {
-            return Err(format!(
-                "{} verify-bytes-storage-profile case `{id}` must keep legacy comparison disabled; this is a PlanExecutor storage proof",
-                report_path.display()
-            )
-            .into());
-        }
         let counters = case
             .get("bytes_storage_counters")
             .and_then(JsonValue::as_object)
@@ -6348,17 +6337,6 @@ fn verify_bytes_storage_profile_report(
             }
         }
         if id == "fixed-bank-file-write-after-set-no-copy" {
-            if case
-                .get("legacy_comparison_enabled")
-                .and_then(JsonValue::as_bool)
-                != Some(false)
-            {
-                return Err(format!(
-                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
-                    report_path.display()
-                )
-                .into());
-            }
             let evidence = case
                 .get("borrowed_read_evidence")
                 .and_then(JsonValue::as_object)
@@ -6532,17 +6510,6 @@ fn verify_bytes_storage_profile_report(
             let expected_byte_len = expected_bytes.len() as u64;
             let expected_first_byte = expected_bytes.first().copied().unwrap_or(0) as u64;
             let expected_last_byte = expected_bytes.last().copied().unwrap_or(0) as u64;
-            if case
-                .get("legacy_comparison_enabled")
-                .and_then(JsonValue::as_bool)
-                != Some(false)
-            {
-                return Err(format!(
-                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
-                    report_path.display()
-                )
-                .into());
-            }
             let evidence = case
                 .get("borrowed_read_evidence")
                 .and_then(JsonValue::as_object)
@@ -6814,17 +6781,6 @@ fn verify_bytes_storage_profile_report(
             }
         }
         if id == "indexed-file-write-source-payload-no-copy" {
-            if case
-                .get("legacy_comparison_enabled")
-                .and_then(JsonValue::as_bool)
-                != Some(false)
-            {
-                return Err(format!(
-                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/write_bytes proof",
-                    report_path.display()
-                )
-                .into());
-            }
             let evidence = case
                 .get("borrowed_read_evidence")
                 .and_then(JsonValue::as_object)
@@ -7059,17 +7015,6 @@ fn verify_bytes_storage_profile_report(
             }
         }
         if id == "indexed-file-read-row-field-path-no-copy" {
-            if case
-                .get("legacy_comparison_enabled")
-                .and_then(JsonValue::as_bool)
-                != Some(false)
-            {
-                return Err(format!(
-                    "{} verify-bytes-storage-profile case `{id}` must explicitly disable legacy comparison for host-boundary File/read_bytes proof",
-                    report_path.display()
-                )
-                .into());
-            }
             let evidence = case
                 .get("borrowed_read_evidence")
                 .and_then(JsonValue::as_object)

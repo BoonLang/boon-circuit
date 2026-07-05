@@ -36722,3 +36722,51 @@ Evidence:
   pass, `70` tests.
 - `cargo test -q -p boon_runtime cells_plan_executor_scenario_events_are_product_only -- --nocapture`:
   pass in `197.26s`.
+
+## 2026-07-05 - Removed Root Legacy Comparison Assembly And Bytes Legacy Flag
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Deleted the unused `RootScenarioLegacyStepComparisonInput`,
+  `RootScenarioLegacyComparisonAssembly`, and
+  `assemble_root_scenario_legacy_comparison(...)` surface from
+  `boon_plan_executor`.
+- Changed `verify-compiler-boundaries` from checking that root-scenario legacy
+  comparison assembly had been extracted into PlanExecutor to checking that the
+  product architecture no longer contains that assembly at all.
+- Removed the stale `compare_legacy=false` field from root-scenario command
+  output core.
+- Removed the all-false `BytesStorageProfileCase.compare_legacy` toggle and
+  stopped emitting `legacy_comparison_enabled=false` in BYTES storage profile
+  case reports.
+- Removed report-schema requirements that BYTES storage profile cases carry the
+  legacy-disabled sentinel; those reports are now proven by PlanExecutor
+  fallback counters, storage counters, and host-boundary evidence instead.
+
+Current interpretation:
+
+- This is another control-plane cleanup cut. It removes one unused enabled
+  legacy comparison assembly and one stale false legacy sentinel from active
+  reports.
+- Root-scalar/source-route reports still carry disabled `legacy_comparison` /
+  `legacy_comparison_acceptance` objects, and runtime tests still assert some
+  of those disabled shapes. That needs a separate report-schema migration.
+- `LoadedRuntime` / `GenericScheduledRuntime` still remain as an implementation
+  island and are not removed by this slice.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p boon_cli -p boon_report_schema -p xtask`:
+  pass.
+- `cargo test -q -p boon_plan_executor root_scenario_command_output_assembles_report_and_executor_core -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_report_schema --lib -- --nocapture`:
+  pass, `70` tests.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
+  pass; `compiler-boundaries:planexecutor-root-scenario-legacy-comparison-removed`
+  is true and blocker count is zero.
+- `cargo run -q -p xtask -- verify-bytes-storage-profile --report target/reports/bytes-plan/bytes-storage-profile.json`:
+  pass; fresh report has `case_count=14` and zero
+  `legacy_comparison_enabled` fields.

@@ -589,22 +589,6 @@ pub fn assemble_source_route_command_output(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RootScenarioLegacyStepComparisonInput {
-    pub step_id: String,
-    pub legacy_state_summary: JsonValue,
-    pub legacy_semantic_delta_signatures: Vec<String>,
-    pub legacy_semantic_deltas: JsonValue,
-    pub plan_semantic_delta_signatures: Vec<JsonValue>,
-    pub plan_semantic_deltas: JsonValue,
-    pub touched_state_summary: JsonMap<String, JsonValue>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RootScenarioLegacyComparisonAssembly {
-    pub comparison: JsonValue,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RootScenarioCommandReportInput {
     pub command_argv: Vec<String>,
     pub generated_at_utc: String,
@@ -12087,91 +12071,6 @@ where
     })
 }
 
-pub fn assemble_root_scenario_legacy_comparison(
-    plan_state_summary: &JsonValue,
-    final_legacy_state_summary: &JsonValue,
-    step_inputs: Vec<RootScenarioLegacyStepComparisonInput>,
-) -> PlanExecutorResult<RootScenarioLegacyComparisonAssembly> {
-    let mut state_match = true;
-    let mut semantic_delta_match = true;
-    let mut step_comparisons = Vec::new();
-
-    for input in step_inputs {
-        let plan_signature_strings = input
-            .plan_semantic_delta_signatures
-            .iter()
-            .map(|signature| {
-                signature.as_str().map(str::to_owned).ok_or_else(|| {
-                    format!(
-                        "plan semantic delta signature for step `{}` is not a string",
-                        input.step_id
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let step_delta_match = plan_signature_strings == input.legacy_semantic_delta_signatures
-            && input.plan_semantic_deltas == input.legacy_semantic_deltas;
-        semantic_delta_match &= step_delta_match;
-
-        let mut touched_state_match = true;
-        for (path, plan_value) in &input.touched_state_summary {
-            let legacy_value = json_value_at_dotted_path(&input.legacy_state_summary, path)
-                .ok_or_else(|| format!("legacy state summary is missing `{path}`"))?;
-            if legacy_value != plan_value {
-                touched_state_match = false;
-            }
-        }
-        state_match &= touched_state_match;
-
-        step_comparisons.push(json!({
-            "executor": "cpu-plan-root-scenario-legacy-step-comparison-v1",
-            "step_id": input.step_id,
-            "state_match": touched_state_match,
-            "semantic_delta_match": step_delta_match,
-            "legacy_semantic_delta_signatures": input.legacy_semantic_delta_signatures,
-            "legacy_semantic_deltas": input.legacy_semantic_deltas,
-            "plan_semantic_delta_signatures": input.plan_semantic_delta_signatures,
-            "plan_semantic_deltas": input.plan_semantic_deltas,
-            "touched_state_summary": JsonValue::Object(input.touched_state_summary),
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
-        }));
-    }
-
-    let final_plan_state = plan_state_summary
-        .as_object()
-        .ok_or("plan state summary is not an object")?;
-    let mut legacy_final_projection = JsonMap::new();
-    for (path, plan_value) in final_plan_state {
-        let legacy_value = json_value_at_dotted_path(final_legacy_state_summary, path)
-            .ok_or_else(|| format!("legacy final state summary is missing `{path}`"))?;
-        legacy_final_projection.insert(path.clone(), legacy_value.clone());
-        if legacy_value != plan_value {
-            state_match = false;
-        }
-    }
-
-    let comparison = json!({
-        "executor": "cpu-plan-root-scenario-legacy-comparison-assembly-v1",
-        "enabled": true,
-        "passed": state_match && semantic_delta_match,
-        "state_match": state_match,
-        "semantic_delta_match": semantic_delta_match,
-        "plan_state_summary": plan_state_summary,
-        "legacy_state_summary": JsonValue::Object(legacy_final_projection),
-        "step_comparisons": step_comparisons,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
-    Ok(RootScenarioLegacyComparisonAssembly { comparison })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_source_route_report(
     plan: &MachinePlan,
@@ -12410,7 +12309,6 @@ pub fn assemble_root_scenario_command_output(
     let command_output_core = json!({
         "executor": "cpu-plan-root-scenario-command-output-v1",
         "selected_step_count": input.selected_step_ids.len(),
-        "compare_legacy": false,
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
         "unknown_plan_op_count": 0,

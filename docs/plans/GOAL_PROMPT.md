@@ -33,8 +33,12 @@ Current checkpoint:
   fields on `run-plan-scenario-events`; and `verify-compiler-boundaries` has a
   dedicated check that this product path cannot regain legacy comparison
   plumbing. Do not reintroduce disabled legacy fields to make old reports pass.
-  The next legacy cuts are root-scalar/source-route diagnostic report contracts
-  and the `LoadedRuntime` / `GenericScheduledRuntime` implementation island.
+  The unused enabled root-scenario legacy comparison assembly has also been
+  deleted, `verify-compiler-boundaries` now checks that it stays removed, and
+  BYTES storage profile reports no longer emit `legacy_comparison_enabled=false`
+  sentinels. The next legacy cuts are root-scalar/source-route disabled legacy
+  report contracts and the `LoadedRuntime` / `GenericScheduledRuntime`
+  implementation island.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,
   `default_switch_allowed=true`, TodoMVC compare, Cells compare, explicit
   legacy smoke, and default PlanExecutor execution all schema-valid.

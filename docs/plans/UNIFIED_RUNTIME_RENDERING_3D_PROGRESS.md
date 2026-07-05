@@ -36528,3 +36528,46 @@ Evidence:
 - `git diff --check`: pass.
 - `cargo check -q -p boon_cli -p boon_runtime -p boon_plan_executor -p boon_report_schema -p xtask`:
   pass.
+
+## 2026-07-05 - Scenario Events Runtime Legacy Compare Switch Removed
+
+Status: implemented and focused-verified in this slice.
+
+What changed:
+
+- Removed the `compare_legacy` parameter from
+  `run_plan_scenario_events(...)`; the scenario-event product API can no longer
+  execute `LoadedRuntime` comparison.
+- Deleted the runtime bridge helper that replayed selected scenario steps
+  through `LiveRuntime::from_project_legacy(...)` and assembled legacy
+  comparison data.
+- Deleted the now-unused bulk `runtime_source_units_from_compiler(...)` helper
+  that existed for the old comparison source-unit rebuild path.
+- Updated CLI, runtime tests, and xtask call sites to use product-only
+  scenario-event reports.
+- Adjusted the compiler-boundary audit so it now requires runtime to not import
+  the root-scenario legacy comparison assembly.
+- Rewrote the Cells scenario-events regression to assert product-only
+  PlanExecutor execution, coverage, checkpoints, and list projection evidence
+  instead of legacy delta-coalescing acceptance.
+
+Current interpretation:
+
+- Public CLI legacy compare is gone, and the normal runtime scenario-event API
+  no longer has a hidden boolean that can re-enter `LoadedRuntime`.
+- Schema-compatible `legacy_comparison.enabled=false` fields still remain in
+  scenario-event reports. Removing those report fields is a later report-schema
+  migration; they are no longer executable legacy comparison hooks in this
+  path.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p boon_cli -p xtask`: pass.
+- `cargo test -q -p boon_cli -- --nocapture`: pass.
+- `cargo test -q -p boon_runtime cells_plan_executor_scenario_events_are_product_only -- --nocapture`:
+  pass in `192.02s`.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report target/reports/compiler-boundaries.json`:
+  expected fail on six pre-existing broader extraction blockers; the
+  legacy-comparison/source-unit rebuild blocker from this slice is gone.
+- `cargo check -q -p boon_runtime -p boon_cli -p xtask -p boon_report_schema`:
+  pass.

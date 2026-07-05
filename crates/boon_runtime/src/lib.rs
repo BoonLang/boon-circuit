@@ -71,8 +71,7 @@ use boon_plan_executor::{
     PlanExecutorScenarioCheckpointErrorExpectation, PlanExecutorScenarioCheckpointInput,
     PlanExecutorScenarioStepMeta, RootBytesEnvironment, RootBytesFixedMutation,
     RootBytesUpdateDispatchKind, RootExecutedUpdate, RootJsonSourceEvent,
-    RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput,
-    RootScenarioLegacyStepComparisonInput, RootUpdateCandidateTracker,
+    RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput, RootUpdateCandidateTracker,
     ScenarioEventsCommandOutputInput, SourceRouteCommandOutputInput, SourceRouteExecutionContext,
     SourceRouteExecutionSurface, SourceRouteFullExecution, SourceRouteRuntimeBranchExecutionInput,
     SourceRouteSourceEventReportInput,
@@ -81,7 +80,6 @@ use boon_plan_executor::{
     assemble_root_runtime_branch_update as assemble_plan_root_runtime_branch_update,
     assemble_root_scenario_command_output as assemble_plan_root_scenario_command_output,
     assemble_root_scenario_coverage_report as assemble_plan_root_scenario_coverage_report,
-    assemble_root_scenario_legacy_comparison as assemble_plan_root_scenario_legacy_comparison,
     assemble_root_scenario_report as assemble_plan_root_scenario_report,
     assemble_root_scenario_step_report as assemble_plan_root_scenario_step_report,
     assemble_scenario_events_command_output as assemble_plan_scenario_events_command_output,
@@ -3912,7 +3910,6 @@ pub fn run_plan_scenario_events(
     source_path: &Path,
     scenario_path: &Path,
     target_profile: TargetProfile,
-    compare_legacy: bool,
     report_path: Option<&Path>,
 ) -> RuntimeResult<PlanRootScalarScenarioOutput> {
     let compiled = compile_source_path_to_machine_plan(source_path, target_profile)?;
@@ -3932,22 +3929,11 @@ pub fn run_plan_scenario_events(
         .map(|index| &scenario.step[*index])
         .collect::<Vec<_>>();
     let output = execute_machine_plan_root_scenario_inner(&plan, &all_steps, source_path.parent())?;
-    let units = runtime_source_units_from_compiler(report_context.source_units.clone());
-    let legacy_comparison = if compare_legacy {
-        compare_plan_root_scenario_with_legacy(
-            source_path,
-            &units,
-            &selected_steps,
-            &output.state_summary,
-            &output.per_step,
-        )?
-    } else {
-        json!({
-            "enabled": false,
-            "passed": true,
-            "reason": "legacy comparison was not requested"
-        })
-    };
+    let legacy_comparison = json!({
+        "enabled": false,
+        "passed": true,
+        "reason": "legacy comparison was removed from the product scenario-event path"
+    });
     let demand_current_field_paths = plan_demand_current_field_paths(&plan);
     let legacy_comparison_acceptance = plan_demand_current_semantic_delta_acceptance_policy(
         &legacy_comparison,
@@ -3989,7 +3975,7 @@ pub fn run_plan_scenario_events(
             semantic_deltas: output.semantic_deltas.clone(),
             legacy_comparison,
             legacy_comparison_acceptance,
-            compare_legacy,
+            compare_legacy: false,
             plan_executor_coverage,
             assertion_only_covered,
             plan_executor: output.executor_report.clone(),
@@ -11409,62 +11395,6 @@ fn root_json_source_event_from_live(event: &LiveSourceEvent) -> RootJsonSourceEv
     }
 }
 
-fn compare_plan_root_scenario_with_legacy(
-    source_path: &Path,
-    units: &[RuntimeSourceUnit],
-    selected_steps: &[&ScenarioStep],
-    plan_state_summary: &JsonValue,
-    plan_per_step: &[JsonValue],
-) -> RuntimeResult<JsonValue> {
-    let mut legacy_runtime =
-        LiveRuntime::from_project_legacy(&source_path.display().to_string(), units)?;
-    let mut last_legacy_state_summary = legacy_runtime.state_summary();
-    let mut step_inputs = Vec::new();
-
-    for (step, plan_step) in selected_steps.iter().zip(plan_per_step) {
-        let generic_event = GenericSourceEvent::require(step)?;
-        let legacy_output =
-            legacy_runtime.apply_source_event(live_source_event_from_generic(&generic_event))?;
-        last_legacy_state_summary = legacy_output.state_summary.clone();
-        let legacy_signatures = legacy_output
-            .semantic_deltas
-            .iter()
-            .map(runtime_delta_signature)
-            .collect::<Vec<_>>();
-        let legacy_deltas = serde_json::to_value(&legacy_output.semantic_deltas)?;
-        let plan_signatures = plan_step
-            .get("semantic_delta_signatures")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let plan_deltas = plan_step
-            .get("semantic_deltas")
-            .cloned()
-            .unwrap_or(JsonValue::Array(Vec::new()));
-
-        let touched = plan_step
-            .get("touched_state_summary")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("plan step `{}` is missing touched_state_summary", step.id))?;
-        step_inputs.push(RootScenarioLegacyStepComparisonInput {
-            step_id: step.id.clone(),
-            legacy_state_summary: legacy_output.state_summary.clone(),
-            legacy_semantic_delta_signatures: legacy_signatures,
-            legacy_semantic_deltas: legacy_deltas,
-            plan_semantic_delta_signatures: plan_signatures,
-            plan_semantic_deltas: plan_deltas,
-            touched_state_summary: touched.clone(),
-        });
-    }
-
-    Ok(assemble_plan_root_scenario_legacy_comparison(
-        plan_state_summary,
-        &last_legacy_state_summary,
-        step_inputs,
-    )?
-    .comparison)
-}
-
 fn row_scoped_source_routes<'a>(
     plan: &'a MachinePlan,
     list_slot: &boon_plan::ListStorageSlot,
@@ -13897,13 +13827,6 @@ fn runtime_source_unit_from_compiler(unit: CompilerSourceUnit) -> RuntimeSourceU
         path: unit.path,
         source: unit.source,
     }
-}
-
-fn runtime_source_units_from_compiler(units: Vec<CompilerSourceUnit>) -> Vec<RuntimeSourceUnit> {
-    units
-        .into_iter()
-        .map(runtime_source_unit_from_compiler)
-        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68505,14 +68428,9 @@ FUNCTION icon_code(item) {
             inspection["inspection_result"]["source_file_access"], "not_attempted",
             "{label} artifact inspection must not touch source files"
         );
-        let source_output = run_plan_scenario_events(
-            source,
-            scenario,
-            TargetProfile::SoftwareDefault,
-            false,
-            None,
-        )
-        .unwrap();
+        let source_output =
+            run_plan_scenario_events(source, scenario, TargetProfile::SoftwareDefault, None)
+                .unwrap();
         let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
 
         assert_eq!(
@@ -68581,14 +68499,9 @@ FUNCTION icon_code(item) {
         let artifact_path = temp_root.join("todomvc.boonc");
 
         emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-        let source_output = run_plan_scenario_events(
-            &source,
-            scenario,
-            TargetProfile::SoftwareDefault,
-            false,
-            None,
-        )
-        .unwrap();
+        let source_output =
+            run_plan_scenario_events(&source, scenario, TargetProfile::SoftwareDefault, None)
+                .unwrap();
         std::fs::remove_file(&source).unwrap();
         let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
 
@@ -87431,48 +87344,30 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
     }
 
     #[test]
-    fn cells_plan_executor_coalesces_transient_indexed_value_deltas() {
+    fn cells_plan_executor_scenario_events_are_product_only() {
         std::thread::Builder::new()
-            .name("cells-plan-delta-coalesce".to_owned())
+            .name("cells-plan-product-events".to_owned())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let output = run_plan_scenario_events(
                     Path::new("../../examples/cells.bn"),
                     Path::new("../../examples/cells.scn"),
                     TargetProfile::SoftwareDefault,
-                    true,
                     None,
                 )
-                .expect("Cells expected-source-event scenario should compare through PlanExecutor");
+                .expect("Cells expected-source-event scenario should run through PlanExecutor");
 
                 assert_eq!(
-                    output.report["legacy_comparison"]["state_match"],
-                    true,
-                    "PlanExecutor should preserve Cells state even when legacy emits extra transient cycle deltas"
+                    output.report["legacy_comparison"]["enabled"], false,
+                    "Cells product scenario events must not execute legacy comparison"
                 );
                 assert_eq!(
-                    output.report["legacy_comparison"]["executor"],
-                    "cpu-plan-root-scenario-legacy-comparison-assembly-v1"
+                    output.report["comparison_status"], "not-requested",
+                    "Cells product scenario events should report comparison as not requested"
                 );
                 assert_eq!(
                     output.report["status"], "pass",
-                    "Cells event replay report should pass through the explicit demand-current semantic-delta coalescing policy"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison"]["semantic_delta_match"], false,
-                    "raw legacy semantic-delta mismatch should remain visible"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["accepted"], true,
-                    "demand-current semantic-delta coalescing should be schema-visible acceptance evidence"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["kind"],
-                    "demand-current-coalesced-semantic-deltas"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["executor"],
-                    "cpu-plan-root-scenario-demand-current-acceptance-v1"
+                    "Cells event replay report should pass through the product PlanExecutor path"
                 );
                 assert_eq!(
                     output.report["command_report_assembly_core"]["executor"],
@@ -87505,7 +87400,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 assert_eq!(
                     output.report["plan_executor"]["assertion_checkpoints"]
                         .as_array()
-                        .expect("Cells compare report should expose assertion checkpoints")
+                        .expect("Cells product report should expose assertion checkpoints")
                         .iter()
                         .map(|checkpoint| checkpoint["step_id"].as_str().unwrap().to_owned())
                         .collect::<Vec<_>>(),
@@ -87518,54 +87413,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                         "d0-updated-by-fanout"
                     ]
                 );
-                assert_eq!(output.report["legacy_comparison"]["state_match"], true);
-                let mismatched_steps = output.report["legacy_comparison"]["step_comparisons"]
-                    .as_array()
-                    .expect("Cells compare report should expose per-step comparisons")
-                    .iter()
-                    .filter(|step| step["semantic_delta_match"] != true)
-                    .map(|step| step["step_id"].as_str().unwrap().to_owned())
-                    .collect::<Vec<_>>();
-                let expected_demand_current_delta_mismatches = vec![
-                    "type-a3-literal-20".to_owned(),
-                    "commit-a3-literal-20".to_owned(),
-                    "commit-c0-formula-bar-sum-through-a3".to_owned(),
-                    "edit-a0-literal".to_owned(),
-                    "commit-a0-literal".to_owned(),
-                    "edit-a0-cancel-draft".to_owned(),
-                    "cancel-a0-draft".to_owned(),
-                    "commit-b0-formula".to_owned(),
-                    "change-a0-updates-b0".to_owned(),
-                    "cycle-error".to_owned(),
-                    "replace-b0-formula-removes-stale-cycle-edge".to_owned(),
-                    "change-a0-after-edge-replacement-does-not-recompute-b0".to_owned(),
-                    "commit-c0-fanout-formula".to_owned(),
-                    "commit-d0-fanout-formula".to_owned(),
-                    "commit-j0-visible-grid-edge".to_owned(),
-                    "change-a0-fanout-recomputes-dependents-only".to_owned(),
-                ];
-                assert_eq!(
-                    mismatched_steps,
-                    expected_demand_current_delta_mismatches,
-                    "Cells PlanExecutor should preserve state/assertion parity; demand-current evaluation no longer promises eager legacy semantic-delta parity"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
-                    0,
-                    "demand-current coalescing may omit transient indexed deltas but must not publish extras"
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["missing_delta_field_paths"],
-                    json!(["display_text", "error", "value"])
-                );
-                assert_eq!(
-                    output.report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
-                    json!([])
-                );
             })
-            .expect("Cells compare regression thread should start")
+            .expect("Cells PlanExecutor product scenario thread should start")
             .join()
-            .expect("Cells compare regression should not panic");
+            .expect("Cells PlanExecutor product scenario should not panic");
     }
 
     #[test]

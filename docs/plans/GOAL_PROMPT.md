@@ -168,6 +168,11 @@ Current checkpoint:
   legacy runtime and legacy-comparison replay commands are retired; normal
   refreshes should rely on report files and compact `jq` summaries, with
   `--print-report` only for intentional stdout JSON inspection.
+- `run_plan_scenario_events(...)` is product-only now. It no longer accepts a
+  `compare_legacy` switch or calls the runtime bridge that replayed selected
+  steps through `LoadedRuntime`; scenario-event reports may still carry
+  schema-compatible `legacy_comparison.enabled=false` fields until the report
+  schema migration removes them.
 - The native aggregate now treats a fresh child report whose own `blockers[]`
   are freshness-only as refresh debt, not a true product blocker. This fixed the
   physical TodoMVC reference parity false blocker: after refreshing only

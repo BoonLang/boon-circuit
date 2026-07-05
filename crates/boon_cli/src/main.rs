@@ -117,7 +117,6 @@ fn run_program(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Path::new(source),
                 Path::new(&scenario),
                 target_profile,
-                false,
                 report.as_deref(),
             )?;
             if print_report || !explicit_report {

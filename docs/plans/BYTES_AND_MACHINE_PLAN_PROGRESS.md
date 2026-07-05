@@ -26135,7 +26135,7 @@ What changed:
   to `boon_compiler`.
 - Runtime live cache misses now delegate source text and source-unit
   parse/lower/verify to `boon_compiler`, then record the remaining local
-  `legacy_runtime_compile_ms` for `CompiledProgram::from_ir`.
+  `runtime_program_build_ms` for `CompiledProgram::from_ir`.
 - `verify-compiler-boundaries` now reports
   `boon_compiler.facade_exports_source_units_to_runtime_ir=true` and
   `boundary_decomposition.runtime_live_cache_uses_compiler_runtime_ir_facade=true`.

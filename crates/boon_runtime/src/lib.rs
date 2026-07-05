@@ -10862,7 +10862,7 @@ fn cached_runtime_plan_from_source_profiled(
     let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
     if let Some(profile) = load_pipeline_profile.as_object_mut() {
         profile.insert("compile_ms".to_owned(), json!(compile_ms));
-        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("runtime_program_build_ms".to_owned(), json!(compile_ms));
         profile.insert(
             "total_ms".to_owned(),
             json!(runtime_elapsed_ms(total_started)),
@@ -10922,7 +10922,7 @@ fn cached_full_runtime_plan_from_project_profiled(
         let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
         if let Some(profile) = load_pipeline_profile.as_object_mut() {
             profile.insert("compile_ms".to_owned(), json!(compile_ms));
-            profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+            profile.insert("runtime_program_build_ms".to_owned(), json!(compile_ms));
             profile.insert(
                 "total_ms".to_owned(),
                 json!(runtime_elapsed_ms(total_started)),
@@ -10961,7 +10961,7 @@ fn cached_full_runtime_plan_from_project_profiled(
     let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
     if let Some(profile) = load_pipeline_profile.as_object_mut() {
         profile.insert("compile_ms".to_owned(), json!(compile_ms));
-        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("runtime_program_build_ms".to_owned(), json!(compile_ms));
         profile.insert(
             "total_ms".to_owned(),
             json!(runtime_elapsed_ms(total_started)),
@@ -11010,7 +11010,7 @@ fn cached_runtime_plan_from_project_profiled(
     let mut load_pipeline_profile = compiler_output.load_pipeline_profile;
     if let Some(profile) = load_pipeline_profile.as_object_mut() {
         profile.insert("compile_ms".to_owned(), json!(compile_ms));
-        profile.insert("legacy_runtime_compile_ms".to_owned(), json!(compile_ms));
+        profile.insert("runtime_program_build_ms".to_owned(), json!(compile_ms));
         profile.insert(
             "total_ms".to_owned(),
             json!(runtime_elapsed_ms(total_started)),
@@ -70945,8 +70945,8 @@ FUNCTION new_todo(title) {
         assert_eq!(profile["owner"], "boon_compiler");
         assert_eq!(profile["surface"], "runtime-ir");
         assert!(
-            profile["legacy_runtime_compile_ms"].as_f64().is_some(),
-            "runtime should report only the remaining local legacy schedule build after compiler-owned parse/lower/verify: {profile}"
+            profile["runtime_program_build_ms"].as_f64().is_some(),
+            "runtime should report only the remaining local runtime program build after compiler-owned parse/lower/verify: {profile}"
         );
     }
 
@@ -70963,8 +70963,8 @@ FUNCTION new_todo(title) {
         assert_eq!(profile["owner"], "boon_compiler");
         assert_eq!(profile["surface"], "full-ir");
         assert!(
-            profile["legacy_runtime_compile_ms"].as_f64().is_some(),
-            "runtime full/static cache should report only the remaining local legacy schedule build after compiler-owned full parse/lower/verify: {profile}"
+            profile["runtime_program_build_ms"].as_f64().is_some(),
+            "runtime full/static cache should report only the remaining local runtime program build after compiler-owned full parse/lower/verify: {profile}"
         );
     }
 

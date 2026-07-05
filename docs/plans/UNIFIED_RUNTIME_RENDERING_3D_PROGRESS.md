@@ -25030,7 +25030,7 @@ What changed:
   compiler runtime-IR facade.
 - Live runtime cache misses delegate source text/source-unit parse, runtime
   lowering, and verification to `boon_compiler`; the profile keeps
-  `legacy_runtime_compile_ms` for the still-local `CompiledProgram::from_ir`.
+  `runtime_program_build_ms` for the still-local `CompiledProgram::from_ir`.
 - `verify-compiler-boundaries` now has specific evidence for
   `facade_exports_source_units_to_runtime_ir` and
   `runtime_live_cache_uses_compiler_runtime_ir_facade`.

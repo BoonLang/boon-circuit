@@ -38104,3 +38104,36 @@ Next cut:
   PlanExecutor boundary.
 - Make live runtime constructors take/use the compiled runtime program so the
   runtime no longer needs a parallel typed-program construction/control path.
+
+## 2026-07-06 - Startup Row Expression Refresh Boundary Moved
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Added executor-owned root-aware startup list row refresh in
+  `boon_plan_executor`.
+- Removed runtime's local startup row-expression refresh wrapper and helper
+  copies. Runtime now calls the executor boundary rather than importing the
+  generic `_with` row-expression refresh iterator.
+- Kept generic behavior: no Cells/example branch, no compatibility shim, and no
+  verifier weakening.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_plan_executor
+  list_row_expression_refresh_loop_is_executor_owned`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: schema-valid `status=fail`, now
+  with only one blocker:
+  `boon_runtime live runtime constructors still require a TypedProgram instead
+  of the compiled runtime program`.
+- Fresh report check:
+  `compiler-boundaries:planexecutor-list-row-expression-refresh-extracted`
+  reports `pass=true`.
+
+Next cut:
+
+- Make live runtime constructors use the compiled runtime program instead of
+  keeping TypedProgram as a parallel constructor input.

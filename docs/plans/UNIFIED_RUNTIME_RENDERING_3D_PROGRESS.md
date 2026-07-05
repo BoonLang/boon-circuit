@@ -36891,3 +36891,25 @@ Evidence:
   broader PlanExecutor migration blockers: indexed list row expression refresh
   iteration is not yet PlanExecutor-owned, and live runtime constructors still
   require a `TypedProgram` instead of the compiled runtime program.
+
+## 2026-07-06 - Startup Row Expression Refresh Boundary Moved
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Moved the remaining root-aware startup list row-expression refresh wrapper
+  into `boon_plan_executor`.
+- Removed runtime ownership of the generic startup row-expression refresh
+  iterator. Runtime now calls a single executor-owned root-aware refresh
+  boundary.
+
+Evidence:
+
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_plan_executor
+  list_row_expression_refresh_loop_is_executor_owned`: pass.
+- Fresh `verify-compiler-boundaries` now reports
+  `planexecutor-list-row-expression-refresh-extracted=true`.
+- The only remaining compiler-boundary blocker is live runtime constructors
+  still requiring a `TypedProgram` instead of the compiled runtime program.

@@ -98,7 +98,6 @@ use boon_plan_executor::{
     derived_field_label as plan_derived_field_label, eval_plan_row_expression,
     evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
-    evaluate_initial_root_derived_values_partial as evaluate_plan_initial_root_derived_values_partial,
     evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
     evaluate_root_bytes_write_update,
     evaluate_root_pure_number_compare_values as evaluate_root_pure_number_compare_values_core,
@@ -114,7 +113,8 @@ use boon_plan_executor::{
     initialize_root_state as initialize_plan_root_state, list_label as plan_list_label,
     list_row_default_fields as plan_list_row_default_fields,
     list_row_state_public_rows as plan_list_row_state_public_rows,
-    list_row_state_report_fields as plan_list_row_state_report_fields, local_field_name,
+    list_row_state_report_fields as plan_list_row_state_report_fields,
+    list_row_with_root_values as plan_executor_row_with_root_values, local_field_name,
     materialize_list_projections as materialize_plan_list_projections_core,
     materialize_list_retains as materialize_plan_list_retains_core,
     plan_constant_bytes_for_storage_slot as plan_executor_constant_bytes_for_storage_slot,
@@ -123,7 +123,7 @@ use boon_plan_executor::{
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
     refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
-    refresh_startup_list_row_fields_for_all_lists_with as refresh_plan_startup_list_row_fields_for_all_lists_with,
+    refresh_startup_list_row_fields_for_all_lists_with_root_state as refresh_plan_startup_list_row_fields_for_all_lists,
     remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
@@ -136,6 +136,7 @@ use boon_plan_executor::{
     semantic_field_label as plan_semantic_field_label,
     source_guard_matches as plan_executor_source_guard_matches,
     state_label_by_id as plan_state_label, summarize_plan_lists as summarize_plan_lists_core,
+    summary_root_state as plan_executor_summary_root_state,
     validate_source_payload_bytes_field_name as validate_plan_source_payload_bytes_field_name,
 };
 use boon_scene_model::{
@@ -5851,60 +5852,12 @@ fn plan_executor_document_summary_value(value: JsonValue) -> JsonValue {
     }
 }
 
-fn plan_executor_summary_root_state(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-) -> serde_json::Map<String, JsonValue> {
-    let mut summary = root_state.clone();
-    if let Ok(derived_values) = evaluate_plan_initial_root_derived_values_partial(plan, &summary) {
-        let source_event_fields = plan_source_event_transform_fields(plan);
-        for (field_id, value) in derived_values {
-            let field_path = plan_derived_field_label(plan, field_id.0);
-            if source_event_fields.contains(&field_id) && summary.contains_key(&field_path) {
-                continue;
-            }
-            summary.insert(field_path, value);
-        }
-    }
-    summary
-}
-
-fn plan_source_event_transform_fields(plan: &MachinePlan) -> BTreeSet<FieldId> {
-    plan.regions
-        .iter()
-        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
-        .flat_map(|region| region.ops.iter())
-        .filter_map(|op| {
-            let PlanOpKind::DerivedValue {
-                derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
-                ..
-            } = &op.kind
-            else {
-                return None;
-            };
-            let Some(ValueRef::Field(field_id)) = op.output else {
-                return None;
-            };
-            Some(field_id)
-        })
-        .collect()
-}
-
 fn refresh_plan_initial_list_state_with_root_context(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> RuntimeResult<()> {
-    let summary_root_state = plan_executor_summary_root_state(plan, root_state);
-    refresh_plan_startup_list_row_fields_for_all_lists_with(
-        plan,
-        list_state,
-        |plan, list_state, row, expression| {
-            let row = plan_executor_row_with_root_values(plan, row, &summary_root_state);
-            eval_plan_row_expression(plan, list_state, &row, expression)
-        },
-    )?;
-    Ok(())
+    refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, list_state)
 }
 
 fn plan_executor_nested_root_summary(
@@ -6209,29 +6162,6 @@ fn plan_executor_row_fields_document_object(
         insert_nested_json(&mut object, field, value.clone());
     }
     object
-}
-
-fn plan_executor_row_with_root_values(
-    plan: &MachinePlan,
-    row: &PlanListRowState,
-    root_state: &serde_json::Map<String, JsonValue>,
-) -> PlanListRowState {
-    let mut row = row.clone();
-    for entry in &plan.debug_map.derived_values {
-        if entry.label.starts_with("row.") {
-            continue;
-        }
-        let local_name = local_field_name(&entry.label);
-        let Some(value) = root_state
-            .get(&entry.label)
-            .or_else(|| root_state.get(&local_name))
-            .cloned()
-        else {
-            continue;
-        };
-        row.fields.entry(local_name).or_insert(value);
-    }
-    row
 }
 
 fn plan_executor_retained_row_document_json(

@@ -46,6 +46,13 @@ Current checkpoint:
   PlanExecutor core does not yet own indexed list row expression refresh
   iteration, and `boon_runtime` live runtime constructors still require a
   `TypedProgram` instead of the compiled runtime program.
+- Latest PlanExecutor boundary cut moved the remaining root-context startup
+  list row-expression refresh wrapper into `boon_plan_executor`. Runtime now
+  calls an executor-owned root-aware startup refresh boundary instead of
+  importing the generic `_with` refresh iterator and supplying runtime-owned
+  row-expression iteration. Fresh `verify-compiler-boundaries` now reports
+  `planexecutor-list-row-expression-refresh-extracted=true`; the only remaining
+  blocker is `runtime-live-constructors-use-compiled-program=false`.
 - Latest architecture cleanup checkpoint moved root branch state and startup
   row-expression refresh behind the PlanExecutor boundary. Runtime no longer
   owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private

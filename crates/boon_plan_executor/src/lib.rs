@@ -3074,6 +3074,84 @@ where
     Ok(())
 }
 
+pub fn summary_root_state(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+) -> JsonMap<String, JsonValue> {
+    let mut summary = root_state.clone();
+    if let Ok(derived_values) = evaluate_initial_root_derived_values_partial(plan, &summary) {
+        let source_event_fields = source_event_transform_fields(plan);
+        for (field_id, value) in derived_values {
+            let field_path = derived_field_label(plan, field_id.0);
+            if source_event_fields.contains(&field_id) && summary.contains_key(&field_path) {
+                continue;
+            }
+            summary.insert(field_path, value);
+        }
+    }
+    summary
+}
+
+fn source_event_transform_fields(plan: &MachinePlan) -> BTreeSet<FieldId> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            let PlanOpKind::DerivedValue {
+                derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let Some(ValueRef::Field(field_id)) = op.output else {
+                return None;
+            };
+            Some(field_id)
+        })
+        .collect()
+}
+
+pub fn list_row_with_root_values(
+    plan: &MachinePlan,
+    row: &PlanExecutorListRowState,
+    root_state: &JsonMap<String, JsonValue>,
+) -> PlanExecutorListRowState {
+    let mut row = row.clone();
+    for entry in &plan.debug_map.derived_values {
+        if entry.label.starts_with("row.") {
+            continue;
+        }
+        let local_name = local_field_name(&entry.label);
+        let Some(value) = root_state
+            .get(&entry.label)
+            .or_else(|| root_state.get(&local_name))
+            .cloned()
+        else {
+            continue;
+        };
+        row.fields.entry(local_name).or_insert(value);
+    }
+    row
+}
+
+pub fn refresh_startup_list_row_fields_for_all_lists_with_root_state(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    list_state: &mut BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+) -> PlanExecutorResult<()> {
+    let summary_root_state = summary_root_state(plan, root_state);
+    refresh_startup_list_row_fields_for_all_lists_with(
+        plan,
+        list_state,
+        |plan, list_state, row, expression| {
+            let row = list_row_with_root_values(plan, row, &summary_root_state);
+            eval_plan_row_expression(plan, list_state, &row, expression)
+        },
+    )
+}
+
 pub fn refresh_startup_list_row_fields_for_all_lists(
     plan: &MachinePlan,
     list_state: &mut BTreeMap<usize, Vec<PlanExecutorListRowState>>,

@@ -35855,3 +35855,31 @@ Current interpretation:
 - This does not by itself complete the unified goal; native handoff,
   retained-render/proof-lane cleanup, and broad aggregate freshness still need
   current evidence.
+
+## 2026-07-05 - Native Handoff Aggregate Refresh-Debt Classification
+
+Status: evidence-only checkpoint; no code change in this slice.
+
+Evidence:
+
+- `cargo run -q -p xtask -- verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+  expected fail, wrote `target/reports/native-gpu-all.json`.
+- `cargo run -q -p xtask -- verify-report-schema target/reports/native-gpu-all.json`:
+  pass.
+- Summary:
+  `status=fail`, `checked_report_count=18`, `failed_report_count=18`,
+  `refresh_debt_child_count=18`, `true_blocker_child_count=0`,
+  `product_contract_child_count=0`, `identity_fast_refresh_child_count=18`.
+- The aggregate emitted `22` refresh commands, including the three
+  PlanExecutor source replay dependencies and native preview E2E/product
+  reports.
+
+Current interpretation:
+
+- After the cleanup commits, the native handoff aggregate is not currently
+  proving product failure; it is proving all child reports need refresh under
+  the current binary/worktree identity.
+- Do not treat this aggregate as readiness evidence until the manifest refresh
+  queue has been executed and the aggregate rerun from fresh children.
+- If refreshed children still fail, classify those failures by product contract
+  versus verifier/proof-lane debt before returning to Cells micro-optimization.

@@ -35730,3 +35730,36 @@ Current interpretation:
   replay freshness into one `xtask` classifier so native preview evidence,
   native aggregates, and BYTES aggregates stop disagreeing on stale full
   fingerprints versus fresh scoped replay identity.
+
+## 2026-07-05 - Native Preview Source Replay Scoped Freshness Cut
+
+Status: implemented a control-plane cleanup slice; broader native aggregates
+still need fresh reruns before readiness claims.
+
+What changed:
+
+- `native_preview_source_scenario_replay_evidence` no longer gates source replay
+  coverage on the replay report's full `git_commit` and full
+  `worktree_fingerprint`.
+- Native preview replay evidence now uses the existing PlanExecutor source
+  replay scoped worktree fingerprint plus fresh `source_replay_identity` as the
+  product freshness contract.
+- Full git/worktree freshness and legacy comparison status remain reported as
+  telemetry, not as the product replay gate.
+- Added a focused regression test proving a replay report with stale full
+  git/worktree fields passes only when the scoped fingerprint and
+  `source_replay_identity` are fresh, and fails when that identity is stale.
+
+Evidence:
+
+- `cargo test -q -p xtask native_preview_source_replay_accepts_scoped_identity_with_stale_full_fingerprint -- --nocapture`:
+  pass, `1 passed`.
+- `cargo test -q -p xtask source_replay -- --nocapture`: pass, `6 passed`.
+
+Current interpretation:
+
+- Native preview E2E can consume current PlanExecutor source replay evidence
+  without being forced into refresh debt by unrelated commits or docs changes.
+- The next cleanup should continue deleting ambiguous legacy comparison/default
+  fallback paths, then rerun native/BYTES aggregates from fresh child reports
+  before interpreting any remaining blocker as a product bug.

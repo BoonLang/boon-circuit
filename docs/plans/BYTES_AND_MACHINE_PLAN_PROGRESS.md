@@ -36634,3 +36634,22 @@ Current interpretation:
   classify the 577 unsupported ops by expression/list kind, implement the
   largest generic missing executor/compiler surface first, and delete or
   quarantine obsolete bridge comparisons as soon as replacement evidence exists.
+
+Immediate next classification:
+
+- The fresh plan has four unresolved ops: three root update branches
+  (`match_number_infix_const`, `match_value_const`) and one unknown list
+  projection for `store.variable_rows`.
+- Expression-less derived/list-view lowering dominates unsupported coverage:
+  362 pure derived fields, 12 list views, 6 source-event transforms, and 1
+  aggregate have no expression payload.
+- Representative missing labels include list filters/maps and object/field
+  projections such as `store.external_catalog_file_tree_rows`,
+  `store.external_file_tree_rows`, `store.reference_descriptor`,
+  `store.effective_metadata_format`, `store.bridge_descriptor_file`, and
+  `store.bridge_diagnostic.*`.
+- Therefore the next high-leverage implementation cut is generic expression
+  payload lowering/execution for list projections, `WHEN`/selection, object
+  field access, and imported function/object summaries. Do not spend the next
+  iteration on native presentation or Cells micro-tuning until this
+  PlanExecutor authority gap is reduced or explicitly retired.

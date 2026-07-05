@@ -83009,8 +83009,11 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project("preview-world-editor-visible-car", &units)
-                .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project_legacy(
+                "preview-world-editor-visible-car",
+                &units,
+            )
+            .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))
@@ -83083,7 +83086,7 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project("preview-hello-3d-world-scene", &units)
+            boon_runtime::LiveRuntime::from_project_legacy("preview-hello-3d-world-scene", &units)
                 .expect("hello_3d runtime should build"),
         ));
         let world_scene = preview_world_scene_for_live_runtime(&source_hash, Some(&live_runtime))
@@ -83106,8 +83109,11 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project("preview-hello-3d-world-scene-orbit", &units)
-                .expect("hello_3d runtime should build"),
+            boon_runtime::LiveRuntime::from_project_legacy(
+                "preview-hello-3d-world-scene-orbit",
+                &units,
+            )
+            .expect("hello_3d runtime should build"),
         ));
         let world_scene = preview_world_scene_for_live_runtime(&source_hash, Some(&live_runtime))
             .expect("hello_3d runtime should expose a world scene");
@@ -83212,7 +83218,7 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project("preview-world-editor-host-car", &units)
+            boon_runtime::LiveRuntime::from_project_legacy("preview-world-editor-host-car", &units)
                 .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
@@ -83449,8 +83455,11 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project("preview-world-editor-click-car", &units)
-                .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project_legacy(
+                "preview-world-editor-click-car",
+                &units,
+            )
+            .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))

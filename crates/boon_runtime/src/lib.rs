@@ -11421,6 +11421,13 @@ fn source_requires_legacy_output_runtime(
     project_requires_legacy_output_runtime(source_label, &[unit])
 }
 
+fn default_runtime_rejects_legacy_output_error(source_label: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "default LiveRuntime construction for `{source_label}` requires a legacy world/manufacturing output runtime; refusing hidden fallback. Use an explicit legacy constructor for diagnostic/output-root verifiers until PlanExecutor supports this output."
+    )
+    .into()
+}
+
 fn cached_runtime_parsed_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
@@ -11491,7 +11498,7 @@ impl LiveRuntime {
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
         let _scenario = parse_scenario(scenario_path)?;
         if source_requires_legacy_output_runtime(source_label, source_text)? {
-            return Self::new_legacy(source_label, source_text, scenario_path);
+            return Err(default_runtime_rejects_legacy_output_error(source_label));
         }
         Self::from_source_plan_executor(source_label, source_text)
     }
@@ -11519,7 +11526,7 @@ impl LiveRuntime {
     ) -> RuntimeResult<Self> {
         let _scenario = parse_scenario(scenario_path)?;
         if project_requires_legacy_output_runtime(source_label, units)? {
-            return Self::new_from_project_legacy(source_label, units, scenario_path);
+            return Err(default_runtime_rejects_legacy_output_error(source_label));
         }
         Self::from_project_plan_executor(source_label, units)
     }
@@ -11542,7 +11549,7 @@ impl LiveRuntime {
 
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         if source_requires_legacy_output_runtime(source_label, source_text)? {
-            return Self::from_source_legacy(source_label, source_text);
+            return Err(default_runtime_rejects_legacy_output_error(source_label));
         }
         Self::from_source_plan_executor(source_label, source_text)
     }
@@ -11572,7 +11579,7 @@ impl LiveRuntime {
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
         if project_requires_legacy_output_runtime(source_label, units)? {
-            return Self::from_project_legacy(source_label, units);
+            return Err(default_runtime_rejects_legacy_output_error(source_label));
         }
         Self::from_project_plan_executor(source_label, units)
     }
@@ -11648,14 +11655,7 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
         if project_requires_legacy_output_runtime(source_label, units)? {
-            let (runtime, mut profile) = Self::from_project_legacy_profiled(source_label, units)?;
-            if let Some(object) = profile.as_object_mut() {
-                object.insert(
-                    "default_runtime_selection".to_owned(),
-                    json!("explicit_legacy_output_runtime"),
-                );
-            }
-            return Ok((runtime, profile));
+            return Err(default_runtime_rejects_legacy_output_error(source_label));
         }
         let (runtime, mut profile) =
             Self::from_project_plan_executor_profiled(source_label, units)?;
@@ -89157,10 +89157,33 @@ expected_source_event = {{ source = "store.decode" }}
             "cpu-plan-root-list-scenario-v1"
         );
         assert_eq!(output.state_summary["store.new_todo_text"], "");
-        assert_eq!(report["legacy_comparison"]["passed"], true);
         assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], true);
-        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 1);
+        assert_eq!(
+            report["legacy_comparison"]["semantic_delta_match"], false,
+            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
+        );
+        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
+            json!(["add-test-todo-submit"])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
+            1
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
+            json!(["store.active_count"])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
+            json!([])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
+            json!([])
+        );
+        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
 
@@ -89176,7 +89199,8 @@ expected_source_event = {{ source = "store.decode" }}
             "SourceBind:todo.sources.todo_checkbox.click",
             "FieldSet:not_editing",
             "FieldSet:not_completed",
-            "FieldSet:store.new_todo_text"
+            "FieldSet:store.new_todo_text",
+            "FieldSet:store.active_count"
         ]);
         assert_eq!(report["semantic_delta_signatures"], expected_signatures);
 
@@ -89231,6 +89255,16 @@ expected_source_event = {{ source = "store.decode" }}
         assert_eq!(report["semantic_deltas"][10]["field_path"], "not_completed");
         assert_eq!(report["semantic_deltas"][10]["value"], true);
         assert_eq!(
+            report["semantic_deltas"][11]["field_path"],
+            "store.new_todo_text"
+        );
+        assert_eq!(report["semantic_deltas"][11]["value"], "");
+        assert_eq!(
+            report["semantic_deltas"][12]["field_path"],
+            "store.active_count"
+        );
+        assert_eq!(report["semantic_deltas"][12]["value"], 4);
+        assert_eq!(
             report["plan_executor"]["per_step"][1]["updates"][0]["candidate_update_op_ids"],
             json!([32, 33])
         );
@@ -89262,9 +89296,35 @@ expected_source_event = {{ source = "store.decode" }}
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["passed"], true);
         assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], true);
+        assert_eq!(
+            report["legacy_comparison"]["semantic_delta_match"], false,
+            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
+        );
+        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
+            json!([
+                "add-test-todo-submit",
+                "toggle-dynamic-test-todo-under-active-filter"
+            ])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
+            3
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
+            json!(["store.active_count", "store.completed_count"])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
+            json!([])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
+            json!([])
+        );
         assert_eq!(report["plan_executor"]["executed_indexed_update_count"], 1);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
@@ -89284,7 +89344,12 @@ expected_source_event = {{ source = "store.decode" }}
         let toggle_step = &report["plan_executor"]["per_step"][3];
         assert_eq!(
             toggle_step["semantic_delta_signatures"],
-            json!(["FieldSet:completed", "FieldSet:not_completed"])
+            json!([
+                "FieldSet:completed",
+                "FieldSet:not_completed",
+                "FieldSet:store.active_count",
+                "FieldSet:store.completed_count"
+            ])
         );
         assert_eq!(toggle_step["executed_indexed_update_count"], 1);
         let indexed = &toggle_step["indexed_updates"][0];
@@ -90150,12 +90215,28 @@ expected_source_event = {{ source = "store.decode" }}
     }
 
     #[test]
-    fn live_runtime_default_constructor_keeps_legacy_explicit_for_world_outputs() {
-        let mut runtime = LiveRuntime::from_source(
+    fn live_runtime_default_constructor_rejects_world_output_hidden_fallback() {
+        let error = match LiveRuntime::from_source(
+            "examples/hello_3d/RUN.bn",
+            include_str!("../../../examples/hello_3d/RUN.bn"),
+        ) {
+            Ok(_) => {
+                panic!("default LiveRuntime must not silently construct legacy for world output")
+            }
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("requires a legacy world/manufacturing output runtime")
+                && error.contains("refusing hidden fallback"),
+            "unexpected default runtime error: {error}"
+        );
+
+        let mut runtime = LiveRuntime::from_source_legacy(
             "examples/hello_3d/RUN.bn",
             include_str!("../../../examples/hello_3d/RUN.bn"),
         )
-        .expect("world output should initialize through explicit legacy output selection");
+        .expect("world output diagnostics should opt into explicit legacy runtime");
 
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
@@ -90448,9 +90529,32 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
         let report = &output.report;
         assert_eq!(report["status"], "pass");
-        assert_eq!(report["legacy_comparison"]["passed"], true);
         assert_eq!(report["legacy_comparison"]["state_match"], true);
-        assert_eq!(report["legacy_comparison"]["semantic_delta_match"], true);
+        assert_eq!(
+            report["legacy_comparison"]["semantic_delta_match"], false,
+            "PlanExecutor publishes current list-derived root deltas that legacy may omit"
+        );
+        assert_eq!(report["legacy_comparison_acceptance"]["accepted"], true);
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["mismatched_step_ids"],
+            json!(["add-test-todo-submit", "delete-dynamic-test-todo"])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_count"],
+            2
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["extra_plan_delta_field_paths"],
+            json!(["store.active_count"])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_extra_plan_deltas"],
+            json!([])
+        );
+        assert_eq!(
+            report["legacy_comparison_acceptance"]["rejected_missing_deltas"],
+            json!([])
+        );
         assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
         assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
         assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
@@ -90479,7 +90583,8 @@ document: Document/new(root: Element/label(element: [], label: store.value))
                 "SourceUnbind:todo.sources.editing_todo_title_element.blur",
                 "SourceUnbind:todo.sources.todo_title_element.double_click",
                 "SourceUnbind:todo.sources.todo_checkbox.click",
-                "ListRemove"
+                "ListRemove",
+                "FieldSet:store.active_count"
             ])
         );
         let removed = &delete_step["list_removes"][0];

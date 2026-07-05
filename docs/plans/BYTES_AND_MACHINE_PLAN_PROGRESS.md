@@ -36949,3 +36949,32 @@ Current interpretation:
   to retire or replace explicit `LoadedRuntime`/`GenericScheduledRuntime`
   callers that are still product-adjacent, especially native preview helper
   fallback and NovyWave bridge/runtime regression surfaces.
+
+## 2026-07-05 - Compare Reports Removed From Normal Aggregate Gates
+
+Status: removed two normal-gate dependencies on legacy compare reports.
+`goal-readiness` and `verify-bytes-machine-plan-all` now use source-replay
+PlanExecutor product evidence for Cells/TodoMVC coverage instead of requiring
+`cells-plan-compare.json` or `todomvc-full-engine-compare.json`.
+
+What changed:
+
+- `goal-readiness` now requires
+  `target/reports/bytes-plan/cells-scenario-events-full.json`, checks
+  PlanExecutor product split status, and checks full
+  `plan_executor_coverage`.
+- Removed the Cells compare semantic-delta readiness helper and its unit tests.
+- Removed `todomvc-full-engine-compare` and `cells-full-engine-compare` from
+  the BYTES/MachinePlan aggregate required-child list.
+- Updated the report schema expected child list to match the product-only
+  aggregate shape.
+- Updated schema unit fixtures to prove Boon CLI source-replay command shape,
+  not `--engine compare` command shape.
+
+Current interpretation:
+
+- Full legacy compare reports can still exist as diagnostic artifacts, but they
+  are no longer required children of the normal BYTES/MachinePlan aggregate.
+- Remaining compare coupling is concentrated in
+  `verify-bytes-default-engine-readiness` and schema handling for explicit
+  compare-mode reports; those should be rewritten as diagnostic-only next.

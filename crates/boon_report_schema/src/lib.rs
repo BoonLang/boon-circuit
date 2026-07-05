@@ -8773,22 +8773,10 @@ fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachine
             measurement_mode: "proof",
         },
         ExpectedBytesMachinePlanChildReport {
-            label: "todomvc-full-engine-compare",
-            path: "target/reports/bytes-plan/todomvc-full-engine-compare.json",
-            command: "run-plan-scenario-events",
-            measurement_mode: "proof",
-        },
-        ExpectedBytesMachinePlanChildReport {
             label: "cells-dump-plan",
             path: "target/reports/bytes-plan/cells-dump-plan.json",
             command: "dump-plan",
             measurement_mode: "diagnostic",
-        },
-        ExpectedBytesMachinePlanChildReport {
-            label: "cells-full-engine-compare",
-            path: "target/reports/bytes-plan/cells-plan-compare.json",
-            command: "run-plan-scenario-events",
-            measurement_mode: "proof",
         },
         ExpectedBytesMachinePlanChildReport {
             label: "cells-ascii-formula",
@@ -33834,26 +33822,24 @@ mod tests {
     }
 
     #[test]
-    fn bytes_machine_plan_child_argv_accepts_boon_cli_run_logical_commands() {
-        let compare_argv = json!([
+    fn bytes_machine_plan_child_argv_accepts_boon_cli_run_source_replay_commands() {
+        let source_replay_argv = json!([
             "target/debug/boon_cli",
             "run",
             "examples/todomvc.bn",
             "--scenario",
             "examples/todomvc.scn",
-            "--engine",
-            "compare",
             "--report",
-            "target/reports/bytes-plan/todomvc-full-engine-compare.json"
+            "target/reports/bytes-plan/todomvc-scenario-events-full.json"
         ]);
-        let compare_argv = compare_argv.as_array().unwrap();
+        let source_replay_argv = source_replay_argv.as_array().unwrap();
         assert!(child_command_argv_proves_expected_command(
-            compare_argv,
+            source_replay_argv,
             "run-plan-scenario-events"
         ));
         assert!(!child_command_argv_proves_expected_command(
-            compare_argv,
-            "semantic"
+            source_replay_argv,
+            "dump-plan"
         ));
 
         let semantic_argv = json!([

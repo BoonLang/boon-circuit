@@ -37194,3 +37194,45 @@ Remaining legacy callers:
   `GenericScheduledRuntime` implementation island. The next cleanup slice
   should replace or delete those remaining callers before making the runtime
   symbols private/test-only or deleting them.
+
+## 2026-07-05 - Obsolete xtask Legacy Speed Wrappers Removed
+
+Status: removed the old `xtask` speed/benchmark wrapper commands that still
+ran `run_legacy_scenario` and produced stale benchmark proof artifacts. Native
+GPU interaction-speed gates and PlanExecutor reports are now the active
+performance evidence; the deleted wrappers are no longer accepted as current
+control-plane commands.
+
+What changed:
+
+- Removed `verify-example-speed`, `verify-todomvc-speed`,
+  `verify-cells-speed`, `bench-example`, `bench-todomvc`,
+  `verify-large-list-scan-counters`, and
+  `verify-bytes-release-benchmark-reproduction` from `xtask` help/dispatch.
+- Removed the shared legacy speed verifier, benchmark wrapper, generated
+  large-list speed fixture, and release benchmark reproduction implementation.
+- Removed stale `bench-*` command handling from `xtask` measurement-mode
+  classification and negative schema fixture generation.
+- Removed `todomvc-release-benchmark-reproduction` from the active
+  bytes-machine-plan required report list. The report schema still understands
+  historical benchmark report shapes, but `xtask` no longer produces or
+  requires them as active proof.
+
+Fresh evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p xtask`: pass.
+- `cargo test -q -p boon_report_schema`: pass.
+- `rg` over `crates/xtask/src/main.rs` finds no removed speed/benchmark
+  command names and only two remaining `run_legacy_scenario` callers:
+  BoonDriver E2E and runtime schema fixture generation.
+
+Remaining legacy callers:
+
+- `verify-boon-driver-e2e` still uses `run_legacy_scenario` and is still part
+  of `verify-boon-driver-all`.
+- `runtime_schema_fixture` still uses `run_legacy_scenario` to build negative
+  schema fixtures.
+- Runtime implementation/tests still contain `LoadedRuntime` and
+  `GenericScheduledRuntime`; those should be cut only after the remaining
+  xtask callers are replaced or deleted.

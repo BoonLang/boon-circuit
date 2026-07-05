@@ -3576,7 +3576,8 @@ pub fn parse_scenario(path: &Path) -> RuntimeResult<Scenario> {
     compiler_parse_scenario_file::<Scenario>(path)
 }
 
-pub fn run_legacy_scenario(
+#[cfg(test)]
+fn run_legacy_scenario(
     source_path: &Path,
     scenario_path: &Path,
     layer: VerificationLayer,
@@ -10700,7 +10701,8 @@ pub fn run_compiled_artifact_scenario(
     run_artifact_plan_scenario(&plan, &scenario)
 }
 
-pub fn run_legacy_scenario_project(
+#[cfg(test)]
+fn run_legacy_scenario_project(
     source_label: &str,
     units: &[RuntimeSourceUnit],
     scenario_path: &Path,
@@ -10748,7 +10750,8 @@ pub fn run_legacy_scenario_project(
     })
 }
 
-pub fn run_legacy_scenario_source(
+#[cfg(test)]
+fn run_legacy_scenario_source(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -10763,7 +10766,8 @@ pub fn run_legacy_scenario_source(
     )
 }
 
-pub fn run_legacy_scenario_source_with_step_limit(
+#[cfg(test)]
+fn run_legacy_scenario_source_with_step_limit(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -10781,7 +10785,8 @@ pub fn run_legacy_scenario_source_with_step_limit(
     )
 }
 
-pub fn run_legacy_scenario_source_with_parsed_scenario_step_limit(
+#[cfg(test)]
+fn run_legacy_scenario_source_with_parsed_scenario_step_limit(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -10829,7 +10834,8 @@ pub fn run_legacy_scenario_source_with_parsed_scenario_step_limit(
     })
 }
 
-pub fn run_legacy_source_initial_state(
+#[cfg(test)]
+fn run_legacy_source_initial_state(
     source_label: &str,
     source_text: &str,
     scenario_path: &Path,
@@ -13273,6 +13279,7 @@ fn run_legacy_loaded_scenario(
     run_legacy_loaded_scenario_with_compiled(_parsed, &compiled, None, compile_ms, scenario, layer)
 }
 
+#[cfg(test)]
 fn run_legacy_loaded_scenario_with_compiled(
     _parsed: &ParsedProgram,
     compiled: &CompiledProgram,

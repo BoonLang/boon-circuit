@@ -37357,3 +37357,33 @@ Remaining cleanup:
 - `xtask` still keeps negative/audit strings for removed command names.
 - `boon_runtime` still has raw legacy runtime internals/tests and explicit
   legacy-output callers that need a separate code retirement slice.
+
+## 2026-07-05 - Legacy Scenario Runner API Quarantined
+
+Status: removed the public `run_legacy_scenario*` runtime scenario helpers from
+normal crate builds. They now compile only as private `#[cfg(test)]` helpers for
+remaining legacy-runtime unit coverage.
+
+What changed:
+
+- `run_legacy_scenario`, `run_legacy_scenario_project`,
+  `run_legacy_scenario_source*`, `run_legacy_source_initial_state`, and the
+  compiled legacy scenario runner are no longer public runtime API.
+- Cross-crate product/control-plane builds cannot call those scenario helpers.
+- Remaining references are confined to `boon_runtime` tests.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime -p boon_cli -p boon_native_playground -p xtask`:
+  pass.
+- `cargo test -q -p boon_runtime --no-run`: pass.
+- `rg` over `crates` finds no public `run_legacy_scenario*` API and only
+  runtime-test callers of the private helper.
+
+Remaining cleanup:
+
+- `LoadedRuntime` and `GenericScheduledRuntime` still implement the explicit
+  legacy/output-root runtime and legacy-runtime tests.
+- `LiveRuntime::from_project_legacy*` still exists for explicit output-root
+  paths and diagnostics; retiring it needs a first-class PlanExecutor/output
+  root replacement.

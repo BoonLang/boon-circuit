@@ -80,6 +80,74 @@ virtualization architecture exists to test. This disposition does not make the
 old readiness/default switch pass. The focused handoff for the next attempt is
 `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
 
+## 2026-07-05 - Cells Retained Click Proof Checkpoint
+
+Status: focused native Cells click slice implemented and freshly verified;
+broader unified cleanup remains open.
+
+What changed:
+
+- The direct retained selection/formula-bar click path now records generic
+  binding-path and written-text metadata for the retained text nodes it patches.
+  This keeps the hot product frame on the retained patch path while giving the
+  post-present proof lane enough document-binding evidence to prove the visible
+  formula/address transition.
+- The verifier contract now accepts the bounded targeted selection currentness
+  work for this path: one demand-current field read per click is reported as the
+  expected targeted currentness barrier when list scans, row scans, and root
+  materialization remain zero.
+- The retained update contract now accepts renderer-owned product-frame patch
+  evidence when the patch is direct, retained, non-full-scene, and carries text
+  plus style touched-node evidence. This is still generic product-frame proof,
+  not a Cells-specific renderer shortcut.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p boon_native_playground
+  cells_release_with_stale_sampled_left_down_uses_simple_click_fast_path
+  -- --test-threads=1 --nocapture`: pass.
+- `cargo test -q -p boon_native_playground
+  pending_deferred_source_work_flushes_without_generic_fallback_on_passive_motion
+  -- --test-threads=1 --nocapture`: pass.
+- `cargo test -q -p xtask cells_visible_click_retained_update_contract
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask
+  cells_visible_click_lane_contracts_accept_split_product_and_proof_paths
+  -- --nocapture`: pass.
+- `cargo xtask verify-native-cells-visible-click-e2e --profile release
+  --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- `cargo xtask verify-report-schema
+  target/reports/native-gpu/cells-visible-click-e2e-release.json`: pass.
+
+Fresh Cells report summary:
+
+- Top-level status: `pass`.
+- Product-only UX: `pass`, `input_to_present_ms.p95=11.071ms`,
+  `max=13.387ms`, `sample_count=60`.
+- Retained update contract: `pass`, with all `64` samples using
+  `product_frame_retained_bound_sync`.
+- Runtime work contract: `pass`, with `64` targeted currentness samples,
+  `64` total recomputed fields, and no broad scan/root materialization
+  regression.
+- Proof-only contract: `pass`, with `64` current structured visual WGPU proof
+  samples and `proof_lag_max_frames=0`.
+- Proof remains deliberately separate from UX latency: the headed proof/readback
+  lane still reports about `264ms` after product present for the slow readback
+  proof, while the product accepted-input-to-formula path is about `11ms`.
+
+Remaining work:
+
+- This is not full unified-goal completion. The manifest-backed native handoff
+  aggregate and BYTES/default readiness aggregates still need fresh current
+  evidence after this code change.
+- The larger cleanup goal remains: continue cutting obsolete legacy/fallback
+  harness paths, finish PlanExecutor authority cleanup, and promote the
+  renderer-owned `ProductFrameGraph` from retained evidence into a fuller dirty
+  resource/pass scheduler.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

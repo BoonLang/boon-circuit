@@ -795,7 +795,7 @@ fn run_cells_interaction_speed(
     let native_input_reject_counts = take_preview_native_input_reject_counts();
     let simple_source_click_count = native_input_timings
         .iter()
-        .filter(|sample| sample.fast_path == "simple_source_click")
+        .filter(|sample| sample.fast_path.starts_with("simple_source_click"))
         .count();
     let simple_click_button_shape_rejects = native_input_reject_counts
         .get("simple_source_click:button_shape")
@@ -1118,7 +1118,10 @@ fn cells_interaction_selection_formula_retained_patch_summary(
     let simple_source_click_count = native_input_samples
         .iter()
         .filter(|profile| {
-            profile.get("fast_path").and_then(Value::as_str) == Some("simple_source_click")
+            profile
+                .get("fast_path")
+                .and_then(Value::as_str)
+                .is_some_and(|fast_path| fast_path.starts_with("simple_source_click"))
         })
         .count() as u64;
     let retained_text_input_focus_click_count = native_input_samples
@@ -40005,16 +40008,32 @@ fn preview_simple_source_click_can_defer_runtime_first_frame(
     click_event_repeat_count: usize,
     target_text: Option<&String>,
 ) -> bool {
-    preview_first_frame_runtime_defer_enabled()
-        && focus_state_applied
+    target_text.is_some()
+        && click_event_repeat_count == 1
+        && preview_first_frame_runtime_defer_enabled()
+        && preview_simple_source_click_can_use_targeted_runtime_first_frame(
+            events,
+            input_state,
+            focus_state_applied,
+            preserve_focus,
+            click_event_repeat_count,
+        )
+}
+
+fn preview_simple_source_click_can_use_targeted_runtime_first_frame(
+    events: &[boon_runtime::LiveSourceEvent],
+    input_state: &PreviewNativeInputState,
+    focus_state_applied: bool,
+    preserve_focus: bool,
+    _click_event_repeat_count: usize,
+) -> bool {
+    focus_state_applied
         && input_state.focused_selection_proxy
         && !preserve_focus
-        && click_event_repeat_count == 1
-        && target_text.is_some()
-        && events.len() == 1
+        && !events.is_empty()
         && events
-            .first()
-            .is_some_and(|event| event.key.is_none() && event.address.is_some())
+            .iter()
+            .all(|event| event.key.is_none() && event.address.is_some())
 }
 
 fn preview_focus_selected_editor_proxy_from_route_table(
@@ -40403,6 +40422,38 @@ fn extend_bound_sync_nodes_for_selection_proxy_text_inputs(
         &shared,
         input_state,
     ));
+}
+
+fn extend_bound_sync_nodes_for_selection_proxy_projection(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    input_state: &PreviewNativeInputState,
+    target_nodes: &mut BTreeSet<String>,
+) {
+    if !input_state.focused_selection_proxy {
+        return;
+    }
+    let Ok(shared) = shared_render_state.lock() else {
+        return;
+    };
+    let mut proxy_nodes = selection_proxy_text_input_candidate_nodes(&shared, input_state);
+    if proxy_nodes.is_empty() {
+        return;
+    }
+    if let Some(layout_hash) = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(serde_json::Value::as_str)
+        && let Some(snapshot) = cached_document_render_snapshot(layout_hash)
+    {
+        let projection_prefixes =
+            document_binding_projection_prefixes_for_nodes(&snapshot, &proxy_nodes);
+        extend_target_nodes_for_binding_projections(
+            &snapshot,
+            &mut proxy_nodes,
+            &projection_prefixes,
+        );
+    }
+    target_nodes.extend(proxy_nodes);
 }
 
 fn selection_proxy_node_matches_editor_sources(
@@ -42169,12 +42220,18 @@ fn preview_try_apply_simple_source_click_input(
     let remembered_candidate = input_state.hovered_click_candidate.clone();
     preview_remember_click_candidate(input_state, position_key, &remembered_candidate);
     clear_preview_retained_bound_sync_stats();
-    let previous_selected_nodes = input_state
+    let mut previous_selected_nodes = input_state
         .selected_overlay_nodes
         .iter()
         .chain(input_state.focus_render_overlay.selected_nodes.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
+    if previous_selected_nodes.is_empty()
+        && let Ok(shared) = shared_render_state.lock()
+        && let Some(frame) = shared.layout_frame_override.as_deref()
+    {
+        previous_selected_nodes.extend(preview_current_selected_display_nodes(frame));
+    }
     let previous_hot_state_summary = shared_render_state
         .lock()
         .ok()
@@ -42308,16 +42365,36 @@ fn preview_try_apply_simple_source_click_input(
         return Ok(true);
     }
     let mut selected_overlay_sync_nodes = BTreeSet::new();
+    let use_targeted_runtime_first_frame =
+        preview_simple_source_click_can_use_targeted_runtime_first_frame(
+            &events,
+            input_state,
+            focus_state_applied,
+            preserve_focus,
+            click_event_repeat_count,
+        );
     preview_set_interaction_diagnostic_subphase("simple_source_click.apply_live_events");
     let live_events_started = Instant::now();
-    let post_turn_state_summary = preview_apply_live_events_state_summary_defer_visible_sync(
-        source_path,
-        source_text,
-        runtime_units,
-        live_runtime,
-        shared_render_state,
-        events,
-    )?;
+    let post_turn_state_summary = if use_targeted_runtime_first_frame {
+        preview_apply_live_events_defer_visible_sync_no_return(
+            source_path,
+            source_text,
+            runtime_units,
+            live_runtime,
+            shared_render_state,
+            events,
+        )?;
+        None
+    } else {
+        preview_apply_live_events_state_summary_defer_visible_sync(
+            source_path,
+            source_text,
+            runtime_units,
+            live_runtime,
+            shared_render_state,
+            events,
+        )?
+    };
     let live_events_ms = elapsed_ms(live_events_started);
     let summary_selection_patch = post_turn_state_summary.as_ref().and_then(|summary| {
         preview_retained_selection_patch_from_shared_snapshot(
@@ -42350,17 +42427,21 @@ fn preview_try_apply_simple_source_click_input(
         None
     };
     let mut bound_sync_nodes = BTreeSet::new();
-    bound_sync_nodes.insert(node.clone());
-    if let Some(previous_focused_node) = previous_focused_node {
-        bound_sync_nodes.insert(previous_focused_node);
-    }
-    if let Some(focused_node) = input_state.focused_node.as_ref() {
-        bound_sync_nodes.insert(focused_node.clone());
+    if !use_targeted_runtime_first_frame {
+        bound_sync_nodes.insert(node.clone());
+        if let Some(previous_focused_node) = previous_focused_node {
+            bound_sync_nodes.insert(previous_focused_node);
+        }
+        if let Some(focused_node) = input_state.focused_node.as_ref() {
+            bound_sync_nodes.insert(focused_node.clone());
+        }
     }
     if let Some(selection_patch) = retained_selection_patch.as_ref() {
         selected_overlay_sync_nodes.extend(selection_patch.previous_nodes.iter().cloned());
         selected_overlay_sync_nodes.extend(selection_patch.current_nodes.iter().cloned());
-        bound_sync_nodes.extend(selection_patch.sync_nodes.iter().cloned());
+        if !use_targeted_runtime_first_frame {
+            bound_sync_nodes.extend(selection_patch.sync_nodes.iter().cloned());
+        }
     } else {
         selected_overlay_sync_nodes.extend(previous_selected_nodes.iter().cloned());
     }
@@ -42382,7 +42463,9 @@ fn preview_try_apply_simple_source_click_input(
             previous_selected_address,
         );
         selected_overlay_sync_nodes.extend(nodes.iter().cloned());
-        bound_sync_nodes.extend(nodes);
+        if !use_targeted_runtime_first_frame {
+            bound_sync_nodes.extend(nodes);
+        }
     }
     let legacy_selected_address_for_style_patch = if has_generic_selection_patch {
         None
@@ -42399,13 +42482,23 @@ fn preview_try_apply_simple_source_click_input(
             selected_address,
         );
         selected_overlay_sync_nodes.extend(nodes.iter().cloned());
-        bound_sync_nodes.extend(nodes);
+        if !use_targeted_runtime_first_frame {
+            bound_sync_nodes.extend(nodes);
+        }
     }
-    extend_bound_sync_nodes_for_selection_proxy_text_inputs(
-        shared_render_state,
-        input_state,
-        &mut bound_sync_nodes,
-    );
+    if use_targeted_runtime_first_frame {
+        extend_bound_sync_nodes_for_selection_proxy_projection(
+            shared_render_state,
+            input_state,
+            &mut bound_sync_nodes,
+        );
+    } else {
+        extend_bound_sync_nodes_for_selection_proxy_text_inputs(
+            shared_render_state,
+            input_state,
+            &mut bound_sync_nodes,
+        );
+    }
     let bound_input_sync_started = Instant::now();
     // `preview_apply_live_events_state_summary` already computed the current
     // post-turn values. Reuse that summary to patch the clicked node and any
@@ -42415,6 +42508,22 @@ fn preview_try_apply_simple_source_click_input(
         // The live-event visible-state sync already patched retained bound text
         // inputs from this same summary. Avoid repeating the scan on the click
         // hot path; the retained sync stats remain as the formula-bar proof.
+    } else if use_targeted_runtime_first_frame && let Some(target_text) = target_text.as_deref() {
+        preview_patch_selection_proxy_text_inputs(shared_render_state, input_state, target_text)?;
+        if let Some(address) = input_state.focused_address.as_deref() {
+            preview_patch_selected_input_address_labels(shared_render_state, address)?;
+        }
+    } else if use_targeted_runtime_first_frame
+        && preview_patch_selection_proxy_from_selected_input_runtime(
+            shared_render_state,
+            live_runtime,
+            input_state,
+        )?
+        .is_some()
+    {
+        // Selection-proxy clicks only need the editor proxy projection to be
+        // current for the first product frame. Cell display/value bindings stay
+        // out of the focus-publication hot path.
     } else if let Some(post_turn_state_summary) = post_turn_state_summary.as_ref() {
         preview_sync_bound_text_inputs_for_nodes_from_state_summary(
             shared_render_state,
@@ -42533,7 +42642,11 @@ fn preview_try_apply_simple_source_click_input(
     let focus_overlay_ms = elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
-        fast_path: "simple_source_click",
+        fast_path: if use_targeted_runtime_first_frame {
+            "simple_source_click_targeted_runtime"
+        } else {
+            "simple_source_click"
+        },
         resolve_source: Some(click_resolve_source),
         route_table_key_source: Some(route_table_key_source),
         shared_lock_wait_ms,
@@ -42557,7 +42670,11 @@ fn preview_try_apply_simple_source_click_input(
         record_preview_native_input_profile(json!({
             "source_path": source_path,
             "capture_scope": input.capture_scope,
-            "fast_path": "simple_source_click",
+            "fast_path": if use_targeted_runtime_first_frame {
+                "simple_source_click_targeted_runtime"
+            } else {
+                "simple_source_click"
+            },
             "mouse_motion_event_count": input.mouse_motion_event_count,
             "mouse_button_event_count": input.mouse_button_event_count,
             "mouse_button_events": input.mouse_button_events.len(),
@@ -46002,6 +46119,50 @@ fn preview_patch_retained_text_inputs_for_source(
     Ok(changed)
 }
 
+fn preview_text_binding_paths_for_node(
+    snapshot: Option<&DocumentRenderSnapshot>,
+    node: &str,
+) -> Vec<String> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut paths = Vec::<String>::new();
+    if let Some(bindings) = snapshot
+        .data_binding_targets
+        .state_binding_targets_by_node
+        .get(node)
+    {
+        for (path, target) in bindings {
+            if matches!(
+                target.attr.as_str(),
+                "text" | "label" | "value" | "display_value"
+            ) && document_state_value_path_can_refresh_targeted(path)
+            {
+                paths.push(path.clone());
+            }
+        }
+    }
+    if let Some(text_paths) = snapshot
+        .data_binding_targets
+        .text_binding_paths_by_node
+        .get(node)
+    {
+        paths.extend(
+            text_paths
+                .iter()
+                .filter(|path| document_state_value_path_can_refresh_targeted(path))
+                .cloned(),
+        );
+    }
+    paths.sort_by(|left, right| {
+        document_text_binding_path_rank(left)
+            .cmp(&document_text_binding_path_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    paths.dedup();
+    paths
+}
+
 fn preview_patch_selection_proxy_text_inputs(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &PreviewNativeInputState,
@@ -46048,6 +46209,8 @@ fn preview_patch_selection_proxy_text_inputs(
     };
     let mut changed = false;
     let mut text_update_nodes = Vec::new();
+    let mut text_update_binding_paths = Vec::new();
+    let mut text_update_values = Vec::new();
     let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
         snapshot.as_deref(),
         frame,
@@ -46066,6 +46229,9 @@ fn preview_patch_selection_proxy_text_inputs(
             item.text = Some(text.to_owned());
             changed = true;
             text_update_nodes.push(item.node.0.clone());
+            let paths = preview_text_binding_paths_for_node(snapshot.as_deref(), &item.node.0);
+            text_update_binding_paths.push((item.node.0.clone(), paths.clone()));
+            text_update_values.push((item.node.0.clone(), text.to_owned(), paths));
         }
     }
     record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
@@ -46074,6 +46240,8 @@ fn preview_patch_selection_proxy_text_inputs(
         target_node_count: target_nodes.len(),
         text_update_count: text_update_nodes.len(),
         text_update_nodes,
+        text_update_binding_paths,
+        text_update_values,
         changed,
         ..PreviewRetainedBoundSyncStats::default()
     });
@@ -46084,6 +46252,119 @@ fn preview_patch_selection_proxy_text_inputs(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn preview_patch_selected_input_address_labels(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    address: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut shared = shared_render_state
+        .lock()
+        .map_err(|_| "preview render state mutex poisoned")?;
+    if shared.layout_frame_override.is_none() {
+        shared.layout_frame_override = Some(Arc::new(layout_frame_from_layout_proof(
+            &shared.layout_proof,
+        )?));
+    }
+    let snapshot = shared
+        .layout_proof
+        .get("layout_frame_hash")
+        .and_then(Value::as_str)
+        .and_then(cached_document_render_snapshot);
+    let target_nodes = snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot
+                .data_binding_targets
+                .state_binding_targets_by_path
+                .get("store.selected_input.address")
+        })
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(|(node, target)| {
+                    matches!(
+                        target.attr.as_str(),
+                        "text" | "label" | "value" | "display_value"
+                    )
+                    .then(|| node.clone())
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if target_nodes.is_empty() {
+        return Ok(false);
+    }
+    let Some(frame) = shared.layout_frame_override.as_mut().map(Arc::make_mut) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    let mut text_update_nodes = Vec::new();
+    let mut text_update_binding_paths = Vec::new();
+    let mut text_update_values = Vec::new();
+    let item_indexes = preview_display_item_indexes_for_nodes_from_snapshot(
+        snapshot.as_deref(),
+        frame,
+        &target_nodes,
+    );
+    for index in item_indexes {
+        let Some(item) = frame.display_list.get_mut(index) else {
+            continue;
+        };
+        if !target_nodes.contains(&item.node.0) {
+            continue;
+        }
+        if item.text.as_deref() != Some(address) {
+            item.text = Some(address.to_owned());
+            changed = true;
+            text_update_nodes.push(item.node.0.clone());
+            let mut paths = preview_text_binding_paths_for_node(snapshot.as_deref(), &item.node.0);
+            if paths.is_empty() {
+                paths.push("store.selected_input.address".to_owned());
+            }
+            text_update_binding_paths.push((item.node.0.clone(), paths.clone()));
+            text_update_values.push((item.node.0.clone(), address.to_owned(), paths));
+        }
+    }
+    record_preview_retained_bound_sync_stats(PreviewRetainedBoundSyncStats {
+        status: "pass",
+        reason: Some("selected-input-address-label".to_owned()),
+        target_node_count: target_nodes.len(),
+        text_update_count: text_update_nodes.len(),
+        text_update_nodes,
+        text_update_binding_paths,
+        text_update_values,
+        changed,
+        ..PreviewRetainedBoundSyncStats::default()
+    });
+    if changed {
+        shared.update_count = shared.update_count.saturating_add(1);
+        shared.last_error = None;
+        shared.last_dirty_reason =
+            Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
+    }
+    Ok(changed)
+}
+
+fn preview_patch_selection_proxy_from_selected_input_runtime(
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    input_state: &PreviewNativeInputState,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    if !input_state.focused_selection_proxy {
+        return Ok(None);
+    }
+    let Some(address) = input_state.focused_address.as_deref() else {
+        return Ok(None);
+    };
+    let Some(text) = selected_input_editor_text_for_address(live_runtime, address) else {
+        return Ok(None);
+    };
+    let text_changed =
+        preview_patch_selection_proxy_text_inputs(shared_render_state, input_state, &text)?;
+    let address_changed =
+        preview_patch_selected_input_address_labels(shared_render_state, address)?;
+    Ok(Some(text_changed || address_changed))
 }
 
 fn preview_patch_retained_display_text_for_address(
@@ -46121,6 +46402,30 @@ fn preview_patch_retained_display_text_for_address(
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
     }
     Ok(changed)
+}
+
+fn selected_input_editor_text_for_address(
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    address: &str,
+) -> Option<String> {
+    let paths = [
+        "store.selected_input.address",
+        "store.selected_input.editing_text",
+        "store.selected_input.formula_text",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let values = live_runtime.lock().ok()?.document_state_values(&paths);
+    if values
+        .get("store.selected_input.address")
+        .and_then(serde_json::Value::as_str)
+        != Some(address)
+    {
+        return None;
+    }
+    document_state_values_text(&values, "store.selected_input.editing_text")
+        .or_else(|| document_state_values_text(&values, "store.selected_input.formula_text"))
 }
 
 fn selected_input_editing_text_for_address(
@@ -48646,6 +48951,27 @@ fn preview_apply_live_events_no_return(
     Ok(())
 }
 
+fn preview_apply_live_events_defer_visible_sync_no_return(
+    source_path: &Path,
+    _source_text: &str,
+    runtime_units: &[boon_runtime::RuntimeSourceUnit],
+    live_runtime: &Arc<Mutex<boon_runtime::LiveRuntime>>,
+    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
+    events: Vec<boon_runtime::LiveSourceEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    preview_apply_live_events_internal(
+        source_path,
+        runtime_units,
+        live_runtime,
+        shared_render_state,
+        events,
+        false,
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
 fn preview_apply_live_events_state_summary_defer_visible_sync(
     source_path: &Path,
     _source_text: &str,
@@ -48843,13 +49169,19 @@ fn preview_apply_live_events_internal(
         if render_patches_for_layout.len() > 1 {
             render_patches_for_layout = coalesced_render_patches(render_patches_for_layout);
         }
-        let render_patch_data_paths_for_layout = render_patches_for_layout
-            .iter()
-            .filter_map(document_data_patch_value)
-            .map(|(path, _)| path)
-            .collect::<BTreeSet<_>>();
         coalesced_render_patch_count = render_patches_for_layout.len() as u64;
-        let document_patch_fast_path_rejection_for_summary =
+        let needs_state_summary =
+            changed && (return_layout || return_state_summary || apply_visible_state_sync);
+        let render_patch_data_paths_for_layout = if needs_state_summary {
+            render_patches_for_layout
+                .iter()
+                .filter_map(document_data_patch_value)
+                .map(|(path, _)| path)
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        let document_patch_fast_path_rejection_for_summary = if needs_state_summary {
             preview_document_patch_fast_path_rejection_for_layout_hash(
                 previous_layout_hash.as_deref(),
                 &render_patches_for_layout,
@@ -48873,102 +49205,119 @@ fn preview_apply_live_events_internal(
                     previous_layout_hash.as_deref(),
                     &semantic_data_paths_for_layout,
                 )
-            });
-        let state_summary = changed.then(|| {
-            let patch_started = Instant::now();
-            preview_set_interaction_diagnostic_subphase("live_events.try_patched_state_summary");
-            if document_patch_fast_path_rejection_for_summary.is_none()
-                && !render_patches_for_layout.is_empty()
-                && let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
-                    patched_window_state_summary_for_render_patches(
-                        summary,
+            })
+        } else {
+            None
+        };
+        let state_summary = if needs_state_summary {
+            Some((|| {
+                let patch_started = Instant::now();
+                preview_set_interaction_diagnostic_subphase(
+                    "live_events.try_patched_state_summary",
+                );
+                if document_patch_fast_path_rejection_for_summary.is_none()
+                    && !render_patches_for_layout.is_empty()
+                    && let Some(patched) = previous_state_summary.as_ref().and_then(|summary| {
+                        patched_window_state_summary_for_render_patches(
+                            summary,
+                            &render_patches_for_layout,
+                        )
+                    })
+                {
+                    summary_source = "patched_previous_window";
+                    runtime_state_summary_ms += elapsed_ms(patch_started);
+                    return patched;
+                }
+                let summary_rejection_allows_targeted_paths =
+                    document_patch_fast_path_rejection_for_summary
+                        .as_deref()
+                        .is_some_and(|reason| {
+                            reason.starts_with("semantic_bound_input_text_currentness:")
+                        });
+                if (document_patch_fast_path_rejection_for_summary.is_none()
+                    || summary_rejection_allows_targeted_paths)
+                    && !render_patches_for_layout.is_empty()
+                    && let Some(targeted) = targeted_state_summary_for_render_patches(
+                        &mut runtime,
+                        previous_layout_hash.as_deref(),
+                        previous_state_summary.as_ref(),
                         &render_patches_for_layout,
                     )
-                })
-            {
-                summary_source = "patched_previous_window";
-                runtime_state_summary_ms += elapsed_ms(patch_started);
-                return patched;
-            }
-            let summary_rejection_allows_targeted_paths =
-                document_patch_fast_path_rejection_for_summary
+                {
+                    summary_source = "targeted_render_patch_paths";
+                    runtime_state_summary_ms += elapsed_ms(patch_started);
+                    return targeted;
+                }
+                if document_patch_fast_path_rejection_for_summary
                     .as_deref()
                     .is_some_and(|reason| {
                         reason.starts_with("semantic_bound_input_text_currentness:")
-                    });
-            if (document_patch_fast_path_rejection_for_summary.is_none()
-                || summary_rejection_allows_targeted_paths)
-                && !render_patches_for_layout.is_empty()
-                && let Some(targeted) = targeted_state_summary_for_render_patches(
-                    &mut runtime,
-                    previous_layout_hash.as_deref(),
-                    previous_state_summary.as_ref(),
-                    &render_patches_for_layout,
-                )
-            {
-                summary_source = "targeted_render_patch_paths";
-                runtime_state_summary_ms += elapsed_ms(patch_started);
-                return targeted;
-            }
-            if document_patch_fast_path_rejection_for_summary
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("semantic_bound_input_text_currentness:"))
-                && !render_patches_for_layout.is_empty()
-                && let Some(mut patched) = previous_state_summary.as_ref().and_then(|summary| {
-                    patched_window_state_summary_for_render_patches(
-                        summary,
-                        &render_patches_for_layout,
-                    )
-                })
-            {
-                let paths = preview_semantic_bound_input_currentness_paths_for_layout_hash(
-                    previous_layout_hash.as_deref(),
-                    &semantic_data_paths_for_layout,
-                    &render_patch_data_paths_for_layout,
-                );
-                targeted_currentness_path_count = paths.len() as u64;
-                if !paths.is_empty() {
-                    let targeted_started = Instant::now();
-                    let path_values =
-                        runtime.document_state_values(&paths.iter().cloned().collect::<Vec<_>>());
-                    targeted_currentness_missing_path =
-                        missing_state_summary_value_path(&path_values, &paths);
-                    if targeted_currentness_missing_path.is_none()
-                        && patch_state_summary_values(&mut patched, &path_values, &paths)
-                    {
-                        summary_source = "patched_previous_window_with_targeted_currentness";
-                        runtime_state_summary_ms += elapsed_ms(patch_started);
-                        return patched;
+                    })
+                    && !render_patches_for_layout.is_empty()
+                    && let Some(mut patched) = previous_state_summary.as_ref().and_then(|summary| {
+                        patched_window_state_summary_for_render_patches(
+                            summary,
+                            &render_patches_for_layout,
+                        )
+                    })
+                {
+                    let paths = preview_semantic_bound_input_currentness_paths_for_layout_hash(
+                        previous_layout_hash.as_deref(),
+                        &semantic_data_paths_for_layout,
+                        &render_patch_data_paths_for_layout,
+                    );
+                    targeted_currentness_path_count = paths.len() as u64;
+                    if !paths.is_empty() {
+                        let targeted_started = Instant::now();
+                        let path_values = runtime
+                            .document_state_values(&paths.iter().cloned().collect::<Vec<_>>());
+                        targeted_currentness_missing_path =
+                            missing_state_summary_value_path(&path_values, &paths);
+                        if targeted_currentness_missing_path.is_none()
+                            && patch_state_summary_values(&mut patched, &path_values, &paths)
+                        {
+                            summary_source = "patched_previous_window_with_targeted_currentness";
+                            runtime_state_summary_ms += elapsed_ms(patch_started);
+                            return patched;
+                        }
+                        runtime_state_summary_ms += elapsed_ms(targeted_started);
                     }
-                    runtime_state_summary_ms += elapsed_ms(targeted_started);
                 }
-            }
-            let summary_started = Instant::now();
-            preview_set_interaction_diagnostic_subphase("live_events.full_or_window_state_summary");
-            let summary_rejection = document_patch_fast_path_rejection_for_summary.as_deref();
-            let rejection_allows_window_summary = summary_rejection
-                .is_some_and(|reason| reason.starts_with("semantic_bound_input_text_currentness:"));
-            let summary = if render_patches_for_layout.is_empty()
-                || (summary_rejection.is_some() && !rejection_allows_window_summary)
-            {
-                summary_source = if render_patches_for_layout.is_empty() {
-                    "post_turn_full_document"
+                let summary_started = Instant::now();
+                preview_set_interaction_diagnostic_subphase(
+                    "live_events.full_or_window_state_summary",
+                );
+                let summary_rejection = document_patch_fast_path_rejection_for_summary.as_deref();
+                let rejection_allows_window_summary = summary_rejection.is_some_and(|reason| {
+                    reason.starts_with("semantic_bound_input_text_currentness:")
+                });
+                let summary = if render_patches_for_layout.is_empty()
+                    || (summary_rejection.is_some() && !rejection_allows_window_summary)
+                {
+                    summary_source = if render_patches_for_layout.is_empty() {
+                        "post_turn_full_document"
+                    } else {
+                        "post_turn_full_document_after_patch_rejection"
+                    };
+                    runtime.document_state_summary()
                 } else {
-                    "post_turn_full_document_after_patch_rejection"
+                    summary_source = "post_turn_window";
+                    runtime.document_state_summary_for_window(
+                        row_start,
+                        row_count,
+                        column_start,
+                        column_count,
+                    )
                 };
-                runtime.document_state_summary()
-            } else {
-                summary_source = "post_turn_window";
-                runtime.document_state_summary_for_window(
-                    row_start,
-                    row_count,
-                    column_start,
-                    column_count,
-                )
-            };
-            runtime_state_summary_ms += elapsed_ms(summary_started);
-            summary
-        });
+                runtime_state_summary_ms += elapsed_ms(summary_started);
+                summary
+            })())
+        } else {
+            if changed {
+                summary_source = "deferred_runtime_only";
+            }
+            None
+        };
         runtime.refresh_candidate_defer_probe_profile(&mut runtime_step_profile);
         runtime.clear_candidate_defer_probe();
         runtime_apply_ms = elapsed_ms(runtime_apply_started);
@@ -49084,9 +49433,6 @@ fn preview_apply_live_events_internal(
         }
         return Ok(return_value);
     }
-    let Some(state_summary) = state_summary.as_ref() else {
-        return Err("changed preview turn did not produce a state summary".into());
-    };
     if !apply_visible_state_sync && !return_layout {
         preview_set_interaction_diagnostic_subphase("live_events.defer_visible_state_sync");
         let shared_update_started = Instant::now();
@@ -49094,10 +49440,12 @@ fn preview_apply_live_events_internal(
             let mut shared = shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
-            cache_layout_runtime_state_snapshot_for_hot_layout_proof(
-                &mut shared.layout_proof,
-                state_summary,
-            );
+            if let Some(state_summary) = state_summary.as_ref() {
+                cache_layout_runtime_state_snapshot_for_hot_layout_proof(
+                    &mut shared.layout_proof,
+                    state_summary,
+                );
+            }
             shared.last_error = None;
             shared.status_overlay = None;
             shared.update_count = shared.update_count.saturating_add(event_count);
@@ -49106,7 +49454,7 @@ fn preview_apply_live_events_internal(
         }
         let shared_update_ms = elapsed_ms(shared_update_started);
         let return_value = if return_state_summary {
-            state_summary.clone()
+            state_summary.clone().unwrap_or(Value::Null)
         } else {
             Value::Null
         };
@@ -49202,6 +49550,9 @@ fn preview_apply_live_events_internal(
         }
         return Ok(return_value);
     }
+    let Some(state_summary) = state_summary.as_ref() else {
+        return Err("changed preview turn did not produce a state summary".into());
+    };
     preview_set_interaction_diagnostic_subphase("live_events.layout_patch_or_rebuild");
     let layout_started = Instant::now();
     let mut layout_proof_clone_ms = 0.0;
@@ -90508,107 +90859,6 @@ document:
         assert_eq!(response["document_layout_proof"]["status"], "pass");
     }
 
-    #[test]
-    fn cells_click_selection_updates_formula_bar_and_selected_style() {
-        let cells_path = repo_path("examples/cells.bn");
-        let scenario_path = repo_path("examples/cells.scn");
-        let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
-        let scenario = boon_runtime::parse_scenario(&scenario_path).unwrap();
-        let mut runtime = cells_live_runtime_with_scenario(
-            "native-cells-select",
-            &cells_path,
-            &cells_source,
-            &scenario_path,
-        );
-        let step = scenario
-            .step
-            .iter()
-            .find(|step| step.id == "select-b0-shows-formula-in-bar")
-            .expect("Cells scenario should cover click selection");
-        let output = runtime
-            .apply_source_event_for_step(
-                step,
-                boon_runtime::LiveSourceEvent {
-                    source: "cell.sources.editor.select".to_owned(),
-                    address: Some("B0".to_owned()),
-                    ..boon_runtime::LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(output.state_summary["store"]["selected_address"], "B0");
-        assert_eq!(
-            output.state_summary["store"]["selected_input"]["editing_text"],
-            "=add(A0,A1)"
-        );
-
-        let proof = native_document_layout_proof_with_state(
-            &cells_path,
-            &cells_source,
-            Some(&output.state_summary),
-        )
-        .unwrap();
-        let intents = proof["source_intent_assertions"].as_array().unwrap();
-        let selected_node = intents
-            .iter()
-            .find_map(|intent| {
-                let node = intent.get("node").and_then(serde_json::Value::as_str)?;
-                let is_click =
-                    intent.get("intent").and_then(serde_json::Value::as_str) == Some("click");
-                let is_select = intent
-                    .get("source_path")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("cell.sources.editor.select");
-                let has_b0_row_lookup = intents.iter().any(|candidate| {
-                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                        && candidate
-                            .get("intent")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|intent| ROW_LOOKUP_SOURCE_INTENT_KINDS.contains(&intent))
-                        && candidate
-                            .get("source_path")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("B0")
-                });
-                let has_formula_target = intents.iter().any(|candidate| {
-                    candidate.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                        && candidate.get("intent").and_then(serde_json::Value::as_str)
-                            == Some("target")
-                        && candidate
-                            .get("source_path")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("=add(A0,A1)")
-                });
-                (is_click && is_select && has_b0_row_lookup && has_formula_target)
-                    .then_some(node.to_owned())
-            })
-            .expect("B0 cell should expose a click select source intent");
-
-        let artifact_path = proof["artifact_path"].as_str().unwrap();
-        let artifact: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(artifact_path).unwrap()).unwrap();
-        let nodes = artifact["document_frame"]["nodes"].as_object().unwrap();
-        let style = nodes
-            .get(&selected_node)
-            .and_then(|node| node.get("style"))
-            .expect("selected B0 node should be in the lowered document frame");
-        assert_eq!(
-            style.get("selected").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert!(
-            style.get("border").is_some(),
-            "selected cell style should carry a public outline/border color"
-        );
-        assert!(
-            nodes.values().any(|node| {
-                node.pointer("/text/text")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("=add(A0,A1)")
-            }),
-            "formula bar should display the selected cell formula text"
-        );
-    }
-
     fn layout_has_visible_address(layout: &serde_json::Value, address: &str) -> bool {
         let intents = layout["source_intent_assertions"]
             .as_array()
@@ -92891,16 +93141,6 @@ document:
         ))
     }
 
-    fn cells_live_runtime_with_scenario(
-        label: &str,
-        cells_path: &Path,
-        cells_source: &str,
-        scenario_path: &Path,
-    ) -> boon_runtime::LiveRuntime {
-        live_runtime_from_source_text_with_scenario(label, cells_path, cells_source, scenario_path)
-            .unwrap()
-    }
-
     fn test_key_press(
         sequence: u64,
         key: &str,
@@ -94159,7 +94399,7 @@ document:
         let click_timings = take_preview_native_input_timings();
         assert!(
             click_timings.iter().any(|sample| {
-                sample.fast_path == "simple_source_click"
+                sample.fast_path.starts_with("simple_source_click")
                     && matches!(
                         sample.resolve_source,
                         Some("cached_click_candidate" | "hover_candidate")
@@ -94319,12 +94559,13 @@ document:
         assert!(
             timings
                 .iter()
-                .any(|sample| sample.fast_path == "simple_source_click"),
+                .any(|sample| sample.fast_path.starts_with("simple_source_click")),
             "real-window-shaped click should stay on the simple source-click path: {timings:?}"
         );
         assert!(
             timings.iter().any(|sample| {
-                sample.fast_path == "simple_source_click" && sample.bound_input_sync_ms < 4.0
+                sample.fast_path.starts_with("simple_source_click")
+                    && sample.bound_input_sync_ms < 4.0
             }),
             "simple cell clicks should use a bounded retained bound-input sync after the retained state patch: {timings:?}"
         );

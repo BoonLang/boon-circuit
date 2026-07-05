@@ -36653,3 +36653,17 @@ Immediate next classification:
   field access, and imported function/object summaries. Do not spend the next
   iteration on native presentation or Cells micro-tuning until this
   PlanExecutor authority gap is reduced or explicitly retired.
+
+Follow-up predicate alignment:
+
+- `root_row_expression_cpu_evaluable` now admits the root source-transform row
+  expression subset that PlanExecutor already evaluates: `Text/to_number`,
+  `List/find_value`, `Object/field`, `Text/concat`, `Select`, constants, fields,
+  and `Router/route`.
+- Evidence:
+  `cargo test -q -p boon_plan root_row_expression_cpu_support_matches_source_transform_subset`
+  and `cargo check -q -p boon_plan -p boon_compiler -p boon_plan_executor -p boon_cli`
+  pass.
+- Fresh NovyWave compact summary after the predicate cut:
+  `status=fail`, `cpu_plan_executor_unsupported_op_count=536`,
+  `unresolved_executable_ref_count=7`, failing verification checks `[]`.

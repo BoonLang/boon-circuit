@@ -5435,11 +5435,20 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
     match expression {
         PlanRowExpression::Field { .. } | PlanRowExpression::Constant { .. } => true,
         PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextToNumber { input }
         | PlanRowExpression::ObjectField { object: input, .. } => {
             root_row_expression_cpu_evaluable(input)
         }
         PlanRowExpression::TextConcat { parts } => {
             parts.iter().all(root_row_expression_cpu_evaluable)
+        }
+        PlanRowExpression::ListFindValue {
+            value, fallback, ..
+        } => {
+            root_row_expression_cpu_evaluable(value)
+                && fallback
+                    .as_deref()
+                    .is_none_or(root_row_expression_cpu_evaluable)
         }
         PlanRowExpression::BuiltinCall {
             function,
@@ -5589,6 +5598,31 @@ mod tests {
             SourcePayloadValueType::Text,
             &PlanValueType::Bool
         ));
+    }
+
+    #[test]
+    fn root_row_expression_cpu_support_matches_source_transform_subset() {
+        let expression = PlanRowExpression::TextToNumber {
+            input: Box::new(PlanRowExpression::ListFindValue {
+                list_id: ListId(3),
+                field: FieldId(4),
+                value: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::State(StateId(5)),
+                }),
+                target: FieldId(6),
+                fallback: Some(Box::new(PlanRowExpression::Constant {
+                    constant_id: PlanConstantId(7),
+                })),
+            }),
+        };
+        assert!(root_row_expression_cpu_evaluable(&expression));
+
+        let unsupported = PlanRowExpression::TextLength {
+            input: Box::new(PlanRowExpression::Constant {
+                constant_id: PlanConstantId(8),
+            }),
+        };
+        assert!(!root_row_expression_cpu_evaluable(&unsupported));
     }
 
     #[test]

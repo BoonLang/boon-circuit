@@ -36443,3 +36443,51 @@ Current interpretation:
 - The remaining visible `legacy` terms are not all equal: some are negative
   gates or historical docs, some are explicit diagnostics, and some are old
   runtime tests still waiting for PlanExecutor migration or deletion.
+
+## 2026-07-05 - Cells Product Tests Moved Off Legacy Internals
+
+Status: implemented and focused runtime-verified in this slice.
+
+What changed:
+
+- Migrated another Cells public-behavior test cluster from private legacy
+  runtime inspection to PlanExecutor construction:
+  - selected-input `List/find` now asserts current selected address/value
+    through document summaries instead of inspecting legacy projection storage;
+  - targeted `document_state_values(...)` now asserts selected address,
+    editing text, and source binding directly from PlanExecutor output;
+  - window summaries now assert the selected input plus visible window rows
+    are current after selection;
+  - visible cell edits now assert a bounded visible window summary remains
+    current after commit;
+  - Cells default initializers from Boon text now assert default formula/value
+    through PlanExecutor document summary.
+- Deleted the old storage row-count, read-key, list-scan counter, and
+  root-materialization assertions from these tests. Those were legacy runtime
+  internals, not product API. Scan/materialization guarantees now need to be
+  owned by explicit runtime-work/native reports rather than hidden
+  `LoadedRuntime` storage peeks.
+- The focused Cells source search now has no `from_source_legacy(...cells...)`
+  or `from_project_legacy(...cells...)` matches in this cluster; the remaining
+  `playground-live:cells` label uses normal `LiveRuntime::new(...)`.
+
+Evidence:
+
+- `cargo test -q -p boon_runtime cells_selected_input_list_find_materializes_single_row_storage -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime cells_selected_input_document_state_values_use_indexed_list_find_projection -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime cells_window_document_summary_keeps_selected_projection_current -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime cells_visible_value_edit_keeps_window_summary_bounded_and_current -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime source_initializers_are_read_from_boon_text -- --nocapture`:
+  pass.
+
+Current interpretation:
+
+- This is a real reduction in legacy test coupling, not complete legacy
+  removal. The remaining executable legacy surface is now clearer: old runtime
+  diagnostic constructors/tests, explicit legacy comparison/report fields, and
+  native verifier negative gates/fallback counters must be cut or quarantined
+  in larger follow-up slices.

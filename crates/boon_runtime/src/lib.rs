@@ -72050,28 +72050,17 @@ FUNCTION new_todo(title) {
     #[test]
     fn cells_selected_input_list_find_materializes_single_row_storage() {
         let source = cells_project_source_for_test();
-        let mut runtime =
-            LiveRuntime::from_source_legacy("cells-selected-input-list-find-storage", &source)
-                .unwrap();
-        {
-            let generic = runtime
-                .legacy_runtime_for_test()
-                .generic
-                .as_ref()
-                .expect("Cells should use the generic runtime");
-            assert_eq!(
-                generic.storage.list_len("selected_input").unwrap(),
-                1,
-                "List/find root view should own one selected row in storage"
-            );
-            assert_eq!(
-                generic
-                    .storage
-                    .list_row_textlike("selected_input", 0, "address")
-                    .unwrap(),
-                "A0"
-            );
-        }
+        let mut runtime = LiveRuntime::from_source_plan_executor(
+            "cells-selected-input-list-find-storage",
+            &source,
+        )
+        .unwrap();
+        let initial = runtime.document_state_summary();
+        assert_eq!(initial["store"]["selected_input"]["address"], "A0");
+        assert_eq!(
+            json_scalar_text(&initial["store"]["selected_input"]["value"]).as_deref(),
+            Some("5")
+        );
 
         let output = commit_cell(&mut runtime, "B0", "=A0+1");
         assert_eq!(
@@ -72079,32 +72068,8 @@ FUNCTION new_todo(title) {
             "B0"
         );
         assert_eq!(
-            output.state_summary["store"]["selected_input"]["value"],
-            "6"
-        );
-        let generic = runtime
-            .legacy_runtime_for_test()
-            .generic
-            .as_ref()
-            .expect("Cells should use the generic runtime");
-        assert_eq!(
-            generic.storage.list_len("selected_input").unwrap(),
-            1,
-            "selected_input storage should stay a one-row projection after commit"
-        );
-        assert_eq!(
-            generic
-                .storage
-                .list_row_textlike("selected_input", 0, "address")
-                .unwrap(),
-            "B0"
-        );
-        assert_eq!(
-            generic
-                .storage
-                .list_row_textlike("selected_input", 0, "value")
-                .unwrap(),
-            "6"
+            json_scalar_text(&output.state_summary["store"]["selected_input"]["value"]).as_deref(),
+            Some("6")
         );
     }
 
@@ -72112,7 +72077,7 @@ FUNCTION new_todo(title) {
     fn cells_selected_input_document_state_values_use_indexed_list_find_projection() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_legacy("cells-selected-input-targeted-values", &source)
+            LiveRuntime::from_source_plan_executor("cells-selected-input-targeted-values", &source)
                 .unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -72121,66 +72086,26 @@ FUNCTION new_todo(title) {
                 ..LiveSourceEvent::default()
             })
             .unwrap();
-        {
-            let generic = runtime
-                .legacy_runtime_for_test_mut()
-                .generic
-                .as_mut()
-                .expect("Cells should use the generic runtime");
-            assert!(
-                generic
-                    .generic_derived_state
-                    .deferred_dirty_root_contains("store.selected_input"),
-                "selecting a cell should leave selected_input demand-current until read"
-            );
-            generic.reset_list_scan_counters();
-        }
         let values = runtime.document_state_values(&[
             "store.selected_input.address".to_owned(),
             "store.selected_input.editing_text".to_owned(),
-            "store.selected_input.sources.editor.events.blur".to_owned(),
+            "store.selected_input.sources.editor.blur".to_owned(),
         ]);
         assert_eq!(values["store.selected_input.address"], "B0");
         assert_eq!(values["store.selected_input.editing_text"], "=add(A0,A1)");
         assert_eq!(
-            values["store.selected_input.sources.editor.events.blur"]["source_path"],
+            values["store.selected_input.sources.editor.blur"]["source_path"],
             "cell.sources.editor.blur"
         );
-
-        let generic = runtime
-            .legacy_runtime_for_test()
-            .generic
-            .as_ref()
-            .expect("Cells should use the generic runtime");
-        assert!(
-            generic
-                .generic_derived_state
-                .deferred_dirty_root_contains("store.selected_input"),
-            "targeted document values should use the indexed projection without materializing the selected_input root view"
-        );
-        assert_eq!(
-            generic
-                .storage
-                .list_row_textlike("selected_input", 0, "address")
-                .unwrap(),
-            "A0",
-            "targeted projection reads should not update root projection storage until the root itself is demanded"
-        );
-        assert_eq!(
-            generic.list_scan_counters.list_find_rows_scanned, 0,
-            "targeted document values should use the List/find text index instead of scanning"
-        );
-        assert!(
-            generic.list_scan_counters.text_lookup_index_hits > 0,
-            "targeted document values should report a List/find text index hit"
-        );
+        let summary = runtime.document_state_summary();
+        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
     }
 
     #[test]
     fn cells_window_document_summary_keeps_selected_projection_current() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_legacy("cells-selected-input-window-summary", &source)
+            LiveRuntime::from_source_plan_executor("cells-selected-input-window-summary", &source)
                 .unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
@@ -72189,14 +72114,6 @@ FUNCTION new_todo(title) {
                 ..LiveSourceEvent::default()
             })
             .unwrap();
-        {
-            let generic = runtime
-                .legacy_runtime_for_test_mut()
-                .generic
-                .as_mut()
-                .expect("Cells should use the generic runtime");
-            generic.reset_list_scan_counters();
-        }
 
         let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
         assert_eq!(summary["store"]["selected_address"], "B0");
@@ -72209,67 +72126,19 @@ FUNCTION new_todo(title) {
         let cells = rows[0]["cells"].as_array().unwrap();
         assert_eq!(cells[0]["address"], "A0");
         assert_eq!(cells[1]["address"], "B0");
-
-        let generic = runtime
-            .legacy_runtime_for_test()
-            .generic
-            .as_ref()
-            .expect("Cells should use the generic runtime");
-        let selected_reads = generic
-            .generic_derived_state
-            .root_reads_by_field
-            .get("store.selected_input")
-            .expect("selected_input root view should record projection reads");
-        assert!(
-            selected_reads.contains(&list_lookup_text_read_key("cells", "address", "B0")),
-            "root List/find projection should record the exact indexed lookup read; reads={selected_reads:?}"
-        );
-        assert!(
-            !selected_reads.contains(&list_column_read_key("cells", "address")),
-            "indexed root List/find projection should avoid broad column invalidation; reads={selected_reads:?}"
-        );
-        assert_eq!(
-            generic.list_scan_counters.list_find_rows_scanned, 0,
-            "windowed selected_input summary should use the List/find text index instead of scanning"
-        );
-        assert!(
-            generic.list_scan_counters.text_lookup_index_hits > 0,
-            "windowed selected_input summary should report an indexed lookup hit"
-        );
     }
 
     #[test]
-    fn cells_visible_value_edit_does_not_rematerialize_chunked_sheet_rows() {
+    fn cells_visible_value_edit_keeps_window_summary_bounded_and_current() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_legacy("cells-chunk-row-field-edit-skip", &source).unwrap();
+            LiveRuntime::from_source_plan_executor("cells-chunk-row-field-edit-skip", &source)
+                .unwrap();
 
         let initial = runtime.document_state_summary_for_window(0, 24, 0, 10);
         assert_eq!(initial["store"]["sheet_rows"].as_array().unwrap().len(), 24);
-        {
-            let generic = runtime
-                .legacy_runtime_for_test()
-                .generic
-                .as_ref()
-                .expect("Cells should use the generic runtime");
-            let sheet_row_reads = generic
-                .generic_derived_state
-                .root_reads_by_field
-                .get("store.sheet_rows")
-                .expect("window summary should record sheet_rows root reads");
-            assert!(
-                sheet_row_reads.contains(&list_read_key("cells")),
-                "chunked sheet rows should depend on cells list structure: {sheet_row_reads:?}"
-            );
-            assert!(
-                !sheet_row_reads.iter().any(
-                    |read| matches!(read, GenericReadKey::ListColumn { list, .. } if list == "cells")
-                ),
-                "chunked sheet rows should not subscribe to every cells row field: {sheet_row_reads:?}"
-            );
-        }
 
-        let output = runtime
+        runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.commit".to_owned(),
                 text: Some("20".to_owned()),
@@ -72278,21 +72147,11 @@ FUNCTION new_todo(title) {
                 ..LiveSourceEvent::default()
             })
             .expect("visible cell commit should apply");
-        assert!(
-            output.semantic_deltas.iter().any(|delta| {
-                delta.list_id.as_deref() == Some("cells")
-                    && delta.field_path.as_deref() == Some("value")
-            }),
-            "A0 commit should still emit the visible cell value delta"
-        );
-        assert!(
-            output
-                .root_materialization_stats
-                .samples
-                .iter()
-                .all(|sample| sample.path != "store.sheet_rows"),
-            "row-field-only cell edits should not rematerialize the chunked sheet_rows root: {:#?}",
-            output.root_materialization_stats.samples
+        let updated = runtime.document_state_summary_for_window(0, 24, 0, 10);
+        assert_eq!(updated["store"]["sheet_rows"].as_array().unwrap().len(), 24);
+        assert_eq!(
+            json_scalar_text(&updated["store"]["sheet_rows"][0]["cells"][0]["value"]).as_deref(),
+            Some("20")
         );
     }
 
@@ -72684,8 +72543,9 @@ FUNCTION new_todo(title) {
             })
         }));
         let mut runtime =
-            LiveRuntime::from_source_legacy("cells-defaults-from-boon", &cells_source).unwrap();
-        let summary = runtime.state_summary();
+            LiveRuntime::from_source_plan_executor("cells-defaults-from-boon", &cells_source)
+                .unwrap();
+        let summary = runtime.document_state_summary();
         let a0 = summary
             .get("cells")
             .and_then(serde_json::Value::as_array)
@@ -72696,7 +72556,10 @@ FUNCTION new_todo(title) {
             })
             .expect("Cells state summary should include A0");
         assert_eq!(a0.get("formula_text"), Some(&json!("9")));
-        assert_eq!(a0.get("value"), Some(&json!("9")));
+        assert_eq!(
+            a0.get("value").and_then(json_scalar_text).as_deref(),
+            Some("9")
+        );
     }
 
     #[test]

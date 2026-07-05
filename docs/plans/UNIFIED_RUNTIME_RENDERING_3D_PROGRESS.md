@@ -80,6 +80,91 @@ virtualization architecture exists to test. This disposition does not make the
 old readiness/default switch pass. The focused handoff for the next attempt is
 `docs/plans/speedup/TASK-0804A_HANDOFF.md`.
 
+## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
+
+Status: control-plane/schema slice implemented; native handoff remains open.
+
+What changed:
+
+- `run-report-refresh-queue` was executed against
+  `target/reports/native-gpu-all.json` with `--until-clean --max-runs 2` and
+  byte-capped child output.
+- The queue executed 22 refresh commands: 17 passed and 5 failed. The failed
+  labels were `cells-visible-click-e2e-release`, `preview-e2e-cells`,
+  `preview-e2e-todo_mvc_physical`, `preview-e2e-todomvc`, and
+  `todomvc-physical-reference-parity`.
+- The post-refresh aggregate before the schema fix had
+  `refresh_debt_child_count=1`, `true_blocker_child_count=6`, and
+  `product_contract_child_count=5`. This was the first useful fresh split after
+  the broad stale-report state.
+- The refresh queue report itself exposed a schema/control-plane bug: bulky
+  `post_refresh_aggregate.remaining_selected_refresh_commands` was sidecarized
+  correctly, but `boon_report_schema` still required that nested field to be an
+  inline array. The schema now resolves that nested sidecar ref and verifies
+  that `remaining_selected_refresh_command_count` matches the sidecar payload
+  length.
+
+Fresh Cells evidence from the pre-schema-fix queue:
+
+- `cells-visible-click-e2e-release` still fails, but the product accepted-input
+  lane is no longer the large-latency blocker:
+  `product_only_ux_contract.input_to_present_ms.p95=11.443ms` and
+  `max=13.111ms`.
+- The failing contracts are architectural: `retained_update_contract.status`
+  and `runtime_work_contract.status` are `fail`.
+- Retained update evidence shows all 64 samples using
+  `layout_source=deferred_visible_sync`,
+  `summary_source=post_turn_full_document`, and missing render-scene patch
+  source. That means selection/formula-bar updates still do not prove a retained
+  patch path.
+- Runtime evidence is much better than the old full-grid failure:
+  `total_list_find_rows_scanned=0`, `total_rows_scanned=0`,
+  `total_root_materialization_candidates=0`, and one recomputed field per
+  sample. The remaining runtime contract failure is the verifier's
+  selection-click contract around recompute/report shape, not a list scan.
+
+Fresh preview E2E blockers from the pre-schema-fix queue:
+
+- `preview-e2e-cells` requires fresh headed visual cursor/readback evidence.
+- `preview-e2e-todomvc` still reports only `boon-driver` evidence while the
+  manifest requires `real-window`, misses manifest-declared scenario coverage,
+  and lacks visible proof for document styling, live frame loop, non-fixture dev
+  UI, and input-visible frame change.
+- `preview-e2e-todo_mvc_physical` did not write the expected live-state proof
+  while windows were alive and is missing native app-window input adapter /
+  per-window provenance evidence.
+- `todomvc-physical-reference-parity` fails because it consumes the failing
+  physical TodoMVC preview E2E report.
+
+Evidence after the schema fix:
+
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p boon_report_schema
+  refresh_queue_schema_accepts_sidecarized_post_refresh_remaining_selected_commands
+  -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/report-refresh-queue-native-gpu-all.json`: pass.
+- Rerunning `verify-native-gpu-all --check-existing` after the schema change is
+  schema-valid but back to refresh debt:
+  `refresh_debt_child_count=18`, `true_blocker_child_count=0`, and
+  `product_contract_child_count=0`, because the verifier identity changed.
+
+Next native cuts:
+
+1. Rerun the dependency-aware native refresh queue once for the new verifier
+   identity; use compact summaries only.
+2. Fix Cells retained selection/formula-bar publication so click updates commit
+   through retained render-scene/document patches instead of
+   `post_turn_full_document` / `deferred_visible_sync` summaries.
+3. Audit the Cells runtime selection-click contract now that scans and root
+   materialization are zero; tighten the verifier if it is still conflating one
+   demand-current recomputed field with forbidden full runtime work.
+4. Fix preview E2E harness coverage around required `real-window`,
+   app-window input provenance, live-state proof, and headed cursor/readback
+   evidence before treating those as product renderer bugs.
+5. Continue the ProductFrameGraph scheduler slice only after the above fresh
+   blocker split is preserved under the new verifier identity.
+
 ## 2026-07-04 - Currentness Fix And Harness Taxonomy Checkpoint
 
 Status: focused U1/harness slice implemented; structured refresh queue added;

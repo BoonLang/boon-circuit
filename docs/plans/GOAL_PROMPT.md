@@ -183,6 +183,28 @@ Current checkpoint:
   A compact dry-run smoke report validated with `verify-report-schema` and was
   about 7 KB inline with three small sidecars, so queue reports no longer need
   to dump large child-result payloads into the conversation.
+- The full native refresh queue was executed once with
+  `--until-clean --max-runs 2`. It executed 22 refresh commands, passed 17, and
+  exposed 5 fresh failing labels before the next schema-code change invalidated
+  current native report identity again: `cells-visible-click-e2e-release`,
+  `preview-e2e-cells`, `preview-e2e-todo_mvc_physical`,
+  `preview-e2e-todomvc`, and `todomvc-physical-reference-parity`. The queue
+  report is now schema-valid after fixing nested sidecar validation for
+  `post_refresh_aggregate.remaining_selected_refresh_commands`.
+- Fresh Cells click evidence from that queue says the accepted product lane is
+  within budget (`input_to_present_ms.p95=11.443ms`, `max=13.111ms`) and proof
+  is separated, but the report still fails because retained updates publish via
+  `deferred_visible_sync` / `post_turn_full_document` with missing render-scene
+  patch evidence, and the runtime-work contract still flags one recomputed field
+  per selection click despite zero list scans, zero row scans, and zero root
+  materialization candidates. The next Cells cut is retained
+  selection/formula-bar patch publication plus a runtime-work contract audit,
+  not another broad renderer/proof micro-optimization loop.
+- Fresh preview E2E failures are harness/coverage blockers: Cells needs headed
+  visual cursor/readback evidence, TodoMVC needs manifest-required real-window
+  coverage instead of only `boon-driver` evidence, and physical TodoMVC needs
+  live-state plus app-window input provenance proof. Fix those harness gaps
+  before using preview E2E failures as product renderer evidence.
 - Native handoff report dependencies now support both
   `consumes-source-replay-report` and `consumes-native-report`. The manifest
   models `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical`,

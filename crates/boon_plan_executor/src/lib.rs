@@ -4840,7 +4840,7 @@ fn evaluate_initial_root_derived_values_with_policy(
     Ok(values)
 }
 
-fn evaluate_root_row_expression_derived_values(
+pub fn evaluate_root_row_expression_derived_values(
     plan: &MachinePlan,
     root_state: &JsonMap<String, JsonValue>,
 ) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {

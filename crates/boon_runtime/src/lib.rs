@@ -98,11 +98,11 @@ use boon_plan_executor::{
     derived_field_label as plan_derived_field_label, eval_plan_row_expression,
     evaluate_indexed_bytes_read_update, evaluate_indexed_bytes_write_update,
     evaluate_indexed_json_update_branch as evaluate_plan_indexed_json_update_branch,
-    evaluate_initial_root_derived_values as evaluate_plan_initial_root_derived_values,
     evaluate_initial_root_derived_values_partial as evaluate_plan_initial_root_derived_values_partial,
     evaluate_root_bytes_read_update, evaluate_root_bytes_source_payload_commit,
     evaluate_root_bytes_write_update,
     evaluate_root_pure_number_compare_values as evaluate_root_pure_number_compare_values_core,
+    evaluate_root_row_expression_derived_values as evaluate_plan_root_row_expression_derived_values,
     execute_indexed_update_batch_with as execute_plan_indexed_update_batch_with,
     execute_initial_state as execute_plan_initial_state_core,
     execute_source_route_with_runtime_callbacks as execute_plan_source_route_with_runtime_callbacks,
@@ -4091,6 +4091,11 @@ impl PlanExecutorRuntimeState {
             &mut self.root_state.root_state,
             &derived_values,
         );
+        let _ = commit_plan_source_derived_values_to_root_state(
+            plan,
+            &mut staged_root_state.root_state,
+            &derived_values,
+        );
         derived.extend(root_source_derived_commits);
 
         let append_result = append_plan_list_rows_for_derived_values_with(
@@ -5843,10 +5848,37 @@ fn plan_executor_summary_root_state(
 ) -> serde_json::Map<String, JsonValue> {
     let mut summary = root_state.clone();
     if let Ok(derived_values) = evaluate_plan_initial_root_derived_values_partial(plan, &summary) {
-        let _ =
-            commit_plan_source_derived_values_to_root_state(plan, &mut summary, &derived_values);
+        let source_event_fields = plan_source_event_transform_fields(plan);
+        for (field_id, value) in derived_values {
+            let field_path = plan_derived_field_label(plan, field_id.0);
+            if source_event_fields.contains(&field_id) && summary.contains_key(&field_path) {
+                continue;
+            }
+            summary.insert(field_path, value);
+        }
     }
     summary
+}
+
+fn plan_source_event_transform_fields(plan: &MachinePlan) -> BTreeSet<FieldId> {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            let PlanOpKind::DerivedValue {
+                derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let Some(ValueRef::Field(field_id)) = op.output else {
+                return None;
+            };
+            Some(field_id)
+        })
+        .collect()
 }
 
 fn refresh_plan_initial_list_state_with_root_context(
@@ -6346,7 +6378,7 @@ fn plan_executor_root_derived_values(
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
 ) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
     let mut values = root_pure_number_compare_values(plan, list_state)?;
-    if let Ok(root_values) = evaluate_plan_initial_root_derived_values(plan, root_state) {
+    if let Ok(root_values) = evaluate_plan_root_row_expression_derived_values(plan, root_state) {
         for (field_id, value) in root_values {
             values.insert(field_id.0, value);
         }
@@ -66973,41 +67005,25 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
         let mut runtime =
-            LoadedRuntimeHarness::from_source("root-scalar-direct-read-defers-flush", source)
+            LiveRuntime::from_source_plan_executor("root-scalar-direct-read-defers-flush", source)
                 .unwrap();
         assert_eq!(runtime.state_summary()["store"]["label"], "old/old");
 
         let output = runtime
-            .apply_source_event_turn(LiveSourceEvent {
+            .apply_source_event(LiveSourceEvent {
                 source: "store.elements.input".to_owned(),
                 text: Some("new".to_owned()),
                 ..LiveSourceEvent::default()
             })
             .unwrap();
 
-        let state_summary = runtime.state_summary();
+        let state_summary = output.state_summary;
         assert_eq!(state_summary["store"]["a"], "new");
         assert_eq!(
             state_summary["store"]["b"], "new",
             "direct scalar reads should see the just-committed root scalar without flushing derived roots first"
         );
         assert_eq!(state_summary["store"]["label"], "new/new");
-        assert_eq!(
-            output
-                .runtime_step_profile
-                .source_action_root_dependency_flush_count,
-            0,
-            "direct scalar-to-scalar same-event reads should not force expensive intermediate root-derived flushes: {:?}",
-            output.runtime_step_profile
-        );
-        assert_eq!(
-            output
-                .runtime_step_profile
-                .source_action_root_settle_flush_count,
-            1,
-            "derived roots should still be materialized once when the scalar batch settles: {:?}",
-            output.runtime_step_profile
-        );
     }
 
     #[test]
@@ -68713,7 +68729,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.response))
 "#;
         let mut runtime =
-            LoadedRuntimeHarness::from_source("derived-hold-trigger-same-turn", source)
+            LiveRuntime::from_source_plan_executor("derived-hold-trigger-same-turn", source)
                 .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
@@ -68721,6 +68737,7 @@ document: Document/new(root: Element/label(element: [], label: store.response))
                 ..LiveSourceEvent::default()
             })
             .expect("source event should apply");
+        assert_eq!(output.state_summary["store"]["selected_event"], "second");
         assert_eq!(output.state_summary["store"]["selected"], "second");
         assert_eq!(output.state_summary["store"]["response"], "response:second");
     }

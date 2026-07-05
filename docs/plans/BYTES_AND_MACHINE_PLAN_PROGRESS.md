@@ -37236,3 +37236,38 @@ Remaining legacy callers:
 - Runtime implementation/tests still contain `LoadedRuntime` and
   `GenericScheduledRuntime`; those should be cut only after the remaining
   xtask callers are replaced or deleted.
+
+## 2026-07-05 - xtask Raw Legacy Scenario Callers Removed
+
+Status: replaced the two remaining direct `xtask` calls to
+`run_legacy_scenario` with PlanExecutor scenario replay. `xtask` no longer
+imports or invokes the raw legacy scenario APIs; remaining references are audit
+strings or report-schema support for historical reports.
+
+What changed:
+
+- `verify-boon-driver-e2e` now generates its fresh scenario report with
+  `run_plan_scenario_events(..., compare_legacy=false)` instead of
+  `run_legacy_scenario`.
+- The BoonDriver E2E report now records `plan_scenario_report` /
+  `plan_scenario_report_sha256` rather than `runtime_scenario_report`.
+- `runtime_schema_fixture` now uses a PlanExecutor scenario-events report as
+  its base fixture before overlaying negative runtime-schema fields.
+- Removed the `run_legacy_scenario` import from `xtask`.
+
+Fresh evidence:
+
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask`: pass.
+- `rg` over `crates/xtask/src/main.rs` finds no direct
+  `run_legacy_scenario` or `run_legacy_scenario_project` calls.
+
+Remaining legacy implementation:
+
+- `boon_runtime` still exposes and tests `run_legacy_scenario`,
+  `LoadedRuntime`, and `GenericScheduledRuntime`.
+- `boon_cli diagnose-plan-legacy-compare` still owns the explicit diagnostic
+  legacy comparison island.
+- Native/playground world/manufacturing paths still need review before the
+  `LoadedRuntime` implementation can be deleted or isolated behind a smaller
+  legacy-output module.

@@ -47,9 +47,11 @@ Current checkpoint:
   variant, legacy constructors, and `apply_checked_step*` legacy fallback helpers
   are `#[cfg(test)]` quarantined while old runtime coverage is migrated or
   deleted. Default `hello_3d` world-output construction now proves PlanExecutor
-  provenance rather than expecting a hidden fallback rejection. The remaining
-  legacy cuts are the
-  `LoadedRuntime` / `GenericScheduledRuntime` implementation island itself and
+  provenance rather than expecting a hidden fallback rejection. `LoadedRuntime`
+  and `GenericScheduledRuntime` themselves are now `#[cfg(test)]`, with the
+  remaining production utility (`List` count predicate row-field extraction)
+  pulled into a free helper. The remaining legacy cuts are deleting or migrating
+  the test-only `LoadedRuntime` / `GenericScheduledRuntime` coverage island and
   any native legacy negative counters that are no longer useful as removal
   guards.
 - Default-engine readiness is fresh and passing with `default_engine=plan`,

@@ -155,7 +155,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
-use std::ops::{Bound, Deref, DerefMut};
+use std::ops::Bound;
+#[cfg(test)]
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11141,6 +11143,7 @@ fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<St
 }
 
 impl LiveRuntime {
+    #[cfg(test)]
     fn legacy_runtime(&self) -> RuntimeResult<&LoadedRuntime> {
         match &self.engine {
             #[cfg(test)]
@@ -11151,6 +11154,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(test)]
     fn legacy_runtime_mut(&mut self) -> RuntimeResult<&mut LoadedRuntime> {
         match &mut self.engine {
             #[cfg(test)]
@@ -13249,15 +13253,18 @@ fn run_legacy_loaded_scenario_with_compiled(
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct LoadedRuntime {
     generic: Option<GenericScheduledRuntime>,
 }
 
+#[cfg(test)]
 struct CountedStepOutput {
     semantic_delta_count: usize,
     render_patch_count: usize,
 }
 
+#[cfg(test)]
 impl LoadedRuntime {
     fn new(compiled: &CompiledProgram) -> RuntimeResult<Self> {
         Ok(Self::new_profiled(compiled)?.0)
@@ -13871,6 +13878,7 @@ impl LoadedRuntime {
     }
 }
 
+#[cfg(test)]
 fn close_other_generic_bool_field<'a>(
     generic: &mut GenericScheduledRuntime,
     list: &str,
@@ -21781,6 +21789,17 @@ impl RuntimeListDeltaCounters {
     }
 }
 
+fn list_count_predicate_row_field(predicate: &RuntimeListPredicate) -> Option<&str> {
+    match predicate {
+        RuntimeListPredicate::FieldBool { path } | RuntimeListPredicate::FieldBoolNot { path } => {
+            Some(row_field_name(path))
+        }
+        RuntimeListPredicate::AlwaysTrue
+        | RuntimeListPredicate::SelectorVisibility { .. }
+        | RuntimeListPredicate::Unsupported => None,
+    }
+}
+
 impl LargeListCountDataflowKernel {
     fn build(
         storage: &GenericCircuitRuntime,
@@ -21789,7 +21808,7 @@ impl LargeListCountDataflowKernel {
         target: &str,
     ) -> RuntimeResult<Self> {
         let predicate = equations.count_predicate(list, target)?;
-        let field = GenericScheduledRuntime::count_predicate_row_field(&predicate)
+        let field = list_count_predicate_row_field(&predicate)
             .ok_or_else(|| {
                 format!("list `{list}` count target `{target}` does not have a row-field predicate")
             })?
@@ -26862,6 +26881,7 @@ impl RuntimeListStore {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct GenericScheduledRuntime {
     storage: GenericCircuitRuntime,
     router_route: String,
@@ -27095,6 +27115,7 @@ impl SummaryLimits {
     }
 }
 
+#[cfg(test)]
 impl GenericScheduledRuntime {
     fn new(compiled: &CompiledProgram) -> RuntimeResult<Self> {
         Ok(Self::new_profiled(compiled)?.0)
@@ -27546,13 +27567,7 @@ impl GenericScheduledRuntime {
     }
 
     fn count_predicate_row_field(predicate: &RuntimeListPredicate) -> Option<&str> {
-        match predicate {
-            RuntimeListPredicate::FieldBool { path }
-            | RuntimeListPredicate::FieldBoolNot { path } => Some(row_field_name(path)),
-            RuntimeListPredicate::AlwaysTrue
-            | RuntimeListPredicate::SelectorVisibility { .. }
-            | RuntimeListPredicate::Unsupported => None,
-        }
+        list_count_predicate_row_field(predicate)
     }
 
     fn capture_count_delta_preimages(
@@ -46788,6 +46803,7 @@ fn text_pattern_pathlike_token(token: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '~')
 }
 
+#[cfg(test)]
 impl Deref for GenericScheduledRuntime {
     type Target = GenericCircuitRuntime;
 
@@ -46796,6 +46812,7 @@ impl Deref for GenericScheduledRuntime {
     }
 }
 
+#[cfg(test)]
 impl DerefMut for GenericScheduledRuntime {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.storage
@@ -63416,13 +63433,7 @@ impl ListEquationPlan {
     }
 
     fn count_predicate_row_field(predicate: &RuntimeListPredicate) -> Option<&str> {
-        match predicate {
-            RuntimeListPredicate::FieldBool { path }
-            | RuntimeListPredicate::FieldBoolNot { path } => Some(row_field_name(path)),
-            RuntimeListPredicate::AlwaysTrue
-            | RuntimeListPredicate::SelectorVisibility { .. }
-            | RuntimeListPredicate::Unsupported => None,
-        }
+        list_count_predicate_row_field(predicate)
     }
 
     fn retain_targets(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -64537,6 +64548,7 @@ impl ListScenarioHarness {
     }
 }
 
+#[cfg(test)]
 impl ScenarioExecutor for LoadedRuntime {
     fn prepare_for_scenario(&mut self, _scenario: &Scenario) -> RuntimeResult<()> {
         Ok(())

@@ -38591,3 +38591,18 @@ Fresh focused evidence before commit:
   -- --nocapture`: pass.
 - `cargo test -q -p xtask native_gpu_label_contract_rejects -- --nocapture`:
   pass.
+
+## 2026-07-06 - Scroll Handoff Rejects Isolated Weston Evidence
+
+Status: implemented and focused verification pending.
+
+What changed:
+
+- Added a shared scroll hot-path contract check that rejects
+  `input_injection_method`, `launcher_command`, `wheel_input_evidence_source`,
+  or `speed_timing_window` values tied to isolated Weston or
+  `weston_test_control`.
+- This keeps isolated Weston as diagnostic infrastructure only; handoff scroll
+  proof must use the product app-owned/BoonDriver input route.
+- Added a focused negative test proving isolated Weston scroll evidence no
+  longer satisfies the common scroll handoff hot-path contract.

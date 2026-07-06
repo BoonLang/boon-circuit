@@ -8806,8 +8806,6 @@ fn verify_bytes_machine_plan_all_report(
 const NATIVE_GPU_HANDOFF_MANIFEST_PATH: &str = "docs/architecture/native_gpu_handoff_manifest.json";
 const NATIVE_GPU_HANDOFF_MANIFEST_JSON: &str =
     include_str!("../../../docs/architecture/native_gpu_handoff_manifest.json");
-const BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH: &str =
-    "target/reports/bytes-plan/bytes-machine-plan-all.json";
 
 fn native_gpu_handoff_manifest_json() -> RuntimeResult<JsonValue> {
     Ok(serde_json::from_str(NATIVE_GPU_HANDOFF_MANIFEST_JSON)?)
@@ -9072,7 +9070,7 @@ fn verify_native_gpu_all_report(report: &JsonValue, report_path: &Path) -> Runti
             let dependency_kind = dependency
                 .get("kind")
                 .and_then(JsonValue::as_str)
-                .unwrap_or("consumes-source-replay-report");
+                .unwrap_or("consumes-native-report");
             let owner_aggregate = dependency
                 .get("owner_aggregate")
                 .and_then(JsonValue::as_str)
@@ -9080,11 +9078,7 @@ fn verify_native_gpu_all_report(report: &JsonValue, report_path: &Path) -> Runti
             let owner_aggregate_report_path = dependency
                 .get("owner_aggregate_report_path")
                 .and_then(JsonValue::as_str)
-                .unwrap_or(if owner_aggregate == "verify-native-gpu-all" {
-                    "target/reports/native-gpu-all.json"
-                } else {
-                    BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH
-                });
+                .unwrap_or("target/reports/native-gpu-all.json");
             expected_dependency_edges.insert((
                 label.to_owned(),
                 dependency_label.to_owned(),
@@ -9192,12 +9186,9 @@ fn verify_native_gpu_all_dependency_graph(
         let from = json_object_str(edge, "from", report_path)?;
         let to = json_object_str(edge, "to", report_path)?;
         let kind = json_object_str(edge, "kind", report_path)?;
-        if !matches!(
-            kind,
-            "consumes-source-replay-report" | "consumes-native-report"
-        ) {
+        if kind != "consumes-native-report" {
             return Err(format!(
-                "{} report_dependency_graph edge {from}->{to} has invalid kind",
+                "{} report_dependency_graph edge {from}->{to} must consume a native report",
                 report_path.display()
             )
             .into());
@@ -9205,12 +9196,9 @@ fn verify_native_gpu_all_dependency_graph(
         let owner_aggregate = json_object_str(edge, "owner_aggregate", report_path)?;
         let owner_aggregate_report_path =
             json_object_str(edge, "owner_aggregate_report_path", report_path)?;
-        if !matches!(
-            owner_aggregate,
-            "verify-bytes-machine-plan-all" | "verify-native-gpu-all"
-        ) {
+        if owner_aggregate != "verify-native-gpu-all" {
             return Err(format!(
-                "{} report_dependency_graph edge {from}->{to} has invalid owner aggregate",
+                "{} report_dependency_graph edge {from}->{to} must be owned by verify-native-gpu-all",
                 report_path.display()
             )
             .into());
@@ -9245,12 +9233,16 @@ fn verify_native_gpu_all_dependency_graph(
             )
             .into());
         }
-        if !matches!(
-            owner_aggregate,
-            "verify-bytes-machine-plan-all" | "verify-native-gpu-all"
-        ) {
+        if kind != "consumes-native-report" {
             return Err(format!(
-                "{} upstream report `{label}` has invalid owner aggregate",
+                "{} upstream report `{label}` must consume a native report",
+                report_path.display()
+            )
+            .into());
+        }
+        if owner_aggregate != "verify-native-gpu-all" {
+            return Err(format!(
+                "{} upstream report `{label}` must be owned by verify-native-gpu-all",
                 report_path.display()
             )
             .into());
@@ -9421,6 +9413,49 @@ fn verify_native_gpu_all_refresh_commands(
         {
             return Err(format!(
                 "{} refresh_commands[{index}] for `{label}` has malformed argv",
+                report_path.display()
+            )
+            .into());
+        }
+        let argv_strings = argv
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<Vec<_>>();
+        let executable = argv_strings
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default();
+        let command_name = argv_strings.get(1).copied().unwrap_or_default();
+        if executable.starts_with("boon_cli") {
+            return Err(format!(
+                "{} refresh_commands[{index}] for `{label}` must not use boon_cli in native aggregate refresh",
+                report_path.display()
+            )
+            .into());
+        }
+        if matches!(
+            command_name,
+            "run"
+                | "run-plan"
+                | "run-plan-route"
+                | "run-plan-root-scalar-scenario"
+                | "run-plan-scenario-events"
+        ) {
+            return Err(format!(
+                "{} refresh_commands[{index}] for `{label}` uses source-replay command `{command_name}` in native aggregate refresh",
+                report_path.display()
+            )
+            .into());
+        }
+        if argv_strings.iter().any(|arg| {
+            matches!(
+                *arg,
+                "--compare-legacy" | "--diagnostic-compare-legacy" | "--engine"
+            )
+        }) {
+            return Err(format!(
+                "{} refresh_commands[{index}] for `{label}` contains retired legacy comparison or engine flags",
                 report_path.display()
             )
             .into());
@@ -32592,7 +32627,7 @@ mod tests {
                 let dependency_kind = dependency
                     .get("kind")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("consumes-source-replay-report");
+                    .unwrap_or("consumes-native-report");
                 let owner_aggregate = dependency
                     .get("owner_aggregate")
                     .and_then(JsonValue::as_str)
@@ -32600,15 +32635,11 @@ mod tests {
                 let owner_aggregate_report_path = dependency
                     .get("owner_aggregate_report_path")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or(if owner_aggregate == "verify-native-gpu-all" {
-                        "target/reports/native-gpu-all.json"
-                    } else {
-                        BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH
-                    });
+                    .unwrap_or("target/reports/native-gpu-all.json");
                 let dependency_command = dependency
                     .get("command")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("run-plan-scenario-events");
+                    .unwrap_or("verify-native-gpu-preview-e2e");
                 let dependency_measurement_mode = dependency
                     .get("measurement_mode")
                     .and_then(JsonValue::as_str)
@@ -32627,8 +32658,8 @@ mod tests {
                     "kind": dependency_kind,
                     "owner_aggregate": owner_aggregate,
                     "owner_aggregate_report_path": owner_aggregate_report_path,
-                    "refresh_command": format!("boon_cli run --report {dependency_path}"),
-                    "refresh_argv": ["boon_cli", "run", "--report", dependency_path],
+                    "refresh_command": format!("xtask {dependency_command} --report {dependency_path}"),
+                    "refresh_argv": ["xtask", dependency_command, "--report", dependency_path],
                     "exists": true,
                     "sha256": "0".repeat(64),
                     "status": "pass",
@@ -32738,6 +32769,77 @@ mod tests {
         assert!(schema_accepts(
             native_gpu_all_aggregate_report(),
             "native-gpu-all-manifest-dependency-graph"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_source_replay_dependency_graph_edge() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["report_dependency_graph"]["edges"][0]["kind"] =
+            json!("consumes-source-replay-report");
+        report["report_dependency_graph"]["upstream_reports"][0]["kind"] =
+            json!("consumes-source-replay-report");
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-source-replay-dependency"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_bytes_owner_dependency_graph_edge() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["report_dependency_graph"]["edges"][0]["owner_aggregate"] =
+            json!("verify-bytes-machine-plan-all");
+        report["report_dependency_graph"]["upstream_reports"][0]["owner_aggregate"] =
+            json!("verify-bytes-machine-plan-all");
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-bytes-owner-dependency"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_source_replay_refresh_command() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["refresh_commands"] = json!([{
+            "label": "preview-e2e-cells",
+            "path": "target/reports/native-gpu/preview-e2e-cells.json",
+            "reason": "identity-freshness",
+            "command": "boon_cli run --compare-legacy --report target/reports/native-gpu/preview-e2e-cells.json",
+            "argv": [
+                "boon_cli",
+                "run",
+                "--compare-legacy",
+                "--report",
+                "target/reports/native-gpu/preview-e2e-cells.json"
+            ]
+        }]);
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-source-replay-refresh-command"
+        ));
+    }
+
+    #[test]
+    fn native_gpu_all_schema_rejects_engine_refresh_flag() {
+        let mut report = native_gpu_all_aggregate_report();
+        report["refresh_commands"] = json!([{
+            "label": "preview-e2e-cells",
+            "path": "target/reports/native-gpu/preview-e2e-cells.json",
+            "reason": "identity-freshness",
+            "command": "xtask verify-native-gpu-preview-e2e --engine legacy --report target/reports/native-gpu/preview-e2e-cells.json",
+            "argv": [
+                "xtask",
+                "verify-native-gpu-preview-e2e",
+                "--engine",
+                "legacy",
+                "--report",
+                "target/reports/native-gpu/preview-e2e-cells.json"
+            ]
+        }]);
+        assert!(!schema_accepts(
+            report,
+            "native-gpu-all-engine-refresh-flag"
         ));
     }
 

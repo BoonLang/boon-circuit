@@ -460,13 +460,39 @@ Fresh focused evidence:
     pass; 4 passed.
   - `git diff --check`: pass.
 
+### 2026-07-06 - Native Refresh Control Plane Is Native-Only
+
+- Tightened `verify-native-gpu-all` dependency graph validation so native
+  handoff edges must be `consumes-native-report` owned by
+  `verify-native-gpu-all`.
+- Removed the native aggregate's implicit fallback to BYTES/MachinePlan owner
+  metadata in schema fixtures and refresh annotations.
+- `run-report-refresh-queue` no longer treats bare `required_by` as enough to
+  rerun an owner aggregate; upstream entries need explicit owner metadata.
+- Native refresh queue execution now rejects `boon_cli` source replay commands,
+  retired `run-plan*` commands, and retired `--compare-legacy`,
+  `--diagnostic-compare-legacy`, and `--engine` flags when the aggregate is
+  `verify-native-gpu-all`.
+- Added negative schema and runner tests so old source-replay commands and
+  BYTES owner edges cannot re-enter the native handoff path silently.
+- Fresh focused evidence:
+  - `cargo fmt -- --check`: pass.
+  - `cargo check -q -p xtask -p boon_report_schema`: pass.
+  - `cargo test -q -p boon_report_schema native_gpu_all_schema -- --nocapture`:
+    pass; 8 passed.
+  - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 12 passed.
+  - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`:
+    pass; 3 passed.
+  - `git diff --check`: pass.
+
 ## Next Cuts
 
-1. Continue moving `ProductFrameGraph` ownership out of playground/report
+1. Delete larger stale-report/control-plane branches instead of wrapping them:
+   BYTES compatibility in native aggregate code, diagnostic timing substitutes,
+   and any stale fingerprint refresh paths not named by the native handoff
+   manifest.
+2. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-2. Delete duplicate report/schema refresh paths that only preserve stale
-   fingerprints, old comparison contracts, or weak diagnostic timing
-   substitutes.
 3. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 

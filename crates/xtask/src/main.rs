@@ -52285,9 +52285,6 @@ struct NativeGpuUpstreamDependency {
     required_argv: &'static [(&'static str, &'static str)],
 }
 
-const BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH: &str =
-    "target/reports/bytes-plan/bytes-machine-plan-all.json";
-
 fn required_xtask_refresh_argv(
     command: &str,
     required_argv: &[(&str, &str)],
@@ -60178,6 +60175,10 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let aggregate = read_json(&aggregate_path)?;
+    let aggregate_command = aggregate
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing");
     let pre_refresh_debt_child_count = aggregate_refresh_debt_child_count(&aggregate);
     let pre_product_contract_child_count =
         aggregate_count_field(&aggregate, "product_contract_child_count");
@@ -60209,6 +60210,7 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
         &mut checks,
         &mut blockers,
         0,
+        aggregate_command,
     );
     let mut results = initial_execution.results.clone();
     let mut missing_argv_count = initial_execution.missing_argv_count;
@@ -60482,6 +60484,10 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
                 &mut checks,
                 &mut blockers,
                 cycle_number,
+                current_aggregate
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing"),
             );
             run_count = run_count.saturating_add(cycle_execution.run_count);
             pass_count = pass_count.saturating_add(cycle_execution.pass_count);
@@ -60889,14 +60895,6 @@ fn annotate_refresh_entry(
         object
             .entry("selected_by_label_filter".to_owned())
             .or_insert_with(|| json!(selected_by_label_filter));
-        if phase == "upstream-dependency" {
-            object
-                .entry("post_owner_aggregate".to_owned())
-                .or_insert_with(|| json!("verify-bytes-machine-plan-all"));
-            object
-                .entry("post_owner_aggregate_report_path".to_owned())
-                .or_insert_with(|| json!(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH));
-        }
     }
     entry
 }
@@ -60929,9 +60927,12 @@ fn refresh_entry_phase(entry: &serde_json::Value) -> String {
     {
         return phase.to_owned();
     }
-    if refresh_entry_required_by(entry).is_some()
+    if entry
+        .get("owner_aggregate")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
         || entry
-            .get("owner_aggregate")
+            .get("post_owner_aggregate")
             .and_then(serde_json::Value::as_str)
             .is_some()
     {
@@ -61134,6 +61135,7 @@ fn run_refresh_queue_entries(
     checks: &mut Vec<serde_json::Value>,
     blockers: &mut Vec<String>,
     cycle_number: usize,
+    aggregate_command: &str,
 ) -> RefreshQueueCycleExecution {
     let mut execution = RefreshQueueCycleExecution::default();
     let selected_requires_boon_cli = selected.iter().any(refresh_entry_uses_boon_cli);
@@ -61235,7 +61237,7 @@ fn run_refresh_queue_entries(
             .unwrap_or_default()
             .to_owned();
         let refresh_command = argv.get(1).cloned().unwrap_or_default();
-        let valid_command = refresh_queue_command_allowed(&argv, command);
+        let valid_command = refresh_queue_command_allowed(&argv, command, aggregate_command);
         if !valid_command {
             execution.invalid_command_count += 1;
             execution.fail_count += 1;
@@ -61404,13 +61406,28 @@ fn rerun_refresh_entry_owner_aggregates(
         let owner_command = entry
             .get("owner_aggregate")
             .or_else(|| entry.get("post_owner_aggregate"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("verify-bytes-machine-plan-all");
+            .and_then(serde_json::Value::as_str);
         let owner_path = entry
             .get("owner_aggregate_report_path")
             .or_else(|| entry.get("post_owner_aggregate_report_path"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH);
+            .and_then(serde_json::Value::as_str);
+        let (Some(owner_command), Some(owner_path)) = (owner_command, owner_path) else {
+            push_audit_check(
+                checks,
+                blockers,
+                format!(
+                    "run-report-refresh-queue:owner-aggregate-metadata:{}",
+                    refresh_entry_label(entry)
+                ),
+                false,
+                "upstream refresh entry is missing explicit owner aggregate metadata",
+                Some(format!(
+                    "refresh entry `{}` is marked upstream but has no explicit owner_aggregate/owner_aggregate_report_path",
+                    refresh_entry_label(entry)
+                )),
+            );
+            continue;
+        };
         owners.insert((owner_command.to_owned(), owner_path.to_owned()));
     }
 
@@ -61634,7 +61651,11 @@ fn refresh_commands_for_labels(
         .collect()
 }
 
-fn refresh_queue_command_allowed(argv: &[String], runner_command: &str) -> bool {
+fn refresh_queue_command_allowed(
+    argv: &[String],
+    runner_command: &str,
+    aggregate_command: &str,
+) -> bool {
     let Some(executable) = argv
         .first()
         .and_then(|arg| Path::new(arg).file_name())
@@ -61645,6 +61666,25 @@ fn refresh_queue_command_allowed(argv: &[String], runner_command: &str) -> bool 
     let Some(command) = argv.get(1).map(String::as_str) else {
         return false;
     };
+    if aggregate_command == "verify-native-gpu-all"
+        && (executable.starts_with("boon_cli")
+            || matches!(
+                command,
+                "run"
+                    | "run-plan"
+                    | "run-plan-route"
+                    | "run-plan-root-scalar-scenario"
+                    | "run-plan-scenario-events"
+            )
+            || argv.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--compare-legacy" | "--diagnostic-compare-legacy" | "--engine"
+                )
+            }))
+    {
+        return false;
+    }
     if executable.starts_with("xtask") {
         return XTASK_COMMANDS.contains(&command)
             && command != runner_command
@@ -76073,6 +76113,72 @@ mod tests {
     }
 
     #[test]
+    fn native_refresh_queue_rejects_source_replay_commands() {
+        let dir = std::env::temp_dir().join(format!(
+            "boon-xtask-native-refresh-queue-rejects-source-replay-{}-{}",
+            std::process::id(),
+            monotonic_now_ns().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aggregate = dir.join("aggregate.json");
+        let output = dir.join("refresh-report.json");
+        let child = dir.join("child.json");
+        write_json(
+            &aggregate,
+            &json!({
+                "status": "fail",
+                "command": "verify-native-gpu-all",
+                "refresh_commands": [{
+                    "label": "bad-source-replay",
+                    "path": child.display().to_string(),
+                    "reason": "identity-freshness",
+                    "command": "boon_cli run --compare-legacy --report child.json",
+                    "argv": [
+                        "boon_cli",
+                        "run",
+                        "--compare-legacy",
+                        "--report",
+                        child.display().to_string()
+                    ]
+                }]
+            }),
+        )
+        .unwrap();
+        let result = run_report_refresh_queue(&[
+            "run-report-refresh-queue".to_owned(),
+            aggregate.display().to_string(),
+            "--dry-run".to_owned(),
+            "--report".to_owned(),
+            output.display().to_string(),
+        ]);
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("blocked")),
+            "invalid native refresh command should block the gate"
+        );
+        let report = read_json(&output).unwrap();
+        assert_eq!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(
+            report
+                .get("invalid_command_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        let results = json_pointer_value_or_sidecar(&report, "/results").unwrap();
+        assert_eq!(
+            results
+                .pointer("/0/reason")
+                .and_then(serde_json::Value::as_str),
+            Some("invalid-command")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn refresh_queue_selection_expands_upstream_dependencies() {
         let aggregate = json!({
             "refresh_commands": [
@@ -76462,7 +76568,8 @@ mod tests {
         ));
         assert!(!refresh_queue_command_allowed(
             &argv,
-            "run-report-refresh-queue"
+            "run-report-refresh-queue",
+            "verify-native-gpu-all"
         ));
     }
 
@@ -77122,7 +77229,11 @@ mod tests {
             let path = Path::new(required.path);
             let replay = bytes_machine_plan_required_report_refresh_argv(required, path);
             assert!(
-                refresh_queue_command_allowed(&replay, "run-report-refresh-queue"),
+                refresh_queue_command_allowed(
+                    &replay,
+                    "run-report-refresh-queue",
+                    "verify-bytes-machine-plan-all"
+                ),
                 "{} canonical refresh argv is not allowed: {replay:?}",
                 required.label
             );

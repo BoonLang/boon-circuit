@@ -37196,3 +37196,42 @@ Remaining scope:
 - The broader goal remains open: refresh-debt cleanup for the BYTES aggregate,
   remaining verifier/control-plane fossils, and deeper ProductFrameGraph/native
   presentation work still need separate verified slices.
+
+## 2026-07-06 - Disabled Native COSMIC Fallback Branches Deleted
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Deleted three disabled `else if false && build.success() && wayland` native
+  verifier branches from the multiwindow, IPC backpressure, and observability
+  gates.
+- Removed the hardcoded dormant `--example cells --probe` COSMIC fallback
+  launch scripts from those gates. The active path is now the isolated native
+  proof path; visible COSMIC background launching remains a manual/dev-window
+  launcher path, not a verifier fallback.
+- Removed the now-unused Wayland probes and stale text that described
+  workspace-qualified COSMIC as the default proof path.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask native_gpu_label_contract -- --nocapture`: pass; 1
+  passed.
+- `cargo test -q -p xtask cosmic -- --nocapture`: pass; 1 passed.
+- `cargo build -q -p xtask`: pass.
+- Fresh `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- `rg` over `crates/xtask/src/main.rs` finds no remaining
+  `false &&`, no dormant `--example cells --probe` launch in these verifier
+  branches, and no old `boon-native-gpu-{multiwindow,ipc,observability}.log`
+  COSMIC fallback scripts.
+
+Remaining scope:
+
+- This removes one dormant native control-plane fallback class. Other active
+  native verifier paths, source-replay report refresh debt, root runtime-branch
+  execution, and ProductFrameGraph/native presentation cleanup remain open.

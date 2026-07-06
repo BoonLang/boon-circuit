@@ -37106,3 +37106,35 @@ Remaining scope:
   mixed stale-replay/native-proof failure mode. The broader architecture goal
   still needs the manifest-backed native handoff aggregate and the next legacy
   runtime/harness deletion slice before completion can be claimed.
+
+## 2026-07-06 - Native Handoff Report Promotion and Present-Floor Identity Cleanup
+
+Status: implemented and focused checks pass; final native handoff aggregate
+still needs fresh post-commit report regeneration.
+
+What changed:
+
+- Runtime summaries emitted by the native preview role now include the live
+  runtime engine provenance, so PlanExecutor ownership is proved at the source
+  instead of inferred by the aggregate.
+- Native preview E2E parent reports now generically promote child role runtime
+  summaries, runtime provenance, interactive WGPU readback artifacts, checkpoint
+  paths, and focused-window proof into the canonical top-level report shape.
+- Present-floor verifier identity now ignores the private `--inner-app-window`
+  probe flag, keeping the public focus-safe manifest command and the inner
+  implementation report aligned.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo test -q -p xtask present_floor_ -- --nocapture`: pass.
+
+Remaining scope:
+
+- Regenerate `present-floor` and physical TodoMVC native preview E2E reports
+  after this checkpoint commit, then rerun the manifest-backed native handoff
+  aggregate. This slice removes report-shape ambiguity; it does not by itself
+  complete the broader legacy runtime/harness deletion goal.

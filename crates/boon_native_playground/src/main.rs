@@ -5946,6 +5946,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 state_summary,
             );
             runtime_summary["restored_ui_state"] = json!(restored_ui_state.is_some());
+            runtime_summary["live_runtime_provenance"] = runtime.engine_provenance_report();
             (
                 runtime_summary,
                 Some(document_state_summary),
@@ -62945,6 +62946,7 @@ fn preview_replace_code_response(
                         state_summary,
                     );
                     runtime_summary["restored_ui_state"] = json!(restored_ui_state.is_some());
+                    runtime_summary["live_runtime_provenance"] = runtime.engine_provenance_report();
                     (runtime_summary, Some(document_state_summary))
                 }
                 Err(error) => (

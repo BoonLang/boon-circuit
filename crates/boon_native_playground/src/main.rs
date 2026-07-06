@@ -12752,29 +12752,20 @@ fn render_layout_proof_app_owned(
 }
 
 #[cfg(test)]
-fn render_proof_matches_frame(
+fn render_proof_matches_scene_identity(
     proof: &boon_native_gpu::RenderProof,
     width: u32,
     height: u32,
-    frame: &boon_document::LayoutFrame,
-) -> bool {
-    render_proof_matches_frame_hash(proof, width, height, &render_frame_hash(frame))
-}
-
-#[cfg(test)]
-fn render_proof_matches_frame_hash(
-    proof: &boon_native_gpu::RenderProof,
-    width: u32,
-    height: u32,
-    frame_hash: &str,
+    scene_identity: &str,
 ) -> bool {
     if !render_proof_matches_viewport(proof, width, height) {
         return false;
     }
     match &proof.artifact {
         boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
-            layout_frame_hash, ..
-        } => layout_frame_hash.as_deref() == Some(frame_hash),
+            render_scene_identity_hash,
+            ..
+        } => render_scene_identity_hash == scene_identity,
         boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => false,
     }
 }
@@ -94034,7 +94025,7 @@ document:
             }
         }
 
-        fn proof_for_frame(frame: &boon_document::LayoutFrame) -> boon_native_gpu::RenderProof {
+        fn proof_for_scene_identity(scene_identity: String) -> boon_native_gpu::RenderProof {
             boon_native_gpu::RenderProof {
                 artifact: boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
                     artifact_path: "target/artifacts/native-gpu/tests/cache-proof.png".to_owned(),
@@ -94043,8 +94034,8 @@ document:
                     surface_id: boon_host::SurfaceId("test-surface".to_owned()),
                     surface_epoch: 0,
                     frame_seq: 1,
-                    layout_frame_hash: Some(render_frame_hash(frame)),
-                    render_scene_identity_hash: render_frame_hash(frame),
+                    layout_frame_hash: None,
+                    render_scene_identity_hash: scene_identity,
                     width: 320,
                     height: 200,
                     nonblank_samples: 1,
@@ -94058,15 +94049,25 @@ document:
 
         let light_frame = frame_with_background("#ffffff");
         let dark_frame = frame_with_background("#1b1b1b");
-        let proof = proof_for_frame(&light_frame);
+        let light_scene_identity = render_frame_hash(&light_frame);
+        let dark_scene_identity = render_frame_hash(&dark_frame);
+        let proof = proof_for_scene_identity(light_scene_identity.clone());
 
         assert!(render_proof_matches_viewport(&proof, 320, 200));
-        assert!(render_proof_matches_frame(&proof, 320, 200, &light_frame));
         assert!(
-            !render_proof_matches_frame(&proof, 320, 200, &dark_frame),
-            "same-size app-owned readbacks must not be reused after a visual frame change"
+            render_proof_matches_scene_identity(&proof, 320, 200, &light_scene_identity),
+            "app-owned readback proof should match the rendered scene identity"
         );
-        assert!(!render_proof_matches_frame(&proof, 321, 200, &light_frame));
+        assert!(
+            !render_proof_matches_scene_identity(&proof, 320, 200, &dark_scene_identity),
+            "same-size app-owned readbacks must not be reused after a scene identity change"
+        );
+        assert!(!render_proof_matches_scene_identity(
+            &proof,
+            321,
+            200,
+            &light_scene_identity
+        ));
     }
 
     #[test]

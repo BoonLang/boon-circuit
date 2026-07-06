@@ -649,6 +649,18 @@ Fresh focused evidence:
   - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`:
     pass; 3 passed.
 
+### 2026-07-06 - Test Proof Reuse Uses Scene Identity
+
+- Replaced the test-only `render_proof_matches_frame*` helpers with a
+  scene-identity proof matcher.
+- The app-owned proof reuse regression no longer fabricates a layout-frame hash;
+  it validates viewport plus `render_scene_identity_hash`, matching the current
+  app-owned proof contract.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_playground app_owned_readback_reuse_requires_matching_render_frame_hash -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

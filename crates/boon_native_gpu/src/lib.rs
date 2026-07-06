@@ -1,6 +1,7 @@
+#[cfg(test)]
+use boon_document::LayoutFrame;
 use boon_document::{
-    DocumentNodeId, DocumentNodeKind, LayoutFrame, Rect, RenderCapabilities, StyleMap,
-    StyleRichTextSpan, StyleValue,
+    DocumentNodeId, DocumentNodeKind, Rect, StyleMap, StyleRichTextSpan, StyleValue,
     render_scene::{
         RenderAssetRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
         RenderScene as DocumentRenderScene, RenderSceneItem as DocumentRenderSceneItem,
@@ -48,14 +49,6 @@ const DOCUMENT_MONOSPACE_FONT_FAMILY: &str = "Liberation Mono";
 const MAX_CACHED_QUAD_BATCHES: usize = 4096;
 const MAX_CACHED_ASSET_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;
 const APP_OWNED_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub trait PresentSurface {
-    fn id(&self) -> SurfaceId;
-    fn viewport_width(&self) -> f32;
-    fn viewport_height(&self) -> f32;
-    fn format(&self) -> SurfaceFormat;
-    fn epoch(&self) -> u64;
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceFormat(pub String);
@@ -286,7 +279,6 @@ pub struct FrameMetrics {
     pub retained_chunks: Vec<RetainedRenderChunkMetric>,
 }
 
-const RENDER_SCENE_SOURCE_COPY_TO_PRESENT_SCAFFOLD: &str = "copy-to-present-scaffold";
 const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE: &str = "document-render-scene";
 const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE_PATCH: &str = "document-render-scene-patch";
 const RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE: &str = "internal-render-scene";
@@ -355,11 +347,6 @@ struct InternalRenderSceneCacheKey {
 }
 
 const VISIBLE_RENDERER_INTERNAL_SCENE_CACHE_CAP: usize = 64;
-
-pub trait RenderBackend<T: PresentSurface + ?Sized> {
-    fn capabilities(&self) -> RenderCapabilities;
-    fn render(&mut self, target: &mut T, frame: &LayoutFrame) -> Result<RenderProof, RenderError>;
-}
 
 #[derive(Debug)]
 pub struct RenderError {
@@ -605,156 +592,8 @@ struct TextMeasureStyleKey {
     font_weight: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct NativeGpuRenderer {
-    frame_seq: u64,
-    rect_shader: generated::shader_bindings::ShaderEntry,
-}
-
-impl NativeGpuRenderer {
-    pub fn new_uninitialized() -> Self {
-        Self {
-            frame_seq: 0,
-            rect_shader: generated::shader_bindings::ShaderEntry::NativeGpuRect,
-        }
-    }
-
-    pub fn required_backend_versions() -> (&'static str, &'static str) {
-        (REQUIRED_WGPU_VERSION, REQUIRED_GLYPHON_VERSION)
-    }
-
-    pub fn default_frame_format_name() -> String {
-        format!("{:?}", wgpu::TextureFormat::Rgba8Unorm)
-    }
-
-    pub fn rect_shader_entry(&self) -> generated::shader_bindings::ShaderEntry {
-        self.rect_shader
-    }
-}
-
-impl<T: PresentSurface + ?Sized> RenderBackend<T> for NativeGpuRenderer {
-    fn capabilities(&self) -> RenderCapabilities {
-        RenderCapabilities {
-            max_texture_dimension_2d: 4096,
-            supports_instancing: true,
-            supports_clip_rects: true,
-            text_backend_class: "glyphon".to_owned(),
-        }
-    }
-
-    fn render(&mut self, target: &mut T, frame: &LayoutFrame) -> Result<RenderProof, RenderError> {
-        self.frame_seq += 1;
-        Ok(RenderProof {
-            artifact: RenderProofArtifact::CopyToPresent {
-                source_texture_hash: format!(
-                    "{:?}:layout-items-{}",
-                    self.rect_shader_entry(),
-                    frame.display_list.len()
-                ),
-                target_surface_id: target.id(),
-                target_surface_epoch: target.epoch(),
-                target_format: target.format(),
-                width: target.viewport_width().max(0.0) as u32,
-                height: target.viewport_height().max(0.0) as u32,
-                acquired_surface_texture: false,
-                command_submission_id: "not-presented-scaffold".to_owned(),
-                present_result: "scaffold-no-surface".to_owned(),
-            },
-            metrics: FrameMetrics {
-                frame_seq: self.frame_seq,
-                render_scene_source: RENDER_SCENE_SOURCE_COPY_TO_PRESENT_SCAFFOLD.to_owned(),
-                renderer_render_graph_kind: String::new(),
-                renderer_render_graph_execution_kind: String::new(),
-                renderer_render_graph_plan_hash: String::new(),
-                renderer_render_graph_workload_hash: String::new(),
-                renderer_render_graph_pass_count: 0,
-                renderer_render_graph_product_pass_count: 0,
-                renderer_render_graph_proof_pass_count: 0,
-                renderer_render_graph_resource_count: 0,
-                renderer_render_graph_product_resource_count: 0,
-                renderer_render_graph_resource_lifetime_hash: String::new(),
-                renderer_render_graph_retained_resource_epoch_hash: String::new(),
-                renderer_render_graph_retained_dirty_resource_count: 0,
-                renderer_render_graph_retained_reused_resource_count: 0,
-                renderer_render_graph_retained_state_resource_count: 0,
-                renderer_render_graph_scheduler_kind: String::new(),
-                renderer_render_graph_schedule_hash: String::new(),
-                renderer_render_graph_schedule_decision_count: 0,
-                renderer_render_graph_dirty_resource_decision_count: 0,
-                renderer_render_graph_reuse_resource_decision_count: 0,
-                renderer_render_graph_per_present_resource_decision_count: 0,
-                renderer_render_graph_passes: Vec::new(),
-                renderer_render_graph_resources: Vec::new(),
-                renderer_render_graph_schedule_decisions: Vec::new(),
-                document_scene_convert_ms: 0.0,
-                document_scene_cache_hit: false,
-                document_scene_cache_entry_count: 0,
-                draw_calls: 0,
-                upload_bytes: 0,
-                allocated_gpu_bytes: 0,
-                dirty_upload_range_count: 0,
-                dirty_upload_ranges: Vec::new(),
-                dirty_upload_chunk_count: 0,
-                dirty_upload_chunk_ids: Vec::new(),
-                buffer_reuse_count: 0,
-                staging_wrap_count: 0,
-                queue_write_count: 0,
-                quad_cache_eviction_count: 0,
-                quad_cache_hit: false,
-                quad_cache_entry_count: 0,
-                scene_key_ms: 0.0,
-                rect_vertices_ms: 0.0,
-                asset_prepare_ms: 0.0,
-                quad_batch_key_ms: 0.0,
-                quad_upload_ms: 0.0,
-                draw_pass_ms: 0.0,
-                retained_metrics_ms: 0.0,
-                text_render_ms: 0.0,
-                visible_display_item_count: 0,
-                rendered_rect_count: 0,
-                rect_cap_hit: false,
-                visible_text_runs: 0,
-                shaped_text_runs: 0,
-                text_runs_shaped: 0,
-                rendered_text_runs: 0,
-                shaped_run_cache_hits: 0,
-                shaped_run_cache_misses: 0,
-                shaped_run_cache_evictions: 0,
-                shaped_run_cache_entry_count: 0,
-                shaped_run_cache_capacity: 0,
-                shaped_run_cache_bytes: 0,
-                missing_glyph_count: 0,
-                glyph_atlas_prepare_count: 0,
-                glyph_atlas_evictions_observed: 0,
-                text_cap_hit: false,
-                glyphon_text_area_count: 0,
-                color_only_rect_fallback: false,
-                preview_blocked_on_ipc_count: 0,
-                asset_ref_count: 0,
-                asset_refs: Vec::new(),
-                asset_cache_hits: 0,
-                asset_cache_misses: 0,
-                asset_cache_evictions: 0,
-                asset_cache_entry_count: 0,
-                asset_cache_byte_count: 0,
-                asset_cache_byte_cap: MAX_CACHED_ASSET_TEXTURE_BYTES,
-                asset_cache_byte_cap_hit: false,
-                asset_decode_count: 0,
-                asset_raster_count: 0,
-                asset_upload_count: 0,
-                asset_upload_bytes: 0,
-                asset_failure_diagnostics: Vec::new(),
-                retained_chunk_count: 0,
-                retained_chunk_hit_count: 0,
-                retained_chunk_miss_count: 0,
-                retained_chunk_reuse_count: 0,
-                dirty_chunk_count: 0,
-                retained_chunk_sample_count: 0,
-                retained_chunk_inventory_truncated: false,
-                retained_chunks: Vec::new(),
-            },
-        })
-    }
+pub fn required_backend_versions() -> (&'static str, &'static str) {
+    (REQUIRED_WGPU_VERSION, REQUIRED_GLYPHON_VERSION)
 }
 
 #[derive(Clone, Debug)]

@@ -38470,6 +38470,32 @@ Fresh focused evidence before commit:
 - `cargo test -q -p xtask source_replay_dependency -- --nocapture`: pass.
 - `cargo check -q -p xtask`: pass.
 
+## 2026-07-06 - Removed LayoutFrame RenderBackend Scaffold
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Deleted the old `boon_native_gpu::RenderBackend<LayoutFrame>` scaffold and
+  `NativeGpuRenderer` copy-to-present proof path.
+- Removed the playground fallback that fabricated a `scaffold-no-surface`
+  `preview_native_gpu_render_proof` from a saved `LayoutFrame` when the preview
+  child did not provide real external render proof.
+- Native preview E2E now fails closed with
+  `missing-external-render-proof` if the child omits app-owned external proof.
+  The active proof path remains `LayoutFrame -> DocumentRenderScene` in
+  `boon_document`, then `DocumentRenderScene -> boon_native_gpu` scene encoding.
+
+Fresh focused evidence before commit:
+
+- `target/debug/xtask verify-native-gpu-architecture --report
+  target/reports/native-gpu/architecture.json`: pass.
+- `cargo test -q -p boon_native_gpu render_scene_without_layout_frame
+  -- --nocapture`: pass.
+- `cargo check -q -p boon_native_gpu -p boon_native_playground`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
 ## 2026-07-06 - Source Replay Retired `--engine` Compatibility Cut
 
 Status: implemented and focused-verified.

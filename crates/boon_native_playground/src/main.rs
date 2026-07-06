@@ -5,7 +5,6 @@ use boon_editor::{
     ClipboardAdapter, EditorBuffer, EditorPosition, EditorSelection, bracket_match_for_source,
 };
 use boon_native_app_window::{NativeWindowOptions, NativeWindowRole};
-use boon_native_gpu::{PresentSurface, RenderBackend};
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind, AstTokenKind,
 };
@@ -7080,7 +7079,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "bounded_ipc_server": connect.as_ref().map(|path| path.display().to_string()),
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
-                                "native_gpu_versions": boon_native_gpu::NativeGpuRenderer::required_backend_versions(),
+                                "native_gpu_versions": boon_native_gpu::required_backend_versions(),
                                 "note": "preview role created an app_window Wayland window and rendered the generic document frame into the visible wgpu surface"
                             }),
                         )
@@ -8098,14 +8097,14 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .filter(|proof| proof.get("status").and_then(serde_json::Value::as_str) == Some("pass"))
         .unwrap_or_else(|| {
-            native_gpu_render_proof(&preview_proof, &document_layout_proof).unwrap_or_else(
-                |error| {
-                    json!({
-                        "status": "fail",
-                        "blocker": error.to_string()
-                    })
-                },
-            )
+            json!({
+                "status": "fail",
+                "blocker": "preview child did not provide app-owned external render proof",
+                "renderer": "boon_native_gpu",
+                "render_backend_trait": "missing-external-render-proof",
+                "visible_surface_rendered": false,
+                "visible_present_path": false
+            })
         });
     if let Some(report) = report {
         let mut details = json!({
@@ -11397,107 +11396,6 @@ fn preview_fresh_runtime_summary_for_state(
         state.runtime_summary = runtime_summary.clone();
     }
     Ok((runtime_summary, shared_render_state))
-}
-
-#[derive(Clone, Debug)]
-struct ReportPresentSurface {
-    id: boon_host::SurfaceId,
-    width: f32,
-    height: f32,
-    format: boon_native_gpu::SurfaceFormat,
-    epoch: u64,
-}
-
-impl PresentSurface for ReportPresentSurface {
-    fn id(&self) -> boon_host::SurfaceId {
-        self.id.clone()
-    }
-
-    fn viewport_width(&self) -> f32 {
-        self.width
-    }
-
-    fn viewport_height(&self) -> f32 {
-        self.height
-    }
-
-    fn format(&self) -> boon_native_gpu::SurfaceFormat {
-        self.format.clone()
-    }
-
-    fn epoch(&self) -> u64 {
-        self.epoch
-    }
-}
-
-fn native_gpu_render_proof(
-    surface_proof: &serde_json::Value,
-    layout_proof: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    if layout_proof
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        != Some("pass")
-    {
-        return Err("layout proof did not pass".into());
-    }
-    let layout_artifact = layout_proof
-        .get("artifact_path")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("layout proof missing artifact_path")?;
-    let artifact_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(layout_artifact)?)?;
-    let layout_frame: boon_document::LayoutFrame = serde_json::from_value(
-        artifact_json
-            .get("layout_frame")
-            .cloned()
-            .ok_or("layout artifact missing layout_frame")?,
-    )?;
-    let mut target = ReportPresentSurface {
-        id: boon_host::SurfaceId(
-            surface_proof
-                .get("surface_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("missing-surface")
-                .to_owned(),
-        ),
-        width: surface_proof
-            .pointer("/logical_size/width")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0) as f32,
-        height: surface_proof
-            .pointer("/logical_size/height")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0) as f32,
-        format: boon_native_gpu::SurfaceFormat(
-            surface_proof
-                .get("surface_format")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned(),
-        ),
-        epoch: surface_proof
-            .get("surface_epoch")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-    };
-    let mut renderer = boon_native_gpu::NativeGpuRenderer::new_uninitialized();
-    let proof = renderer.render(&mut target, &layout_frame)?;
-    Ok(json!({
-        "status": "pass",
-        "renderer": "boon_native_gpu",
-        "render_backend_trait": "boon_native_gpu::RenderBackend",
-        "layout_artifact": layout_artifact,
-        "layout_artifact_sha256": layout_proof.get("artifact_sha256").cloned().unwrap_or_else(|| json!("missing")),
-        "surface_id": target.id,
-        "surface_epoch": target.epoch,
-        "surface_format": target.format,
-        "uses_generated_shader_entry": format!("{:?}", renderer.rect_shader_entry()),
-        "proof": proof,
-        "visible_surface_rendered": false,
-        "visible_present_path": false,
-        "copy_to_present_limitation": "renderer proof is bound to the preview surface identity, but the native app_window role still performs the actual first-frame clear/present until the renderer owns the render pass"
-    }))
 }
 
 struct PreviewNativeGpuRenderHookOutput {

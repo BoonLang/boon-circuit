@@ -11602,12 +11602,7 @@ fn preview_native_render_frame_metrics(
         render_hook_outer_revision_ms: None,
         render_hook_outer_total_ms: None,
         render_hook_phase_timings: None,
-        product_frame: None,
         product_result: None,
-        render_graph: None,
-        present_plan: None,
-        render_graph_execution: None,
-        post_present_proof_requests: Vec::new(),
     }
 }
 
@@ -11776,10 +11771,6 @@ fn preview_attach_product_proof_boundary(
         renderer_metrics,
         metrics.upload_bytes.unwrap_or(0),
     );
-    metrics.product_frame = Some(product_result.product_frame.clone());
-    metrics.render_graph = product_result.render_graph.clone();
-    metrics.present_plan = product_result.present_plan.clone();
-    metrics.post_present_proof_requests = product_result.post_present_proof_requests.clone();
     metrics.product_result = Some(product_result);
 }
 
@@ -11830,9 +11821,6 @@ fn preview_set_product_render_graph_encode_time_ms(
     let Some(encode_time_ms) = encode_time_ms else {
         return;
     };
-    if let Some(render_graph) = metrics.render_graph.as_mut() {
-        render_graph.encode_time_ms = Some(encode_time_ms);
-    }
     if let Some(product_result) = metrics.product_result.as_mut()
         && let Some(render_graph) = product_result.render_graph.as_mut()
     {
@@ -64925,7 +64913,7 @@ mod tests {
     }
 
     #[test]
-    fn product_frame_result_is_single_source_for_metric_slots() {
+    fn product_frame_result_is_single_source_for_product_metrics() {
         let patch = preview_product_patch_summary(PreviewProductPatchSummaryInput {
             active_scene_identity: Some("active-preview-scene:single-source".to_owned()),
             route_identity: Some("route:single-source".to_owned()),
@@ -64963,21 +64951,18 @@ mod tests {
             .as_ref()
             .expect("product result should be attached");
         assert_eq!(
-            metrics.product_frame.as_ref(),
-            Some(&product_result.product_frame)
+            product_result.product_frame.layout_identity.as_deref(),
+            Some("layout:single-source")
         );
         assert_eq!(
-            metrics.render_graph.as_ref(),
-            product_result.render_graph.as_ref()
+            product_result
+                .product_frame
+                .render_scene_identity
+                .as_deref(),
+            Some("render-scene:single-source")
         );
-        assert_eq!(
-            metrics.present_plan.as_ref(),
-            product_result.present_plan.as_ref()
-        );
-        assert_eq!(
-            metrics.post_present_proof_requests,
-            product_result.post_present_proof_requests
-        );
+        assert!(product_result.render_graph.is_some());
+        assert!(product_result.present_plan.is_some());
         assert_eq!(product_result.owner, "preview_active_scene");
         assert_eq!(product_result.result_kind, "active_preview_scene_patch");
     }

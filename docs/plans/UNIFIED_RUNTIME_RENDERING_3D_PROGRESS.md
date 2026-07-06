@@ -681,6 +681,27 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground product_render_graph_plan_hash_ignores_workload_and_post_present_proof_requests -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Deleted Loose Product Frame Metric Slots
+
+- Removed the duplicate product-frame, render-graph, present-plan, render-graph
+  execution, and post-present proof request fields from
+  `NativeRenderFrameMetrics`.
+- Product-owned frame/report data now enters the app-window path only through
+  `NativeProductFrameResult`; loop reports derive `last_product_render_frame`
+  and post-present proof request summaries from the committed product frame.
+- Deleted the old loose-metrics compatibility test instead of preserving another
+  fallback contract.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_app_window -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_app_window product_frame_commit_uses_typed_product_result -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_app_window product_frame_commit_adds_visible_surface_readback_request_once -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_app_window render_loop_report_uses_frame_scoped_input_latency_for_preview_perf_stats -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_product_metrics -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

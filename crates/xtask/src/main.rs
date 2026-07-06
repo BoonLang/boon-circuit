@@ -27553,7 +27553,7 @@ fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std:
     let overlay_contract = scenario_json
         .pointer("/overlay/rendered_by")
         .and_then(serde_json::Value::as_str)
-        == Some("preview LayoutFrame -> boon_native_gpu WGPU render scene");
+        == Some("preview RenderScene -> boon_native_gpu ProductFrameGraph");
     let direct_runtime_state_mutation = scenario_json
         .get("direct_runtime_state_mutation")
         .and_then(serde_json::Value::as_bool)

@@ -8083,20 +8083,6 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .pointer("/details/preview_runtime_summary")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
-    let preview_native_gpu_render_proof = preview_proof
-        .get("external_render_proof")
-        .cloned()
-        .filter(|proof| proof.get("status").and_then(serde_json::Value::as_str) == Some("pass"))
-        .unwrap_or_else(|| {
-            json!({
-                "status": "fail",
-                "blocker": "preview child did not provide app-owned external render proof",
-                "renderer": "boon_native_gpu",
-                "render_backend_trait": "missing-external-render-proof",
-                "visible_surface_rendered": false,
-                "visible_present_path": false
-            })
-        });
     if let Some(report) = report {
         let mut details = json!({
             "resolved_example": example,
@@ -8157,7 +8143,6 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["preview_document_layout_proof"] = document_layout_proof;
         details["preview_surface_proof"] = preview_proof;
         details["dev_surface_proof"] = dev_proof;
-        details["preview_native_gpu_render_proof"] = preview_native_gpu_render_proof;
         details["preview_runtime_summary"] = preview_runtime_summary;
         details["dev_ipc_probe"] = dev_ipc_probe;
         details["dev_shell_interaction_probe"] = dev_shell_interaction_probe;
@@ -38195,7 +38180,7 @@ impl PreviewHeadedScenarioRun {
                 "cancellation"
             ],
             "overlay": {
-                "rendered_by": "preview LayoutFrame -> boon_native_gpu WGPU render scene",
+                "rendered_by": "preview RenderScene -> boon_native_gpu ProductFrameGraph",
                 "cursor_visible": true,
                 "click_feedback_visible": true,
                 "key_hud_visible": true,
@@ -38335,7 +38320,7 @@ fn preview_start_headed_scenario_response(
         "scenario_id": run.definition.id,
         "scenario_label": run.definition.label,
         "report_path": report_path,
-        "overlay_rendered_by": "preview LayoutFrame -> boon_native_gpu WGPU render scene",
+        "overlay_rendered_by": "preview RenderScene -> boon_native_gpu ProductFrameGraph",
         "direct_runtime_state_mutation": false,
         "preview_pid": std::process::id()
     }))

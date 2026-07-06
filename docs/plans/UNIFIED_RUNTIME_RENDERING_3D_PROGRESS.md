@@ -336,6 +336,23 @@ Fresh focused evidence:
 - `cargo test -q -p xtask dev_editor_scroll_budget_uses_dev_surface_adapter_flag -- --nocapture`:
   pass; 1 passed.
 
+### 2026-07-06 - Desktop Report Proof Alias Producer Removed
+
+- The native playground desktop supervisor no longer writes top-level
+  `preview_native_gpu_render_proof`; preview visible proof stays under
+  `preview_surface_proof`.
+- Headed-scenario overlay reports now describe the active
+  `preview RenderScene -> boon_native_gpu ProductFrameGraph` route instead of
+  the old LayoutFrame-to-WGPU wording.
+- The remaining `preview_native_gpu_render_proof` strings in `xtask` are
+  negative/diagnostic fixtures that prove the removed alias cannot satisfy
+  native acceptance.
+- Focused checks passed:
+  - `cargo fmt --check`
+  - `cargo check -q -p boon_native_playground -p xtask`
+  - `cargo test -q -p xtask preview_e2e_surface_proof_does_not_republish_top_level_alias -- --nocapture`
+  - `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`
+
 ### 2026-07-06 - Native Manifest Coverage Split Confirmed
 
 - Confirmed current `native_preview_manifest_scenario_evidence` separates

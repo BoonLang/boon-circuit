@@ -559,16 +559,40 @@ Fresh focused evidence:
     pass.
   - `git diff --check`: pass.
 
+### 2026-07-06 - Render-Scene Patch Cache Uses Scene Identity
+
+- Replaced the preview render-scene patch cache's separate patch/base-hash maps
+  with one typed cache entry keyed by explicit `render_scene_patch_identity`.
+- Patch producers now write `render_scene_patch_identity` into layout proofs and
+  cache entries with their base layout hash plus patch hash. The patched layout
+  hash is no longer accepted as the render-scene patch cache key.
+- The preview render hook now looks up sidecars by `render_scene_patch_identity`
+  and keys patched render-scene cache entries by base render-scene hash plus
+  patch hash, viewport, and lowering mode.
+- Document render snapshot eviction no longer deletes render-scene patch entries
+  by unrelated layout hashes; the render-scene patch cache owns its own cap.
+- Updated focused tests to assert that patched layout hashes do not retrieve
+  render-scene sidecars, while explicit render-scene patch identities do.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_playground render_scene_patch -- --nocapture`:
+    pass; 7 passed.
+  - `cargo test -q -p boon_native_playground render_scene_sidecar -- --nocapture`:
+    pass; 3 passed.
+  - `cargo test -q -p boon_native_playground direct_input_overlay_base_scene_lookup_uses_retained_content_revision -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground direct_layout_sidecar_base_scene_lookup_uses_cached_base_layout_hash -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground legacy_replace_code_probe_uses_current_preview_fast_path -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
 1. Cut remaining BYTES/`boon_cli` refresh compatibility from native
    control-plane code where it is not required by a current BYTES aggregate.
 2. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-3. Promote `DocumentRenderSnapshot` and preview render hook caches to
-   scene-first identity and remove LayoutFrame-hash-keyed render-scene patch
-   cache compatibility.
-4. Keep Cells product-latency and proof-lane reports fresh after each
+3. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

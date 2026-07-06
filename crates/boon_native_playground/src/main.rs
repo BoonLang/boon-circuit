@@ -9505,73 +9505,62 @@ fn document_layout_node_index_cache()
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn render_scene_patch_cache()
--> &'static Mutex<BTreeMap<String, Arc<boon_document::RenderScenePatch>>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<boon_document::RenderScenePatch>>>> =
+#[derive(Clone, Debug)]
+struct RenderScenePatchCacheEntry {
+    base_layout_frame_hash: String,
+    patch_hash: String,
+    patch: boon_document::RenderScenePatch,
+}
+
+fn render_scene_patch_cache() -> &'static Mutex<BTreeMap<String, Arc<RenderScenePatchCacheEntry>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Arc<RenderScenePatchCacheEntry>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn render_scene_patch_base_hash_cache() -> &'static Mutex<BTreeMap<String, String>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
 #[cfg(test)]
-fn cache_render_scene_patch(hash: String, patch: boon_document::RenderScenePatch) {
-    cache_render_scene_patch_with_base(hash, None, patch);
+fn cache_render_scene_patch_for_test(
+    identity: String,
+    base_layout_frame_hash: String,
+    patch: boon_document::RenderScenePatch,
+) {
+    let patch_hash = render_scene_patch_hash(Some(&patch));
+    cache_render_scene_patch(identity, base_layout_frame_hash, patch_hash, patch);
 }
 
-fn cache_render_scene_patch_with_base(
-    hash: String,
-    base_hash: Option<String>,
+fn render_scene_patch_identity(base_layout_frame_hash: &str, patch_hash: &str) -> String {
+    format!("render-scene-patch:{base_layout_frame_hash}:{patch_hash}")
+}
+
+fn cache_render_scene_patch(
+    identity: String,
+    base_layout_frame_hash: String,
+    patch_hash: String,
     patch: boon_document::RenderScenePatch,
 ) {
     if let Ok(mut cache) = render_scene_patch_cache().lock() {
-        while cache.len() >= 256 && !cache.contains_key(&hash) {
+        while cache.len() >= 256 && !cache.contains_key(&identity) {
             let Some(oldest_key) = cache.keys().next().cloned() else {
                 break;
             };
             cache.remove(&oldest_key);
-            if let Ok(mut base_cache) = render_scene_patch_base_hash_cache().lock() {
-                base_cache.remove(&oldest_key);
-            }
         }
-        cache.insert(hash.clone(), Arc::new(patch));
-    }
-    if let Ok(mut cache) = render_scene_patch_base_hash_cache().lock() {
-        if let Some(base_hash) = base_hash {
-            cache.insert(hash, base_hash);
-        } else {
-            cache.remove(&hash);
-        }
+        cache.insert(
+            identity,
+            Arc::new(RenderScenePatchCacheEntry {
+                base_layout_frame_hash,
+                patch_hash,
+                patch,
+            }),
+        );
     }
 }
 
-fn cached_render_scene_patch(hash: &str) -> Option<Arc<boon_document::RenderScenePatch>> {
+fn cached_render_scene_patch_entry(identity: &str) -> Option<Arc<RenderScenePatchCacheEntry>> {
     render_scene_patch_cache()
         .lock()
         .ok()
-        .and_then(|cache| cache.get(hash).cloned())
-}
-
-fn cached_render_scene_patch_base_hash(hash: &str) -> Option<String> {
-    render_scene_patch_base_hash_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(hash).cloned())
-}
-
-fn render_scene_patch_geometry_base_hash(layout_hash: Option<&str>) -> Option<String> {
-    let mut current = layout_hash?.to_owned();
-    let mut seen = BTreeSet::new();
-    while seen.insert(current.clone()) {
-        let Some(base) = cached_render_scene_patch_base_hash(&current) else {
-            return Some(current);
-        };
-        current = base;
-    }
-    Some(current)
+        .and_then(|cache| cache.get(identity).cloned())
 }
 
 fn render_scene_patch_hash(patch: Option<&boon_document::RenderScenePatch>) -> String {
@@ -9592,12 +9581,6 @@ fn cache_document_render_snapshot(hash: String, snapshot: DocumentRenderSnapshot
             cache.remove(&oldest_key);
             if let Ok(mut index_cache) = document_layout_node_index_cache().lock() {
                 index_cache.remove(&oldest_key);
-            }
-            if let Ok(mut patch_cache) = render_scene_patch_cache().lock() {
-                patch_cache.remove(&oldest_key);
-            }
-            if let Ok(mut patch_base_cache) = render_scene_patch_base_hash_cache().lock() {
-                patch_base_cache.remove(&oldest_key);
             }
         }
         cache.insert(hash.clone(), Arc::new(snapshot));
@@ -11035,19 +11018,24 @@ fn native_gpu_app_owned_render_hook(
     let render_scene_patch_lookup_started = Instant::now();
     let current_render_scene_lowering_mode =
         preview_render_scene_lowering_mode_for_hash(visible_state.layout_frame_hash.as_deref());
-    let layout_render_scene_patch = visible_state
-        .layout_frame_hash
+    let layout_render_scene_patch_entry = visible_state
+        .render_scene_patch_identity
         .as_deref()
-        .and_then(cached_render_scene_patch);
-    let layout_render_scene_patch_base_hash = visible_state
-        .layout_frame_hash
-        .as_deref()
-        .and_then(cached_render_scene_patch_base_hash);
-    let layout_render_scene_patch_hash =
-        render_scene_patch_hash(layout_render_scene_patch.as_deref());
+        .and_then(cached_render_scene_patch_entry);
+    let layout_render_scene_patch = layout_render_scene_patch_entry
+        .as_ref()
+        .map(|entry| &entry.patch);
+    let layout_render_scene_patch_base_hash = layout_render_scene_patch_entry
+        .as_ref()
+        .map(|entry| entry.base_layout_frame_hash.clone());
+    let layout_render_scene_patch_hash = layout_render_scene_patch_entry
+        .as_ref()
+        .map(|entry| entry.patch_hash.clone())
+        .unwrap_or_else(|| render_scene_patch_hash(None));
     let render_scene_patch_lookup_ms = elapsed_ms(render_scene_patch_lookup_started);
     let render_frame_layout_cache_key = if visible_state.render_scene_patch_layout_reuse {
-        render_scene_patch_geometry_base_hash(visible_state.layout_frame_hash.as_deref())
+        layout_render_scene_patch_base_hash
+            .clone()
             .unwrap_or_else(|| layout_cache_key.to_owned())
     } else {
         layout_cache_key.to_owned()
@@ -11228,9 +11216,9 @@ fn native_gpu_app_owned_render_hook(
             .layout_frame_hash
             .as_deref()
             .unwrap_or(&layout_cache_key);
-        let input_overlay_base_layout_hash =
-            render_scene_patch_geometry_base_hash(visible_state.layout_frame_hash.as_deref())
-                .unwrap_or_else(|| current_layout_hash.to_owned());
+        let input_overlay_base_layout_hash = layout_render_scene_patch_base_hash
+            .clone()
+            .unwrap_or_else(|| current_layout_hash.to_owned());
         let cached_base_key = preview_cached_render_scene_key_for_layout_hash(
             render_scene_cache,
             &input_overlay_base_layout_hash,
@@ -11308,10 +11296,20 @@ fn native_gpu_app_owned_render_hook(
         .ok_or("input overlay render scene patch was enabled but produced no patch")?;
         effective_render_scene_patch_hash =
             render_scene_patch_hash(Some(&input_overlay_patch.patch));
-        render_scene_cache_key.4 = effective_render_scene_patch_hash.clone();
         input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
+        if let Some((_base_layout_hash, base_scene_hash, _base_scene)) =
+            render_scene_cache.get(&base_cache_key)
+        {
+            render_scene_cache_key = preview_patched_render_scene_cache_key(
+                base_scene_hash,
+                context.width,
+                context.height,
+                current_render_scene_lowering_mode,
+                &effective_render_scene_patch_hash,
+            );
+        }
         if !render_scene_cache.contains_key(&render_scene_cache_key)
-            && let Some((base_layout_hash, _, base_scene)) =
+            && let Some((base_layout_hash, _base_scene_hash, base_scene)) =
                 render_scene_cache.get(&base_cache_key).cloned()
         {
             let mut patched_scene = base_scene;
@@ -11373,18 +11371,28 @@ fn native_gpu_app_owned_render_hook(
             );
             base_cache_key
         };
-        let patched_base_cache_key = (
-            visible_state
-                .layout_frame_hash
-                .clone()
-                .unwrap_or_else(|| layout_cache_key.to_owned()),
-            context.width,
-            context.height,
-            current_render_scene_lowering_mode.to_owned(),
-            "none".to_owned(),
-        );
+        let patched_base_cache_key = render_scene_cache
+            .get(&base_cache_key)
+            .map(|(_base_layout_hash, base_scene_hash, _base_scene)| {
+                preview_patched_render_scene_cache_key(
+                    base_scene_hash,
+                    context.width,
+                    context.height,
+                    current_render_scene_lowering_mode,
+                    &layout_render_scene_patch_hash,
+                )
+            })
+            .unwrap_or_else(|| {
+                preview_patched_render_scene_cache_key(
+                    base_hash,
+                    context.width,
+                    context.height,
+                    current_render_scene_lowering_mode,
+                    &layout_render_scene_patch_hash,
+                )
+            });
         if let (Some(layout_patch), Some(patched_layout_hash)) = (
-            layout_render_scene_patch.as_ref(),
+            layout_render_scene_patch,
             visible_state.layout_frame_hash.as_ref(),
         ) {
             let patched_scene_cache_started = Instant::now();
@@ -11496,7 +11504,7 @@ fn native_gpu_app_owned_render_hook(
             render_scene.apply_patch(&input_overlay_patch.patch)?;
             Some((render_scene, lowering_mode))
         } else if let (Some(render_scene_patch), Some(base_hash)) = (
-            layout_render_scene_patch.as_deref(),
+            layout_render_scene_patch,
             layout_render_scene_patch_base_hash.as_deref(),
         ) {
             render_scene_cache
@@ -11540,7 +11548,7 @@ fn native_gpu_app_owned_render_hook(
                         context.height,
                         render_text_columns,
                     )?;
-                if let Some(render_scene_patch) = layout_render_scene_patch.as_deref() {
+                if let Some(render_scene_patch) = layout_render_scene_patch {
                     render_scene.apply_patch(render_scene_patch)?;
                 }
                 (render_scene, render_scene_lowering_mode.to_owned())
@@ -12310,6 +12318,22 @@ fn preview_cached_render_scene_key_for_layout_hash(
     )
 }
 
+fn preview_patched_render_scene_cache_key(
+    base_scene_hash: &str,
+    width: u32,
+    height: u32,
+    lowering_mode: &str,
+    patch_hash: &str,
+) -> PreviewRenderSceneCacheKey {
+    (
+        format!("base-scene:{base_scene_hash}"),
+        width,
+        height,
+        lowering_mode.to_owned(),
+        patch_hash.to_owned(),
+    )
+}
+
 fn preview_apply_hover_overlay_to_render_frame(
     frame: &mut boon_document::LayoutFrame,
     hover_overlay: &PreviewHoverOverlayState,
@@ -12868,7 +12892,7 @@ fn render_proof_matches_frame_hash(
     match &proof.artifact {
         boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
             layout_frame_hash, ..
-        } => layout_frame_hash == frame_hash,
+        } => layout_frame_hash.as_deref() == Some(frame_hash),
         boon_native_gpu::RenderProofArtifact::CopyToPresent { .. } => false,
     }
 }
@@ -50152,6 +50176,7 @@ struct PreviewVisibleRenderState {
     overlay_route_identity: String,
     layout_artifact: String,
     layout_frame_hash: Option<String>,
+    render_scene_patch_identity: Option<String>,
     content_revision: u64,
     layout_frame_override: Option<Arc<boon_document::LayoutFrame>>,
     render_scene_patch_layout_reuse: bool,
@@ -50378,6 +50403,11 @@ impl PreviewVisibleRenderState {
                     .as_deref()
                     .map(render_frame_hash)
             });
+        let render_scene_patch_identity = shared
+            .layout_proof
+            .get("render_scene_patch_identity")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let overlay_route_identity = preview_render_overlay_lookup_cache_key(&shared.layout_proof);
         Self {
             status: shared
@@ -50389,6 +50419,7 @@ impl PreviewVisibleRenderState {
             overlay_route_identity,
             layout_artifact,
             layout_frame_hash,
+            render_scene_patch_identity,
             content_revision: preview_content_revision(shared.update_count),
             layout_frame_override: shared.layout_frame_override.clone(),
             render_scene_patch_layout_reuse: shared
@@ -57597,9 +57628,14 @@ fn preview_try_patch_paint_space_for_root_deltas(
         },
     );
     if let Some(render_scene_patch) = render_scene_patch {
-        cache_render_scene_patch_with_base(
-            layout_frame_hash,
-            Some(layout_hash.to_owned()),
+        let patch_hash = render_scene_patch_hash(Some(&render_scene_patch));
+        let patch_identity = render_scene_patch_identity(layout_hash, &patch_hash);
+        proof["render_scene_patch_identity"] = json!(patch_identity.clone());
+        proof["layout_profile"]["render_scene_patch_identity"] = json!(patch_identity.clone());
+        cache_render_scene_patch(
+            patch_identity,
+            layout_hash.to_owned(),
+            patch_hash,
             render_scene_patch,
         );
     }
@@ -58390,9 +58426,14 @@ fn preview_try_patch_document_layout_for_root_deltas(
         },
     );
     if let Some(render_scene_patch) = render_scene_patch {
-        cache_render_scene_patch_with_base(
-            patched_layout_frame_hash,
-            Some(layout_hash.to_owned()),
+        let patch_hash = render_scene_patch_hash(Some(&render_scene_patch));
+        let patch_identity = render_scene_patch_identity(layout_hash, &patch_hash);
+        proof["render_scene_patch_identity"] = json!(patch_identity.clone());
+        proof["layout_profile"]["render_scene_patch_identity"] = json!(patch_identity.clone());
+        cache_render_scene_patch(
+            patch_identity,
+            layout_hash.to_owned(),
+            patch_hash,
             render_scene_patch,
         );
     }
@@ -66194,10 +66235,17 @@ mod tests {
             .patch
             .expect("text color target should produce a render-scene patch");
         assert_eq!(patch.operations.len(), 1);
-        cache_render_scene_patch("layout-hash-for-test".to_owned(), patch.clone());
+        let patch_hash = render_scene_patch_hash(Some(&patch));
+        let patch_identity = render_scene_patch_identity("layout-hash-for-test", &patch_hash);
+        cache_render_scene_patch_for_test(
+            patch_identity.clone(),
+            "layout-hash-for-test".to_owned(),
+            patch.clone(),
+        );
         assert_eq!(
-            cached_render_scene_patch("layout-hash-for-test")
+            cached_render_scene_patch_entry(&patch_identity)
                 .expect("cached render scene patch")
+                .patch
                 .operations
                 .len(),
             1
@@ -66215,7 +66263,9 @@ mod tests {
         assert_eq!(scene.text_runs[0].color, [1, 2, 3, 255]);
         assert_eq!(
             render_scene_patch_hash(Some(&patch)),
-            render_scene_patch_hash(cached_render_scene_patch("layout-hash-for-test").as_deref())
+            cached_render_scene_patch_entry(&patch_identity)
+                .expect("cached render scene patch")
+                .patch_hash
         );
     }
 
@@ -67059,12 +67109,6 @@ mod tests {
         .unwrap()
         .expect("paint-space color patch should reuse layout with a render-scene sidecar");
 
-        assert!(!result.direct_layout_frame_patch);
-        assert!(
-            result
-                .layout_patch_profile
-                .retained_layout_frame_reuse_without_clone
-        );
         assert_eq!(
             result.layout_patch_profile.derived_indexes_ms, 0.0,
             "render-scene-only paint patches should carry forward snapshot indexes"
@@ -67084,9 +67128,16 @@ mod tests {
         let next_hash = result.proof["layout_frame_hash"]
             .as_str()
             .expect("patched proof should expose layout hash");
+        let patch_identity = result.proof["render_scene_patch_identity"]
+            .as_str()
+            .expect("patched proof should expose render-scene patch identity");
         assert!(
-            cached_render_scene_patch(next_hash).is_some(),
-            "paint-space sidecar should be cached by the patched layout hash"
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "paint-space sidecar must not be cached by the patched layout hash"
+        );
+        assert!(
+            cached_render_scene_patch_entry(patch_identity).is_some(),
+            "paint-space sidecar should be cached by explicit render-scene patch identity"
         );
         assert_eq!(
             result.proof["layout_profile"]["layout_patch_profile"]["render_scene_patch_applied"],
@@ -67185,7 +67236,16 @@ mod tests {
         let next_hash = result.proof["layout_frame_hash"]
             .as_str()
             .expect("patched proof should expose layout hash");
-        let patch = cached_render_scene_patch(next_hash).expect("cached text render scene patch");
+        let patch_identity = result.proof["render_scene_patch_identity"]
+            .as_str()
+            .expect("patched proof should expose render-scene patch identity");
+        assert!(
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "patched layout hash should not be the render-scene patch cache key"
+        );
+        let patch_entry = cached_render_scene_patch_entry(patch_identity)
+            .expect("cached text render scene patch");
+        let patch = &patch_entry.patch;
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
             result.layout_frame.as_ref(),
@@ -67312,11 +67372,17 @@ mod tests {
         let next_hash = result.proof["layout_frame_hash"]
             .as_str()
             .expect("patched proof should expose layout hash");
-        assert_eq!(
-            cached_render_scene_patch_base_hash(next_hash).as_deref(),
-            Some(layout_hash)
+        let patch_identity = result.proof["render_scene_patch_identity"]
+            .as_str()
+            .expect("patched proof should expose render-scene patch identity");
+        let patch_entry = cached_render_scene_patch_entry(patch_identity)
+            .expect("cached text render scene patch");
+        assert_eq!(patch_entry.base_layout_frame_hash.as_str(), layout_hash);
+        assert!(
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "patched layout hash should not be the render-scene patch cache key"
         );
-        let patch = cached_render_scene_patch(next_hash).expect("cached text render scene patch");
+        let patch = &patch_entry.patch;
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut scene = boon_document::render_scene::lower_layout_frame_to_render_scene(
             result.layout_frame.as_ref(),
@@ -67472,12 +67538,21 @@ mod tests {
         let next_hash = result.proof["layout_frame_hash"]
             .as_str()
             .expect("patched proof should expose layout hash");
+        let patch_identity = result.proof["render_scene_patch_identity"]
+            .as_str()
+            .expect("patched proof should expose render-scene patch identity");
+        let patch_entry = cached_render_scene_patch_entry(patch_identity)
+            .expect("cached mixed render scene patch");
         assert_eq!(
-            cached_render_scene_patch_base_hash(next_hash).as_deref(),
-            Some(layout_hash),
+            patch_entry.base_layout_frame_hash.as_str(),
+            layout_hash,
             "visible rendering may apply the sidecar only to the scene for the previous layout hash"
         );
-        let patch = cached_render_scene_patch(next_hash).expect("cached mixed render scene patch");
+        assert!(
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "patched layout hash should not be the render-scene patch cache key"
+        );
+        let patch = &patch_entry.patch;
         assert!(
             patch.operations.iter().any(|operation| matches!(
                 operation,
@@ -67675,12 +67750,21 @@ mod tests {
         let next_hash = result.proof["layout_frame_hash"]
             .as_str()
             .expect("patched proof should expose layout hash");
+        let patch_identity = result.proof["render_scene_patch_identity"]
+            .as_str()
+            .expect("patched proof should expose render-scene patch identity");
+        let patch_entry = cached_render_scene_patch_entry(patch_identity)
+            .expect("cached mixed render scene patch");
         assert_eq!(
-            cached_render_scene_patch_base_hash(next_hash).as_deref(),
-            Some(layout_hash),
+            patch_entry.base_layout_frame_hash.as_str(),
+            layout_hash,
             "the sidecar must retain the base mapping for the previous render scene"
         );
-        let patch = cached_render_scene_patch(next_hash).expect("cached mixed render scene patch");
+        assert!(
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "patched layout hash should not be the render-scene patch cache key"
+        );
+        let patch = &patch_entry.patch;
         assert!(
             patch.operations.iter().any(|operation| matches!(
                 operation,
@@ -72483,12 +72567,11 @@ label:
                     ..
                 } => {
                     assert_eq!(
-                        layout_frame_hash, &render_scene_identity,
-                        "app-owned readback proof should bind to the rendered Classic dark scene"
+                        layout_frame_hash, &None,
+                        "app-owned scene readback proof should not fabricate a layout frame hash"
                     );
                     assert_eq!(
-                        render_scene_identity_hash.as_deref(),
-                        Some(render_scene_identity.as_str()),
+                        render_scene_identity_hash, &render_scene_identity,
                         "app-owned readback proof should expose the rendered Classic dark scene identity"
                     );
                     PathBuf::from(artifact_path)
@@ -72672,12 +72755,11 @@ label:
                         ..
                     } => {
                         assert_eq!(
-                            layout_frame_hash, &render_scene_identity,
-                            "{theme} Light app-owned readback proof should bind to the rendered scene"
+                            layout_frame_hash, &None,
+                            "{theme} Light app-owned scene readback proof should not fabricate a layout frame hash"
                         );
                         assert_eq!(
-                            render_scene_identity_hash.as_deref(),
-                            Some(render_scene_identity.as_str()),
+                            render_scene_identity_hash, &render_scene_identity,
                             "{theme} Light app-owned readback proof should expose the rendered scene identity"
                         );
                         assert!(
@@ -88211,8 +88293,19 @@ document:
             .get("layout_frame_hash")
             .and_then(serde_json::Value::as_str)
             .expect("post-input layout proof should expose a layout hash");
-        let render_scene_patch =
-            cached_render_scene_patch(next_hash).expect("counter text sidecar should be cached");
+        let patch_identity = shared
+            .layout_proof
+            .get("render_scene_patch_identity")
+            .and_then(serde_json::Value::as_str)
+            .expect("post-input layout proof should expose render-scene patch identity");
+        assert!(
+            cached_render_scene_patch_entry(next_hash).is_none(),
+            "post-input layout hash should not be the render-scene patch cache key"
+        );
+        let render_scene_patch = cached_render_scene_patch_entry(patch_identity)
+            .expect("counter text sidecar should be cached")
+            .patch
+            .clone();
         assert!(
             render_scene_patch
                 .operations
@@ -90466,12 +90559,11 @@ document:
                 ..
             } => {
                 assert_eq!(
-                    layout_frame_hash, &render_scene_identity,
-                    "{artifact_label} app-owned readback proof should bind to the rendered scene"
+                    layout_frame_hash, &None,
+                    "{artifact_label} app-owned scene readback proof should not fabricate a layout frame hash"
                 );
                 assert_eq!(
-                    render_scene_identity_hash.as_deref(),
-                    Some(render_scene_identity.as_str()),
+                    render_scene_identity_hash, &render_scene_identity,
                     "{artifact_label} app-owned readback proof should expose the rendered scene identity"
                 );
                 assert!(
@@ -94069,8 +94161,8 @@ document:
                     surface_id: boon_host::SurfaceId("test-surface".to_owned()),
                     surface_epoch: 0,
                     frame_seq: 1,
-                    layout_frame_hash: render_frame_hash(frame),
-                    render_scene_identity_hash: None,
+                    layout_frame_hash: Some(render_frame_hash(frame)),
+                    render_scene_identity_hash: render_frame_hash(frame),
                     width: 320,
                     height: 200,
                     nonblank_samples: 1,

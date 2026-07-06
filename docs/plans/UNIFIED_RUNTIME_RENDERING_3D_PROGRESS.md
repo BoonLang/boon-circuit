@@ -283,6 +283,45 @@ Remaining work:
 - Regenerate the relevant native reports before claiming handoff readiness; the
   current manifest aggregate is still refresh debt, not a fresh pass.
 
+## 2026-07-06 - PlanExecutor List Store Ownership Slice
+
+Status: behavior-preserving runtime ownership cut verified with focused tests
+and runtime finality.
+
+What changed:
+
+- `PlanExecutorRuntimeState` no longer owns list rows as a raw
+  `BTreeMap<usize, Vec<PlanListRowState>>`. It now owns a
+  `PlanExecutorListStore`, which is the first runtime-local boundary for moving
+  indexed lookup, currentness refresh, and projection materialization out of
+  scattered helper functions.
+- Initial PlanExecutor runtime construction and initial-state execution now wrap
+  list rows through the store boundary before startup currentness/materialization
+  work runs.
+- This slice deliberately keeps existing evaluator behavior through deref
+  compatibility so semantic changes can be isolated in the next store-method
+  slices.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining work:
+
+- Move summary currentness, `List/find`/`List/find_value` exact-match lookup,
+  and list projection materialization onto `PlanExecutorListStore` methods.
+- Once those methods own the lookup/currentness contracts, add diagnostics for
+  index hits, candidates, and zero-scan address lookup without reintroducing
+  Cells-specific branches.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

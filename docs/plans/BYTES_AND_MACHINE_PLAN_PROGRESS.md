@@ -38711,3 +38711,32 @@ Fresh focused evidence before commit:
   "from_source_plan_executor|from_project_plan_executor|new_from_project\\(|LiveRuntime::new\\("
   crates docs/plans/GOAL_PROMPT.md --glob '!target'`: no matches.
 - `git diff --check`: pass.
+
+## 2026-07-06 - Source Replay Product Acceptance Side Channel Deleted
+
+Status: implemented and focused-verified; broad report refresh pending.
+
+What changed:
+
+- Removed `accepted_for_product_status` from PlanExecutor product command
+  reports and command-report assembly cores. Top-level `status` is now the
+  product acceptance field, and `plan_executor_status` proves the executor lane.
+- Removed the matching schema requirement, fixtures, aggregate details, default
+  engine child evidence, and product-status helper dependency on the old side
+  channel.
+- Kept focused tests asserting the obsolete field is absent from new
+  PlanExecutor reports.
+- Updated the native GPU contract and active goal prompt so future verifier work
+  does not preserve a second product-acceptance status field.
+
+Fresh focused evidence before commit:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_report_schema -p boon_runtime
+  -p xtask`: pass.
+- `cargo test -q -p boon_plan_executor command_output_assembles --
+  --nocapture`: pass.
+- `cargo test -q -p boon_report_schema run_plan -- --nocapture`: pass.
+- `cargo test -q -p xtask
+  source_replay_product_status_uses_plan_executor_split_fields -- --nocapture`:
+  pass.

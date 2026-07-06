@@ -1400,10 +1400,6 @@ fn verify_bytes_default_engine_readiness_report(
                 .and_then(JsonValue::as_str)
                 != Some("pass")
             || child
-                .get("accepted_for_product_status")
-                .and_then(JsonValue::as_str)
-                != Some("pass")
-            || child
                 .get("event_step_count")
                 .and_then(JsonValue::as_u64)
                 .is_none_or(|count| count > 2)
@@ -4488,7 +4484,6 @@ fn verify_run_plan_root_scalar_scenario_report(
         "plan_version",
         "capability_summary",
         "plan_executor_status",
-        "accepted_for_product_status",
         "report_status_basis",
         "selected_step_ids",
         "state_summary",
@@ -4520,17 +4515,6 @@ fn verify_run_plan_root_scalar_scenario_report(
     {
         return Err(format!(
             "{} run-plan-scenario-events plan_executor_status must be pass",
-            report_path.display()
-        )
-        .into());
-    }
-    if report
-        .get("accepted_for_product_status")
-        .and_then(JsonValue::as_str)
-        != Some("pass")
-    {
-        return Err(format!(
-            "{} run-plan-scenario-events accepted_for_product_status must be pass",
             report_path.display()
         )
         .into());
@@ -4898,10 +4882,6 @@ fn verify_run_plan_scenario_events_report(
         .get("plan_executor_status")
         .and_then(JsonValue::as_str)
         != Some("pass")
-        || report
-            .get("accepted_for_product_status")
-            .and_then(JsonValue::as_str)
-            != Some("pass")
         || report
             .get("report_status_basis")
             .and_then(JsonValue::as_str)
@@ -32172,7 +32152,6 @@ mod tests {
                 "status": "pass",
                 "command": "run-plan-scenario-events",
                 "plan_executor_status": "pass",
-                "accepted_for_product_status": "pass",
                 "event_step_count": 2,
                 "argv_matches_expected_command": true
             }
@@ -34037,7 +34016,6 @@ mod tests {
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-source-route-command-report-assembly-v1",
             "plan_executor_status": "pass",
-            "accepted_for_product_status": "pass",
             "status": "pass",
             "report_status_basis": "plan-executor-product",
             "exit_status": 0,
@@ -34145,7 +34123,6 @@ mod tests {
         let command_report_assembly_core = json!({
             "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
             "plan_executor_status": "pass",
-            "accepted_for_product_status": "pass",
             "status": "pass",
             "report_status_basis": "plan-executor-product",
             "exit_status": 0,
@@ -34191,7 +34168,6 @@ mod tests {
             source_path_string
         ]);
         report["plan_executor_status"] = json!("pass");
-        report["accepted_for_product_status"] = json!("pass");
         report["report_status_basis"] = json!("plan-executor-product");
         report["source_path"] = json!(source_path.display().to_string());
         report["source_hash"] = json!(source_hash);

@@ -12481,7 +12481,6 @@ pub fn assemble_source_route_command_report(
     input: SourceRouteCommandReportInput,
 ) -> SourceRouteCommandReportAssembly {
     let plan_executor_status = "pass";
-    let accepted_for_product_status = "pass";
     let expression_kind = input
         .route_surface
         .get("expression_kind")
@@ -12494,7 +12493,6 @@ pub fn assemble_source_route_command_report(
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
@@ -12507,7 +12505,6 @@ pub fn assemble_source_route_command_report(
     let report = json!({
         "status": report_status,
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "report_status_basis": report_status_basis,
         "report_version": 1,
         "command": "run-plan-route",
@@ -12623,14 +12620,12 @@ pub fn assemble_root_scenario_command_report(
     input: RootScenarioCommandReportInput,
 ) -> RootScenarioCommandReportAssembly {
     let plan_executor_status = "pass";
-    let accepted_for_product_status = "pass";
     let report_status = "pass";
     let exit_status = 0;
     let report_status_basis = "plan-executor-product";
     let command_report_assembly_core = json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
@@ -12643,7 +12638,6 @@ pub fn assemble_root_scenario_command_report(
     let report = json!({
         "status": report_status,
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "report_status_basis": report_status_basis,
         "report_version": 1,
         "command": "run-plan-root-scalar-scenario",
@@ -12759,11 +12753,6 @@ pub fn assemble_scenario_events_command_report(
     input: ScenarioEventsCommandReportInput,
 ) -> ScenarioEventsCommandReportAssembly {
     let plan_executor_status = "pass";
-    let accepted_for_product_status = if input.assertion_only_covered {
-        "pass"
-    } else {
-        "fail"
-    };
     let accepted = input.assertion_only_covered;
     let report_status = if accepted { "pass" } else { "fail" };
     let exit_status = if accepted { 0 } else { 1 };
@@ -12773,7 +12762,6 @@ pub fn assemble_scenario_events_command_report(
         "executor": "cpu-plan-scenario-events-command-report-assembly-v1",
         "assertion_only_covered": input.assertion_only_covered,
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
@@ -12791,7 +12779,6 @@ pub fn assemble_scenario_events_command_report(
     let report = json!({
         "status": report_status,
         "plan_executor_status": plan_executor_status,
-        "accepted_for_product_status": accepted_for_product_status,
         "report_status_basis": report_status_basis,
         "report_version": 1,
         "command": "run-plan-scenario-events",
@@ -18957,7 +18944,7 @@ mod tests {
         let digest = sha256_bytes(&payload);
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.report["plan_executor_status"], "pass");
-        assert_eq!(output.report["accepted_for_product_status"], "pass");
+        assert!(output.report.get("accepted_for_product_status").is_none());
         assert!(output.report.get("comparison_status").is_none());
         assert_eq!(
             output.report["plan_executor"]["command_output_core"]["executor"],
@@ -19021,7 +19008,7 @@ mod tests {
 
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.report["plan_executor_status"], "pass");
-        assert_eq!(output.report["accepted_for_product_status"], "pass");
+        assert!(output.report.get("accepted_for_product_status").is_none());
         assert!(output.report.get("comparison_status").is_none());
         assert_eq!(output.report["command"], "run-plan-root-scalar-scenario");
         assert_eq!(
@@ -19085,7 +19072,7 @@ mod tests {
 
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.report["plan_executor_status"], "pass");
-        assert_eq!(output.report["accepted_for_product_status"], "pass");
+        assert!(output.report.get("accepted_for_product_status").is_none());
         assert!(output.report.get("comparison_status").is_none());
         assert_eq!(output.report["command"], "run-plan-scenario-events");
         assert_eq!(

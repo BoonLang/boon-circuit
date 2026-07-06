@@ -1066,11 +1066,11 @@ forcing product verifier reruns without weakening stale-report detection for
 reports that have no scoped identity.
 
 PlanExecutor source replay reports must describe product execution directly in
-the BYTES/MachinePlan verifier. `plan_executor_status` and
-`accepted_for_product_status` describe whether the PlanExecutor replay is usable
-as semantic product evidence. Legacy oracle parity is not part of product
-source-replay reports; any future comparison gate must use an explicit
-diagnostic report. Native preview E2E does not consume those reports.
+the BYTES/MachinePlan verifier. Top-level `status` is product acceptance, and
+`plan_executor_status` proves the PlanExecutor lane. Legacy oracle parity and
+old product-acceptance side channels are not part of product source-replay
+reports; any future comparison gate must use an explicit diagnostic report.
+Native preview E2E does not consume those reports.
 
 PlanExecutor source replay reports carry source-replay freshness evidence
 separate from native verifier identity. `run-plan-scenario-events` reports keep

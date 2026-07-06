@@ -37448,10 +37448,9 @@ What changed:
 - Removed the nested TodoMVC/Cells full scenario child replays from the
   readiness verifier and schema. The schema now rejects the old
   `todomvc-default-plan` / `cells-default-plan` readiness shape.
-- Added machine-checkable delegation metadata: full TodoMVC and Cells product
-  source replay belongs to `verify-bytes-machine-plan-all`, specifically
-  `todomvc-native-preview-source-replay` and
-  `cells-native-preview-source-replay`.
+- Added machine-checkable control-plane metadata. Full TodoMVC and Cells
+  product source replay does not belong to this default-engine readiness gate.
+  It is owned by native GPU handoff/product evidence.
 - The default-dispatch smoke child is bounded by contract: PlanExecutor status
   pass, accepted product status pass, and at most two source-event steps.
 
@@ -37467,14 +37466,14 @@ Fresh focused evidence:
   target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
 - Fresh readiness summary:
   `status=pass`, `readiness_scope=default-engine-control-plane-only`, one
-  `default-dispatch-smoke` child, and delegated TodoMVC/Cells replay coverage
-  owned by the BYTES aggregate.
+  `default-dispatch-smoke` child, and full TodoMVC/Cells replay coverage left
+  to native GPU handoff/product evidence.
 
 Remaining scope:
 
-- Continue BYTES aggregate refresh in bounded batches; default-engine readiness
-  no longer pulls Cells into every refresh, but the canonical full Cells replay
-  remains required as its own aggregate child.
+- Continue BYTES aggregate refresh only for the PlanExecutor/control-plane
+  contract; default-engine readiness no longer pulls Cells into every refresh,
+  and native preview/source replay stays under native GPU handoff.
 - Continue ProductFrameGraph/native presentation and Cells UX latency work; this
   control-plane split is not a Cells 60 FPS claim.
 
@@ -37529,3 +37528,51 @@ Remaining scope:
 - Do not restore native source replay to the BYTES aggregate. Native handoff
   manifests and native GPU reports are the correct authority for visual/product
   proof.
+
+## 2026-07-06 - Native Handoff Source Replay Ownership
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Removed the stale ownership edge where native preview/source replay depended
+  on `verify-bytes-machine-plan-all`.
+- The native handoff manifest now marks `todomvc-native-preview-source-replay`,
+  `cells-native-preview-source-replay`, and
+  `todo-mvc-physical-native-preview-source-replay` as dependencies owned by
+  `verify-native-gpu-all`.
+- The refresh queue still executes those dependencies directly with
+  `boon_cli run`, but native aggregate dependency graphs and refresh entries no
+  longer point back to the BYTES aggregate.
+- `verify-bytes-default-engine-readiness` now reports
+  `product_replay_coverage_owner=native-gpu-handoff` and an empty
+  `delegated_product_replay_reports` list.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema
+  bytes_default_engine_readiness_schema_requires_bounded_control_plane_scope
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/native-gpu-all.json`: pass.
+- `cargo run -q -p xtask -- verify-native-gpu-all --check-existing --report
+  target/reports/native-gpu-all.json`: expected fail from stale native reports,
+  but zero true blockers; source replay refresh entries are native-owned and
+  direct `boon_cli run`.
+
+Remaining scope:
+
+- The next implementation cut should follow the native/render explorer finding:
+  extract a typed preview presentation plan so JSON/proof construction stops
+  participating in render decisions.
+- In parallel, the runtime/PlanExecutor cut remains generic list/currentness
+  ownership for Cells-style lookup and dependency fanout. Do not add
+  Cells-specific runtime branches.

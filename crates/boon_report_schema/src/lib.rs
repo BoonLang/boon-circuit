@@ -1001,7 +1001,7 @@ fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
         "bytes-default-engine:cli-build",
         "bytes-default-engine:source-default-plan",
         "bytes-default-engine:default-dispatch-smoke",
-        "bytes-default-engine:product-replay-delegated-to-aggregate",
+        "bytes-default-engine:product-replay-not-owned-by-control-plane",
         "bytes-default-engine:phase10-switch-ready",
     ]
 }
@@ -1329,10 +1329,10 @@ fn verify_bytes_default_engine_readiness_report(
     if report
         .get("product_replay_coverage_owner")
         .and_then(JsonValue::as_str)
-        != Some("bytes-machine-plan-aggregate")
+        != Some("native-gpu-handoff")
     {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness must delegate full product replay coverage to the BYTES aggregate",
+            "{} verify-bytes-default-engine-readiness must leave full product replay coverage to native GPU handoff",
             report_path.display()
         )
         .into());
@@ -1346,68 +1346,12 @@ fn verify_bytes_default_engine_readiness_report(
                 report_path.display()
             )
         })?;
-    let expected_delegated_reports = vec![
-        (
-            "todomvc-native-preview-source-replay",
-            "target/reports/bytes-plan/todomvc-scenario-events-full.json",
-        ),
-        (
-            "cells-native-preview-source-replay",
-            "target/reports/bytes-plan/cells-scenario-events-full.json",
-        ),
-    ];
-    if delegated_reports.len() != expected_delegated_reports.len() {
+    if !delegated_reports.is_empty() {
         return Err(format!(
-            "{} verify-bytes-default-engine-readiness delegated_product_replay_reports length is wrong",
+            "{} verify-bytes-default-engine-readiness must not delegate product replay through the BYTES control-plane report",
             report_path.display()
         )
         .into());
-    }
-    for (delegated, (expected_label, expected_path)) in
-        delegated_reports.iter().zip(expected_delegated_reports)
-    {
-        if delegated.get("label").and_then(JsonValue::as_str) != Some(expected_label)
-            || delegated.get("path").and_then(JsonValue::as_str) != Some(expected_path)
-            || delegated.get("command").and_then(JsonValue::as_str)
-                != Some("run-plan-scenario-events")
-            || delegated.get("owner_aggregate").and_then(JsonValue::as_str)
-                != Some("verify-bytes-machine-plan-all")
-            || delegated
-                .get("owner_aggregate_report_path")
-                .and_then(JsonValue::as_str)
-                != Some("target/reports/bytes-plan/bytes-machine-plan-all.json")
-        {
-            return Err(format!(
-                "{} verify-bytes-default-engine-readiness delegated product replay report `{expected_label}` is not declared correctly",
-                report_path.display()
-            )
-            .into());
-        }
-        let coverage_required = delegated
-            .get("coverage_required")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-default-engine-readiness delegated product replay `{expected_label}` missing coverage_required",
-                    report_path.display()
-                )
-            })?
-            .iter()
-            .map(|item| item.as_str().unwrap_or(""))
-            .collect::<Vec<_>>();
-        if coverage_required
-            != [
-                "covers_all_source_events",
-                "covers_assertion_only_steps",
-                "full_scenario_parity",
-            ]
-        {
-            return Err(format!(
-                "{} verify-bytes-default-engine-readiness delegated product replay `{expected_label}` has wrong coverage_required",
-                report_path.display()
-            )
-            .into());
-        }
     }
 
     let children = report
@@ -9168,11 +9112,15 @@ fn verify_native_gpu_all_report(report: &JsonValue, report_path: &Path) -> Runti
             let owner_aggregate = dependency
                 .get("owner_aggregate")
                 .and_then(JsonValue::as_str)
-                .unwrap_or("verify-bytes-machine-plan-all");
+                .unwrap_or("verify-native-gpu-all");
             let owner_aggregate_report_path = dependency
                 .get("owner_aggregate_report_path")
                 .and_then(JsonValue::as_str)
-                .unwrap_or(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH);
+                .unwrap_or(if owner_aggregate == "verify-native-gpu-all" {
+                    "target/reports/native-gpu-all.json"
+                } else {
+                    BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH
+                });
             expected_dependency_edges.insert((
                 label.to_owned(),
                 dependency_label.to_owned(),
@@ -32210,33 +32158,8 @@ mod tests {
         report["default_switch_blocker"] = JsonValue::Null;
         report["diagnostic_comparison_mode"] = json!("not-run-not-required-for-product-readiness");
         report["explicit_compare_case_count"] = json!(0);
-        report["product_replay_coverage_owner"] = json!("bytes-machine-plan-aggregate");
-        report["delegated_product_replay_reports"] = json!([
-            {
-                "label": "todomvc-native-preview-source-replay",
-                "path": "target/reports/bytes-plan/todomvc-scenario-events-full.json",
-                "command": "run-plan-scenario-events",
-                "owner_aggregate": "verify-bytes-machine-plan-all",
-                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
-                "coverage_required": [
-                    "covers_all_source_events",
-                    "covers_assertion_only_steps",
-                    "full_scenario_parity"
-                ]
-            },
-            {
-                "label": "cells-native-preview-source-replay",
-                "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
-                "command": "run-plan-scenario-events",
-                "owner_aggregate": "verify-bytes-machine-plan-all",
-                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
-                "coverage_required": [
-                    "covers_all_source_events",
-                    "covers_assertion_only_steps",
-                    "full_scenario_parity"
-                ]
-            }
-        ]);
+        report["product_replay_coverage_owner"] = json!("native-gpu-handoff");
+        report["delegated_product_replay_reports"] = json!([]);
         report["child_reports"] = json!([
             {
                 "id": "default-dispatch-smoke",
@@ -32748,7 +32671,7 @@ mod tests {
             "refresh_phase": "upstream-dependency",
             "dependency_depth": 1,
             "required_by": "preview-e2e-cells",
-            "owner_aggregate": "verify-bytes-machine-plan-all",
+            "owner_aggregate": "verify-native-gpu-all",
             "selected_by_label_filter": true
         }]);
         report["boon_cli_prebuild"] = json!({
@@ -32877,11 +32800,15 @@ mod tests {
                 let owner_aggregate = dependency
                     .get("owner_aggregate")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or("verify-bytes-machine-plan-all");
+                    .unwrap_or("verify-native-gpu-all");
                 let owner_aggregate_report_path = dependency
                     .get("owner_aggregate_report_path")
                     .and_then(JsonValue::as_str)
-                    .unwrap_or(BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH);
+                    .unwrap_or(if owner_aggregate == "verify-native-gpu-all" {
+                        "target/reports/native-gpu-all.json"
+                    } else {
+                        BYTES_MACHINE_PLAN_AGGREGATE_REPORT_PATH
+                    });
                 let dependency_command = dependency
                     .get("command")
                     .and_then(JsonValue::as_str)
@@ -33121,8 +33048,8 @@ mod tests {
             "owner_aggregate_rerun_executed": true,
             "owner_aggregate_rerun_count": 1,
             "owner_aggregate_reruns": [{
-                "owner_aggregate": "verify-bytes-machine-plan-all",
-                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
+                "owner_aggregate": "verify-native-gpu-all",
+                "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
                 "rerun_executed": true
             }]
         }]);

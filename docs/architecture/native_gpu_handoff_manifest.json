@@ -97,8 +97,8 @@
           "command": "run-plan-scenario-events",
           "required_argv": [],
           "measurement_mode": "proof",
-          "owner_aggregate": "verify-bytes-machine-plan-all",
-          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+          "owner_aggregate": "verify-native-gpu-all",
+          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
         }
       ]
     },
@@ -121,8 +121,8 @@
           "command": "run-plan-scenario-events",
           "required_argv": [],
           "measurement_mode": "proof",
-          "owner_aggregate": "verify-bytes-machine-plan-all",
-          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+          "owner_aggregate": "verify-native-gpu-all",
+          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
         }
       ]
     },
@@ -145,8 +145,8 @@
           "command": "run-plan-scenario-events",
           "required_argv": [],
           "measurement_mode": "proof",
-          "owner_aggregate": "verify-bytes-machine-plan-all",
-          "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json"
+          "owner_aggregate": "verify-native-gpu-all",
+          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
         }
       ]
     },

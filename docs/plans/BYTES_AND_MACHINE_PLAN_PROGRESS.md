@@ -38245,15 +38245,14 @@ Fresh focused evidence:
   target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
 - Fresh report summary:
   `status=pass`, `readiness_scope=default-engine-control-plane-only`, one
-  `default-dispatch-smoke` child, and delegated TodoMVC/Cells product replay
-  reports owned by `verify-bytes-machine-plan-all`.
+  `default-dispatch-smoke` child, and full TodoMVC/Cells product replay no
+  longer owned by this BYTES control-plane gate.
 
 Remaining scope:
 
 - Refresh/remint the BYTES aggregate children in bounded batches. The default
-  readiness gate is no longer the source of the slow nested Cells replay, but
-  the canonical full Cells source replay still needs to stay fresh as its own
-  aggregate child.
+  readiness gate is no longer the source of slow product replay work, and
+  native preview/source replay stays under native GPU handoff.
 - Continue native/product performance and ProductFrameGraph work; do not use
   this control-plane gate as a Cells 60 FPS claim.
 
@@ -38318,3 +38317,50 @@ Remaining scope:
   comprehensive.
 - Cells full replay and interaction performance remain product/runtime
   architecture work; this checkpoint only removes misleading harness churn.
+
+## 2026-07-06 - Native Handoff Owns Source Replay Dependencies
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Updated `verify-bytes-default-engine-readiness` so full product replay is
+  explicitly owned by `native-gpu-handoff`, with zero delegated replay reports.
+  The BYTES default-engine gate now proves only the default PlanExecutor switch
+  plus one bounded default-dispatch smoke.
+- Updated the native GPU handoff manifest so preview E2E source-replay
+  dependencies are owned by `verify-native-gpu-all`, not by
+  `verify-bytes-machine-plan-all`.
+- `run-report-refresh-queue` still refreshes those source-replay dependencies
+  directly through `boon_cli run`, but they no longer re-enter the BYTES
+  aggregate.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema
+  bytes_default_engine_readiness_schema_requires_bounded_control_plane_scope
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass with
+  `product_replay_coverage_owner=native-gpu-handoff` and zero delegated
+  product replay reports.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/native-gpu-all.json`: pass.
+- Fresh native aggregate summary is still status `fail` because 17 native
+  reports are stale, but it has `true_blocker_child_count=0` and source replay
+  refresh entries now have `owner_aggregate=verify-native-gpu-all` with
+  `boon_cli run` argv.
+
+Remaining scope:
+
+- Refresh native handoff reports separately when ready; do not route source
+  replay through BYTES to satisfy native freshness.
+- Continue the ProductFrameGraph/proof-lane and PlanExecutor Cells
+  currentness/list-index work. This checkpoint only fixes ownership and
+  control-plane coupling.

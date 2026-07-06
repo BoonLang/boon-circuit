@@ -254,7 +254,10 @@ Current checkpoint:
 - `run-report-refresh-queue` is now dependency-aware and schema-locked. Full
   native refresh dry-runs select the three upstream BYTES source replay reports
   first; a label-filtered `preview-e2e-cells` dry-run expands to
-  `cells-native-preview-source-replay` before `preview-e2e-cells`. Queue reports
+  `cells-native-preview-source-replay` before `preview-e2e-cells`. These
+  native source-replay dependencies are owned by `verify-native-gpu-all` and
+  refreshed directly with `boon_cli run`, not routed through the BYTES
+  aggregate. Queue reports
   include `selection_mode`, dependency expansion/deferred counts,
   `refresh_phase_summaries`, ordered `refresh_execution_plan`,
   `selected_by_label_filter`, `boon_cli_prebuild`, and owner-aggregate rerun

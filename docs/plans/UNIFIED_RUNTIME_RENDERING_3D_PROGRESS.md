@@ -721,6 +721,18 @@ Fresh focused evidence:
   - `cargo test -q -p xtask native_gpu_handoff_requires_cells_visible_click_release_report -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Simplified Native Stale-Path Ledger Modes
+
+- Removed unused `diagnostic-only`, `fail-fast-alias`, and `removed` mode
+  support from the native stale-path ledger verifier.
+- The verifier now accepts only `product-forbidden` rows, matching the actual
+  ledger and keeping stale-path checks as a release product negative gate rather
+  than a generic compatibility framework.
+- Added a negative test that rejects obsolete non-product ledger modes.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask stale_path_ledger -- --nocapture`: pass; 3 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

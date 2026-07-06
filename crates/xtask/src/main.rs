@@ -49044,7 +49044,6 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
     let mut product_forbidden_count = 0_u64;
     let mut product_forbidden_pass_count = 0_u64;
     let mut product_forbidden_absent_pass_count = 0_u64;
-    let mut diagnostic_only_count = 0_u64;
     let mut missing_report_count = 0_u64;
     let mut linked_report_count = 0_u64;
     let mut failed_row_count = 0_u64;
@@ -49101,16 +49100,12 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
                 missing_metadata.join(", ")
             ));
         }
-        if !matches!(
-            mode,
-            "product-forbidden" | "diagnostic-only" | "fail-fast-alias" | "removed"
-        ) {
-            row_blockers.push(format!("unsupported mode `{mode}`"));
-        }
         if mode == "product-forbidden" {
             product_forbidden_count = product_forbidden_count.saturating_add(1);
-        } else if mode == "diagnostic-only" {
-            diagnostic_only_count = diagnostic_only_count.saturating_add(1);
+        } else {
+            row_blockers.push(format!(
+                "unsupported mode `{mode}`; stale-path ledger accepts only product-forbidden rows"
+            ));
         }
 
         let base_path = PathBuf::from(report_path);
@@ -49151,25 +49146,13 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
                         )),
                     }
                 }
-                Some(linked_path) => {
-                    if mode == "product-forbidden" {
-                        source_kind = "linked_report_absent";
-                        linked_report_absent = true;
-                    } else {
-                        row_blockers.push(format!(
-                            "linked report `{linked_path}` from {pointer} is missing"
-                        ));
-                    }
+                Some(_) => {
+                    source_kind = "linked_report_absent";
+                    linked_report_absent = true;
                 }
                 None => {
-                    if mode == "product-forbidden" {
-                        source_kind = "linked_report_pointer_absent";
-                        linked_report_absent = true;
-                    } else {
-                        row_blockers.push(format!(
-                            "linked_report_path_pointer `{pointer}` did not resolve to a report path"
-                        ));
-                    }
+                    source_kind = "linked_report_pointer_absent";
+                    linked_report_absent = true;
                 }
             }
         }
@@ -49182,8 +49165,7 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
                 .and_then(|report| report.pointer(json_pointer))
                 .cloned()
         };
-        let absent_counts_as_pass =
-            matches!(mode, "product-forbidden" | "removed") && observed.is_none();
+        let absent_counts_as_pass = mode == "product-forbidden" && observed.is_none();
         if observed.as_ref() != Some(&expected) && !absent_counts_as_pass {
             row_blockers.push(format!(
                 "{json_pointer} observed={} expected={}",
@@ -49259,7 +49241,6 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
             "product_forbidden_row_count": product_forbidden_count,
             "product_forbidden_pass_count": product_forbidden_pass_count,
             "product_forbidden_absent_pass_count": product_forbidden_absent_pass_count,
-            "diagnostic_only_row_count": diagnostic_only_count,
             "missing_report_count": missing_report_count,
             "linked_report_count": linked_report_count,
             "failed_row_count": failed_row_count,
@@ -75490,6 +75471,73 @@ mod tests {
                 .pointer("/row_results/0/absent_counts_as_pass")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn stale_path_ledger_rejects_non_product_forbidden_modes() {
+        let dir = PathBuf::from(format!(
+            "target/tmp/xtask-stale-path-ledger-mode-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create stale-path mode test dir");
+        let base_report = dir.join("cells-visible-click.json");
+        let ledger = dir.join("ledger.json");
+        let output = dir.join("out.json");
+        write_json(
+            &base_report,
+            &json!({
+                "status": "pass",
+                "some_counter": 0
+            }),
+        )
+        .expect("write base report");
+        write_json(
+            &ledger,
+            &json!({
+                "schema_version": 1,
+                "rows": [{
+                    "id": "obsolete-diagnostic-mode",
+                    "mode": "diagnostic-only",
+                    "current_owner": "test",
+                    "typed_replacement": "product forbidden row",
+                    "report_path": base_report,
+                    "symbol_or_field": "some_counter",
+                    "json_pointer": "/some_counter",
+                    "expected": 0,
+                    "positive_gate": "test positive gate",
+                    "negative_gate": "test negative gate",
+                    "removal_condition": "test removal"
+                }]
+            }),
+        )
+        .expect("write ledger");
+
+        let result = verify_native_gpu_stale_path_ledger(&[
+            "verify-native-gpu-stale-path-ledger".to_owned(),
+            "--ledger".to_owned(),
+            ledger.display().to_string(),
+            "--report".to_owned(),
+            output.display().to_string(),
+        ]);
+
+        assert!(
+            result.is_err(),
+            "stale path ledger must reject obsolete non-product modes"
+        );
+        let report = read_json(&output).expect("read failing stale-path mode report");
+        assert_eq!(
+            report.get("status").and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert!(
+            report
+                .get("blockers")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blockers| blockers.iter().any(|blocker| blocker
+                    .as_str()
+                    .is_some_and(|text| text.contains("product-forbidden")))),
+            "failing report should name the only accepted mode: {report}"
         );
     }
 

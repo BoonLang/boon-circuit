@@ -41411,10 +41411,6 @@ fn cells_visible_click_product_only_ux_contract(
         .unwrap_or(0);
     let exact_product_commit_match_count =
         json_u64(product_frames, "/exact_product_commit_match_count");
-    let exact_proof_frame_commit_match_count =
-        json_u64(product_frames, "/exact_proof_frame_commit_match_count");
-    let input_latency_fallback_match_count =
-        json_u64(product_frames, "/input_latency_fallback_match_count");
     let typed_product_patch_count = json_u64(product_frames, "/typed_product_patch_count");
     let typed_product_result_count = json_u64(product_frames, "/typed_product_result_count");
     let product_render_graph_count = json_u64(product_frames, "/product_render_graph_count");
@@ -41483,8 +41479,6 @@ fn cells_visible_click_product_only_ux_contract(
         && render_loop_mode == "demand_driven"
         && sample_count > 0
         && exact_product_commit_match_count >= sample_count
-        && exact_proof_frame_commit_match_count == 0
-        && input_latency_fallback_match_count == 0
         && typed_product_patch_count >= sample_count
         && typed_product_result_count >= sample_count
         && graph_contract_ok
@@ -41523,8 +41517,6 @@ fn cells_visible_click_product_only_ux_contract(
         "product_render_graph_contract_status": if graph_contract_ok { "pass" } else { "fail" },
         "sample_count": sample_count,
         "exact_product_commit_match_count": exact_product_commit_match_count,
-        "exact_proof_frame_commit_match_count": exact_proof_frame_commit_match_count,
-        "input_latency_fallback_match_count": input_latency_fallback_match_count,
         "typed_product_patch_count": typed_product_patch_count,
         "typed_product_result_count": typed_product_result_count,
         "product_render_graph_count": product_render_graph_count,
@@ -42084,7 +42076,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
     let mut missed_frame_count = 0_u64;
     let mut hard_failure_count = 0_u64;
     let mut exact_product_commit_match_count = 0_u64;
-    let mut exact_proof_frame_commit_match_count = 0_u64;
     let mut typed_product_patch_count = 0_u64;
     let mut typed_product_result_count = 0_u64;
     let mut product_result_missing_count = 0_u64;
@@ -42122,60 +42113,34 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         let product_key = sample
             .get("product_frame_evidence_key")
             .filter(|value| value.is_object());
-        let proof_key = sample
-            .get("proof_frame_evidence_key")
-            .or_else(|| sample.pointer("/present_probe/frame_evidence_key"))
-            .or_else(|| sample.pointer("/proof_present_probe/frame_evidence_key"))
-            .filter(|value| value.is_object());
-        let Some(sample_key) = product_key.or(proof_key) else {
+        let Some(product_key) = product_key else {
             missed_frame_count = missed_frame_count.saturating_add(1);
             hard_failure_count = hard_failure_count.saturating_add(1);
             sample_failures.push(json!({
                 "index": sample_index,
                 "target_address": target_address,
-                "reason": "missing_click_frame_evidence_key",
+                "reason": "missing_product_frame_evidence_key",
                 "budget_ms": budget_ms
             }));
             continue;
         };
         let exact_product_key_commit =
-            cells_visible_click_find_product_commit_by_key(commits, product_key);
-        let exact_matching_commit = exact_product_key_commit
-            .or_else(|| cells_visible_click_find_product_commit_by_key(commits, proof_key));
-        let match_method = if exact_product_key_commit.is_some() {
-            "exact_product_commit"
-        } else if exact_matching_commit.is_some() {
-            "exact_frame_evidence_key"
-        } else {
-            "missing"
-        };
-        let Some(commit) = exact_matching_commit else {
+            cells_visible_click_find_product_commit_by_key(commits, Some(product_key));
+        let Some(commit) = exact_product_key_commit else {
             missed_frame_count = missed_frame_count.saturating_add(1);
             hard_failure_count = hard_failure_count.saturating_add(1);
             sample_failures.push(json!({
                 "index": sample_index,
                 "target_address": target_address,
                 "reason": "missing_matching_product_commit",
-                "frame_evidence_key": sample_key,
-                "product_frame_evidence_key": product_key.cloned().unwrap_or(serde_json::Value::Null),
-                "proof_frame_evidence_key": proof_key.cloned().unwrap_or(serde_json::Value::Null),
+                "product_frame_evidence_key": product_key,
                 "budget_ms": budget_ms
             }));
             continue;
         };
 
         matched_commit_count = matched_commit_count.saturating_add(1);
-        match match_method {
-            "exact_product_commit" => {
-                exact_product_commit_match_count =
-                    exact_product_commit_match_count.saturating_add(1);
-            }
-            "exact_frame_evidence_key" => {
-                exact_proof_frame_commit_match_count =
-                    exact_proof_frame_commit_match_count.saturating_add(1);
-            }
-            _ => {}
-        }
+        exact_product_commit_match_count = exact_product_commit_match_count.saturating_add(1);
         let input_to_present_ms = commit
             .get("input_to_present_ms")
             .and_then(numeric_value_as_f64)
@@ -42515,7 +42480,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             && input_to_present_ms <= budget_ms
             && input_to_formula_visible_ms <= budget_ms
             && product_formula_state_current
-            && match_method == "exact_product_commit"
             && typed_product_patch_ok
             && typed_product_result_ok
             && render_graph_ok_for_sample
@@ -42526,7 +42490,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             && input_to_present_ms <= max_budget_ms
             && input_to_formula_visible_ms <= max_budget_ms
             && product_formula_state_current
-            && match_method == "exact_product_commit"
             && typed_product_patch_ok
             && typed_product_result_ok
             && render_graph_ok_for_sample
@@ -42542,8 +42505,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
                 "missing_click_formula_timing"
             } else if !product_formula_state_current {
                 "product_formula_state_not_current"
-            } else if match_method != "exact_product_commit" {
-                "product_commit_not_exact_product_frame"
             } else if !typed_product_patch_ok {
                 "missing_typed_product_patch"
             } else if !typed_product_result_ok {
@@ -42574,9 +42535,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
                     serde_json::Value::Null
                 },
                 "product_formula_state_current": product_formula_state_current,
-                "frame_evidence_key": sample_key,
-                "product_frame_evidence_key": product_key.cloned().unwrap_or(serde_json::Value::Null),
-                "proof_frame_evidence_key": proof_key.cloned().unwrap_or(serde_json::Value::Null),
+                "product_frame_evidence_key": product_key,
                 "budget_ms": budget_ms,
                 "max_budget_ms": max_budget_ms
             });
@@ -42590,36 +42549,20 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         matched_samples.push(json!({
             "index": sample_index,
             "target_address": target_address,
-            "match_method": match_method,
+            "match_method": "exact_product_commit",
             "product_frame_evidence_key": commit
                 .get("frame_evidence_key")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
-            "proof_frame_evidence_key": sample_key,
             "frame_seq": commit
                 .pointer("/frame_evidence_key/frame_seq")
                 .cloned()
-                .or_else(|| sample_key.get("frame_seq").cloned())
                 .unwrap_or(serde_json::Value::Null),
             "present_id": commit
                 .pointer("/frame_evidence_key/present_id")
                 .cloned()
-                .or_else(|| sample_key.get("present_id").cloned())
-                .unwrap_or(serde_json::Value::Null),
-            "proof_frame_seq": sample_key
-                .get("frame_seq")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "proof_present_id": sample_key
-                .get("present_id")
-                .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "input_event_seq": commit
-                .get("input_event_seq")
-                .cloned()
-                .or_else(|| sample_key.get("input_event_seq").cloned())
-                .unwrap_or(serde_json::Value::Null),
-            "proof_input_event_seq": sample_key
                 .get("input_event_seq")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
@@ -42741,8 +42684,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         "click_sample_count": click_sample_count,
         "product_frame_sample_count": matched_commit_count,
         "exact_product_commit_match_count": exact_product_commit_match_count,
-        "exact_proof_frame_commit_match_count": exact_proof_frame_commit_match_count,
-        "input_latency_fallback_match_count": 0,
         "typed_product_patch_count": typed_product_patch_count,
         "typed_product_result_count": typed_product_result_count,
         "product_render_graph_count": product_render_graph_count,
@@ -72596,8 +72537,6 @@ mod tests {
             "adapter_status": "hardware",
             "product_frame_sample_count": 16,
             "exact_product_commit_match_count": 16,
-            "exact_proof_frame_commit_match_count": 0,
-            "input_latency_fallback_match_count": 0,
             "typed_product_patch_count": 16,
             "typed_product_result_count": 16,
             "product_render_graph_count": 16,
@@ -72688,8 +72627,6 @@ mod tests {
             "adapter_status": "hardware",
             "product_frame_sample_count": 16,
             "exact_product_commit_match_count": 16,
-            "exact_proof_frame_commit_match_count": 0,
-            "input_latency_fallback_match_count": 0,
             "typed_product_patch_count": 16,
             "typed_product_result_count": 16,
             "product_result_missing_count": 0,
@@ -72769,8 +72706,6 @@ mod tests {
             "adapter_status": "software",
             "product_frame_sample_count": 16,
             "exact_product_commit_match_count": 16,
-            "exact_proof_frame_commit_match_count": 0,
-            "input_latency_fallback_match_count": 0,
             "typed_product_patch_count": 16,
             "typed_product_result_count": 16,
             "product_result_missing_count": 0,
@@ -72827,8 +72762,6 @@ mod tests {
             "adapter_status": "hardware",
             "product_frame_sample_count": 16,
             "exact_product_commit_match_count": 16,
-            "exact_proof_frame_commit_match_count": 0,
-            "input_latency_fallback_match_count": 0,
             "typed_product_patch_count": 0,
             "typed_product_result_count": 16,
             "product_result_missing_count": 0,
@@ -72874,8 +72807,6 @@ mod tests {
             "adapter_status": "hardware",
             "product_frame_sample_count": 16,
             "exact_product_commit_match_count": 16,
-            "exact_proof_frame_commit_match_count": 0,
-            "input_latency_fallback_match_count": 0,
             "typed_product_patch_count": 16,
             "typed_product_result_count": 0,
             "product_result_missing_count": 16,

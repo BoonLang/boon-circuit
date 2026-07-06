@@ -784,12 +784,34 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_product_metrics -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Deleted Cells Product-Key Proof Fallback
+
+- Removed the Cells product-frame scope fallback that matched product commits
+  by proof-frame evidence keys when `product_frame_evidence_key` was missing.
+- Deleted the dead `input_latency_fallback_match_count` and
+  `exact_proof_frame_commit_match_count` fields from the product-only UX
+  contract and related fixtures.
+- Product latency is now measured only from exact product-frame commits; proof
+  frame keys remain in the proof lane.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask cells_visible_click -- --nocapture`: pass; 21
+    passed.
+  - `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+    pass; product input-to-present p95 9.61ms, max 14.65ms, 60 exact product
+    commit matches, proof lag max 0, removed product-fallback fields absent.
+  - `target/debug/xtask verify-report-schema target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+    pass.
+  - `cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+    expected fail from 17 stale non-Cells child reports; Cells
+    `cells-visible-click-e2e-release` is full-contract fresh/pass.
+
 ## Next Cuts
 
-1. Refresh the Cells product-latency and proof-lane reports after the
-   renderer-owned graph and app-window execution deletions.
+1. Refresh the remaining stale native handoff children, starting with the cheap
+   static/contract reports before the headed preview reports.
 2. Keep deleting obsolete verifier/report fields that only existed to support
-   removed product graph execution compatibility.
+   removed product graph execution or proof-key product fallback compatibility.
 3. Cut the next stale runtime/verifier compatibility lane only if fresh reports
    show it is still on the active path.
 

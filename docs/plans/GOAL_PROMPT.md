@@ -19,10 +19,10 @@ Current checkpoint:
 - Latest runtime cleanup cut removed the test-only `LiveRuntimeEngine::LoadedRuntime`
   branch, the `LoadedRuntimeHarness` wrapper, the `LoadedRuntime` shell, and the
   private `apply_checked_step*` helpers that duplicated product event execution.
-  `crates/boon_runtime/src/lib.rs` now has no `LoadedRuntime` or
-  `LoadedRuntimeHarness` code references. The remaining runtime implementation
-  island is `GenericScheduledRuntime`; do not recreate a `LoadedRuntime`
-  wrapper or quarantine bucket to keep old tests alive. Several
+  `crates/boon_runtime/src/lib.rs` now has no `LoadedRuntime`,
+  `LoadedRuntimeHarness`, or `GenericScheduledRuntime` code references. Do not
+  recreate a `LoadedRuntime` wrapper, `GenericScheduledRuntime` wrapper, or
+  quarantine bucket to keep old tests alive. Several
   `LoadedRuntimeHarness::from_source` tests were deleted rather than migrated
   because direct PlanExecutor runs exposed unsupported old-fixture semantics
   rather than current product evidence: unqualified root initial copies, row
@@ -61,14 +61,24 @@ Current checkpoint:
   target/reports/compiler-boundaries.json` now passes, and
   `cargo run -q -p xtask -- verify-report-schema
   target/reports/compiler-boundaries.json` passes.
+- Latest runtime deletion cut removed the remaining test-only
+  `GenericScheduledRuntime` wrapper and its old scheduled-runtime method body
+  from `crates/boon_runtime/src/lib.rs`, while keeping shared value conversion
+  helpers as normal free functions. The compiler-boundary gate now checks
+  `generic-scheduled-runtime-removed=true` instead of accepting a quarantined
+  island. Fresh evidence: `cargo check -q -p boon_runtime -p xtask`,
+  `cargo test -q -p boon_runtime --lib --no-run`, focused
+  `generic_runtime_owns_todo_list_structural_checks`, fresh
+  `verify-compiler-boundaries`, and schema validation of
+  `target/reports/compiler-boundaries.json` pass.
 - Latest architecture cleanup checkpoint moved root branch state and startup
   row-expression refresh behind the PlanExecutor boundary. Runtime no longer
   owns `RootBytesRuntimeEnvironment`, no longer passes loose root JSON/private
   BYTES/fixed-bank maps into `execute_root_scalar_update_branch(...)`, and no
-  longer owns the startup row-expression evaluator. This is not complete legacy
-  removal: `GenericScheduledRuntime`,
-  explicit diagnostic legacy comparison report surfaces, and native legacy
-  negative counters still need deletion or replacement in later slices.
+  longer owns the startup row-expression evaluator. This is not complete
+  readiness: explicit diagnostic legacy comparison report surfaces, native
+  legacy negative counters, stale native Cells reports, and native/product
+  performance work still need deletion, replacement, or fresh verification.
 - Scenario-events product reports are now PlanExecutor-only. The
   `ScenarioEventsCommandOutputInput` / `ScenarioEventsCommandReportInput`
   structs no longer accept `legacy_comparison`, `legacy_comparison_acceptance`,

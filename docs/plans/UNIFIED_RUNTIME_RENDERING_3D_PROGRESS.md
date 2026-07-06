@@ -36935,3 +36935,26 @@ Evidence:
   target/reports/compiler-boundaries.json`: pass.
 - `cargo run -q -p xtask -- verify-report-schema
   target/reports/compiler-boundaries.json`: pass.
+
+## 2026-07-06 - GenericScheduledRuntime Island Deleted
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Deleted the remaining test-only `GenericScheduledRuntime` wrapper and its old
+  scheduled-runtime implementation body from `boon_runtime`.
+- Kept shared helper functions as free helpers where PlanExecutor/runtime code
+  still uses them.
+- Updated compiler-boundary checks to require
+  `generic-scheduled-runtime-removed=true`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- Focused structural storage test
+  `generic_runtime_owns_todo_list_structural_checks`: pass.
+- Fresh `verify-compiler-boundaries`: pass, including
+  `generic-scheduled-runtime-removed=true`.
+- Fresh schema validation of `target/reports/compiler-boundaries.json`: pass.

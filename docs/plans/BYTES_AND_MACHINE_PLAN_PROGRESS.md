@@ -38172,3 +38172,40 @@ Next cut:
 - Return to the larger goal: native/product performance and remaining
   `GenericScheduledRuntime` test-island deletion, without reopening
   LoadedRuntime compatibility.
+
+## 2026-07-06 - GenericScheduledRuntime Island Deleted
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Deleted the remaining test-only `GenericScheduledRuntime` wrapper and its old
+  scheduled-runtime method body from `crates/boon_runtime/src/lib.rs`.
+- Kept shared conversion/numeric helper functions as normal free helpers
+  because current PlanExecutor/runtime code still uses them.
+- Removed the dead `Deref`/`DerefMut`, list-count cache-key/preimage, and
+  `close_other_list_editors` leftovers that only existed for the deleted
+  wrapper.
+- Updated `verify-compiler-boundaries` from
+  `generic-scheduled-runtime-island-explicit` to
+  `generic-scheduled-runtime-removed`.
+
+Evidence:
+
+- `cargo check -q -p boon_runtime -p xtask`: pass.
+- `cargo test -q -p boon_runtime --lib --no-run`: pass.
+- `cargo test -q -p boon_runtime --lib
+  generic_runtime_owns_todo_list_structural_checks`: pass.
+- `cargo run -q -p xtask -- verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh report check:
+  `compiler-boundaries:generic-scheduled-runtime-removed` reports
+  `pass=true`.
+
+Next cut:
+
+- Return to native/product performance and stale native Cells report refresh.
+- Continue deleting obsolete diagnostic legacy comparison/control-plane paths;
+  do not recreate `LoadedRuntime` or `GenericScheduledRuntime` compatibility.

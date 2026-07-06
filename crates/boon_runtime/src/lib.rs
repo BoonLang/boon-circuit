@@ -10811,14 +10811,9 @@ pub fn run_compiled_artifact_scenario(
 
 #[derive(Clone)]
 pub struct LiveRuntime {
-    engine: LiveRuntimeEngine,
+    plan_session: PlanExecutorLiveSession,
     next_step: usize,
     last_source_batch_sequence: Option<u64>,
-}
-
-#[derive(Clone)]
-enum LiveRuntimeEngine {
-    PlanExecutor(PlanExecutorLiveSession),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -11167,26 +11162,12 @@ fn source_row_lookup_fields_from_routes(routes: &SourceRoutePlan) -> BTreeMap<St
 }
 
 impl LiveRuntime {
-    fn plan_session(&self) -> Option<&PlanExecutorLiveSession> {
-        match &self.engine {
-            LiveRuntimeEngine::PlanExecutor(session) => Some(session),
-        }
+    fn plan_session(&self) -> &PlanExecutorLiveSession {
+        &self.plan_session
     }
 
-    fn plan_session_mut(&mut self) -> Option<&mut PlanExecutorLiveSession> {
-        match &mut self.engine {
-            LiveRuntimeEngine::PlanExecutor(session) => Some(session),
-        }
-    }
-
-    fn require_plan_session(&self) -> RuntimeResult<&PlanExecutorLiveSession> {
-        self.plan_session()
-            .ok_or_else(|| "LiveRuntime product build has no PlanExecutor session".into())
-    }
-
-    fn require_plan_session_mut(&mut self) -> RuntimeResult<&mut PlanExecutorLiveSession> {
-        self.plan_session_mut()
-            .ok_or_else(|| "LiveRuntime product build has no PlanExecutor session".into())
+    fn plan_session_mut(&mut self) -> &mut PlanExecutorLiveSession {
+        &mut self.plan_session
     }
 
     pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
@@ -11214,7 +11195,7 @@ impl LiveRuntime {
             TargetProfile::SoftwareDefault,
         )?;
         Ok(Self {
-            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
+            plan_session,
             next_step: 1,
             last_source_batch_sequence: None,
         })
@@ -11234,7 +11215,7 @@ impl LiveRuntime {
             TargetProfile::SoftwareDefault,
         )?;
         Ok(Self {
-            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
+            plan_session,
             next_step: 1,
             last_source_batch_sequence: None,
         })
@@ -11253,7 +11234,7 @@ impl LiveRuntime {
         )?;
         let session_ms = runtime_elapsed_ms(session_started);
         let live_runtime = Self {
-            engine: LiveRuntimeEngine::PlanExecutor(plan_session),
+            plan_session,
             next_step: 1,
             last_source_batch_sequence: None,
         };
@@ -11293,22 +11274,18 @@ impl LiveRuntime {
     }
 
     pub fn world_scene_output(&mut self) -> RuntimeResult<RuntimeWorldSceneOutput> {
-        match &mut self.engine {
-            LiveRuntimeEngine::PlanExecutor(session) => session.world_scene_output(),
-        }
+        self.plan_session_mut().world_scene_output()
     }
 
     pub fn solid_model_output(&mut self) -> RuntimeResult<RuntimeSolidModelOutput> {
-        match &mut self.engine {
-            LiveRuntimeEngine::PlanExecutor(session) => session.solid_model_output(),
-        }
+        self.plan_session_mut().solid_model_output()
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
         let event = self.accept_single_source_event_batch(event)?;
         let apply_started = Instant::now();
         let (output, state_summary) = {
-            let plan_session = self.require_plan_session_mut()?;
+            let plan_session = self.plan_session_mut();
             let step_report = plan_session.apply_source_event(event)?;
             let output = plan_executor_step_report_to_live_turn_output(
                 &step_report,
@@ -11335,7 +11312,7 @@ impl LiveRuntime {
         let event = self.accept_single_source_event_batch(event)?;
         let apply_started = Instant::now();
         let (output, state_summary) = {
-            let plan_session = self.require_plan_session_mut()?;
+            let plan_session = self.plan_session_mut();
             let step_report = plan_session.apply_source_event(event)?;
             let output = plan_executor_step_report_to_live_turn_output(
                 &step_report,
@@ -11367,7 +11344,7 @@ impl LiveRuntime {
         let event = self.accept_single_source_event_batch(event)?;
         let apply_started = Instant::now();
         let (output, state_summary) = {
-            let plan_session = self.require_plan_session_mut()?;
+            let plan_session = self.plan_session_mut();
             let step_report = plan_session.apply_source_event(event)?;
             let output = plan_executor_step_report_to_live_turn_output(
                 &step_report,
@@ -11399,7 +11376,7 @@ impl LiveRuntime {
     ) -> RuntimeResult<LiveTurnOutput> {
         let event = self.accept_single_source_event_batch(event)?;
         let apply_started = Instant::now();
-        let step_report = self.require_plan_session_mut()?.apply_source_event(event)?;
+        let step_report = self.plan_session_mut().apply_source_event(event)?;
         self.next_step = self.next_step.saturating_add(1);
         plan_executor_step_report_to_live_turn_output(
             &step_report,
@@ -11440,7 +11417,7 @@ impl LiveRuntime {
         for event in normalized_events {
             let apply_started = Instant::now();
             let output = {
-                let plan_session = self.require_plan_session_mut()?;
+                let plan_session = self.plan_session_mut();
                 let step_report = plan_session.apply_source_event(event)?;
                 plan_executor_step_report_to_live_turn_output(
                     &step_report,
@@ -11503,18 +11480,16 @@ impl LiveRuntime {
     }
 
     fn normalize_live_source_event(&self, mut event: LiveSourceEvent) -> LiveSourceEvent {
-        if let Some(plan_session) = self.plan_session() {
-            if let Some(source) = plan_session.canonical_source_path(&event.source)
-                && source != event.source
-            {
-                event.source = source;
-            }
-            if event.source_id.is_none() {
-                event.source_id = plan_session
-                    .source_id(&event.source)
-                    .map(|source_id| source_id.as_usize() as u64);
-            }
-            return event;
+        let plan_session = self.plan_session();
+        if let Some(source) = plan_session.canonical_source_path(&event.source)
+            && source != event.source
+        {
+            event.source = source;
+        }
+        if event.source_id.is_none() {
+            event.source_id = plan_session
+                .source_id(&event.source)
+                .map(|source_id| source_id.as_usize() as u64);
         }
         event
     }
@@ -11605,21 +11580,11 @@ impl LiveRuntime {
     }
 
     pub fn state_summary(&mut self) -> JsonValue {
-        self.require_plan_session_mut()
-            .map(PlanExecutorLiveSession::state_summary)
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        self.plan_session_mut().state_summary()
     }
 
     pub fn engine_provenance_report(&self) -> JsonValue {
-        self.require_plan_session()
-            .map(PlanExecutorLiveSession::provenance_report)
-            .unwrap_or_else(|_| {
-                json!({
-                    "engine": "missing_plan_executor_session",
-                    "session_kind": "invalid-product-runtime",
-                    "generic_fallback_enabled": false,
-                })
-            })
+        self.plan_session().provenance_report()
     }
 
     pub fn refresh_candidate_defer_probe_profile(&mut self, profile: &mut LiveRuntimeStepProfile) {
@@ -11635,35 +11600,29 @@ impl LiveRuntime {
         max_fields: usize,
         max_list_items: usize,
     ) -> JsonValue {
-        self.require_plan_session_mut()
-            .map(|plan_session| {
-                plan_session.runtime_value_summaries(paths, max_depth, max_fields, max_list_items)
-            })
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        self.plan_session_mut().runtime_value_summaries(
+            paths,
+            max_depth,
+            max_fields,
+            max_list_items,
+        )
     }
 
     pub fn document_state_values(&mut self, paths: &[String]) -> JsonValue {
-        self.require_plan_session_mut()
-            .map(|plan_session| plan_session.document_state_values(paths))
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        self.plan_session_mut().document_state_values(paths)
     }
 
     pub fn document_state_summary(&mut self) -> JsonValue {
-        self.require_plan_session_mut()
-            .map(|plan_session| {
-                plan_session.document_state_summary(SummaryLimits::document_preview())
-            })
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        self.plan_session_mut()
+            .document_state_summary(SummaryLimits::document_preview())
     }
 
     pub fn source_payload_has_text(&self, source: &str) -> bool {
-        self.require_plan_session()
-            .is_ok_and(|plan_session| plan_session.source_payload_has_text(source))
+        self.plan_session().source_payload_has_text(source)
     }
 
     pub fn has_source_path(&self, source: &str) -> bool {
-        self.require_plan_session()
-            .is_ok_and(|plan_session| plan_session.has_source_path(source))
+        self.plan_session().has_source_path(source)
     }
 
     pub fn document_state_summary_for_window(
@@ -11673,16 +11632,13 @@ impl LiveRuntime {
         column_start: usize,
         column_count: usize,
     ) -> JsonValue {
-        self.require_plan_session_mut()
-            .map(|plan_session| {
-                plan_session.document_state_summary(SummaryLimits::document_preview_window(
-                    row_start,
-                    row_count,
-                    column_start,
-                    column_count,
-                ))
-            })
-            .unwrap_or_else(|error| json!({"error": error.to_string()}))
+        self.plan_session_mut()
+            .document_state_summary(SummaryLimits::document_preview_window(
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            ))
     }
 }
 

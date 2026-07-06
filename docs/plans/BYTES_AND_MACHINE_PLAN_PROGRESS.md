@@ -38792,6 +38792,25 @@ Fresh focused evidence before commit:
 - `cargo test -q -p xtask advertised_xtask_commands_are_unique --
   --nocapture`: pass.
 - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.
+
+## 2026-07-06 - Legacy Removed-Command And Manual Proof Residue Deleted
+
+Status: implemented; focused verification pending.
+
+What changed:
+
+- Deleted the `xtask` compatibility shim that intercepted removed Ply/COSMIC
+  command names and returned a custom migration error. Those names now fail as
+  ordinary unknown commands instead of remaining as an active compatibility
+  surface.
+- Removed the stale `audit-manual-readiness` schema allowlist entry. The active
+  machine/goal audits and native GPU handoff manifest remain the readiness
+  contract.
+- Deleted the stale Cells-specific `verify-cells-visible-reality` schema branch
+  and validator. The native GPU schema now routes Cells evidence through the
+  generic native GPU contract rather than a removed report shape.
+- Deleted the old manual human-report command provenance unit test and helper
+  exports that existed only for removed `prepare-*-human-report` commands.
 - `cargo test -q -p xtask
   native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
   --nocapture`: pass.

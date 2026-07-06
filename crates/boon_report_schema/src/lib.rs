@@ -808,9 +808,6 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     if report_command_is(&report, "bench-todomvc") || report_command_is(&report, "bench-example") {
         verify_benchmark_report(&report, path)?;
     }
-    if report_command_is(&report, "verify-cells-visible-reality") {
-        verify_cells_visible_reality_report(&report, path)?;
-    }
     Ok(())
 }
 
@@ -3276,12 +3273,10 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
         Some(
             "audit-machine-readiness"
                 | "audit-goal-readiness"
-                | "audit-manual-readiness"
                 | "verify-report-schema"
                 | "run-report-refresh-queue"
                 | "boon-native-playground-role"
                 | "verify-runtime-finality"
-                | "verify-cells-wayland-scroll-speed"
                 | "verify-platform-contract"
                 | "verify-native-gpu-dependency-graph"
                 | "verify-native-gpu-architecture"
@@ -30211,122 +30206,6 @@ pub fn verify_playground_surface_report(
     Ok(())
 }
 
-fn verify_cells_visible_reality_report(
-    report: &JsonValue,
-    report_path: &Path,
-) -> RuntimeResult<()> {
-    let dimensions = report
-        .get("source_grid_dimensions")
-        .ok_or_else(|| format!("{} missing source_grid_dimensions", report_path.display()))?;
-    if dimensions.get("columns").and_then(JsonValue::as_u64) != Some(26)
-        || dimensions.get("rows").and_then(JsonValue::as_u64) != Some(100)
-    {
-        return Err(format!(
-            "{} Cells visible reality report is not bound to the 26x100 source grid",
-            report_path.display()
-        )
-        .into());
-    }
-    let viewport = report
-        .get("viewport_dimensions")
-        .ok_or_else(|| format!("{} missing viewport_dimensions", report_path.display()))?;
-    let viewport_columns = viewport
-        .get("columns")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_default();
-    let viewport_rows = viewport
-        .get("rows")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_default();
-    let viewport_cells = viewport
-        .get("cell_count")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_default();
-    if viewport_columns < 26 || viewport_rows < 100 || viewport_cells < 2600 {
-        return Err(format!(
-            "{} Cells visible viewport is too small: columns={viewport_columns}, rows={viewport_rows}, cells={viewport_cells}",
-            report_path.display()
-        )
-        .into());
-    }
-    let rendered = report
-        .get("rendered_cell_count")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or_default();
-    if rendered < viewport_cells {
-        return Err(format!(
-            "{} rendered only {rendered} addressed inputs for {viewport_cells} visible cells",
-            report_path.display()
-        )
-        .into());
-    }
-    let samples = report
-        .get("visible_address_samples")
-        .ok_or_else(|| format!("{} missing visible_address_samples", report_path.display()))?;
-    let has_required = samples
-        .get("required_present")
-        .and_then(JsonValue::as_array)
-        .is_some_and(|items| {
-            let values = items
-                .iter()
-                .filter_map(JsonValue::as_str)
-                .collect::<BTreeSet<_>>();
-            values.contains("Z0") && values.contains("A99") && values.contains("Z99")
-        });
-    if !has_required {
-        return Err(format!(
-            "{} visible address samples do not prove non-A-D spreadsheet cells",
-            report_path.display()
-        )
-        .into());
-    }
-    let screenshot = report
-        .get("screenshot_path")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| format!("{} missing screenshot_path", report_path.display()))?;
-    let expected_hash = report
-        .get("screenshot_sha256")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| format!("{} missing screenshot_sha256", report_path.display()))?;
-    let actual_hash = sha256_file(Path::new(screenshot))?;
-    if actual_hash != expected_hash {
-        return Err(format!(
-            "{} has stale screenshot_sha256 for `{screenshot}`",
-            report_path.display()
-        )
-        .into());
-    }
-    let nonblank = report
-        .get("nonblank_screenshot_hashes")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} missing nonblank_screenshot_hashes",
-                report_path.display()
-            )
-        })?;
-    let proved_nonblank = nonblank.iter().any(|entry| {
-        entry
-            .get("nonzero_channels")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or_default()
-            > 0
-            && entry
-                .get("unique_rgba_values")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or_default()
-                > 1
-    });
-    if !proved_nonblank {
-        return Err(format!(
-            "{} Cells visible reality screenshot is blank",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn verify_render_patch_protocol_identity(
     report: &JsonValue,
     report_path: &Path,
@@ -31936,72 +31815,12 @@ fn command_argv_has_arg(command_argv: &[JsonValue], expected: &str) -> bool {
         .any(|arg| arg.as_str() == Some(expected))
 }
 
-pub fn command_argv_values_after<'a>(
-    command_argv: &'a [JsonValue],
-    flag: &str,
-) -> BTreeSet<&'a str> {
-    command_argv
-        .windows(2)
-        .filter_map(|window| {
-            (window[0].as_str() == Some(flag))
-                .then(|| window[1].as_str())
-                .flatten()
-        })
-        .collect()
-}
-
 pub fn command_argv_value_after<'a>(command_argv: &'a [JsonValue], flag: &str) -> Option<&'a str> {
     command_argv.windows(2).find_map(|window| {
         (window[0].as_str() == Some(flag))
             .then(|| window[1].as_str())
             .flatten()
     })
-}
-
-pub fn require_command_argv_value(
-    report_path: &Path,
-    command_argv: &[JsonValue],
-    flag: &str,
-    expected: &str,
-) -> RuntimeResult<()> {
-    match command_argv_value_after(command_argv, flag) {
-        Some(actual) if actual == expected => Ok(()),
-        Some(actual) => Err(format!(
-            "{} command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
-            report_path.display()
-        )
-        .into()),
-        None => Err(format!(
-            "{} command_argv missing `{flag}` value",
-            report_path.display()
-        )
-        .into()),
-    }
-}
-
-pub fn require_command_argv_f64(
-    report_path: &Path,
-    command_argv: &[JsonValue],
-    flag: &str,
-    expected: f64,
-) -> RuntimeResult<()> {
-    let actual = command_argv_value_after(command_argv, flag)
-        .ok_or_else(|| {
-            format!(
-                "{} command_argv missing `{flag}` value",
-                report_path.display()
-            )
-        })?
-        .parse::<f64>()?;
-    if (actual - expected).abs() <= f64::EPSILON {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} command_argv `{flag}` value `{actual}` does not match report value `{expected}`",
-            report_path.display()
-        )
-        .into())
-    }
 }
 
 fn json_u64_field(report: &JsonValue, key: &str) -> RuntimeResult<u64> {

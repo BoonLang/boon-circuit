@@ -11985,8 +11985,7 @@ fn live_source_user_action() -> BTreeMap<String, toml::Value> {
 }
 
 pub use boon_report_schema::{
-    command_argv_value_after, command_argv_values_after, report_schema_hash,
-    require_command_argv_f64, require_command_argv_value, require_generic_runtime_slice_flags,
+    command_argv_value_after, report_schema_hash, require_generic_runtime_slice_flags,
     sha256_bytes, sha256_file, verify_bytes_file_write_negative_artifact,
     verify_playground_surface_report, verify_report_schema, verify_report_schema_negative_probe,
     verify_runtime_execution_metadata, verify_semantic_delta_protocol_batches, write_json,
@@ -44179,7 +44178,7 @@ FUNCTION decorate(value) {
         write_json(&path, &report).unwrap();
         verify_report_schema(&path).unwrap();
 
-        report["command"] = json!("verify-example-all");
+        report["command"] = json!("verify-example-negative");
         write_json(&path, &report).unwrap();
         assert!(
             verify_report_schema(&path)
@@ -53537,56 +53536,6 @@ document: Document/new(root: Element/label(element: [], label: store.value))
                 "exact_index_build_count": 2,
                 "exact_index_build_row_count": 4,
             })
-        );
-    }
-
-    #[test]
-    fn human_report_command_pass_labels_must_match_checklist() {
-        let command_argv = vec![
-            json!("cargo"),
-            json!("xtask"),
-            json!("prepare-todomvc-human-report"),
-            json!("--pass-label"),
-            json!("initial"),
-            json!("--pass-label"),
-            json!("add-test-todo-submit"),
-            json!("--artifact"),
-            json!("target/reports/manual-todomvc.png"),
-            json!("--display-server"),
-            json!("wayland"),
-            json!("--display-scale"),
-            json!("1.25"),
-        ];
-        let labels = command_argv_values_after(&command_argv, "--pass-label");
-        assert_eq!(
-            labels,
-            ["add-test-todo-submit", "initial"].into_iter().collect()
-        );
-        assert_ne!(
-            labels,
-            ["initial", "filter-active"].into_iter().collect(),
-            "manual command provenance must not pass with missing or extra checklist labels"
-        );
-        assert_eq!(
-            command_argv_value_after(&command_argv, "--display-server"),
-            Some("wayland")
-        );
-        require_command_argv_f64(
-            Path::new("target/reports/test-human.json"),
-            &command_argv,
-            "--display-scale",
-            1.25,
-        )
-        .unwrap();
-        assert!(
-            require_command_argv_value(
-                Path::new("target/reports/test-human.json"),
-                &command_argv,
-                "--display-server",
-                "x11",
-            )
-            .is_err(),
-            "manual report command provenance must match the recorded visible-session metadata"
         );
     }
 

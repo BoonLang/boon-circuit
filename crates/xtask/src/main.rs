@@ -49287,7 +49287,6 @@ fn verify_native_gpu_report_bundle(
     let mut all_steps_pass_count = 0usize;
     let mut git_fresh_count = 0usize;
     let mut worktree_fresh_count = 0usize;
-    let mut acknowledged_known_failure_count = 0usize;
     let mut report_size_failure_count = 0usize;
     let mut sidecar_size_failure_count = 0usize;
     let mut schema_file_failure_count = 0usize;
@@ -49957,23 +49956,13 @@ fn verify_native_gpu_report_bundle(
             .and_then(serde_json::Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
-        let acknowledged_known_failure =
-            native_gpu_report_bundle_known_failing_child(aggregate_scope, label)
-                && !pass
-                && schema_file_valid
-                && schema_valid
-                && child_failure_blocker_count > 0;
-        if acknowledged_known_failure {
-            acknowledged_known_failure_count += 1;
-        }
         let semantic_blockers = validate_native_gpu_child_report(requirement, &report);
         let semantically_valid = semantic_blockers.is_empty();
         let native_contract_freshness_failure =
             !semantically_valid && native_gpu_blockers_are_freshness_only(&semantic_blockers);
-        let native_contract_ok_for_aggregate = semantically_valid || acknowledged_known_failure;
+        let native_contract_ok_for_aggregate = semantically_valid;
         if semantically_valid {
             contract_valid_count += 1;
-        } else if acknowledged_known_failure {
         } else if native_contract_freshness_failure {
             native_contract_freshness_failure_count += 1;
         }
@@ -49983,7 +49972,7 @@ fn verify_native_gpu_report_bundle(
             format!("{command}:contract:{label}"),
             native_contract_ok_for_aggregate,
             format!(
-                "{} native contract valid={semantically_valid}, acknowledged_known_failure={acknowledged_known_failure}",
+                "{} native contract valid={semantically_valid}",
                 path.display()
             ),
             (!native_contract_ok_for_aggregate).then(|| {
@@ -50005,19 +49994,16 @@ fn verify_native_gpu_report_bundle(
             });
         if all_steps_pass {
             all_steps_pass_count += 1;
-        } else if !acknowledged_known_failure {
+        } else {
             all_steps_failure_count += 1;
         }
-        let all_steps_ok_for_aggregate = all_steps_pass || acknowledged_known_failure;
+        let all_steps_ok_for_aggregate = all_steps_pass;
         push_audit_check(
             &mut checks,
             &mut blockers,
             format!("{command}:all-steps-pass:{label}"),
             all_steps_ok_for_aggregate,
-            format!(
-                "{} all_steps_pass={all_steps_pass}, acknowledged_known_failure={acknowledged_known_failure}",
-                path.display()
-            ),
+            format!("{} all_steps_pass={all_steps_pass}", path.display()),
             (!all_steps_ok_for_aggregate).then(|| {
                 format!(
                     "native GPU report `{}` has missing or failing per_step_pass_fail entries",
@@ -50025,7 +50011,7 @@ fn verify_native_gpu_report_bundle(
                 )
             }),
         );
-        let status_ok_for_aggregate = pass || acknowledged_known_failure;
+        let status_ok_for_aggregate = pass;
         if !status_ok_for_aggregate {
             status_failure_count += 1;
         }
@@ -50034,10 +50020,7 @@ fn verify_native_gpu_report_bundle(
             &mut blockers,
             format!("{command}:status-pass:{label}"),
             status_ok_for_aggregate,
-            format!(
-                "{} status pass={pass}, acknowledged_known_failure={acknowledged_known_failure}",
-                path.display()
-            ),
+            format!("{} status pass={pass}", path.display()),
             (!status_ok_for_aggregate)
                 .then(|| format!("native GPU report `{}` did not pass", path.display())),
         );
@@ -50067,9 +50050,7 @@ fn verify_native_gpu_report_bundle(
                 "argv": refresh_argv,
             }));
         }
-        let product_contract_failure = !semantically_valid
-            && !acknowledged_known_failure
-            && !native_contract_freshness_failure;
+        let product_contract_failure = !semantically_valid && !native_contract_freshness_failure;
         if product_contract_failure && freshness_debt {
             refresh_first_product_contract_child_count += 1;
             refresh_first_product_contract_children.push(json!({
@@ -50258,10 +50239,6 @@ fn verify_native_gpu_report_bundle(
                 json!(status_ok_for_aggregate),
             );
             object.insert(
-                "acknowledged_known_failure".to_owned(),
-                json!(acknowledged_known_failure),
-            );
-            object.insert(
                 "child_failure_blocker_count".to_owned(),
                 json!(child_failure_blocker_count),
             );
@@ -50340,7 +50317,6 @@ fn verify_native_gpu_report_bundle(
             "missing_report_count": missing_report_count,
             "passed_report_count": passed_report_count,
             "failed_report_count": checked_report_count.saturating_sub(passed_report_count),
-            "acknowledged_known_failure_count": acknowledged_known_failure_count,
             "schema_file_valid_report_count": schema_file_valid_count,
             "schema_valid_report_count": schema_valid_count,
             "native_contract_valid_report_count": contract_valid_count,
@@ -50427,13 +50403,6 @@ fn verify_native_gpu_report_bundle(
             "linked_report_artifacts": artifacts,
             "artifact_sha256s": artifacts
         }),
-    )
-}
-
-fn native_gpu_report_bundle_known_failing_child(aggregate_scope: &str, label: &str) -> bool {
-    matches!(
-        (aggregate_scope, label),
-        ("demand-driven-render-loop", "idle-wake-custom-projects")
     )
 }
 

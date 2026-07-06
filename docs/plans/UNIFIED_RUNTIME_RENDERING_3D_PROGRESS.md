@@ -702,6 +702,25 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_product_metrics -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Deleted Native Aggregate Known-Failure Bypass
+
+- Removed the native aggregate's `acknowledged_known_failure` bypass and the
+  stale `idle-wake-custom-projects` known-failing child hook.
+- Fresh native children now either pass, count as refresh debt when stale or
+  missing, or become true blockers when fresh and failing.
+- Removed the aggregate report's acknowledged-known-failure fields instead of
+  keeping another compatibility lane.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask native_gpu_aggregate_treats_child_reported_stale_dependency_as_refresh_debt -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask native_gpu_handoff_requires_present_floor_report -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask native_gpu_handoff_requires_cells_visible_click_release_report -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

@@ -156,7 +156,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
-use std::ops::{Bound, Deref, DerefMut};
+use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4226,23 +4226,23 @@ impl PlanExecutorRuntimeState {
             let mut runtime_branch = |op: &boon_plan::PlanOp,
                                       staged_state: &PlanExecutorRootState|
              -> RuntimeResult<Option<RootExecutedUpdate>> {
-                execute_root_scalar_update_branch(
-                    plan,
-                    op,
-                    source_id,
-                    source_route_slot,
-                    &event,
-                    Some(&mut self.list_store),
-                    staged_state,
-                    host_file_root,
-                )
-                .map_err(|error| -> Box<dyn std::error::Error> {
-                    format!(
-                        "PlanExecutor root update op {} for source {}: {error}",
-                        op.id.0, source_id.0
+                self.list_store
+                    .execute_root_scalar_update_branch(
+                        plan,
+                        op,
+                        source_id,
+                        source_route_slot,
+                        &event,
+                        staged_state,
+                        host_file_root,
                     )
-                    .into()
-                })
+                    .map_err(|error| -> Box<dyn std::error::Error> {
+                        format!(
+                            "PlanExecutor root update op {} for source {}: {error}",
+                            op.id.0, source_id.0
+                        )
+                        .into()
+                    })
             };
             let collection = collect_plan_root_update_candidate_for_step(
                 plan,
@@ -4448,12 +4448,8 @@ impl PlanExecutorRuntimeState {
     }
 
     fn document_state_summary(&mut self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
-        plan_executor_document_summary_with_limits(
-            plan,
-            &self.root_state.root_state,
-            &mut self.list_store,
-            limits,
-        )
+        self.list_store
+            .document_summary_with_limits(plan, &self.root_state.root_state, limits)
     }
 }
 
@@ -5707,7 +5703,7 @@ impl PlanExecutorListStore {
             plan,
             &list_slot,
             &list_label,
-            self,
+            &mut self.rows_by_list,
             row_index,
             IndexedDerivedRefreshOptions {
                 suppress_recursive_cycle_values: false,
@@ -5727,7 +5723,7 @@ impl PlanExecutorListStore {
         root_state: &serde_json::Map<String, JsonValue>,
     ) -> RuntimeResult<()> {
         self.invalidate_indexes();
-        refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, self)
+        refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, &mut self.rows_by_list)
     }
 
     fn append_rows_for_derived_values<E>(
@@ -5749,7 +5745,7 @@ impl PlanExecutorListStore {
         self.invalidate_indexes();
         append_plan_list_rows_for_derived_values_with(
             plan,
-            self,
+            &mut self.rows_by_list,
             list_next_keys,
             list_append_row_bool_delta_lists,
             derived_values,
@@ -5765,7 +5761,32 @@ impl PlanExecutorListStore {
         event: &PlanExecutorLiveSourceEvent<'_>,
     ) -> RuntimeResult<ListRemoveExecution> {
         self.invalidate_indexes();
-        remove_plan_list_rows_for_source_event(plan, source_id, source_route_slot, event, self)
+        remove_plan_list_rows_for_source_event(
+            plan,
+            source_id,
+            source_route_slot,
+            event,
+            &mut self.rows_by_list,
+        )
+    }
+
+    fn set_row_field(
+        &mut self,
+        list_id: usize,
+        row_index: usize,
+        field: impl Into<String>,
+        value: JsonValue,
+    ) -> RuntimeResult<()> {
+        self.invalidate_indexes();
+        let row = self
+            .rows_by_list
+            .get_mut(&list_id)
+            .and_then(|rows| rows.get_mut(row_index))
+            .ok_or_else(|| {
+                format!("PlanExecutor list store has no row {row_index} in list {list_id}")
+            })?;
+        row.fields.insert(field.into(), value);
+        Ok(())
     }
 
     fn execute_indexed_update_branch(
@@ -5786,7 +5807,7 @@ impl PlanExecutorListStore {
             source_id,
             source_route_slot,
             generic_event,
-            self,
+            &mut self.rows_by_list,
             row_resolution_cache,
             root_derived_values_before_updates,
             host_file_root,
@@ -5799,7 +5820,42 @@ impl PlanExecutorListStore {
         changed_root_state_ids: &BTreeSet<StateId>,
     ) -> RuntimeResult<Vec<JsonValue>> {
         self.invalidate_indexes();
-        refresh_indexed_derived_fields_after_root_state_changes(plan, self, changed_root_state_ids)
+        refresh_indexed_derived_fields_after_root_state_changes(
+            plan,
+            &mut self.rows_by_list,
+            changed_root_state_ids,
+        )
+    }
+
+    fn execute_root_scalar_update_branch(
+        &mut self,
+        plan: &MachinePlan,
+        op: &boon_plan::PlanOp,
+        source_id: SourceId,
+        source_route_slot: &boon_plan::SourceRoute,
+        event: &LiveSourceEvent,
+        root_state: &PlanExecutorRootState,
+        host_file_root: Option<&Path>,
+    ) -> RuntimeResult<Option<RootExecutedUpdate>> {
+        execute_root_scalar_update_branch(
+            plan,
+            op,
+            source_id,
+            source_route_slot,
+            event,
+            Some(self),
+            root_state,
+            host_file_root,
+        )
+    }
+
+    fn document_summary_with_limits(
+        &mut self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+        limits: SummaryLimits,
+    ) -> JsonValue {
+        plan_executor_document_summary_with_limits(plan, root_state, self, limits)
     }
 
     fn materialize_projections(
@@ -5898,13 +5954,6 @@ impl Deref for PlanExecutorListStore {
 
     fn deref(&self) -> &Self::Target {
         &self.rows_by_list
-    }
-}
-
-impl DerefMut for PlanExecutorListStore {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.invalidate_indexes();
-        &mut self.rows_by_list
     }
 }
 
@@ -54352,13 +54401,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
             store.exact_field_lookup(7, "address", &json!("B0")),
             Some(1)
         );
-        store
-            .get_mut(&7)
-            .unwrap()
-            .get_mut(1)
-            .unwrap()
-            .fields
-            .insert("address".to_owned(), json!("C0"));
+        store.set_row_field(7, 1, "address", json!("C0")).unwrap();
 
         assert_eq!(store.exact_field_lookup(7, "address", &json!("B0")), None);
         assert_eq!(

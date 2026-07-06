@@ -607,6 +607,53 @@ Remaining work:
   access and document-summary entrypoints are also expressed as store methods.
 - Refresh native handoff reports after the runtime/store code stops changing.
 
+## 2026-07-06 - PlanExecutor Store Mutable Escape Hatch Removal
+
+Status: implemented and verified.
+
+What changed:
+
+- Removed `DerefMut` from `PlanExecutorListStore`; callers can no longer obtain
+  a broad mutable `BTreeMap` view of PlanExecutor list rows through the store.
+- Store-internal mutation now passes `rows_by_list` explicitly to lower-level
+  executor helpers after invalidating lookup indexes.
+- Added `PlanExecutorListStore::set_row_field` as a named mutation helper for
+  focused tests and future narrow mutation sites.
+- Root scalar update list lookup and document summary materialization now enter
+  through named store methods instead of passing `&mut self.list_store` as a raw
+  mutable argument.
+- A source audit for `DerefMut`, `&mut self.list_store`,
+  `&mut list_store`, and direct `list_store.get_mut` usage in
+  `crates/boon_runtime/src/lib.rs` returns no matches.
+
+Fresh evidence:
+
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo test -q -p boon_runtime
+  list_find_and_chunk_project_generic_record_lists_without_grid_identity -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_root_find_value_resolves_runtime_list_ref -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime`: pass.
+- `target/debug/xtask verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+
+Remaining work:
+
+- Refresh native handoff/Cells reports after this runtime-store cleanup.
+- If native reports expose new runtime/store blockers, fix them in the generic
+  PlanExecutor/list/currentness path rather than adding example-specific
+  shortcuts.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

@@ -38836,3 +38836,31 @@ Fresh focused evidence:
 - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.
 - `cargo test -q -p boon_report_schema
   native_gpu_schema_rejects_browser_proof_substitution -- --nocapture`: pass.
+
+## 2026-07-06 - Old Native Example Readiness Commands Deleted
+
+Status: implemented and focused-verified; native aggregate refresh still
+separate.
+
+What changed:
+
+- Removed the old broad all-example and per-example visible-launch native
+  readiness command surfaces from `xtask`.
+- Removed their stale helper code for preview report identity comparison,
+  decoded PNG pixel inventory, and Boon-source manifest filtering.
+- Removed those commands from native regression report lists, default report
+  paths, UX/native command classifiers, and report-schema allowlists.
+- Updated the active native GPU contract and strict visible-testing plan so the
+  manifest-backed native GPU handoff gates remain the source of readiness truth.
+
+Fresh focused evidence:
+
+- `rg -n
+  "verify-native-visible-launch|verify-native-examples|native_example_preview_identity_reasons|native_readback_pixel_inventory|manifest_boon_source_files"
+  crates docs/architecture/NATIVE_GPU_PIPELINE.md
+  docs/plans/STRICT_EXAMPLE_VISIBLE_TESTING_RULES.md --glob '!target'`: no
+  matches.
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p xtask advertised_xtask_commands_are_unique --
+  --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.

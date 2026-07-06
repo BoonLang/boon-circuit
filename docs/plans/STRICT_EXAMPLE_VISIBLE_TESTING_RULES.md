@@ -157,34 +157,13 @@ Each entry must define:
 Future examples fail readiness until they add a manifest entry and pass all
 generic native gates for that entry.
 
-## Required Generic Commands
+## Retired Generic Commands
 
-The repo should provide a single all-example command:
-
-```sh
-cargo xtask verify-native-examples --all
-```
-
-It must run the manifest-defined gates for every example. It must fail if:
-
-- an example has no manifest entry
-- an example manifest references a missing scenario
-- a scenario is not exercised
-- visible launch evidence is missing
-- raw visible input evidence is required but absent
-- a report relies on a lower evidence tier than the manifest requires
-
-Per-example command shape:
-
-```sh
-cargo xtask verify-native-visible-launch \
-  --example <example> \
-  --report target/reports/native-gpu/<example>-visible-launch.json
-```
-
-The command must launch the exact visible app, capture app-owned frames from the
-exact preview/dev child PIDs, run the required scenarios, and write a report
-whose tier is explicit.
+The old broad example-readiness command surfaces have been deleted. Native
+readiness now flows through the manifest-backed native GPU gates in
+`docs/architecture/native_gpu_handoff_manifest.json` and the aggregate
+`verify-native-gpu-all --check-existing`. Do not restore a parallel
+example-readiness path.
 
 ## TodoMVC Required Scenarios
 

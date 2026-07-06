@@ -3317,8 +3317,6 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-bytes-release-benchmark-reproduction"
                 | "verify-bytes-machine-plan-all"
                 | "verify-compiler-boundaries"
-                | "verify-native-visible-launch"
-                | "verify-native-examples"
                 | "verify-native-dev-window-editor"
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
@@ -27825,8 +27823,6 @@ fn report_is_native_gpu_command(report: &JsonValue) -> bool {
                 | "verify-native-dev-editor-scroll-speed"
                 | "verify-native-example-switch-speed"
                 | "verify-native-real-window-input-environment"
-                | "verify-native-visible-launch"
-                | "verify-native-examples"
                 | "verify-native-dev-window-editor"
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
@@ -27850,7 +27846,6 @@ fn report_is_native_ux_command(report: &JsonValue) -> bool {
             command,
             "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-idle-wake"
-                | "verify-native-visible-launch"
                 | "verify-native-cells-visible-click-e2e"
                 | "verify-demand-driven-render-loop"
         )

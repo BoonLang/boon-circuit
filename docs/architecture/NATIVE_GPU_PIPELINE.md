@@ -1133,9 +1133,6 @@ cargo xtask verify-native-gpu-idle-wake --example todomvc --report target/report
 cargo xtask verify-native-gpu-idle-wake --example cells --report target/reports/native-gpu/idle-wake-cells.json
 cargo xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --report target/reports/native-gpu/idle-wake-custom-projects.json
 cargo xtask verify-native-real-window-input-environment --report target/reports/native-gpu/real-window-input-environment.json
-cargo xtask verify-native-visible-launch --example todomvc --report target/reports/native-gpu/todomvc-visible-launch.json
-cargo xtask verify-native-visible-launch --example cells --report target/reports/native-gpu/cells-visible-launch.json
-cargo xtask verify-native-examples --all --report target/reports/native-gpu/native-examples.json
 cargo xtask verify-native-dev-window-editor --example todomvc --report target/reports/native-gpu/dev-editor-todomvc.json
 cargo xtask verify-native-dev-window-editor --example cells --report target/reports/native-gpu/dev-editor-cells.json
 cargo xtask verify-native-example-tabs --report target/reports/native-gpu/example-tabs.json

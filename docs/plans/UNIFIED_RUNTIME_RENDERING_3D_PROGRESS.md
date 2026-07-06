@@ -29,7 +29,7 @@ for old evidence.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| PlanExecutor authority | In progress | Legacy runtime ambiguity is reduced but not fully gone. Continue removing fallback paths instead of adding comparison-only harness code. |
+| PlanExecutor authority | In progress | Current source inspection shows no `LoadedRuntime`, `LoadedRuntimeHarness`, or `GenericScheduledRuntime` implementation references in `crates/boon_runtime`; keep guarding this and replace stale docs/tests with PlanExecutor product coverage. |
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Present/proof split exists, but renderer ownership and retained resource scheduling still need larger cuts. |
@@ -126,13 +126,35 @@ Fresh focused evidence:
 - `cargo test -q -p xtask preview_e2e_delegates_full_manifest_inputs_when_native_smoke_passes -- --nocapture`:
   pass; 1 passed.
 
+### 2026-07-06 - Active Goal Prompt Compacted
+
+- Replaced the stale verbose slash prompt with a compact current prompt that
+  names the authoritative native GPU contract, PlanExecutor default runtime,
+  surface-scoped proof contract, manifest coverage split, and ProductFrameGraph
+  next direction.
+- Removed old prompt text that still described removed `LoadedRuntime` /
+  `GenericScheduledRuntime` islands, `run --engine`, compare-legacy refresh
+  shapes, and stale report states as current work.
+- Current source scan over product/runtime crates found no actual
+  `LoadedRuntime`, `LoadedRuntimeHarness`, or `GenericScheduledRuntime`
+  implementation references in `crates/boon_runtime`.
+- Independent runtime audit confirmed no product/runtime legacy execution path
+  remains in the requested crates. Remaining fallback-like work is native
+  layout/input recovery naming and full-layout recompute recovery in
+  `boon_native_playground`, not legacy runtime fallback.
+
 ## Next Cuts
 
-1. Remove remaining legacy `LoadedRuntime`/`GenericScheduledRuntime` fallback
-   routes where `PlanExecutor` is the intended authority.
-2. Delete duplicate report/schema refresh paths that only preserve stale
+1. Run compact native/BYTES aggregate summaries and use fresh taxonomy to choose
+   refresh queue work versus true product blockers.
+2. Audit native layout/input recovery paths that still report generic fallback
+   labels; either prove them as explicit retained-layout recovery or rename/cut
+   them so they cannot be confused with runtime fallback.
+3. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints or old comparison contracts.
-3. Re-run focused native Cells product-latency and proof-lane reports after the
+4. Move the current linear retained `ProductFrameGraph` toward a real
+   renderer-owned dirty-resource scheduler.
+5. Re-run focused native Cells product-latency and proof-lane reports after the
    harness is lean enough that reports are trustworthy.
 
 ## Completion Rules

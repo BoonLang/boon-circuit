@@ -157,6 +157,28 @@ generic `ProductRenderGraph` / `PresentPlan` path, and keep it only if it
 improves performance or removes/quarantines legacy hot-path coupling without
 budget regression.
 
+2026-07-06 checkpoint: the manifest-backed native handoff aggregate is fresh
+and passing after the `PlanExecutorListStore` cleanup and a verifier contract
+fix (`target/reports/native-gpu-all.json`, `status=pass`,
+`refresh_debt_child_count=0`, `true_blocker_child_count=0`). The verifier cut
+removed a false geometry contract from visible-readback proof: window usability
+is now checked against the app-reported surface `physical_size`, while WGPU
+readback remains the app-owned nonblank/frame-identity proof. This avoids
+treating COSMIC/tiled readback rectangles as the UI layout size, without adding
+example-specific renderer/runtime behavior.
+
+Current Cells evidence is also fresh:
+`target/reports/native-gpu/cells-visible-click-e2e-release.json` passes with
+product-path input-to-present p95 `9.435423ms`, `64` product samples, and zero
+product missed frames. The older broad `click_to_formula_visible_ms_p95`
+remains reported separately because it includes external driver/app-wake/proof
+timing; it is not the product UX budget. The authoritative fast path for this
+checkpoint is `MachinePlan`/`PlanExecutor`, `PlanExecutorListStore`, retained
+native GPU rendering, and separated proof/readback reporting. Remaining work is
+the larger architecture cleanup: continue deleting legacy runtime/harness
+ambiguity, make `ProductRenderGraph` / `PresentPlan` the normal product
+boundary, and avoid reintroducing fallback proof or example-specific hot paths.
+
 ### 4.1 Snapshot collapse after semantic deltas
 
 The current effective path is approximately:

@@ -17539,6 +17539,7 @@ impl ExampleCatalogEntry {
             human_testing_needed: false,
             initial_visible_assertions: Vec::new(),
             input_scenarios: Vec::new(),
+            native_preview_scenarios: Vec::new(),
             scroll_focus_scenarios: Vec::new(),
             visual_artifacts: Vec::new(),
             performance_thresholds: Vec::new(),

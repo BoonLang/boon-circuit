@@ -51,6 +51,10 @@ input_scenarios = [
   "commit-j0-visible-grid-edge",
   "change-a0-fanout-recomputes-dependents-only",
 ]
+native_preview_scenarios = [
+  "edit-a0-cancel-draft",
+  "change-a0-fanout-recomputes-dependents-only",
+]
 scroll_focus_scenarios = [
   "vertical-wheel-scroll",
   "horizontal-wheel-scroll",
@@ -127,6 +131,10 @@ input_scenarios = [
   "toggle-all-single-after-clear",
   "clear-all-rows",
 ]
+native_preview_scenarios = [
+  "add-test-todo-type",
+  "clear-all-rows",
+]
 scroll_focus_scenarios = []
 visual_artifacts = [
   "preview-app-owned-framebuffer-before-after",
@@ -201,6 +209,9 @@ input_scenarios = [
   "switch-theme-neobrutalism",
   "switch-theme-neumorphism",
   "toggle-light-dark-mode",
+]
+native_preview_scenarios = [
+  "add-todo",
 ]
 scroll_focus_scenarios = []
 visual_artifacts = [

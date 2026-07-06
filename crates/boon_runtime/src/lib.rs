@@ -12074,6 +12074,8 @@ pub struct ExampleManifestEntry {
     #[serde(default)]
     pub input_scenarios: Vec<String>,
     #[serde(default)]
+    pub native_preview_scenarios: Vec<String>,
+    #[serde(default)]
     pub scroll_focus_scenarios: Vec<String>,
     #[serde(default)]
     pub scenario_ref_provenance: Vec<ScenarioRefProvenance>,

@@ -30697,17 +30697,6 @@ fn verify_native_example_switch_speed(args: &[String]) -> Result<(), Box<dyn std
     )
 }
 
-fn native_preview_e2e_prefers_cosmic_workspace_launch(
-    explicit_cosmic_request: bool,
-    require_hardware_adapter: bool,
-    wayland_session: bool,
-    required_evidence_tier: &str,
-) -> bool {
-    explicit_cosmic_request
-        || require_hardware_adapter
-        || (wayland_session && required_evidence_tier == boon_driver::TIER_REAL_WINDOW)
-}
-
 fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let example = value_arg(args, "--example").unwrap_or_else(|| "cells".to_owned());
     let entry = boon_runtime::example_manifest_entry(&example)?;
@@ -30802,23 +30791,17 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
 
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
-    let isolated_real_window_available = command_available("weston")
-        && command_available("wayland-info")
-        && weston_test_plugin_path().is_some()
-        && weston_test_driver_path().is_some();
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:real-window-launch-environment"),
-        wayland || isolated_real_window_available,
+        wayland,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!(wayland || isolated_real_window_available)).then(|| {
-            "native preview E2E requires either a Wayland session or the isolated Weston real-window harness".to_owned()
-        }),
+        (!wayland).then(|| "native preview E2E requires a Wayland session".to_owned()),
     );
 
     push_audit_check(
@@ -30901,73 +30884,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let native_input_driver_attempt =
         native_gpu_operator_input_driver_attempt("preview-e2e", &example, driver_target.clone());
 
-    let prefer_cosmic_workspace_launch = native_preview_e2e_prefers_cosmic_workspace_launch(
-        std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_COSMIC")
-            .ok()
-            .as_deref()
-            == Some("1"),
-        require_hardware_adapter,
-        wayland,
-        &entry.required_evidence_tier,
-    );
-    let prefer_isolated_real_window = isolated_real_window_available
-        && !prefer_cosmic_workspace_launch
-        && !require_hardware_adapter
-        && example != "todo_mvc_physical";
-    let mut isolated_real_window_launch_proof = json!({
-        "status": "not-run",
-        "reason": if prefer_isolated_real_window {
-            "isolated Weston launch unavailable or not applicable"
-        } else {
-            "workspace-qualified COSMIC launch was selected for this evidence tier, explicitly requested, or isolated Weston is unavailable"
-        }
-    });
-    if build.success()
-        && prefer_isolated_real_window
-        && isolated_real_window_available
-        && example != "todo_mvc_physical"
-    {
-        let isolated_role_report_timeout_ms = 180_000_u64.saturating_add(input_sample_delay_ms);
-        let isolated_driver_text = isolated_preview_driver_text(&entry.id);
-        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
-            &launched_binary_path,
-            &entry.id,
-            &title_token,
-            input_sample_delay_ms.max(1_500),
-            isolated_role_report_timeout_ms,
-            &supervisor_report,
-            &live_state_report,
-            driver_target.clone(),
-            isolated_driver_text.as_deref(),
-            None,
-            false,
-            true,
-            false,
-        )?;
-        let isolated_launch_success =
-            isolated_preview_real_window_input_delivery_proven(&isolated_real_window_launch_proof);
-        push_audit_check(
-            &mut checks,
-            &mut blockers,
-            format!("native-gpu-preview-e2e-{example}:isolated-real-window-launch"),
-            isolated_launch_success,
-            format!(
-                "status={:?}, driver_effect_observed={:?}, supervisor_report_written={:?}",
-                isolated_real_window_launch_proof
-                    .get("status")
-                    .and_then(serde_json::Value::as_str),
-                isolated_real_window_launch_proof
-                    .get("driver_effect_observed")
-                    .and_then(serde_json::Value::as_bool),
-                isolated_real_window_launch_proof
-                    .get("supervisor_report_written")
-                    .and_then(serde_json::Value::as_bool)
-            ),
-            (!isolated_launch_success).then(|| {
-                "isolated Weston native launch did not prove real-window input delivery for this native run".to_owned()
-            }),
-        );
-    } else if build.success() && wayland {
+    if build.success() && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -31160,17 +31077,11 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "operator_report": true,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
-        "launcher_command": if prefer_isolated_real_window {
-            "isolated-weston-real-window"
-        } else {
-            "cosmic-background-launch --workspace boon-circuit"
-        },
+        "launcher_command": "cosmic-background-launch --workspace boon-circuit",
         "cosmic_background_launch_proof": cosmic_launch_proof,
-        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_desktop_input_allowed": false,
         "native_input_driver_attempt": native_input_driver_attempt
     });
-    extra["isolated_real_window_launch_proof"] = isolated_real_window_launch_proof.clone();
 
     if supervisor_report.exists() {
         let supervisor = read_json(&supervisor_report)?;
@@ -31248,11 +31159,6 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             .pointer("/preview_surface_proof/input_adapter")
             .cloned()
         {
-            let input_adapter = isolated_real_window_launch_proof
-                .get("preview_input_adapter")
-                .cloned()
-                .filter(native_input_adapter_has_delivered_events)
-                .unwrap_or(input_adapter);
             let adapter_installed = input_adapter
                 .get("installed")
                 .and_then(serde_json::Value::as_bool)
@@ -31288,14 +31194,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 extra["real_window_input"] = json!(true);
                 extra["evidence_tier"] = json!("real-window");
                 extra["real_os_input"] = json!(true);
-                extra["input_injection_method"] = isolated_real_window_launch_proof
-                    .get("method")
+                extra["input_injection_method"] = extra
+                    .pointer("/native_input_adapter/input_injection_method")
                     .cloned()
-                    .or_else(|| {
-                        extra
-                            .pointer("/native_input_adapter/input_injection_method")
-                            .cloned()
-                    })
                     .unwrap_or_else(|| json!("app_window_per_window_input_harness"));
                 extra["focused_window_proof"] = json!({
                     "status": "pass",
@@ -31406,10 +31307,6 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             extra["display_connection"] = display_connection.clone();
         }
     }
-    native_preview_promote_isolated_measured_loop_evidence(
-        &mut extra,
-        &isolated_real_window_launch_proof,
-    );
     if live_state_report.exists() {
         extra["live_state_report_sha256"] =
             json!(file_hash(live_state_report.to_string_lossy().as_ref()));
@@ -37389,212 +37286,6 @@ fn native_preview_route_array(
             })
         })
         .unwrap_or_default()
-}
-
-fn isolated_preview_real_window_input_delivery_proven(report: &serde_json::Value) -> bool {
-    report
-        .get("driver_pass")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        && report
-            .get("real_os_events_observed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && report
-            .get("driver_effect_observed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && report
-            .get("measured_loop_pass")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && report
-            .get("preview_input_adapter")
-            .is_some_and(native_input_adapter_has_delivered_events)
-}
-
-fn native_preview_promote_isolated_measured_loop_evidence(
-    extra: &mut serde_json::Value,
-    isolated_real_window_launch_proof: &serde_json::Value,
-) {
-    if !isolated_preview_real_window_input_delivery_proven(isolated_real_window_launch_proof) {
-        return;
-    }
-    let Some(measured_loop) = isolated_real_window_launch_proof.get("measured_loop_report") else {
-        return;
-    };
-    if measured_loop
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        != Some("pass")
-    {
-        return;
-    }
-
-    extra["measured_preview_loop_evidence_promoted"] = json!(true);
-    extra["measured_preview_loop_evidence_source"] =
-        json!("isolated_real_window_launch_proof.measured_loop_report");
-    extra["evidence_tier"] = json!(boon_driver::TIER_REAL_WINDOW);
-    extra["real_window_input"] = json!(true);
-    extra["real_os_input"] = json!(true);
-    extra["app_owned_window_input"] = json!(true);
-    extra["input_injection_method"] = isolated_real_window_launch_proof
-        .get("method")
-        .cloned()
-        .unwrap_or_else(|| json!("isolated-weston-real-window-app-window-input"));
-
-    if let Some(input_adapter) = isolated_real_window_launch_proof
-        .get("preview_input_adapter")
-        .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
-        .or_else(|| {
-            measured_loop
-                .get("observed_input_adapter")
-                .filter(|adapter| native_input_adapter_has_delivered_events(adapter))
-        })
-        .cloned()
-    {
-        let adapter_installed = input_adapter
-            .get("installed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let wheel_api_present = input_adapter
-            .get("wheel_api")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|api| !api.is_empty());
-        let provenance_api_present = input_adapter
-            .get("per_window_event_provenance_api")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|api| !api.is_empty());
-        extra["native_input_adapter"] = input_adapter;
-        extra["native_input_adapter_installed"] = json!(adapter_installed);
-        extra["native_wheel_adapter_installed"] = json!(adapter_installed && wheel_api_present);
-        extra["native_per_window_input_provenance_installed"] =
-            json!(adapter_installed && provenance_api_present);
-        extra["native_input_observation_only"] = json!(false);
-    }
-
-    for key in [
-        "surface_id",
-        "surface_epoch",
-        "frame_evidence_key",
-        "rendered_frame_count",
-        "presented_revision",
-        "last_render_content_revision",
-        "last_render_layout_revision",
-        "last_render_scene_revision",
-        "render_loop_state",
-        "preview_perf_stats",
-        "frame_input_to_present_ms",
-        "accepted_host_input_event_wake_count",
-        "input_to_present_accounted_event_wake_count",
-        "last_product_frame_commit",
-        "recent_product_frame_commit_count",
-        "recent_product_frame_commits",
-    ] {
-        if let Some(value) = measured_loop.get(key).cloned() {
-            extra[key] = value;
-        }
-    }
-
-    if let Some(frame_key) = measured_loop.get("frame_evidence_key") {
-        if extra.get("surface_id").is_none() {
-            if let Some(surface_id) = frame_key.get("surface_id").cloned() {
-                extra["surface_id"] = surface_id;
-            }
-        }
-        if extra.get("surface_epoch").is_none() {
-            if let Some(surface_epoch) = frame_key.get("surface_epoch").cloned() {
-                extra["surface_epoch"] = surface_epoch;
-            }
-        }
-    }
-
-    if let Some(external_render_proof) = measured_loop.get("last_external_render_proof").cloned() {
-        if !extra
-            .get("preview_surface_proof")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            extra["preview_surface_proof"] = json!({});
-        }
-        if let Some(proof) = external_render_proof.get("proof").cloned() {
-            if proof.pointer("/artifact/kind").is_some() {
-                extra["native_gpu_render_proof"] = proof;
-            }
-        }
-        extra["preview_surface_proof"]["external_render_proof"] = external_render_proof;
-        extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
-        extra["preview_surface_proof"]["status"] = json!("pass");
-    }
-
-    if let Some(readback) = measured_loop
-        .get("last_interactive_readback_artifact")
-        .filter(|artifact| {
-            artifact
-                .get("nonblank_samples")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
-        })
-        .cloned()
-    {
-        if !extra
-            .get("preview_surface_proof")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            extra["preview_surface_proof"] = json!({});
-        }
-        extra["last_interactive_readback_artifact"] = readback.clone();
-        extra["readback_artifacts"] = json!([readback.clone()]);
-        extra["preview_surface_proof"]["readback_artifact"] = readback.clone();
-        extra["preview_surface_proof"]["interactive_frame_loop"] = json!(true);
-        extra["preview_surface_proof"]["status"] = json!("pass");
-        extra["native_gpu_render_proof"] = visible_surface_readback_render_proof(
-            &readback,
-            "isolated_real_window_launch_proof.measured_loop_report.last_interactive_readback_artifact",
-        );
-        if let Some(path) = readback.get("path").and_then(serde_json::Value::as_str) {
-            extra["checkpoint_screenshot_or_video_paths"] = json!([path]);
-            if let Some(sha256) = readback.get("sha256").and_then(serde_json::Value::as_str) {
-                let entry = json!({
-                    "kind": "visible-surface-readback",
-                    "source": "isolated_real_window_launch_proof.measured_loop_report.last_interactive_readback_artifact",
-                    "path": path,
-                    "sha256": sha256
-                });
-                let mut frame_hashes = extra
-                    .get("frame_hashes")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                frame_hashes.push(entry.clone());
-                extra["frame_hashes"] = json!(frame_hashes);
-                let mut artifact_sha256s = extra
-                    .get("artifact_sha256s")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                artifact_sha256s.push(entry);
-                extra["artifact_sha256s"] = json!(artifact_sha256s);
-            }
-        }
-    }
-
-    if let (Some(frame_key), Some(readback_key)) = (
-        extra.get("frame_evidence_key"),
-        extra.pointer("/last_interactive_readback_artifact/frame_evidence_key"),
-    ) {
-        let proof_lag_frames = frame_key
-            .get("frame_seq")
-            .and_then(serde_json::Value::as_u64)
-            .zip(
-                readback_key
-                    .get("frame_seq")
-                    .and_then(serde_json::Value::as_u64),
-            )
-            .map(|(frame, proof_frame)| frame.saturating_sub(proof_frame))
-            .unwrap_or(0);
-        extra["proof_lag_frames"] = json!(proof_lag_frames);
-    }
 }
 
 fn visible_surface_readback_render_proof(
@@ -83895,10 +83586,6 @@ fn native_gpu_preview_input_text(label: &str) -> String {
     scenario_text_input_sample(label).unwrap_or_else(|| "boon-native-input-proof".to_owned())
 }
 
-fn isolated_preview_driver_text(label: &str) -> Option<String> {
-    scenario_text_input_sample(label)
-}
-
 fn scenario_text_input_sample(label: &str) -> Option<String> {
     let (_source, scenario, _budget) = example_paths(label).ok()?;
     let scenario = boon_runtime::parse_scenario(&scenario).ok()?;
@@ -88994,160 +88681,6 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .and_then(serde_json::Value::as_str),
             Some("store.sources.primary.click")
         );
-    }
-
-    #[test]
-    fn native_preview_promotes_measured_loop_real_window_evidence() {
-        let frame_key = json!({
-            "frame_seq": 9,
-            "content_revision": 7,
-            "layout_revision": 5,
-            "render_scene_revision": 6,
-            "surface_id": "preview:test-surface",
-            "surface_epoch": 1,
-            "present_id": 9,
-            "input_event_seq": 3,
-            "proof_request_id": null
-        });
-        let input_adapter = json!({
-            "installed": true,
-            "real_os_events_observed": true,
-            "synthetic_input_probe": false,
-            "mouse_button_event_count": 1,
-            "mouse_last_window_protocol_id": 11,
-            "wheel_api": "app_window::input::mouse::Mouse::load_clear_scroll_delta",
-            "per_window_event_provenance_api": "app_window::input::{mouse,keyboard}::event_provenance"
-        });
-        let isolated = json!({
-            "status": "fail",
-            "method": "isolated-weston-headless-with-weston-test-control",
-            "driver_pass": true,
-            "desktop_pass": false,
-            "real_os_events_observed": true,
-            "driver_effect_observed": true,
-            "measured_loop_pass": true,
-            "preview_input_adapter": input_adapter,
-            "measured_loop_report": {
-                "status": "pass",
-                "surface_id": "preview:test-surface",
-                "surface_epoch": 1,
-                "frame_evidence_key": frame_key,
-                "rendered_frame_count": 9,
-                "presented_revision": 7,
-                "last_render_content_revision": 7,
-                "last_render_layout_revision": 5,
-                "last_render_scene_revision": 6,
-                "preview_perf_stats": {
-                    "status": "pass",
-                    "frame_seq": 9,
-                    "frame_evidence_key": frame_key
-                },
-                "last_external_render_proof": {
-                    "status": "pass",
-                    "visible_style_mode": "document_style",
-                    "debug_palette_used": false,
-                    "viewport_fill_ratio": 1.0,
-                    "content_bounds_fill_ratio": 1.0,
-                    "proof": {
-                        "artifact": {
-                            "kind": "app_owned_pixels",
-                            "artifact_path": "target/artifacts/native-gpu/test-preview.png",
-                            "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                            "nonblank_samples": 16
-                        }
-                    }
-                },
-                "last_interactive_readback_artifact": {
-                    "capture_method": "wgpu-visible-surface-copy-src-readback",
-                    "path": "target/artifacts/native-gpu/test-visible.png",
-                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "nonblank_samples": 16,
-                    "width": 920,
-                    "height": 720,
-                    "frame_evidence_key": frame_key
-                }
-            }
-        });
-        let mut extra = json!({
-            "evidence_tier": boon_driver::TIER_BOON_DRIVER,
-            "frame_hashes": [],
-            "artifact_sha256s": []
-        });
-
-        assert!(isolated_preview_real_window_input_delivery_proven(
-            &isolated
-        ));
-        native_preview_promote_isolated_measured_loop_evidence(&mut extra, &isolated);
-
-        assert_eq!(
-            extra
-                .get("evidence_tier")
-                .and_then(serde_json::Value::as_str),
-            Some(boon_driver::TIER_REAL_WINDOW)
-        );
-        assert_eq!(
-            extra
-                .pointer("/native_input_adapter/real_os_events_observed")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            extra
-                .pointer("/preview_surface_proof/readback_artifact/nonblank_samples")
-                .and_then(serde_json::Value::as_u64),
-            Some(16)
-        );
-        assert_eq!(extra.pointer("/frame_evidence_key"), Some(&frame_key));
-        assert_eq!(
-            extra
-                .get("proof_lag_frames")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            extra
-                .pointer("/native_gpu_render_proof/artifact/kind")
-                .and_then(serde_json::Value::as_str),
-            Some("app_owned_pixels")
-        );
-        assert_eq!(
-            extra
-                .pointer("/native_gpu_render_proof/artifact/capture_method")
-                .and_then(serde_json::Value::as_str),
-            Some("wgpu-visible-surface-copy-src-readback")
-        );
-        assert_eq!(
-            extra.pointer("/native_gpu_render_proof/artifact/frame_evidence_key"),
-            Some(&frame_key)
-        );
-    }
-
-    #[test]
-    fn native_preview_real_window_examples_prefer_workspace_launch_on_wayland() {
-        assert!(native_preview_e2e_prefers_cosmic_workspace_launch(
-            false,
-            false,
-            true,
-            boon_driver::TIER_REAL_WINDOW
-        ));
-        assert!(!native_preview_e2e_prefers_cosmic_workspace_launch(
-            false,
-            false,
-            true,
-            boon_driver::TIER_HOST_SYNTHETIC
-        ));
-        assert!(native_preview_e2e_prefers_cosmic_workspace_launch(
-            false,
-            true,
-            false,
-            boon_driver::TIER_HOST_SYNTHETIC
-        ));
-        assert!(native_preview_e2e_prefers_cosmic_workspace_launch(
-            true,
-            false,
-            false,
-            boon_driver::TIER_HOST_SYNTHETIC
-        ));
     }
 
     #[test]

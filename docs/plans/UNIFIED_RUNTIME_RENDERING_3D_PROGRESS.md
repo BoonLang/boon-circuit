@@ -33,7 +33,7 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
-| Test harness cleanup | In progress | Cells visible-click no longer has an isolated-Weston fallback; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Cells visible-click and preview E2E no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -178,6 +178,19 @@ for old evidence.
   - `cargo test -q -p xtask native_gpu_label_contract_rejects_cells_visible_click_address_selection_fallback -- --nocapture`
   - `cargo test -q -p xtask native_gpu_handoff_requires_cells_visible_click_release_report -- --nocapture`
   - `cargo test -q -p xtask native_mouse_position_wait -- --nocapture`
+
+### 2026-07-06 - Preview E2E Isolated-Weston Branch Deleted
+
+- `verify-native-gpu-preview-e2e` now requires the headed Wayland /
+  workspace-qualified product path. It no longer selects the verifier-owned
+  isolated Weston branch for non-hardware or debug preview runs.
+- Deleted preview-specific isolated Weston input-delivery promotion, driver-text
+  plumbing, and the tests that only validated that deleted branch.
+- The manifest preview E2E handoff labels already use release hardware args, so
+  this removes stale alternate execution without changing the intended product
+  route.
+- Focused checks passed:
+  - `cargo check -q -p xtask`
 
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 

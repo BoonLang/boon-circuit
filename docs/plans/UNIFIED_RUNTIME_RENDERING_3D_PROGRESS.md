@@ -520,6 +520,50 @@ Remaining work:
 - Add a focused runtime/verifier report that proves exact lookup index hits and
   `exact_lookup_row_scan_count=0` through an end-to-end `List/find` demand.
 
+## 2026-07-06 - Generic List/find Index-Hit Proof Slice
+
+Status: focused runtime proof added and verified.
+
+What changed:
+
+- The generic `list_find_and_chunk_project_generic_record_lists_without_grid_identity`
+  runtime test now asserts report-level `PlanExecutorListStore` lookup telemetry
+  for a non-Cells `List/find(sheet, field: address, value: selected)` projection.
+- The test proves `exact_lookup_count=1`, `exact_lookup_hit_count=1`,
+  `exact_lookup_candidate_count=1`, and `exact_lookup_row_scan_count=0` after
+  document summary materialization.
+- The older root `List/find_value` test remains a semantic correctness test
+  only; it does not claim store lookup telemetry because that value is cached
+  through a different derived path.
+
+Fresh evidence:
+
+- `cargo test -q -p boon_runtime
+  list_find_and_chunk_project_generic_record_lists_without_grid_identity -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_root_find_value_resolves_runtime_list_ref -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining work:
+
+- Promote the focused lookup telemetry into a report/verifier consumed by the
+  native/Cells handoff path, not only a unit test.
+- Continue replacing raw list-store mutation with explicit store methods so
+  index invalidation is precise instead of `DerefMut`-broad.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

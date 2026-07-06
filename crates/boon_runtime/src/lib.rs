@@ -45998,6 +45998,23 @@ FUNCTION new_entry(entry) {
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "B0");
         assert_eq!(summary["store"]["selected_input"]["value"], "2");
+        let provenance = runtime.engine_provenance_report();
+        assert_eq!(
+            provenance["list_store_lookup_stats"]["exact_lookup_count"], 1,
+            "document summary List/find projection should use the PlanExecutor list store exact index"
+        );
+        assert_eq!(
+            provenance["list_store_lookup_stats"]["exact_lookup_hit_count"], 1,
+            "List/find projection should hit the exact field index"
+        );
+        assert_eq!(
+            provenance["list_store_lookup_stats"]["exact_lookup_candidate_count"], 1,
+            "B0 has one matching projected row"
+        );
+        assert_eq!(
+            provenance["list_store_lookup_stats"]["exact_lookup_row_scan_count"], 0,
+            "List/find projection should not scan rows after the store index is available"
+        );
         assert_eq!(summary["store"]["visible_rows"][0]["row_number"], "0");
         assert_eq!(
             summary["store"]["visible_rows"][0]["entries"][0]["address"],
@@ -48016,6 +48033,17 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
         assert_eq!(
             summary["store"]["selected_value"], "second",
             "PlanExecutor root List/find_value should expose the first matching target value"
+        );
+        let output = runtime
+            .apply_source_event(LiveSourceEvent {
+                source: "store.sources.noop".to_owned(),
+                text: Some("row-1".to_owned()),
+                ..LiveSourceEvent::default()
+            })
+            .expect("source event should update selected row");
+        assert_eq!(
+            output.state_summary["store"]["selected_value"], "first",
+            "PlanExecutor root List/find_value should update from runtime list rows"
         );
         assert_eq!(
             runtime.engine_provenance_report()["generic_fallback_enabled"],

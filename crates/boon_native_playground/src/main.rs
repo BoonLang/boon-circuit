@@ -2798,7 +2798,6 @@ fn native_gpu_renderer_upload_probe_for_frames(
             "status": "pass",
             "probe": "persistent-offscreen-render-scene-renderer",
             "render_scene_probe": true,
-            "layout_frame_compatibility_renderer": false,
             "hot_path": false,
             "width": width,
             "height": height,
@@ -12909,15 +12908,7 @@ fn preview_render_scene_for_frame_hash(
             "cached-derived-retained-keys",
         ));
     }
-    Ok((
-        boon_document::render_scene::lower_layout_frame_to_render_scene(
-            render_frame,
-            width,
-            height,
-            columns,
-        ),
-        "legacy-display-item-no-cached-document-snapshot",
-    ))
+    Err("native preview render scene requires a cached retained document snapshot".into())
 }
 
 #[cfg(test)]
@@ -12935,7 +12926,7 @@ fn preview_render_scene_lowering_mode_for_hash(layout_frame_hash: Option<&str>) 
     {
         "cached-derived-retained-keys"
     } else {
-        "legacy-display-item-no-cached-document-snapshot"
+        "missing-retained-render-snapshot"
     }
 }
 

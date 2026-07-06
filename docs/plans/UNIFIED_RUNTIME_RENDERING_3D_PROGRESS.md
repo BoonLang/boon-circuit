@@ -246,6 +246,43 @@ Remaining work:
   changing; current aggregate failures remain refresh debt unless a fresh child
   report proves otherwise.
 
+## 2026-07-06 - Native Preview Retained Snapshot Requirement
+
+Status: implementation slice verified with focused compile and contract tests;
+runtime/native report refresh still pending.
+
+What changed:
+
+- The native preview product render-scene path no longer falls back from a
+  missing retained document snapshot to direct `LayoutFrame` display-item
+  lowering. Product/native rendering now requires the cached retained document
+  snapshot and returns an explicit error if the retained identity is missing.
+- The NovyWave renderer upload probe no longer emits or verifies the old
+  `layout_frame_compatibility_renderer=false` compatibility field. The verifier
+  now accepts the path only through positive retained RenderScene evidence:
+  `render_scene_probe=true` and all expected samples carrying cached retained
+  keys.
+- Native proof label checks now require any reported `render_scene_lowering_mode`
+  to be `cached-derived-retained-keys`; a renamed or missing-retained fallback
+  is not an acceptable product/native proof path.
+
+Fresh evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_native_playground -p xtask`: pass.
+- `cargo test -q -p boon_native_playground preview_render_scene -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask native_gpu_label_contract -- --nocapture`: pass.
+- `cargo test -q -p xtask product_render_graph -- --nocapture`: pass.
+- `cargo test -q -p boon_native_playground product_render_graph -- --nocapture`:
+  pass.
+
+Remaining work:
+
+- Regenerate the relevant native reports before claiming handoff readiness; the
+  current manifest aggregate is still refresh debt, not a fresh pass.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

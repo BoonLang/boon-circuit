@@ -33,7 +33,7 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
-| Test harness cleanup | In progress | Cells visible-click, preview E2E, and scroll-speed no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Cells visible-click, preview E2E, scroll-speed, and present-floor no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining multiwindow/IPC/observability isolated-Weston compositor paths remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -217,12 +217,32 @@ for old evidence.
   require or validate those deleted gates.
 - Removed now-unused idle CPU sampling, source-project switch payload,
   dev-editor scroll-axis observation, and Weston click-driver helper islands.
-- Kept manifest-owned native handoff routes intact. Multiwindow, IPC,
-  observability, and present-floor still need their remaining isolated-Weston
-  manifest-owned branches replaced by headed product-path evidence in a later
-  cut.
+- Kept manifest-owned native handoff routes intact. Multiwindow, IPC, and
+  observability still need their remaining isolated-Weston manifest-owned
+  branches replaced by headed product-path evidence in a later cut.
 - Focused checks passed:
   - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
+
+### 2026-07-06 - Present-Floor Isolated Fallback Deleted
+
+- `verify-native-gpu-present-floor` now has one public product path: the
+  default focus-safe hardware launcher, plus the private `--inner-app-window`
+  implementation invoked by that launcher.
+- Deleted the isolated-Weston present-floor probe, current-Wayland focus-risk
+  opt-in branch, removed-mode report shape, and stale unit coverage for those
+  branches instead of preserving them as diagnostic fallbacks.
+- Direct inner reports now identify `inner-app-window-direct-present-floor`;
+  handoff acceptance still requires the focus-safe hardware product-preview
+  report contract.
+- Remaining isolated-Weston handoff cuts are multiwindow, IPC backpressure, and
+  observability.
+- Focused checks passed:
+  - `cargo fmt --check`
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask present_floor -- --nocapture`
+  - `cargo test -q -p boon_report_schema present_floor_scoped_verifier_identity_ignores_inner_probe_arg -- --nocapture`
+  - `cargo test -q -p xtask native_gpu_handoff_requires_present_floor_report -- --nocapture`
   - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
 
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed

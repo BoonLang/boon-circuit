@@ -24811,144 +24811,45 @@ fn verify_native_gpu_present_floor(args: &[String]) -> Result<(), Box<dyn std::e
     {
         return run_focus_safe_hardware_present_floor_probe(args);
     }
-    if args.iter().any(|arg| arg == "--no-isolated-weston") {
-        if !present_floor_current_wayland_focus_risk_allowed(args) {
-            let mut checks = Vec::new();
-            let mut blockers = Vec::new();
-            push_audit_check(
-                &mut checks,
-                &mut blockers,
-                "native-gpu-present-floor:current-wayland-focus-risk-explicitly-allowed",
-                false,
-                "--no-isolated-weston can create a focus-taking visible window; pass --allow-current-wayland-focus-risk or set BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK=1 to run it",
-                Some("current Wayland present-floor baseline is not focus-safe yet".to_owned()),
-            );
-            let unmeasured_summary = present_floor_summary_json(0.0, 0.0, 0.0, 0.0, 0);
-            let unmeasured_stages = json!({
-                "present_floor": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "presented_frame_ms_p50_p95_p99_max"
-                ),
-                "surface_acquire": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "surface_acquire_ms_p50_p95_p99_max"
-                ),
-                "present_submit": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "present_submit_ms_p50_p95_p99_max"
-                ),
-                "command_record": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "command_record_ms_p50_p95_p99_max"
-                ),
-                "encoder_finish": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "encoder_finish_ms_p50_p95_p99_max"
-                ),
-                "queue_submit": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "queue_submit_ms_p50_p95_p99_max"
-                ),
-                "frame_present": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "frame_present_ms_p50_p95_p99_max"
-                ),
-                "post_present_bookkeeping": present_floor_stage_json(
-                    &unmeasured_summary,
-                    "post_present_bookkeeping_ms_p50_p95_p99_max"
-                )
-            });
-            return write_native_gate_report(
-                args,
-                "verify-native-gpu-present-floor",
-                checks,
-                blockers,
-                json!({
-                    "measurement_source": "current-wayland-app-window-clear-only-present-floor",
-                    "harness_kind": "current-process-wayland",
-                    "surface_class": "raw-app-window-clear-only-preview-surface",
-                    "product_only": true,
-                    "proof_mode": "counters",
-                    "proof_deferred": true,
-                    "proof_required_for_visible_update": false,
-                    "readback_in_hot_path": false,
-                    "proof_readback_in_hot_path": false,
-                    "hot_path_proof_readback_count": 0,
-                    "hot_path_report_write_count": 0,
-                    "sample_input_after_initial_frames": false,
-                    "observed_real_os_input": false,
-                    "observed_input_event_wake_count": 0,
-                    "observed_keyboard_key_event_count": 0,
-                    "observed_mouse_total_event_count": 0,
-                    "operator_host_input": false,
-                    "real_os_input": false,
-                    "private_runtime_dispatch_used": false,
-                    "preview_blocked_on_ipc_count": 0,
-                    "render_loop_mode": "demand_driven",
-                    "frame_evidence_key": null,
-                    "surface_id": null,
-                    "surface_epoch": null,
-                    "rendered_frame_count": 0,
-                    "presented_revision": 0,
-                    "last_render_content_revision": 0,
-                    "last_render_layout_revision": 0,
-                    "last_render_scene_revision": 0,
-                    "requested_width": null,
-                    "requested_height": null,
-                    "warmup_frame_count": 0,
-                    "sample_frame_count": 0,
-                    "measured_frame_count": 0,
-                    "max_presented_frame_ms_p95": 16.7,
-                    "max_presented_frame_ms_max": 33.4,
-                    "presented_frame_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "surface_acquire_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "present_submit_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "command_record_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "encoder_finish_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "queue_submit_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "frame_present_ms_p50_p95_p99_max": unmeasured_summary.clone(),
-                    "post_present_bookkeeping_ms_p50_p95_p99_max": unmeasured_summary,
-                    "presented_frame_ms_over_16_7_count": 0,
-                    "presented_frame_ms_over_16_7_indices": [],
-                    "presented_frame_ms_over_16_7_max": 0.0,
-                    "present_mode": null,
-                    "supported_present_modes": [],
-                    "non_vsync_present_mode_available": false,
-                    "desired_maximum_frame_latency": null,
-                    "adapter_name": null,
-                    "adapter_backend": null,
-                    "adapter_device_type": null,
-                    "adapter_is_software": null,
-                    "surface_format": null,
-                    "supported_usages": null,
-                    "surface_copy_to_present_supported": null,
-                    "surface_copy_src_readback_supported": null,
-                    "present_path_mode": null,
-                    "present_path_requested_mode": null,
-                    "present_path_selection_reason": null,
-                    "present_path_readback_enabled": false,
-                    "readback_ms": null,
-                    "render_hook_ms_p95": null,
-                    "frame_timing": null,
-                    "stage_counters": unmeasured_stages,
-                    "app_window_surface_proof": null,
-                    "focus_safe": false,
-                    "requires_explicit_focus_risk_opt_in": true,
-                    "allow_flag": "--allow-current-wayland-focus-risk",
-                    "allow_env": "BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK=1"
-                }),
-            );
-        }
-        return verify_native_gpu_present_floor_inner(args);
-    }
-    run_isolated_weston_present_floor_probe(args)
-}
-
-fn present_floor_current_wayland_focus_risk_allowed(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--allow-current-wayland-focus-risk")
-        || std::env::var("BOON_NATIVE_PRESENT_FLOOR_ALLOW_CURRENT_WAYLAND_FOCUS_RISK").as_deref()
-            == Ok("1")
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-present-floor:focus-safe-product-path-selected",
+        false,
+        "present-floor supports only default focus-safe hardware mode, explicit --surface product-preview --hardware --focus-safe, or --inner-app-window",
+        Some("obsolete isolated/current-Wayland present-floor modes were removed".to_owned()),
+    );
+    write_native_gate_report(
+        args,
+        "verify-native-gpu-present-floor",
+        checks,
+        blockers,
+        json!({
+            "measurement_source": "unsupported-present-floor-mode",
+            "harness_kind": "unsupported",
+            "surface_class": "unsupported",
+            "product_only": true,
+            "proof_mode": "counters",
+            "proof_deferred": true,
+            "readback_in_hot_path": false,
+            "proof_readback_in_hot_path": false,
+            "hot_path_proof_readback_count": 0,
+            "hot_path_report_write_count": 0,
+            "operator_host_input": false,
+            "real_os_input": false,
+            "private_runtime_dispatch_used": false,
+            "preview_blocked_on_ipc_count": 0,
+            "focus_safe": false,
+            "hardware_requested": false,
+            "supported_modes": [
+                "default focus-safe hardware product preview",
+                "--surface product-preview --hardware --focus-safe",
+                "--inner-app-window"
+            ]
+        }),
+    )
 }
 
 fn present_floor_focus_safe_hardware_requested(args: &[String]) -> bool {
@@ -24958,15 +24859,29 @@ fn present_floor_focus_safe_hardware_requested(args: &[String]) -> bool {
 }
 
 fn present_floor_default_focus_safe_hardware_requested(args: &[String]) -> bool {
-    !args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--inner-app-window"
-                | "--no-isolated-weston"
-                | "--allow-software-adapter-diagnostic"
-                | "--allow-current-wayland-focus-risk"
-        )
-    }) && value_arg(args, "--surface").is_none()
+    if value_arg(args, "--surface").is_some() || args.iter().any(|arg| arg == "--inner-app-window")
+    {
+        return false;
+    }
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--report"
+            | "--present-mode"
+            | "--warmup-frame-count"
+            | "--sample-frame-count"
+            | "--width"
+            | "--height"
+            | "--max-presented-frame-ms-p95"
+            | "--max-presented-frame-ms-max"
+            | "--max-presented-frame-ms-bounded-outlier-cap"
+            | "--max-presented-frame-ms-bounded-outlier-count" => {
+                index += 2;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn run_focus_safe_hardware_present_floor_probe(
@@ -25047,7 +24962,7 @@ fn run_focus_safe_hardware_present_floor_probe(
             "--report" | "--surface" | "--present-mode" => {
                 skip_next = true;
             }
-            "--hardware" | "--focus-safe" | "--no-isolated-weston" | "--inner-app-window" => {}
+            "--hardware" | "--focus-safe" | "--inner-app-window" => {}
             _ => child_args.push(arg.clone()),
         }
     }
@@ -25170,221 +25085,6 @@ fn run_focus_safe_hardware_present_floor_probe(
             report.display()
         )
         .into())
-    }
-}
-
-fn run_isolated_weston_present_floor_probe(
-    args: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let report = report_arg(args)
-        .unwrap_or_else(|| native_default_report_path("verify-native-gpu-present-floor", args));
-    let artifact_dir = PathBuf::from(format!(
-        "target/artifacts/native-gpu/present-floor-{}-{}",
-        std::process::id(),
-        current_unix_seconds()
-    ));
-    fs::create_dir_all(&artifact_dir)?;
-    let weston_log_path = artifact_dir.join("weston.log");
-    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
-    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
-    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
-    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
-    let inner_stdout_path = artifact_dir.join("present-floor-inner.stdout.txt");
-    let inner_stderr_path = artifact_dir.join("present-floor-inner.stderr.txt");
-    let socket = format!(
-        "boon-native-present-floor-{}-{}",
-        std::process::id(),
-        current_unix_seconds()
-    );
-    let mut checks = Vec::new();
-    let mut blockers = Vec::new();
-    let weston_available = command_available("weston");
-    let wayland_info_available = command_available("wayland-info");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-present-floor:isolated-weston-tools",
-        weston_available && wayland_info_available,
-        format!("weston={weston_available}, wayland-info={wayland_info_available}"),
-        (!(weston_available && wayland_info_available))
-            .then(|| "present-floor baseline requires weston and wayland-info".to_owned()),
-    );
-    if !(weston_available && wayland_info_available) {
-        return write_native_gate_report(
-            args,
-            "verify-native-gpu-present-floor",
-            checks,
-            blockers,
-            json!({
-                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
-                "artifact_dir": artifact_dir,
-                "operator_host_input": false,
-                "real_os_input": false,
-                "product_only": true,
-                "proof_mode": "counters",
-                "readback_in_hot_path": false,
-                "proof_readback_in_hot_path": false,
-                "hot_path_proof_readback_count": 0,
-                "hot_path_report_write_count": 0
-            }),
-        );
-    }
-
-    let mut weston = Command::new("weston")
-        .args([
-            "--backend=headless-backend.so",
-            "--socket",
-            &socket,
-            "--idle-time=0",
-            "--log",
-            weston_log_path
-                .to_str()
-                .ok_or("weston log path is not UTF-8")?,
-        ])
-        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
-        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
-        .spawn()?;
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(output) = Command::new("wayland-info")
-            .env("WAYLAND_DISPLAY", &socket)
-            .output()
-        {
-            fs::write(&wayland_info_stdout_path, &output.stdout)?;
-            fs::write(&wayland_info_stderr_path, &output.stderr)?;
-            if output.status.success() {
-                ready = true;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-present-floor:isolated-weston-ready",
-        ready,
-        format!("socket={socket}, weston_pid={}", weston.id()),
-        (!ready).then(|| "isolated Weston did not become ready".to_owned()),
-    );
-    if !ready {
-        terminate_child_process(&mut weston);
-        return write_native_gate_report(
-            args,
-            "verify-native-gpu-present-floor",
-            checks,
-            blockers,
-            json!({
-                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
-                "artifact_dir": artifact_dir,
-                "weston_pid": weston.id(),
-                "weston_socket": socket,
-                "weston_log_path": weston_log_path,
-                "operator_host_input": false,
-                "real_os_input": false,
-                "product_only": true,
-                "proof_mode": "counters",
-                "readback_in_hot_path": false,
-                "proof_readback_in_hot_path": false,
-                "hot_path_proof_readback_count": 0,
-                "hot_path_report_write_count": 0
-            }),
-        );
-    }
-
-    let mut child_args = vec![
-        "verify-native-gpu-present-floor".to_owned(),
-        "--inner-app-window".to_owned(),
-        "--report".to_owned(),
-        report
-            .to_str()
-            .ok_or("present-floor report path is not UTF-8")?
-            .to_owned(),
-    ];
-    let mut skip_next = false;
-    for arg in args.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        match arg.as_str() {
-            "--report" | "--present-mode" => {
-                skip_next = true;
-            }
-            "--inner-app-window" | "--no-isolated-weston" => {}
-            _ => child_args.push(arg.clone()),
-        }
-    }
-    let current_exe = std::env::current_exe()?;
-    let mut child = Command::new(current_exe);
-    child
-        .args(&child_args)
-        .env("WAYLAND_DISPLAY", &socket)
-        .env("XDG_SESSION_TYPE", "wayland")
-        .env(
-            "BOON_NATIVE_PRESENT_FLOOR_ISOLATED",
-            "isolated-weston-headless",
-        )
-        .env("BOON_NATIVE_PRESENT_FLOOR_SOCKET", &socket)
-        .env("BOON_NATIVE_PRESENT_FLOOR_ARTIFACT_DIR", &artifact_dir)
-        .env("BOON_NATIVE_PRESENT_FLOOR_WESTON_LOG", &weston_log_path)
-        .env(
-            "BOON_NATIVE_PRESENT_FLOOR_WESTON_PID",
-            weston.id().to_string(),
-        )
-        .stdout(Stdio::from(fs::File::create(&inner_stdout_path)?))
-        .stderr(Stdio::from(fs::File::create(&inner_stderr_path)?));
-    if let Some(present_mode) = value_arg(args, "--present-mode") {
-        child.env("BOON_NATIVE_PRESENT_MODE", present_mode);
-    }
-    let status = child.status()?;
-    terminate_child_process(&mut weston);
-    if report.exists() {
-        if status.success() {
-            println!("wrote {}", report.display());
-            Ok(())
-        } else {
-            Err(format!(
-                "native GPU present-floor gate blocked; wrote {}",
-                report.display()
-            )
-            .into())
-        }
-    } else {
-        let mut checks = checks;
-        let mut blockers = blockers;
-        push_audit_check(
-            &mut checks,
-            &mut blockers,
-            "native-gpu-present-floor:inner-report-written",
-            false,
-            format!("inner_status={status}, report={}", report.display()),
-            Some("present-floor inner app-window probe did not write a report".to_owned()),
-        );
-        write_native_gate_report(
-            args,
-            "verify-native-gpu-present-floor",
-            checks,
-            blockers,
-            json!({
-                "measurement_source": "isolated-weston-app-window-clear-only-present-floor",
-                "artifact_dir": artifact_dir,
-                "weston_pid": weston.id(),
-                "weston_socket": socket,
-                "weston_log_path": weston_log_path,
-                "inner_status": status.to_string(),
-                "inner_stdout_path": inner_stdout_path,
-                "inner_stderr_path": inner_stderr_path,
-                "operator_host_input": false,
-                "real_os_input": false,
-                "product_only": true,
-                "proof_mode": "counters",
-                "readback_in_hot_path": false,
-                "proof_readback_in_hot_path": false,
-                "hot_path_proof_readback_count": 0,
-                "hot_path_report_write_count": 0
-            }),
-        )
     }
 }
 
@@ -25666,29 +25366,23 @@ fn verify_native_gpu_present_floor_inner(
         "post_present_bookkeeping": present_floor_stage_json(&post_present_bookkeeping_summary, "post_present_bookkeeping_ms_p50_p95_p99_max")
     });
     let focus_safe_harness = std::env::var("BOON_NATIVE_PRESENT_FLOOR_FOCUS_SAFE").ok();
-    let harness_kind = std::env::var("BOON_NATIVE_PRESENT_FLOOR_ISOLATED")
-        .ok()
-        .or_else(|| focus_safe_harness.clone())
-        .unwrap_or_else(|| "current-process-wayland".to_owned());
+    let harness_kind = focus_safe_harness
+        .clone()
+        .unwrap_or_else(|| "inner-app-window-direct".to_owned());
     let focus_safe = focus_safe_harness.is_some();
     let measurement_source = if focus_safe {
         "focus-safe-hardware-product-preview-present-floor"
-    } else if harness_kind == "isolated-weston-headless" {
-        "isolated-weston-app-window-clear-only-present-floor"
     } else {
-        "current-wayland-app-window-clear-only-present-floor"
+        "inner-app-window-direct-present-floor"
     };
     let extra = json!({
         "measurement_source": measurement_source,
         "harness_kind": harness_kind,
-        "weston_socket": std::env::var("BOON_NATIVE_PRESENT_FLOOR_SOCKET").ok(),
-        "weston_pid": std::env::var("BOON_NATIVE_PRESENT_FLOOR_WESTON_PID").ok(),
-        "weston_log_path": std::env::var("BOON_NATIVE_PRESENT_FLOOR_WESTON_LOG").ok(),
         "artifact_dir": std::env::var("BOON_NATIVE_PRESENT_FLOOR_ARTIFACT_DIR").ok(),
         "surface_class": if focus_safe {
             "product-preview-app-window-surface"
         } else {
-            "raw-app-window-clear-only-preview-surface"
+            "inner-app-window-preview-surface"
         },
         "focus_safe": focus_safe,
         "hardware_requested": focus_safe,
@@ -77965,15 +77659,18 @@ mod tests {
     }
 
     #[test]
-    fn present_floor_current_wayland_focus_risk_requires_explicit_allow_flag() {
-        assert!(!present_floor_current_wayland_focus_risk_allowed(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--no-isolated-weston".to_owned()
+    fn present_floor_default_path_is_focus_safe_product_hardware_only() {
+        assert!(present_floor_default_focus_safe_hardware_requested(&[
+            "verify-native-gpu-present-floor".to_owned()
         ]));
-        assert!(present_floor_current_wayland_focus_risk_allowed(&[
+        assert!(!present_floor_default_focus_safe_hardware_requested(&[
             "verify-native-gpu-present-floor".to_owned(),
-            "--no-isolated-weston".to_owned(),
-            "--allow-current-wayland-focus-risk".to_owned()
+            "--unsupported-mode".to_owned()
+        ]));
+        assert!(!present_floor_default_focus_safe_hardware_requested(&[
+            "verify-native-gpu-present-floor".to_owned(),
+            "--surface".to_owned(),
+            "raw-clear".to_owned()
         ]));
     }
 

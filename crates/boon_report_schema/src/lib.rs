@@ -4560,9 +4560,14 @@ fn verify_run_plan_root_scalar_scenario_report(
     )?;
 
     if report.get("state_summary") != Some(&expected.state_summary) {
+        let actual = report.get("state_summary").unwrap_or(&JsonValue::Null);
+        let difference = first_json_difference_path(Some(actual), Some(&expected.state_summary))
+            .unwrap_or_else(|| "<unknown>".to_owned());
         return Err(format!(
-            "{} run-plan-root-scalar-scenario state_summary does not match source-derived replay",
-            report_path.display()
+            "{} run-plan-root-scalar-scenario state_summary does not match source-derived replay at {difference}; actual={} expected={}",
+            report_path.display(),
+            actual,
+            expected.state_summary
         )
         .into());
     }
@@ -14920,6 +14925,10 @@ fn expected_root_scalar_scenario_execution(
     let (mut state, mut bytes_state, initialized_root_state_count) =
         expected_root_scalar_initial_state(plan, report_path)?;
     let mut list_state = expected_initial_list_state(plan, report_path)?;
+    let initial_list_derived_values = expected_root_pure_number_compare_values(plan, &list_state)?;
+    for (field_id, value) in initial_list_derived_values {
+        state.insert(plan_derived_field_label(plan, field_id), value);
+    }
     let mut per_step = Vec::new();
     let mut signatures = Vec::new();
     let mut semantic_deltas = Vec::new();
@@ -15311,6 +15320,27 @@ fn expected_root_scalar_scenario_execution(
             signatures.push(json!(signature));
             semantic_deltas.push(delta.clone());
             step_deltas.push(delta.clone());
+        }
+        let root_list_derived_values_after_updates =
+            expected_root_pure_number_compare_values(plan, &list_state)?;
+        for (field_id, value) in &root_list_derived_values_after_updates {
+            state.insert(plan_derived_field_label(plan, *field_id), value.clone());
+        }
+        for (delta, report) in expected_changed_root_derived_deltas(
+            plan,
+            &root_derived_values_before_updates,
+            &root_list_derived_values_after_updates,
+        ) {
+            if step_deltas.iter().any(|recorded| recorded == &delta) {
+                continue;
+            }
+            let signature = plan_json_delta_signature(&delta, report_path)?;
+            step_signatures.push(json!(signature.clone()));
+            signatures.push(json!(signature));
+            semantic_deltas.push(delta.clone());
+            step_deltas.push(delta);
+            derived.push(report);
+            executed_derived_value_count += 1;
         }
         let retain_execution =
             expected_materialize_plan_list_retains(plan, &state, &list_state, report_path)?;
@@ -16117,7 +16147,10 @@ fn expected_root_pure_number_compare_values(
     list_state: &BTreeMap<usize, Vec<ExpectedPlanListRowState>>,
 ) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
     let aggregate_counts = expected_aggregate_count_values(plan, list_state)?;
-    let mut values = BTreeMap::new();
+    let mut values = aggregate_counts
+        .iter()
+        .map(|(field_id, value)| (*field_id, json!(value)))
+        .collect::<BTreeMap<_, _>>();
     for op in plan
         .regions
         .iter()

@@ -37328,3 +37328,45 @@ Remaining scope:
   of stale observed command lines.
 - Root runtime-branch update execution and ProductFrameGraph/native presentation
   cleanup remain larger open architecture slices.
+
+## 2026-07-06 - Root-Scalar Schema Replay Currentness Fixed
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Fixed the `run-plan-root-scalar-scenario` report schema replay mirror so it
+  starts from the same PlanExecutor-current root/list state as product
+  execution. Initial root aggregate/count fields are now committed from the
+  initialized list state before selected steps run.
+- Fixed the same schema replay mirror to commit root-list derived values after
+  each selected step changes list state. The verifier still records semantic
+  deltas only when they are not already emitted by the step, matching the
+  product PlanExecutor report behavior.
+- Improved the root-scalar `state_summary` schema error to include the first
+  JSON difference path and actual/expected summaries. This is verifier
+  diagnostics only; it does not weaken the schema gate.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_report_schema -p xtask`: pass.
+- `cargo test -q -p boon_report_schema root_scalar -- --nocapture`: pass; 14
+  passed.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json`:
+  pass.
+- Fresh `target/debug/xtask verify-bytes-machine-plan-all --check-existing
+  --report target/reports/bytes-plan/bytes-machine-plan-all-current.json`:
+  expected fail with `refresh_debt_child_count=59`,
+  `true_blocker_child_count=0`, and 59 refresh commands after the schema binary
+  changed.
+
+Remaining scope:
+
+- Refresh the remaining BYTES child reports with the canonical queue and keep
+  `true_blocker_child_count=0`; do not debug product code from stale reports.
+- Continue the larger architecture cuts: remaining runtime execution ambiguity,
+  ProductFrameGraph/native presentation ownership, and Cells/native performance
+  proof separation.

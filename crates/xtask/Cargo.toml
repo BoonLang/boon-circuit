@@ -21,7 +21,6 @@ boon_solid_model.workspace = true
 boon_manufacturing.workspace = true
 boon_3mf.workspace = true
 boon_mesh_export.workspace = true
-boon_web_host.workspace = true
 boon_driver.workspace = true
 boon_host.workspace = true
 boon_native_app_window.workspace = true

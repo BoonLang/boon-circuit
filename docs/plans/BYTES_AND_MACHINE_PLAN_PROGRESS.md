@@ -38795,3 +38795,44 @@ Fresh focused evidence before commit:
 - `cargo test -q -p xtask
   native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
   --nocapture`: pass.
+
+## 2026-07-06 - Browser/WebGPU Verifier Stack Deleted From Active Code
+
+Status: implemented and focused-verified; native aggregate refresh still
+separate.
+
+What changed:
+
+- Removed the obsolete browser/native-web verifier command family:
+  `verify-native-web-render-contract`,
+  `verify-browser-webgpu-world-scene`,
+  `verify-native-web-render-comparison`,
+  `verify-native-web-render-parity`,
+  `build-browser-host-artifact`,
+  `verify-browser-artifact-budget`, and
+  `verify-browser-startup-budget`.
+- Deleted the `boon_web_host` workspace crate and removed its `xtask`
+  dependency. The active native GPU handoff manifest did not depend on this
+  browser stack.
+- Simplified `verify-wgpu-readback` and `verify-wgpu-retained-arenas` to native
+  WGPU evidence only. They no longer require browser readback, native/browser
+  parity, browser retained upload/draw dispatch, or browser artifact reports.
+- Kept browser-proof rejection in the native schema. Browser evidence is still
+  explicitly rejected as a substitute for app-owned native proof.
+- Kept the generic document semantic scene/source-dispatch checks and native
+  AccessKit checks, but removed browser-host JS/Rust proof requirements from
+  those gates.
+
+Fresh focused evidence:
+
+- `rg -n
+  "boon_web_host|world_scene_host|web_host_semantic|browser-host-semantic|browser-semantic-live|verify-browser-webgpu-world-scene|verify-browser-startup-budget|verify-native-web-render|browser-host"
+  Cargo.toml Cargo.lock crates docs/architecture/native_gpu_handoff_manifest.json
+  --glob '!target'`: no matches.
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p xtask advertised_xtask_commands_are_unique --
+  --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.
+- `cargo test -q -p boon_report_schema
+  native_gpu_schema_rejects_browser_proof_substitution -- --nocapture`: pass.

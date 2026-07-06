@@ -798,17 +798,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boon_web_host"
-version = "0.1.0"
-dependencies = [
- "boon_document",
- "boon_scene_model",
- "boon_solid_model",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "borsh"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4203,7 +4192,6 @@ dependencies = [
  "boon_scene_model",
  "boon_solid_model",
  "boon_typecheck",
- "boon_web_host",
  "flate2",
  "futures",
  "image 0.24.9",

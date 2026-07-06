@@ -418,6 +418,21 @@ Fresh focused evidence:
     pass; 1 passed.
   - `git diff --check`: pass.
 
+### 2026-07-06 - Refresh Queue Uses One Execution Path
+
+- Removed the duplicate first-cycle command execution body from
+  `run_report_refresh_queue`.
+- The first selected batch and closed-loop batches now both execute through
+  `run_refresh_queue_entries`, so argv validation, bounded stdout/stderr
+  capture, Boon CLI prebuild, owner-aggregate reruns, result shape, and failure
+  accounting have one implementation.
+- This directly reduces report/control-plane ambiguity without changing the
+  allowed command set or adding compatibility shims.
+- Fresh focused evidence:
+  - `cargo fmt -- --check`: pass.
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 11 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

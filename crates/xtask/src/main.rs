@@ -60196,253 +60196,28 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
         .collect::<Vec<_>>();
     let selected_label_set = selected_labels.iter().cloned().collect::<BTreeSet<_>>();
     let full_queue_mode = labels.is_empty() && limit == usize::MAX;
-    let mut results = Vec::new();
-    let mut missing_argv_count = 0usize;
-    let mut invalid_command_count = 0usize;
-    let mut run_count = 0usize;
-    let mut pass_count = 0usize;
-    let mut fail_count = 0usize;
     let mut post_aggregate_report = None::<serde_json::Value>;
-    let mut owner_aggregate_reruns = Vec::new();
     let selected_has_upstream_phase = selected
         .iter()
         .any(|entry| refresh_entry_phase(entry) == "upstream-dependency");
-    let mut owner_aggregate_rerun_done = false;
-    let selected_requires_boon_cli = selected.iter().any(refresh_entry_uses_boon_cli);
-    let (boon_cli_prebuild, boon_cli_prebuild_ok) = refresh_queue_boon_cli_prebuild(
-        selected_requires_boon_cli,
+    let initial_execution = run_refresh_queue_entries(
+        COMMAND,
+        &aggregate_path,
+        &selected,
         dry_run,
         output_byte_limit,
         &mut checks,
         &mut blockers,
-        COMMAND,
+        0,
     );
-    for (index, entry) in selected.iter().enumerate() {
-        if refresh_entry_uses_boon_cli(entry) && !boon_cli_prebuild_ok {
-            fail_count += 1;
-            let label = entry
-                .get("label")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("missing")
-                .to_owned();
-            let path = entry
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("missing")
-                .to_owned();
-            results.push(json!({
-                "label": label,
-                "path": path,
-                "status": "fail",
-                "reason": "boon-cli-prebuild-failed"
-            }));
-            continue;
-        }
-        if refresh_queue_should_rerun_owner_aggregate_before_entry(
-            selected_has_upstream_phase,
-            owner_aggregate_rerun_done,
-            fail_count,
-            dry_run,
-            entry,
-        ) {
-            owner_aggregate_reruns = rerun_refresh_entry_owner_aggregates(
-                &selected,
-                output_byte_limit,
-                &mut checks,
-                &mut blockers,
-            );
-            owner_aggregate_rerun_done = true;
-        }
-        let label = entry
-            .get("label")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("missing")
-            .to_owned();
-        let path = entry
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("missing")
-            .to_owned();
-        let Some(mut argv) = entry
-            .get("argv")
-            .and_then(serde_json::Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|values| values.len() >= 2)
-        else {
-            missing_argv_count += 1;
-            fail_count += 1;
-            push_audit_check(
-                &mut checks,
-                &mut blockers,
-                format!("{COMMAND}:entry-{index}:argv-present:{label}"),
-                false,
-                format!("refresh entry `{label}` missing structured argv"),
-                Some(format!(
-                    "refresh entry `{label}` in `{}` is missing structured argv",
-                    aggregate_path.display()
-                )),
-            );
-            results.push(json!({
-                "label": label,
-                "path": path,
-                "status": "fail",
-                "reason": "missing-structured-argv"
-            }));
-            continue;
-        };
-        argv[0] = current_binary_path();
-        if entry
-            .get("argv")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|argv| argv.first())
-            .and_then(serde_json::Value::as_str)
-            .and_then(|arg| Path::new(arg).file_name())
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|file_name| file_name.starts_with("boon_cli"))
-        {
-            argv[0] = current_boon_cli_path();
-        }
-        let executable = Path::new(&argv[0])
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_owned();
-        let refresh_command = argv.get(1).cloned().unwrap_or_default();
-        let valid_command = refresh_queue_command_allowed(&argv, COMMAND);
-        if !valid_command {
-            invalid_command_count += 1;
-            fail_count += 1;
-            push_audit_check(
-                &mut checks,
-                &mut blockers,
-                format!("{COMMAND}:entry-{index}:command-valid:{label}"),
-                false,
-                format!(
-                    "refresh entry `{label}` executable `{executable}` command `{refresh_command}` valid={valid_command}"
-                ),
-                Some(format!(
-                    "refresh entry `{label}` has invalid or recursive command `{refresh_command}`"
-                )),
-            );
-            results.push(json!({
-                "label": label,
-                "path": path,
-                "status": "fail",
-                "argv": argv,
-                "reason": "invalid-command"
-            }));
-            continue;
-        }
-        if dry_run {
-            pass_count += 1;
-            push_audit_check(
-                &mut checks,
-                &mut blockers,
-                format!("{COMMAND}:entry-{index}:dry-run:{label}"),
-                true,
-                format!("would run {}", shell_join_args(&argv)),
-                None,
-            );
-            results.push(json!({
-                "label": label,
-                "path": path,
-                "status": "dry-run",
-                "argv": argv,
-                "command": shell_join_args(&argv)
-            }));
-            continue;
-        }
-        run_count += 1;
-        let started = Instant::now();
-        let output = Command::new(&argv[0]).args(&argv[1..]).output();
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        match output {
-            Ok(output) => {
-                let success = output.status.success();
-                if success {
-                    pass_count += 1;
-                } else {
-                    fail_count += 1;
-                }
-                push_audit_check(
-                    &mut checks,
-                    &mut blockers,
-                    format!("{COMMAND}:entry-{index}:exit-success:{label}"),
-                    success,
-                    format!(
-                        "{} exit_status={}, elapsed_ms={elapsed_ms:.3}",
-                        shell_join_args(&argv),
-                        output.status
-                    ),
-                    (!success).then(|| {
-                        format!(
-                            "refresh entry `{label}` failed with exit status {}",
-                            output.status
-                        )
-                    }),
-                );
-                let (stdout, stdout_truncated) =
-                    bounded_command_text(&output.stdout, output_byte_limit);
-                let (stderr, stderr_truncated) =
-                    bounded_command_text(&output.stderr, output_byte_limit);
-                results.push(json!({
-                    "label": label,
-                    "path": path,
-                    "status": if success { "pass" } else { "fail" },
-                    "argv": argv,
-                    "command": shell_join_args(&argv),
-                    "exit_status": output.status.to_string(),
-                    "exit_code": output.status.code(),
-                    "elapsed_ms": elapsed_ms,
-                    "stdout": stdout,
-                    "stdout_truncated": stdout_truncated,
-                    "stderr": stderr,
-                    "stderr_truncated": stderr_truncated
-                }));
-            }
-            Err(error) => {
-                fail_count += 1;
-                push_audit_check(
-                    &mut checks,
-                    &mut blockers,
-                    format!("{COMMAND}:entry-{index}:spawn:{label}"),
-                    false,
-                    error.to_string(),
-                    Some(format!(
-                        "refresh entry `{label}` could not be spawned: {error}"
-                    )),
-                );
-                results.push(json!({
-                    "label": label,
-                    "path": path,
-                    "status": "fail",
-                    "argv": argv,
-                    "command": shell_join_args(&argv),
-                    "error": error.to_string(),
-                    "elapsed_ms": elapsed_ms
-                }));
-            }
-        }
-    }
-    if refresh_queue_should_rerun_owner_aggregate_after_entries(
-        selected_has_upstream_phase,
-        owner_aggregate_rerun_done,
-        fail_count,
-        dry_run,
-    ) {
-        owner_aggregate_reruns = rerun_refresh_entry_owner_aggregates(
-            &selected,
-            output_byte_limit,
-            &mut checks,
-            &mut blockers,
-        );
-    }
+    let mut results = initial_execution.results.clone();
+    let mut missing_argv_count = initial_execution.missing_argv_count;
+    let mut invalid_command_count = initial_execution.invalid_command_count;
+    let mut run_count = initial_execution.run_count;
+    let mut pass_count = initial_execution.pass_count;
+    let mut fail_count = initial_execution.fail_count;
+    let boon_cli_prebuild = initial_execution.boon_cli_prebuild.clone();
+    let owner_aggregate_reruns = initial_execution.owner_aggregate_reruns.clone();
     push_audit_check(
         &mut checks,
         &mut blockers,

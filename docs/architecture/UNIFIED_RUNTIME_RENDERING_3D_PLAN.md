@@ -2388,3 +2388,16 @@ This architecture is implemented only when all of the following are true:
 The governing implementation principle is:
 
 > Preserve stable identity and precise changes from Boon equations all the way to pixels and printer regions. Recompute only when a dependency, tolerance, or platform resource genuinely requires it.
+
+---
+
+## 28. Progress checkpoints
+
+### 2026-07-06 — ProductRenderGraph is mandatory
+
+- Removed the native playground `BOON_NATIVE_PRODUCT_RENDER_GRAPH` runtime escape hatch.
+- Removed xtask graph-disabled/baseline ProductRenderGraph comparison logic.
+- `ProductRenderGraph` / `PresentPlan` emission is now the only product interaction contract; missing graph, present plan, or execution evidence is a verifier failure.
+- Removed graph-disabled before-report requirements from `verify-native-product-render-graph`; the focused gate now checks current active reports only.
+- Kept negative proof counters such as full-rebuild fallback and proof/readback-in-product counts because they reject slow paths rather than preserve legacy behavior.
+- Focused verification for this checkpoint: `cargo fmt -- --check`, `cargo build -q -p xtask`, `cargo test -q -p xtask product_render_graph -- --nocapture`, `cargo test -q -p xtask cells_visible_click_product -- --nocapture`, `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`, `cargo test -q -p boon_native_playground product_render_graph -- --nocapture`, and `git diff --check`.

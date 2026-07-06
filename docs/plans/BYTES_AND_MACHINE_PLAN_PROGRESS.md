@@ -38445,6 +38445,31 @@ Fresh focused evidence before commit:
   change; reports became stale for the changed verifier identity and must be
   refreshed after commit.
 
+## 2026-07-06 - Native Runtime Assertions Require Live Preview Route
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Removed the remaining native preview label-contract alternative that accepted
+  a passing `source_scenario_replay` assertion plus host-route ack as native
+  runtime assertion proof.
+- Native preview E2E handoff reports must now prove
+  `native_runtime_assertion_evidence.live_preview_process_route = true`.
+  PlanExecutor source replay remains semantic/BYTES evidence and does not prove
+  native runtime behavior.
+- Updated the native visible-reality test fixture to model live preview runtime
+  evidence instead of stale source replay evidence.
+
+Fresh focused evidence before commit:
+
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p xtask
+  native_runtime_assertion_requires_live_preview_route_not_source_replay
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask source_replay_dependency -- --nocapture`: pass.
+- `cargo check -q -p xtask`: pass.
+
 ## 2026-07-06 - Source Replay Retired `--engine` Compatibility Cut
 
 Status: implemented and focused-verified.

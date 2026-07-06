@@ -3340,10 +3340,6 @@ fn report_is_blocker_audit(report: &JsonValue) -> bool {
                 | "verify-boon-driver-dev-window"
                 | "verify-boon-driver-speed"
                 | "verify-boon-driver-all"
-                | "verify-linux-human-like-environment"
-                | "verify-linux-human-like-e2e"
-                | "verify-linux-human-like-speed"
-                | "verify-linux-human-like-all"
         )
     )
 }

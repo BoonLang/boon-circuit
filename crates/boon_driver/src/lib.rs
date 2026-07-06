@@ -11,7 +11,6 @@ pub const TIER_HUMAN: &str = "human";
 pub const TIER_HOST_SYNTHETIC: &str = "host-synthetic";
 
 pub const METHOD_APP_OWNED_HOST_INPUT: &str = "boon-driver-app-owned-host-input";
-pub const METHOD_LINUX_HUMAN_LIKE: &str = "linux-human-like-isolated-compositor";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceIntent {

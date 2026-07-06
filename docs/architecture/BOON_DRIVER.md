@@ -254,10 +254,10 @@ driver gates because they can capture the wrong workspace or unrelated windows.
 
 ### Native Linux
 
-Default automation should use the app-owned BoonDriver adapter. Real-window
-evidence requires a separate Linux platform adapter that can prove compositor
-delivery to the exact window. See
-`docs/architecture/LINUX_HUMAN_LIKE_TESTING.md`.
+Default automation should use the app-owned BoonDriver adapter. Native
+real-window evidence is owned by the native GPU contract, which proves input and
+readback through app-owned host-event/WGPU paths rather than a separate
+Linux-human-like harness. See `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 
 ### Browser/WASM
 
@@ -348,7 +348,7 @@ A terminal backend can implement the same driver concepts:
 
 ### Phase 5: Platform Real-Window Adapters
 
-- Implement Linux human-like adapter separately from BoonDriver core.
+- Keep native real-window evidence in the native GPU verifier path.
 - Add browser/WASM adapter through Playwright/WebDriver later.
 - Add macOS/Windows adapters only behind opt-in platform features.
 - Keep `boon-driver` as the default automated tier everywhere.
@@ -397,4 +397,3 @@ BoonDriver is acceptable when:
 - browser/WASM can reuse the same scenario files with a different adapter;
 - negative tests fail if runtime shortcuts, example shortcuts, stale artifacts,
   or wrong evidence tiers are introduced.
-

@@ -19338,7 +19338,7 @@ Files changed in this slice:
 - `crates/boon_runtime/src/lib.rs`
 - `crates/xtask/src/main.rs`
 - `examples/cells/view.bn`
-- `tools/linux-human-like/weston-test-driver.c`
+- `tools/native-isolated-input/weston-test-driver.c`
 - `vendor/app_window/src/input/keyboard.rs`
 - `vendor/app_window/src/input/mouse.rs`
 - `vendor/app_window/src/sys/linux/window.rs`
@@ -19957,7 +19957,7 @@ smoke gate and preserves the broader p95/max distinction.
 
 What changed:
 
-- `tools/linux-human-like/weston-test-driver.c` now emits monotonic timestamps
+- `tools/native-isolated-input/weston-test-driver.c` now emits monotonic timestamps
   for process start, pointer move, button press, and button release.
 - `verify-native-cells-visible-click-e2e` converts those driver timestamps into
   a `click_measurement_timing` report and uses the actual Weston button-release

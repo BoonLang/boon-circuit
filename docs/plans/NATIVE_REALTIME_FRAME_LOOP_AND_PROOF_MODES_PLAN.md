@@ -5407,7 +5407,7 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo check -q -p xtask`;
   - `git diff --check`;
   - direct `cc` compile of
-    `tools/linux-human-like/weston-test-driver.c` against the generated
+    `tools/native-isolated-input/weston-test-driver.c` against the generated
     Weston test protocol;
   - `cargo xtask verify-native-gpu-scroll-speed --example cells --report
     target/reports/native-gpu/scroll-speed-cells.json` failed honestly with the

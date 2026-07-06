@@ -29,7 +29,7 @@ Local constraints:
 - `docs/architecture/NATIVE_GPU_PIPELINE.md` remains the active native GPU
   evidence contract.
 - `docs/architecture/BOON_DRIVER.md` is the OS-agnostic automation direction.
-- `docs/architecture/LINUX_HUMAN_LIKE_TESTING.md` is a platform-specific
+- `docs/architecture/NATIVE_GPU_PIPELINE.md` is a platform-specific
   upgrade tier, not the portable default.
 - Existing `.scn` files remain the scenario source format. Do not invent a
   parallel scenario DSL for this docs pass.
@@ -370,7 +370,7 @@ Local docs and files:
 
 - `docs/architecture/NATIVE_GPU_PIPELINE.md`
 - `docs/architecture/BOON_DRIVER.md`
-- `docs/architecture/LINUX_HUMAN_LIKE_TESTING.md`
+- `docs/architecture/NATIVE_GPU_PIPELINE.md`
 - `docs/plans/EXAMPLE_VERIFICATION_PLAN.md`
 - `docs/plans/MANUAL_TESTING_RUNBOOK.md`
 - `examples/manifest.toml`

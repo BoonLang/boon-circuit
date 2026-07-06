@@ -38758,3 +38758,40 @@ Fresh focused evidence before commit:
   --glob '!target'`: no matches.
 - `cargo test -q -p boon_ir scene_view_bindings -- --nocapture`: pass.
 - `cargo check -q -p boon_ir`: pass.
+
+## 2026-07-06 - Linux Human-Like Harness Removed From Active Verification
+
+Status: implemented and focused-verified; broad native refresh pending.
+
+What changed:
+
+- Removed the public `verify-linux-human-like-environment`,
+  `verify-linux-human-like-e2e`, `verify-linux-human-like-speed`, and
+  `verify-linux-human-like-all` `xtask` command surface.
+- Deleted the obsolete Linux human-like architecture doc instead of keeping a
+  stale command guide.
+- Removed stale native preview/scroll sidecars that linked current native proof
+  to `target/reports/linux-human-like/*` reports.
+- Renamed the remaining active Weston surface probe helper and artifact/tool
+  paths to native isolated input terminology. The native scroll retry path still
+  uses isolated Weston as a native verifier implementation detail, but the
+  deleted Linux-human-like report family no longer exists as a parallel proof
+  stack.
+- Removed the unused `METHOD_LINUX_HUMAN_LIKE` BoonDriver constant and schema
+  allow-list entries for the deleted commands.
+
+Fresh focused evidence before commit:
+
+- `rg -n
+  "linux_human_like|verify-linux-human-like|target/reports/linux-human-like|LINUX_HUMAN_LIKE|linux-human-like|run_linux_human_like|tools/linux-human-like|METHOD_LINUX_HUMAN_LIKE"
+  crates docs tools --glob '!target'`: no matches.
+- `cargo fmt`: pass.
+- `cargo check -q -p xtask -p boon_report_schema -p boon_driver`: pass.
+- `cargo test -q -p boon_report_schema native -- --nocapture`: pass.
+- `cargo test -q -p boon_driver -- --nocapture`: pass.
+- `cargo test -q -p xtask advertised_xtask_commands_are_unique --
+  --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`: pass.
+- `cargo test -q -p xtask
+  native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
+  --nocapture`: pass.

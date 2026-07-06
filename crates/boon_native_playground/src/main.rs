@@ -397,12 +397,10 @@ fn run_interaction_speed(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         status_overlay: None,
         last_dirty_reason: None,
     }));
-    let live_runtime = Arc::new(Mutex::new(
-        boon_runtime::LiveRuntime::from_project_plan_executor(
-            &format!("interaction-speed:{}", source_path.display()),
-            &source_units,
-        )?,
-    ));
+    let live_runtime = Arc::new(Mutex::new(boon_runtime::LiveRuntime::from_project(
+        &format!("interaction-speed:{}", source_path.display()),
+        &source_units,
+    )?));
     let mut input_state = PreviewNativeInputState::default();
     let input = deterministic_click_input(event_count, x, y);
     let started = Instant::now();
@@ -1794,7 +1792,7 @@ fn run_novywave_interaction_speed(
         let source_path = PathBuf::from(&entry.source);
         let source = boon_runtime::source_text_for_entry(entry)?;
         let source_units = boon_runtime::source_units_for_entry(entry)?;
-        let runtime = boon_runtime::LiveRuntime::from_project_plan_executor(
+        let runtime = boon_runtime::LiveRuntime::from_project(
             &format!("interaction-speed:{}", source_path.display()),
             &source_units,
         )?;
@@ -8222,7 +8220,7 @@ fn live_runtime_from_source_text(
     source: &str,
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
     let units = project_units_for_source_text(source_path, source);
-    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
+    Ok(boon_runtime::LiveRuntime::from_project(
         source_label,
         &units,
     )?)
@@ -8232,7 +8230,7 @@ fn native_preview_live_runtime_from_project(
     source_label: &str,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
-    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
+    Ok(boon_runtime::LiveRuntime::from_project(
         source_label,
         units,
     )?)
@@ -8245,7 +8243,7 @@ fn native_preview_live_runtime_from_project_profiled(
     let has_world_or_manufacturing_output_root =
         boon_runtime::project_has_world_or_manufacturing_output_root(source_label, units)?;
     let (runtime, mut profile) =
-        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(source_label, units)?;
+        boon_runtime::LiveRuntime::from_project_profiled(source_label, units)?;
     if let Some(object) = profile.as_object_mut() {
         object.insert(
             "native_preview_runtime_selection".to_owned(),
@@ -8271,7 +8269,7 @@ fn live_runtime_from_source_text_with_scenario(
 ) -> Result<boon_runtime::LiveRuntime, Box<dyn std::error::Error>> {
     let _scenario = boon_runtime::parse_scenario(scenario_path)?;
     let units = project_units_for_source_text(source_path, source);
-    Ok(boon_runtime::LiveRuntime::from_project_plan_executor(
+    Ok(boon_runtime::LiveRuntime::from_project(
         source_label,
         &units,
     )?)
@@ -11245,7 +11243,7 @@ fn runtime_document_state_summary_for_project(
     source_path: &Path,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<Value, String> {
-    let mut runtime = boon_runtime::LiveRuntime::from_project_plan_executor(
+    let mut runtime = boon_runtime::LiveRuntime::from_project(
         &format!("native-preview-document:{}", source_path.display()),
         units,
     )
@@ -11265,12 +11263,11 @@ fn runtime_document_state_summary_for_project_profiled(
             "source_unit_count": units.len()
         }),
     );
-    let (mut runtime, init_profile) =
-        boon_runtime::LiveRuntime::from_project_plan_executor_profiled(
-            &format!("native-preview-document:{}", source_path.display()),
-            units,
-        )
-        .map_err(|error| error.to_string())?;
+    let (mut runtime, init_profile) = boon_runtime::LiveRuntime::from_project_profiled(
+        &format!("native-preview-document:{}", source_path.display()),
+        units,
+    )
+    .map_err(|error| error.to_string())?;
     let init_ms = elapsed_ms(total_started);
     write_layout_proof_progress(
         "runtime-state-init-finished",
@@ -18600,14 +18597,14 @@ impl BoonLanguageService {
             boon_runtime::parse_scenario(&scenario_path)
                 .map_err(|error| error.to_string())
                 .and_then(|_| {
-                    boon_runtime::LiveRuntime::from_project_plan_executor(
+                    boon_runtime::LiveRuntime::from_project(
                         &format!("dev-window-validate:{source_label}"),
                         units,
                     )
                     .map_err(|error| error.to_string())
                 })
         } else {
-            boon_runtime::LiveRuntime::from_project_plan_executor(
+            boon_runtime::LiveRuntime::from_project(
                 &format!("dev-window-validate:{source_label}"),
                 units,
             )
@@ -82358,6 +82355,7 @@ label:
             status_overlay: None,
             last_dirty_reason: None,
         }));
+        boon_runtime::parse_scenario(&counter_scenario_path).unwrap();
         let state = Arc::new(Mutex::new(PreviewIpcState {
             source_path: counter_path.clone(),
             source_text: counter_source.clone(),
@@ -82368,12 +82366,7 @@ label:
             preview_perf_stats: None,
             shared_render_state: Arc::clone(&shared_render_state),
             live_runtime: Some(Arc::new(Mutex::new(
-                boon_runtime::LiveRuntime::new(
-                    "test-counter",
-                    &counter_source,
-                    &counter_scenario_path,
-                )
-                .unwrap(),
+                boon_runtime::LiveRuntime::from_source("test-counter", &counter_source).unwrap(),
             ))),
             world_scene: None,
             world_editor_session: None,
@@ -82432,11 +82425,8 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_plan_executor(
-                "preview-world-editor-visible-car",
-                &units,
-            )
-            .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project("preview-world-editor-visible-car", &units)
+                .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))
@@ -82509,11 +82499,8 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_plan_executor(
-                "preview-hello-3d-world-scene",
-                &units,
-            )
-            .expect("hello_3d runtime should build"),
+            boon_runtime::LiveRuntime::from_project("preview-hello-3d-world-scene", &units)
+                .expect("hello_3d runtime should build"),
         ));
         let world_scene = preview_world_scene_for_live_runtime(&source_hash, Some(&live_runtime))
             .expect("hello_3d runtime should expose a world scene");
@@ -82535,11 +82522,8 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_plan_executor(
-                "preview-hello-3d-world-scene-orbit",
-                &units,
-            )
-            .expect("hello_3d runtime should build"),
+            boon_runtime::LiveRuntime::from_project("preview-hello-3d-world-scene-orbit", &units)
+                .expect("hello_3d runtime should build"),
         ));
         let world_scene = preview_world_scene_for_live_runtime(&source_hash, Some(&live_runtime))
             .expect("hello_3d runtime should expose a world scene");
@@ -82644,11 +82628,8 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_plan_executor(
-                "preview-world-editor-host-car",
-                &units,
-            )
-            .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project("preview-world-editor-host-car", &units)
+                .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))
@@ -82884,11 +82865,8 @@ label:
         let units = project_units_for_source_text(&source_path, &source);
         let source_hash = boon_runtime::source_units_hash(&units);
         let live_runtime = Arc::new(Mutex::new(
-            boon_runtime::LiveRuntime::from_project_plan_executor(
-                "preview-world-editor-click-car",
-                &units,
-            )
-            .expect("parametric car runtime should build"),
+            boon_runtime::LiveRuntime::from_project("preview-world-editor-click-car", &units)
+                .expect("parametric car runtime should build"),
         ));
         let world_editor_session =
             preview_world_editor_session_for_live_runtime(&source_hash, Some(&live_runtime))

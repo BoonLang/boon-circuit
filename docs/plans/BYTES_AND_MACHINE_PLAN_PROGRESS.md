@@ -38680,3 +38680,34 @@ Known verification limit:
   passing evidence; it reinforces that broad Cells scenario replay is too costly
   for every report-contract cleanup slice and should be covered by the larger
   fresh native/report aggregate pass.
+
+## 2026-07-06 - LiveRuntime PlanExecutor Alias Constructors Deleted
+
+Status: implemented and focused-verified; broad report refresh pending.
+
+What changed:
+
+- Deleted the migration-style `LiveRuntime::from_source_plan_executor`,
+  `LiveRuntime::from_project_plan_executor`,
+  `LiveRuntime::from_project_plan_executor_profiled`,
+  `LiveRuntime::new`, and `LiveRuntime::new_from_project` constructor surface.
+- Normal `LiveRuntime::{from_source, from_project, from_project_profiled}` is
+  now the PlanExecutor-backed product construction API. Verifiers that need a
+  scenario must parse the scenario explicitly, then construct the runtime
+  normally.
+- Replaced runtime, native playground, and `xtask` call sites with the normal
+  constructor surface and removed tests whose only purpose was preserving the
+  deleted scenario-shaped wrappers.
+- Updated the active goal prompt so future work does not reintroduce explicit
+  PlanExecutor constructor aliases.
+
+Fresh focused evidence before commit:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p boon_runtime live_runtime_default -- --nocapture`: pass.
+- `rg -n
+  "from_source_plan_executor|from_project_plan_executor|new_from_project\\(|LiveRuntime::new\\("
+  crates docs/plans/GOAL_PROMPT.md --glob '!target'`: no matches.
+- `git diff --check`: pass.

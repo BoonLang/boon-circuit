@@ -11445,25 +11445,7 @@ impl LiveRuntime {
         &mut self.plan_session
     }
 
-    pub fn new(source_label: &str, source_text: &str, scenario_path: &Path) -> RuntimeResult<Self> {
-        let _scenario = parse_scenario(scenario_path)?;
-        Self::from_source_plan_executor(source_label, source_text)
-    }
-
-    pub fn new_from_project(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-        scenario_path: &Path,
-    ) -> RuntimeResult<Self> {
-        let _scenario = parse_scenario(scenario_path)?;
-        Self::from_project_plan_executor(source_label, units)
-    }
-
     pub fn from_source(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
-        Self::from_source_plan_executor(source_label, source_text)
-    }
-
-    pub fn from_source_plan_executor(source_label: &str, source_text: &str) -> RuntimeResult<Self> {
         let plan_session = PlanExecutorLiveSession::from_source(
             source_label,
             source_text,
@@ -11477,13 +11459,6 @@ impl LiveRuntime {
     }
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
-        Self::from_project_plan_executor(source_label, units)
-    }
-
-    pub fn from_project_plan_executor(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<Self> {
         let plan_session = PlanExecutorLiveSession::from_project(
             source_label,
             units,
@@ -11496,7 +11471,7 @@ impl LiveRuntime {
         })
     }
 
-    pub fn from_project_plan_executor_profiled(
+    pub fn from_project_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, JsonValue)> {
@@ -11508,37 +11483,26 @@ impl LiveRuntime {
             TargetProfile::SoftwareDefault,
         )?;
         let session_ms = runtime_elapsed_ms(session_started);
-        let live_runtime = Self {
+        let runtime = Self {
             plan_session,
             next_step: 1,
             last_source_batch_sequence: None,
         };
-        let provenance = live_runtime.engine_provenance_report();
-        Ok((
-            live_runtime,
-            json!({
-                "initialized_runtime_cache_hit": false,
+        let provenance = runtime.engine_provenance_report();
+        let mut profile = json!({
+            "initialized_runtime_cache_hit": false,
+            "engine": "plan_executor",
+            "session_kind": "machine-plan-live-session",
+            "generic_fallback_enabled": false,
+            "source_unit_count": units.len(),
+            "runtime": {
                 "engine": "plan_executor",
-                "session_kind": "machine-plan-live-session",
-                "generic_fallback_enabled": false,
-                "source_unit_count": units.len(),
-                "runtime": {
-                    "engine": "plan_executor",
-                    "session_init_ms": session_ms,
-                    "provenance": provenance
-                },
-                "runtime_total_ms": session_ms,
-                "total_ms": runtime_elapsed_ms(total_started)
-            }),
-        ))
-    }
-
-    pub fn from_project_profiled(
-        source_label: &str,
-        units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<(Self, JsonValue)> {
-        let (runtime, mut profile) =
-            Self::from_project_plan_executor_profiled(source_label, units)?;
+                "session_init_ms": session_ms,
+                "provenance": provenance
+            },
+            "runtime_total_ms": session_ms,
+            "total_ms": runtime_elapsed_ms(total_started)
+        });
         if let Some(object) = profile.as_object_mut() {
             object.insert(
                 "default_runtime_selection".to_owned(),
@@ -44423,8 +44387,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("root-scalar-direct-read-defers-flush", source)
-                .unwrap();
+            LiveRuntime::from_source("root-scalar-direct-read-defers-flush", source).unwrap();
         assert_eq!(runtime.state_summary()["store"]["label"], "old/old");
 
         let output = runtime
@@ -44468,8 +44431,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: store.page_label))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("root-structured-parent-no-empty-patch", source)
-                .unwrap();
+            LiveRuntime::from_source("root-structured-parent-no-empty-patch", source).unwrap();
         let initial_summary = runtime.state_summary();
         assert_eq!(
             initial_summary["store"]["page_label"], "42 s PageRef",
@@ -44684,11 +44646,8 @@ FUNCTION new_todo(title) {
     #[test]
     fn cells_selected_input_list_find_materializes_single_row_storage() {
         let source = cells_project_source_for_test();
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-selected-input-list-find-storage",
-            &source,
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-selected-input-list-find-storage", &source).unwrap();
         let initial = runtime.document_state_summary();
         assert_eq!(initial["store"]["selected_input"]["address"], "A0");
         assert_eq!(
@@ -44711,8 +44670,7 @@ FUNCTION new_todo(title) {
     fn cells_selected_input_document_state_values_use_indexed_list_find_projection() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("cells-selected-input-targeted-values", &source)
-                .unwrap();
+            LiveRuntime::from_source("cells-selected-input-targeted-values", &source).unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.select".to_owned(),
@@ -44739,8 +44697,7 @@ FUNCTION new_todo(title) {
     fn cells_window_document_summary_keeps_selected_projection_current() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("cells-selected-input-window-summary", &source)
-                .unwrap();
+            LiveRuntime::from_source("cells-selected-input-window-summary", &source).unwrap();
         runtime
             .apply_source_event_turn(LiveSourceEvent {
                 source: "cell.sources.editor.select".to_owned(),
@@ -44766,8 +44723,7 @@ FUNCTION new_todo(title) {
     fn cells_visible_value_edit_keeps_window_summary_bounded_and_current() {
         let source = cells_project_source_for_test();
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("cells-chunk-row-field-edit-skip", &source)
-                .unwrap();
+            LiveRuntime::from_source("cells-chunk-row-field-edit-skip", &source).unwrap();
 
         let initial = runtime.document_state_summary_for_window(0, 24, 0, 10);
         assert_eq!(initial["store"]["sheet_rows"].as_array().unwrap().len(), 24);
@@ -45026,8 +44982,7 @@ FUNCTION new_todo(title) {
             })
         }));
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("cells-defaults-from-boon", &cells_source)
-                .unwrap();
+            LiveRuntime::from_source("cells-defaults-from-boon", &cells_source).unwrap();
         let summary = runtime.document_state_summary();
         let a0 = summary
             .get("cells")
@@ -45084,7 +45039,7 @@ FUNCTION new_number(number) {
             CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
         );
 
-        let mut runtime = LiveRuntime::from_source_plan_executor("range-list", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("range-list", source).unwrap();
         let summary = runtime.state_summary();
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -45123,8 +45078,7 @@ FUNCTION new_number(number) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("generic-window-materialization", source)
-                .unwrap();
+            LiveRuntime::from_source("generic-window-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(4, 3, 0, 1);
         let rows = summary["numbers"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
@@ -45200,8 +45154,7 @@ FUNCTION new_row(row) {
     ]
 }
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("nested-row-fields", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("nested-row-fields", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["page_ref"]["page_kind"], "signal_page");
         let row = &summary["rows"][0];
@@ -45262,8 +45215,7 @@ FUNCTION new_item(item) {
     ]
 }
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("generic-page-materialization", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("generic-page-materialization", source).unwrap();
         let summary = runtime.document_state_summary_for_window(1, 1, 0, 2);
         let pages = summary["store"]["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 1);
@@ -45343,8 +45295,7 @@ FUNCTION new_entry(entry) {
                 && projection.columns == 2
         }));
 
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("generic-list-projections", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("generic-list-projections", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_input"]["address"], "B0");
         assert_eq!(summary["store"]["selected_input"]["value"], "2");
@@ -45407,8 +45358,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("list-user-key-fields", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("list-user-key-fields", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_value"], "signal");
         assert_eq!(summary["store"]["selected_end"], 150);
@@ -45450,9 +45400,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.response))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("derived-hold-trigger-same-turn", source)
-                .expect("runtime should initialize");
+        let mut runtime = LiveRuntime::from_source("derived-hold-trigger-same-turn", source)
+            .expect("runtime should initialize");
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "store.elements.select_next".to_owned(),
@@ -45509,8 +45458,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Text concat }))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("text-concat-labels", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("text-concat-labels", source).unwrap();
         let summary = runtime.state_summary();
         assert_eq!(summary["store"]["scoped_label"], "4 results in top.cpu");
         assert_eq!(
@@ -45549,9 +45497,8 @@ FUNCTION new_marker(marker, store) {
     ]
 }
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("indexed-text-const-row-update", source)
-                .expect("runtime should load const indexed text source");
+        let mut runtime = LiveRuntime::from_source("indexed-text-const-row-update", source)
+            .expect("runtime should load const indexed text source");
         let mut action = BTreeMap::new();
         action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
         action.insert(
@@ -45655,7 +45602,7 @@ FUNCTION new_marker(marker) {
     ]
 }
 "#;
-        let mut runtime = LiveRuntime::from_source_plan_executor("source-const-append-row", source)
+        let mut runtime = LiveRuntime::from_source("source-const-append-row", source)
             .expect("runtime should load const append source");
         let mut create_expected = BTreeMap::new();
         create_expected.insert(
@@ -46049,8 +45996,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.one))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("value-summary-path-count", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("value-summary-path-count", source).unwrap();
         let paths = [
             "store.one",
             "store.two",
@@ -46107,8 +46053,7 @@ FUNCTION new_signal(signal) {
 }
 "#;
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("row-scoped-source-needs-row-context", source)
-                .unwrap();
+            LiveRuntime::from_source("row-scoped-source-needs-row-context", source).unwrap();
         let error = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "signal.signal_elements.select_signal".to_owned(),
@@ -46220,9 +46165,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("derived-root-summary-byte-length", source)
-                .expect("runtime should initialize");
+        let mut runtime = LiveRuntime::from_source("derived-root-summary-byte-length", source)
+            .expect("runtime should initialize");
         let initial = runtime.state_summary();
         assert_eq!(initial["store"]["descriptor_file"], "simple.vcd");
         assert_eq!(initial["store"]["byte_length"], 311);
@@ -46326,7 +46270,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.a_output))
 "#;
-        let mut runtime = LiveRuntime::from_source_plan_executor("root-derived-revisit", source)
+        let mut runtime = LiveRuntime::from_source("root-derived-revisit", source)
             .expect("runtime should initialize");
         assert_eq!(runtime.state_summary()["store"]["a_output"], "cold-output");
 
@@ -46729,11 +46673,9 @@ document: Document/new(root: Element/label(element: [], label: store.a_output))
 
     #[test]
     fn cells_deltas_use_hidden_list_slots_not_visible_address_hashes() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-hidden-keys",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-hidden-keys", &cells_project_source_for_test())
+                .unwrap();
         let output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.commit".to_owned(),
@@ -46793,8 +46735,7 @@ document: Document/new(root: Element/label(element: [], label: store.a_output))
         let parsed = parse_source("examples/cells.bn", source).unwrap();
         lower(&parsed).unwrap();
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("renamed-cells-sources", &parsed.source)
-                .unwrap();
+            LiveRuntime::from_source("renamed-cells-sources", &parsed.source).unwrap();
         let _output = runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.apply".to_owned(),
@@ -46858,11 +46799,9 @@ document: Document/new(root: Element/label(element: [], label: store.a_output))
 
     #[test]
     fn cells_escape_cancel_restores_uncommitted_draft_from_row_formula_text() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-cancel-draft",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-cancel-draft", &cells_project_source_for_test())
+                .unwrap();
         runtime
             .apply_source_event(LiveSourceEvent {
                 source: "cell.sources.editor.change".to_owned(),
@@ -47377,8 +47316,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 "#;
         let mut runtime =
-            LiveRuntime::from_source_plan_executor("plan-executor-list-find-value", source)
-                .unwrap();
+            LiveRuntime::from_source("plan-executor-list-find-value", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(
             summary["store"]["selected_value"], "second",
@@ -47439,8 +47377,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "root List/find should lower to a PlanExecutor list projection"
         );
 
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("plan-executor-list-find", source).unwrap();
+        let mut runtime = LiveRuntime::from_source("plan-executor-list-find", source).unwrap();
         let summary = runtime.document_state_summary();
         assert_eq!(summary["store"]["selected_record"]["key"], "row-2");
         assert_eq!(summary["store"]["selected_record"]["value"], "second");
@@ -51807,7 +51744,7 @@ expected_source_event = {{ source = "store.decode" }}
                 }
             })
             .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project_plan_executor(source_label, &runtime_units)
+        let mut runtime = LiveRuntime::from_project(source_label, &runtime_units)
             .expect("LiveRuntime PlanExecutor mode should initialize");
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
@@ -52216,9 +52153,8 @@ expected_source_event = {{ source = "store.decode" }}
             })
             .collect::<Vec<_>>();
 
-        let mut runtime =
-            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
-                .expect("LiveRuntime PlanExecutor mode should initialize");
+        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
+            .expect("LiveRuntime PlanExecutor mode should initialize");
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
             "plan_executor"
@@ -52265,9 +52201,8 @@ expected_source_event = {{ source = "store.decode" }}
                 source: unit.source,
             })
             .collect::<Vec<_>>();
-        let mut runtime =
-            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
-                .expect("TodoMVC should initialize through PlanExecutor");
+        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
+            .expect("TodoMVC should initialize through PlanExecutor");
         assert_eq!(
             runtime.engine_provenance_report()["generic_fallback_enabled"],
             false
@@ -52360,9 +52295,8 @@ expected_source_event = {{ source = "store.decode" }}
                 source: unit.source,
             })
             .collect::<Vec<_>>();
-        let mut runtime =
-            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
-                .expect("TodoMVC should initialize through PlanExecutor");
+        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
+            .expect("TodoMVC should initialize through PlanExecutor");
         assert_eq!(
             runtime.engine_provenance_report()["generic_fallback_enabled"],
             false
@@ -52435,7 +52369,7 @@ expected_source_event = {{ source = "store.decode" }}
             .collect::<Vec<_>>();
 
         let (runtime, profile) =
-            LiveRuntime::from_project_plan_executor_profiled("examples/todomvc.bn", &runtime_units)
+            LiveRuntime::from_project_profiled("examples/todomvc.bn", &runtime_units)
                 .expect("profiled PlanExecutor constructor should initialize TodoMVC");
 
         assert_eq!(
@@ -52485,52 +52419,6 @@ expected_source_event = {{ source = "store.decode" }}
         let runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units).expect(
             "TodoMVC should initialize through the default LiveRuntime project constructor",
         );
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_scenario_constructor_uses_plan_executor_for_document_programs() {
-        let runtime = LiveRuntime::new(
-            "examples/counter.bn",
-            include_str!("../../../examples/counter.bn"),
-            Path::new("../../examples/counter.scn"),
-        )
-        .expect("Counter scenario constructor should initialize through PlanExecutor");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_project_scenario_constructor_uses_plan_executor() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let runtime = LiveRuntime::new_from_project(
-            "examples/todomvc.bn",
-            &runtime_units,
-            Path::new("../../examples/todomvc.scn"),
-        )
-        .expect("TodoMVC project scenario constructor should initialize through PlanExecutor");
 
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
@@ -52633,9 +52521,8 @@ expected_source_event = {{ source = "store.decode" }}
                 }
             })
             .collect::<Vec<_>>();
-        let mut runtime =
-            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
-                .expect("LiveRuntime PlanExecutor mode should initialize");
+        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
+            .expect("LiveRuntime PlanExecutor mode should initialize");
         runtime
             .apply_source_batch_turn(SourceBatch {
                 sequence_id: 1,
@@ -52739,7 +52626,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
             "root List/map ListView must carry an executable row expression: {projected_op:#?}"
         );
 
-        let mut runtime = LiveRuntime::from_source_plan_executor("root-list-map-summary", source)
+        let mut runtime = LiveRuntime::from_source("root-list-map-summary", source)
             .expect("root List/map projection should initialize through PlanExecutor");
 
         let summary = runtime.document_state_summary();
@@ -52770,9 +52657,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 source: unit.source,
             })
             .collect::<Vec<_>>();
-        let mut runtime =
-            LiveRuntime::from_project_plan_executor("examples/todomvc.bn", &runtime_units)
-                .expect("LiveRuntime PlanExecutor mode should initialize");
+        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
+            .expect("LiveRuntime PlanExecutor mode should initialize");
 
         assert!(runtime.has_source_path("store.sources.new_todo_input.change"));
         assert!(runtime.has_source_path("store.sources.new_todo_input.events.change"));
@@ -52848,9 +52734,8 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.value))
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("plan-executor-legacy-output-guard", source)
-                .expect("source should initialize in PlanExecutor mode");
+        let mut runtime = LiveRuntime::from_source("plan-executor-legacy-output-guard", source)
+            .expect("source should initialize in PlanExecutor mode");
         let world_error = runtime
             .world_scene_output()
             .expect_err("PlanExecutor mode must not fall back for world output")
@@ -52871,7 +52756,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn live_runtime_plan_executor_cells_window_summary_is_bounded_and_current() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
+        let mut runtime = LiveRuntime::from_source(
             "cells-plan-window-summary",
             &cells_project_source_for_test(),
         )
@@ -53735,11 +53620,8 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_helpers_support_documented_arithmetic_ops() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-arithmetic",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-arithmetic", &cells_project_source_for_test()).unwrap();
         for (formula, expected) in [
             ("=8+2", "10"),
             ("=8-2", "6"),
@@ -53799,7 +53681,7 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn cells_unrelated_row_commit_preserves_default_sum_until_formula_changes() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
+        let mut runtime = LiveRuntime::from_source(
             "cells-unrelated-row-commit",
             &cells_project_source_for_test(),
         )
@@ -53829,11 +53711,9 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_replacing_reference_removes_stale_dependents() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-replace-reference",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-replace-reference", &cells_project_source_for_test())
+                .unwrap();
         commit_cell(&mut runtime, "A0", "1");
         let output = commit_cell(&mut runtime, "B0", "=A0+1");
         assert_eq!(
@@ -53867,11 +53747,8 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_fanout_recomputes_from_generic_read_index() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-fanout",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-fanout", &cells_project_source_for_test()).unwrap();
         commit_cell(&mut runtime, "A0", "1");
         commit_cell(&mut runtime, "B0", "=A0+1");
         commit_cell(&mut runtime, "C0", "=A0+2");
@@ -53903,11 +53780,9 @@ document: Document/new(root: Element/label(element: [], label: store.value))
 
     #[test]
     fn pure_boon_cells_range_formula_updates_from_member_change() {
-        let mut runtime = LiveRuntime::from_source_plan_executor(
-            "cells-range-fanout",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
+        let mut runtime =
+            LiveRuntime::from_source("cells-range-fanout", &cells_project_source_for_test())
+                .unwrap();
         commit_cell(&mut runtime, "A3", "20");
         let output = commit_cell(&mut runtime, "C0", "=sum(A0:A3)");
         assert_eq!(
@@ -54084,9 +53959,8 @@ world: World/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("world-output-runtime-lowering", source)
-                .expect("world output source should compile");
+        let mut runtime = LiveRuntime::from_source("world-output-runtime-lowering", source)
+            .expect("world output source should compile");
         let output = runtime
             .world_scene_output()
             .expect("world output should lower into a WorldScene");
@@ -54151,9 +54025,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("manufacturing-output-runtime-lowering", source)
-                .expect("manufacturing output source should compile");
+        let mut runtime = LiveRuntime::from_source("manufacturing-output-runtime-lowering", source)
+            .expect("manufacturing output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("manufacturing output should lower into a SolidModelBundle");
@@ -54200,9 +54073,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("curved-solid-output-runtime-lowering", source)
-                .expect("curved solid output source should compile");
+        let mut runtime = LiveRuntime::from_source("curved-solid-output-runtime-lowering", source)
+            .expect("curved solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("curved solid output should lower into a SolidModelBundle");
@@ -54262,9 +54134,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("shell-solid-output-runtime-lowering", source)
-                .expect("shell solid output source should compile");
+        let mut runtime = LiveRuntime::from_source("shell-solid-output-runtime-lowering", source)
+            .expect("shell solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("shell solid output should lower into a SolidModelBundle");
@@ -54320,9 +54191,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("extrude-solid-output-runtime-lowering", source)
-                .expect("extrude solid output source should compile");
+        let mut runtime = LiveRuntime::from_source("extrude-solid-output-runtime-lowering", source)
+            .expect("extrude solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("extrude solid output should lower into a SolidModelBundle");
@@ -54384,9 +54254,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("revolve-solid-output-runtime-lowering", source)
-                .expect("revolve solid output source should compile");
+        let mut runtime = LiveRuntime::from_source("revolve-solid-output-runtime-lowering", source)
+            .expect("revolve solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("revolve solid output should lower into a SolidModelBundle");
@@ -54448,9 +54317,8 @@ manufacturing: Assembly/new(
     }
 )
 "#;
-        let mut runtime =
-            LiveRuntime::from_source_plan_executor("loft-solid-output-runtime-lowering", source)
-                .expect("loft solid output source should compile");
+        let mut runtime = LiveRuntime::from_source("loft-solid-output-runtime-lowering", source)
+            .expect("loft solid output source should compile");
         let output = runtime
             .solid_model_output()
             .expect("loft solid output should lower into a SolidModelBundle");

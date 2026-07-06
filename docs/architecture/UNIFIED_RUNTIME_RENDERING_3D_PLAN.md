@@ -8,6 +8,15 @@
 
 > The commit above is a planning snapshot, not a pin. Every implementation pass must inspect the actual current `HEAD`, preserve user work, and update path/symbol assumptions without reducing the contract.
 
+## Implementation Checkpoints
+
+- 2026-07-06: Removed the old `verify-native-gpu-scroll-speed --surface dev-code-editor`
+  compatibility alias and its report-conversion helpers. The generic native GPU
+  scroll-speed gate is now an example preview gate only; dev-editor scrolling is
+  owned by the dedicated `verify-native-dev-editor-scroll-speed --profile
+  debug|release` verifier. The old native GPU dev-code-editor scroll report
+  label stays out of the native handoff manifest and must fail closed if invoked.
+
 ---
 
 ## 1. Purpose

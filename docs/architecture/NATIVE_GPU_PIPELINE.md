@@ -1267,18 +1267,6 @@ horizontal wheel scroll over the full 26x100 logical grid through
 visible-plus-overscan budget, capture the rendered result through GPU readback,
 and list every frame over 16.7 ms as an outlier.
 
-`verify-native-gpu-scroll-speed --surface dev-code-editor` must launch through
-`--role desktop` with the preview role loaded and debug telemetry enabled. It
-must use a generated source fixture with at least 10,000 lines, a longest line of
-at least 2,000 bytes, diagnostics/selection/caret overlays enabled, and
-sustained vertical and horizontal operator host wheel scroll. Reports must include
-`dev_editor_frame_ms_p50_p95_p99_max`, `wheel_to_visible_ms_p95` per axis,
-`visible_line_count`, `materialized_line_count_max`, `text_runs_shaped_p95`,
-`text_cache_hit_rate`, `glyph_atlas_evictions`, `upload_bytes_p95`,
-`preview_frame_ms_p95`, and `preview_blocked_on_ipc_count` during the editor
-scroll. Hard gates: no full-file widget tree, no full-file reshaping,
-`preview_blocked_on_ipc_count = 0`, and preview frame p95 remains `<= 16.7 ms`.
-
 `verify-native-gpu-idle-wake` must prove the preview and dev child processes use
 the demand-driven render loop in an idle desktop launch. Reports must use child
 PID procfs tick deltas for CPU, include skipped idle polls, dirty/presented
@@ -1290,15 +1278,16 @@ filesystem path, scenario name, or custom-example origin. The same verifier must
 cover Counter, TodoMVC, Cells, and a table-driven custom-project fixture.
 
 `verify-native-dev-editor-scroll-speed` supersedes the old dev-code-editor
-surface scroll report for the manual user-facing editor path. It must run in
-both debug and release profiles, use a passive scroll-only probe, cover vertical
-and horizontal `scroll_column` updates, include a selected custom-example buffer,
-and fail if `command_probe`, source replacement, preview runtime summaries,
-graph rebuilds, full-file materialization, full-file reshaping, or footer
-telemetry polling occur in the scroll hot path. The older
-`verify-native-gpu-scroll-speed --surface dev-code-editor` command may remain
-only as a compatibility alias to the release report, with duplicate reports
-hash-linked or removed from the aggregate.
+surface scroll report for the manual user-facing editor path. The old
+`verify-native-gpu-scroll-speed --surface dev-code-editor` compatibility alias
+has been removed and must fail closed; use
+`verify-native-dev-editor-scroll-speed --profile debug|release` instead. The
+dedicated dev-editor gate must run in both debug and release profiles, use a
+passive scroll-only probe, cover vertical and horizontal `scroll_column`
+updates, include a selected custom-example buffer, and fail if `command_probe`,
+source replacement, preview runtime summaries, graph rebuilds, full-file
+materialization, full-file reshaping, or footer telemetry polling occur in the
+scroll hot path.
 Current speed targets are `wheel_to_visible_ms_p95 <= 35 ms` in debug and
 `<= 16.7 ms` in release, with corresponding max-frame budgets in
 `budgets/native-gpu.toml`.

@@ -38840,6 +38840,19 @@ What changed:
 - Removed the duplicated
   `render_loop_legacy_input_accept_to_present_ms` sample field. The report
   keeps the product `render_loop_input_accept_to_present_ms` metric.
+
+## 2026-07-06 - Native Readback Compatibility Flag Removed
+
+Status: implemented; focused verification pending.
+
+What changed:
+
+- Removed the playground compatibility path where `--probe` or
+  `--frame-readback` implicitly selected readback proof mode.
+- `--proof-mode readback` is now the only CLI path that enables native readback
+  proof mode. Probe launches that need readback pass that mode explicitly.
+- Updated native verifier launch sites and the realtime frame-loop plan to match
+  the explicit proof-mode contract.
 - `cargo test -q -p xtask
   native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
   --nocapture`: pass.

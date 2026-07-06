@@ -8527,7 +8527,8 @@ This checkpoint is progress toward the product/proof split, not the final
   - app-window readback work is gated by `proof_mode == Readback` plus an
     artifact directory, not merely by an optional artifact path;
   - preview/dev roles accept `--proof-mode counters|readback`;
-  - legacy `--probe` / `--frame-readback` still map to `readback`;
+  - legacy `--frame-readback` mapping has been removed; probes that require
+    readback must pass `--proof-mode readback` explicitly;
   - counters mode forces the compact render-hook proof path and reports
     `proof_mode = "counters"` / `configured_proof_mode = "counters"` instead
     of looking like proof accidentally disappeared;

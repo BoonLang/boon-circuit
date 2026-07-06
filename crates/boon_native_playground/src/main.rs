@@ -5868,16 +5868,12 @@ fn json_scalar_display_text(value: &serde_json::Value) -> String {
 
 fn native_proof_mode_arg(
     args: &[String],
-    readback_requested_by_compat_flags: bool,
 ) -> Result<boon_native_app_window::NativeProofMode, Box<dyn std::error::Error>> {
     match value_arg(args, "--proof-mode").as_deref() {
         Some("counters") => Ok(boon_native_app_window::NativeProofMode::Counters),
         Some("readback") => Ok(boon_native_app_window::NativeProofMode::Readback),
         Some(value) => {
             Err(format!("unsupported --proof-mode `{value}`; expected counters|readback").into())
-        }
-        None if readback_requested_by_compat_flags => {
-            Ok(boon_native_app_window::NativeProofMode::Readback)
         }
         None => Ok(boon_native_app_window::NativeProofMode::Counters),
     }
@@ -5998,10 +5994,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let headed_scenario_timeout_ms = numeric_arg(args, "--headed-scenario-timeout-ms")
         .unwrap_or(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS);
-    let frame_readback_requested = synthetic_input_probe
-        || args.iter().any(|arg| arg == "--probe")
-        || args.iter().any(|arg| arg == "--frame-readback");
-    let proof_mode = native_proof_mode_arg(args, frame_readback_requested)?;
+    let proof_mode = native_proof_mode_arg(args)?;
     let frame_readback = proof_mode == boon_native_app_window::NativeProofMode::Readback;
     let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_interactive_surface_readback_when_external_proof = args
@@ -7124,9 +7117,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let probe = args.iter().any(|arg| arg == "--probe");
-    let frame_readback_requested =
-        probe || synthetic_input_probe || args.iter().any(|arg| arg == "--frame-readback");
-    let proof_mode = native_proof_mode_arg(args, frame_readback_requested)?;
+    let proof_mode = native_proof_mode_arg(args)?;
     let frame_readback = proof_mode == boon_native_app_window::NativeProofMode::Readback;
     let adapter_policy = native_adapter_policy_arg(args)?;
     let skip_interactive_surface_readback_when_external_proof = args
@@ -7703,7 +7694,8 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     if probe {
-        preview_args.push("--frame-readback".to_owned());
+        preview_args.push("--proof-mode".to_owned());
+        preview_args.push("readback".to_owned());
     }
     if demand_driven_loop {
         preview_args.push("--demand-driven-loop".to_owned());
@@ -7838,7 +7830,8 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if probe {
         dev_args.push("--probe".to_owned());
-        dev_args.push("--frame-readback".to_owned());
+        dev_args.push("--proof-mode".to_owned());
+        dev_args.push("readback".to_owned());
     }
     if skip_dev_ipc_probe {
         dev_args.push("--skip-ipc-probe".to_owned());

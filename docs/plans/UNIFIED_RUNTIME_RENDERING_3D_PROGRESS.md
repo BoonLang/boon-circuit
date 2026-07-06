@@ -102,6 +102,24 @@ for old evidence.
   with p95 about 2.1 ms, max about 49.9 ms, one bounded outlier, and the spike
   isolated to surface acquire.
 
+### 2026-07-06 - Native Handoff Refreshed Clean
+
+- Re-ran the manifest-backed native refresh queue after the present-floor policy
+  change. It refreshed 17 reports and completed with `status=pass`.
+- Fresh `verify-native-gpu-all --check-existing` passed:
+  `refresh_debt_child_count=0`, `true_blocker_child_count=0`,
+  `child_count=17`.
+- `verify-report-schema target/reports/native-gpu-all.json` passed.
+- Fresh Cells visible-click release evidence passed with product UX separated
+  from proof/harness latency:
+  - product accepted input to formula/present p95: about 10.89 ms;
+  - product accepted input max: about 11.26 ms;
+  - product sample count: 60;
+  - product missed frames: 0;
+  - proof lane status: pass, proof lag max: 0 frames;
+  - broad harness click-to-formula p95 remains about 203 ms and is reported
+    separately from product UX.
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the
@@ -209,15 +227,13 @@ Fresh focused evidence:
 
 ## Next Cuts
 
-1. Run compact native/BYTES aggregate summaries and use fresh taxonomy to choose
-   refresh queue work versus true product blockers.
-2. Delete duplicate report/schema refresh paths that only preserve stale
+1. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints, old comparison contracts, or weak diagnostic timing
    substitutes.
-3. Move the current linear retained `ProductFrameGraph` toward a real
+2. Move the current linear retained `ProductFrameGraph` toward a real
    renderer-owned dirty-resource scheduler.
-4. Re-run focused native Cells product-latency and proof-lane reports after the
-   harness is lean enough that reports are trustworthy.
+3. Keep Cells product-latency and proof-lane reports fresh after each
+   architecture cut.
 
 ## Completion Rules
 

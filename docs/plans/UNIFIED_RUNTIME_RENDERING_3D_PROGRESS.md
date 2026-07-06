@@ -247,7 +247,26 @@ for old evidence.
     `product_contract_child_count=0`.
   - `cargo xtask verify-report-schema target/reports/native-gpu-all.json`:
     pass.
-  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
+
+### 2026-07-06 - App-Owned Scene Proof Uses Scene Identity
+
+- `boon_native_gpu::RenderProofArtifact::AppOwnedPixels` now has mandatory
+  `render_scene_identity_hash` and optional `layout_frame_hash`.
+- `render_app_owned_scene_pixels` no longer writes the prelowered
+  `RenderScene` identity into `layout_frame_hash`.
+- World-scene readback, which projects through a `RenderScene`, also reports
+  scene identity directly instead of pretending the proof came from a
+  `LayoutFrame`.
+- Updated the native GPU architecture contract to document scene identity as
+  the primary app-owned pixel proof key.
+- This is a focused LayoutFrame compatibility cut. The larger remaining
+  playground cut is still to promote `DocumentRenderSnapshot` and the preview
+  render hook caches to scene-first keys instead of LayoutFrame-hash staging
+  keys.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_gpu -p xtask -p boon_report_schema`: pass.
+  - `cargo test -q -p boon_native_gpu app_owned -- --nocapture`:
+    pass; 4 passed.
 
 ### 2026-07-06 - Present-Floor Isolated Fallback Deleted
 
@@ -546,8 +565,9 @@ Fresh focused evidence:
    control-plane code where it is not required by a current BYTES aggregate.
 2. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-3. Promote `DocumentRenderSnapshot` to scene-first identity and remove
-   LayoutFrame-hash-keyed render-scene patch cache compatibility.
+3. Promote `DocumentRenderSnapshot` and preview render hook caches to
+   scene-first identity and remove LayoutFrame-hash-keyed render-scene patch
+   cache compatibility.
 4. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 

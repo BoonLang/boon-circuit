@@ -36995,3 +36995,54 @@ Next architecture cut:
 - Rework the proof lane as a bounded post-present subscriber keyed by
   `FrameEvidenceKey`, so it can prove visible formula/selection changes without
   active verifier-frame scheduling or product-path timing pollution.
+
+## 2026-07-06 - Cells Post-Present Proof Lane Joined
+
+Status: implemented and verified for Cells visible-click release gate.
+
+What changed:
+
+- Kept product interaction samples pure: product pass and latency still come
+  from product frame commits, retained patches, product render graph execution,
+  and present plans.
+- Increased the bounded native post-present proof queue/artifact history so a
+  full Cells visible-click run can retain visible-bound-text,
+  retained-bound-sync, and visible-surface-readback artifacts for each product
+  frame.
+- Matched post-present proof artifacts by presented-frame identity
+  (`surface_id`, `surface_epoch`, `frame_seq`, `present_id`, and revisions)
+  while allowing proof artifacts to omit `input_event_seq`.
+- Added end-of-run sample enrichment that joins already-produced app-owned WGPU
+  proof artifacts back to measured product frames. It does not request new
+  readbacks and does not block product samples.
+- Populated formula/selection observation fields from passing structured WGPU
+  visual proof when runtime IPC was intentionally skipped on the product path.
+
+Fresh evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo check -q -p boon_native_app_window`: pass.
+- `cargo test -q -p xtask cells_visible_click_`: pass.
+- Fresh `cargo xtask verify-native-cells-visible-click-e2e --profile release
+  --report target/reports/native-gpu/cells-visible-click-e2e-release.json`:
+  pass.
+- Fresh `cargo xtask verify-report-schema
+  target/reports/native-gpu/cells-visible-click-e2e-release.json`: pass.
+- Report summary: `status=pass`, blockers `0`, completed clicks `64/64`,
+  `product_only_ux_contract.status=pass`, `proof_only_contract.status=pass`,
+  `formula_transition_contract.status=pass`,
+  `selected_cell_transition_contract.status=pass`,
+  `proof_isolation_contract.status=pass`.
+- Product UX stayed inside budget:
+  `input_accept_to_formula_visible_ms_p95=9.482ms`, max `11.169ms`.
+- Post-present proof enrichment joined `63` samples after the product run; the
+  remaining sample already had same-frame proof. Sidecar payload was
+  `1,276,880` bytes, within the manifest budget.
+
+Remaining scope:
+
+- This completes the Cells visible-click proof/product split slice. The broader
+  goal still needs the native handoff aggregate and remaining architecture
+  cleanup gates refreshed before completion can be claimed.

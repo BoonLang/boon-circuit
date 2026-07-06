@@ -806,10 +806,28 @@ Fresh focused evidence:
     expected fail from 17 stale non-Cells child reports; Cells
     `cells-visible-click-e2e-release` is full-contract fresh/pass.
 
+### 2026-07-06 - Multiwindow Uses Surface-Scoped WGPU Proof
+
+- Updated the multiwindow verifier/native-contract path to accept the actual
+  app-owned surface proof object (`presented_frame` plus nonblank
+  `readback_artifact`) instead of requiring an obsolete nested
+  `external_render_proof` wrapper.
+- Kept the stricter nested render-proof validator intact and added a separate
+  surface-proof predicate that reuses `require_native_surface_proof`.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask multiwindow -- --nocapture`: pass; 1 passed.
+  - `target/debug/xtask verify-native-gpu-multiwindow --report target/reports/native-gpu/multiwindow.json`:
+    pass; preview/dev both presented nonblank app-owned WGPU readbacks.
+  - `target/debug/xtask verify-report-schema target/reports/native-gpu/multiwindow.json`:
+    pass.
+  - `cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+    expected fail from 16 stale child reports; no true blocker children remain.
+
 ## Next Cuts
 
-1. Refresh the remaining stale native handoff children, starting with the cheap
-   static/contract reports before the headed preview reports.
+1. Commit the multiwindow verifier fix, then refresh the remaining stale native
+   handoff children against the committed identity.
 2. Keep deleting obsolete verifier/report fields that only existed to support
    removed product graph execution or proof-key product fallback compatibility.
 3. Cut the next stale runtime/verifier compatibility lane only if fresh reports

@@ -23419,11 +23419,21 @@ fn multiwindow_surface_visible_proof_ok(report: &serde_json::Value) -> bool {
 
 fn preview_surface_visible_proof_ok(report: &serde_json::Value) -> bool {
     report
-        .pointer("/preview_surface_proof/product_render_graph_visible_proof")
-        .is_some_and(native_product_graph_visible_render_proof_is_usable)
+        .get("preview_surface_proof")
+        .is_some_and(|proof| native_surface_visible_proof_is_usable(proof, "preview"))
+        || report
+            .pointer("/preview_surface_proof/product_render_graph_visible_proof")
+            .is_some_and(native_product_graph_visible_render_proof_is_usable)
         || report
             .pointer("/preview_surface_proof/external_render_proof")
             .is_some_and(native_visible_render_proof_is_usable)
+}
+
+fn native_surface_visible_proof_is_usable(proof: &serde_json::Value, role: &str) -> bool {
+    let report = json!({ "surface": proof });
+    let mut blockers = Vec::new();
+    require_native_surface_proof(&mut blockers, &report, "surface", role);
+    blockers.is_empty()
 }
 
 fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -51852,15 +51862,18 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
             let preview_visible_proof_ok = multiwindow_surface_visible_proof_ok(report);
             if !preview_visible_proof_ok {
                 blockers.push(
-                    "multiwindow preview must publish usable visible proof from ProductRenderGraph or external visible-surface render proof"
+                    "multiwindow preview must publish usable surface-scoped visible proof"
                         .to_owned(),
                 );
             }
-            require_visible_native_render_proof(
-                &mut blockers,
-                report,
-                "/dev_surface_proof/external_render_proof",
-            );
+            let dev_visible_proof_ok = report
+                .get("dev_surface_proof")
+                .is_some_and(|proof| native_surface_visible_proof_is_usable(proof, "dev"));
+            if !dev_visible_proof_ok {
+                blockers.push(
+                    "multiwindow dev must publish usable surface-scoped visible proof".to_owned(),
+                );
+            }
             require_preview_runtime_ownership(&mut blockers, report, "/preview_runtime_summary");
             require_preview_runtime_query(
                 &mut blockers,
@@ -76996,6 +77009,11 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             }
         });
         assert!(multiwindow_surface_visible_proof_ok(&surface_scoped));
+
+        let direct_surface_scoped = json!({
+            "preview_surface_proof": native_visible_reality_surface_report(1020, 1080)["preview_surface_proof"].clone()
+        });
+        assert!(multiwindow_surface_visible_proof_ok(&direct_surface_scoped));
     }
 
     #[test]

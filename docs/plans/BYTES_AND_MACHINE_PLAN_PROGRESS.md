@@ -38415,3 +38415,46 @@ Remaining scope:
   removes a false scroll blocker and makes the native handoff aggregate fresh,
   but it does not eliminate every older plan item or all legacy terminology in
   historical docs.
+
+## 2026-07-06 - Source Replay Retired `--engine` Compatibility Cut
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Tightened source replay schema matching so `boon_cli run ... --engine ...`
+  no longer proves `run-plan-scenario-events`. Current product replay is the
+  default PlanExecutor-backed `boon_cli run` path with no engine switch.
+- Made source replay identity generation fail closed when `command_argv`
+  contains `--engine` or `--engine=...`, both in `boon_report_schema` and the
+  runtime helper used by aggregate freshness checks.
+- Updated source replay identity fixtures to the current argv shape and added
+  negative tests proving retired `--engine plan` cannot mint fresh scoped
+  identity.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p boon_report_schema --lib -- --nocapture`: pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_source_replay_report_carries_scoped_freshness_and_identity
+  -- --nocapture`: pass.
+- `cargo check -q -p boon_runtime -p boon_report_schema -p xtask`: pass.
+- `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+
+Independent audit findings carried forward:
+
+- Product runtime is now PlanExecutor-only: no active `LoadedRuntime`,
+  `GenericScheduledRuntime`, or `LiveRuntimeEngine` product implementation was
+  found in `boon_runtime`, `boon_plan_executor`, or `boon_cli`.
+- Remaining runtime/control-plane cleanup should replace zero-valued
+  PlanExecutor "no fallback" counters with a positive execution-surface
+  contract based on executor labels, PlanExecutor status, accepted product
+  status, MachinePlan verification, and absence of legacy comparison fields.
+- Remaining native handoff cleanup should make label contracts accept only the
+  current app-owned native proof path, remove source-replay acceptance from
+  native runtime assertion evidence, and move Weston-specific input branches out
+  of handoff into diagnostic/regression-only commands if they are still useful.

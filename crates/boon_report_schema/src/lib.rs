@@ -420,6 +420,12 @@ fn source_replay_identity_for_report(report: &JsonValue) -> Option<JsonValue> {
         .iter()
         .map(|arg| arg.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
+    if args
+        .iter()
+        .any(|arg| arg == "--engine" || arg.starts_with("--engine="))
+    {
+        return None;
+    }
     let canonical_args = canonical_source_replay_args(&args);
     let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
     let source_hash = report.get("source_hash").and_then(JsonValue::as_str)?;
@@ -4931,6 +4937,17 @@ fn verify_run_plan_scenario_events_report(
     {
         return Err(format!(
             "{} run-plan-scenario-events source_replay_identity is stale",
+            report_path.display()
+        )
+        .into());
+    }
+    if report
+        .get("command_argv")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|argv| command_argv_value_after(argv, "--engine").is_some())
+    {
+        return Err(format!(
+            "{} run-plan-scenario-events command_argv must use default PlanExecutor `boon_cli run` without retired --engine",
             report_path.display()
         )
         .into());
@@ -31954,10 +31971,7 @@ fn child_command_argv_proves_expected_command(command_argv: &[JsonValue], expect
     match expected {
         "run-plan-scenario-events" => {
             command_argv_has_arg(command_argv, "run")
-                && matches!(
-                    command_argv_value_after(command_argv, "--engine"),
-                    Some("compare") | None
-                )
+                && command_argv_value_after(command_argv, "--engine").is_none()
         }
         "semantic" => {
             command_argv_has_arg(command_argv, "run")
@@ -32389,6 +32403,21 @@ mod tests {
         assert!(!child_command_argv_proves_expected_command(
             source_replay_argv,
             "dump-plan"
+        ));
+        let retired_engine_argv = json!([
+            "target/debug/boon_cli",
+            "run",
+            "examples/todomvc.bn",
+            "--scenario",
+            "examples/todomvc.scn",
+            "--engine",
+            "plan",
+            "--report",
+            "target/reports/bytes-plan/todomvc-scenario-events-full.json"
+        ]);
+        assert!(!child_command_argv_proves_expected_command(
+            retired_engine_argv.as_array().unwrap(),
+            "run-plan-scenario-events"
         ));
 
         let semantic_argv = json!([
@@ -33587,8 +33616,6 @@ mod tests {
                 "examples/cells.bn",
                 "--scenario",
                 "examples/cells.scn",
-                "--engine",
-                "plan",
                 "--report",
                 "target/reports/bytes-plan/cells-scenario-events-full.json"
             ],
@@ -33617,6 +33644,23 @@ mod tests {
         );
         report["source_replay_identity"] = identity;
         assert!(report_source_replay_identity_matches_report(&report));
+
+        let mut retired_engine_report = source_replay_identity_report_fixture();
+        retired_engine_report["command_argv"] = json!([
+            "target/debug/boon_cli",
+            "run",
+            "examples/cells.bn",
+            "--scenario",
+            "examples/cells.scn",
+            "--engine",
+            "plan",
+            "--report",
+            "target/reports/bytes-plan/cells-scenario-events-full.json"
+        ]);
+        assert!(
+            source_replay_identity_for_report(&retired_engine_report).is_none(),
+            "retired --engine source replay argv must not mint a current identity"
+        );
 
         report["plan_hash"] = json!("different-planhash");
         assert!(

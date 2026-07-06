@@ -41703,6 +41703,12 @@ pub fn plan_executor_source_replay_identity_for_report(report: &JsonValue) -> Op
         .iter()
         .map(|arg| arg.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
+    if args
+        .iter()
+        .any(|arg| arg == "--engine" || arg.starts_with("--engine="))
+    {
+        return None;
+    }
     let canonical_args = canonical_plan_executor_source_replay_args(&args);
     let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
     let source_hash = report.get("source_hash").and_then(JsonValue::as_str)?;
@@ -42096,8 +42102,6 @@ mod tests {
                 "examples/cells.bn",
                 "--scenario",
                 "examples/cells.scn",
-                "--engine",
-                "plan",
                 "--report",
                 "target/reports/bytes-plan/cells-scenario-events-full.json"
             ],
@@ -42176,6 +42180,23 @@ mod tests {
         assert_eq!(
             report.get("source_replay_identity"),
             plan_executor_source_replay_identity_for_report(&report).as_ref()
+        );
+
+        let mut retired_engine_report = report.clone();
+        retired_engine_report["command_argv"] = json!([
+            "target/debug/boon_cli",
+            "run",
+            "examples/cells.bn",
+            "--scenario",
+            "examples/cells.scn",
+            "--engine",
+            "plan",
+            "--report",
+            "target/reports/bytes-plan/cells-scenario-events-full.json"
+        ]);
+        assert!(
+            plan_executor_source_replay_identity_for_report(&retired_engine_report).is_none(),
+            "retired --engine source replay argv must not mint scoped freshness identity"
         );
     }
 

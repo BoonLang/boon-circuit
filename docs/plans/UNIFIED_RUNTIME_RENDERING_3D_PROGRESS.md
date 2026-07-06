@@ -37622,3 +37622,47 @@ Remaining scope:
   present/encode stays on the hot path.
 - The runtime/PlanExecutor Cells cut remains generic list/currentness and
   dependency fanout ownership, with no Cells-specific branches.
+
+## 2026-07-06 - Deleted Product Render-Hook Proof Report Branch
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Removed the document preview product-path `app_owned_proof_cache` and
+  render-hook `render_app_owned_scene_pixels(...)` branch. Document product
+  frames now encode/present, attach product frame metrics, and return
+  `proof: None`; visual proof for product interactions is owned by the
+  post-present proof lane keyed by frame evidence.
+- Removed the obsolete `defer_product_render_report` switch from the product
+  render hook. The product path no longer has a hidden pre-present report mode.
+- Deleted old pre-present visible-bound-text layout-scan reports and compact
+  frame-metrics JSON wrappers that only existed for the removed branch.
+- Removed the preview-role forwarding of
+  `--skip-render-hook-app-owned-proof`; product document preview no longer has
+  a render-hook app-owned proof mode to skip.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo test -q -p boon_native_playground
+  preview_presentation_plan_owns_product_and_proof_boundary -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_native_playground
+  deferred_product_proof_requests_are_not_built_pre_present -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_native_playground product_render_graph
+  -- --nocapture`: pass.
+
+Remaining scope:
+
+- This removes a stale product proof/report branch; it is not a regenerated
+  Cells UX performance claim.
+- The next native cut should move frame commit/report identity closer to the
+  renderer-owned `ProductFrameGraph` execution object, leaving proof artifacts
+  in the bounded post-present lane.
+- The runtime/PlanExecutor Cells work remains generic list/currentness and
+  dependency fanout ownership, with no Cells-specific runtime/compiler/render
+  branches.

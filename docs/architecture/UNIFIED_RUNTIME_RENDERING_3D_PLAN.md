@@ -2401,3 +2401,11 @@ The governing implementation principle is:
 - Removed graph-disabled before-report requirements from `verify-native-product-render-graph`; the focused gate now checks current active reports only.
 - Kept negative proof counters such as full-rebuild fallback and proof/readback-in-product counts because they reject slow paths rather than preserve legacy behavior.
 - Focused verification for this checkpoint: `cargo fmt -- --check`, `cargo build -q -p xtask`, `cargo test -q -p xtask product_render_graph -- --nocapture`, `cargo test -q -p xtask cells_visible_click_product -- --nocapture`, `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`, `cargo test -q -p boon_native_playground product_render_graph -- --nocapture`, and `git diff --check`.
+
+### 2026-07-06 — Native GPU product encode requires retained state
+
+- Removed private optional retained-state fallbacks from the native GPU visible encode path.
+- `encode_render_scene_to_surface_with_pipeline`, `encode_render_scene_patch_to_surface_with_pipeline`, and `encode_internal_scene_to_surface` now require retained text state, render-scene cache, quad buffers, upload ring, prepared-quad cache, previous chunk IDs, and ProductFrameGraph state.
+- Removed the fresh per-call `QuadUploadRing` and `ProductFrameGraphState` fallbacks from product encoding.
+- Render-scene patch encoding now requires a `patch_identity`, so patch caching cannot silently collapse to an uncached one-off path.
+- Focused verification for this checkpoint: `cargo fmt -- --check`, `cargo build -q -p xtask`, `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`, `cargo test -q -p boon_native_playground product_render_graph -- --nocapture`, `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`, `target/debug/xtask verify-report-schema target/reports/native-gpu/architecture.json`, and `git diff --check`.

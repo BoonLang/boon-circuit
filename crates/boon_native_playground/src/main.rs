@@ -8260,7 +8260,6 @@ fn native_preview_live_runtime_from_project_profiled(
             "has_world_or_manufacturing_output_root".to_owned(),
             json!(has_world_or_manufacturing_output_root),
         );
-        object.insert("runtime_fallback_hidden".to_owned(), json!(false));
     }
     Ok((runtime, profile))
 }
@@ -12654,10 +12653,6 @@ fn preview_compile_product_render_graph(
     );
     let proof_pass_count = passes.iter().filter(|pass| pass.proof_or_readback).count() as u32;
     let product_pass_count = passes.len() as u32 - proof_pass_count;
-    let full_rebuild_fallback_count = product_patch
-        .filter(|patch| patch.full_scene_build_before_present)
-        .map(|_| 1)
-        .unwrap_or(0);
     let cache_hit = product_patch.is_some_and(|patch| patch.source == "cached_scene");
     let dirty_chunk_count = product_patch
         .map(|patch| patch.touched_node_count)
@@ -12684,7 +12679,7 @@ fn preview_compile_product_render_graph(
     );
     let plan_hash = boon_runtime::sha256_bytes(graph_fingerprint.as_bytes());
     let workload_fingerprint = format!(
-        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{full_rebuild_fallback_count}|{}|{:?}|{:?}",
+        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{}|{:?}|{:?}",
         active_scene_identity,
         render_scene_identity,
         u8::from(cache_hit),
@@ -12767,7 +12762,6 @@ fn preview_compile_product_render_graph(
         upload_bytes,
         encode_time_ms: None,
         cache_hit,
-        full_rebuild_fallback_count,
         proof_readback_in_product_graph: false,
         stale_epoch_rejection_count: 0,
         plan_hash: plan_hash.clone(),
@@ -61974,10 +61968,6 @@ where
                     .get("has_world_or_manufacturing_output_root")
                     .cloned()
                     .unwrap_or_else(|| json!(false));
-                summary["runtime_fallback_hidden"] = profile
-                    .get("runtime_fallback_hidden")
-                    .cloned()
-                    .unwrap_or_else(|| json!(false));
                 (
                     summary,
                     Some(document_state_summary),
@@ -66218,7 +66208,6 @@ mod tests {
             "plan_executor_document_runtime"
         );
         assert_eq!(profile["generic_fallback_enabled"], false);
-        assert_eq!(profile["runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
             "plan_executor"
@@ -66250,7 +66239,6 @@ mod tests {
             "plan_executor_output_root_runtime"
         );
         assert_eq!(profile["has_world_or_manufacturing_output_root"], true);
-        assert_eq!(profile["runtime_fallback_hidden"], false);
         assert_eq!(
             runtime.engine_provenance_report()["engine"],
             "plan_executor"

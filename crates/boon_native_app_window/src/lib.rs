@@ -3788,7 +3788,6 @@ pub struct NativeProductRenderGraphSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encode_time_ms: Option<f64>,
     pub cache_hit: bool,
-    pub full_rebuild_fallback_count: u64,
     pub proof_readback_in_product_graph: bool,
     pub stale_epoch_rejection_count: u64,
     pub plan_hash: String,

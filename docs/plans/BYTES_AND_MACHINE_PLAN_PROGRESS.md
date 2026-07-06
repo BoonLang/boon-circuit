@@ -38621,3 +38621,17 @@ What changed:
   so large multi-unit examples can finish the bounded dev IPC/source-event probe
   and report real `apply_source_event` outputs instead of relying on route-only
   synthetic proof.
+
+## 2026-07-06 - Physical TodoMVC Preview Content Contract Bounded
+
+Status: implemented; physical TodoMVC refresh pending.
+
+What changed:
+
+- After the timeout fix, physical TodoMVC produced real preview-side runtime
+  outputs, but its preview content gate still treated a bounded native smoke
+  probe as if it had full theme/clear-completed scenario coverage.
+- Updated the content contract so preview E2E must prove initial native layout
+  and bounded add-todo visual output from native layout/readback artifacts.
+  Missing unvisited theme actions remain recorded as delegated full scenario
+  coverage instead of failing the preview smoke gate.

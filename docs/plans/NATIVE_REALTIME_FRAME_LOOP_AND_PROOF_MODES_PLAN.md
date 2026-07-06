@@ -12916,7 +12916,34 @@ host-input follow-up cut:
   - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`;
   - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`.
 - The follow-up cleanup chunk deleted the retired `audit-goal-readiness` command
-  and the 38k-line historical BYTES progress file. The next large cut should be
-  a document protocol migration that removes the primary `source_binding` field
-  in favor of canonical multi-bindings. Do not nibble around that with more
-  compatibility comments.
+  and the 38k-line historical BYTES progress file.
+
+2026-07-06 document source-binding protocol cleanup:
+
+- Removed the split document source-binding storage shape. `DocumentNode` no
+  longer has a separate primary `source_binding`; all bindings live in the
+  canonical `source_bindings` vector.
+- `DocumentPatch::SetBinding` remains as the patch vocabulary for setting
+  ordinal zero, but it now writes `source_bindings[0]` through
+  `DocumentNode::set_primary_source_binding`. `SetBindingAt` now uses direct
+  canonical ordinals, so ordinal `0` is the first binding and ordinal `1` is the
+  second binding.
+- Removed duplicate primary source-binding intern storage from
+  `DocumentInternedNode`; typed binding indexes and hit/semantic paths now read
+  the canonical vector.
+- Updated native playground document producers and tests to construct and
+  assert canonical vector bindings instead of relying on a hidden primary field.
+- Focused verification for this slice:
+  - `rg -n "\\.source_binding\\b|source_binding:|compatibility source binding|compatibility primary binding" crates/boon_document_model/src/lib.rs crates/boon_document/src/lib.rs crates/boon_native_playground/src/main.rs crates/xtask/src/main.rs --glob '*.rs'`
+    returns no matches;
+  - `cargo fmt --check`;
+  - `git diff --check`;
+  - `cargo check -q -p boon_document_model -p boon_document -p boon_native_playground -p xtask`;
+  - `cargo test -q -p boon_document binding -- --nocapture`;
+  - `cargo test -q -p boon_native_playground source_intent -- --nocapture`;
+  - `cargo test -q -p boon_native_playground data_binding_targets_lower_to_atomic_ui_semantic_change_batch -- --nocapture`;
+  - `cargo test -q -p xtask advertised_xtask_commands_are_unique -- --nocapture`.
+- This is still not the full native performance goal. Remaining large cuts are
+  control-plane report refresh debt, ProductFrameGraph dirty-resource
+  scheduling, retained input routing/fallback removal, and fresh native Cells
+  measurement using product latency separated from proof/readback latency.

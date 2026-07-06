@@ -181,7 +181,7 @@ impl HitSideTable {
         };
         for (index, hit) in layout.hit_regions.iter().enumerate() {
             let node = document.nodes.get(&hit.node);
-            let binding = node.and_then(|node| node.source_binding.as_ref());
+            let binding = node.and_then(|node| node.primary_source_binding());
             let spatial_bucket = hit_bucket_for_point(hit.bounds.x, hit.bounds.y, bucket_size);
             let entry_index = table.entries.len();
             let entry = HitSideTableEntry {
@@ -434,7 +434,7 @@ fn semantic_node_from_document_node(
         || item.is_some_and(|item| item.focused)
         || semantic_style_bool(&node.style, "__focused") == Some(true)
         || semantic_style_bool(&node.style, "focus") == Some(true);
-    let source_binding = node.source_binding.as_ref();
+    let source_binding = node.primary_source_binding();
     let source_intent = source_binding.map(|binding| binding.intent.clone());
     let role = semantic_role_for_document_kind(&node.kind);
     let actions = semantic_actions_for_node(&node.kind, source_intent.as_deref());
@@ -625,7 +625,7 @@ pub fn document_frame_from_world_editor_tree(
         }
         if let Some(intent) = world_editor_source_intent(node) {
             let source_path = world_editor_source_path(node, &intent);
-            document_node.source_binding = Some(boon_document_model::SourceBinding {
+            document_node.set_primary_source_binding(boon_document_model::SourceBinding {
                 id: SourceBindingId(format!("source:{source_path}:{intent}")),
                 source_path,
                 intent,
@@ -1377,7 +1377,6 @@ pub struct DocumentInternedNode {
     pub text_style: DocumentInternId,
     pub material: DocumentInternId,
     pub clip: DocumentInternId,
-    pub source_binding: Option<DocumentInternId>,
     pub source_bindings: Vec<DocumentInternId>,
 }
 
@@ -2031,7 +2030,6 @@ impl DocumentInternIndex {
                 ))
             })
             .collect::<Vec<_>>();
-        let source_binding = source_bindings.first().copied();
         self.nodes.insert(
             hot_ref.id,
             DocumentInternedNode {
@@ -2042,7 +2040,6 @@ impl DocumentInternIndex {
                 text_style,
                 material,
                 clip,
-                source_binding,
                 source_bindings,
             },
         );
@@ -3209,7 +3206,7 @@ fn apply_document_patch_unchecked(
         }
         DocumentPatch::SetBinding { id, binding } => {
             let node = required_node_mut(frame, "set_binding", &id)?;
-            node.source_binding = Some(binding);
+            node.set_primary_source_binding(binding);
             Ok(PatchApplyReport {
                 patch_kind: "set_binding",
                 target: Some(id),
@@ -3299,16 +3296,16 @@ fn apply_source_binding_at(
     binding: boon_document_model::SourceBinding,
 ) -> Result<(), PatchApplyError> {
     if ordinal == 0 {
-        if node.source_binding.is_none() {
+        if node.source_bindings.is_empty() {
             return Err(PatchApplyError::StaleReference {
                 reference_kind: "source_binding_at",
                 id: node.id.clone(),
             });
         }
-        node.source_binding = Some(binding);
+        node.source_bindings[0] = binding;
         return Ok(());
     }
-    let index = usize::try_from(ordinal - 1).map_err(|_| PatchApplyError::StaleReference {
+    let index = usize::try_from(ordinal).map_err(|_| PatchApplyError::StaleReference {
         reference_kind: "source_binding_at",
         id: node.id.clone(),
     })?;
@@ -4272,7 +4269,7 @@ impl LayoutBuilder<'_, '_> {
             .as_ref()
             .map(|record| record.pseudo.hover_scope)
             .unwrap_or_else(|| style_bool(&node.style, "__hover_scope") == Some(true));
-        if node.source_binding.is_some() || hover_scope {
+        if node.has_source_binding() || hover_scope {
             self.hit_regions.push(HitRegion {
                 id: format!("hit:{}", node.id.0),
                 node: node.id.clone(),
@@ -5224,7 +5221,7 @@ mod tests {
         button.text = Some(TextValue {
             text: "Save".to_owned(),
         });
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:save:press".to_owned()),
             source_path: "toolbar.save".to_owned(),
             intent: "press".to_owned(),
@@ -5663,7 +5660,7 @@ mod tests {
             frame
                 .nodes
                 .get(&export_doc_id)
-                .and_then(|node| node.source_binding.as_ref())
+                .and_then(|node| node.primary_source_binding())
                 .map(|binding| binding.source_path.as_str()),
             Some("world.manufacturing.export_3mf")
         );
@@ -5671,7 +5668,7 @@ mod tests {
             frame
                 .nodes
                 .get(&wheel_doc_id)
-                .and_then(|node| node.source_binding.as_ref())
+                .and_then(|node| node.primary_source_binding())
                 .map(|binding| binding.source_path.as_str()),
             Some("world.instance.7.select")
         );
@@ -6186,10 +6183,10 @@ mod tests {
     }
 
     #[test]
-    fn document_batch_set_binding_at_updates_secondary_binding_only() {
+    fn document_batch_set_binding_at_updates_canonical_ordinal_only() {
         let mut state = DocumentState::new("root");
         let mut button = node("button", DocumentNodeKind::Button, Some("root"));
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:button:press".to_owned()),
             source_path: "old.press".to_owned(),
             intent: "press".to_owned(),
@@ -6237,16 +6234,16 @@ mod tests {
         );
         assert_eq!(
             button
-                .source_binding
-                .as_ref()
+                .source_bindings
+                .first()
                 .map(|binding| binding.source_path.as_str()),
             Some("old.press"),
-            "secondary binding updates must not rewrite the compatibility primary binding"
+            "secondary binding updates must not rewrite ordinal zero"
         );
         assert_eq!(
             button
                 .source_bindings
-                .first()
+                .get(1)
                 .map(|binding| binding.source_path.as_str()),
             Some("new.change")
         );
@@ -6474,7 +6471,7 @@ mod tests {
             "__clip_rect".to_owned(),
             StyleValue::Text("viewport".to_owned()),
         );
-        alpha.source_binding = Some(boon_document_model::SourceBinding {
+        alpha.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("title-binding".to_owned()),
             source_path: "todos[0].title".to_owned(),
             intent: "edit".to_owned(),
@@ -6487,7 +6484,7 @@ mod tests {
         beta.style = alpha.style.clone();
         beta.style
             .insert("color".to_owned(), StyleValue::Text("blue".to_owned()));
-        beta.source_binding = alpha.source_binding.clone();
+        beta.source_bindings = alpha.source_bindings.clone();
 
         let mut state = DocumentState::new("root");
         state
@@ -6512,7 +6509,7 @@ mod tests {
         assert_ne!(alpha_refs.paint_style, beta_refs.paint_style);
         assert_eq!(alpha_refs.material, beta_refs.material);
         assert_eq!(alpha_refs.clip, beta_refs.clip);
-        assert_eq!(alpha_refs.source_binding, beta_refs.source_binding);
+        assert_eq!(alpha_refs.source_bindings, beta_refs.source_bindings);
         assert_eq!(index.source_bindings.keys_by_id.len(), 1);
 
         let previous_hot_ids =
@@ -6536,7 +6533,7 @@ mod tests {
         alpha
             .style
             .insert("width".to_owned(), StyleValue::Number(120.0));
-        alpha.source_binding = Some(boon_document_model::SourceBinding {
+        alpha.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("alpha-binding".to_owned()),
             source_path: "store.before".to_owned(),
             intent: "edit".to_owned(),
@@ -7310,7 +7307,7 @@ mod tests {
         button
             .style
             .insert("size".to_owned(), StyleValue::Number(12.0));
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:button:press".to_owned()),
             source_path: "controls.primary.press".to_owned(),
             intent: "press".to_owned(),
@@ -7385,9 +7382,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_binding_index_exposes_current_single_binding_as_multi_binding_shape() {
+    fn typed_binding_index_exposes_single_binding_from_canonical_vector() {
         let mut button = node("button", DocumentNodeKind::Button, Some("root"));
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:button:press".to_owned()),
             source_path: "todos[0].done".to_owned(),
             intent: "toggle".to_owned(),
@@ -7407,7 +7404,7 @@ mod tests {
         let binding = bindings
             .bindings_for_node(button_hot)
             .first()
-            .expect("button should expose its compatibility source binding");
+            .expect("button should expose its source binding");
 
         assert_eq!(binding.reference.node, button_hot);
         assert_eq!(binding.reference.ordinal, 0);
@@ -7416,7 +7413,13 @@ mod tests {
         assert_eq!(binding.route.intent, "toggle");
         assert_eq!(
             Some(binding.intern_id),
-            intern_index.nodes.get(&button_hot).unwrap().source_binding
+            intern_index
+                .nodes
+                .get(&button_hot)
+                .unwrap()
+                .source_bindings
+                .first()
+                .copied()
         );
         assert_eq!(
             bindings.refs_for_binding_id(&SourceBindingId("source:button:press".to_owned())),
@@ -7470,7 +7473,7 @@ mod tests {
         button
             .style
             .insert("height".to_owned(), StyleValue::Number(32.0));
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:button:press".to_owned()),
             source_path: "controls.primary.press".to_owned(),
             intent: "press".to_owned(),
@@ -7515,7 +7518,13 @@ mod tests {
         );
         assert_eq!(
             Some(node_bindings[0].intern_id),
-            intern_index.nodes.get(&button_hot).unwrap().source_binding
+            intern_index
+                .nodes
+                .get(&button_hot)
+                .unwrap()
+                .source_bindings
+                .first()
+                .copied()
         );
         assert_eq!(
             bindings.refs_for_route(&DocumentTypedBindingRoute {
@@ -7647,7 +7656,7 @@ mod tests {
             "row_generation".to_owned(),
             StyleValue::Text("7".to_owned()),
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: SourceBindingId("source:row-button:press".to_owned()),
             source_path: "rows.press".to_owned(),
             intent: "press".to_owned(),

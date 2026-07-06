@@ -20514,7 +20514,7 @@ impl CodeEditorView {
             x: model.scroll_column as f32,
             y: model.scroll_line as f32,
         });
-        editor.source_binding = Some(boon_document_model::SourceBinding {
+        editor.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:dev-editor:insert-text".to_owned()),
             source_path: "dev.editor.insert_text".to_owned(),
             intent: "text_input".to_owned(),
@@ -23906,7 +23906,7 @@ fn dev_shell_document(
                 ("font", BOON_EDITOR_FONT_FAMILY),
             ],
         );
-        tab.source_binding = Some(boon_document_model::SourceBinding {
+        tab.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId(format!("source:dev-tab:{}:select", entry.id)),
             source_path: format!("dev.tabs.select.{}", entry.id),
             intent: "select".to_owned(),
@@ -23932,7 +23932,7 @@ fn dev_shell_document(
             ("font", BOON_EDITOR_FONT_FAMILY),
         ],
     );
-    new_tab.source_binding = Some(boon_document_model::SourceBinding {
+    new_tab.set_primary_source_binding(boon_document_model::SourceBinding {
         id: boon_document_model::SourceBindingId("source:dev-tab:new".to_owned()),
         source_path: "dev.tabs.new".to_owned(),
         intent: "select".to_owned(),
@@ -23990,7 +23990,7 @@ fn dev_shell_document(
                     ("font", BOON_EDITOR_FONT_FAMILY),
                 ],
             );
-            tab.source_binding = Some(boon_document_model::SourceBinding {
+            tab.set_primary_source_binding(boon_document_model::SourceBinding {
                 id: boon_document_model::SourceBindingId(format!(
                     "source:dev-project-file:{}:select",
                     boon_runtime::sha256_bytes(file.path.as_bytes())
@@ -24093,7 +24093,7 @@ fn dev_shell_document(
                 boon_document_model::StyleValue::Bool(true),
             );
         } else {
-            button.source_binding = Some(boon_document_model::SourceBinding {
+            button.set_primary_source_binding(boon_document_model::SourceBinding {
                 id: boon_document_model::SourceBindingId(format!("source:dev-command:{command}")),
                 source_path: format!("dev.commands.{command}"),
                 intent: "press".to_owned(),
@@ -24312,7 +24312,7 @@ fn append_dev_type_inspector_resize_handle(
             ("cursor", "col-resize"),
         ],
     );
-    handle.source_binding = Some(boon_document_model::SourceBinding {
+    handle.set_primary_source_binding(boon_document_model::SourceBinding {
         id: boon_document_model::SourceBindingId("source:dev-type-inspector-resize".to_owned()),
         source_path: "dev.type_inspector.resize".to_owned(),
         intent: "drag".to_owned(),
@@ -24566,7 +24566,7 @@ fn dev_custom_name_input(shell: &DevWindowShell) -> boon_document_model::Documen
         ],
     );
     if selected_is_custom {
-        input.source_binding = Some(boon_document_model::SourceBinding {
+        input.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:dev-custom-name".to_owned()),
             source_path: "dev.custom.name".to_owned(),
             intent: "text_input".to_owned(),
@@ -25986,7 +25986,7 @@ fn dev_tabs_node(_shell: &DevWindowShell, height: u32) -> boon_document_model::D
             ("width", "fill"),
         ],
     );
-    tabs.source_binding = Some(boon_document_model::SourceBinding {
+    tabs.set_primary_source_binding(boon_document_model::SourceBinding {
         id: boon_document_model::SourceBindingId("source:dev-example-tabs:select".to_owned()),
         source_path: "dev.tabs.select".to_owned(),
         intent: "select".to_owned(),
@@ -26014,7 +26014,7 @@ fn dev_project_files_node(
             ("width", "fill"),
         ],
     );
-    tabs.source_binding = Some(boon_document_model::SourceBinding {
+    tabs.set_primary_source_binding(boon_document_model::SourceBinding {
         id: boon_document_model::SourceBindingId("source:dev-project-files:select".to_owned()),
         source_path: "dev.project_files.select".to_owned(),
         intent: "select".to_owned(),
@@ -26045,7 +26045,7 @@ fn dev_toolbar_node(height: u32) -> boon_document_model::DocumentNode {
             ("width", "fill"),
         ],
     );
-    toolbar.source_binding = Some(boon_document_model::SourceBinding {
+    toolbar.set_primary_source_binding(boon_document_model::SourceBinding {
         id: boon_document_model::SourceBindingId("source:dev-toolbar:press".to_owned()),
         source_path: "dev.commands.press".to_owned(),
         intent: "press".to_owned(),
@@ -32137,8 +32137,8 @@ fn push_canonical_source_intent_with_fields(
     if source_path.is_empty() {
         return;
     }
-    if node.source_binding.is_none() {
-        node.source_binding = Some(boon_document_model::SourceBinding {
+    if !node.has_source_binding() {
+        node.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId(format!("source:{}:{}", node_id.0, intent)),
             source_path: source_path.to_owned(),
             intent: intent.to_owned(),
@@ -32199,7 +32199,7 @@ fn push_implicit_target_intent_from_node_text(
     node: &boon_document_model::DocumentNode,
     source_intents: &mut Vec<serde_json::Value>,
 ) {
-    if node.source_binding.is_none()
+    if !node.has_source_binding()
         || source_intents.iter().any(|intent| {
             intent.get("node").and_then(serde_json::Value::as_str) == Some(node_id.0.as_str())
                 && intent.get("intent").and_then(serde_json::Value::as_str) == Some("target")
@@ -32230,7 +32230,7 @@ fn push_descendant_target_intent_from_node_text(
     let Some(node) = frame.nodes.get(node_id) else {
         return;
     };
-    if node.source_binding.is_none()
+    if !node.has_source_binding()
         || source_intents.iter().any(|intent| {
             intent.get("node").and_then(serde_json::Value::as_str) == Some(node_id.0.as_str())
                 && intent.get("intent").and_then(serde_json::Value::as_str) == Some("target")
@@ -32423,8 +32423,8 @@ fn lower_document_element(
             }
             document_context_record_source_intent_reads(context, &id, &field, reads);
         }
-        if is_source_binding_field(&field) && node.source_binding.is_none() {
-            node.source_binding = Some(boon_document_model::SourceBinding {
+        if is_source_binding_field(&field) && !node.has_source_binding() {
+            node.set_primary_source_binding(boon_document_model::SourceBinding {
                 id: boon_document_model::SourceBindingId(format!("source:{}:{}", id.0, field)),
                 source_path: source_intent_value.clone(),
                 intent: field.clone(),
@@ -66678,8 +66678,7 @@ mod tests {
             .expect("dev toolbar should expose a Test button");
         assert_eq!(
             button
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("dev.commands.test")
         );
@@ -69756,7 +69755,7 @@ mod tests {
             Some("Old".to_owned()),
             &[("width", "80"), ("size", "14")],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
             source_path: "old.press".to_owned(),
             intent: "press".to_owned(),
@@ -69864,8 +69863,7 @@ mod tests {
         );
         assert_eq!(
             button
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("new.press")
         );
@@ -69881,7 +69879,7 @@ mod tests {
             Some("Run".to_owned()),
             &[("width", "80"), ("size", "14")],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
             source_path: "old.press".to_owned(),
             intent: "press".to_owned(),
@@ -69928,15 +69926,14 @@ mod tests {
             &state.frame().nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
         assert_eq!(
             button
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("old.press")
         );
         assert_eq!(
             button
                 .source_bindings
-                .first()
+                .get(1)
                 .map(|binding| binding.source_path.as_str()),
             Some("new.change")
         );
@@ -69952,7 +69949,7 @@ mod tests {
             Some("Run".to_owned()),
             &[("width", "80"), ("size", "14")],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:button:press-primary".to_owned()),
             source_path: "old.primary".to_owned(),
             intent: "press".to_owned(),
@@ -70022,15 +70019,14 @@ mod tests {
             &state.frame().nodes[&boon_document_model::DocumentNodeId("button".to_owned())];
         assert_eq!(
             button
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("old.primary")
         );
         assert_eq!(
             button
                 .source_bindings
-                .first()
+                .get(1)
                 .map(|binding| binding.source_path.as_str()),
             Some("new.secondary")
         );
@@ -70065,7 +70061,7 @@ mod tests {
             Some("Run".to_owned()),
             &[("width", "80"), ("height", "32"), ("size", "14")],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
             source_path: "old.press".to_owned(),
             intent: "press".to_owned(),
@@ -70363,7 +70359,7 @@ mod tests {
             Some("Run".to_owned()),
             &[("width", "80"), ("height", "32"), ("size", "14")],
         );
-        button.source_binding = Some(boon_document_model::SourceBinding {
+        button.set_primary_source_binding(boon_document_model::SourceBinding {
             id: boon_document_model::SourceBindingId("source:button:press".to_owned()),
             source_path: "store.run".to_owned(),
             intent: "press".to_owned(),
@@ -79344,8 +79340,7 @@ label:
             .expect("custom name input should render");
         assert_eq!(
             name_input
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("dev.custom.name")
         );
@@ -81786,7 +81781,7 @@ label:
                 "dev-command-remove_custom".to_owned(),
             ))
             .expect("remove button should render");
-        assert!(remove_button.source_binding.is_none());
+        assert!(!remove_button.has_source_binding());
         assert_eq!(
             remove_button.style.get("disabled"),
             Some(&boon_document_model::StyleValue::Bool(true))
@@ -81805,8 +81800,7 @@ label:
             .expect("remove button should render");
         assert_eq!(
             remove_button
-                .source_binding
-                .as_ref()
+                .primary_source_binding()
                 .map(|binding| binding.source_path.as_str()),
             Some("dev.commands.remove_custom")
         );

@@ -223,7 +223,6 @@ pub struct DocumentNode {
     pub children: Vec<DocumentNodeId>,
     pub text: Option<TextValue>,
     pub style: StyleMap,
-    pub source_binding: Option<SourceBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_bindings: Vec<SourceBinding>,
     pub scroll: Option<ScrollState>,
@@ -239,7 +238,6 @@ impl DocumentNode {
             children: Vec::new(),
             text: None,
             style: StyleMap::new(),
-            source_binding: None,
             source_bindings: Vec::new(),
             scroll: None,
             materialized: Vec::new(),
@@ -247,9 +245,23 @@ impl DocumentNode {
     }
 
     pub fn source_bindings(&self) -> impl Iterator<Item = &SourceBinding> {
-        self.source_binding
-            .iter()
-            .chain(self.source_bindings.iter())
+        self.source_bindings.iter()
+    }
+
+    pub fn primary_source_binding(&self) -> Option<&SourceBinding> {
+        self.source_bindings.first()
+    }
+
+    pub fn has_source_binding(&self) -> bool {
+        !self.source_bindings.is_empty()
+    }
+
+    pub fn set_primary_source_binding(&mut self, binding: SourceBinding) {
+        if let Some(primary) = self.source_bindings.first_mut() {
+            *primary = binding;
+        } else {
+            self.source_bindings.push(binding);
+        }
     }
 }
 

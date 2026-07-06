@@ -21125,27 +21125,8 @@ impl PreviewTransport {
                 "preview_receives_example_name": false
             });
         };
-        let json_request = || {
-            json!({
-                "kind": "replace-source",
-                "payload": payload,
-                "dev_pid": std::process::id()
-            })
-        };
         let ack_result =
-            send_preview_source_project_ipc_request(connect, "replace-source", payload).and_then(
-                |ack| {
-                    if source_project_binary_ack_needs_json_fallback(&ack) {
-                        let mut fallback_ack = send_preview_ipc_request(connect, json_request())?;
-                        fallback_ack["source_project_ipc_binary_fallback"] = json!(true);
-                        fallback_ack["source_project_ipc_binary_fallback_reason"] =
-                            json!("preview did not understand source_project_frame");
-                        Ok(fallback_ack)
-                    } else {
-                        Ok(ack)
-                    }
-                },
-            );
+            send_preview_source_project_ipc_request(connect, "replace-source", payload);
         match ack_result {
             Ok(ack) => {
                 let hash_matches = ack.get("hash_matches").and_then(serde_json::Value::as_bool)
@@ -64156,11 +64137,13 @@ fn run_dev_ipc_probe(
         let response = if let Some(payload) =
             source_project_payload_for_manifest_replace_probe(path, &code, selected_example_id)?
         {
-            send_preview_source_project_ipc_request_with_json_fallback(
+            send_preview_source_project_ipc_request_with_timeouts(
                 connect,
                 "replace-source",
                 &payload,
+                Duration::from_secs(5),
                 request_timeout,
+                Duration::from_secs(10),
             )
             .map(|mut response| {
                 response["replace_source_protocol"] = json!(true);
@@ -65115,40 +65098,6 @@ fn source_project_payload_for_manifest_replace_probe(
     )?))
 }
 
-fn send_preview_source_project_ipc_request_with_json_fallback(
-    connect: &str,
-    kind: &str,
-    payload: &SourceProjectPayload,
-    request_timeout: Duration,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let ack = send_preview_source_project_ipc_request_with_timeouts(
-        connect,
-        kind,
-        payload,
-        Duration::from_secs(5),
-        request_timeout,
-        Duration::from_secs(10),
-    )?;
-    if !source_project_binary_ack_needs_json_fallback(&ack) {
-        return Ok(ack);
-    }
-    let mut fallback_ack = send_preview_ipc_request_with_timeouts(
-        connect,
-        json!({
-            "kind": kind,
-            "payload": payload,
-            "dev_pid": std::process::id()
-        }),
-        Duration::from_secs(5),
-        request_timeout,
-        Duration::from_secs(10),
-    )?;
-    fallback_ack["source_project_ipc_binary_fallback"] = json!(true);
-    fallback_ack["source_project_ipc_binary_fallback_reason"] =
-        json!("preview did not understand source_project_frame");
-    Ok(fallback_ack)
-}
-
 fn send_preview_source_project_ipc_request(
     connect: &str,
     kind: &str,
@@ -65162,14 +65111,6 @@ fn send_preview_source_project_ipc_request(
         Duration::from_secs(30),
         Duration::from_secs(10),
     )
-}
-
-fn source_project_binary_ack_needs_json_fallback(ack: &serde_json::Value) -> bool {
-    ack.get("status").and_then(serde_json::Value::as_str) == Some("fail")
-        && ack
-            .get("diagnostic")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|diagnostic| diagnostic.contains("missing source text"))
 }
 
 fn send_preview_source_project_ipc_request_with_timeouts(

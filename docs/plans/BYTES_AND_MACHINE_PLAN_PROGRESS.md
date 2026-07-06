@@ -38853,6 +38853,19 @@ What changed:
   proof mode. Probe launches that need readback pass that mode explicitly.
 - Updated native verifier launch sites and the realtime frame-loop plan to match
   the explicit proof-mode contract.
+
+## 2026-07-06 - Source-Project IPC JSON Fallback Removed
+
+Status: implemented; focused verification pending.
+
+What changed:
+
+- Deleted the dev/preview source-project IPC downgrade path that retried a
+  binary source-project frame as a full JSON source payload when the preview
+  responded with a missing-source-text diagnostic.
+- Source-project replacement now uses the binary source-project protocol
+  directly. Protocol failure remains visible instead of silently changing
+  transport shape.
 - `cargo test -q -p xtask
   native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
   --nocapture`: pass.

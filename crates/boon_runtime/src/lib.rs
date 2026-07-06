@@ -4394,6 +4394,7 @@ impl PlanExecutorRuntimeState {
             state_summary.as_object().unwrap(),
             &self.list_store,
         )?;
+        let list_store_lookup_stats = self.list_store.lookup_stats_report();
         let semantic_deltas = JsonValue::Array(self.semantic_deltas);
         let list_projection_summary = JsonValue::Object(projection_execution.summary);
         let list_view_summary = JsonValue::Object(retain_execution.summary);
@@ -4431,6 +4432,13 @@ impl PlanExecutorRuntimeState {
             &bytes_storage_counters_report,
             bytes_storage_no_copy,
         )?;
+        let mut executor_report = report_assembly.executor_report;
+        if let Some(report) = executor_report.as_object_mut() {
+            report.insert(
+                "list_store_lookup_stats".to_owned(),
+                list_store_lookup_stats,
+            );
+        }
         Ok(RootScenarioExecution {
             plan_hash,
             state_summary,
@@ -4438,7 +4446,7 @@ impl PlanExecutorRuntimeState {
             semantic_deltas,
             per_step: self.per_step,
             assertion_checkpoints: self.assertion_checkpoints,
-            executor_report: report_assembly.executor_report,
+            executor_report,
         })
     }
 
@@ -4670,6 +4678,7 @@ impl PlanExecutorLiveSession {
             "output_root_evaluator": "plan_executor_generic_output_program",
             "output_root_count": self.generic_output_plan.output_roots.len(),
             "generic_fallback_enabled": false,
+            "list_store_lookup_stats": self.state.list_store.lookup_stats_report(),
         })
     }
 
@@ -5498,6 +5507,7 @@ fn execute_machine_plan_initial_state_inner(
         materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_store)?;
     let retain_execution =
         materialize_plan_list_retains(plan, state_summary.as_object().unwrap(), &list_store)?;
+    let list_store_lookup_stats = list_store.lookup_stats_report();
     let list_projection_summary = JsonValue::Object(projection_execution.summary);
     let list_view_summary = JsonValue::Object(retain_execution.summary);
     let report_assembly = assemble_plan_initial_state_report(
@@ -5519,10 +5529,17 @@ fn execute_machine_plan_initial_state_inner(
         &list_view_summary,
         &retain_execution.reports,
     );
+    let mut executor_report = report_assembly.executor_report;
+    if let Some(report) = executor_report.as_object_mut() {
+        report.insert(
+            "list_store_lookup_stats".to_owned(),
+            list_store_lookup_stats,
+        );
+    }
     Ok(InitialStateExecution {
         plan_hash,
         state_summary: state_summary.clone(),
-        executor_report: report_assembly.executor_report,
+        executor_report,
     })
 }
 
@@ -5626,6 +5643,7 @@ type PlanListRowState = PlanExecutorListRowState;
 struct PlanExecutorListStore {
     rows_by_list: BTreeMap<usize, Vec<PlanListRowState>>,
     exact_field_indexes: BTreeMap<(usize, String), PlanExecutorExactFieldIndex>,
+    lookup_stats: PlanExecutorListLookupStats,
 }
 
 impl PlanExecutorListStore {
@@ -5635,21 +5653,52 @@ impl PlanExecutorListStore {
         field_name: &str,
         expected: &JsonValue,
     ) -> Option<usize> {
+        self.lookup_stats.exact_lookup_count =
+            self.lookup_stats.exact_lookup_count.saturating_add(1);
         let key = (list_id, field_name.to_owned());
         if !self.exact_field_indexes.contains_key(&key) {
             let Some(rows) = self.rows_by_list.get(&list_id) else {
+                self.lookup_stats.exact_lookup_miss_count =
+                    self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
                 return None;
             };
             let index = PlanExecutorExactFieldIndex::from_rows(rows, field_name);
+            self.lookup_stats.exact_index_build_count =
+                self.lookup_stats.exact_index_build_count.saturating_add(1);
+            self.lookup_stats.exact_index_build_row_count = self
+                .lookup_stats
+                .exact_index_build_row_count
+                .saturating_add(rows.len() as u64);
             self.exact_field_indexes.insert(key.clone(), index);
         }
-        self.exact_field_indexes
+        let candidate_count = self
+            .exact_field_indexes
             .get(&key)?
-            .first_row_index(expected)
+            .candidate_count(expected);
+        self.lookup_stats.exact_lookup_candidate_count = self
+            .lookup_stats
+            .exact_lookup_candidate_count
+            .saturating_add(candidate_count as u64);
+        let row_index = self
+            .exact_field_indexes
+            .get(&key)?
+            .first_row_index(expected);
+        if row_index.is_some() {
+            self.lookup_stats.exact_lookup_hit_count =
+                self.lookup_stats.exact_lookup_hit_count.saturating_add(1);
+        } else {
+            self.lookup_stats.exact_lookup_miss_count =
+                self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
+        }
+        row_index
     }
 
     fn invalidate_indexes(&mut self) {
         self.exact_field_indexes.clear();
+    }
+
+    fn lookup_stats_report(&self) -> JsonValue {
+        self.lookup_stats.report_json()
     }
 }
 
@@ -5658,7 +5707,33 @@ impl From<BTreeMap<usize, Vec<PlanListRowState>>> for PlanExecutorListStore {
         Self {
             rows_by_list,
             exact_field_indexes: BTreeMap::new(),
+            lookup_stats: PlanExecutorListLookupStats::default(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PlanExecutorListLookupStats {
+    exact_lookup_count: u64,
+    exact_lookup_hit_count: u64,
+    exact_lookup_miss_count: u64,
+    exact_lookup_candidate_count: u64,
+    exact_lookup_row_scan_count: u64,
+    exact_index_build_count: u64,
+    exact_index_build_row_count: u64,
+}
+
+impl PlanExecutorListLookupStats {
+    fn report_json(&self) -> JsonValue {
+        json!({
+            "exact_lookup_count": self.exact_lookup_count,
+            "exact_lookup_hit_count": self.exact_lookup_hit_count,
+            "exact_lookup_miss_count": self.exact_lookup_miss_count,
+            "exact_lookup_candidate_count": self.exact_lookup_candidate_count,
+            "exact_lookup_row_scan_count": self.exact_lookup_row_scan_count,
+            "exact_index_build_count": self.exact_index_build_count,
+            "exact_index_build_row_count": self.exact_index_build_row_count,
+        })
     }
 }
 
@@ -5685,6 +5760,13 @@ impl PlanExecutorExactFieldIndex {
     fn first_row_index(&self, expected: &JsonValue) -> Option<usize> {
         let key = serde_json::to_string(expected).ok()?;
         self.rows_by_value.get(&key)?.first().copied()
+    }
+
+    fn candidate_count(&self, expected: &JsonValue) -> usize {
+        let Ok(key) = serde_json::to_string(expected) else {
+            return 0;
+        };
+        self.rows_by_value.get(&key).map(Vec::len).unwrap_or(0)
     }
 }
 
@@ -54187,6 +54269,18 @@ document: Document/new(root: Element/label(element: [], label: store.value))
         assert_eq!(
             store.exact_field_lookup(7, "address", &json!("C0")),
             Some(1)
+        );
+        assert_eq!(
+            store.lookup_stats_report(),
+            json!({
+                "exact_lookup_count": 3,
+                "exact_lookup_hit_count": 2,
+                "exact_lookup_miss_count": 1,
+                "exact_lookup_candidate_count": 2,
+                "exact_lookup_row_scan_count": 0,
+                "exact_index_build_count": 2,
+                "exact_index_build_row_count": 4,
+            })
         );
     }
 

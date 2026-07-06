@@ -381,6 +381,63 @@ Remaining work:
   counts, and scan counts so native/Cells reports can prove zero-scan address
   lookup directly.
 
+## 2026-07-06 - PlanExecutor List Lookup Telemetry Slice
+
+Status: report telemetry implemented and verified with focused runtime,
+Cells source-replay compatibility, and runtime-finality evidence.
+
+What changed:
+
+- `PlanExecutorListStore` now tracks bounded exact-lookup telemetry:
+  lookup count, hit count, miss count, candidate count, lookup row-scan count,
+  index build count, and index-build row count.
+- Initial-state and root-scenario PlanExecutor reports now include
+  `plan_executor.list_store_lookup_stats`.
+- `PlanExecutorLiveSession::provenance_report` also exposes the same store
+  lookup stats for native/document preview runtime provenance.
+- The exact lookup path reports lookup row scans separately from index-build row
+  visits. The current indexed lookup path keeps `exact_lookup_row_scan_count=0`.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_root_find_value_resolves_runtime_list_ref -- --nocapture`:
+  pass.
+- `cargo run -q -p boon_cli -- run examples/cells.bn --scenario
+  examples/cells.scn --report
+  target/reports/bytes-plan/cells-scenario-events-full.json`: pass.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json
+  target/reports/bytes-plan/cells-scenario-events-full.json`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Fresh Cells source-replay summary:
+
+- `status=pass`, `plan_executor_status=pass`, `exit_status=0`.
+- `comparison_status=not-requested`, with
+  `runtime_ast_eval_count=0`, `executable_string_path_count=0`,
+  `unknown_plan_op_count=0`, and `graph_rebuild_count=0`.
+- `plan_executor.list_store_lookup_stats` is present and schema-valid, but this
+  source-replay report does not exercise exact lookup
+  (`exact_lookup_count=0`). Lookup performance proof still needs native/document
+  summary evidence or a focused report that demands `List/find`/`List/find_value`
+  through the store path.
+
+Remaining work:
+
+- Add a focused runtime/verifier report that exercises `List/find` address-style
+  lookup through `PlanExecutorListStore` and asserts index hits plus
+  `exact_lookup_row_scan_count=0`.
+- Move summary currentness refresh and projection materialization fully onto
+  store methods, then remove the deref mutation compatibility surface.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

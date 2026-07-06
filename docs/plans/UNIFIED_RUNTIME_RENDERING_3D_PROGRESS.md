@@ -79,19 +79,45 @@ for old evidence.
   - `git diff --check`
   - `cargo check -q -p xtask`
   - `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`
-  - `cargo test -q -p xtask multiwindow_scaffold_supervisor_proof_is_rejected_summary -- --nocapture`
+
+### 2026-07-06 - Preview E2E Top-Level Proof Alias Cut
+
+- Removed producer and acceptance paths that copied, promoted, or accepted
+  top-level `preview_native_gpu_render_proof` for native preview E2E, scroll
+  evidence, TodoMVC visual richness, and NovyWave layout checks.
+- Native preview E2E now requires `native_gpu_render_proof` for app-owned pixel
+  proof and `preview_surface_proof` for surface-scoped ProductFrameGraph or
+  external visible-surface proof.
+- Scroll/render budget metrics now read from
+  `preview_surface_proof.visible_surface_metrics`,
+  `preview_surface_proof.external_render_proof`, or
+  `preview_surface_proof.product_render_graph_visible_proof`; unit fixtures were
+  moved off the top-level alias.
+- The remaining `preview_native_gpu_render_proof` strings in `xtask` are
+  negative/diagnostic test data, not production acceptance.
+
+Fresh focused evidence:
+
+- `cargo fmt --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask preview_e2e_surface_proof_does_not_republish_top_level_alias -- --nocapture`:
+  pass; 1 passed.
+- `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`:
+  pass; 1 passed.
+- `cargo test -q -p xtask product_path_input_to_present_timing_drives_scroll_budget_when_proven -- --nocapture`:
+  pass; 1 passed.
+- `cargo test -q -p xtask dev_editor_scroll_budget_uses_dev_surface_adapter_flag -- --nocapture`:
+  pass; 1 passed.
 
 ## Next Cuts
 
-1. Remove remaining stale preview-E2E top-level proof dependencies that duplicate
-   surface-scoped proof.
-2. Split or delete manifest coverage logic that conflates full semantic scenario
+1. Split or delete manifest coverage logic that conflates full semantic scenario
    coverage with the smaller native input proof subset.
-3. Remove remaining legacy `LoadedRuntime`/`GenericScheduledRuntime` fallback
+2. Remove remaining legacy `LoadedRuntime`/`GenericScheduledRuntime` fallback
    routes where `PlanExecutor` is the intended authority.
-4. Delete duplicate report/schema refresh paths that only preserve stale
+3. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints or old comparison contracts.
-5. Re-run focused native Cells product-latency and proof-lane reports after the
+4. Re-run focused native Cells product-latency and proof-lane reports after the
    harness is lean enough that reports are trustworthy.
 
 ## Completion Rules

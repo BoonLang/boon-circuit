@@ -36958,3 +36958,40 @@ Evidence:
 - Fresh `verify-compiler-boundaries`: pass, including
   `generic-scheduled-runtime-removed=true`.
 - Fresh schema validation of `target/reports/compiler-boundaries.json`: pass.
+
+## 2026-07-06 - Cells Product UX Split From Proof Lane
+
+Status: product lane implemented and verified; proof lane remains the blocker.
+
+What changed:
+
+- Split Cells visible-click sample status into product and proof lanes.
+- Product timing/currentness now stops at the exact product frame commit with a
+  retained product patch, product render graph, and product present plan.
+- WGPU/readback visual proof remains separately reported and no longer stretches
+  product input-to-formula latency or live probe status.
+- Report timing completeness is now product-path completeness; proof/readback
+  and legacy full timing completeness are explicit separate fields.
+
+Fresh evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask cells_visible_click_`: pass.
+- Fresh `verify-native-cells-visible-click-e2e --profile release` wrote a
+  schema-valid report with product lane passing and proof lane failing:
+  `live_probe.status=pass`, `product_only_ux_contract.status=pass`,
+  `preview_loop_product_path_contract.status=pass`,
+  `proof_only_contract.status=fail`.
+- Product samples: 64/64 pass, product currentness 64/64,
+  `input_accept_to_formula_visible_ms_p95=9.335ms`, max `9.608ms`.
+- Proof samples: 1/64 pass. The remaining blockers are WGPU/readback visual
+  proof, formula-bar visual transition proof, and selected-cell visual proof.
+
+Next architecture cut:
+
+- Keep the product path hot and unchanged.
+- Rework the proof lane as a bounded post-present subscriber keyed by
+  `FrameEvidenceKey`, so it can prove visible formula/selection changes without
+  active verifier-frame scheduling or product-path timing pollution.

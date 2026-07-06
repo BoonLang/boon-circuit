@@ -77,8 +77,6 @@ const DEV_FILE_TAB_HEIGHT: u32 = 24;
 const DEV_TOOLBAR_PADDING: u32 = 8;
 const DEV_TOOLBAR_GAP: u32 = 10;
 const DEV_TOOLBAR_ROW_HEIGHT: u32 = 32;
-const PREVIEW_HEADED_SCENARIO_FRAME_MS: u64 = 16;
-const PREVIEW_HEADED_SCENARIO_TIMEOUT_MS: u64 = 12_000;
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
 const DEV_FOOTER_SCROLL_PADDING: u32 = 6;
@@ -5428,444 +5426,6 @@ fn deterministic_motion_input_from_counts(
     input
 }
 
-fn preview_advance_headed_scenario(
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    input_state: &mut PreviewNativeInputState,
-    input_context: &PreviewInputRuntimeContext,
-    width: u32,
-    height: u32,
-    now: Instant,
-) -> Result<PreviewHeadedScenarioPollResult, Box<dyn std::error::Error>> {
-    let mut state = preview_headed_scenario_state()
-        .lock()
-        .map_err(|_| "preview headed scenario mutex poisoned")?;
-    let Some(run) = state.as_mut() else {
-        return Ok(PreviewHeadedScenarioPollResult::default());
-    };
-    if !run.active() {
-        return Ok(PreviewHeadedScenarioPollResult {
-            dirty: false,
-            active: false,
-        });
-    }
-    if now.duration_since(run.started_at).as_millis() > u128::from(run.timeout_ms) {
-        run.fail(
-            "timeout",
-            format!("headed scenario exceeded {} ms", run.timeout_ms),
-        );
-        write_preview_headed_scenario_report(run);
-        preview_mark_headed_scenario_dirty(shared_render_state)?;
-        return Ok(PreviewHeadedScenarioPollResult {
-            dirty: true,
-            active: false,
-        });
-    }
-
-    let Some(step) = run.definition.steps.get(run.step_index).cloned() else {
-        run.finish_pass_if_done();
-        write_preview_headed_scenario_report(run);
-        preview_mark_headed_scenario_dirty(shared_render_state)?;
-        return Ok(PreviewHeadedScenarioPollResult {
-            dirty: true,
-            active: false,
-        });
-    };
-
-    let dirty = true;
-    match step {
-        PreviewHeadedScenarioStep::MoveToSource {
-            source,
-            target_text,
-            duration_ms,
-        } => {
-            let (target_x, target_y, _) =
-                preview_headed_source_target(shared_render_state, &source, target_text.as_deref())?;
-            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
-            let t = if duration_ms == 0 {
-                1.0
-            } else {
-                (elapsed_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
-            };
-            let eased = t * t * (3.0 - 2.0 * t);
-            run.cursor = (
-                run.step_start_cursor.0 + (target_x - run.step_start_cursor.0) * eased,
-                run.step_start_cursor.1 + (target_y - run.step_start_cursor.1) * eased,
-            );
-            run.overlay.cursor_x = run.cursor.0;
-            run.overlay.cursor_y = run.cursor.1;
-            run.overlay.status_text = "Running".to_owned();
-            run.overlay.step_text = format!(
-                "Move to {}",
-                target_text
-                    .as_deref()
-                    .map(|target| format!("`{target}`"))
-                    .unwrap_or_else(|| source.clone())
-            );
-            run.overlay.pressed_keys.clear();
-            run.overlay.mouse_down = false;
-            if t >= 1.0 {
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "move_mouse",
-                        "status": "pass",
-                        "source": source,
-                        "target_text": target_text,
-                        "cursor": {"x": target_x, "y": target_y},
-                        "duration_ms": duration_ms,
-                        "input_route": "layout source intent hit center"
-                    }),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::MoveToPoint {
-            x,
-            y,
-            label,
-            duration_ms,
-        } => {
-            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
-            let t = if duration_ms == 0 {
-                1.0
-            } else {
-                (elapsed_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
-            };
-            let eased = t * t * (3.0 - 2.0 * t);
-            run.cursor = (
-                run.step_start_cursor.0 + (x - run.step_start_cursor.0) * eased,
-                run.step_start_cursor.1 + (y - run.step_start_cursor.1) * eased,
-            );
-            run.overlay.cursor_x = run.cursor.0;
-            run.overlay.cursor_y = run.cursor.1;
-            run.overlay.status_text = "Running".to_owned();
-            run.overlay.step_text = format!("Move to {label}");
-            run.overlay.pressed_keys.clear();
-            run.overlay.mouse_down = false;
-            if t >= 1.0 {
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "move_mouse",
-                        "status": "pass",
-                        "label": label,
-                        "cursor": {"x": x, "y": y},
-                        "duration_ms": duration_ms,
-                        "input_route": "visual headed scenario fixed viewport point"
-                    }),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::ClickSource {
-            source,
-            target_text,
-        } => {
-            let (target_x, target_y, route) =
-                preview_headed_source_target(shared_render_state, &source, target_text.as_deref())?;
-            run.cursor = (target_x, target_y);
-            run.overlay.cursor_x = target_x;
-            run.overlay.cursor_y = target_y;
-            run.overlay.mouse_down = true;
-            run.overlay.pressed_keys = vec!["Mouse Left".to_owned()];
-            run.overlay.click_pulse_started_at_ms = Some(unix_now_ms());
-            run.overlay.step_text = format!(
-                "Click {}",
-                target_text
-                    .as_deref()
-                    .map(|target| format!("`{target}`"))
-                    .unwrap_or_else(|| source.clone())
-            );
-            let start_index = input_state.last_mouse_button_event_count / 2;
-            let mut input =
-                deterministic_click_input_from_start_index(start_index, 1, target_x, target_y);
-            input.capture_scope = "headed_scenario_mouse_click".to_owned();
-            input.input_injection_method =
-                "preview_headed_scenario_app_owned_native_input_adapter".to_owned();
-            input.mouse_motion_event_count =
-                input_state.last_mouse_motion_event_count.saturating_add(1);
-            input.mouse_total_event_count = input
-                .mouse_button_event_count
-                .saturating_add(input.mouse_motion_event_count);
-            set_input_window_size(&mut input, (width as f32, height as f32));
-            if let Some(live_runtime) = input_context.live_runtime.as_ref() {
-                if let Err(error) = preview_apply_real_window_input_with_units(
-                    &input,
-                    &input_context.source_path,
-                    &input_context.source_text,
-                    &input_context.runtime_units,
-                    Some(live_runtime),
-                    shared_render_state,
-                    input_state,
-                ) {
-                    run.fail("event_routing", error.to_string());
-                } else {
-                    run.advance_step(
-                        now,
-                        json!({
-                            "kind": "click",
-                            "status": "pass",
-                            "source": source,
-                            "target_text": target_text,
-                            "cursor": {"x": target_x, "y": target_y},
-                            "route": route,
-                            "input_route_contract": "NativeInputAdapterProof -> preview_apply_real_window_input_with_units",
-                            "direct_runtime_state_mutation": false
-                        }),
-                    );
-                }
-            } else {
-                run.fail(
-                    "event_routing",
-                    "preview live runtime is not available for headed scenario input".to_owned(),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::ClickPoint { x, y, label } => {
-            run.cursor = (x, y);
-            run.overlay.cursor_x = x;
-            run.overlay.cursor_y = y;
-            run.overlay.mouse_down = true;
-            run.overlay.pressed_keys = vec!["Mouse Left".to_owned()];
-            run.overlay.click_pulse_started_at_ms = Some(unix_now_ms());
-            run.overlay.step_text = format!("Click {label}");
-            let start_index = input_state.last_mouse_button_event_count / 2;
-            let mut input = deterministic_click_input_from_start_index(start_index, 1, x, y);
-            input.capture_scope = "headed_scenario_mouse_click".to_owned();
-            input.input_injection_method =
-                "preview_headed_scenario_app_owned_native_input_adapter".to_owned();
-            input.mouse_motion_event_count =
-                input_state.last_mouse_motion_event_count.saturating_add(1);
-            input.mouse_total_event_count = input
-                .mouse_button_event_count
-                .saturating_add(input.mouse_motion_event_count);
-            set_input_window_size(&mut input, (width as f32, height as f32));
-            if let Some(live_runtime) = input_context.live_runtime.as_ref() {
-                if let Err(error) = preview_apply_real_window_input_with_units(
-                    &input,
-                    &input_context.source_path,
-                    &input_context.source_text,
-                    &input_context.runtime_units,
-                    Some(live_runtime),
-                    shared_render_state,
-                    input_state,
-                ) {
-                    let error = error.to_string();
-                    if error.contains("layout proof missing artifact_path") {
-                        run.advance_step(
-                            now,
-                            json!({
-                                "kind": "click",
-                                "status": "pass",
-                                "label": label,
-                                "cursor": {"x": x, "y": y},
-                                "input_route_contract": "visual overlay click pulse; no document layout hit target available",
-                                "route_skipped_reason": error,
-                                "direct_runtime_state_mutation": false
-                            }),
-                        );
-                    } else {
-                        run.fail("event_routing", error);
-                    }
-                } else {
-                    run.advance_step(
-                        now,
-                        json!({
-                            "kind": "click",
-                            "status": "pass",
-                            "label": label,
-                            "cursor": {"x": x, "y": y},
-                            "input_route_contract": "NativeInputAdapterProof -> preview_apply_real_window_input_with_units",
-                            "direct_runtime_state_mutation": false
-                        }),
-                    );
-                }
-            } else {
-                run.fail(
-                    "event_routing",
-                    "preview live runtime is not available for headed scenario input".to_owned(),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::KeyOverlay { keys, duration_ms } => {
-            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
-            run.overlay.pressed_keys = keys.clone();
-            run.overlay.mouse_down = keys.iter().any(|key| key == "Mouse Left");
-            run.overlay.status_text = "Running".to_owned();
-            run.overlay.step_text = format!("Show keys: {}", keys.join(" + "));
-            if elapsed_ms >= duration_ms {
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "key_overlay",
-                        "status": "pass",
-                        "keys": keys,
-                        "duration_ms": duration_ms,
-                        "rendered_by": "preview WGPU overlay HUD"
-                    }),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::Wait { duration_ms } => {
-            let elapsed_ms = now.duration_since(run.step_started_at).as_millis() as u64;
-            run.overlay.pressed_keys.clear();
-            run.overlay.mouse_down = false;
-            run.overlay.status_text = "Running".to_owned();
-            run.overlay.step_text = format!("Wait {duration_ms} ms");
-            if elapsed_ms >= duration_ms {
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "wait",
-                        "status": "pass",
-                        "duration_ms": duration_ms
-                    }),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::AssertRuntimeText {
-            json_pointer,
-            expected,
-        } => {
-            let Some(live_runtime) = input_context.live_runtime.as_ref() else {
-                run.fail(
-                    "runtime_assertion",
-                    "preview live runtime is not available for headed scenario assertion"
-                        .to_owned(),
-                );
-                write_preview_headed_scenario_report(run);
-                preview_mark_headed_scenario_dirty(shared_render_state)?;
-                return Ok(PreviewHeadedScenarioPollResult {
-                    dirty: true,
-                    active: run.active(),
-                });
-            };
-            let actual = {
-                let mut runtime = live_runtime
-                    .lock()
-                    .map_err(|_| "preview live runtime mutex poisoned")?;
-                let summary = runtime.state_summary();
-                summary
-                    .pointer(&json_pointer)
-                    .map(json_scalar_display_text)
-                    .unwrap_or_else(|| "<missing>".to_owned())
-            };
-            if actual == expected {
-                run.overlay.pressed_keys.clear();
-                run.overlay.mouse_down = false;
-                run.overlay.status_text = "Running".to_owned();
-                run.overlay.step_text = format!("Assert {json_pointer} == {expected}");
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "assert_runtime_text",
-                        "status": "pass",
-                        "json_pointer": json_pointer,
-                        "expected": expected,
-                        "actual": actual,
-                        "failure_category": "runtime_assertion"
-                    }),
-                );
-            } else {
-                run.fail(
-                    "runtime_assertion",
-                    format!(
-                        "runtime value at {json_pointer} expected `{expected}` but was `{actual}`"
-                    ),
-                );
-            }
-        }
-        PreviewHeadedScenarioStep::AssertFormulaBarText { expected } => {
-            let (node, actual) = preview_headed_formula_bar_text(shared_render_state)?;
-            if actual == expected {
-                run.overlay.pressed_keys.clear();
-                run.overlay.mouse_down = false;
-                run.overlay.status_text = "Running".to_owned();
-                run.overlay.step_text = format!("Assert formula bar == {expected}");
-                run.advance_step(
-                    now,
-                    json!({
-                        "kind": "assert_formula_bar_text",
-                        "status": "pass",
-                        "node": node,
-                        "expected": expected,
-                        "actual": actual,
-                        "failure_category": "retained_visual_text"
-                    }),
-                );
-            } else {
-                run.fail(
-                    "retained_visual_text",
-                    format!("formula bar node `{node}` expected `{expected}` but retained text was `{actual}`"),
-                );
-            }
-        }
-    }
-    write_preview_headed_scenario_report(run);
-    preview_mark_headed_scenario_dirty(shared_render_state)?;
-    Ok(PreviewHeadedScenarioPollResult {
-        dirty,
-        active: run.active(),
-    })
-}
-
-fn preview_mark_headed_scenario_dirty(
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut shared = shared_render_state
-        .lock()
-        .map_err(|_| "preview render state mutex poisoned")?;
-    shared.update_count = shared.update_count.saturating_add(1);
-    shared.last_dirty_reason = Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
-    Ok(())
-}
-
-fn preview_headed_source_target(
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    source: &str,
-    target_text: Option<&str>,
-) -> Result<(f64, f64, String), Box<dyn std::error::Error>> {
-    let layout_proof = shared_render_state
-        .lock()
-        .map_err(|_| "preview render state mutex poisoned")?
-        .layout_proof
-        .clone();
-    source_hit_center_for_target(&layout_proof, source, target_text)
-}
-
-fn preview_headed_formula_bar_text(
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let (layout_proof, frame) = {
-        let shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        let frame = match shared.layout_frame_override.as_ref() {
-            Some(frame) => frame.as_ref().clone(),
-            None => layout_frame_from_layout_proof(&shared.layout_proof)?,
-        };
-        (shared.layout_proof.clone(), frame)
-    };
-    let (_, _, node) = formula_bar_input_center(&layout_proof)?;
-    let text = frame
-        .display_list
-        .iter()
-        .find(|item| item.node.0 == node)
-        .and_then(|item| item.text.clone())
-        .unwrap_or_default();
-    Ok((node, text))
-}
-
-fn json_scalar_display_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "null".to_owned(),
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_default()
-        }
-    }
-}
-
 fn native_proof_mode_arg(
     args: &[String],
 ) -> Result<boon_native_app_window::NativeProofMode, Box<dyn std::error::Error>> {
@@ -5992,8 +5552,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
-    let headed_scenario_timeout_ms = numeric_arg(args, "--headed-scenario-timeout-ms")
-        .unwrap_or(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS);
     let proof_mode = native_proof_mode_arg(args)?;
     let frame_readback = proof_mode == boon_native_app_window::NativeProofMode::Readback;
     let adapter_policy = native_adapter_policy_arg(args)?;
@@ -6102,25 +5660,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(path, Arc::clone(&preview_ipc_state), wake_handle.clone())?;
-    }
-    if let Some(scenario_id) = value_arg(args, "--auto-headed-scenario") {
-        let response = preview_start_headed_scenario_response(
-            &preview_ipc_state,
-            &json!({
-                "kind": "headed-scenario-start",
-                "scenario_id": scenario_id,
-                "trigger": "preview-role-auto-start",
-                "timeout_ms": headed_scenario_timeout_ms
-            }),
-        )?;
-        if response.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
-            let diagnostic = json_diagnostic(&response).unwrap_or_else(|| {
-                "auto headed scenario failed before preview loop start".to_owned()
-            });
-            preview_note_render_error(&shared_render_state, diagnostic)?;
-        } else {
-            wake_handle.wake();
-        }
     }
     let role_args = args[1..].to_vec();
     let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
@@ -6676,21 +6215,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             note_poll_phase!("viewport_relayout_ms", phase_started);
             let phase_started = Instant::now();
-            let headed_scenario_poll = preview_advance_headed_scenario(
-                &poll_shared_render_state,
-                &mut input_state,
-                &input_context,
-                context.width,
-                context.height,
-                context.now,
-            )
-            .map_err(|error| error.to_string())?;
-            if headed_scenario_poll.dirty && role_dirty_reason.is_none() {
-                role_dirty_reason =
-                    Some(boon_native_app_window::NativeRoleDirtyReason::VerifierFrame);
-            }
-            note_poll_phase!("headed_scenario_ms", phase_started);
-            let phase_started = Instant::now();
             let caret_visible = preview_caret_visible(&input_state, context.now);
             let focus_changed =
                 if preview_has_world_scene || input_state.focus_overlay_applied_in_input {
@@ -6738,8 +6262,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 || after_content_revision != last_poll_revision
                 || verifier_host_input_applied
                 || context.forced_frame
-                || verifier_frame_requested
-                || headed_scenario_poll.dirty;
+                || verifier_frame_requested;
             last_poll_revision = last_poll_revision.max(after_content_revision);
             note_poll_phase!("dirty_revision_compute_ms", phase_started);
             let phase_started = Instant::now();
@@ -6749,8 +6272,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
             } else if context.input_delta.real_os_events_observed {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
-            } else if headed_scenario_poll.dirty {
-                Some(boon_native_app_window::NativeSchedulerReason::Timer)
             } else if dirty
                 && role_dirty_reason
                     == Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged)
@@ -6789,7 +6310,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     dirty,
                     !context.accessibility_actions.is_empty(),
                     context.forced_frame,
-                    headed_scenario_poll.active,
                     pending_accessibility_refresh,
                 );
             let mut accessibility_snapshot_status = "unchanged_or_not_applicable";
@@ -6859,8 +6379,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "after_update_count": after_update_count,
                 "previous_poll_revision": last_poll_revision,
                 "after_content_revision": after_content_revision,
-                "headed_scenario_dirty": headed_scenario_poll.dirty,
-                "headed_scenario_active": headed_scenario_poll.active,
                 "verifier_host_input_applied": verifier_host_input_applied,
                 "verifier_host_input_report": verifier_host_input_report,
                 "focus_changed": focus_changed,
@@ -6891,16 +6409,8 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason,
                 frame_lane: frame_lane_hint,
                 accepted_host_input_event_hint: input_state.accepted_host_input_event_hint.clone(),
-                next_wake_after_ms: [
-                    preview_text_input_caret_active.then_some(500),
-                    headed_scenario_poll
-                        .active
-                        .then_some(PREVIEW_HEADED_SCENARIO_FRAME_MS),
-                ]
-                .into_iter()
-                .flatten()
-                .min(),
-                wants_animation_frame: headed_scenario_poll.active || verifier_host_input_applied,
+                next_wake_after_ms: preview_text_input_caret_active.then_some(500),
+                wants_animation_frame: verifier_host_input_applied,
                 cursor_icon,
                 diagnostics: Some(poll_diagnostics),
                 accessibility_update,
@@ -6932,7 +6442,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .unwrap_or_default();
             let render_hook_outer_input_snapshot_ms = elapsed_ms(input_snapshot_started);
-            let render_headed_scenario_overlay = preview_headed_scenario_overlay();
             let world_snapshot_started = Instant::now();
             let render_world_scene = render_preview_ipc_state
                 .lock()
@@ -6957,7 +6466,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 render_status_overlay.as_ref(),
                 &render_hover_overlay,
                 &render_focus_overlay,
-                render_headed_scenario_overlay.as_ref(),
                 &mut visible_renderer,
                 &mut render_text_columns,
                 &mut layout_frame_cache,
@@ -11482,7 +10990,6 @@ fn native_gpu_app_owned_render_hook(
     status_overlay: Option<&PreviewStatusOverlay>,
     hover_overlay: &PreviewHoverOverlayState,
     focus_overlay: &PreviewFocusOverlayState,
-    headed_scenario_overlay: Option<&PreviewHeadedScenarioOverlayState>,
     visible_renderer: &mut Option<boon_native_gpu::VisibleLayoutRenderer>,
     render_text_columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
     layout_frame_cache: &mut Option<(String, boon_document::LayoutFrame)>,
@@ -11580,7 +11087,6 @@ fn native_gpu_app_owned_render_hook(
     let input_overlay_render_scene_patch_enabled = layout_render_scene_patch.is_none()
         && last_error.is_none()
         && status_overlay.is_none()
-        && headed_scenario_overlay.is_none()
         && (!hover_overlay.is_empty()
             || !focus_overlay.is_empty()
             || !retained_bound_text_nodes.is_empty());
@@ -11615,7 +11121,6 @@ fn native_gpu_app_owned_render_hook(
         status_overlay: status_overlay.map(|overlay| (overlay.kind, overlay.message.clone())),
         hover_overlay: hover_overlay.clone(),
         focus_overlay: focus_overlay.clone(),
-        headed_scenario_overlay: headed_scenario_overlay.cloned(),
     };
     let (render_frame, render_frame_hash_value) = if input_overlay_render_scene_patch_enabled {
         render_frame_cache_hit = true;
@@ -11667,14 +11172,6 @@ fn native_gpu_app_owned_render_hook(
                 &visible_state.overlay_lookup,
                 focus_overlay,
             );
-            if let Some(overlay) = headed_scenario_overlay {
-                preview_apply_headed_scenario_overlay_to_render_frame(
-                    &mut render_frame,
-                    overlay,
-                    context.width as f32,
-                    context.height as f32,
-                );
-            }
             let render_frame = preview_frame_with_viewport_background(
                 &render_frame,
                 context.width as f32,
@@ -12791,7 +12288,6 @@ struct PreviewRenderFrameCacheKey {
     status_overlay: Option<(PreviewStatusOverlayKind, String)>,
     hover_overlay: PreviewHoverOverlayState,
     focus_overlay: PreviewFocusOverlayState,
-    headed_scenario_overlay: Option<PreviewHeadedScenarioOverlayState>,
 }
 
 type PreviewRenderSceneCacheKey = (String, u32, u32, String, String);
@@ -13219,198 +12715,6 @@ fn preview_input_overlay_render_scene_patch_from_base(
     let patch_frame =
         preview_frame_with_viewport_background(&patch_frame, width as f32, height as f32);
     preview_input_overlay_render_scene_patch(&patch_frame, touched_nodes, width, height, columns)
-}
-
-fn preview_apply_headed_scenario_overlay_to_render_frame(
-    frame: &mut boon_document::LayoutFrame,
-    overlay: &PreviewHeadedScenarioOverlayState,
-    width: f32,
-    height: f32,
-) {
-    let x = overlay.cursor_x as f32;
-    let y = overlay.cursor_y as f32;
-    if let Some(started_at) = overlay.click_pulse_started_at_ms {
-        let age_ms = unix_now_ms().saturating_sub(started_at);
-        if age_ms <= 420 {
-            push_preview_overlay_rect(
-                frame,
-                "headed-scenario-click-pulse",
-                (x - 20.0).max(0.0),
-                (y - 20.0).max(0.0),
-                44.0,
-                44.0,
-                "#dbeafe",
-                "#2563eb",
-            );
-        }
-    }
-    push_preview_overlay_rect(
-        frame,
-        "headed-scenario-cursor-marker",
-        x.max(0.0),
-        y.max(0.0),
-        14.0,
-        20.0,
-        if overlay.mouse_down {
-            "#1d4ed8"
-        } else {
-            "#111827"
-        },
-        "#bfdbfe",
-    );
-    push_preview_overlay_rect(
-        frame,
-        "headed-scenario-cursor-hotspot",
-        (x - 2.0).max(0.0),
-        (y - 2.0).max(0.0),
-        5.0,
-        5.0,
-        "#f8fafc",
-        "#111827",
-    );
-    push_preview_overlay_text(
-        frame,
-        "headed-scenario-cursor-label",
-        (x + 18.0).min((width - 92.0).max(0.0)),
-        (y + 2.0).min((height - 26.0).max(0.0)),
-        88.0,
-        24.0,
-        &overlay.label,
-        "#2563eb",
-        "#eff6ff",
-        13.0,
-    );
-
-    let keys_text = if overlay.pressed_keys.is_empty() {
-        "Keys: none".to_owned()
-    } else {
-        format!("Keys: {}", overlay.pressed_keys.join(" + "))
-    };
-    let hud_width = 300.0_f32.min((width - 24.0).max(1.0));
-    let hud_x = (width - hud_width - 16.0).max(0.0);
-    let hud_y = (height - 72.0).max(0.0);
-    push_preview_overlay_rect(
-        frame,
-        "headed-scenario-key-hud-bg",
-        hud_x,
-        hud_y,
-        hud_width,
-        56.0,
-        "#111827",
-        "#60a5fa",
-    );
-    push_preview_overlay_text(
-        frame,
-        "headed-scenario-key-hud-keys",
-        hud_x + 10.0,
-        hud_y + 8.0,
-        (hud_width - 20.0).max(1.0),
-        20.0,
-        &keys_text,
-        "#111827",
-        "#f8fafc",
-        13.0,
-    );
-    push_preview_overlay_text(
-        frame,
-        "headed-scenario-key-hud-status",
-        hud_x + 10.0,
-        hud_y + 30.0,
-        (hud_width - 20.0).max(1.0),
-        18.0,
-        &format!("{}: {}", overlay.status_text, overlay.step_text),
-        "#111827",
-        "#bfdbfe",
-        12.0,
-    );
-    frame.metrics.display_item_count = frame.display_list.len();
-}
-
-fn push_preview_overlay_rect(
-    frame: &mut boon_document::LayoutFrame,
-    id: &str,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    bg: &str,
-    border: &str,
-) {
-    let mut style = BTreeMap::new();
-    style.insert(
-        "bg".to_owned(),
-        boon_document_model::StyleValue::Text(bg.to_owned()),
-    );
-    style.insert(
-        "border".to_owned(),
-        boon_document_model::StyleValue::Text(border.to_owned()),
-    );
-    let style_identity = boon_document::ComputedStyleIdentity::from_style(&style);
-    frame.display_list.push(boon_document::DisplayItem {
-        node: boon_document_model::DocumentNodeId(id.to_owned()),
-        kind: boon_document_model::DocumentNodeKind::Text,
-        bounds: boon_document::Rect {
-            x,
-            y,
-            width,
-            height,
-        },
-        text: Some(String::new()),
-        style_identity,
-        style,
-        focused: false,
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_preview_overlay_text(
-    frame: &mut boon_document::LayoutFrame,
-    id: &str,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    text: &str,
-    bg: &str,
-    color: &str,
-    size: f64,
-) {
-    let mut style = BTreeMap::new();
-    style.insert(
-        "bg".to_owned(),
-        boon_document_model::StyleValue::Text(bg.to_owned()),
-    );
-    style.insert(
-        "color".to_owned(),
-        boon_document_model::StyleValue::Text(color.to_owned()),
-    );
-    style.insert(
-        "size".to_owned(),
-        boon_document_model::StyleValue::Number(size),
-    );
-    style.insert(
-        "font".to_owned(),
-        boon_document_model::StyleValue::Text(BOON_EDITOR_FONT_FAMILY.to_owned()),
-    );
-    style.insert(
-        "padding".to_owned(),
-        boon_document_model::StyleValue::Number(4.0),
-    );
-    let style_identity = boon_document::ComputedStyleIdentity::from_style(&style);
-    frame.display_list.push(boon_document::DisplayItem {
-        node: boon_document_model::DocumentNodeId(id.to_owned()),
-        kind: boon_document_model::DocumentNodeKind::Text,
-        bounds: boon_document::Rect {
-            x,
-            y,
-            width,
-            height,
-        },
-        text: Some(text.to_owned()),
-        style_identity,
-        style,
-        focused: false,
-    });
 }
 
 fn preview_frame_with_viewport_background(
@@ -14166,7 +13470,7 @@ fn dev_visible_render_report(
         "example_catalog_entry_count": shell.catalog.entries.len(),
         "dev_window_tabs_visible": true,
         "dev_window_toolbar_visible": true,
-        "dev_window_controls": ["Run", "Test", "Format", "Reset"],
+        "dev_window_controls": ["Run", "Format", "Reset"],
         "code_editor_model": code_editor_model_report,
         "code_editor_visible_style": dev_code_editor_visible_style_report(layout_frame),
         "dev_hot_path_counters": {
@@ -21256,44 +20560,6 @@ impl PreviewTransport {
             }),
         }
     }
-
-    fn start_headed_scenario(
-        &self,
-        scenario_id: &str,
-        selected_example_id: &str,
-    ) -> serde_json::Value {
-        let Some(connect) = &self.connect else {
-            return json!({
-                "status": "not-bound",
-                "kind": "headed-scenario-start-ack",
-                "transport_bound": false,
-                "scenario_id": scenario_id,
-                "selected_example_id": selected_example_id
-            });
-        };
-        match send_preview_ipc_request_with_timeouts(
-            connect,
-            json!({
-                "kind": "headed-scenario-start",
-                "scenario_id": scenario_id,
-                "selected_example_id": selected_example_id,
-                "dev_pid": std::process::id()
-            }),
-            Duration::ZERO,
-            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
-            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
-        ) {
-            Ok(value) => value,
-            Err(error) => json!({
-                "status": "unavailable",
-                "kind": "headed-scenario-start-ack",
-                "transport_bound": true,
-                "scenario_id": scenario_id,
-                "selected_example_id": selected_example_id,
-                "diagnostic": error.to_string()
-            }),
-        }
-    }
 }
 
 struct DevWindowShell {
@@ -22299,10 +21565,6 @@ impl DevWindowShell {
 
         let mut value = match source_path {
             "dev.commands.run" => self.workspace.run_selected(&self.catalog),
-            "dev.commands.test" => {
-                self.hovered_editor_position = None;
-                self.start_selected_headed_scenario()
-            }
             "dev.commands.format" => {
                 self.hovered_editor_position = None;
                 self.workspace.format_selected(&self.catalog)
@@ -22364,48 +21626,11 @@ impl DevWindowShell {
                         .unwrap_or("DevCommand"),
                 );
             }
-            if command != "HeadedScenarioTest" {
-                value["preview_transport"] = self.queue_selected_preview(&command);
-            }
+            value["preview_transport"] = self.queue_selected_preview(&command);
         }
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
         value
-    }
-
-    fn start_selected_headed_scenario(&mut self) -> serde_json::Value {
-        let selected_example_id = self.workspace.selected_example_id.clone();
-        let scenario_id = if selected_example_id == "counter" {
-            "counter"
-        } else {
-            "counter"
-        };
-        let response = self
-            .preview_transport
-            .start_headed_scenario(scenario_id, &selected_example_id);
-        let status = response
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("fail")
-            .to_owned();
-        self.last_dev_command = "HeadedScenarioTest".to_owned();
-        self.last_dev_command_status = status.clone();
-        self.last_dev_command_detail = json_diagnostic(&response).or_else(|| {
-            response
-                .get("report_path")
-                .and_then(serde_json::Value::as_str)
-                .map(|path| format!("report {path}"))
-        });
-        json!({
-            "status": status,
-            "command": "HeadedScenarioTest",
-            "scenario_id": scenario_id,
-            "selected_example_id": selected_example_id,
-            "preview_transport": response,
-            "dispatched_source_path": "dev.commands.test",
-            "dispatch_boundary": "Document SourceBinding -> DevWindowShell -> PreviewTransport -> preview headed scenario runner",
-            "direct_runtime_state_mutation": false
-        })
     }
 
     fn create_blank_custom_tab(&mut self) -> serde_json::Value {
@@ -23695,7 +22920,7 @@ fn dev_shell_document(
     } else {
         0
     };
-    let command_specs = ["run", "test", "format", "reset", "remove_custom"];
+    let command_specs = ["run", "format", "reset", "remove_custom"];
     let command_widths = command_specs
         .iter()
         .map(|command| if *command == "remove_custom" { 116 } else { 96 })
@@ -24015,7 +23240,6 @@ fn dev_shell_document(
         .any(|entry| entry.id == shell.workspace.selected_example_id && entry.custom);
     for (command_index, command) in command_specs.iter().copied().enumerate() {
         let label = match command {
-            "test" => "TEST".to_owned(),
             "remove_custom" => "REMOVE".to_owned(),
             other => other.to_ascii_uppercase(),
         };
@@ -24588,7 +23812,6 @@ fn ui_status_label(status: &str) -> &'static str {
 fn friendly_dev_command(command: &str) -> &'static str {
     match command {
         "startup" => "Startup",
-        "test" => "Test",
         "Run" => "Run",
         "Format" => "Format",
         "Reset" => "Reset",
@@ -37311,98 +36534,6 @@ struct PreviewActiveDrag {
     last_y: f64,
 }
 
-#[derive(Clone, Debug)]
-struct PreviewHeadedScenarioDefinition {
-    id: String,
-    label: String,
-    steps: Vec<PreviewHeadedScenarioStep>,
-}
-
-#[derive(Clone, Debug)]
-enum PreviewHeadedScenarioStep {
-    MoveToSource {
-        source: String,
-        target_text: Option<String>,
-        duration_ms: u64,
-    },
-    MoveToPoint {
-        x: f64,
-        y: f64,
-        label: String,
-        duration_ms: u64,
-    },
-    ClickSource {
-        source: String,
-        target_text: Option<String>,
-    },
-    ClickPoint {
-        x: f64,
-        y: f64,
-        label: String,
-    },
-    KeyOverlay {
-        keys: Vec<String>,
-        duration_ms: u64,
-    },
-    Wait {
-        duration_ms: u64,
-    },
-    AssertRuntimeText {
-        json_pointer: String,
-        expected: String,
-    },
-    AssertFormulaBarText {
-        expected: String,
-    },
-}
-
-#[derive(Clone, Debug)]
-struct PreviewHeadedScenarioRun {
-    definition: PreviewHeadedScenarioDefinition,
-    status: PreviewHeadedScenarioStatus,
-    step_index: usize,
-    started_at: Instant,
-    timeout_ms: u64,
-    step_started_at: Instant,
-    step_start_cursor: (f64, f64),
-    cursor: (f64, f64),
-    overlay: PreviewHeadedScenarioOverlayState,
-    report_steps: Vec<serde_json::Value>,
-    failures: Vec<serde_json::Value>,
-    completed_at_unix_ms: Option<u128>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreviewHeadedScenarioStatus {
-    Running,
-    Pass,
-    Fail,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct PreviewHeadedScenarioOverlayState {
-    scenario_id: String,
-    cursor_x: f64,
-    cursor_y: f64,
-    label: String,
-    pressed_keys: Vec<String>,
-    mouse_down: bool,
-    click_pulse_started_at_ms: Option<u128>,
-    status_text: String,
-    step_text: String,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PreviewHeadedScenarioPollResult {
-    dirty: bool,
-    active: bool,
-}
-
-fn preview_headed_scenario_state() -> &'static Mutex<Option<PreviewHeadedScenarioRun>> {
-    static STATE: OnceLock<Mutex<Option<PreviewHeadedScenarioRun>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
-}
-
 fn unix_now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -37429,8 +36560,13 @@ fn preview_apply_verifier_host_click_request(
             }),
         )
     } else {
-        let (x, y, node) = preview_headed_source_target(
-            shared_render_state,
+        let layout_proof = shared_render_state
+            .lock()
+            .map_err(|_| "preview render state mutex poisoned")?
+            .layout_proof
+            .clone();
+        let (x, y, node) = source_hit_center_for_target(
+            &layout_proof,
             &request.source,
             request.target_text.as_deref(),
         )?;
@@ -37936,415 +37072,6 @@ fn preview_retained_bound_sync_already_changed_style_for_nodes(nodes: &BTreeSet<
                     .iter()
                     .all(|node| stats.style_update_nodes.iter().any(|seen| seen == node))
         })
-}
-
-fn preview_headed_counter_scenario_definition() -> PreviewHeadedScenarioDefinition {
-    PreviewHeadedScenarioDefinition {
-        id: "counter-basic-headed".to_owned(),
-        label: "Counter headed smoke".to_owned(),
-        steps: vec![
-            PreviewHeadedScenarioStep::MoveToSource {
-                source: "store.sources.increment_button.press".to_owned(),
-                target_text: Some("+".to_owned()),
-                duration_ms: 520,
-            },
-            PreviewHeadedScenarioStep::ClickSource {
-                source: "store.sources.increment_button.press".to_owned(),
-                target_text: Some("+".to_owned()),
-            },
-            PreviewHeadedScenarioStep::KeyOverlay {
-                keys: vec!["Mouse Left".to_owned()],
-                duration_ms: 180,
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/count".to_owned(),
-                expected: "1".to_owned(),
-            },
-            PreviewHeadedScenarioStep::MoveToSource {
-                source: "store.sources.decrement_button.press".to_owned(),
-                target_text: Some("-".to_owned()),
-                duration_ms: 520,
-            },
-            PreviewHeadedScenarioStep::ClickSource {
-                source: "store.sources.decrement_button.press".to_owned(),
-                target_text: Some("-".to_owned()),
-            },
-            PreviewHeadedScenarioStep::KeyOverlay {
-                keys: vec!["Mouse Left".to_owned()],
-                duration_ms: 180,
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/count".to_owned(),
-                expected: "0".to_owned(),
-            },
-            PreviewHeadedScenarioStep::Wait { duration_ms: 320 },
-        ],
-    }
-}
-
-fn preview_headed_cells_scenario_definition() -> PreviewHeadedScenarioDefinition {
-    PreviewHeadedScenarioDefinition {
-        id: "cells-basic-headed".to_owned(),
-        label: "Cells headed click/edit smoke".to_owned(),
-        steps: vec![
-            PreviewHeadedScenarioStep::MoveToSource {
-                source: "cell.sources.editor.select".to_owned(),
-                target_text: Some("B0".to_owned()),
-                duration_ms: 520,
-            },
-            PreviewHeadedScenarioStep::ClickSource {
-                source: "cell.sources.editor.select".to_owned(),
-                target_text: Some("B0".to_owned()),
-            },
-            PreviewHeadedScenarioStep::KeyOverlay {
-                keys: vec!["Mouse Left".to_owned()],
-                duration_ms: 180,
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/selected_address".to_owned(),
-                expected: "B0".to_owned(),
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/selected_input/editing_text".to_owned(),
-                expected: "=add(A0,A1)".to_owned(),
-            },
-            PreviewHeadedScenarioStep::AssertFormulaBarText {
-                expected: "=add(A0,A1)".to_owned(),
-            },
-            PreviewHeadedScenarioStep::MoveToSource {
-                source: "cell.sources.editor.select".to_owned(),
-                target_text: Some("C0".to_owned()),
-                duration_ms: 520,
-            },
-            PreviewHeadedScenarioStep::ClickSource {
-                source: "cell.sources.editor.select".to_owned(),
-                target_text: Some("C0".to_owned()),
-            },
-            PreviewHeadedScenarioStep::KeyOverlay {
-                keys: vec!["Mouse Left".to_owned()],
-                duration_ms: 180,
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/selected_address".to_owned(),
-                expected: "C0".to_owned(),
-            },
-            PreviewHeadedScenarioStep::AssertRuntimeText {
-                json_pointer: "/store/selected_input/editing_text".to_owned(),
-                expected: "=sum(A0:A2)".to_owned(),
-            },
-            PreviewHeadedScenarioStep::AssertFormulaBarText {
-                expected: "=sum(A0:A2)".to_owned(),
-            },
-            PreviewHeadedScenarioStep::Wait { duration_ms: 320 },
-        ],
-    }
-}
-
-fn preview_headed_generic_visual_scenario_definition(
-    example: &str,
-) -> PreviewHeadedScenarioDefinition {
-    PreviewHeadedScenarioDefinition {
-        id: format!("{example}-visual-headed"),
-        label: format!("{example} visual headed smoke"),
-        steps: vec![
-            PreviewHeadedScenarioStep::MoveToPoint {
-                x: 160.0,
-                y: 120.0,
-                label: "primary viewport".to_owned(),
-                duration_ms: 420,
-            },
-            PreviewHeadedScenarioStep::ClickPoint {
-                x: 160.0,
-                y: 120.0,
-                label: "primary viewport".to_owned(),
-            },
-            PreviewHeadedScenarioStep::KeyOverlay {
-                keys: vec!["Mouse Left".to_owned()],
-                duration_ms: 180,
-            },
-            PreviewHeadedScenarioStep::MoveToPoint {
-                x: 320.0,
-                y: 180.0,
-                label: "secondary viewport".to_owned(),
-                duration_ms: 420,
-            },
-        ],
-    }
-}
-
-fn preview_headed_scenario_definition(id: &str) -> Option<PreviewHeadedScenarioDefinition> {
-    match id {
-        "counter" | "counter-basic-headed" => Some(preview_headed_counter_scenario_definition()),
-        "cells" | "cells-basic-headed" => Some(preview_headed_cells_scenario_definition()),
-        "todomvc" | "todomvc-visual-headed" => {
-            Some(preview_headed_generic_visual_scenario_definition("todomvc"))
-        }
-        "todo_mvc_physical" | "todo_mvc_physical-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("todo_mvc_physical"),
-        ),
-        "novywave" | "novywave-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("novywave"),
-        ),
-        "hello_3d" | "hello_3d-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("hello_3d"),
-        ),
-        "printable_bracket_3d" | "printable_bracket_3d-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("printable_bracket_3d"),
-        ),
-        "parametric_car_3d" | "parametric_car_3d-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("parametric_car_3d"),
-        ),
-        "parametric_car_rich_3d" | "parametric_car_rich_3d-visual-headed" => Some(
-            preview_headed_generic_visual_scenario_definition("parametric_car_rich_3d"),
-        ),
-        _ => None,
-    }
-}
-
-fn preview_headed_scenario_required_source_path(scenario_id: &str) -> Option<&'static str> {
-    match scenario_id {
-        "counter-basic-headed" => Some("examples/counter.bn"),
-        "cells-basic-headed" => Some("examples/cells.bn"),
-        "todomvc-visual-headed" => Some("examples/todomvc.bn"),
-        "todo_mvc_physical-visual-headed" => Some("examples/todo_mvc_physical/RUN.bn"),
-        "novywave-visual-headed" => Some("examples/novywave/RUN.bn"),
-        "hello_3d-visual-headed" => Some("examples/hello_3d/RUN.bn"),
-        "printable_bracket_3d-visual-headed" => Some("examples/printable_bracket_3d/RUN.bn"),
-        "parametric_car_3d-visual-headed" => Some("examples/parametric_car_3d/RUN.bn"),
-        "parametric_car_rich_3d-visual-headed" => Some("examples/parametric_car_rich_3d/RUN.bn"),
-        _ => None,
-    }
-}
-
-impl PreviewHeadedScenarioRun {
-    fn new(definition: PreviewHeadedScenarioDefinition, timeout_ms: u64) -> Self {
-        let now = Instant::now();
-        let started_at_unix_ms = unix_now_ms();
-        let cursor = (96.0, 96.0);
-        Self {
-            overlay: PreviewHeadedScenarioOverlayState {
-                scenario_id: definition.id.clone(),
-                cursor_x: cursor.0,
-                cursor_y: cursor.1,
-                label: "Test".to_owned(),
-                pressed_keys: Vec::new(),
-                mouse_down: false,
-                click_pulse_started_at_ms: None,
-                status_text: "Running".to_owned(),
-                step_text: "Starting".to_owned(),
-            },
-            report_steps: vec![json!({
-                    "id": "start",
-                    "status": "pass",
-                    "started_at_unix_ms": started_at_unix_ms,
-                    "runner": "preview-headed-scenario-runner",
-                "scenario_api": "Rust enum steps: move mouse, click, key overlay, wait, assert runtime text"
-            })],
-            definition,
-            status: PreviewHeadedScenarioStatus::Running,
-            step_index: 0,
-            started_at: now,
-            timeout_ms,
-            step_started_at: now,
-            step_start_cursor: cursor,
-            cursor,
-            failures: Vec::new(),
-            completed_at_unix_ms: None,
-        }
-    }
-
-    fn active(&self) -> bool {
-        self.status == PreviewHeadedScenarioStatus::Running
-    }
-
-    fn report(&self) -> serde_json::Value {
-        json!({
-            "kind": "headed-scenario-report",
-            "status": match self.status {
-                PreviewHeadedScenarioStatus::Running => "running",
-                PreviewHeadedScenarioStatus::Pass => "pass",
-                PreviewHeadedScenarioStatus::Fail => "fail",
-            },
-            "scenario_id": self.definition.id,
-            "scenario_label": self.definition.label,
-            "step_index": self.step_index,
-            "step_count": self.definition.steps.len(),
-            "timeout_ms": self.timeout_ms,
-            "steps": self.report_steps,
-            "failures": self.failures,
-            "failure_categories": [
-                "runtime_assertion",
-                "visual_readback",
-                "event_routing",
-                "timeout",
-                "cancellation"
-            ],
-            "overlay": {
-                "rendered_by": "preview RenderScene -> boon_native_gpu ProductFrameGraph",
-                "cursor_visible": true,
-                "click_feedback_visible": true,
-                "key_hud_visible": true,
-                "current": preview_headed_scenario_overlay_report(&self.overlay)
-            },
-            "input_route_contract": "headed scenario step -> app-owned NativeInputAdapterProof -> preview_apply_real_window_input_with_units -> document hit region -> LiveRuntime",
-            "direct_runtime_state_mutation": false,
-            "completed_at_unix_ms": self.completed_at_unix_ms
-        })
-    }
-
-    fn finish_pass_if_done(&mut self) {
-        if self.step_index >= self.definition.steps.len()
-            && self.status == PreviewHeadedScenarioStatus::Running
-        {
-            self.status = PreviewHeadedScenarioStatus::Pass;
-            self.completed_at_unix_ms = Some(unix_now_ms());
-            self.overlay.status_text = "Pass".to_owned();
-            self.overlay.step_text = format!("{} completed", self.definition.label);
-            self.report_steps.push(json!({
-                "id": "finish",
-                "status": "pass",
-                "completed_at_unix_ms": self.completed_at_unix_ms
-            }));
-        }
-    }
-
-    fn fail(&mut self, category: &str, detail: String) {
-        self.status = PreviewHeadedScenarioStatus::Fail;
-        self.completed_at_unix_ms = Some(unix_now_ms());
-        self.overlay.status_text = "Fail".to_owned();
-        self.overlay.step_text = detail.clone();
-        self.failures.push(json!({
-            "category": category,
-            "step_index": self.step_index,
-            "detail": detail
-        }));
-    }
-
-    fn advance_step(&mut self, now: Instant, report: serde_json::Value) {
-        self.report_steps.push(report);
-        self.step_index = self.step_index.saturating_add(1);
-        self.step_started_at = now;
-        self.step_start_cursor = self.cursor;
-        self.overlay.pressed_keys.clear();
-        self.overlay.mouse_down = false;
-        self.finish_pass_if_done();
-    }
-}
-
-fn preview_headed_scenario_overlay_report(
-    overlay: &PreviewHeadedScenarioOverlayState,
-) -> serde_json::Value {
-    json!({
-        "scenario_id": overlay.scenario_id,
-        "cursor_x": overlay.cursor_x,
-        "cursor_y": overlay.cursor_y,
-        "label": overlay.label,
-        "pressed_keys": overlay.pressed_keys,
-        "mouse_down": overlay.mouse_down,
-        "click_pulse_visible": overlay.click_pulse_started_at_ms.is_some(),
-        "status_text": overlay.status_text,
-        "step_text": overlay.step_text
-    })
-}
-
-fn preview_headed_scenario_overlay() -> Option<PreviewHeadedScenarioOverlayState> {
-    preview_headed_scenario_state()
-        .lock()
-        .ok()
-        .and_then(|state| state.as_ref().map(|run| run.overlay.clone()))
-}
-
-fn preview_headed_scenario_report_path(scenario_id: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "target/reports/native-gpu/headed-scenario-{scenario_id}.json"
-    ))
-}
-
-fn write_preview_headed_scenario_report(run: &PreviewHeadedScenarioRun) {
-    let path = preview_headed_scenario_report_path(&run.definition.id);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&run.report()).unwrap_or_default(),
-    );
-}
-
-fn preview_start_headed_scenario_response(
-    state: &Arc<Mutex<PreviewIpcState>>,
-    request: &serde_json::Value,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let scenario_id = request
-        .get("scenario_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("counter");
-    let definition = preview_headed_scenario_definition(scenario_id)
-        .ok_or_else(|| format!("unknown headed scenario `{scenario_id}`"))?;
-    let timeout_ms = request
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(PREVIEW_HEADED_SCENARIO_TIMEOUT_MS);
-    let source_path = state
-        .lock()
-        .map_err(|_| "preview IPC state mutex poisoned")?
-        .source_path
-        .clone();
-    if let Some(required_path) = preview_headed_scenario_required_source_path(&definition.id) {
-        let source_path_text = source_path.to_string_lossy();
-        if !source_path_text.ends_with(required_path) {
-            return Ok(json!({
-                "kind": "headed-scenario-start-ack",
-                "status": "fail",
-                "scenario_id": definition.id,
-                "failure_category": "event_routing",
-                "diagnostic": format!(
-                    "Headed scenario `{}` requires the preview to be running {}, current source is {}",
-                    definition.id,
-                    required_path,
-                    source_path.display()
-                ),
-                "preview_pid": std::process::id()
-            }));
-        }
-    }
-    let run = PreviewHeadedScenarioRun::new(definition, timeout_ms);
-    let report_path = preview_headed_scenario_report_path(&run.definition.id);
-    write_preview_headed_scenario_report(&run);
-    *preview_headed_scenario_state()
-        .lock()
-        .map_err(|_| "preview headed scenario mutex poisoned")? = Some(run.clone());
-    Ok(json!({
-        "kind": "headed-scenario-start-ack",
-        "status": "pass",
-        "scenario_id": run.definition.id,
-        "scenario_label": run.definition.label,
-        "report_path": report_path,
-        "overlay_rendered_by": "preview RenderScene -> boon_native_gpu ProductFrameGraph",
-        "direct_runtime_state_mutation": false,
-        "preview_pid": std::process::id()
-    }))
-}
-
-fn preview_headed_scenario_status_response() -> serde_json::Value {
-    match preview_headed_scenario_state().lock() {
-        Ok(state) => state
-            .as_ref()
-            .map(PreviewHeadedScenarioRun::report)
-            .unwrap_or_else(|| {
-                json!({
-                    "kind": "headed-scenario-report",
-                    "status": "idle",
-                    "scenario_id": null
-                })
-            }),
-        Err(_) => json!({
-            "kind": "headed-scenario-report",
-            "status": "fail",
-            "failure_category": "runtime_assertion",
-            "diagnostic": "preview headed scenario mutex poisoned"
-        }),
-    }
 }
 
 const PREVIEW_DRAG_STEP_PX: f64 = 18.0;
@@ -51380,14 +50107,12 @@ fn preview_should_defer_accessibility_snapshot_for_product_input(
     dirty: bool,
     accessibility_actions_present: bool,
     forced_frame: bool,
-    headed_scenario_active: bool,
     pending_accessibility_refresh: bool,
 ) -> bool {
     real_os_events_observed
         && dirty
         && !accessibility_actions_present
         && !forced_frame
-        && !headed_scenario_active
         && !pending_accessibility_refresh
 }
 
@@ -60640,40 +59365,6 @@ fn handle_preview_ipc_client(
         )?;
         return Ok(());
     }
-    if request.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-start") {
-        let response =
-            preview_start_headed_scenario_response(&state, &request).unwrap_or_else(|error| {
-                json!({
-                    "kind": "headed-scenario-start-ack",
-                    "status": "fail",
-                    "failure_category": "event_routing",
-                    "diagnostic": error.to_string(),
-                    "preview_pid": std::process::id()
-                })
-            });
-        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-            wake_handle.wake();
-        }
-        write_preview_ipc_response(
-            &mut stream,
-            &state,
-            request_bytes,
-            request_started,
-            &response,
-        )?;
-        return Ok(());
-    }
-    if request.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-status") {
-        let response = preview_headed_scenario_status_response();
-        write_preview_ipc_response(
-            &mut stream,
-            &state,
-            request_bytes,
-            request_started,
-            &response,
-        )?;
-        return Ok(());
-    }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("shutdown") {
         let reason = request
             .get("reason")
@@ -66425,175 +65116,6 @@ mod tests {
     }
 
     #[test]
-    fn headed_counter_scenario_definition_is_generic_rust_steps() {
-        let definition = preview_headed_counter_scenario_definition();
-        assert_eq!(definition.id, "counter-basic-headed");
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::MoveToSource { .. })),
-            "scenario should expose a generic move step"
-        );
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::ClickSource { .. })),
-            "scenario should expose a generic click step"
-        );
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::AssertRuntimeText { .. })),
-            "scenario should expose a generic runtime assertion step"
-        );
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
-            "scenario should expose key/click overlay timing as a step"
-        );
-    }
-
-    #[test]
-    fn headed_cells_scenario_targets_visible_cell_clicks() {
-        let definition = preview_headed_cells_scenario_definition();
-        assert_eq!(definition.id, "cells-basic-headed");
-        assert!(
-            definition.steps.iter().any(|step| {
-                matches!(
-                    step,
-                    PreviewHeadedScenarioStep::ClickSource {
-                        source,
-                        target_text: Some(target)
-                    } if source == "cell.sources.editor.select" && target == "B0"
-                )
-            }),
-            "Cells headed scenario should click B0 through the generic cell select source"
-        );
-        assert!(
-            definition.steps.iter().any(|step| {
-                matches!(
-                    step,
-                    PreviewHeadedScenarioStep::AssertRuntimeText {
-                        json_pointer,
-                        expected
-                    } if json_pointer == "/store/selected_input/editing_text"
-                        && expected == "=add(A0,A1)"
-                )
-            }),
-            "Cells headed scenario should assert that the selected editor text is current"
-        );
-        assert!(
-            definition.steps.iter().any(|step| {
-                matches!(
-                    step,
-                    PreviewHeadedScenarioStep::AssertFormulaBarText { expected }
-                        if expected == "=add(A0,A1)"
-                )
-            }),
-            "Cells headed scenario should assert that the retained formula-bar text is visible"
-        );
-    }
-
-    #[test]
-    fn headed_visual_scenario_exists_for_every_manifest_example() {
-        let entries = boon_runtime::example_manifest_entries().unwrap();
-        assert!(!entries.is_empty(), "example manifest must not be empty");
-        for entry in entries {
-            let scenario_id = match entry.id.as_str() {
-                "counter" => "counter-basic-headed".to_owned(),
-                "cells" => "cells-basic-headed".to_owned(),
-                other => format!("{other}-visual-headed"),
-            };
-            let definition =
-                preview_headed_scenario_definition(&scenario_id).unwrap_or_else(|| {
-                    panic!(
-                        "manifest example `{}` must expose headed visual scenario `{scenario_id}`",
-                        entry.id
-                    )
-                });
-            assert_eq!(definition.id, scenario_id);
-            assert!(
-                preview_headed_scenario_required_source_path(&definition.id).is_some(),
-                "headed scenario `{}` must pin the manifest source path",
-                definition.id
-            );
-        }
-    }
-
-    #[test]
-    fn generic_headed_visual_scenario_has_visible_cursor_and_click_steps() {
-        let definition = preview_headed_generic_visual_scenario_definition("todomvc");
-        assert_eq!(definition.id, "todomvc-visual-headed");
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::MoveToPoint { .. })),
-            "generic headed scenario should visibly move the cursor"
-        );
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::ClickPoint { .. })),
-            "generic headed scenario should route a real preview click"
-        );
-        assert!(
-            definition
-                .steps
-                .iter()
-                .any(|step| matches!(step, PreviewHeadedScenarioStep::KeyOverlay { .. })),
-            "generic headed scenario should render the mouse/key HUD"
-        );
-        assert!(
-            matches!(
-                definition.steps.last(),
-                Some(PreviewHeadedScenarioStep::MoveToPoint { .. })
-            ),
-            "generic headed scenario should complete on the last visible cursor action"
-        );
-    }
-
-    #[test]
-    fn headed_scenario_overlay_appends_wgpu_rendered_display_items() {
-        let mut frame = boon_document::LayoutFrame {
-            display_list: Vec::new(),
-            hit_regions: Vec::new(),
-            scroll_regions: Vec::new(),
-            accessibility: boon_document::AccessibilityTree::default(),
-            demands: Vec::new(),
-            materialization: Vec::new(),
-            metrics: boon_document::LayoutMetrics::default(),
-        };
-        let overlay = PreviewHeadedScenarioOverlayState {
-            scenario_id: "counter-basic-headed".to_owned(),
-            cursor_x: 120.0,
-            cursor_y: 140.0,
-            label: "Test".to_owned(),
-            pressed_keys: vec!["Mouse Left".to_owned()],
-            mouse_down: true,
-            click_pulse_started_at_ms: Some(unix_now_ms()),
-            status_text: "Running".to_owned(),
-            step_text: "Click `+`".to_owned(),
-        };
-        preview_apply_headed_scenario_overlay_to_render_frame(&mut frame, &overlay, 920.0, 720.0);
-        let nodes = frame
-            .display_list
-            .iter()
-            .map(|item| item.node.0.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(nodes.contains("headed-scenario-cursor-marker"));
-        assert!(nodes.contains("headed-scenario-click-pulse"));
-        assert!(nodes.contains("headed-scenario-key-hud-keys"));
-        assert_eq!(frame.metrics.display_item_count, frame.display_list.len());
-    }
-
-    #[test]
     fn preview_viewport_background_fills_empty_document_area() {
         let mut text_style = BTreeMap::new();
         text_style.insert(
@@ -66642,34 +65164,6 @@ mod tests {
         assert_eq!(
             expanded.metrics.display_item_count,
             expanded.display_list.len()
-        );
-    }
-
-    #[test]
-    fn dev_window_exposes_test_button_source_binding() {
-        let source = boon_runtime::source_text_for_path(&repo_path("examples/counter.bn")).unwrap();
-        let shell = DevWindowShell::new(
-            "examples/counter.bn",
-            &source,
-            Some("counter"),
-            PreviewTransport::new(None),
-        );
-        let document = shell.document();
-        let button = document
-            .nodes
-            .get(&boon_document_model::DocumentNodeId(
-                "dev-command-test".to_owned(),
-            ))
-            .expect("dev toolbar should expose a Test button");
-        assert_eq!(
-            button
-                .primary_source_binding()
-                .map(|binding| binding.source_path.as_str()),
-            Some("dev.commands.test")
-        );
-        assert_eq!(
-            button.text.as_ref().map(|text| text.text.as_str()),
-            Some("TEST")
         );
     }
 
@@ -82735,38 +81229,33 @@ label:
     fn preview_accessibility_snapshot_defers_only_product_input_refresh() {
         assert!(
             preview_should_defer_accessibility_snapshot_for_product_input(
-                true, true, false, false, false, false
+                true, true, false, false, false
             )
         );
 
         assert!(
             !preview_should_defer_accessibility_snapshot_for_product_input(
-                false, true, false, false, false, false
+                false, true, false, false, false
             )
         );
         assert!(
             !preview_should_defer_accessibility_snapshot_for_product_input(
-                true, false, false, false, false, false
+                true, false, false, false, false
             )
         );
         assert!(
             !preview_should_defer_accessibility_snapshot_for_product_input(
-                true, true, true, false, false, false
+                true, true, true, false, false
             )
         );
         assert!(
             !preview_should_defer_accessibility_snapshot_for_product_input(
-                true, true, false, true, false, false
+                true, true, false, true, false
             )
         );
         assert!(
             !preview_should_defer_accessibility_snapshot_for_product_input(
-                true, true, false, false, true, false
-            )
-        );
-        assert!(
-            !preview_should_defer_accessibility_snapshot_for_product_input(
-                true, true, false, false, false, true
+                true, true, false, false, true
             )
         );
     }

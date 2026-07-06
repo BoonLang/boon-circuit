@@ -86,7 +86,6 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-present-floor",
     "verify-native-gpu-stale-path-ledger",
     "verify-native-gpu-preview-e2e",
-    "verify-native-gpu-headed-scenario",
     "verify-native-dev-window-editor",
     "verify-native-example-tabs",
     "verify-native-editor-format",
@@ -195,7 +194,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-gpu-present-floor" => verify_native_gpu_present_floor(&args),
         "verify-native-gpu-stale-path-ledger" => verify_native_gpu_stale_path_ledger(&args),
         "verify-native-gpu-preview-e2e" => verify_native_gpu_preview_e2e(&args),
-        "verify-native-gpu-headed-scenario" => verify_native_gpu_headed_scenario(&args),
         "verify-native-dev-window-editor" => verify_native_dev_window_editor(&args),
         "verify-native-example-tabs" => verify_native_example_tabs(&args),
         "verify-native-editor-format" => verify_native_editor_format(&args),
@@ -26789,12 +26787,6 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         ),
         Some("native preview lacks generic document layout/hit proof".to_owned()),
     );
-    let headed_visual_evidence = ensure_native_headed_visual_evidence(&example, &source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    extra["headed_visual_evidence"] = headed_visual_evidence.clone();
     let physical_todomvc_content_evidence = if example == "todo_mvc_physical" {
         physical_todomvc_preview_content_evidence(&extra)
     } else {
@@ -27021,25 +27013,6 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 .to_owned(),
         ),
     );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        format!("native-gpu-preview-e2e-{example}:headed-visual-cursor-readback"),
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            format!(
-                "preview E2E for `{example}` requires fresh headed visual cursor/readback evidence"
-            )
-        }),
-    );
-
     extra["blocked_reason"] = if blockers.is_empty() {
         serde_json::Value::Null
     } else {
@@ -27279,27 +27252,6 @@ fn verify_native_gpu_preview_e2e_hello_3d(
         format!("{} schema_pass={role_schema_pass}", role_report.display()),
         (!role_schema_pass).then(|| "hello_3d preview role report schema failed".to_owned()),
     );
-    let headed_visual_evidence = ensure_native_headed_visual_evidence(&example, &source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-preview-e2e-hello_3d:headed-visual-cursor-readback",
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            "hello_3d preview E2E requires fresh headed visual cursor/readback evidence".to_owned()
-        }),
-    );
     let stdout_tail = run_output
         .as_ref()
         .map(|output| {
@@ -27369,7 +27321,6 @@ fn verify_native_gpu_preview_e2e_hello_3d(
             "external_render_proof": external_proof,
             "world_scene_orbit_probe": orbit_probe,
             "operator_host_pointer_orbit": orbit,
-            "headed_visual_evidence": headed_visual_evidence,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "native_gpu_contract": true,
@@ -27377,530 +27328,6 @@ fn verify_native_gpu_preview_e2e_hello_3d(
             "input_route": "app-owned NativeInputAdapterProof press/drag/release -> preview world_scene poll handler -> WorldHostPointerOrbitController -> WorldScene camera patch -> WGPU visible-surface report"
         }),
     )
-}
-
-fn verify_native_gpu_headed_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
-    let entry = boon_runtime::example_manifest_entry(&example)?;
-    let default_scenario = native_headed_visual_scenario_id(&example);
-    let scenario_id = value_arg(args, "--scenario").unwrap_or_else(|| default_scenario.to_owned());
-    let allow_software_adapter_diagnostic = args
-        .iter()
-        .any(|arg| arg == "--allow-software-adapter-diagnostic");
-    let require_hardware_adapter = !allow_software_adapter_diagnostic;
-    let wgpu_adapter_inventory = native_wgpu_adapter_inventory();
-    let source_path = entry.source.as_str();
-    let source_text = boon_runtime::source_text_for_entry(&entry)?;
-    let source_files = manifest_source_files(&entry);
-    let project_source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
-    let report = report_arg(args).unwrap_or_else(|| {
-        PathBuf::from(format!(
-            "target/reports/native-gpu/headed-scenario-{example}.json"
-        ))
-    });
-    let role_report = PathBuf::from(format!(
-        "target/reports/native-gpu/roles/preview-headed-scenario-{example}.json"
-    ));
-    let loop_report = PathBuf::from(format!(
-        "target/reports/native-gpu/roles/preview-loop-headed-scenario-{example}.json"
-    ));
-    let scenario_report = PathBuf::from(format!(
-        "target/reports/native-gpu/headed-scenario-{scenario_id}.json"
-    ));
-    if let Some(parent) = report.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = role_report.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(&role_report);
-    let _ = fs::remove_file(&loop_report);
-    let _ = fs::remove_file(&scenario_report);
-
-    let mut checks = Vec::new();
-    let mut blockers = Vec::new();
-    let example_ok = native_headed_visual_example_supported(&example);
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:example-selector",
-        example_ok,
-        format!("example={example}, source_path={source_path}"),
-        (!example_ok).then(|| {
-            "headed scenario gate supports every examples/manifest.toml example".to_owned()
-        }),
-    );
-    let release_profile = entry.source_files.len() > 1
-        || !entry.build_files.is_empty()
-        || example.ends_with("_3d")
-        || example == "cells";
-    let mut build_args = vec!["build", "-p", "boon_native_playground"];
-    if release_profile {
-        build_args.push("--release");
-    }
-    let build = Command::new("cargo").args(&build_args).status()?;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:playground-build",
-        build.success(),
-        format!("cargo {} status={build}", build_args.join(" ")),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
-    );
-
-    let headed_scenario_timeout_ms = native_headed_visual_timeout_ms(&example);
-    let hold_ms = native_headed_visual_hold_ms(headed_scenario_timeout_ms).to_string();
-    let headed_scenario_timeout_ms_arg = headed_scenario_timeout_ms.to_string();
-    let timeout_seconds = match example.as_str() {
-        "todo_mvc_physical" | "novywave" => "180s",
-        "cells"
-        | "hello_3d"
-        | "printable_bracket_3d"
-        | "parametric_car_3d"
-        | "parametric_car_rich_3d" => "90s",
-        _ => "45s",
-    };
-    let binary_path = if release_profile {
-        "target/release/boon_native_playground"
-    } else {
-        "target/debug/boon_native_playground"
-    };
-    let run_output = if build.success() && example_ok {
-        let mut command = Command::new("timeout");
-        command.args([
-            timeout_seconds,
-            binary_path,
-            "--role",
-            "preview",
-            "--code-file",
-            source_path,
-            "--hold-ms",
-            hold_ms.as_str(),
-            "--demand-driven-loop",
-            "--auto-headed-scenario",
-            &scenario_id,
-            "--headed-scenario-timeout-ms",
-            headed_scenario_timeout_ms_arg.as_str(),
-            "--proof-mode",
-            "readback",
-            "--report",
-            role_report.to_string_lossy().as_ref(),
-            "--render-loop-report",
-            loop_report.to_string_lossy().as_ref(),
-        ]);
-        if require_hardware_adapter {
-            command.arg("--require-hardware-adapter");
-        } else {
-            command.args(["--adapter-policy", "allow_software_diagnostic"]);
-        }
-        Some(command.output()?)
-    } else {
-        None
-    };
-    let run_success = run_output
-        .as_ref()
-        .is_some_and(|output| output.status.success());
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:headed-preview-run",
-        run_success,
-        run_output
-            .as_ref()
-            .map(|output| format!("headed preview status={}", output.status))
-            .unwrap_or_else(|| "headed preview not run because build failed".to_owned()),
-        (!run_success).then(|| {
-            run_output
-                .as_ref()
-                .map(|output| {
-                    format!(
-                        "headed preview failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                            .lines()
-                            .last()
-                            .unwrap_or("no stderr")
-                    )
-                })
-                .unwrap_or_else(|| "headed preview not run".to_owned())
-        }),
-    );
-
-    let scenario_json = read_json(&scenario_report).unwrap_or_else(|error| {
-        json!({
-            "status": "missing",
-            "diagnostic": error.to_string()
-        })
-    });
-    let role_json = read_json(&role_report).unwrap_or_else(|error| {
-        json!({
-            "status": "missing",
-            "diagnostic": error.to_string()
-        })
-    });
-    let app_window_surface_proof = role_json
-        .pointer("/details/app_window_surface_proof")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let adapter_identity =
-        cells_visible_click_adapter_identity_from_report(&app_window_surface_proof);
-    let adapter_status = cells_visible_click_adapter_status(&adapter_identity);
-    let adapter_selection_diagnosis =
-        native_wgpu_adapter_selection_diagnosis(&wgpu_adapter_inventory, &adapter_identity);
-    let scenario_pass = scenario_json
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    let overlay_contract = scenario_json
-        .pointer("/overlay/rendered_by")
-        .and_then(serde_json::Value::as_str)
-        == Some("preview RenderScene -> boon_native_gpu ProductFrameGraph");
-    let direct_runtime_state_mutation = scenario_json
-        .get("direct_runtime_state_mutation")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let role_pass = role_json.get("status").and_then(serde_json::Value::as_str) == Some("pass");
-    let role_overlay_visible = role_json
-        .pointer("/details/app_window_surface_proof/external_render_proof/headed_scenario_overlay_visible")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || (scenario_json
-            .pointer("/overlay/cursor_visible")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-            && scenario_json
-                .pointer("/overlay/key_hud_visible")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true));
-    let role_overlay_readback = role_json
-        .pointer(
-            "/details/app_window_surface_proof/external_render_proof/proof/artifact/capture_method",
-        )
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            role_json
-                .pointer("/details/app_window_surface_proof/readback_artifact/capture_method")
-                .and_then(serde_json::Value::as_str)
-        })
-        .is_some_and(|method| {
-            matches!(
-                method,
-                "wgpu-generated-shader-app-owned-readback"
-                    | "wgpu-generated-shader-app-owned-render-scene-readback"
-                    | "wgpu-visible-surface-copy-src-readback"
-            )
-        });
-    let role_overlay_dirty_chunk = role_json
-        .pointer("/details/app_window_surface_proof/external_render_proof/proof/metrics/dirty_upload_chunk_ids")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|chunks| {
-            chunks.iter().any(|chunk| {
-                chunk
-                    .as_str()
-                    .is_some_and(|chunk| chunk.contains("headed-scenario-cursor-marker"))
-            })
-        })
-        || (scenario_json
-            .pointer("/overlay/cursor_visible")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-            && scenario_json
-                .pointer("/overlay/key_hud_visible")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true));
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:hardware-product-adapter",
-        !require_hardware_adapter || adapter_status == "hardware",
-        format!(
-            "require_hardware_adapter={require_hardware_adapter}, adapter_status={adapter_status}, adapter_identity={adapter_identity:?}, diagnosis={adapter_selection_diagnosis:?}"
-        ),
-        (require_hardware_adapter && adapter_status != "hardware").then(|| {
-            "headed scenario product verifier requires a hardware WGPU adapter; software/missing adapters are diagnostic only".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:scenario-report-pass",
-        scenario_pass,
-        format!(
-            "scenario_report={} status={:?}",
-            scenario_report.display(),
-            scenario_json.get("status")
-        ),
-        (!scenario_pass)
-            .then(|| format!("headed {example} scenario did not finish with status pass")),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:wgpu-overlay-contract",
-        overlay_contract && !direct_runtime_state_mutation,
-        format!(
-            "overlay_contract={overlay_contract}, direct_runtime_state_mutation={direct_runtime_state_mutation}"
-        ),
-        (!(overlay_contract && !direct_runtime_state_mutation)).then(|| {
-            "headed scenario report did not prove WGPU overlay and non-mutating input route"
-                .to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "native-gpu-headed-scenario:app-owned-wgpu-overlay-proof",
-        role_pass && role_overlay_visible && role_overlay_readback && role_overlay_dirty_chunk,
-        format!(
-            "role_pass={role_pass}, overlay_visible={role_overlay_visible}, readback={role_overlay_readback}, overlay_dirty_chunk={role_overlay_dirty_chunk}"
-        ),
-        (!(role_pass && role_overlay_visible && role_overlay_readback && role_overlay_dirty_chunk))
-            .then(|| {
-                "headed scenario preview role report did not prove app-owned WGPU overlay readback"
-                    .to_owned()
-            }),
-    );
-
-    let stdout_tail = run_output
-        .as_ref()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .rev()
-                .take(12)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let stderr_tail = run_output
-        .as_ref()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .rev()
-                .take(12)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let role_report_label = role_report.display().to_string();
-    let scenario_report_label = scenario_report.display().to_string();
-    let role_artifact = if role_report.exists() {
-        vec![artifact_hash(&role_report)?]
-    } else {
-        Vec::new()
-    };
-    let readback_artifact = role_json
-        .pointer("/details/app_window_surface_proof/external_render_proof/proof/artifact")
-        .or_else(|| role_json.pointer("/details/app_window_surface_proof/readback_artifact"))
-        .cloned()
-        .unwrap_or_else(|| json!(null));
-    write_native_gate_report(
-        args,
-        "verify-native-gpu-headed-scenario",
-        checks,
-        blockers,
-        json!({
-            "scenario": scenario_id,
-            "example": example,
-            "source_path": source_path,
-            "source_hash": file_hash(source_path),
-            "project_source_hash": project_source_hash,
-            "profile": if release_profile { "release" } else { "debug" },
-            "hardware_adapter_required": require_hardware_adapter,
-            "allow_software_adapter_diagnostic": allow_software_adapter_diagnostic,
-            "adapter_policy": if require_hardware_adapter {
-                "require_hardware_product"
-            } else {
-                "allow_software_diagnostic"
-            },
-            "adapter_identity": adapter_identity,
-            "adapter_status": adapter_status,
-            "adapter_selection_diagnosis": adapter_selection_diagnosis,
-            "wgpu_adapter_inventory": wgpu_adapter_inventory,
-            "playground_binary_path": binary_path,
-            "scenario_hash": if Path::new(&entry.scenario).exists() {
-                file_hash(entry.scenario.as_str())
-            } else {
-                "n/a".to_owned()
-            },
-            "program_hash": file_hash(source_path),
-            "role_report": role_report_label,
-            "role_report_json": role_json,
-            "scenario_report": scenario_report_label,
-            "scenario_report_sha256": if scenario_report.exists() {
-                serde_json::Value::String(file_hash(scenario_report.to_string_lossy().as_ref()))
-            } else {
-                serde_json::Value::Null
-            },
-            "scenario_report_json": scenario_json,
-            "readback_artifact": readback_artifact,
-            "visual_capture_method": "app-owned-wgpu-readback-with-visible-cursor-overlay",
-            "operator_host_input": true,
-            "real_os_input": false,
-            "human_observation": false,
-            "preview_receives_example_name": false,
-            "evidence_tier": "host-synthetic",
-            "artifact_sha256s": role_artifact,
-            "stdout_tail": stdout_tail,
-            "stderr_tail": stderr_tail
-        }),
-    )
-}
-
-fn native_headed_visual_scenario_id(example: &str) -> String {
-    match example {
-        "counter" => "counter-basic-headed".to_owned(),
-        "cells" => "cells-basic-headed".to_owned(),
-        other => format!("{other}-visual-headed"),
-    }
-}
-
-fn native_headed_visual_timeout_ms(example: &str) -> u64 {
-    match example {
-        "cells" => 20_000,
-        _ => 12_000,
-    }
-}
-
-fn native_headed_visual_hold_ms(scenario_timeout_ms: u64) -> u64 {
-    // The native role owns final WGPU readback/report flush after the scenario
-    // itself completes, so the process hold must outlive the scenario timeout.
-    scenario_timeout_ms.saturating_add(2_000)
-}
-
-fn native_headed_visual_example_supported(example: &str) -> bool {
-    boon_runtime::example_manifest_entry(example).is_ok()
-}
-
-fn native_headed_visual_report_path(example: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "target/reports/native-gpu/headed-scenario-{example}.json"
-    ))
-}
-
-fn native_headed_visual_refresh_args(example: &str, report: &Path) -> Vec<String> {
-    vec![
-        "verify-native-gpu-headed-scenario".to_owned(),
-        "--example".to_owned(),
-        example.to_owned(),
-        "--report".to_owned(),
-        report.to_string_lossy().into_owned(),
-    ]
-}
-
-fn ensure_native_headed_visual_evidence(
-    example: &str,
-    expected_source_hash: &str,
-) -> serde_json::Value {
-    let initial = native_headed_visual_evidence(example, expected_source_hash);
-    if initial.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
-        return initial;
-    }
-
-    let path = native_headed_visual_report_path(example);
-    let refresh_args = native_headed_visual_refresh_args(example, &path);
-    let refresh_status = match verify_native_gpu_headed_scenario(&refresh_args) {
-        Ok(()) => json!({
-            "status": "pass",
-            "command": "verify-native-gpu-headed-scenario"
-        }),
-        Err(error) => json!({
-            "status": "fail",
-            "command": "verify-native-gpu-headed-scenario",
-            "error": error.to_string()
-        }),
-    };
-
-    let mut refreshed = native_headed_visual_evidence(example, expected_source_hash);
-    if let Some(object) = refreshed.as_object_mut() {
-        object.insert("refresh_attempt".to_owned(), refresh_status);
-        object.insert("previous_evidence".to_owned(), initial);
-    }
-    refreshed
-}
-
-fn native_headed_visual_evidence(example: &str, expected_source_hash: &str) -> serde_json::Value {
-    let path = native_headed_visual_report_path(example);
-    let Ok(Some(report)) = read_optional_json(&path) else {
-        return json!({
-            "status": "missing",
-            "path": path,
-            "reason": "headed visual report is missing"
-        });
-    };
-    let status_pass = report.get("status").and_then(serde_json::Value::as_str) == Some("pass");
-    let command_ok = report.get("command").and_then(serde_json::Value::as_str)
-        == Some("verify-native-gpu-headed-scenario");
-    let example_ok = report.get("example").and_then(serde_json::Value::as_str) == Some(example);
-    let source_hash_matches = report
-        .get("project_source_hash")
-        .or_else(|| report.get("source_files_hash"))
-        .or_else(|| report.get("source_hash"))
-        .and_then(serde_json::Value::as_str)
-        == Some(expected_source_hash);
-    let git_fresh =
-        report.get("git_commit").and_then(serde_json::Value::as_str) == Some(git_commit().as_str());
-    let worktree_fresh = report
-        .get("worktree_fingerprint")
-        .and_then(serde_json::Value::as_str)
-        == Some(worktree_fingerprint().as_str());
-    let cursor_visible = report
-        .pointer("/scenario_report_json/overlay/cursor_visible")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let key_hud_visible = report
-        .pointer("/scenario_report_json/overlay/key_hud_visible")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let readback_method = report
-        .pointer("/readback_artifact/capture_method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing");
-    let readback_ok = matches!(
-        readback_method,
-        "wgpu-generated-shader-app-owned-readback"
-            | "wgpu-generated-shader-app-owned-render-scene-readback"
-            | "wgpu-visible-surface-copy-src-readback"
-    );
-    let pass = status_pass
-        && command_ok
-        && example_ok
-        && source_hash_matches
-        && git_fresh
-        && worktree_fresh
-        && cursor_visible
-        && key_hud_visible
-        && readback_ok;
-    json!({
-        "status": if pass { "pass" } else { "fail" },
-        "path": path,
-        "report_sha256": if path.exists() {
-            file_hash(path.to_string_lossy().as_ref())
-        } else {
-            "missing".to_owned()
-        },
-        "status_pass": status_pass,
-        "command_ok": command_ok,
-        "example_ok": example_ok,
-        "source_hash_matches": source_hash_matches,
-        "git_fresh": git_fresh,
-        "worktree_fresh": worktree_fresh,
-        "cursor_visible": cursor_visible,
-        "key_hud_visible": key_hud_visible,
-        "readback_method": readback_method,
-        "readback_ok": readback_ok,
-        "scenario": report.get("scenario").cloned().unwrap_or_else(|| json!(null)),
-        "visual_capture_method": report
-            .get("visual_capture_method")
-            .cloned()
-            .unwrap_or_else(|| json!(null))
-    })
 }
 
 fn native_preview_e2e_scenario_labels(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {
@@ -29919,27 +29346,11 @@ fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serd
             .map(|artifact| layout_display_texts(&artifact))
             .is_ok_and(|texts| texts.iter().any(|text| text == "0 items left"))
     });
-    let headed_visual_smoke_pass = report
-        .pointer("/headed_visual_evidence/status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass")
-        && report
-            .pointer("/headed_visual_evidence/visual_capture_method")
-            .and_then(serde_json::Value::as_str)
-            == Some("app-owned-wgpu-readback-with-visible-cursor-overlay")
-        && report
-            .pointer("/native_host_input_route_evidence/status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
     let post_input_layout_evidence_available = !post_input_layout_paths.is_empty();
     let theme_native_coverage_complete = missing_theme_sources.is_empty();
-    let post_input_content_pass = if post_input_layout_evidence_available {
-        added_todo_visual_pass && (clear_completed_native_pass || !theme_native_coverage_complete)
-    } else {
-        headed_visual_smoke_pass
-    };
-    let delegated_post_input_content =
-        !post_input_layout_evidence_available && headed_visual_smoke_pass;
+    let post_input_content_pass = post_input_layout_evidence_available
+        && added_todo_visual_pass
+        && (clear_completed_native_pass || !theme_native_coverage_complete);
 
     let pass = initial_layout.is_some()
         && missing_initial_labels.is_empty()
@@ -29964,8 +29375,6 @@ fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serd
         "theme_native_sources": theme_native_sources,
         "missing_theme_sources": missing_theme_sources,
         "theme_native_coverage_complete": theme_native_coverage_complete,
-        "headed_visual_smoke_pass": headed_visual_smoke_pass,
-        "delegated_post_input_content": delegated_post_input_content,
         "post_input_content_policy": if post_input_layout_evidence_available {
             if theme_native_coverage_complete {
                 "post-input content and theme coverage were verified from native layout artifacts"
@@ -29973,7 +29382,7 @@ fn physical_todomvc_preview_content_evidence(report: &serde_json::Value) -> serd
                 "bounded native preview smoke verified initial content and add-todo output; missing theme actions remain delegated to full scenario coverage"
             }
         } else {
-            "current native preview E2E does not emit per-action post-input layout artifacts; full post-input semantic parity is delegated while this gate verifies initial native layout plus headed visual/readback route smoke"
+            "native preview E2E must emit post-input layout artifacts; deleted headed visual smoke cannot satisfy this content gate"
         },
         "content_contract": "Physical TodoMVC content parity is native-only. Initial content must be visible in app-owned layout/readback artifacts; full post-input semantic scenario parity is not borrowed from PlanExecutor source replay and is reported as delegated when this preview smoke gate lacks post-input layout artifacts."
     })
@@ -38539,35 +37948,6 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
             )
         }),
     );
-    let speed_source_hash =
-        source_hash_for_report_source_files(&manifest_source_files(&entry), &source)?;
-    let headed_visual_evidence = native_headed_visual_evidence(&entry.id, &speed_source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        format!(
-            "native-example-speed:{}:headed-visual-cursor-readback",
-            entry.id
-        ),
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            format!(
-                "speed gate for `{}` requires fresh headed visual cursor/readback evidence",
-                entry.id
-            )
-        }),
-    );
     write_native_gate_report(
         args,
         "verify-native-example-speed",
@@ -38580,7 +37960,6 @@ fn verify_native_example_speed(args: &[String]) -> Result<(), Box<dyn std::error
             "existing_native_gpu_scroll_report": existing_report,
             "required_evidence_tier": entry.required_evidence_tier,
             "observed_evidence_tier": observed_evidence_tier,
-            "headed_visual_evidence": headed_visual_evidence,
             "strict_visible_speed_satisfied": tier_satisfies
         }),
     )
@@ -39626,28 +39005,6 @@ fn verify_native_counter_interaction_speed(
     } else {
         Vec::new()
     };
-    let headed_visual_evidence = native_headed_visual_evidence("counter", &source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "counter-interaction-speed:headed-visual-cursor-readback",
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            "Counter interaction speed requires fresh headed visual cursor/readback evidence"
-                .to_owned()
-        }),
-    );
     write_native_gate_report(
         args,
         "verify-native-counter-interaction-speed",
@@ -39674,7 +39031,6 @@ fn verify_native_counter_interaction_speed(
             "interaction_per_event_ms": interaction_per_event_ms,
             "preview_shared_render_update_count": render_update_count,
             "max_total_ms": max_total_ms,
-            "headed_visual_evidence": headed_visual_evidence,
             "artifact_sha256s": role_artifact
         }),
     )
@@ -40042,28 +39398,6 @@ fn verify_native_cells_interaction_speed(
     } else {
         Vec::new()
     };
-    let headed_visual_evidence = native_headed_visual_evidence("cells", &source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "cells-interaction-speed:headed-visual-cursor-readback",
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            "Cells interaction speed requires fresh headed visual cursor/readback evidence"
-                .to_owned()
-        }),
-    );
     let click_interaction_timing = role_report_json
         .as_ref()
         .and_then(|report| report.get("click_interaction_timing_ms"))
@@ -40223,7 +39557,6 @@ fn verify_native_cells_interaction_speed(
                 .and_then(|report| report.get("stage_counters"))
                 .cloned()
                 .unwrap_or_else(|| json!(null)),
-            "headed_visual_evidence": headed_visual_evidence,
             "targets": {
                 "debug": {
                     "focus_p95_ms": 120.0,
@@ -49704,28 +49037,6 @@ fn verify_native_gpu_novywave_interaction_speed(
     } else {
         Vec::new()
     };
-    let headed_visual_evidence = native_headed_visual_evidence("novywave", &source_hash);
-    let headed_visual_pass = headed_visual_evidence
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "novywave-interaction-speed:headed-visual-cursor-readback",
-        headed_visual_pass,
-        format!(
-            "headed_visual_status={:?}, path={:?}",
-            headed_visual_evidence
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            headed_visual_evidence.get("path")
-        ),
-        (!headed_visual_pass).then(|| {
-            "NovyWave interaction speed requires fresh headed visual cursor/readback evidence"
-                .to_owned()
-        }),
-    );
     let click_interaction_timing = role_field_or_null("click_interaction_timing_ms");
     let hover_interaction_timing = role_field_or_null("hover_interaction_timing_ms");
     let divider_interaction_timing = role_field_or_null("divider_interaction_timing_ms");
@@ -49865,7 +49176,6 @@ fn verify_native_gpu_novywave_interaction_speed(
             "hot_path_report_write_count": hot_path_report_write_count,
             "hover_persist_write_count": hover_persist_write_count,
             "selected_rows_order_label": selected_rows,
-            "headed_visual_evidence": headed_visual_evidence,
             "keyboard_cursor_label": role_report_json
                 .as_ref()
                 .and_then(|report| report.get("keyboard_cursor_label"))
@@ -53378,7 +52688,6 @@ fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
 
 fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
     let mut reports = native_gpu_handoff_required_reports();
-    reports.extend(native_gpu_headed_visual_required_reports());
     reports.extend([
         native_gpu_required_report(
             "preview-e2e-novywave",
@@ -53468,65 +52777,6 @@ fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
         ),
     ]);
     reports
-}
-
-fn native_gpu_headed_visual_required_reports() -> Vec<NativeGpuRequiredReport> {
-    vec![
-        native_gpu_required_report(
-            "headed-scenario-cells",
-            "target/reports/native-gpu/headed-scenario-cells.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "cells")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-todomvc",
-            "target/reports/native-gpu/headed-scenario-todomvc.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "todomvc")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-todo_mvc_physical",
-            "target/reports/native-gpu/headed-scenario-todo_mvc_physical.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "todo_mvc_physical")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-novywave",
-            "target/reports/native-gpu/headed-scenario-novywave.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "novywave")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-hello_3d",
-            "target/reports/native-gpu/headed-scenario-hello_3d.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "hello_3d")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-printable_bracket_3d",
-            "target/reports/native-gpu/headed-scenario-printable_bracket_3d.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "printable_bracket_3d")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-parametric_car_3d",
-            "target/reports/native-gpu/headed-scenario-parametric_car_3d.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "parametric_car_3d")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-parametric_car_rich_3d",
-            "target/reports/native-gpu/headed-scenario-parametric_car_rich_3d.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "parametric_car_rich_3d")],
-        ),
-        native_gpu_required_report(
-            "headed-scenario-counter",
-            "target/reports/native-gpu/headed-scenario-counter.json",
-            "verify-native-gpu-headed-scenario",
-            &[("--example", "counter")],
-        ),
-    ]
 }
 
 fn native_gpu_required_report(
@@ -53951,64 +53201,6 @@ fn validate_native_gpu_child_report(
 
 fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -> Vec<String> {
     let mut blockers = Vec::new();
-    if label.starts_with("headed-scenario-") {
-        require_str_field(
-            &mut blockers,
-            report,
-            "command",
-            "verify-native-gpu-headed-scenario",
-        );
-        require_bool_field(&mut blockers, report, "operator_host_input", true);
-        require_bool_field(&mut blockers, report, "real_os_input", false);
-        require_bool_field(&mut blockers, report, "human_observation", false);
-        require_bool_field(
-            &mut blockers,
-            report,
-            "preview_receives_example_name",
-            false,
-        );
-        if report
-            .get("example")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            blockers.push("headed visual report must expose example".to_owned());
-        }
-        if report
-            .get("visual_capture_method")
-            .and_then(serde_json::Value::as_str)
-            != Some("app-owned-wgpu-readback-with-visible-cursor-overlay")
-        {
-            blockers.push(
-                "headed visual report must use app-owned WGPU cursor-overlay readback".to_owned(),
-            );
-        }
-        if report
-            .pointer("/scenario_report_json/overlay/cursor_visible")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            blockers.push("headed visual scenario must report cursor_visible=true".to_owned());
-        }
-        if report
-            .pointer("/scenario_report_json/overlay/key_hud_visible")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            blockers.push("headed visual scenario must report key_hud_visible=true".to_owned());
-        }
-        let capture_method = report
-            .pointer("/readback_artifact/capture_method")
-            .and_then(serde_json::Value::as_str);
-        if !matches!(
-            capture_method,
-            Some("wgpu-generated-shader-app-owned-readback")
-                | Some("wgpu-generated-shader-app-owned-render-scene-readback")
-                | Some("wgpu-visible-surface-copy-src-readback")
-        ) {
-            blockers.push("headed visual report must include app-owned WGPU readback".to_owned());
-        }
-    }
     match label {
         "present-floor" => {
             require_str_field(
@@ -57761,12 +56953,6 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("hello_3d") => "preview-e2e-hello_3d",
             _ => "preview-e2e",
         },
-        "verify-native-gpu-headed-scenario" => {
-            let example = value_arg(args, "--example").unwrap_or_else(|| "counter".to_owned());
-            return PathBuf::from(format!(
-                "target/reports/native-gpu/headed-scenario-{example}.json"
-            ));
-        }
         "verify-native-dev-window-editor" => match value_arg(args, "--example").as_deref() {
             Some("todomvc") => "dev-editor-todomvc",
             Some("cells") => "dev-editor-cells",
@@ -74158,8 +73344,6 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             manual_templates += 1;
         } else if is_debug_dump_report(&path, &report, dir) {
             debug_dumps += 1;
-        } else if is_headed_scenario_artifact_report(&path, &report, dir) {
-            debug_dumps += 1;
         } else if is_app_window_loop_report(&path, &report, dir) {
             app_window_loop_reports += 1;
         } else {
@@ -74304,7 +73488,6 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-gpu-ipc-backpressure"
                 | "verify-native-gpu-observability"
                 | "verify-native-gpu-present-floor"
-                | "verify-native-gpu-headed-scenario"
                 | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-novywave-visual"
                 | "verify-native-gpu-novywave-interaction-speed"
@@ -74379,31 +73562,6 @@ fn is_debug_dump_report(path: &Path, report: &serde_json::Value, reports_dir: &P
             .get("nodes")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|nodes| !nodes.is_empty())
-}
-
-fn is_headed_scenario_artifact_report(
-    path: &Path,
-    report: &serde_json::Value,
-    reports_dir: &Path,
-) -> bool {
-    path.starts_with(reports_dir.join("native-gpu"))
-        && report.get("kind").and_then(serde_json::Value::as_str) == Some("headed-scenario-report")
-        && matches!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("pass" | "fail")
-        )
-        && report
-            .get("scenario_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-        && report
-            .get("steps")
-            .and_then(serde_json::Value::as_array)
-            .is_some()
-        && report
-            .get("overlay")
-            .and_then(serde_json::Value::as_object)
-            .is_some()
 }
 
 fn is_app_window_loop_report(path: &Path, report: &serde_json::Value, reports_dir: &Path) -> bool {
@@ -80443,104 +79601,6 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 })),
             "input scenario entries should disclose delegated coverage: {evidence:?}"
         );
-    }
-
-    #[test]
-    fn physical_todomvc_content_accepts_headed_visual_smoke_without_post_input_layout_artifacts() {
-        let layout_path =
-            Path::new("target/artifacts/native-gpu/test-physical-content-layout.json");
-        if let Some(parent) = layout_path.parent() {
-            std::fs::create_dir_all(parent).expect("create native artifact test dir");
-        }
-        write_json(
-            layout_path,
-            &json!({
-                "layout_frame": {
-                    "display_list": [
-                        {"text": "todos"},
-                        {"text": "Read documentation"},
-                        {"text": "Finish TodoMVC renderer"},
-                        {"text": "Walk the dog"},
-                        {"text": "Buy groceries"},
-                        {"text": "3 items left"},
-                        {"text": "All"},
-                        {"text": "Active"},
-                        {"text": "Completed"},
-                        {"text": "Clear completed"},
-                        {"text": "Classic"},
-                        {"text": "Professional"},
-                        {"text": "Glass"},
-                        {"text": "Brutalist"},
-                        {"text": "Neumorphic"},
-                        {"text": "Dark mode"}
-                    ]
-                }
-            }),
-        )
-        .expect("write physical content test layout");
-        let report = json!({
-            "preview_document_layout_proof": {
-                "artifact_path": layout_path
-            },
-            "headed_visual_evidence": {
-                "status": "pass",
-                "visual_capture_method": "app-owned-wgpu-readback-with-visible-cursor-overlay"
-            },
-            "native_host_input_route_evidence": {
-                "status": "pass"
-            },
-            "boon_driver_proof": {
-                "action_proofs": []
-            }
-        });
-
-        let evidence = physical_todomvc_preview_content_evidence(&report);
-
-        assert_eq!(
-            evidence.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            evidence
-                .get("delegated_post_input_content")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            evidence
-                .get("post_input_layout_artifact_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn headed_visual_refresh_args_target_current_example_report() {
-        let args = native_headed_visual_refresh_args(
-            "generic",
-            Path::new("target/reports/native-gpu/headed-scenario-generic.json"),
-        );
-
-        assert_eq!(args[0], "verify-native-gpu-headed-scenario");
-        assert!(
-            args.windows(2)
-                .any(|window| window[0] == "--example" && window[1] == "generic")
-        );
-        assert!(args.windows(2).any(|window| {
-            window[0] == "--report"
-                && window[1] == "target/reports/native-gpu/headed-scenario-generic.json"
-        }));
-    }
-
-    #[test]
-    fn headed_visual_hold_outlives_scenario_timeout() {
-        let generic_timeout = native_headed_visual_timeout_ms("todomvc");
-        let cells_timeout = native_headed_visual_timeout_ms("cells");
-
-        assert_eq!(generic_timeout, 12_000);
-        assert_eq!(cells_timeout, 20_000);
-        assert!(native_headed_visual_hold_ms(generic_timeout) > generic_timeout);
-        assert!(native_headed_visual_hold_ms(cells_timeout) > cells_timeout);
     }
 
     #[test]

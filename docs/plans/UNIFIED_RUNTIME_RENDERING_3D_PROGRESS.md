@@ -387,6 +387,37 @@ Fresh focused evidence:
   layout/input recovery naming and full-layout recompute recovery in
   `boon_native_playground`, not legacy runtime fallback.
 
+### 2026-07-06 - Headed Scenario Compatibility Lane Deleted
+
+- Deleted the obsolete headed-scenario verifier/playground lane instead of
+  preserving it behind another compatibility shim.
+- Removed the preview scripted cursor/HUD runner, its IPC request kinds, dev
+  toolbar Test command, scenario catalog, overlay renderer, reports, tests, and
+  the unreferenced `tools/native-isolated-input/weston-test-driver.c` artifact.
+- Removed headed visual/readback requirements from xtask preview/speed gates,
+  native aggregate required reports, schema recursion, default report paths,
+  and label contract checks.
+- Physical TodoMVC native content evidence now fails when post-input layout
+  artifacts are missing instead of accepting a headed visual smoke fallback.
+- Fresh focused evidence:
+  - `rg -n "headed_visual|headed-scenario|native_headed_visual|verify-native-gpu-headed-scenario|HeadedScenario|preview_headed|auto-headed|PREVIEW_HEADED|weston-test-driver|native-isolated-input" crates/xtask/src/main.rs crates/boon_native_playground/src/main.rs tools docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`:
+    no active code references outside this progress note.
+  - `cargo fmt -- --check`: pass.
+  - `cargo check -q -p xtask -p boon_native_playground`: pass.
+  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask preview_e2e_delegates_full_manifest_inputs_when_native_smoke_passes -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask preview_e2e_surface_proof_does_not_republish_top_level_alias -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground preview_viewport_background_fills_empty_document_area -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground preview_accessibility_snapshot_defers_only_product_input_refresh -- --nocapture`:
+    pass; 1 passed.
+  - `git diff --check`: pass.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

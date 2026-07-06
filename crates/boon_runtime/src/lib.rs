@@ -66,13 +66,14 @@ use boon_plan_executor::{
     IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
     IndexedUpdateBranchExecution, IndexedUpdateTargetEvent, IndexedUpdateTargetOverride,
     ListProjectionExecution, ListRetainExecution, ListRowDefaultFields, PlanExecutorBytes,
-    PlanExecutorListRowState, PlanExecutorLiveSourceEvent, PlanExecutorLiveSourceEventExpectedToml,
-    PlanExecutorRootState, PlanExecutorScenarioCheckpointCellExpectation,
-    PlanExecutorScenarioCheckpointErrorExpectation, PlanExecutorScenarioCheckpointInput,
-    PlanExecutorScenarioStepMeta, RootBytesFixedMutation, RootBytesUpdateDispatchKind,
-    RootExecutedUpdate, RootJsonSourceEvent, RootRuntimeBranchUpdateInput,
-    RootScenarioCommandOutputInput, RootUpdateCandidateTracker, ScenarioEventsCommandOutputInput,
-    SourceRouteCommandOutputInput, SourceRouteFullExecution, SourceRouteSourceEventReportInput,
+    PlanExecutorListRow, PlanExecutorListRowState, PlanExecutorLiveSourceEvent,
+    PlanExecutorLiveSourceEventExpectedToml, PlanExecutorRootState,
+    PlanExecutorScenarioCheckpointCellExpectation, PlanExecutorScenarioCheckpointErrorExpectation,
+    PlanExecutorScenarioCheckpointInput, PlanExecutorScenarioStepMeta, RootBytesFixedMutation,
+    RootBytesUpdateDispatchKind, RootExecutedUpdate, RootJsonSourceEvent,
+    RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput, RootUpdateCandidateTracker,
+    ScenarioEventsCommandOutputInput, SourceRouteCommandOutputInput, SourceRouteFullExecution,
+    SourceRouteSourceEventReportInput,
     append_list_rows_for_derived_values_with as append_plan_list_rows_for_derived_values_with,
     assemble_initial_state_report as assemble_plan_initial_state_report,
     assemble_root_runtime_branch_update as assemble_plan_root_runtime_branch_update,
@@ -3937,11 +3938,7 @@ impl PlanExecutorRuntimeState {
         let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
             plan_root_scalar_initial_state(plan)?;
         let mut list_store = PlanExecutorListStore::from(plan_initial_list_state(plan)?);
-        refresh_plan_initial_list_state_with_root_context(
-            plan,
-            &root_state.root_state,
-            &mut list_store,
-        )?;
+        list_store.refresh_startup_fields(plan, &root_state.root_state)?;
         let initial_list_derived_values = root_pure_number_compare_values(plan, &list_store)?
             .into_iter()
             .map(|(field_id, value)| (FieldId(field_id), value))
@@ -3962,7 +3959,7 @@ impl PlanExecutorRuntimeState {
             );
         }
         let list_next_keys =
-            initial_plan_list_next_keys(&plan_executor_list_state_for_materialization(&list_store));
+            initial_plan_list_next_keys(&list_store.public_rows_for_materialization());
         Ok(Self {
             root_state,
             root_bytes_initialization_core,
@@ -4153,8 +4150,7 @@ impl PlanExecutorRuntimeState {
                     indexed_updates.extend(indexed.report_rows);
                     continue;
                 }
-                let indexed_target_rows =
-                    plan_executor_list_state_for_materialization(&self.list_store);
+                let indexed_target_rows = self.list_store.public_rows_for_materialization();
                 let indexed_batch = execute_plan_indexed_update_batch_with(
                     plan,
                     op,
@@ -4328,8 +4324,9 @@ impl PlanExecutorRuntimeState {
             derived.push(report);
             self.executed_derived_value_count += 1;
         }
-        let step_retain_execution =
-            materialize_plan_list_retains(plan, &self.root_state.root_state, &self.list_store)?;
+        let step_retain_execution = self
+            .list_store
+            .materialize_retains(plan, &self.root_state.root_state)?;
         self.executed_list_retain_count += step_retain_execution.executed_count;
         self.executed_list_view_count += step_retain_execution.view_count;
         self.retained_list_row_count += step_retain_execution.retained_row_count;
@@ -4384,16 +4381,12 @@ impl PlanExecutorRuntimeState {
             .saturating_delta_since(self.bytes_counter_baseline);
         let state_summary = JsonValue::Object(self.root_state.root_state);
         let list_summary = plan_list_summary(plan, &self.list_store);
-        let projection_execution = materialize_plan_list_projections(
-            plan,
-            state_summary.as_object().unwrap(),
-            &self.list_store,
-        )?;
-        let retain_execution = materialize_plan_list_retains(
-            plan,
-            state_summary.as_object().unwrap(),
-            &self.list_store,
-        )?;
+        let projection_execution = self
+            .list_store
+            .materialize_projections(plan, state_summary.as_object().unwrap())?;
+        let retain_execution = self
+            .list_store
+            .materialize_retains(plan, state_summary.as_object().unwrap())?;
         let list_store_lookup_stats = self.list_store.lookup_stats_report();
         let semantic_deltas = JsonValue::Array(self.semantic_deltas);
         let list_projection_summary = JsonValue::Object(projection_execution.summary);
@@ -5497,16 +5490,12 @@ fn execute_machine_plan_initial_state_inner(
     let mut list_store = PlanExecutorListStore::from(plan_initial_list_state(plan)?);
     let plan_hash = core_execution.plan_hash;
     let state_summary = core_execution.state_summary;
-    refresh_plan_initial_list_state_with_root_context(
-        plan,
-        state_summary.as_object().unwrap(),
-        &mut list_store,
-    )?;
+    list_store.refresh_startup_fields(plan, state_summary.as_object().unwrap())?;
     let list_summary = plan_list_summary(plan, &list_store);
     let projection_execution =
-        materialize_plan_list_projections(plan, state_summary.as_object().unwrap(), &list_store)?;
+        list_store.materialize_projections(plan, state_summary.as_object().unwrap())?;
     let retain_execution =
-        materialize_plan_list_retains(plan, state_summary.as_object().unwrap(), &list_store)?;
+        list_store.materialize_retains(plan, state_summary.as_object().unwrap())?;
     let list_store_lookup_stats = list_store.lookup_stats_report();
     let list_projection_summary = JsonValue::Object(projection_execution.summary);
     let list_view_summary = JsonValue::Object(retain_execution.summary);
@@ -5735,6 +5724,37 @@ impl PlanExecutorListStore {
         )
         .expect("PlanExecutor document summary currentness refresh failed");
     }
+
+    fn refresh_startup_fields(
+        &mut self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<()> {
+        self.invalidate_indexes();
+        refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, self)
+    }
+
+    fn materialize_projections(
+        &self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<ListProjectionExecution> {
+        let executor_rows = self.public_rows_for_materialization();
+        materialize_plan_list_projections_core(plan, root_state, &executor_rows)
+    }
+
+    fn materialize_retains(
+        &self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> RuntimeResult<ListRetainExecution> {
+        let executor_rows = self.public_rows_for_materialization();
+        materialize_plan_list_retains_core(plan, root_state, &executor_rows)
+    }
+
+    fn public_rows_for_materialization(&self) -> BTreeMap<usize, Vec<PlanExecutorListRow>> {
+        plan_list_row_state_public_rows(&self.rows_by_list)
+    }
 }
 
 impl From<BTreeMap<usize, Vec<PlanListRowState>>> for PlanExecutorListStore {
@@ -5824,24 +5844,6 @@ fn plan_executor_list_row_report_fields(
     row: &PlanListRowState,
 ) -> RuntimeResult<BTreeMap<String, JsonValue>> {
     Ok(plan_list_row_state_report_fields(row))
-}
-
-fn materialize_plan_list_projections(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-) -> RuntimeResult<ListProjectionExecution> {
-    let executor_rows = plan_executor_list_state_for_materialization(list_state);
-    materialize_plan_list_projections_core(plan, root_state, &executor_rows)
-}
-
-fn materialize_plan_list_retains(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
-) -> RuntimeResult<ListRetainExecution> {
-    let executor_rows = plan_executor_list_state_for_materialization(list_state);
-    materialize_plan_list_retains_core(plan, root_state, &executor_rows)
 }
 
 fn plan_executor_document_summary_with_limits(
@@ -6195,12 +6197,12 @@ fn plan_executor_insert_projection_summaries(
 fn plan_executor_insert_retain_summaries(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_store: &mut PlanExecutorListStore,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
 ) {
-    let Ok(retain_execution) = materialize_plan_list_retains(plan, root_state, list_state) else {
+    let Ok(retain_execution) = list_store.materialize_retains(plan, root_state) else {
         return;
     };
     for (target, summary) in retain_execution.summary {

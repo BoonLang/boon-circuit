@@ -476,6 +476,50 @@ Remaining work:
 - Remove the transitional `DerefMut` raw-map mutation surface once append,
   remove, indexed update, and startup refresh paths have explicit store methods.
 
+## 2026-07-06 - PlanExecutor Store Materialization Boundary Slice
+
+Status: materialization ownership cut implemented and verified with focused
+runtime tests plus runtime finality.
+
+What changed:
+
+- `PlanExecutorListStore` now owns projection materialization through
+  `materialize_projections`.
+- `PlanExecutorListStore` now owns retain/list-view materialization through
+  `materialize_retains`.
+- Store-owned `public_rows_for_materialization` replaced direct
+  `plan_executor_list_state_for_materialization(&self.list_store)` calls in
+  PlanExecutor runtime initialization and indexed update targeting.
+- PlanExecutor runtime construction and initial-state execution now route
+  startup row-field refresh through `PlanExecutorListStore::refresh_startup_fields`.
+- The old standalone projection/retain materialization wrappers over raw list
+  maps were deleted from the active PlanExecutor runtime path.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_root_find_value_resolves_runtime_list_ref -- --nocapture`:
+  pass.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining work:
+
+- Add explicit store methods for append/remove/indexed-update mutation so the
+  transitional `DerefMut` raw-map escape hatch can be deleted.
+- Add a focused runtime/verifier report that proves exact lookup index hits and
+  `exact_lookup_row_scan_count=0` through an end-to-end `List/find` demand.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

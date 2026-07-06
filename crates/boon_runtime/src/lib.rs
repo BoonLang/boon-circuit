@@ -17527,7 +17527,6 @@ fn source_route_artifact(route_id: usize, route: &SourceRoute) -> JsonValue {
         "source_id": route.source_id.as_usize(),
         "source": route.source,
         "row_lookup_field": route.row_lookup_field,
-        "address_lookup_field": route.row_lookup_field,
         "payload_fields": route.payload_fields,
         "root_scalar_targets": route.root_scalar_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
         "indexed_text_targets": route.indexed_text_targets.iter().map(source_route_scalar_target_artifact).collect::<Vec<_>>(),
@@ -17995,13 +17994,7 @@ impl SourceRoute {
         Ok(Self {
             source_id: SourceId(artifact_usize_field(object, "source_id", context)?),
             source: artifact_string_field(object, "source", context)?,
-            row_lookup_field: optional_string_field(object, "row_lookup_field", context)?.or_else(
-                || {
-                    optional_string_field(object, "address_lookup_field", context)
-                        .ok()
-                        .flatten()
-                },
-            ),
+            row_lookup_field: optional_string_field(object, "row_lookup_field", context)?,
             payload_fields: source_payload_fields_from_artifact(
                 artifact_field(object, "payload_fields", context)?,
                 &format!("{context}.payload_fields"),

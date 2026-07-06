@@ -18583,7 +18583,6 @@ mod tests {
                         value_type: boon_plan::SourcePayloadValueType::Text,
                     }],
                     row_lookup_field: None,
-                    address_lookup_field: None,
                 },
             }],
             storage_layout: boon_plan::StorageLayout {
@@ -19320,7 +19319,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         };
         let update_op = PlanOp {
@@ -19537,7 +19535,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         };
         let update_op = PlanOp {
@@ -19734,7 +19731,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         };
         let plan = MachinePlan {
@@ -19855,7 +19851,6 @@ mod tests {
                         value_type: boon_plan::SourcePayloadValueType::Text,
                     }],
                     row_lookup_field: None,
-                    address_lookup_field: None,
                 },
             }],
             storage_layout: boon_plan::StorageLayout {
@@ -22355,7 +22350,6 @@ mod tests {
                     fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
                     typed_fields: Vec::new(),
                     row_lookup_field: None,
-                    address_lookup_field: None,
                 },
             }],
             storage_layout: boon_plan::StorageLayout {
@@ -22528,7 +22522,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.list_slots = vec![list_slot.clone()];
@@ -22648,7 +22641,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.list_slots = vec![list_slot.clone()];
@@ -22780,7 +22772,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.list_slots = vec![list_slot];
@@ -22943,7 +22934,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.list_slots = vec![list_slot];
@@ -23046,7 +23036,6 @@ mod tests {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
@@ -23200,7 +23189,6 @@ mod tests {
                 fields: vec![SourcePayloadField::Named("title".to_owned())],
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         }];
         plan.storage_layout.scalar_slots = vec![
@@ -23479,7 +23467,6 @@ mod tests {
                     fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
                     typed_fields: Vec::new(),
                     row_lookup_field: None,
-                    address_lookup_field: None,
                 },
             }],
             storage_layout: boon_plan::StorageLayout {
@@ -23660,7 +23647,6 @@ mod tests {
                         },
                     ],
                     row_lookup_field: None,
-                    address_lookup_field: None,
                 },
             }],
             storage_layout: boon_plan::StorageLayout {
@@ -24399,7 +24385,6 @@ mod tests {
                 fields: vec![SourcePayloadField::Text],
                 typed_fields: Vec::new(),
                 row_lookup_field: None,
-                address_lookup_field: None,
             },
         };
         let op = PlanOp {

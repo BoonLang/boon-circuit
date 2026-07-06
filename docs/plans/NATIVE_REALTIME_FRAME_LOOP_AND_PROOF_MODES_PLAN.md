@@ -4972,31 +4972,26 @@ native UX latency gates, and generic runtime/list/currentness work remain.
 - Row resolution reports now expose `row_lookup_field`,
   `row_lookup_payload`, and `method=row_lookup_payload` when the typed payload
   path is used.
-- Artifact validation no longer requires every `address_lookup_field` route to
+- Artifact validation no longer requires every `row_lookup_field` route to
   declare an `Address` payload. This keeps row identity metadata separate from
-  source payload expressions while preserving the legacy compiler metadata for
-  compatibility.
+  source payload expressions.
 - Added non-Cells runtime coverage with arbitrary `row.file` identity proving a
   source event carrying only `payload["file"]` updates the selected row.
 - Focused verification passed:
   - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`
   - `cargo check -q -p boon_ir -p boon_runtime`
-- This still does not complete the source-identity architecture. The compiler
-  still names this metadata `address_lookup_field` and still auto-declares a
-  legacy `Address` payload for compatibility. The next slice should rename or
-  split that metadata into generic row lookup identity and then remove the
-  remaining address-shaped native/playground fallbacks once release verifiers no
-  longer rely on them.
+- This still did not complete the source-identity architecture at the time. The
+  later 2026-07-06 cleanup removed the serialized `address_lookup_field` alias;
+  remaining work is to retire address-shaped source payload naming where the
+  language/runtime still exposes `event.address`.
 
 2026-07-01 row-lookup metadata alias slice:
 
 - `SourcePayloadSchema`, compiler source-route metadata, runtime source-route
   artifacts, and static program analysis now carry `row_lookup_field` as the
-  generic source identity name. `address_lookup_field` remains serialized and
-  accepted as a compatibility alias during the transition.
-- Runtime route construction prefers `row_lookup_field` and falls back to
-  `address_lookup_field`; legacy consumers still see the old field populated so
-  existing native/playground paths do not break mid-migration.
+  generic source identity name. This slice originally kept
+  `address_lookup_field` as a serialized compatibility alias; that alias was
+  removed on 2026-07-06.
 - Plan-executor test fixtures were updated with explicit `row_lookup_field:
   None` defaults so schema changes compile in test builds, not just normal
   library builds.
@@ -5005,9 +5000,9 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`
   - `cargo test -q -p boon_plan_executor --no-run`
   - `cargo check -q -p boon_ir -p boon_plan -p boon_compiler -p boon_runtime -p boon_native_playground`
-- This still does not complete the architecture. The old compatibility field
-  and address-shaped helper names remain in a few call sites, and the larger
-  native UX/frame-loop/runtime-currentness plan still needs implementation and
+- This still does not complete the architecture. Address-shaped payload fields
+  remain in the source-event language/runtime surface, and the larger native
+  UX/frame-loop/runtime-currentness plan still needs implementation and
   release native GPU verification.
 
 2026-07-01 frame-scoped input latency measurement slice:
@@ -5167,13 +5162,10 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   until the remaining runtime/compiler compatibility aliases are retired.
 - The duplicate compiler/runtime static-analysis map named
   `source_address_lookup_fields` was removed. Runtime static analysis now
-  exposes the generic `source_row_lookup_fields` map only; lower-level route
-  slots still serialize `address_lookup_field` as a compatibility alias.
+  exposes the generic `source_row_lookup_fields` map only.
 - `CompilerSourceRouteSource` and runtime `SourceRoute` no longer store a
-  second `address_lookup_field` identity. Compiler output carries
-  `row_lookup_field`; runtime route artifacts still emit and accept the legacy
-  `address_lookup_field` key as a compatibility alias derived from
-  `row_lookup_field`.
+  second address-shaped lookup identity. Compiler output and runtime route
+  artifacts now carry `row_lookup_field`.
 - Runtime helper names now use row lookup terminology:
   `row_lookup_field_for_source_id`, `row_lookup_field_for_list`, and
   `set_row_lookup_fields`.
@@ -5641,22 +5633,19 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   - `cargo xtask verify-report-schema
     target/reports/native-gpu/scroll-speed-cells.json` passed.
 
-2026-07-01 row-lookup schema alias accessor slice:
+2026-07-01 row-lookup schema alias accessor slice, superseded 2026-07-06:
 
 - `SourcePayloadSchema` in both IR and machine-plan types now exposes a
-  generic `row_lookup_field_name()` accessor. The accessor prefers
-  `row_lookup_field` and treats `address_lookup_field` only as a legacy decode
-  alias.
-- `address_lookup_field` is now a defaulted, skipped-when-empty compatibility
-  field in both schema structs, so newer row-lookup-only payload schemas can
-  deserialize and serialize without requiring the old alias.
+  generic `row_lookup_field_name()` accessor. The accessor now reads only
+  `row_lookup_field`; the legacy decode alias was removed on 2026-07-06.
+- `address_lookup_field` is no longer a schema field in IR, machine-plan, or
+  runtime source-route artifacts. Newer row-lookup-only payload schemas must use
+  the generic name directly.
 - Compiler static analysis, compiler source-route metadata, runtime row
   resolution reports, plan-executor row lookup, and report-schema expected row
   lookup now read through the generic accessor rather than reaching directly
   for the legacy alias.
-- The compiler legacy backend still emits the legacy alias deliberately for old
-  plan consumers, but it derives the generic row lookup value from the accessor
-  and backfills the compatibility alias from `row_lookup_field` when needed.
+- The compiler machine-plan backend no longer emits the legacy alias.
 - The IR row-intent scoring helper was renamed from address-intent terminology
   to row-lookup terminology. Real app data and legacy source payload
   `Address` compatibility remain unchanged.
@@ -5668,8 +5657,8 @@ native UX latency gates, and generic runtime/list/currentness work remain.
   needs report alignment plus hardware-backed scroll evidence.
 - Focused verification passed:
   - `cargo fmt --check`;
-  - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias`;
-  - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias`;
+  - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name`;
+  - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name`;
   - `cargo check -q -p boon_ir -p boon_plan -p boon_compiler -p boon_runtime -p boon_plan_executor -p boon_report_schema -p boon_native_playground -p xtask`;
   - `cargo test -q -p boon_runtime row_scoped_source_resolves_named_lookup_payload_without_address`;
   - `cargo test -q -p boon_runtime compiled_artifact_decodes_source_routes_and_action_table_without_ast`;
@@ -12908,3 +12897,29 @@ host-input follow-up cut:
   scheduler-owned decisions over the retained state: clean, dirty upload, dirty
   encode, surface epoch reset, device loss replay, and proof-subscriber-only
   work. Do not call this the final dirty-resource scheduler yet.
+
+2026-07-06 row-lookup alias deletion:
+
+- Removed the serialized `address_lookup_field` compatibility alias from
+  `SourcePayloadSchema`, compiler machine-plan lowering, runtime source-route
+  artifacts, and PlanExecutor test fixtures. The generic source-row identity
+  contract is now `row_lookup_field`.
+- Runtime artifact decode no longer accepts the old alias. This intentionally
+  cuts stale compiled artifacts that predate the generic row-lookup contract
+  instead of keeping another migration path alive.
+- Active docs were updated so they no longer describe the alias as a retained
+  compatibility path. Historical BYTES progress still exists because
+  `audit-goal-readiness` and the unified prompt currently consume that ledger;
+  retiring it requires a separate readiness-auditor replacement, not a casual
+  file delete.
+- Focused verification for this slice:
+  - `rg -n "address_lookup_field|source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias" crates --glob '!target'`
+    returns no matches;
+  - `cargo check -q -p boon_compiler -p boon_plan_executor -p boon_runtime`;
+  - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`;
+  - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`.
+- Next cleanup chunk should be either a deliberate readiness-ledger/auditor
+  replacement that deletes the 38k-line historical BYTES progress file, or a
+  document protocol migration that removes the primary `source_binding` field
+  in favor of canonical multi-bindings. Do not nibble around those with more
+  compatibility comments.

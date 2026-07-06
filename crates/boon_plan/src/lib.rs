@@ -138,15 +138,11 @@ pub struct SourcePayloadSchema {
     pub typed_fields: Vec<SourcePayloadDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_lookup_field: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address_lookup_field: Option<String>,
 }
 
 impl SourcePayloadSchema {
     pub fn row_lookup_field_name(&self) -> Option<&str> {
-        self.row_lookup_field
-            .as_deref()
-            .or(self.address_lookup_field.as_deref())
+        self.row_lookup_field.as_deref()
     }
 }
 
@@ -5693,22 +5689,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias() {
+    fn source_payload_schema_row_lookup_field_uses_generic_name() {
         let schema = SourcePayloadSchema {
             fields: Vec::new(),
             typed_fields: Vec::new(),
             row_lookup_field: Some("file".to_owned()),
-            address_lookup_field: Some("address".to_owned()),
         };
         assert_eq!(schema.row_lookup_field_name(), Some("file"));
-
-        let legacy_schema = SourcePayloadSchema {
-            fields: Vec::new(),
-            typed_fields: Vec::new(),
-            row_lookup_field: None,
-            address_lookup_field: Some("legacy_key".to_owned()),
-        };
-        assert_eq!(legacy_schema.row_lookup_field_name(), Some("legacy_key"));
 
         let decoded: SourcePayloadSchema = serde_json::from_value(serde_json::json!({
             "fields": [],
@@ -5716,7 +5703,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(decoded.row_lookup_field_name(), Some("file"));
-        assert_eq!(decoded.address_lookup_field, None);
     }
 
     #[test]

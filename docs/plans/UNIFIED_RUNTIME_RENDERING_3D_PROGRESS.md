@@ -37235,3 +37235,43 @@ Remaining scope:
 - This removes one dormant native control-plane fallback class. Other active
   native verifier paths, source-replay report refresh debt, root runtime-branch
   execution, and ProductFrameGraph/native presentation cleanup remain open.
+
+## 2026-07-06 - Native Refresh Replay Retired-Arg Compatibility Narrowed
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Native/xtask report refresh replay no longer sanitizes and replays observed
+  commands containing retired control flags such as `--engine`,
+  `--compare-legacy`, or `--diagnostic-compare-legacy`.
+- When a native xtask report has retired control args in `command_argv`, the
+  refresh path now rebuilds from the required canonical report command and
+  arguments instead of preserving a cleaned-up stale command line.
+- Kept the existing `boon_cli` observed-argv sanitization only for BYTES reports
+  that still lack a complete canonical source/scenario/steps table. That is now
+  explicitly remaining control-plane work rather than hidden native verifier
+  compatibility.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask observed_xtask_refresh_argv -- --nocapture`: pass; 1
+  passed.
+- `cargo test -q -p xtask observed_report_refresh_argv -- --nocapture`: pass; 1
+  passed.
+- `cargo test -q -p xtask present_floor_refresh_command_drops_inner_probe_arg
+  -- --nocapture`: pass; 1 passed.
+- Fresh `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+
+Remaining scope:
+
+- Replace BYTES observed `boon_cli` refresh replay with canonical report
+  metadata for source/scenario/steps, then delete the remaining
+  `retired_cli_refresh_arg_skip_count` compatibility helper.
+- Root runtime-branch update execution and ProductFrameGraph/native presentation
+  cleanup remain larger open architecture slices.

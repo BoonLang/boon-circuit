@@ -602,6 +602,25 @@ Fresh focused evidence:
   - `cargo check -q -p xtask`: pass.
   - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 10 passed.
 
+### 2026-07-06 - Direct Preview Scene Patch Path Has No Non-Direct Fallback
+
+- Removed the hardcoded `product_present_fast_path` switch and the stale
+  non-direct input-overlay render-scene patch fallback in the preview render
+  hook.
+- Product rendering now has clearer branches: direct input-overlay scene patch,
+  direct layout sidecar scene patch, cached full scene, or explicit full scene
+  rebuild. There is no preserved middle path that re-applies input overlays
+  after declaring the product fast path active.
+- `NativeProductPatchSummary.direct_input_overlay_render_scene_patch_enabled`
+  now follows the actual input-overlay scene patch branch instead of a separate
+  always-true product fast-path gate.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_playground render_scene_patch -- --nocapture`:
+    pass; 7 passed.
+  - `cargo test -q -p boon_native_playground render_scene_sidecar -- --nocapture`:
+    pass; 3 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

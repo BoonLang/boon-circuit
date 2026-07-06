@@ -11093,9 +11093,7 @@ fn native_gpu_app_owned_render_hook(
     let input_overlay_render_scene_patch_enabled =
         input_overlay_render_scene_patch_enabled && !input_overlay_touched_nodes.is_empty();
     let input_overlay_prepare_ms = elapsed_ms(input_overlay_prepare_started);
-    let product_present_fast_path = true;
     let direct_layout_render_scene_patch_enabled = !input_overlay_render_scene_patch_enabled
-        && product_present_fast_path
         && layout_render_scene_patch.is_some()
         && layout_render_scene_patch_base_hash.is_some();
     let render_frame_cache_started = Instant::now();
@@ -11206,11 +11204,9 @@ fn native_gpu_app_owned_render_hook(
     );
     let mut patched_scene_cache_ms = 0.0_f64;
     let mut patched_scene_cache_written = false;
-    let direct_input_overlay_render_scene_patch_enabled =
-        input_overlay_render_scene_patch_enabled && product_present_fast_path;
     let mut render_scene_encode_cache_key = render_scene_cache_key.clone();
     let render_scene_cache_hit: bool;
-    if direct_input_overlay_render_scene_patch_enabled {
+    if input_overlay_render_scene_patch_enabled {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
         let current_layout_hash = visible_state
             .layout_frame_hash
@@ -11424,135 +11420,21 @@ fn native_gpu_app_owned_render_hook(
     } else {
         render_scene_cache_hit = render_scene_cache.contains_key(&render_scene_cache_key);
     }
-    if !direct_input_overlay_render_scene_patch_enabled
+    if !input_overlay_render_scene_patch_enabled
         && !direct_layout_render_scene_patch_enabled
         && !render_scene_cache_hit
     {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
-        let patched_cached_scene = if input_overlay_render_scene_patch_enabled {
-            let cached_base_scene = render_scene_cache.iter().find_map(
-                |(
-                    (
-                        _cached_render_hash,
-                        cached_width,
-                        cached_height,
-                        cached_lowering_mode,
-                        cached_patch_hash,
-                    ),
-                    (cached_layout_hash, _cached_scene_hash, cached_scene),
-                )| {
-                    (cached_layout_hash == &layout_cache_key
-                        && *cached_width == context.width
-                        && *cached_height == context.height
-                        && cached_lowering_mode == current_render_scene_lowering_mode
-                        && cached_patch_hash == "none")
-                        .then(|| (cached_scene.clone(), cached_lowering_mode.clone()))
-                },
-            );
-            let base_scene = if let Some(base_scene) = cached_base_scene {
-                base_scene
-            } else {
-                let base_render_frame = preview_frame_with_viewport_background(
-                    layout_frame,
-                    context.width as f32,
-                    context.height as f32,
-                );
-                let (base_render_scene, base_lowering_mode) = preview_render_scene_for_frame_hash(
-                    visible_state.layout_frame_hash.as_deref(),
-                    &base_render_frame,
-                    context.width,
-                    context.height,
-                    render_text_columns,
-                )?;
-                let base_scene_hash = render_scene_hash(&base_render_scene);
-                let base_cache_key = (
-                    render_frame_hash(&base_render_frame),
-                    context.width,
-                    context.height,
-                    base_lowering_mode.to_owned(),
-                    "none".to_owned(),
-                );
-                if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
-                    && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
-                {
-                    render_scene_cache.remove(&oldest_key);
-                }
-                render_scene_cache.insert(
-                    base_cache_key,
-                    (
-                        layout_cache_key.to_owned(),
-                        base_scene_hash,
-                        base_render_scene.clone(),
-                    ),
-                );
-                (base_render_scene, base_lowering_mode.to_owned())
-            };
-            let patch_build_started = Instant::now();
-            let input_overlay_patch = preview_input_overlay_render_scene_patch_from_base(
-                layout_frame,
-                &visible_state.overlay_lookup,
-                hover_overlay,
-                focus_overlay,
-                &input_overlay_touched_nodes,
-                context.width,
-                context.height,
-                render_text_columns,
-            )
-            .ok_or("input overlay render scene patch was enabled but produced no patch")?;
-            input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
-            let (mut render_scene, lowering_mode) = base_scene;
-            render_scene.apply_patch(&input_overlay_patch.patch)?;
-            Some((render_scene, lowering_mode))
-        } else if let (Some(render_scene_patch), Some(base_hash)) = (
-            layout_render_scene_patch,
-            layout_render_scene_patch_base_hash.as_deref(),
-        ) {
-            render_scene_cache
-                .iter()
-                .find_map(
-                    |(
-                        (
-                            _cached_render_hash,
-                            cached_width,
-                            cached_height,
-                            cached_lowering_mode,
-                            cached_patch_hash,
-                        ),
-                        (cached_layout_hash, _cached_scene_hash, cached_scene),
-                    )| {
-                        (cached_layout_hash == base_hash
-                            && *cached_width == context.width
-                            && *cached_height == context.height
-                            && cached_lowering_mode == current_render_scene_lowering_mode
-                            && cached_patch_hash == "none")
-                            .then(|| (cached_scene.clone(), cached_lowering_mode.clone()))
-                    },
-                )
-                .map(|(mut render_scene, lowering_mode)| {
-                    render_scene.apply_patch(render_scene_patch)?;
-                    Ok::<_, Box<dyn std::error::Error>>((render_scene, lowering_mode))
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        let (render_scene, _render_scene_lowering_mode) =
-            if let Some((render_scene, lowering_mode)) = patched_cached_scene {
-                (render_scene, lowering_mode)
-            } else {
-                let (mut render_scene, render_scene_lowering_mode) =
-                    preview_render_scene_for_frame_hash(
-                        visible_state.layout_frame_hash.as_deref(),
-                        render_frame,
-                        context.width,
-                        context.height,
-                        render_text_columns,
-                    )?;
-                if let Some(render_scene_patch) = layout_render_scene_patch {
-                    render_scene.apply_patch(render_scene_patch)?;
-                }
-                (render_scene, render_scene_lowering_mode.to_owned())
-            };
+        let (mut render_scene, _render_scene_lowering_mode) = preview_render_scene_for_frame_hash(
+            visible_state.layout_frame_hash.as_deref(),
+            render_frame,
+            context.width,
+            context.height,
+            render_text_columns,
+        )?;
+        if let Some(render_scene_patch) = layout_render_scene_patch {
+            render_scene.apply_patch(render_scene_patch)?;
+        }
         if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
             && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
         {
@@ -11612,7 +11494,7 @@ fn native_gpu_app_owned_render_hook(
         focus_overlay,
         touched_nodes: &input_overlay_touched_nodes,
         input_overlay_render_scene_patch_enabled,
-        direct_input_overlay_render_scene_patch_enabled,
+        direct_input_overlay_render_scene_patch_enabled: input_overlay_render_scene_patch_enabled,
         layout_render_scene_patch_applied: layout_render_scene_patch.is_some(),
         direct_layout_render_scene_patch_enabled,
         render_scene_cache_hit,

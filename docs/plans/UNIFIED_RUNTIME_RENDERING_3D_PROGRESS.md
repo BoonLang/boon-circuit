@@ -37640,6 +37640,38 @@ Remaining scope:
   native verifier paths, source-replay report refresh debt, root runtime-branch
   execution, and ProductFrameGraph/native presentation cleanup remain open.
 
+## 2026-07-06 - Multiwindow Top-Level Proof Alias Acceptance Removed
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Removed top-level `preview_native_gpu_render_proof` as an independent
+  acceptance candidate for the multiwindow native GPU gate.
+- Multiwindow now accepts only surface-scoped preview proof:
+  `preview_surface_proof.product_render_graph_visible_proof` or
+  `preview_surface_proof.external_render_proof`.
+- Supervisor proofs are copied into the matching surface proof field when they
+  are usable; scaffold proofs are kept only as rejected summaries.
+- The measured-loop ProductFrameGraph proof attachment writes to
+  `preview_surface_proof` directly and no longer republishes a compatibility
+  top-level alias.
+
+Fresh focused evidence:
+
+- `cargo fmt --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`:
+  pass; 1 passed.
+- `cargo test -q -p xtask multiwindow_scaffold_supervisor_proof_is_rejected_summary -- --nocapture`:
+  pass; 1 passed.
+
+Remaining scope:
+
+- Continue deleting duplicate proof/report acceptance shapes instead of
+  preserving compatibility aliases. The next high-value cuts are stale
+  preview-E2E top-level proof dependencies and manifest coverage conflation.
+
 ## 2026-07-06 - Native Refresh Replay Retired-Arg Compatibility Narrowed
 
 Status: implemented and focused checks pass.

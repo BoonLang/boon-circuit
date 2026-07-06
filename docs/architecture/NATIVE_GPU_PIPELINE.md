@@ -1202,9 +1202,13 @@ outside generated APIs.
 - reports include app_window backend, `WAYLAND_DISPLAY`, `WGPU_STRATEGY`,
   `WGPU_SURFACE_STRATEGY`, main thread ID, render thread ID, role IDs, window
   IDs, surface IDs, surface epochs, logical/physical sizes, scale, app-owned
-  texture hash, copy-to-present proof, and current git commit;
+  texture hash, surface-scoped ProductFrameGraph or external visible-surface
+  proof, and current git commit;
 - the preview surface renders a nonblank frame before the dev window finishes
   rendering its first full debug frame;
+- top-level preview render-proof aliases are diagnostic metadata only and must
+  not satisfy the multiwindow gate unless the same proof is present under
+  `preview_surface_proof`;
 - closing the dev window does not stop preview rendering;
 - closing the preview window shuts down the preview role cleanly and causes the
   dev role to show disconnected state or exit cleanly;

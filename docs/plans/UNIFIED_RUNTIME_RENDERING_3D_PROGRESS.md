@@ -37477,3 +37477,55 @@ Remaining scope:
   remains required as its own aggregate child.
 - Continue ProductFrameGraph/native presentation and Cells UX latency work; this
   control-plane split is not a Cells 60 FPS claim.
+
+## 2026-07-06 - BYTES Aggregate Cut Away From Native Source Replay
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Finished the BYTES aggregate checkpoint after the default-engine readiness
+  split. The active BYTES aggregate now has 58 required children and passes
+  with zero refresh debt and zero true blockers.
+- Removed stale TodoMVC direct `run-plan-route` aggregate children from the
+  active contract. Root-scalar/root-list scenarios remain the authoritative
+  PlanExecutor product coverage for those TodoMVC interactions.
+- Removed native preview/source-replay children from the BYTES aggregate:
+  `todomvc-native-preview-source-replay`, `cells-native-preview-source-replay`,
+  and `todo-mvc-physical-native-preview-source-replay`. Those belong to
+  native/ProductFrameGraph handoff and product latency evidence, not the BYTES
+  control-plane contract.
+- Removed the obsolete TodoMVC release-benchmark reproduction child from the
+  BYTES schema expected set.
+- Fixed report identity/currentness details that caused false churn:
+  library-generated embedded MachinePlan reports no longer receive verifier
+  identity for unrelated outer xtask argv, `verify-bytes-negative` now emits a
+  scoped verifier identity at the top level, and schema validation now mirrors
+  PlanExecutor indexed `ReadPath` fallback plus scoped aggregate freshness.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_runtime
+  bytes_machine_plan_identity_requires_command_argv_to_prove_report_command
+  -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-machine-plan-all-current.json`: pass.
+- `cargo run -q -p xtask -- verify-bytes-machine-plan-all
+  --check-existing --report
+  target/reports/bytes-plan/bytes-machine-plan-all-current.json`: pass with
+  `required_report_count=58`, `refresh_debt_child_count=0`, and
+  `true_blocker_child_count=0`.
+
+Remaining scope:
+
+- This is not a Cells 60 FPS result. It only makes the control plane cheaper
+  and less ambiguous.
+- Next architecture work should stay on the product path: ProductFrameGraph,
+  retained native rendering, separated proof/readback, and Cells/runtime
+  currentness/performance.
+- Do not restore native source replay to the BYTES aggregate. Native handoff
+  manifests and native GPU reports are the correct authority for visual/product
+  proof.

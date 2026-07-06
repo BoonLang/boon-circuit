@@ -42354,7 +42354,7 @@ fn command_supports_bytes_machine_plan_identity(command: &str) -> bool {
     )
 }
 
-fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Vec<String> {
+fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Option<Vec<String>> {
     let mut start = args
         .iter()
         .position(|arg| arg == command)
@@ -42365,6 +42365,7 @@ fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Vec<S
             .position(|arg| arg == "run")
             .map_or(0, |index| index.saturating_add(1));
     }
+    let command_seen = start > 0;
     if start == 0
         && args
             .first()
@@ -42379,6 +42380,9 @@ fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Vec<S
         {
             start = start.saturating_add(1);
         }
+    }
+    if start == 0 && !command_seen {
+        return None;
     }
     let mut canonical = Vec::new();
     let mut index = start;
@@ -42395,7 +42399,7 @@ fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Vec<S
         canonical.push(arg.clone());
         index = index.saturating_add(1);
     }
-    canonical
+    Some(canonical)
 }
 
 fn machine_plan_verifier_identity_for_report(report: &JsonValue) -> Option<JsonValue> {
@@ -42409,7 +42413,7 @@ fn machine_plan_verifier_identity_for_report(report: &JsonValue) -> Option<JsonV
         .iter()
         .map(|arg| arg.as_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
-    let canonical_args = canonical_machine_plan_verifier_args(command, &args);
+    let canonical_args = canonical_machine_plan_verifier_args(command, &args)?;
     let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
     let mut material = Vec::new();
     let scheme_version = VERIFIER_IDENTITY_SCHEME_VERSION.to_string();
@@ -42683,6 +42687,68 @@ mod tests {
         assert_eq!(
             report.get("source_replay_identity"),
             plan_executor_source_replay_identity_for_report(&report).as_ref()
+        );
+    }
+
+    #[test]
+    fn bytes_machine_plan_identity_requires_command_argv_to_prove_report_command() {
+        let mut embedded_report = json!({
+            "command": "run-plan-root-scalar-scenario",
+            "command_argv": [
+                "target/debug/xtask",
+                "verify-bytes-negative",
+                "--report",
+                "target/reports/bytes-plan/bytes-negative.json"
+            ],
+            "measurement_mode": "proof",
+            "worktree_fingerprint": "unit-full-worktree"
+        });
+        insert_bytes_machine_plan_identity(&mut embedded_report);
+        assert!(
+            embedded_report.get("verifier_identity").is_none(),
+            "library-generated fixture reports must not carry identity for unrelated xtask argv"
+        );
+        assert_eq!(
+            embedded_report
+                .get("worktree_fingerprint_scope")
+                .and_then(JsonValue::as_str),
+            Some(BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE),
+            "scoped freshness fields are still useful for BYTES reports"
+        );
+
+        let mut cli_report = json!({
+            "command": "run-plan-root-scalar-scenario",
+            "command_argv": [
+                "target/debug/boon_cli",
+                "run-plan-root-scalar-scenario",
+                "examples/bytes_set_plan_ops.bn",
+                "--scenario",
+                "examples/bytes_set_plan_ops.scn",
+                "--steps",
+                "patch-bytes,inspect-patched",
+                "--report",
+                "target/reports/bytes-plan/bytes-negative-base.json"
+            ],
+            "measurement_mode": "proof",
+            "worktree_fingerprint": "unit-full-worktree"
+        });
+        insert_bytes_machine_plan_identity(&mut cli_report);
+        let identity = cli_report
+            .get("verifier_identity")
+            .expect("CLI-shaped MachinePlan report should carry verifier identity");
+        assert_eq!(
+            identity
+                .pointer("/canonical_args/0")
+                .and_then(JsonValue::as_str),
+            Some("examples/bytes_set_plan_ops.bn")
+        );
+        assert!(
+            !identity
+                .get("canonical_args")
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str() == Some("--report"))
         );
     }
 

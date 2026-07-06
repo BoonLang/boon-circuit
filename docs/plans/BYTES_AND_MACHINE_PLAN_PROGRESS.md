@@ -38256,3 +38256,65 @@ Remaining scope:
   aggregate child.
 - Continue native/product performance and ProductFrameGraph work; do not use
   this control-plane gate as a Cells 60 FPS claim.
+
+## 2026-07-06 - BYTES Aggregate Trimmed To PlanExecutor Control Plane
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Reminted the BYTES/MachinePlan aggregate after the default-engine readiness
+  split and burned refresh debt down to zero.
+- Fixed MachinePlan verifier identity insertion so library-generated embedded
+  reports do not claim verifier identity for an unrelated outer xtask command.
+  Top-level `verify-bytes-negative` reports now carry replayable xtask argv,
+  BYTES scoped freshness, and verifier identity; the embedded negative base
+  report deliberately does not carry mismatched identity.
+- Deleted obsolete TodoMVC `run-plan-route` aggregate children
+  `todomvc-new-text-route` and `todomvc-filter-active-route`. Current product
+  behavior is covered by root-scalar/root-list scenario reports, and the old
+  route children were stale harness surface rather than an authoritative
+  PlanExecutor product gate.
+- Deleted `todomvc-native-preview-source-replay`,
+  `cells-native-preview-source-replay`, and
+  `todo-mvc-physical-native-preview-source-replay` from the active BYTES
+  aggregate. Full native preview/source replay belongs to native/product
+  handoff gates, not this BYTES control-plane aggregate.
+- Removed the already-obsolete `todomvc-release-benchmark-reproduction` child
+  from the BYTES schema expected set.
+- Aligned schema replay with PlanExecutor indexed `ReadPath`: when an indexed
+  output has no explicit non-output state input, schema replay now mirrors the
+  executor fallback to `initial_row_field_path`.
+- Aligned BYTES aggregate schema validation with the aggregate freshness model
+  for scoped child reports: schema still requires pass/status/schema/artifact
+  checks, but it no longer rejects a scoped child solely because its raw
+  fingerprint differs when the aggregate recorded `worktree_fresh=true` for
+  the matching scope.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_runtime
+  bytes_machine_plan_identity_requires_command_argv_to_prove_report_command
+  -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-machine-plan-all-current.json`: pass.
+- `cargo run -q -p xtask -- verify-bytes-machine-plan-all
+  --check-existing --report
+  target/reports/bytes-plan/bytes-machine-plan-all-current.json`: pass.
+- Fresh aggregate summary:
+  `status=pass`, `required_report_count=58`, `checked_report_count=58`,
+  `refresh_debt_child_count=0`, `true_blocker_child_count=0`.
+
+Remaining scope:
+
+- The BYTES aggregate is now a smaller PlanExecutor/control-plane contract, not
+  a native preview performance proof.
+- Native/ProductFrameGraph handoff reports still own preview/source replay,
+  WGPU readback proof, and Cells UX latency. Do not re-add those native replay
+  children to the BYTES aggregate to make another control-plane gate look
+  comprehensive.
+- Cells full replay and interaction performance remain product/runtime
+  architecture work; this checkpoint only removes misleading harness churn.

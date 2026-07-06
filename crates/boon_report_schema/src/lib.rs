@@ -8377,12 +8377,6 @@ fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachine
             measurement_mode: "proof",
         },
         ExpectedBytesMachinePlanChildReport {
-            label: "todomvc-release-benchmark-reproduction",
-            path: "target/reports/bytes-plan/todomvc-release-benchmark-reproduction.json",
-            command: "verify-bytes-release-benchmark-reproduction",
-            measurement_mode: "proof",
-        },
-        ExpectedBytesMachinePlanChildReport {
             label: "bytes-file-read-plan",
             path: "target/reports/bytes-plan/bytes-file-read-plan.json",
             command: "verify-bytes-file-read-plan",
@@ -8473,18 +8467,6 @@ fn expected_bytes_machine_plan_child_reports() -> &'static [ExpectedBytesMachine
             measurement_mode: "proof",
         },
         ExpectedBytesMachinePlanChildReport {
-            label: "todomvc-new-text-route",
-            path: "target/reports/bytes-plan/todomvc-new-text-route-run-plan.json",
-            command: "run-plan-route",
-            measurement_mode: "proof",
-        },
-        ExpectedBytesMachinePlanChildReport {
-            label: "todomvc-filter-active-route",
-            path: "target/reports/bytes-plan/todomvc-filter-active-route-run-plan.json",
-            command: "run-plan-route",
-            measurement_mode: "proof",
-        },
-        ExpectedBytesMachinePlanChildReport {
             label: "todomvc-root-scalar",
             path: "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json",
             command: "run-plan-root-scalar-scenario",
@@ -8545,6 +8527,9 @@ fn verify_bytes_machine_plan_all_report(
         .get("worktree_fingerprint")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| format!("{} missing worktree_fingerprint", report_path.display()))?;
+    let aggregate_worktree_fingerprint_scope = report
+        .get("worktree_fingerprint_scope")
+        .and_then(JsonValue::as_str);
     let required_count = report
         .get("required_report_count")
         .and_then(JsonValue::as_u64)
@@ -8789,8 +8774,18 @@ fn verify_bytes_machine_plan_all_report(
                         report_path.display()
                     )
                 })?;
+            let child_uses_matching_scoped_freshness = child
+                .get("worktree_fingerprint_basis")
+                .and_then(JsonValue::as_str)
+                == Some("scoped")
+                && child
+                    .get("worktree_fingerprint_scope")
+                    .and_then(JsonValue::as_str)
+                    == aggregate_worktree_fingerprint_scope
+                && child.get("worktree_fresh").and_then(JsonValue::as_bool) == Some(true);
             if child_worktree_fingerprint != aggregate_worktree_fingerprint
                 && !child_uses_source_replay_scope
+                && !child_uses_matching_scoped_freshness
             {
                 return Err(format!(
                     "{} child report `{label}` worktree_fingerprint `{child_worktree_fingerprint}` does not match aggregate `{aggregate_worktree_fingerprint}`",
@@ -17841,16 +17836,32 @@ fn expected_indexed_update_branch(
             update_constant_id: None,
             ..
         } => {
-            let input_state_id =
-                expected_indexed_single_state_input(op, output_state_id, report_path)?;
-            let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
-            let value = row.fields.get(&input_name).cloned().ok_or_else(|| {
-                format!(
-                    "{} indexed ReadPath update branch {} input field `{input_name}` is missing",
-                    report_path.display(),
-                    op.id.0
-                )
-            })?;
+            let value = match expected_indexed_single_state_input(op, output_state_id, report_path)
+            {
+                Ok(input_state_id) => {
+                    let input_name = local_field_name(&plan_state_label(plan, input_state_id.0));
+                    row.fields.get(&input_name).cloned().ok_or_else(|| {
+                            format!(
+                                "{} indexed ReadPath update branch {} input field `{input_name}` is missing",
+                                report_path.display(),
+                                op.id.0
+                            )
+                        })?
+                }
+                Err(error) => {
+                    let Some(row_field_path) = output_slot.initial_row_field_path.as_deref() else {
+                        return Err(error);
+                    };
+                    let row_field = local_field_name(row_field_path);
+                    row.fields.get(&row_field).cloned().ok_or_else(|| {
+                            format!(
+                                "{} indexed ReadPath update branch {} could not read fallback row field `{row_field}`",
+                                report_path.display(),
+                                op.id.0
+                            )
+                        })?
+                }
+            };
             (value, None, "read_path")
         }
         boon_plan::PlanOpKind::UpdateBranch {

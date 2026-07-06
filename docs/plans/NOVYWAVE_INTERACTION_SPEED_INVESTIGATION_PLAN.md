@@ -18,10 +18,9 @@ render state, dev inspector contention, and string-heavy runtime identity.
 
 - Add `cargo xtask verify-native-gpu-novywave-interaction-speed --report target/reports/native-gpu/novywave-interaction-speed.json`.
 - Register the command in xtask help/dispatch, report-schema allowlist, default
-  report path selection, native report validation, and
-  `verify-native-gpu-regression-all` after schema/negative coverage exists.
-  Do not add it to `verify-native-gpu-all` unless `NATIVE_GPU_PIPELINE.md` and
-  `AGENTS.md` are updated together.
+  report path selection, and native report validation. Do not add it to the
+  native handoff aggregate unless `docs/architecture/native_gpu_handoff_manifest.json`,
+  `NATIVE_GPU_PIPELINE.md`, and `AGENTS.md` are updated together.
 - Add `[novywave_interaction.release]` budgets in `budgets/native-gpu.toml`:
   `input_to_visible_ms_p95 <= 16.7`, `input_to_visible_ms_max <= 33.4`,
   `hover_to_overlay_ms_p95 <= 16.7`, `click_to_cursor_ms_p95 <= 16.7`,
@@ -295,8 +294,9 @@ The next review narrowed the remaining work into three generic problem areas.
 - Freshly run `verify-native-gpu-novywave-interaction-speed`,
   `verify-native-gpu-novywave-visual`, `verify-native-gpu-preview-e2e --example
   novywave`, `verify-native-gpu-scroll-speed --example novywave`,
-  `verify-native-gpu-negative`, and `verify-native-gpu-regression-all
-  --check-existing`.
+  and `verify-native-gpu-negative`. If NovyWave becomes handoff-critical, add
+  those reports to the native handoff manifest and then run
+  `verify-native-gpu-all --check-existing`.
 - Reports must be fresh for commit, worktree fingerprint, binary hash, source
   hash, scenario hash, and budget hash.
 - After reports pass, stop only matching old NovyWave release playground
@@ -318,8 +318,9 @@ The next review narrowed the remaining work into three generic problem areas.
   nonzero `preview_blocked_on_ipc_count`, hot-path PNG writes, and private
   runtime dispatch are rejected.
 - Acceptance commands: run the fresh NovyWave interaction-speed gate plus
-  existing NovyWave visual/E2E/scroll gates and
-  `verify-native-gpu-regression-all --check-existing`.
+  existing NovyWave visual/E2E/scroll gates. The manifest-backed
+  `verify-native-gpu-all --check-existing` is required only after adding
+  NovyWave reports to the handoff manifest.
 
 ## Assumptions
 

@@ -104,7 +104,6 @@ const XTASK_COMMANDS: &[&str] = &[
     "verify-native-gpu-scroll-speed",
     "verify-native-gpu-negative",
     "verify-native-gpu-all",
-    "verify-native-gpu-regression-all",
     "verify-world-scene",
     "verify-3d-hello-cube",
     "verify-solid-graph",
@@ -216,7 +215,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
         "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
         "verify-native-gpu-all" => verify_native_gpu_all(&args),
-        "verify-native-gpu-regression-all" => verify_native_gpu_regression_all(&args),
         "verify-world-scene" => verify_world_scene(&args),
         "verify-3d-hello-cube" => verify_3d_hello_cube(&args),
         "verify-solid-graph" => verify_solid_graph(&args),
@@ -51016,15 +51014,6 @@ fn verify_native_gpu_stale_path_ledger(args: &[String]) -> Result<(), Box<dyn st
     )
 }
 
-fn verify_native_gpu_regression_all(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    verify_native_gpu_report_bundle(
-        args,
-        "verify-native-gpu-regression-all",
-        native_gpu_regression_required_reports(),
-        "native-gpu-product-regression",
-    )
-}
-
 fn verify_native_gpu_report_bundle(
     args: &[String],
     command: &str,
@@ -52681,117 +52670,6 @@ fn shell_join_args(args: &[String]) -> String {
 fn native_gpu_handoff_required_reports() -> Vec<NativeGpuRequiredReport> {
     native_gpu_handoff_manifest_reports()
         .unwrap_or_else(|error| panic!("failed to load native GPU handoff manifest: {error}"))
-}
-
-fn native_gpu_regression_required_reports() -> Vec<NativeGpuRequiredReport> {
-    let mut reports = native_gpu_handoff_required_reports();
-    reports.extend([
-        native_gpu_required_report(
-            "preview-e2e-novywave",
-            "target/reports/native-gpu/preview-e2e-novywave.json",
-            "verify-native-gpu-preview-e2e",
-            &[("--example", "novywave")],
-        ),
-        native_gpu_required_report(
-            "novywave-visual",
-            "target/reports/native-gpu/novywave-visual.json",
-            "verify-native-gpu-novywave-visual",
-            &[],
-        ),
-        native_gpu_required_report(
-            "counter-interaction-speed",
-            "target/reports/native-gpu/counter-interaction-speed.json",
-            "verify-native-counter-interaction-speed",
-            &[],
-        ),
-        native_gpu_required_report(
-            "cells-interaction-speed-debug",
-            "target/reports/native-gpu/cells-interaction-speed-debug.json",
-            "verify-native-cells-interaction-speed",
-            &[("--profile", "debug")],
-        ),
-        native_gpu_required_report(
-            "cells-interaction-speed-release",
-            "target/reports/native-gpu/cells-interaction-speed-release.json",
-            "verify-native-cells-interaction-speed",
-            &[("--profile", "release")],
-        ),
-        native_gpu_required_report(
-            "novywave-interaction-speed",
-            "target/reports/native-gpu/novywave-interaction-speed.json",
-            "verify-native-gpu-novywave-interaction-speed",
-            &[],
-        ),
-    ]);
-    reports.extend([
-        native_gpu_required_report(
-            "dev-editor-todomvc",
-            "target/reports/native-gpu/dev-editor-todomvc.json",
-            "verify-native-dev-window-editor",
-            &[("--example", "todomvc")],
-        ),
-        native_gpu_required_report(
-            "dev-editor-cells",
-            "target/reports/native-gpu/dev-editor-cells.json",
-            "verify-native-dev-window-editor",
-            &[("--example", "cells")],
-        ),
-        native_gpu_required_report(
-            "dev-editor-novywave",
-            "target/reports/native-gpu/dev-editor-novywave.json",
-            "verify-native-dev-window-editor",
-            &[("--example", "novywave")],
-        ),
-        native_gpu_required_report(
-            "example-tabs",
-            "target/reports/native-gpu/example-tabs.json",
-            "verify-native-example-tabs",
-            &[],
-        ),
-        native_gpu_required_report(
-            "editor-format",
-            "target/reports/native-gpu/editor-format.json",
-            "verify-native-editor-format",
-            &[],
-        ),
-        native_gpu_required_report(
-            "speed-cells",
-            "target/reports/native-gpu/speed-cells.json",
-            "verify-native-example-speed",
-            &[("--example", "cells")],
-        ),
-        native_gpu_required_report(
-            "scroll-speed-novywave",
-            "target/reports/native-gpu/scroll-speed-novywave.json",
-            "verify-native-gpu-scroll-speed",
-            &[("--example", "novywave")],
-        ),
-        native_gpu_required_report(
-            "dev-editor-speed",
-            "target/reports/native-gpu/dev-editor-speed.json",
-            "verify-native-dev-editor-speed",
-            &[],
-        ),
-    ]);
-    reports
-}
-
-fn native_gpu_required_report(
-    label: &'static str,
-    path: &str,
-    command: &'static str,
-    required_argv: &'static [(&'static str, &'static str)],
-) -> NativeGpuRequiredReport {
-    NativeGpuRequiredReport {
-        label,
-        path: PathBuf::from(path),
-        command,
-        required_argv,
-        upstream_dependencies: &[],
-        requires_native_gpu_contract: true,
-        max_report_bytes: u64::MAX,
-        max_sidecar_bytes: u64::MAX,
-    }
 }
 
 fn leak_static_str(value: String) -> &'static str {
@@ -57014,9 +56892,6 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
         }
         "verify-native-gpu-negative" => "negative",
         "verify-native-gpu-all" => return PathBuf::from("target/reports/native-gpu-all.json"),
-        "verify-native-gpu-regression-all" => {
-            return PathBuf::from("target/reports/native-gpu-regression-all.json");
-        }
         _ => command,
     };
     PathBuf::from(format!("target/reports/native-gpu/{name}.json"))
@@ -77441,29 +77316,6 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("presented_frame_ms.p95=18")),
             "present-floor contract must reject over-budget p95: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn native_gpu_handoff_keeps_novywave_in_regression_scope() {
-        let handoff = native_gpu_handoff_required_reports();
-        assert!(
-            handoff
-                .iter()
-                .all(|report| !report.label.contains("novywave")),
-            "NovyWave product visual gates are regression scope, not native GPU handoff scope"
-        );
-
-        let regression = native_gpu_regression_required_reports();
-        assert!(
-            regression
-                .iter()
-                .any(|report| report.label == "preview-e2e-novywave")
-        );
-        assert!(
-            regression
-                .iter()
-                .any(|report| report.label == "novywave-visual")
         );
     }
 

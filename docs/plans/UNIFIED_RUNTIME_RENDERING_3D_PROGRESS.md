@@ -222,6 +222,31 @@ for old evidence.
   branches replaced by headed product-path evidence in a later cut.
 - Focused checks passed:
   - `cargo check -q -p xtask`
+
+### 2026-07-06 - Non-Manifest Native Regression Aggregate Deleted
+
+- Deleted the duplicate `verify-native-gpu-regression-all` command.
+- Removed its built-in non-manifest report list, default report path, command
+  registry entry, and test that preserved NovyWave in a separate regression
+  scope.
+- Updated `docs/architecture/NATIVE_GPU_PIPELINE.md` so the manifest-backed
+  `verify-native-gpu-all` aggregate is the only native aggregate. Broader
+  product checks remain individual commands unless they are explicitly added to
+  `docs/architecture/native_gpu_handoff_manifest.json` with bounded budgets.
+- This removes the second native report inventory that could drift from the
+  handoff manifest and produce ambiguous readiness claims.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`:
+    pass; 3 passed.
+  - `cargo test -q -p xtask advertised_xtask_commands_are_unique -- --nocapture`:
+    pass; 1 passed.
+  - `cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`:
+    expected refresh-debt fail after this source change; fresh taxonomy shows
+    `refresh_debt_child_count=17`, `true_blocker_child_count=0`,
+    `product_contract_child_count=0`.
+  - `cargo xtask verify-report-schema target/reports/native-gpu-all.json`:
+    pass.
   - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
 
 ### 2026-07-06 - Present-Floor Isolated Fallback Deleted
@@ -498,8 +523,8 @@ Fresh focused evidence:
   refresh entries still run before their consumers, and closed-loop mode remains
   the deterministic way to prove burndown.
 - Independent audits identified the next larger cuts:
-  non-manifest `verify-native-gpu-regression-all` report lists, remaining
-  BYTES/`boon_cli` refresh compatibility outside native handoff, and
+  duplicate non-manifest native report lists, remaining BYTES/`boon_cli`
+  refresh compatibility outside native handoff, and
   LayoutFrame-keyed render-scene cache compatibility in the playground.
 - Fresh focused evidence:
   - `cargo fmt -- --check`: pass.
@@ -517,17 +542,13 @@ Fresh focused evidence:
 
 ## Next Cuts
 
-1. Delete the non-manifest `verify-native-gpu-regression-all` aggregate or
-   replace it with an explicit manifest if it is still product-critical. Do not
-   keep a second native report list that drifts from
-   `native_gpu_handoff_manifest.json`.
-2. Cut remaining BYTES/`boon_cli` refresh compatibility from native
+1. Cut remaining BYTES/`boon_cli` refresh compatibility from native
    control-plane code where it is not required by a current BYTES aggregate.
-3. Continue moving `ProductFrameGraph` ownership out of playground/report
+2. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-4. Promote `DocumentRenderSnapshot` to scene-first identity and remove
+3. Promote `DocumentRenderSnapshot` to scene-first identity and remove
    LayoutFrame-hash-keyed render-scene patch cache compatibility.
-5. Keep Cells product-latency and proof-lane reports fresh after each
+4. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

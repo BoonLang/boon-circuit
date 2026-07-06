@@ -412,16 +412,14 @@ The aggregate gate must have one explicit contract. Current mismatch resolution
 is part of the recovery:
 
 - for handoff readiness, it should match the `AGENTS.md` native GPU gate list;
-- for product regression readiness, it may also require dev-editor scroll
-  speed, example switching, and idle-wake/demand-loop probes;
+- for product regression readiness, it may also require individual
+  dev-editor, example-switch, or product-speed reports;
 - it must not silently mix those scopes without labeling why each report is
   required.
 
-Dev-editor scroll speed, example switching, and idle-wake/demand-loop probes
-should either:
-
-- run in a separate regression aggregate; or
-- be clearly marked optional/product-regression gates in the report.
+Broader product-regression reports must either be added to the native handoff
+manifest with bounded budgets or remain individual reports. Do not recreate a
+second built-in native aggregate.
 
 ## Phase 4: Architecture Update After Recovery
 
@@ -496,11 +494,12 @@ cargo xtask verify-native-example-switch-speed --profile debug --report target/r
 cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
 ```
 
-The aggregate scope mismatch is resolved by keeping two aggregates:
-`verify-native-gpu-all` is the `AGENTS.md` handoff aggregate, while
-`verify-native-gpu-regression-all` covers broader product/editor/example-switch
-regression reports. Before claiming native GPU handoff readiness, run the
-authoritative `AGENTS.md` handoff gate list:
+The aggregate scope mismatch is resolved by keeping one native aggregate:
+`verify-native-gpu-all` is the manifest-backed handoff aggregate. Broader
+product/editor/example-switch regression reports remain individual gates unless
+they are added to `docs/architecture/native_gpu_handoff_manifest.json`. Before
+claiming native GPU handoff readiness, run the authoritative manifest-backed
+handoff aggregate:
 
 ```bash
 cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
@@ -519,9 +518,8 @@ cargo xtask verify-native-gpu-negative --report target/reports/native-gpu/negati
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
-Then run `verify-native-gpu-regression-all --check-existing` only after the
-focused regression reports and other broader product reports documented in
-`docs/architecture/NATIVE_GPU_PIPELINE.md` have been generated fresh.
+Focused regression reports outside the manifest may be run separately, but they
+do not define native handoff readiness.
 
 ## Subagent Verification
 

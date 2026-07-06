@@ -1100,7 +1100,7 @@ reports must include
 final refresh debt counts, selected-label counts, and per-cycle summaries.
 Dry-runs must be schema-valid and explicitly report `closed_loop_stop_reason =
 dry-run` plus a skipped post-refresh aggregate rerun. Bulky refresh controller
-arrays such as `results`, `closed_loop_cycles`, owner-rerun lists, and
+arrays such as `results`, `closed_loop_cycles`, and
 remaining-refresh-command lists may be emitted as JSON sidecars with SHA-256 and
 byte-length metadata; inline scalar counts remain canonical for quick
 classification.
@@ -1109,41 +1109,20 @@ Refresh queues are dependency-aware. When a native refresh command depends on an
 upstream report declared by the handoff manifest, the queue must select and run
 the upstream refresh before the native consumer, mark the execution phase in
 `refresh_execution_plan`, and report whether an entry was selected directly by
-label or expanded from dependency edges. Upstream BYTES-owned replay refreshes
-must be followed by their owner aggregate rerun before native preview consumers
-are treated as meaningful product evidence. This keeps stale prerequisite
-reports from masquerading as Cells/native rendering failures.
+label or expanded from dependency edges. Native handoff dependencies are native
+reports owned by `verify-native-gpu-all`; source-replay and BYTES-owned report
+dependencies are not native handoff evidence. Closed-loop refresh proves
+burndown by rerunning the manifest-backed aggregate after selected refresh
+entries complete.
 
-When selected refresh entries execute through `boon_cli`, the queue must run a
-single `cargo build -p boon_cli` preflight before executing non-dry replay
-commands and must report the result in `boon_cli_prebuild`. Dry-runs report the
-same preflight as `skipped-dry-run`. A failed prebuild fails only the selected
-`boon_cli` refresh entries instead of running a stale binary.
-
-The broader product/regression gates remain required before claiming the
-dev-editor/example-switch recovery complete, but they are not part of the
-handoff aggregate unless this document and `AGENTS.md` are updated together:
+The native handoff aggregate is the only native aggregate. Broader product or
+regression checks may exist as individual commands, but they must not be
+collected through a second built-in native report list. If a report becomes
+handoff-critical, add it to `docs/architecture/native_gpu_handoff_manifest.json`
+with bounded report and sidecar budgets:
 
 ```text
-cargo xtask verify-native-counter-interaction-speed --report target/reports/native-gpu/counter-interaction-speed.json
-cargo xtask verify-native-cells-interaction-speed --profile debug --report target/reports/native-gpu/cells-interaction-speed-debug.json
-cargo xtask verify-native-cells-interaction-speed --profile release --report target/reports/native-gpu/cells-interaction-speed-release.json
-cargo xtask verify-native-gpu-idle-wake --example counter --report target/reports/native-gpu/idle-wake-counter.json
-cargo xtask verify-native-gpu-idle-wake --example todomvc --report target/reports/native-gpu/idle-wake-todomvc.json
-cargo xtask verify-native-gpu-idle-wake --example cells --report target/reports/native-gpu/idle-wake-cells.json
-cargo xtask verify-native-gpu-idle-wake --custom-project-fixture target/fixtures/native-gpu/custom-projects.json --report target/reports/native-gpu/idle-wake-custom-projects.json
-cargo xtask verify-native-real-window-input-environment --report target/reports/native-gpu/real-window-input-environment.json
-cargo xtask verify-native-dev-window-editor --example todomvc --report target/reports/native-gpu/dev-editor-todomvc.json
-cargo xtask verify-native-dev-window-editor --example cells --report target/reports/native-gpu/dev-editor-cells.json
-cargo xtask verify-native-example-tabs --report target/reports/native-gpu/example-tabs.json
-cargo xtask verify-native-editor-format --report target/reports/native-gpu/editor-format.json
-cargo xtask verify-native-dev-editor-scroll-speed --profile debug --report target/reports/native-gpu/dev-editor-scroll-speed-debug.json
-cargo xtask verify-native-dev-editor-scroll-speed --profile release --report target/reports/native-gpu/dev-editor-scroll-speed-release.json
-cargo xtask verify-native-example-switch-speed --profile debug --report target/reports/native-gpu/example-switch-speed-debug.json
-cargo xtask verify-native-example-switch-speed --profile release --report target/reports/native-gpu/example-switch-speed-release.json
-cargo xtask verify-native-example-speed --example cells --report target/reports/native-gpu/speed-cells.json
-cargo xtask verify-native-dev-editor-speed --report target/reports/native-gpu/dev-editor-speed.json
-cargo xtask verify-native-gpu-regression-all --check-existing --report target/reports/native-gpu-regression-all.json
+cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
 Do not run the legacy readiness audits as part of this architecture gate. The

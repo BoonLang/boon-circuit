@@ -60836,6 +60836,10 @@ fn refresh_entry_uses_boon_cli(entry: &serde_json::Value) -> bool {
         .is_some_and(|file_name| file_name.starts_with("boon_cli"))
 }
 
+fn refresh_queue_aggregate_allows_boon_cli(aggregate_command: &str) -> bool {
+    aggregate_command == "verify-bytes-machine-plan-all"
+}
+
 fn refresh_queue_boon_cli_prebuild(
     required: bool,
     dry_run: bool,
@@ -60993,7 +60997,9 @@ fn run_refresh_queue_entries(
     aggregate_command: &str,
 ) -> RefreshQueueCycleExecution {
     let mut execution = RefreshQueueCycleExecution::default();
-    let selected_requires_boon_cli = selected.iter().any(refresh_entry_uses_boon_cli);
+    let aggregate_allows_boon_cli = refresh_queue_aggregate_allows_boon_cli(aggregate_command);
+    let selected_requires_boon_cli =
+        aggregate_allows_boon_cli && selected.iter().any(refresh_entry_uses_boon_cli);
     let (boon_cli_prebuild, boon_cli_prebuild_ok) = refresh_queue_boon_cli_prebuild(
         selected_requires_boon_cli,
         dry_run,
@@ -61014,7 +61020,8 @@ fn run_refresh_queue_entries(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("missing")
             .to_owned();
-        if refresh_entry_uses_boon_cli(entry) && !boon_cli_prebuild_ok {
+        let entry_uses_boon_cli = aggregate_allows_boon_cli && refresh_entry_uses_boon_cli(entry);
+        if entry_uses_boon_cli && !boon_cli_prebuild_ok {
             execution.fail_count += 1;
             execution.results.push(json!({
                 "cycle": cycle_number,
@@ -61060,15 +61067,7 @@ fn run_refresh_queue_entries(
             continue;
         };
         argv[0] = current_binary_path();
-        if entry
-            .get("argv")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|argv| argv.first())
-            .and_then(serde_json::Value::as_str)
-            .and_then(|arg| Path::new(arg).file_name())
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|file_name| file_name.starts_with("boon_cli"))
-        {
+        if entry_uses_boon_cli {
             argv[0] = current_boon_cli_path();
         }
         let executable = Path::new(&argv[0])
@@ -61340,30 +61339,22 @@ fn refresh_queue_command_allowed(
     let Some(command) = argv.get(1).map(String::as_str) else {
         return false;
     };
-    if aggregate_command == "verify-native-gpu-all"
-        && (executable.starts_with("boon_cli")
-            || matches!(
-                command,
-                "run"
-                    | "run-plan"
-                    | "run-plan-route"
-                    | "run-plan-root-scalar-scenario"
-                    | "run-plan-scenario-events"
-            )
-            || argv.iter().any(|arg| {
-                matches!(
-                    arg.as_str(),
-                    "--compare-legacy" | "--diagnostic-compare-legacy" | "--engine"
-                )
-            }))
-    {
-        return false;
-    }
-    if executable.starts_with("xtask") {
-        return XTASK_COMMANDS.contains(&command)
+    let xtask_refresh_command_allowed = || {
+        executable.starts_with("xtask")
+            && XTASK_COMMANDS.contains(&command)
             && command != runner_command
             && command != "verify-native-gpu-all"
-            && command != "verify-bytes-machine-plan-all";
+            && command != "verify-bytes-machine-plan-all"
+    };
+    match aggregate_command {
+        "verify-native-gpu-all" => {
+            return xtask_refresh_command_allowed();
+        }
+        "verify-bytes-machine-plan-all" => {}
+        _ => return false,
+    }
+    if xtask_refresh_command_allowed() {
+        return true;
     }
     if executable.starts_with("boon_cli") {
         return matches!(
@@ -75841,6 +75832,11 @@ mod tests {
                 .get("invalid_command_count")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+        assert_eq!(
+            report.pointer("/boon_cli_prebuild/required"),
+            Some(&json!(false)),
+            "native refresh must reject boon_cli entries without entering the BYTES prebuild lane"
         );
         let results = json_pointer_value_or_sidecar(&report, "/results").unwrap();
         assert_eq!(

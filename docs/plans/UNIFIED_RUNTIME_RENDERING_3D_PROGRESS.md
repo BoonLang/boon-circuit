@@ -586,13 +586,27 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground legacy_replace_code_probe_uses_current_preview_fast_path -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Native Refresh Queue Cannot Enter BYTES CLI Lane
+
+- Split refresh-queue command policy by aggregate owner. Native handoff refresh
+  entries now accept only xtask verifier commands; `boon_cli` and source replay
+  commands are not part of the native branch at all.
+- The BYTES/MachinePlan aggregate remains the only refresh owner allowed to use
+  `boon_cli` report regeneration.
+- Native refresh entries that mention `boon_cli` are rejected before the
+  `boon_cli` prebuild lane, removing a stale control-plane coupling that made
+  native refresh behavior depend on BYTES tooling.
+- Updated the negative native refresh test to assert that rejected source replay
+  commands do not set `boon_cli_prebuild.required`.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 10 passed.
+
 ## Next Cuts
 
-1. Cut remaining BYTES/`boon_cli` refresh compatibility from native
-   control-plane code where it is not required by a current BYTES aggregate.
-2. Continue moving `ProductFrameGraph` ownership out of playground/report
+1. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-3. Keep Cells product-latency and proof-lane reports fresh after each
+2. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

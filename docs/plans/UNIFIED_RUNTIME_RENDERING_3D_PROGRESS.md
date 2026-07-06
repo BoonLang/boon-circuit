@@ -203,6 +203,28 @@ for old evidence.
 - Focused checks passed:
   - `cargo check -q -p xtask`
 
+### 2026-07-06 - Regression-Only Isolated-Weston Gates Deleted
+
+- Deleted stale non-handoff verifier commands instead of preserving them as
+  compatibility shims:
+  - `verify-demand-driven-render-loop`
+  - `verify-native-gpu-idle-wake`
+  - `verify-native-real-window-input-environment`
+  - `verify-native-dev-editor-scroll-speed`
+  - `verify-native-example-switch-speed`
+- Trimmed `verify-native-gpu-regression-all`, unified required reports,
+  default-report routing, negative fixtures, and unit tests so they no longer
+  require or validate those deleted gates.
+- Removed now-unused idle CPU sampling, source-project switch payload,
+  dev-editor scroll-axis observation, and Weston click-driver helper islands.
+- Kept manifest-owned native handoff routes intact. Multiwindow, IPC,
+  observability, and present-floor still need their remaining isolated-Weston
+  manifest-owned branches replaced by headed product-path evidence in a later
+  cut.
+- Focused checks passed:
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the

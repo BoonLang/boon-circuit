@@ -26,9 +26,6 @@ const BYTES_FILE_WRITE_PLAN_FIXTURE_DIR: &str = "target/generated/bytes-file-wri
 const BYTES_FILE_WRITE_PLAN_SOURCE_REL: &str = "bytes_file_write_plan_ops.bn";
 const BYTES_FILE_WRITE_PLAN_SCENARIO_REL: &str = "bytes_file_write_plan_ops.scn";
 const BYTES_FILE_WRITE_PLAN_OUTPUT_REL: &str = "outputs/payload.bin";
-const NATIVE_APP_WINDOW_INITIAL_X: f64 = 120.0;
-const NATIVE_APP_WINDOW_INITIAL_Y: f64 = 120.0;
-
 const XTASK_COMMANDS: &[&str] = &[
     "bytes-plan-phase0-baseline",
     "verify-example-negative",
@@ -23078,44 +23075,78 @@ pub const NATIVE_GPU_SHADER_WESL_SHA256S: &[(&str, &str)] = &[
     Ok(())
 }
 
+struct NativeDesktopProbeLaunch {
+    proof: serde_json::Value,
+    live_state_ready: bool,
+    supervisor_ready: bool,
+}
+
+fn run_workspace_desktop_probe_launch(
+    binary_path: &Path,
+    example: &str,
+    title_token: &str,
+    supervisor_report: &Path,
+    live_state_report: &Path,
+    log_slug: &str,
+) -> Result<NativeDesktopProbeLaunch, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?;
+    let role_report_timeout_ms = 120_000_u64;
+    let script = format!(
+        "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --skip-render-hook-app-owned-proof --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms 1500 --warmup-frame-count 3 --sample-frame-count 30 --role-report-timeout-ms {} --live-state-report {} --report {} --require-hardware-adapter >>/tmp/boon-native-gpu-{}.log 2>&1",
+        shell_quote(&cwd.display().to_string()),
+        shell_quote(&format!("./{}", binary_path.display())),
+        shell_quote(example),
+        shell_quote(title_token),
+        role_report_timeout_ms,
+        shell_quote(&live_state_report.display().to_string()),
+        shell_quote(&supervisor_report.display().to_string()),
+        shell_quote(log_slug)
+    );
+    let proof = run_cosmic_background_launch("boon-circuit", &script)?;
+    let launch_success = proof.get("success").and_then(serde_json::Value::as_bool) == Some(true);
+    let wait_timeout = Duration::from_millis(role_report_timeout_ms.saturating_add(20_000));
+    let live_state_ready = launch_success && wait_for_json_report(live_state_report, wait_timeout);
+    let supervisor_ready = launch_success && wait_for_json_report(supervisor_report, wait_timeout);
+    Ok(NativeDesktopProbeLaunch {
+        proof,
+        live_state_ready,
+        supervisor_ready,
+    })
+}
+
 fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
     let supervisor_report = PathBuf::from("target/reports/native-gpu/.multiwindow-supervisor.json");
     let live_state_report =
         PathBuf::from("target/artifacts/native-gpu/multiwindow-live-state.json");
-    let cosmic_launch_proof = json!({"status": "removed"});
-    let prefer_isolated_real_window = std::env::var("BOON_NATIVE_GPU_PREVIEW_E2E_ISOLATED")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let mut isolated_real_window_launch_proof = json!({
-        "status": "not-run",
-        "reason": if prefer_isolated_real_window {
-            "isolated Weston launch unavailable or not applicable"
-        } else {
-            "isolated native proof path is the default"
-        }
-    });
+    let mut cosmic_launch_proof = json!({"status": "not-run"});
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
     let _ = std::fs::remove_file("target/reports/native-gpu/.multiwindow-live-state.json");
-    let isolated_real_window_available = command_available("weston")
-        && command_available("wayland-info")
-        && weston_test_plugin_path().is_some()
-        && weston_test_driver_path().is_some();
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-multiwindow:isolated-real-window-environment",
-        isolated_real_window_available,
+        "native-gpu-multiwindow:real-window-launch-environment",
+        wayland,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!isolated_real_window_available).then(|| {
-            "native multiwindow proof requires the isolated Weston real-window harness".to_owned()
+        (!wayland).then(|| "native multiwindow proof requires a Wayland session".to_owned()),
+    );
+    let launcher_available = command_available("cosmic-background-launch");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-multiwindow:workspace-launcher-available",
+        launcher_available,
+        format!("cosmic-background-launch={launcher_available}"),
+        (!launcher_available).then(|| {
+            "workspace-qualified native launch requires cosmic-background-launch".to_owned()
         }),
     );
 
@@ -23131,69 +23162,64 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    if build.success() && isolated_real_window_available {
-        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+    if build.success() && wayland && launcher_available {
+        let launch = run_workspace_desktop_probe_launch(
             Path::new("target/debug/boon_native_playground"),
             "todomvc",
             &native_gpu_title_token("multiwindow"),
-            1_500,
-            60_000,
             &supervisor_report,
             &live_state_report,
-            None,
-            Some("a"),
-            None,
-            true,
-            false,
-            false,
+            "multiwindow",
         )?;
-        let launch_success = isolated_real_window_launch_proof
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+        cosmic_launch_proof = launch.proof;
+        let launch_success = cosmic_launch_proof
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         push_audit_check(
             &mut checks,
             &mut blockers,
-            "native-gpu-multiwindow:isolated-launch-command",
+            "native-gpu-multiwindow:workspace-launch-command",
             launch_success,
             format!(
-                "status={:?}, desktop_pass={:?}, driver_effect_observed={:?}",
-                isolated_real_window_launch_proof
-                    .get("status")
+                "launch_id={:?}, child_pid={:?}",
+                cosmic_launch_proof
+                    .get("launch_id")
                     .and_then(serde_json::Value::as_str),
-                isolated_real_window_launch_proof
-                    .get("desktop_pass")
-                    .and_then(serde_json::Value::as_bool),
-                isolated_real_window_launch_proof
-                    .get("driver_effect_observed")
-                    .and_then(serde_json::Value::as_bool)
+                cosmic_launch_proof
+                    .get("child_pid")
+                    .and_then(serde_json::Value::as_u64)
             ),
-            (!launch_success).then(|| {
-                "isolated native multiwindow launch failed to produce real-window proof".to_owned()
-            }),
+            (!launch_success).then(|| "workspace-qualified multiwindow launch failed".to_owned()),
         );
-        let live_state_ready = live_state_report.exists();
         push_audit_check(
             &mut checks,
             &mut blockers,
             "native-gpu-multiwindow:live-state-report-written",
-            live_state_ready,
-            format!("{} ready={live_state_ready}", live_state_report.display()),
-            (!live_state_ready).then(|| {
+            launch.live_state_ready,
+            format!(
+                "{} ready={}",
+                live_state_report.display(),
+                launch.live_state_ready
+            ),
+            (!launch.live_state_ready).then(|| {
                 format!(
                     "desktop supervisor did not write live state `{}` while windows were alive",
                     live_state_report.display()
                 )
             }),
         );
-        let report_ready = supervisor_report.exists();
         push_audit_check(
             &mut checks,
             &mut blockers,
             "native-gpu-multiwindow:supervisor-report-written",
-            report_ready,
-            format!("{} ready={report_ready}", supervisor_report.display()),
-            (!report_ready).then(|| {
+            launch.supervisor_ready,
+            format!(
+                "{} ready={}",
+                supervisor_report.display(),
+                launch.supervisor_ready
+            ),
+            (!launch.supervisor_ready).then(|| {
                 format!(
                     "desktop supervisor did not write `{}`",
                     supervisor_report.display()
@@ -23204,9 +23230,8 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
 
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "isolated-weston-headless-with-weston-test-control",
+        "launcher_command": "cosmic-background-launch",
         "cosmic_background_launch_proof": cosmic_launch_proof,
-        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "cosmic_toplevel_probe": {"status": "removed", "reason": "native proof uses app-owned live state and process reports, not compositor toplevel scraping"},
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
@@ -23293,7 +23318,6 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
                 .then(|| "desktop supervisor still reports blockers".to_owned()),
         );
     }
-    attach_multiwindow_product_graph_surface_proof(&mut extra);
     let preview_pid = extra
         .get("preview_child_pid")
         .and_then(serde_json::Value::as_u64);
@@ -23440,35 +23464,6 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
     )
 }
 
-fn attach_multiwindow_product_graph_surface_proof(extra: &mut serde_json::Value) {
-    if extra
-        .pointer("/preview_surface_proof/product_render_graph_visible_proof")
-        .is_some()
-    {
-        return;
-    }
-    let Some(loop_report) = extra
-        .pointer("/isolated_real_window_launch_proof/measured_loop_report")
-        .cloned()
-    else {
-        return;
-    };
-    let Some(graph_proof) = native_product_graph_visible_surface_proof(&loop_report) else {
-        return;
-    };
-    if extra.get("preview_surface_proof").is_none() {
-        extra["preview_surface_proof"] = json!({});
-    }
-    if native_product_graph_visible_render_proof_is_usable(&graph_proof) {
-        extra["preview_surface_proof"]["product_render_graph_visible_proof"] = graph_proof;
-        extra["preview_surface_proof"]["product_render_graph_visible_proof_source"] =
-            json!("isolated_real_window_launch_proof.measured_loop_report");
-    } else {
-        extra["preview_surface_proof"]["product_render_graph_visible_proof_rejected"] =
-            native_product_graph_rejected_visible_proof_summary(&graph_proof);
-    }
-}
-
 fn multiwindow_surface_visible_proof_ok(report: &serde_json::Value) -> bool {
     preview_surface_visible_proof_ok(report)
 }
@@ -23490,22 +23485,29 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
     let live_state_report = PathBuf::from("target/artifacts/native-gpu/ipc-live-state.json");
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
-    let isolated_real_window_available = command_available("weston")
-        && command_available("wayland-info")
-        && weston_test_plugin_path().is_some()
-        && weston_test_driver_path().is_some();
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-ipc:isolated-real-window-environment",
-        isolated_real_window_available,
+        "native-gpu-ipc:real-window-launch-environment",
+        wayland,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!isolated_real_window_available).then(|| {
-            "native IPC proof requires the isolated Weston real-window harness".to_owned()
+        (!wayland).then(|| "native IPC proof requires a Wayland session".to_owned()),
+    );
+    let launcher_available = command_available("cosmic-background-launch");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-ipc:workspace-launcher-available",
+        launcher_available,
+        format!("cosmic-background-launch={launcher_available}"),
+        (!launcher_available).then(|| {
+            "workspace-qualified native launch requires cosmic-background-launch".to_owned()
         }),
     );
 
@@ -23521,43 +23523,69 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
-    if build.success() && isolated_real_window_available {
-        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+    let mut cosmic_launch_proof = json!({"status": "not-run"});
+    if build.success() && wayland && launcher_available {
+        let launch = run_workspace_desktop_probe_launch(
             Path::new("target/debug/boon_native_playground"),
             "todomvc",
             &native_gpu_title_token("ipc-backpressure"),
-            1_500,
-            60_000,
             &supervisor_report,
             &live_state_report,
-            None,
-            Some("a"),
-            None,
-            true,
-            false,
-            false,
+            "ipc-backpressure",
         )?;
-        let launch_success = isolated_real_window_launch_proof
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+        cosmic_launch_proof = launch.proof;
+        let launch_success = cosmic_launch_proof
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         push_audit_check(
             &mut checks,
             &mut blockers,
-            "native-gpu-ipc:isolated-launch-command",
+            "native-gpu-ipc:workspace-launch-command",
             launch_success,
             format!(
-                "status={:?}, desktop_pass={:?}",
-                isolated_real_window_launch_proof
-                    .get("status")
+                "launch_id={:?}, child_pid={:?}",
+                cosmic_launch_proof
+                    .get("launch_id")
                     .and_then(serde_json::Value::as_str),
-                isolated_real_window_launch_proof
-                    .get("desktop_pass")
-                    .and_then(serde_json::Value::as_bool)
+                cosmic_launch_proof
+                    .get("child_pid")
+                    .and_then(serde_json::Value::as_u64)
             ),
-            (!launch_success).then(|| {
-                "isolated native IPC launch failed to produce supervisor proof".to_owned()
+            (!launch_success).then(|| "workspace-qualified IPC launch failed".to_owned()),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-ipc:live-state-report-written",
+            launch.live_state_ready,
+            format!(
+                "{} ready={}",
+                live_state_report.display(),
+                launch.live_state_ready
+            ),
+            (!launch.live_state_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write live state `{}` while windows were alive",
+                    live_state_report.display()
+                )
+            }),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-ipc:supervisor-report-written",
+            launch.supervisor_ready,
+            format!(
+                "{} ready={}",
+                supervisor_report.display(),
+                launch.supervisor_ready
+            ),
+            (!launch.supervisor_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write `{}`",
+                    supervisor_report.display()
+                )
             }),
         );
     }
@@ -23565,10 +23593,10 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
     let mut ipc_probe = json!({});
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "isolated-weston-headless-with-weston-test-control",
+        "launcher_command": "cosmic-background-launch",
+        "cosmic_background_launch_proof": cosmic_launch_proof,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
-        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "live_preview_dev_windows": false,
         "bounded_ipc": false,
         "preview_blocked_on_ipc_count": serde_json::Value::Null,
@@ -23792,22 +23820,29 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         PathBuf::from("target/artifacts/native-gpu/observability-live-state.json");
     let _ = std::fs::remove_file(&supervisor_report);
     let _ = std::fs::remove_file(&live_state_report);
-    let isolated_real_window_available = command_available("weston")
-        && command_available("wayland-info")
-        && weston_test_plugin_path().is_some()
-        && weston_test_driver_path().is_some();
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "wayland";
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "native-gpu-observability:isolated-real-window-environment",
-        isolated_real_window_available,
+        "native-gpu-observability:real-window-launch-environment",
+        wayland,
         format!(
-            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}, isolated_real_window_available={isolated_real_window_available}",
+            "WAYLAND_DISPLAY={:?}, XDG_SESSION_TYPE={:?}",
             std::env::var("WAYLAND_DISPLAY").ok(),
             std::env::var("XDG_SESSION_TYPE").ok()
         ),
-        (!isolated_real_window_available).then(|| {
-            "native observability proof requires the isolated Weston real-window harness".to_owned()
+        (!wayland).then(|| "native observability proof requires a Wayland session".to_owned()),
+    );
+    let launcher_available = command_available("cosmic-background-launch");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "native-gpu-observability:workspace-launcher-available",
+        launcher_available,
+        format!("cosmic-background-launch={launcher_available}"),
+        (!launcher_available).then(|| {
+            "workspace-qualified native launch requires cosmic-background-launch".to_owned()
         }),
     );
 
@@ -23823,43 +23858,69 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    let mut isolated_real_window_launch_proof = json!({"status": "not-run"});
-    if build.success() && isolated_real_window_available {
-        isolated_real_window_launch_proof = run_isolated_weston_desktop_preview_e2e(
+    let mut cosmic_launch_proof = json!({"status": "not-run"});
+    if build.success() && wayland && launcher_available {
+        let launch = run_workspace_desktop_probe_launch(
             Path::new("target/debug/boon_native_playground"),
             "todomvc",
             &native_gpu_title_token("observability"),
-            1_500,
-            60_000,
             &supervisor_report,
             &live_state_report,
-            None,
-            Some("a"),
-            None,
-            true,
-            false,
-            false,
+            "observability",
         )?;
-        let launch_success = isolated_real_window_launch_proof
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
+        cosmic_launch_proof = launch.proof;
+        let launch_success = cosmic_launch_proof
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         push_audit_check(
             &mut checks,
             &mut blockers,
-            "native-gpu-observability:isolated-launch-command",
+            "native-gpu-observability:workspace-launch-command",
             launch_success,
             format!(
-                "status={:?}, desktop_pass={:?}",
-                isolated_real_window_launch_proof
-                    .get("status")
+                "launch_id={:?}, child_pid={:?}",
+                cosmic_launch_proof
+                    .get("launch_id")
                     .and_then(serde_json::Value::as_str),
-                isolated_real_window_launch_proof
-                    .get("desktop_pass")
-                    .and_then(serde_json::Value::as_bool)
+                cosmic_launch_proof
+                    .get("child_pid")
+                    .and_then(serde_json::Value::as_u64)
             ),
-            (!launch_success).then(|| {
-                "isolated native observability launch failed to produce supervisor proof".to_owned()
+            (!launch_success).then(|| "workspace-qualified observability launch failed".to_owned()),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-observability:live-state-report-written",
+            launch.live_state_ready,
+            format!(
+                "{} ready={}",
+                live_state_report.display(),
+                launch.live_state_ready
+            ),
+            (!launch.live_state_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write live state `{}` while windows were alive",
+                    live_state_report.display()
+                )
+            }),
+        );
+        push_audit_check(
+            &mut checks,
+            &mut blockers,
+            "native-gpu-observability:supervisor-report-written",
+            launch.supervisor_ready,
+            format!(
+                "{} ready={}",
+                supervisor_report.display(),
+                launch.supervisor_ready
+            ),
+            (!launch.supervisor_ready).then(|| {
+                format!(
+                    "desktop supervisor did not write `{}`",
+                    supervisor_report.display()
+                )
             }),
         );
     }
@@ -23867,10 +23928,10 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
     let mut ipc_probe = json!({});
     let mut extra = json!({
         "requested_workspace": "boon-circuit",
-        "launcher_command": "isolated-weston-headless-with-weston-test-control",
+        "launcher_command": "cosmic-background-launch",
+        "cosmic_background_launch_proof": cosmic_launch_proof,
         "supervisor_report": supervisor_report,
         "live_state_report": live_state_report,
-        "isolated_real_window_launch_proof": isolated_real_window_launch_proof,
         "bounded_observability": false,
         "full_state_mirroring_observed": false,
         "live_preview_dev_windows": false,
@@ -38881,10 +38942,6 @@ fn json_pointer_value_or_sidecar(
 }
 
 fn native_product_render_graph_todomvc_summary(report: &serde_json::Value) -> serde_json::Value {
-    let nested_measured_loop = report
-        .pointer("/isolated_real_window_launch_proof/measured_loop_report")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
     let preview_loop_report_path = report
         .get("preview_loop_report")
         .and_then(serde_json::Value::as_str)
@@ -38894,15 +38951,7 @@ fn native_product_render_graph_todomvc_summary(report: &serde_json::Value) -> se
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .unwrap_or(serde_json::Value::Null);
-    let (measured_loop, source) = if nested_measured_loop
-        .get("last_product_frame_commit")
-        .is_some()
-    {
-        (
-            &nested_measured_loop,
-            "preview_e2e_nested_measured_loop_last_product_frame_commit",
-        )
-    } else if preview_measured_loop
+    let (measured_loop, source) = if preview_measured_loop
         .get("last_product_frame_commit")
         .is_some()
     {
@@ -60348,708 +60397,9 @@ fn wait_for_surface_loop_report_ready(
     })
 }
 
-fn run_isolated_weston_desktop_preview_e2e(
-    binary: &Path,
-    example: &str,
-    title_token: &str,
-    input_sample_delay_ms: u64,
-    role_report_timeout_ms: u64,
-    supervisor_report: &Path,
-    live_state_report: &Path,
-    driver_target: Option<serde_json::Value>,
-    driver_text: Option<&str>,
-    code_file: Option<&Path>,
-    skip_operator_host_input_probe: bool,
-    skip_render_hook_app_owned_proof: bool,
-    target_dev_surface: bool,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let artifact_dir = PathBuf::from(format!(
-        "target/artifacts/native-gpu/isolated-preview-e2e-{}-{}-{}",
-        example,
-        std::process::id(),
-        current_unix_seconds()
-    ));
-    fs::create_dir_all(&artifact_dir)?;
-    let Some(plugin_path) = weston_test_plugin_path() else {
-        return Ok(json!({
-            "status": "fail",
-            "reason": "Weston test control plugin missing",
-            "artifact_dir": artifact_dir
-        }));
-    };
-    let Some(driver_path) = weston_test_driver_path() else {
-        return Ok(json!({
-            "status": "fail",
-            "reason": "Weston test driver missing",
-            "artifact_dir": artifact_dir,
-            "weston_control_plugin_path": plugin_path
-        }));
-    };
-
-    let socket = format!(
-        "boon-native-preview-e2e-{}-{}",
-        std::process::id(),
-        current_unix_seconds()
-    );
-    let weston_log_path = artifact_dir.join("weston.log");
-    let weston_stdout_path = artifact_dir.join("weston.stdout.txt");
-    let weston_stderr_path = artifact_dir.join("weston.stderr.txt");
-    let wayland_info_stdout_path = artifact_dir.join("wayland-info.txt");
-    let wayland_info_stderr_path = artifact_dir.join("wayland-info.stderr.txt");
-    let desktop_stdout_path = artifact_dir.join("desktop.stdout.txt");
-    let desktop_stderr_path = artifact_dir.join("desktop.stderr.txt");
-    let driver_stdout_path = artifact_dir.join("weston-test-driver.jsonl");
-    let driver_stderr_path = artifact_dir.join("weston-test-driver.stderr.txt");
-
-    let mut weston = Command::new("weston")
-        .args([
-            "--backend=headless-backend.so",
-            "--socket",
-            &socket,
-            "--idle-time=0",
-            "--log",
-            weston_log_path
-                .to_str()
-                .ok_or("weston log path is not UTF-8")?,
-            "--modules",
-            plugin_path
-                .to_str()
-                .ok_or("weston control plugin path is not UTF-8")?,
-        ])
-        .stdout(Stdio::from(fs::File::create(&weston_stdout_path)?))
-        .stderr(Stdio::from(fs::File::create(&weston_stderr_path)?))
-        .spawn()?;
-
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(output) = Command::new("wayland-info")
-            .env("WAYLAND_DISPLAY", &socket)
-            .output()
-        {
-            fs::write(&wayland_info_stdout_path, &output.stdout)?;
-            fs::write(&wayland_info_stderr_path, &output.stderr)?;
-            if output.status.success() {
-                ready = true;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    if !ready {
-        terminate_child_process(&mut weston);
-        return Ok(json!({
-            "status": "fail",
-            "reason": "isolated Weston did not become ready",
-            "artifact_dir": artifact_dir,
-            "socket": socket,
-            "weston_log_path": weston_log_path
-        }));
-    }
-
-    let desktop_args = isolated_weston_desktop_preview_e2e_args(
-        example,
-        title_token,
-        input_sample_delay_ms,
-        role_report_timeout_ms,
-        supervisor_report,
-        live_state_report,
-        code_file,
-        skip_operator_host_input_probe,
-        skip_render_hook_app_owned_proof,
-        target_dev_surface,
-    )?;
-    let mut desktop = Command::new(binary)
-        .args(&desktop_args)
-        .env("WAYLAND_DISPLAY", &socket)
-        .env("XDG_SESSION_TYPE", "wayland")
-        .stdout(Stdio::from(fs::File::create(&desktop_stdout_path)?))
-        .stderr(Stdio::from(fs::File::create(&desktop_stderr_path)?))
-        .spawn()?;
-
-    thread::sleep(Duration::from_millis(if target_dev_surface {
-        1_200
-    } else {
-        800
-    }));
-    let (target_x, target_y) = driver_target
-        .as_ref()
-        .map(|target| native_driver_weston_coordinates(target, 240.0, 220.0))
-        .unwrap_or_else(|| native_driver_weston_coordinates(&json!({}), 240.0, 220.0));
-    let driver_points = [
-        [target_x.to_string(), target_y.to_string()],
-        [(target_x + 30).to_string(), (target_y + 20).to_string()],
-        [target_x.to_string(), target_y.to_string()],
-    ];
-    let mut driver_stdout = Vec::new();
-    let mut driver_stderr = Vec::new();
-    let mut last_driver_json = json!({"status": "not-run"});
-    let mut last_driver_success = false;
-    let driver_point_count = driver_points.len();
-    for (point_index, point) in driver_points.into_iter().enumerate() {
-        let mut command = Command::new(&driver_path);
-        command.args([point[0].as_str(), point[1].as_str()]);
-        let should_type = point_index + 1 == driver_point_count;
-        if should_type {
-            if let Some(text) = driver_text {
-                command.args([text, "enter"]);
-            } else {
-                command.arg("");
-            }
-        } else {
-            command.arg("");
-        }
-        let output = command.env("WAYLAND_DISPLAY", &socket).output()?;
-        last_driver_success = output.status.success();
-        last_driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .unwrap_or_else(|_| json!({"status": "fail", "reason": "driver stdout was not JSON"}));
-        driver_stdout.extend_from_slice(&output.stdout);
-        driver_stderr.extend_from_slice(&output.stderr);
-        thread::sleep(Duration::from_millis(250));
-    }
-    thread::sleep(Duration::from_millis(3_200));
-    let dev_points = [["376", "260"], ["386", "270"], ["376", "260"]];
-    for point in dev_points {
-        let output = Command::new(&driver_path)
-            .args([point[0], point[1], ""])
-            .env("WAYLAND_DISPLAY", &socket)
-            .output()?;
-        if output.status.success() {
-            last_driver_success = true;
-            last_driver_json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                .unwrap_or_else(
-                    |_| json!({"status": "fail", "reason": "driver stdout was not JSON"}),
-                );
-        }
-        driver_stdout.extend_from_slice(&output.stdout);
-        driver_stderr.extend_from_slice(&output.stderr);
-        thread::sleep(Duration::from_millis(250));
-    }
-    fs::write(&driver_stdout_path, &driver_stdout)?;
-    fs::write(&driver_stderr_path, &driver_stderr)?;
-
-    let desktop_status = wait_child_exit_with_timeout(
-        &mut desktop,
-        Duration::from_millis(role_report_timeout_ms.saturating_add(20_000)),
-    );
-    if desktop_status.is_none() {
-        terminate_child_process(&mut desktop);
-    }
-    terminate_child_process(&mut weston);
-    let _ = weston.wait();
-
-    let supervisor = if supervisor_report.exists() {
-        read_json(supervisor_report).unwrap_or_else(|error| {
-            json!({
-                "status": "fail",
-                "reason": format!("failed to read supervisor report: {error}")
-            })
-        })
-    } else {
-        json!({"status": "missing"})
-    };
-    let measured_loop_report_key = if target_dev_surface {
-        "dev_loop_report"
-    } else {
-        "preview_loop_report"
-    };
-    let measured_loop_report_path = supervisor
-        .get(measured_loop_report_key)
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
-    let measured_loop_report = measured_loop_report_path
-        .as_ref()
-        .map(|path| {
-            read_json(path).unwrap_or_else(|error| {
-                json!({
-                    "status": "fail",
-                    "reason": format!("failed to read measured loop report: {error}"),
-                    "path": path
-                })
-            })
-        })
-        .unwrap_or_else(|| {
-            json!({
-                "status": "missing",
-                "reason": format!("supervisor missing `{measured_loop_report_key}`")
-            })
-        });
-    let measured_loop_status_pass = measured_loop_report
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        == Some("pass")
-        && measured_loop_report
-            .get("loop_error")
-            .is_none_or(serde_json::Value::is_null);
-    let measured_loop_dirty_revision = measured_loop_report
-        .get("dirty_revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let measured_loop_presented_revision = measured_loop_report
-        .get("presented_revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let measured_loop_content_revision = measured_loop_report
-        .get("last_render_content_revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let measured_loop_required_content_revision = measured_loop_report
-        .pointer("/frame_evidence_key/content_revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(measured_loop_content_revision);
-    let measured_loop_role_dirty_reason = measured_loop_report
-        .get("current_role_dirty_reason")
-        .or_else(|| measured_loop_report.get("last_role_dirty_reason"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let measured_loop_presented_fresh =
-        measured_loop_presented_revision >= measured_loop_dirty_revision;
-    let measured_loop_content_fresh = !matches!(
-        measured_loop_role_dirty_reason,
-        "scroll_changed"
-            | "runtime_turn_applied"
-            | "document_patch_applied"
-            | "source_payload_accepted"
-    ) || measured_loop_content_revision
-        >= measured_loop_required_content_revision;
-    let measured_loop_pass =
-        measured_loop_status_pass && measured_loop_presented_fresh && measured_loop_content_fresh;
-    let measured_surface_pointer = if target_dev_surface {
-        "/dev_surface_proof"
-    } else {
-        "/preview_surface_proof"
-    };
-    let initial_input_adapter = supervisor
-        .pointer(&format!("{measured_surface_pointer}/input_adapter"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let input_adapter = measured_loop_report
-        .get("observed_input_adapter")
-        .cloned()
-        .filter(native_input_adapter_has_delivered_events)
-        .unwrap_or(initial_input_adapter);
-    let real_os_events_observed = input_adapter
-        .get("real_os_events_observed")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        && input_adapter
-            .get("synthetic_input_probe")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true);
-    let driver_effect_observed = input_adapter
-        .get("mouse_button_event_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        > 0
-        || (input_adapter
-            .get("mouse_motion_event_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            > 0
-            && input_adapter.get("mouse_window_pos").is_some())
-        || input_adapter
-            .get("mouse_scroll_event_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            > 0
-        || input_adapter
-            .get("keyboard_key_event_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            > 0;
-    let supervisor_report_written = supervisor_report.exists()
-        && supervisor.get("status").and_then(serde_json::Value::as_str) == Some("pass");
-    let driver_pass = last_driver_success
-        && last_driver_json
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-    let desktop_pass = desktop_status
-        .as_ref()
-        .is_some_and(|status| status.success());
-    let pass = driver_pass
-        && desktop_pass
-        && supervisor_report_written
-        && real_os_events_observed
-        && driver_effect_observed
-        && measured_loop_pass;
-
-    Ok(json!({
-        "status": if pass { "pass" } else { "fail" },
-        "example": example,
-        "artifact_dir": artifact_dir,
-        "socket": socket,
-        "method": "isolated-weston-headless-with-weston-test-control",
-        "live_desktop_input_used": false,
-        "weston_control_plugin_path": plugin_path,
-        "weston_test_driver_path": driver_path,
-        "weston_log_path": weston_log_path,
-        "weston_stdout_path": weston_stdout_path,
-        "weston_stderr_path": weston_stderr_path,
-        "wayland_info_stdout_path": wayland_info_stdout_path,
-        "wayland_info_stderr_path": wayland_info_stderr_path,
-        "desktop_stdout_path": desktop_stdout_path,
-        "desktop_stderr_path": desktop_stderr_path,
-        "desktop_args": desktop_args,
-        "render_hook_app_owned_proof_skipped": skip_render_hook_app_owned_proof,
-        "desktop_exit_status": desktop_status
-            .as_ref()
-            .map(std::process::ExitStatus::to_string)
-            .unwrap_or_else(|| "timeout".to_owned()),
-        "weston_test_driver": last_driver_json,
-        "weston_test_driver_stdout_path": driver_stdout_path,
-        "weston_test_driver_stderr_path": driver_stderr_path,
-        "driver_target_region": driver_target,
-        "driver_pass": driver_pass,
-        "desktop_pass": desktop_pass,
-        "supervisor_report_written": supervisor_report_written,
-        "supervisor_report": supervisor_report,
-        "live_state_report": live_state_report,
-        "measured_loop_report_key": measured_loop_report_key,
-        "measured_loop_report_path": measured_loop_report_path,
-        "measured_loop_report": measured_loop_report,
-        "measured_loop_pass": measured_loop_pass,
-        "measured_loop_status_pass": measured_loop_status_pass,
-        "measured_loop_presented_fresh": measured_loop_presented_fresh,
-        "measured_loop_content_fresh": measured_loop_content_fresh,
-        "measured_loop_required_content_revision": measured_loop_required_content_revision,
-        "preview_input_adapter": input_adapter,
-        "real_os_events_observed": real_os_events_observed,
-        "driver_effect_observed": driver_effect_observed,
-        "input_route": "weston_test compositor control API -> isolated Weston test seat -> two native app_window child processes -> preview app_window Wayland pointer/keyboard dispatch -> app_window coalesced input proof"
-    }))
-}
-
-fn isolated_weston_desktop_preview_e2e_args(
-    example: &str,
-    title_token: &str,
-    input_sample_delay_ms: u64,
-    role_report_timeout_ms: u64,
-    supervisor_report: &Path,
-    live_state_report: &Path,
-    code_file: Option<&Path>,
-    skip_operator_host_input_probe: bool,
-    skip_render_hook_app_owned_proof: bool,
-    target_dev_surface: bool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let dev_start_delay_text = if target_dev_surface { "0" } else { "2500" };
-    let mut args = vec![
-        "--role".to_owned(),
-        "desktop".to_owned(),
-        "--example".to_owned(),
-        example.to_owned(),
-    ];
-    if let Some(code_file) = code_file {
-        let code_file = code_file
-            .to_str()
-            .ok_or("isolated code file path is not UTF-8")?
-            .to_owned();
-        args.extend([
-            "--code-file".to_owned(),
-            code_file.clone(),
-            "--dev-editor-code-file".to_owned(),
-            code_file,
-        ]);
-        if target_dev_surface {
-            args.push("--dev-editor-only".to_owned());
-        }
-    }
-    args.extend([
-        "--probe".to_owned(),
-        "--real-window-input-probe".to_owned(),
-        "--demand-driven-loop".to_owned(),
-        "--child-hold-ms".to_owned(),
-        "30000".to_owned(),
-        "--dev-hold-ms".to_owned(),
-        "10000".to_owned(),
-        "--title-token".to_owned(),
-        title_token.to_owned(),
-        "--input-sample-delay-ms".to_owned(),
-        input_sample_delay_ms.to_string(),
-        "--warmup-frame-count".to_owned(),
-        "3".to_owned(),
-        "--sample-frame-count".to_owned(),
-        "30".to_owned(),
-        "--role-report-timeout-ms".to_owned(),
-        role_report_timeout_ms.to_string(),
-        "--probe-min-dev-hold-ms".to_owned(),
-        "5000".to_owned(),
-        "--probe-preview-hold-tail-ms".to_owned(),
-        "1000".to_owned(),
-        "--dev-start-delay-ms".to_owned(),
-        dev_start_delay_text.to_owned(),
-        "--live-state-report".to_owned(),
-        live_state_report
-            .to_str()
-            .ok_or("live state report path is not UTF-8")?
-            .to_owned(),
-        "--report".to_owned(),
-        supervisor_report
-            .to_str()
-            .ok_or("supervisor report path is not UTF-8")?
-            .to_owned(),
-    ]);
-    if skip_operator_host_input_probe {
-        args.push("--skip-operator-host-input-probe".to_owned());
-    }
-    if skip_render_hook_app_owned_proof {
-        args.push("--skip-render-hook-app-owned-proof".to_owned());
-    }
-    if !target_dev_surface {
-        args.push("--dev-app-owned-input-probe".to_owned());
-    }
-    Ok(args)
-}
 fn terminate_child_process(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn wait_child_exit_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
-        }
-        if start.elapsed() >= timeout {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn ensure_weston_control_helpers() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    let out_dir = PathBuf::from("target/tools/boon-weston-control-plugin");
-    fs::create_dir_all(&out_dir)?;
-    let plugin_path = out_dir.join("boon-weston-test-plugin.so");
-    let driver_path = out_dir.join("boon-weston-test-driver");
-    let driver_source = PathBuf::from("tools/native-isolated-input/weston-test-driver.c");
-    if !driver_source.exists() {
-        return Err(format!(
-            "missing tracked Weston test driver source `{}`",
-            driver_source.display()
-        )
-        .into());
-    }
-
-    ensure_weston_source_tree()?;
-    let weston_source = PathBuf::from("target/vendor/weston-13.0.0");
-    let weston_build = PathBuf::from("target/vendor/weston-build");
-    let protocol = weston_source.join("protocol/weston-test.xml");
-    let upstream_plugin = weston_source.join("tests/weston-test.c");
-    let generated_plugin_source = out_dir.join("boon-weston-test.c");
-
-    run_command(
-        Command::new("wayland-scanner").args([
-            "server-header",
-            protocol
-                .to_str()
-                .ok_or("weston protocol path is not UTF-8")?,
-            out_dir
-                .join("weston-test-server-protocol.h")
-                .to_str()
-                .ok_or("server protocol header path is not UTF-8")?,
-        ]),
-        "generate weston-test server protocol header",
-    )?;
-    run_command(
-        Command::new("wayland-scanner").args([
-            "client-header",
-            protocol
-                .to_str()
-                .ok_or("weston protocol path is not UTF-8")?,
-            out_dir
-                .join("weston-test-client-protocol.h")
-                .to_str()
-                .ok_or("client protocol header path is not UTF-8")?,
-        ]),
-        "generate weston-test client protocol header",
-    )?;
-    run_command(
-        Command::new("wayland-scanner").args([
-            "private-code",
-            protocol
-                .to_str()
-                .ok_or("weston protocol path is not UTF-8")?,
-            out_dir
-                .join("weston-test-protocol.c")
-                .to_str()
-                .ok_or("protocol private code path is not UTF-8")?,
-        ]),
-        "generate weston-test protocol private code",
-    )?;
-
-    let plugin_source = patched_weston_test_plugin_source(&fs::read_to_string(&upstream_plugin)?)?;
-    fs::write(&generated_plugin_source, plugin_source)?;
-
-    let out_dir_text = out_dir.display().to_string();
-    let source_text = weston_source.display().to_string();
-    let build_text = weston_build.display().to_string();
-    let plugin_cmd = format!(
-        "cc -D_GNU_SOURCE -shared -fPIC \
-         -I{} -I{} -I{}/include -I{}/libweston -I{}/shared -I{}/tests \
-         -I{} -I{}/include -I{}/protocol \
-         $(pkg-config --cflags weston libweston-13 pixman-1 wayland-server xkbcommon) \
-         {}/boon-weston-test.c {}/weston-test-protocol.c \
-         $(pkg-config --libs weston libweston-13 pixman-1 wayland-server xkbcommon) -lpthread \
-         -o {}",
-        shell_quote(&out_dir_text),
-        shell_quote(&source_text),
-        shell_quote(&source_text),
-        shell_quote(&source_text),
-        shell_quote(&source_text),
-        shell_quote(&source_text),
-        shell_quote(&build_text),
-        shell_quote(&build_text),
-        shell_quote(&build_text),
-        shell_quote(&out_dir_text),
-        shell_quote(&out_dir_text),
-        shell_quote(&plugin_path.display().to_string())
-    );
-    run_shell_command(&plugin_cmd, "build Boon Weston control plugin")?;
-
-    let driver_cmd = format!(
-        "cc -I{} {} {}/weston-test-protocol.c -lwayland-client -o {}",
-        shell_quote(&out_dir_text),
-        shell_quote(&driver_source.display().to_string()),
-        shell_quote(&out_dir_text),
-        shell_quote(&driver_path.display().to_string())
-    );
-    run_shell_command(&driver_cmd, "build Boon Weston test driver")?;
-
-    Ok((
-        plugin_path
-            .canonicalize()
-            .unwrap_or_else(|_| plugin_path.clone()),
-        driver_path
-            .canonicalize()
-            .unwrap_or_else(|_| driver_path.clone()),
-    ))
-}
-
-fn ensure_weston_source_tree() -> Result<(), Box<dyn std::error::Error>> {
-    let weston_source = PathBuf::from("target/vendor/weston-13.0.0");
-    let weston_build = PathBuf::from("target/vendor/weston-build");
-    if !weston_source.join("tests/weston-test.c").exists() {
-        fs::create_dir_all("target/vendor")?;
-        run_command(
-            Command::new("apt-get")
-                .args(["source", "weston"])
-                .current_dir("target/vendor"),
-            "fetch Weston source package",
-        )?;
-    }
-    if !weston_build.join("config.h").exists() {
-        let cwd = std::env::current_dir()?;
-        let cmd = format!(
-            "meson setup {} {} \
-             --prefix {} \
-             -Dbackend-default=headless \
-             -Dbackend-drm=false -Dbackend-headless=true -Dbackend-pipewire=false \
-             -Dbackend-rdp=false -Dbackend-vnc=false -Dbackend-wayland=false -Dbackend-x11=false \
-             -Drenderer-gl=false -Dshell-desktop=true -Dshell-fullscreen=false \
-             -Dshell-ivi=false -Dshell-kiosk=false -Ddemo-clients=false \
-             -Dtools=[] -Dsimple-clients=[] -Dimage-jpeg=false -Dimage-webp=false \
-             -Dsystemd=false -Dremoting=false -Dpipewire=false -Dscreenshare=false \
-             -Dxwayland=false -Dcolor-management-lcms=false -Dtest-junit-xml=false \
-             -Dwcap-decode=false",
-            shell_quote(&weston_build.display().to_string()),
-            shell_quote(&weston_source.display().to_string()),
-            shell_quote(&cwd.join("target/tools/weston-test").display().to_string())
-        );
-        run_shell_command(&cmd, "configure local Weston source tree")?;
-    }
-    Ok(())
-}
-
-fn patched_weston_test_plugin_source(source: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut patched = source.replace("#include <signal.h>", "#include </usr/include/signal.h>");
-    patched = replace_required(
-        patched,
-        "struct wl_event_source *client_source;\n\n\tstruct wl_list output_list;",
-        "struct wl_event_source *client_source;\n\tstruct wl_client *standalone_client;\n\n\tstruct wl_list output_list;",
-    )?;
-    patched = replace_required(
-        patched,
-        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\n\twl_list_for_each_safe(bp, tmp, &tsd->breakpoints.list, link) {",
-        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\tif (!tsd)\n\t\treturn;\n\n\twl_list_for_each_safe(bp, tmp, &tsd->breakpoints.list, link) {",
-    )?;
-    patched = replace_required(
-        patched,
-        "\ttimespec_from_proto(&time, tv_sec_hi, tv_sec_lo, tv_nsec);\n\n\tnotify_motion(seat, &time, &event);\n",
-        "\ttimespec_from_proto(&time, tv_sec_hi, tv_sec_lo, tv_nsec);\n\n\tstruct weston_view *picked_view = weston_compositor_pick_view(test->compositor, pos);\n\tif (picked_view)\n\t\tweston_pointer_set_focus(pointer, picked_view);\n\tnotify_motion(seat, &time, &event);\n",
-    )?;
-    patched = replace_required(
-        patched,
-        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\n\tassert(tsd->wl_client);\n\ttsd->wl_client = NULL;",
-        "struct wet_testsuite_data *tsd = weston_compositor_get_test_data(test->compositor);\n\tif (tsd) {\n\t\tassert(tsd->wl_client);\n\t\ttsd->wl_client = NULL;\n\t} else {\n\t\ttest->standalone_client = NULL;\n\t}",
-    )?;
-    patched = replace_required(
-        patched,
-        "\t/* There can only be one wl_client bound */\n\tassert(!tsd->wl_client);\n\ttsd->wl_client = client;\n\tnotify_pointer_position(test, resource);",
-        "\t/* There can only be one wl_client bound */\n\tif (tsd) {\n\t\tassert(!tsd->wl_client);\n\t\ttsd->wl_client = client;\n\t} else {\n\t\tassert(!test->standalone_client);\n\t\ttest->standalone_client = client;\n\t}\n\tnotify_pointer_position(test, resource);",
-    )?;
-    patched = replace_required(
-        patched,
-        "\tdata->wl_client = NULL;\n\n\twl_list_remove(&test->layer.view_list.link);",
-        "\tif (data)\n\t\tdata->wl_client = NULL;\n\ttest->standalone_client = NULL;\n\n\twl_list_remove(&test->layer.view_list.link);",
-    )?;
-    Ok(patched)
-}
-
-fn replace_required(
-    mut text: String,
-    needle: &str,
-    replacement: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if !text.contains(needle) {
-        return Err(format!("Weston source patch pattern was not found: {needle:?}").into());
-    }
-    text = text.replacen(needle, replacement, 1);
-    Ok(text)
-}
-
-fn run_command(command: &mut Command, label: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{label} failed with {status}").into())
-    }
-}
-
-fn run_shell_command(command: &str, label: &str) -> Result<(), Box<dyn std::error::Error>> {
-    run_command(Command::new("bash").args(["-lc", command]), label)
-}
-
-fn weston_test_plugin_path() -> Option<PathBuf> {
-    if let Ok((plugin_path, _)) = ensure_weston_control_helpers() {
-        return Some(plugin_path);
-    }
-    [
-        Path::new("target/tools/boon-weston-control-plugin/boon-weston-test-plugin.so"),
-        Path::new("target/tools/weston-test/tests/test-plugin.so"),
-        Path::new("/usr/lib/x86_64-linux-gnu/weston/weston-test.so"),
-        Path::new("/usr/lib/x86_64-linux-gnu/libweston-13/weston-test.so"),
-        Path::new("/usr/lib/weston/weston-test.so"),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
-    .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
-}
-
-fn weston_test_driver_path() -> Option<PathBuf> {
-    if let Ok((_, driver_path)) = ensure_weston_control_helpers() {
-        return Some(driver_path);
-    }
-    [Path::new(
-        "target/tools/boon-weston-control-plugin/boon-weston-test-driver",
-    )]
-    .into_iter()
-    .find(|path| path.exists())
-    .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
 fn modified_unix_seconds(path: &Path) -> Option<u64> {
@@ -75565,41 +74915,6 @@ fn native_driver_target_from_region(
     }))
 }
 
-fn native_driver_weston_coordinates(
-    target: &serde_json::Value,
-    default_local_x: f64,
-    default_local_y: f64,
-) -> (i64, i64) {
-    native_driver_weston_coordinates_with_origin(
-        target,
-        default_local_x,
-        default_local_y,
-        NATIVE_APP_WINDOW_INITIAL_X,
-        NATIVE_APP_WINDOW_INITIAL_Y,
-    )
-}
-
-fn native_driver_weston_coordinates_with_origin(
-    target: &serde_json::Value,
-    default_local_x: f64,
-    default_local_y: f64,
-    origin_x: f64,
-    origin_y: f64,
-) -> (i64, i64) {
-    let local_x = target
-        .get("local_x")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(default_local_x);
-    let local_y = target
-        .get("local_y")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(default_local_y);
-    (
-        (origin_x + local_x).round().max(0.0) as i64,
-        (origin_y + local_y).round().max(0.0) as i64,
-    )
-}
-
 fn native_gpu_real_input_observed(report: &serde_json::Value) -> bool {
     native_gpu_app_window_input_observed(report)
         && report
@@ -81071,12 +80386,9 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
             .expect("fixture should include a real visible render proof");
         assert!(native_visible_render_proof_is_usable(&visible_proof));
 
-        let mut alias_only = json!({
+        let alias_only = json!({
             "preview_native_gpu_render_proof": visible_proof
         });
-        assert!(!multiwindow_surface_visible_proof_ok(&alias_only));
-
-        attach_multiwindow_product_graph_surface_proof(&mut alias_only);
         assert!(!multiwindow_surface_visible_proof_ok(&alias_only));
         assert!(
             alias_only
@@ -81200,71 +80512,6 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 .and_then(serde_json::Value::as_u64),
             Some(0)
         );
-    }
-
-    #[test]
-    fn isolated_weston_desktop_preview_e2e_uses_demand_driven_product_mode() {
-        let args = isolated_weston_desktop_preview_e2e_args(
-            "generic",
-            "test-title-token",
-            1500,
-            180_000,
-            Path::new("target/reports/native-gpu/test-supervisor.json"),
-            Path::new("target/reports/native-gpu/test-live-state.json"),
-            Some(Path::new("examples/counter.bn")),
-            true,
-            true,
-            true,
-        )
-        .expect("test paths are UTF-8");
-
-        assert!(args.iter().any(|arg| arg == "--demand-driven-loop"));
-        assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--skip-render-hook-app-owned-proof")
-        );
-        assert!(command_argv_contains_pair(
-            &args.iter().map(|arg| json!(arg)).collect::<Vec<_>>(),
-            "--probe-min-dev-hold-ms",
-            "5000"
-        ));
-        assert!(command_argv_contains_pair(
-            &args.iter().map(|arg| json!(arg)).collect::<Vec<_>>(),
-            "--probe-preview-hold-tail-ms",
-            "1000"
-        ));
-        assert!(args.iter().any(|arg| arg == "--dev-editor-only"));
-        assert!(!args.iter().any(|arg| arg == "--dev-app-owned-input-probe"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--skip-operator-host-input-probe")
-        );
-    }
-
-    #[test]
-    fn isolated_preview_e2e_keeps_dev_app_owned_input_probe() {
-        let args = isolated_weston_desktop_preview_e2e_args(
-            "generic",
-            "test-title-token",
-            1500,
-            180_000,
-            Path::new("target/reports/native-gpu/test-supervisor.json"),
-            Path::new("target/reports/native-gpu/test-live-state.json"),
-            None,
-            false,
-            true,
-            false,
-        )
-        .expect("test paths are UTF-8");
-
-        assert!(args.iter().any(|arg| arg == "--real-window-input-probe"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--skip-render-hook-app-owned-proof")
-        );
-        assert!(args.iter().any(|arg| arg == "--dev-app-owned-input-probe"));
-        assert!(!args.iter().any(|arg| arg == "--dev-editor-only"));
     }
 
     #[test]

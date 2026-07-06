@@ -33,7 +33,7 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
-| Test harness cleanup | In progress | Cells visible-click, preview E2E, scroll-speed, and present-floor no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining multiwindow/IPC/observability isolated-Weston compositor paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Cells visible-click, preview E2E, scroll-speed, present-floor, multiwindow, IPC, and observability no longer have isolated-Weston product paths; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and negative fixtures remain cleanup targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -218,7 +218,7 @@ for old evidence.
 - Removed now-unused idle CPU sampling, source-project switch payload,
   dev-editor scroll-axis observation, and Weston click-driver helper islands.
 - Kept manifest-owned native handoff routes intact. Multiwindow, IPC, and
-  observability still need their remaining isolated-Weston manifest-owned
+  observability still needed their remaining isolated-Weston manifest-owned
   branches replaced by headed product-path evidence in a later cut.
 - Focused checks passed:
   - `cargo check -q -p xtask`
@@ -244,6 +244,26 @@ for old evidence.
   - `cargo test -q -p boon_report_schema present_floor_scoped_verifier_identity_ignores_inner_probe_arg -- --nocapture`
   - `cargo test -q -p xtask native_gpu_handoff_requires_present_floor_report -- --nocapture`
   - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
+
+### 2026-07-06 - Multiwindow/IPC/Observability Isolated Harness Deleted
+
+- `verify-native-gpu-multiwindow`, `verify-native-gpu-ipc-backpressure`, and
+  `verify-native-gpu-observability` now launch the desktop role through the
+  same workspace-qualified headed `cosmic-background-launch` route used by
+  preview and scroll gates.
+- Deleted the shared verifier-owned isolated-Weston desktop preview harness,
+  Weston test-control plugin build path, Weston test driver lookup path,
+  nested isolated-loop proof promotion adapter, and argument-builder tests.
+- The three handoff labels still parse app-owned supervisor/live-state reports
+  and keep their existing multiwindow, IPC, and observability contract checks;
+  they no longer manufacture evidence through a nested compositor.
+- Focused checks passed:
+  - `cargo fmt`
+  - `cargo fmt --check`
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask multiwindow_visible_proof_must_be_surface_scoped -- --nocapture`
+  - `cargo test -q -p xtask native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source -- --nocapture`
+  - `cargo test -q -p xtask native_gpu_handoff_requires_present_floor_report -- --nocapture`
 
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
@@ -352,14 +372,12 @@ Fresh focused evidence:
 
 ## Next Cuts
 
-1. Delete the remaining isolated-Weston verifier-owned compositor family and
-   replace affected native handoff labels with headed hardware/app-owned paths.
-2. Continue moving `ProductFrameGraph` ownership out of playground/report
+1. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-3. Delete duplicate report/schema refresh paths that only preserve stale
+2. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints, old comparison contracts, or weak diagnostic timing
    substitutes.
-4. Keep Cells product-latency and proof-lane reports fresh after each
+3. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

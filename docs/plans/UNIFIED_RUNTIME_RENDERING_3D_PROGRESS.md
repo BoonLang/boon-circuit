@@ -760,13 +760,38 @@ Fresh focused evidence:
   - `cargo test -q -p xtask product_render_graph -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Deleted App-Window Render Graph Execution Synthesis
+
+- Removed `NativeProductRenderGraphExecutionSummary` from
+  `boon_native_app_window`; the product commit now owns frame evidence and
+  present timing directly, while `NativeProductRenderGraphSummary` owns the
+  renderer graph contract.
+- Deleted the app-window helper that rebuilt graph execution from the product
+  graph, present plan, and commit timing.
+- Removed `render_graph_execution` from `NativeProductFrameResult`,
+  `NativeProductFrameCommit`, playground product results, Cells product-frame
+  summaries, and focused product-render-graph verifier output.
+- Trimmed the Cells verifier fixtures so they no longer include synthetic
+  app-level graph passes or the removed execution object.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_app_window -p boon_native_playground -p xtask`:
+    pass.
+  - `cargo fmt -- --check`: pass.
+  - `cargo test -q -p xtask product_render_graph -- --nocapture`: pass; 1
+    passed.
+  - `cargo test -q -p xtask cells_visible_click -- --nocapture`: pass; 21
+    passed.
+  - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_product_metrics -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
-1. Delete app-window `render_graph_execution` synthesis and replace it with
-   commit/present timing owned by `NativeProductFrameCommit`; graph execution
-   now belongs to the renderer-owned `ProductFrameGraphReport`.
-2. Keep Cells product-latency and proof-lane reports fresh after each
-   architecture cut.
+1. Refresh the Cells product-latency and proof-lane reports after the
+   renderer-owned graph and app-window execution deletions.
+2. Keep deleting obsolete verifier/report fields that only existed to support
+   removed product graph execution compatibility.
+3. Cut the next stale runtime/verifier compatibility lane only if fresh reports
+   show it is still on the active path.
 
 ## Completion Rules
 

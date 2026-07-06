@@ -36560,7 +36560,6 @@ fn native_product_render_graph_cells_summary(report: &serde_json::Value) -> serd
     let renderer_owned_graph_count =
         json_u64(contract, "/product_render_graph_renderer_owned_count");
     let present_plan_count = json_u64(contract, "/present_plan_count");
-    let execution_count = json_u64(contract, "/product_render_graph_execution_count");
     let sample_count = json_u64(contract, "/sample_count");
     let graph_missing = json_u64(contract, "/product_render_graph_missing_count");
     let renderer_owned_graph_missing = json_u64(
@@ -36568,11 +36567,6 @@ fn native_product_render_graph_cells_summary(report: &serde_json::Value) -> serd
         "/product_render_graph_renderer_owned_missing_count",
     );
     let present_plan_missing = json_u64(contract, "/present_plan_missing_count");
-    let execution_missing = json_u64(contract, "/product_render_graph_execution_missing_count");
-    let execution_frame_key_mismatch = json_u64(
-        contract,
-        "/product_render_graph_execution_frame_key_mismatch_count",
-    );
     let graph_readback = json_u64(contract, "/product_render_graph_proof_readback_count");
     let plan_readback = json_u64(
         contract,
@@ -36588,13 +36582,10 @@ fn native_product_render_graph_cells_summary(report: &serde_json::Value) -> serd
         && graph_count >= sample_count
         && renderer_owned_graph_count >= sample_count
         && present_plan_count >= sample_count
-        && execution_count >= sample_count
         && encode_time_count >= sample_count
         && graph_missing == 0
         && renderer_owned_graph_missing == 0
         && present_plan_missing == 0
-        && execution_missing == 0
-        && execution_frame_key_mismatch == 0
         && graph_readback == 0
         && plan_readback == 0
         && pre_present == 0
@@ -36640,13 +36631,10 @@ fn native_product_render_graph_cells_summary(report: &serde_json::Value) -> serd
         "product_render_graph_count": graph_count,
         "product_render_graph_renderer_owned_count": renderer_owned_graph_count,
         "present_plan_count": present_plan_count,
-        "product_render_graph_execution_count": execution_count,
         "product_render_graph_encode_time_sample_count": encode_time_count,
         "product_render_graph_missing_count": graph_missing,
         "product_render_graph_renderer_owned_missing_count": renderer_owned_graph_missing,
         "present_plan_missing_count": present_plan_missing,
-        "product_render_graph_execution_missing_count": execution_missing,
-        "product_render_graph_execution_frame_key_mismatch_count": execution_frame_key_mismatch,
         "product_render_graph_proof_readback_count": graph_readback,
         "present_plan_proof_readback_in_product_pass_count": plan_readback,
         "pre_present_request_count": pre_present,
@@ -36722,28 +36710,13 @@ fn native_product_render_graph_todomvc_summary(report: &serde_json::Value) -> se
     let present_plan = commit
         .get("present_plan")
         .unwrap_or(&serde_json::Value::Null);
-    let render_graph_execution = commit
-        .get("render_graph_execution")
-        .unwrap_or(&serde_json::Value::Null);
     let graph_contract = native_product_render_graph_object_contract(render_graph);
     let present_contract = native_product_present_plan_object_contract(present_plan);
-    let execution_contract = native_product_render_graph_execution_object_contract(
-        render_graph_execution,
-        render_graph,
-        present_plan,
-        commit
-            .get("frame_evidence_key")
-            .unwrap_or(&serde_json::Value::Null),
-    );
     let graph_contract_pass = graph_contract
         .get("status")
         .and_then(serde_json::Value::as_str)
         == Some("pass")
         && present_contract
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass")
-        && execution_contract
             .get("status")
             .and_then(serde_json::Value::as_str)
             == Some("pass")
@@ -36803,99 +36776,7 @@ fn native_product_render_graph_todomvc_summary(report: &serde_json::Value) -> se
         "max_budget_ms": max_budget_ms,
         "frame_evidence_key_present": commit.get("frame_evidence_key").is_some_and(|key| key.is_object()),
         "render_graph": graph_contract,
-        "present_plan": present_contract,
-        "render_graph_execution": execution_contract
-    })
-}
-
-fn native_product_render_graph_execution_object_contract(
-    execution: &serde_json::Value,
-    graph: &serde_json::Value,
-    plan: &serde_json::Value,
-    commit_frame_evidence_key: &serde_json::Value,
-) -> serde_json::Value {
-    let frame_evidence_key_matches_commit = execution
-        .get("frame_evidence_key")
-        .filter(|key| key.is_object())
-        .is_some_and(|key| key == commit_frame_evidence_key);
-    let graph_hash_matches = execution
-        .get("render_graph_plan_hash")
-        .and_then(serde_json::Value::as_str)
-        .zip(graph.get("plan_hash").and_then(serde_json::Value::as_str))
-        .is_some_and(|(actual, expected)| actual == expected && is_sha256_hex(actual));
-    let present_hash_matches = execution
-        .get("present_plan_hash")
-        .and_then(serde_json::Value::as_str)
-        .zip(plan.get("plan_hash").and_then(serde_json::Value::as_str))
-        .is_some_and(|(actual, expected)| actual == expected && is_sha256_hex(actual));
-    let measured_present_path = execution
-        .get("present_path_ms")
-        .and_then(numeric_value_as_f64)
-        .is_some_and(|value| value >= 0.0);
-    let measured_queue_submit = execution
-        .get("queue_submit_call_ms")
-        .and_then(numeric_value_as_f64)
-        .is_some_and(|value| value >= 0.0);
-    let measured_present_call = execution
-        .get("present_call_ms")
-        .and_then(numeric_value_as_f64)
-        .is_some_and(|value| value >= 0.0);
-    let encode_time_present = execution
-        .get("encode_time_ms")
-        .and_then(numeric_value_as_f64)
-        .is_some_and(|value| value >= 0.0);
-    let no_product_readback = execution
-        .get("proof_readback_in_product_graph")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false);
-    let no_pre_present = execution
-        .get("pre_present_proof_request_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1)
-        == 0
-        && execution
-            .get("product_proof_built_pre_present")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false);
-    let pass = execution.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-        && execution.get("owner").and_then(serde_json::Value::as_str)
-            == Some("app_window_product_frame_commit")
-        && execution
-            .get("execution_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("product_render_graph_execution")
-        && frame_evidence_key_matches_commit
-        && graph_hash_matches
-        && present_hash_matches
-        && execution
-            .get("product_pass_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            >= 2
-        && measured_present_path
-        && measured_queue_submit
-        && measured_present_call
-        && encode_time_present
-        && no_product_readback
-        && no_pre_present;
-    json!({
-        "status": if pass { "pass" } else { "fail" },
-        "owner": execution.get("owner").cloned().unwrap_or(serde_json::Value::Null),
-        "execution_kind": execution.get("execution_kind").cloned().unwrap_or(serde_json::Value::Null),
-        "frame_evidence_key_matches_commit": frame_evidence_key_matches_commit,
-        "graph_hash_matches": graph_hash_matches,
-        "present_hash_matches": present_hash_matches,
-        "product_pass_count": execution.get("product_pass_count").cloned().unwrap_or(serde_json::Value::Null),
-        "proof_pass_count": execution.get("proof_pass_count").cloned().unwrap_or(serde_json::Value::Null),
-        "proof_readback_in_product_graph": execution.get("proof_readback_in_product_graph").cloned().unwrap_or(serde_json::Value::Null),
-        "pre_present_proof_request_count": execution.get("pre_present_proof_request_count").cloned().unwrap_or(serde_json::Value::Null),
-        "product_proof_built_pre_present": execution.get("product_proof_built_pre_present").cloned().unwrap_or(serde_json::Value::Null),
-        "surface_acquire_call_ms": execution.get("surface_acquire_call_ms").cloned().unwrap_or(serde_json::Value::Null),
-        "encode_time_ms": execution.get("encode_time_ms").cloned().unwrap_or(serde_json::Value::Null),
-        "encoder_finish_ms": execution.get("encoder_finish_ms").cloned().unwrap_or(serde_json::Value::Null),
-        "queue_submit_call_ms": execution.get("queue_submit_call_ms").cloned().unwrap_or(serde_json::Value::Null),
-        "present_call_ms": execution.get("present_call_ms").cloned().unwrap_or(serde_json::Value::Null),
-        "present_path_ms": execution.get("present_path_ms").cloned().unwrap_or(serde_json::Value::Null)
+        "present_plan": present_contract
     })
 }
 
@@ -41540,8 +41421,6 @@ fn cells_visible_click_product_only_ux_contract(
     let product_render_graph_renderer_owned_count =
         json_u64(product_frames, "/product_render_graph_renderer_owned_count");
     let present_plan_count = json_u64(product_frames, "/present_plan_count");
-    let product_render_graph_execution_count =
-        json_u64(product_frames, "/product_render_graph_execution_count");
     let product_result_missing_count = json_u64(product_frames, "/product_result_missing_count");
     let product_patch_full_scene_build_count =
         json_u64(product_frames, "/product_patch_full_scene_build_count");
@@ -41558,14 +41437,6 @@ fn cells_visible_click_product_only_ux_contract(
         "/product_render_graph_renderer_owned_missing_count",
     );
     let present_plan_missing_count = json_u64(product_frames, "/present_plan_missing_count");
-    let product_render_graph_execution_missing_count = json_u64(
-        product_frames,
-        "/product_render_graph_execution_missing_count",
-    );
-    let product_render_graph_execution_frame_key_mismatch_count = json_u64(
-        product_frames,
-        "/product_render_graph_execution_frame_key_mismatch_count",
-    );
     let product_render_graph_proof_readback_count =
         json_u64(product_frames, "/product_render_graph_proof_readback_count");
     let present_plan_proof_readback_in_product_pass_count = json_u64(
@@ -41600,12 +41471,9 @@ fn cells_visible_click_product_only_ux_contract(
     let graph_contract_ok = product_render_graph_count >= sample_count
         && product_render_graph_renderer_owned_count >= sample_count
         && present_plan_count >= sample_count
-        && product_render_graph_execution_count >= sample_count
         && product_render_graph_missing_count == 0
         && product_render_graph_renderer_owned_missing_count == 0
         && present_plan_missing_count == 0
-        && product_render_graph_execution_missing_count == 0
-        && product_render_graph_execution_frame_key_mismatch_count == 0
         && product_render_graph_proof_readback_count == 0
         && present_plan_proof_readback_in_product_pass_count == 0;
     let status = if product_status == "pass"
@@ -41662,7 +41530,6 @@ fn cells_visible_click_product_only_ux_contract(
         "product_render_graph_count": product_render_graph_count,
         "product_render_graph_renderer_owned_count": product_render_graph_renderer_owned_count,
         "present_plan_count": present_plan_count,
-        "product_render_graph_execution_count": product_render_graph_execution_count,
         "product_result_missing_count": product_result_missing_count,
         "product_patch_full_scene_build_count": product_patch_full_scene_build_count,
         "product_patch_proof_json_required_count": product_patch_proof_json_required_count,
@@ -41670,8 +41537,6 @@ fn cells_visible_click_product_only_ux_contract(
         "product_render_graph_missing_count": product_render_graph_missing_count,
         "product_render_graph_renderer_owned_missing_count": product_render_graph_renderer_owned_missing_count,
         "present_plan_missing_count": present_plan_missing_count,
-        "product_render_graph_execution_missing_count": product_render_graph_execution_missing_count,
-        "product_render_graph_execution_frame_key_mismatch_count": product_render_graph_execution_frame_key_mismatch_count,
         "product_render_graph_proof_readback_count": product_render_graph_proof_readback_count,
         "present_plan_proof_readback_in_product_pass_count": present_plan_proof_readback_in_product_pass_count,
         "hard_failure_count": hard_failure_count,
@@ -42229,13 +42094,10 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
     let mut product_patch_latest_report_required_count = 0_u64;
     let mut product_render_graph_count = 0_u64;
     let mut present_plan_count = 0_u64;
-    let mut product_render_graph_execution_count = 0_u64;
     let mut product_render_graph_missing_count = 0_u64;
     let mut product_render_graph_renderer_owned_count = 0_u64;
     let mut product_render_graph_renderer_owned_missing_count = 0_u64;
     let mut present_plan_missing_count = 0_u64;
-    let mut product_render_graph_execution_missing_count = 0_u64;
-    let mut product_render_graph_execution_frame_key_mismatch_count = 0_u64;
     let mut product_render_graph_proof_readback_count = 0_u64;
     let mut present_plan_proof_readback_in_product_pass_count = 0_u64;
     let mut bounded_product_frame_outliers = Vec::new();
@@ -42608,37 +42470,8 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             present_plan_proof_readback_in_product_pass_count =
                 present_plan_proof_readback_in_product_pass_count.saturating_add(1);
         }
-        let render_graph_execution = commit.get("render_graph_execution");
-        let execution_contract = native_product_render_graph_execution_object_contract(
-            render_graph_execution.unwrap_or(&serde_json::Value::Null),
-            render_graph.unwrap_or(&serde_json::Value::Null),
-            present_plan.unwrap_or(&serde_json::Value::Null),
-            commit
-                .get("frame_evidence_key")
-                .unwrap_or(&serde_json::Value::Null),
-        );
-        let render_graph_execution_ok = execution_contract
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass");
-        if render_graph_execution_ok {
-            product_render_graph_execution_count =
-                product_render_graph_execution_count.saturating_add(1);
-        } else {
-            product_render_graph_execution_missing_count =
-                product_render_graph_execution_missing_count.saturating_add(1);
-        }
-        if execution_contract
-            .get("frame_evidence_key_matches_commit")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
-        {
-            product_render_graph_execution_frame_key_mismatch_count =
-                product_render_graph_execution_frame_key_mismatch_count.saturating_add(1);
-        }
         let render_graph_ok_for_sample = render_graph_ok;
         let present_plan_ok_for_sample = present_plan_ok;
-        let render_graph_execution_ok_for_sample = render_graph_execution_ok;
         let input_wake_to_input_accept_ms = commit
             .pointer("/input_timing/input_wake_to_input_accept_ms")
             .and_then(numeric_value_as_f64)
@@ -42687,8 +42520,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             && typed_product_result_ok
             && render_graph_ok_for_sample
             && renderer_owned_graph_ok_for_sample
-            && present_plan_ok_for_sample
-            && render_graph_execution_ok_for_sample;
+            && present_plan_ok_for_sample;
         let within_bounded_max = input_to_present_ms.is_finite()
             && input_to_formula_visible_ms.is_finite()
             && input_to_present_ms <= max_budget_ms
@@ -42699,8 +42531,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             && typed_product_result_ok
             && render_graph_ok_for_sample
             && renderer_owned_graph_ok_for_sample
-            && present_plan_ok_for_sample
-            && render_graph_execution_ok_for_sample;
+            && present_plan_ok_for_sample;
         if within_budget {
             within_budget_sample_count = within_budget_sample_count.saturating_add(1);
         } else {
@@ -42723,8 +42554,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
                 "missing_or_invalid_renderer_owned_product_render_graph"
             } else if !present_plan_ok_for_sample {
                 "missing_or_invalid_present_plan"
-            } else if !render_graph_execution_ok_for_sample {
-                "missing_or_invalid_product_render_graph_execution"
             } else if within_bounded_max {
                 "bounded_keyed_product_commit_outlier"
             } else {
@@ -42833,13 +42662,10 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             "product_patch": product_patch.cloned().unwrap_or(serde_json::Value::Null),
             "render_graph": render_graph.cloned().unwrap_or(serde_json::Value::Null),
             "present_plan": present_plan.cloned().unwrap_or(serde_json::Value::Null),
-            "render_graph_execution": render_graph_execution.cloned().unwrap_or(serde_json::Value::Null),
-            "render_graph_execution_contract": execution_contract,
             "typed_product_patch_ok": typed_product_patch_ok,
             "typed_product_result_ok": typed_product_result_ok,
             "render_graph_ok": render_graph_ok,
-            "present_plan_ok": present_plan_ok,
-            "render_graph_execution_ok": render_graph_execution_ok
+            "present_plan_ok": present_plan_ok
         }));
     }
 
@@ -42868,12 +42694,9 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
     let graph_scope_ok = product_render_graph_count >= measured_required_sample_count
         && product_render_graph_renderer_owned_count >= measured_required_sample_count
         && present_plan_count >= measured_required_sample_count
-        && product_render_graph_execution_count >= measured_required_sample_count
         && product_render_graph_missing_count == 0
         && product_render_graph_renderer_owned_missing_count == 0
         && present_plan_missing_count == 0
-        && product_render_graph_execution_missing_count == 0
-        && product_render_graph_execution_frame_key_mismatch_count == 0
         && product_render_graph_proof_readback_count == 0
         && present_plan_proof_readback_in_product_pass_count == 0;
     let status = if measured_required_sample_count > 0
@@ -42925,7 +42748,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         "product_render_graph_count": product_render_graph_count,
         "product_render_graph_renderer_owned_count": product_render_graph_renderer_owned_count,
         "present_plan_count": present_plan_count,
-        "product_render_graph_execution_count": product_render_graph_execution_count,
         "product_result_missing_count": product_result_missing_count,
         "product_patch_missing_count": product_patch_missing_count,
         "product_patch_full_scene_build_count": product_patch_full_scene_build_count,
@@ -42934,8 +42756,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         "product_render_graph_missing_count": product_render_graph_missing_count,
         "product_render_graph_renderer_owned_missing_count": product_render_graph_renderer_owned_missing_count,
         "present_plan_missing_count": present_plan_missing_count,
-        "product_render_graph_execution_missing_count": product_render_graph_execution_missing_count,
-        "product_render_graph_execution_frame_key_mismatch_count": product_render_graph_execution_frame_key_mismatch_count,
         "product_render_graph_proof_readback_count": product_render_graph_proof_readback_count,
         "present_plan_proof_readback_in_product_pass_count": present_plan_proof_readback_in_product_pass_count,
         "product_frame_count": available_product_commit_count,
@@ -72645,8 +72465,8 @@ mod tests {
             "renderer_graph_per_present_resource_decision_count": 2,
             "active_scene_identity": "active-preview-scene:test",
             "render_scene_identity": "render-scene:test",
-            "pass_count": 7,
-            "product_pass_count": 7,
+            "pass_count": 5,
+            "product_pass_count": 4,
             "proof_pass_count": 0,
             "dirty_chunk_count": 3,
             "upload_bytes": 128,
@@ -72656,15 +72476,6 @@ mod tests {
             "stale_epoch_rejection_count": 0,
             "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "passes": [
-                {
-                    "schema_version": 1,
-                    "pass_id": "active-preview-scene",
-                    "pass_kind": "active_preview_scene",
-                    "source": "ActivePreviewScene",
-                    "target": "visible-surface-direct",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                },
                 {
                     "schema_version": 1,
                     "pass_id": "native-gpu:renderer-scene-key",
@@ -72703,19 +72514,10 @@ mod tests {
                 },
                 {
                     "schema_version": 1,
-                    "pass_id": "product-patch",
-                    "pass_kind": "product_patch",
-                    "source": "ProductPatch",
-                    "target": "visible-surface-direct",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                },
-                {
-                    "schema_version": 1,
-                    "pass_id": "present",
-                    "pass_kind": "present",
-                    "source": "visible-surface-direct",
-                    "target": "visible_surface",
+                    "pass_id": "native-gpu:renderer-text-draw",
+                    "pass_kind": "text_draw_pass",
+                    "source": "TextRuns",
+                    "target": "ColorTarget",
                     "product_visible": true,
                     "proof_or_readback": false
                 }
@@ -72730,36 +72532,11 @@ mod tests {
             "owner": "preview_active_scene",
             "plan_kind": "product_present_plan",
             "render_target_kind": "visible-surface-direct",
-            "pass_count": 7,
-            "product_pass_count": 7,
+            "pass_count": 5,
+            "product_pass_count": 4,
             "proof_pass_count": 0,
             "proof_readback_in_product_passes": false,
             "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        })
-    }
-
-    fn cells_visible_click_test_product_render_graph_execution(
-        frame_evidence_key: serde_json::Value,
-    ) -> serde_json::Value {
-        json!({
-            "schema_version": 1,
-            "status": "pass",
-            "owner": "app_window_product_frame_commit",
-            "execution_kind": "product_render_graph_execution",
-            "frame_evidence_key": frame_evidence_key,
-            "render_graph_plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "present_plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "product_pass_count": 7,
-            "proof_pass_count": 0,
-            "proof_readback_in_product_graph": false,
-            "pre_present_proof_request_count": 0,
-            "product_proof_built_pre_present": false,
-            "surface_acquire_call_ms": 0.1,
-            "encode_time_ms": 0.7,
-            "encoder_finish_ms": 0.1,
-            "queue_submit_call_ms": 0.2,
-            "present_call_ms": 0.3,
-            "present_path_ms": 0.6
         })
     }
 
@@ -72826,7 +72603,6 @@ mod tests {
             "product_render_graph_count": 16,
             "product_render_graph_renderer_owned_count": 16,
             "present_plan_count": 16,
-            "product_render_graph_execution_count": 16,
             "product_result_missing_count": 0,
             "product_patch_full_scene_build_count": 0,
             "product_patch_proof_json_required_count": 0,
@@ -72834,8 +72610,6 @@ mod tests {
             "product_render_graph_missing_count": 0,
             "product_render_graph_renderer_owned_missing_count": 0,
             "present_plan_missing_count": 0,
-            "product_render_graph_execution_missing_count": 0,
-            "product_render_graph_execution_frame_key_mismatch_count": 0,
             "product_render_graph_proof_readback_count": 0,
             "present_plan_proof_readback_in_product_pass_count": 0,
             "hard_failure_count": 0,
@@ -73186,17 +72960,7 @@ mod tests {
                     "product_patch": cells_visible_click_test_product_patch()
                 },
                 "render_graph": cells_visible_click_test_product_render_graph(),
-                "present_plan": cells_visible_click_test_present_plan(),
-                "render_graph_execution": cells_visible_click_test_product_render_graph_execution(json!({
-                    "frame_seq": 7,
-                    "present_id": 7,
-                    "input_event_seq": 4,
-                    "surface_id": "preview:test",
-                    "surface_epoch": 1,
-                    "content_revision": 6,
-                    "layout_revision": 1,
-                    "render_scene_revision": 4
-                }))
+                "present_plan": cells_visible_click_test_present_plan()
             }]
         });
 
@@ -75646,12 +75410,9 @@ mod tests {
                 "product_render_graph_count": 16,
                 "product_render_graph_renderer_owned_count": 16,
                 "present_plan_count": 16,
-                "product_render_graph_execution_count": 16,
                 "product_render_graph_missing_count": 0,
                 "product_render_graph_renderer_owned_missing_count": 0,
                 "present_plan_missing_count": 0,
-                "product_render_graph_execution_missing_count": 0,
-                "product_render_graph_execution_frame_key_mismatch_count": 0,
                 "product_render_graph_proof_readback_count": 0,
                 "present_plan_proof_readback_in_product_pass_count": 0,
                 "product_patch_full_scene_build_count": 0
@@ -75737,8 +75498,6 @@ mod tests {
         headed_warmup_report["product_only_ux_contract"]["product_render_graph_renderer_owned_count"] =
             json!(60);
         headed_warmup_report["product_only_ux_contract"]["present_plan_count"] = json!(60);
-        headed_warmup_report["product_only_ux_contract"]["product_render_graph_execution_count"] =
-            json!(60);
         headed_warmup_report["proof_only_contract"]["click_sample_count"] = json!(64);
         headed_warmup_report["proof_only_contract"]["current_structured_visual_proof_sample_count"] =
             json!(64);

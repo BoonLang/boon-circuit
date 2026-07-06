@@ -11813,7 +11813,6 @@ fn preview_product_frame_result(
         product_frame,
         render_graph,
         present_plan,
-        render_graph_execution: None,
         post_present_proof_requests: presentation_plan.post_present_proof_requests.clone(),
     }
 }

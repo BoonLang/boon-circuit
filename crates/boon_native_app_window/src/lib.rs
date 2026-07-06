@@ -3814,34 +3814,6 @@ pub struct NativePresentPlanSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NativeProductRenderGraphExecutionSummary {
-    pub schema_version: u32,
-    pub status: String,
-    pub owner: String,
-    pub execution_kind: String,
-    pub frame_evidence_key: FrameEvidenceKey,
-    pub render_graph_plan_hash: String,
-    pub present_plan_hash: String,
-    pub product_pass_count: u32,
-    pub proof_pass_count: u32,
-    pub proof_readback_in_product_graph: bool,
-    pub pre_present_proof_request_count: u32,
-    pub product_proof_built_pre_present: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub surface_acquire_call_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encode_time_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder_finish_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_submit_call_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub present_call_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub present_path_ms: Option<f64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeProductFrameResult {
     pub schema_version: u32,
     pub owner: String,
@@ -3851,8 +3823,6 @@ pub struct NativeProductFrameResult {
     pub render_graph: Option<NativeProductRenderGraphSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_plan: Option<NativePresentPlanSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_graph_execution: Option<NativeProductRenderGraphExecutionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
 }
@@ -3921,8 +3891,6 @@ pub struct NativeProductFrameCommit {
     pub render_graph: Option<NativeProductRenderGraphSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_plan: Option<NativePresentPlanSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_graph_execution: Option<NativeProductRenderGraphExecutionSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
     pub post_present_proof_request_count: u32,
@@ -8028,14 +7996,6 @@ fn product_frame_commit_for_presented_frame(
     let product_proof_built_pre_present = product_frame.as_ref().is_some_and(|frame| {
         frame.proof_json_built_pre_present || frame.render_hook_proof_built_pre_present
     });
-    let render_graph_execution = product_render_graph_execution_for_commit(
-        state,
-        &frame_evidence_key,
-        render_graph.as_ref(),
-        present_plan.as_ref(),
-        pre_present_proof_request_count,
-        product_proof_built_pre_present,
-    );
     NativeProductFrameCommit {
         schema_version: 1,
         commit_source: "app_window_product_frame_commit".to_owned(),
@@ -8091,40 +8051,7 @@ fn product_frame_commit_for_presented_frame(
         product_frame,
         render_graph,
         present_plan,
-        render_graph_execution,
     }
-}
-
-fn product_render_graph_execution_for_commit(
-    state: &NativeRenderLoopState,
-    frame_evidence_key: &FrameEvidenceKey,
-    render_graph: Option<&NativeProductRenderGraphSummary>,
-    present_plan: Option<&NativePresentPlanSummary>,
-    pre_present_proof_request_count: u32,
-    product_proof_built_pre_present: bool,
-) -> Option<NativeProductRenderGraphExecutionSummary> {
-    let render_graph = render_graph?;
-    let present_plan = present_plan?;
-    Some(NativeProductRenderGraphExecutionSummary {
-        schema_version: 1,
-        status: "pass".to_owned(),
-        owner: "app_window_product_frame_commit".to_owned(),
-        execution_kind: "product_render_graph_execution".to_owned(),
-        frame_evidence_key: frame_evidence_key.clone(),
-        render_graph_plan_hash: render_graph.plan_hash.clone(),
-        present_plan_hash: present_plan.plan_hash.clone(),
-        product_pass_count: render_graph.product_pass_count,
-        proof_pass_count: render_graph.proof_pass_count,
-        proof_readback_in_product_graph: render_graph.proof_readback_in_product_graph,
-        pre_present_proof_request_count,
-        product_proof_built_pre_present,
-        surface_acquire_call_ms: state.last_surface_acquire_call_ms,
-        encode_time_ms: render_graph.encode_time_ms,
-        encoder_finish_ms: state.last_encoder_finish_ms,
-        queue_submit_call_ms: state.last_queue_submit_call_ms,
-        present_call_ms: state.last_present_call_ms,
-        present_path_ms: state.last_present_path_ms,
-    })
 }
 
 fn visible_surface_readback_post_present_request() -> NativePostPresentProofRequestSummary {
@@ -8154,10 +8081,6 @@ fn add_post_present_proof_request_to_commit(
     commit.post_present_proof_request_count = commit.post_present_proof_requests.len() as u32;
     if let Some(product_frame) = commit.product_frame.as_mut() {
         product_frame.post_present_proof_request_count = commit.post_present_proof_request_count;
-    }
-    if let Some(execution) = commit.render_graph_execution.as_mut() {
-        execution.pre_present_proof_request_count = commit.pre_present_proof_request_count;
-        execution.product_proof_built_pre_present = commit.product_proof_built_pre_present;
     }
 }
 
@@ -10953,7 +10876,6 @@ mod tests {
             product_frame,
             render_graph: None,
             present_plan: None,
-            render_graph_execution: None,
             post_present_proof_requests,
         }
     }
@@ -11329,7 +11251,6 @@ mod tests {
                 product_frame: typed_frame,
                 render_graph: None,
                 present_plan: None,
-                render_graph_execution: None,
                 post_present_proof_requests: typed_requests,
             }),
             ..NativeRenderFrameMetrics::default()

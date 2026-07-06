@@ -37576,3 +37576,49 @@ Remaining scope:
 - In parallel, the runtime/PlanExecutor cut remains generic list/currentness
   ownership for Cells-style lookup and dependency fanout. Do not add
   Cells-specific runtime branches.
+
+## 2026-07-06 - Typed Preview Presentation Plan Boundary
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Added `PreviewPresentationPlan` in `boon_native_playground` as the typed
+  boundary between product presentation decisions and proof/report JSON.
+- The native preview render hook now builds the active scene identity,
+  render-scene identity, product patch summary, proof-before-present flags, and
+  post-present proof request list before report JSON construction.
+- `preview_attach_product_proof_boundary` now consumes the typed presentation
+  plan instead of eleven loose arguments. Product frame metrics, product
+  result, render graph summary, present plan, and post-present proof requests
+  are derived from the same plan.
+- Dev-window visible rendering paths now also construct a typed presentation
+  plan instead of calling the product boundary through optional compatibility
+  arguments.
+- Added a focused unit test proving the presentation plan owns both product
+  identity and proof request boundaries.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_native_playground`: pass.
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_native_playground
+  preview_presentation_plan_owns_product_and_proof_boundary -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_native_playground product_patch -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_native_playground product_render_graph
+  -- --nocapture`: pass.
+- `cargo test -q -p boon_native_playground preview_render_scene
+  -- --nocapture`: pass.
+
+Remaining scope:
+
+- This is an architecture boundary cleanup, not a Cells 60 FPS claim.
+- The next native cut is to move more JSON/report-only work behind this plan:
+  proof payload construction should consume `PreviewPresentationPlan`, while
+  present/encode stays on the hot path.
+- The runtime/PlanExecutor Cells cut remains generic list/currentness and
+  dependency fanout ownership, with no Cells-specific branches.

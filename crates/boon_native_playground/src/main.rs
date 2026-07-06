@@ -11526,6 +11526,99 @@ struct PreviewNativeGpuRenderHookOutput {
     post_present_proof_subscribers: Vec<boon_native_app_window::NativePostPresentProofSubscriber>,
 }
 
+#[derive(Clone, Debug)]
+struct PreviewPresentationPlan {
+    product_result_owner: &'static str,
+    product_result_kind: &'static str,
+    render_target_kind: &'static str,
+    layout_identity: String,
+    render_scene_identity: String,
+    active_scene_identity: String,
+    product_patch: boon_native_app_window::NativeProductPatchSummary,
+    proof_json_built_pre_present: bool,
+    render_hook_proof_built_pre_present: bool,
+    post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
+}
+
+fn preview_presentation_plan(
+    render_target_kind: &'static str,
+    layout_identity: String,
+    render_scene_identity: String,
+    active_scene_identity: String,
+    product_patch: boon_native_app_window::NativeProductPatchSummary,
+    proof_json_built_pre_present: bool,
+    render_hook_proof_built_pre_present: bool,
+    emit_deferred_post_present_proof: bool,
+) -> PreviewPresentationPlan {
+    PreviewPresentationPlan {
+        product_result_owner: "preview_active_scene",
+        product_result_kind: "active_preview_scene_patch",
+        render_target_kind,
+        layout_identity,
+        render_scene_identity,
+        active_scene_identity,
+        product_patch,
+        proof_json_built_pre_present,
+        render_hook_proof_built_pre_present,
+        post_present_proof_requests: preview_post_present_proof_request_summaries_for_mode(
+            emit_deferred_post_present_proof,
+        ),
+    }
+}
+
+fn preview_dev_presentation_plan(
+    render_target_kind: &'static str,
+    layout_identity: String,
+    render_scene_identity: String,
+    width: u32,
+    height: u32,
+    patch_kind: &'static str,
+    source: &'static str,
+    direct_render_scene_patch: bool,
+    post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
+) -> PreviewPresentationPlan {
+    let active_scene_identity = preview_active_scene_identity(
+        &layout_identity,
+        &layout_identity,
+        &render_scene_identity,
+        width,
+        height,
+        "dev-window-render-scene",
+        patch_kind,
+    );
+    let product_patch = boon_native_app_window::NativeProductPatchSummary {
+        schema_version: 1,
+        status: "pass".to_owned(),
+        owner: "preview_active_scene".to_owned(),
+        patch_kind: patch_kind.to_owned(),
+        source: source.to_owned(),
+        active_scene_identity: Some(active_scene_identity.clone()),
+        route_identity: None,
+        touched_node_count: 0,
+        touched_node_samples: Vec::new(),
+        retained_text_update_count: 0,
+        retained_style_update_count: 0,
+        hover_node_count: 0,
+        focus_node_count: 0,
+        direct_render_scene_patch,
+        full_scene_build_before_present: !direct_render_scene_patch,
+        proof_json_required: true,
+        latest_report_required: false,
+    };
+    PreviewPresentationPlan {
+        product_result_owner: "preview_active_scene",
+        product_result_kind: "dev_visible_scene",
+        render_target_kind,
+        layout_identity,
+        render_scene_identity,
+        active_scene_identity,
+        product_patch,
+        proof_json_built_pre_present: true,
+        render_hook_proof_built_pre_present: true,
+        post_present_proof_requests,
+    }
+}
+
 fn native_gpu_app_owned_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
     world_scene: Option<&PreviewWorldSceneState>,
@@ -12216,6 +12309,16 @@ fn native_gpu_app_owned_render_hook(
         proof_json_required: !defer_product_render_report,
         latest_report_required: false,
     });
+    let presentation_plan = preview_presentation_plan(
+        context.render_target_kind,
+        layout_identity.clone(),
+        product_render_scene_identity.clone(),
+        active_scene_identity.clone(),
+        product_patch_summary,
+        !defer_product_render_report,
+        !defer_product_render_report,
+        emit_deferred_post_present_proof,
+    );
     let proof_started = Instant::now();
     let render_identity_hash = render_scene_identity
         .strip_prefix("render-scene:")
@@ -12320,12 +12423,12 @@ fn native_gpu_app_owned_render_hook(
             "render_scene_identity": render_scene_identity,
             "scroll_transform": visible_state.scroll_transform.clone(),
             "active_preview_scene": {
-                "identity": active_scene_identity.clone(),
+                "identity": presentation_plan.active_scene_identity.clone(),
                 "route_identity": visible_state.overlay_route_identity.clone(),
-                "layout_identity": layout_identity.clone(),
-                "render_scene_identity": product_render_scene_identity.clone()
+                "layout_identity": presentation_plan.layout_identity.clone(),
+                "render_scene_identity": presentation_plan.render_scene_identity.clone()
             },
-            "product_patch": product_patch_summary.clone(),
+            "product_patch": presentation_plan.product_patch.clone(),
             "surface_id": context.surface_id,
             "surface_epoch": context.surface_epoch,
             "surface_format": context.surface_format,
@@ -12441,16 +12544,8 @@ fn native_gpu_app_owned_render_hook(
         });
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
-        Some("preview_active_scene"),
-        Some("active_preview_scene_patch"),
-        context.render_target_kind,
-        Some(layout_identity.clone()),
-        Some(product_render_scene_identity.clone()),
-        !defer_product_render_report,
-        !defer_product_render_report,
+        &presentation_plan,
         Some(&visible_metrics),
-        Some(product_patch_summary.clone()),
-        preview_post_present_proof_request_summaries_for_mode(emit_deferred_post_present_proof),
     );
     render_frame_metrics.render_hook_phase_timings = Some(render_hook_phase_timings_ms.clone());
     preview_set_product_render_graph_encode_time_ms(
@@ -12671,41 +12766,31 @@ fn preview_product_patch_summary(
 
 fn preview_attach_product_proof_boundary(
     metrics: &mut boon_native_app_window::NativeRenderFrameMetrics,
-    product_result_owner: Option<&str>,
-    product_result_kind: Option<&str>,
-    render_target_kind: &str,
-    layout_identity: Option<String>,
-    render_scene_identity: Option<String>,
-    proof_json_built_pre_present: bool,
-    render_hook_proof_built_pre_present: bool,
+    presentation_plan: &PreviewPresentationPlan,
     renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
-    product_patch: Option<boon_native_app_window::NativeProductPatchSummary>,
-    post_present_proof_requests: Vec<boon_native_app_window::NativePostPresentProofRequestSummary>,
 ) {
-    let post_present_proof_request_count = post_present_proof_requests.len() as u32;
+    let post_present_proof_request_count =
+        presentation_plan.post_present_proof_requests.len() as u32;
     let product_render_graph_enabled = preview_product_render_graph_enabled();
     let product_frame = boon_native_app_window::NativeRenderedProductFrame {
         schema_version: 1,
-        render_target_kind: render_target_kind.to_owned(),
+        render_target_kind: presentation_plan.render_target_kind.to_owned(),
         visible_surface_rendered: true,
         visible_present_path: true,
-        layout_identity,
-        render_scene_identity,
-        proof_json_built_pre_present,
-        render_hook_proof_built_pre_present,
+        layout_identity: Some(presentation_plan.layout_identity.clone()),
+        render_scene_identity: Some(presentation_plan.render_scene_identity.clone()),
+        proof_json_built_pre_present: presentation_plan.proof_json_built_pre_present,
+        render_hook_proof_built_pre_present: presentation_plan.render_hook_proof_built_pre_present,
         post_present_proof_request_count,
-        product_patch,
+        product_patch: Some(presentation_plan.product_patch.clone()),
     };
     metrics.product_frame = Some(product_frame.clone());
     let (render_graph, present_plan) = if product_render_graph_enabled {
         let (render_graph, present_plan) = preview_compile_product_render_graph(
-            render_target_kind,
-            product_frame
-                .product_patch
-                .as_ref()
-                .and_then(|patch| patch.active_scene_identity.clone()),
-            product_frame.render_scene_identity.clone(),
-            product_frame.product_patch.as_ref(),
+            presentation_plan.render_target_kind,
+            Some(presentation_plan.active_scene_identity.clone()),
+            Some(presentation_plan.render_scene_identity.clone()),
+            Some(&presentation_plan.product_patch),
             post_present_proof_request_count,
             metrics.upload_bytes.unwrap_or(0),
             renderer_metrics,
@@ -12718,20 +12803,17 @@ fn preview_attach_product_proof_boundary(
         metrics.present_plan = None;
         (None, None)
     };
-    metrics.product_result =
-        product_result_owner.map(|owner| boon_native_app_window::NativeProductFrameResult {
-            schema_version: 1,
-            owner: owner.to_owned(),
-            result_kind: product_result_kind
-                .unwrap_or("presented_product_frame")
-                .to_owned(),
-            product_frame: product_frame.clone(),
-            render_graph: render_graph.clone(),
-            present_plan: present_plan.clone(),
-            render_graph_execution: None,
-            post_present_proof_requests: post_present_proof_requests.clone(),
-        });
-    metrics.post_present_proof_requests = post_present_proof_requests;
+    metrics.product_result = Some(boon_native_app_window::NativeProductFrameResult {
+        schema_version: 1,
+        owner: presentation_plan.product_result_owner.to_owned(),
+        result_kind: presentation_plan.product_result_kind.to_owned(),
+        product_frame: product_frame.clone(),
+        render_graph: render_graph.clone(),
+        present_plan: present_plan.clone(),
+        render_graph_execution: None,
+        post_present_proof_requests: presentation_plan.post_present_proof_requests.clone(),
+    });
+    metrics.post_present_proof_requests = presentation_plan.post_present_proof_requests.clone();
 }
 
 fn preview_product_render_graph_enabled() -> bool {
@@ -14384,6 +14466,8 @@ fn native_gpu_dev_visible_render_hook(
                 "total_before_report_json_ms": elapsed_ms(render_hook_started),
             });
             let render_target_kind = context.render_target_kind;
+            let presentation_width = context.width;
+            let presentation_height = context.height;
             let report_json_started = Instant::now();
             let mut report = dev_visible_render_report(
                 context,
@@ -14420,18 +14504,21 @@ fn native_gpu_dev_visible_render_hook(
             report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
             let mut render_frame_metrics =
                 preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
+            let presentation_plan = preview_dev_presentation_plan(
+                render_target_kind,
+                cache.layout_frame_hash.clone(),
+                cache.render_scene_identity.clone(),
+                presentation_width,
+                presentation_height,
+                "dev_direct_render_scene_patch",
+                "dev_window_fast_render_scene_patch",
+                true,
+                dev_post_present_proof_request_summaries(),
+            );
             preview_attach_product_proof_boundary(
                 &mut render_frame_metrics,
-                None,
-                None,
-                render_target_kind,
-                Some(cache.layout_frame_hash.clone()),
-                Some(cache.render_scene_identity.clone()),
-                true,
-                true,
+                &presentation_plan,
                 Some(&visible_metrics),
-                None,
-                dev_post_present_proof_request_summaries(),
             );
             preview_set_product_render_graph_encode_time_ms(
                 &mut render_frame_metrics,
@@ -14504,6 +14591,8 @@ fn native_gpu_dev_visible_render_hook(
         "total_before_report_json_ms": elapsed_ms(render_hook_started),
     });
     let render_target_kind = context.render_target_kind;
+    let presentation_width = context.width;
+    let presentation_height = context.height;
     let report_json_started = Instant::now();
     let mut report = dev_visible_render_report(
         context,
@@ -14542,18 +14631,29 @@ fn native_gpu_dev_visible_render_hook(
     report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
     let mut render_frame_metrics =
         preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
+    let presentation_plan = preview_dev_presentation_plan(
+        render_target_kind,
+        cache.layout_frame_hash.clone(),
+        cache.render_scene_identity.clone(),
+        presentation_width,
+        presentation_height,
+        if direct_patch_rejection.is_some() {
+            "dev_full_render_scene"
+        } else {
+            "dev_cached_render_scene"
+        },
+        if direct_patch_rejection.is_some() {
+            "dev_window_full_render_scene"
+        } else {
+            "dev_window_cached_render_scene"
+        },
+        false,
+        dev_post_present_proof_request_summaries(),
+    );
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
-        None,
-        None,
-        render_target_kind,
-        Some(cache.layout_frame_hash.clone()),
-        Some(cache.render_scene_identity.clone()),
-        true,
-        true,
+        &presentation_plan,
         Some(&visible_metrics),
-        None,
-        dev_post_present_proof_request_summaries(),
     );
     preview_set_product_render_graph_encode_time_ms(
         &mut render_frame_metrics,
@@ -66968,6 +67068,54 @@ mod tests {
                 .iter()
                 .any(|node| node == "input-alpha"),
             "product patch evidence should expose generic touched node ids"
+        );
+    }
+
+    #[test]
+    fn preview_presentation_plan_owns_product_and_proof_boundary() {
+        let hover_overlay = PreviewHoverOverlayState::default();
+        let focus_overlay = PreviewFocusOverlayState::default();
+        let touched_nodes = BTreeSet::from([boon_document_model::DocumentNodeId(
+            "button-alpha".to_owned(),
+        )]);
+        let patch = preview_product_patch_summary(PreviewProductPatchSummaryInput {
+            active_scene_identity: Some("active-preview-scene:unit".to_owned()),
+            route_identity: Some("route:unit".to_owned()),
+            retained_bound_sync_stats: None,
+            hover_overlay: &hover_overlay,
+            focus_overlay: &focus_overlay,
+            touched_nodes: &touched_nodes,
+            input_overlay_render_scene_patch_enabled: true,
+            direct_input_overlay_render_scene_patch_enabled: true,
+            layout_render_scene_patch_applied: false,
+            direct_layout_render_scene_patch_enabled: false,
+            render_scene_cache_hit: true,
+            proof_json_required: false,
+            latest_report_required: false,
+        });
+
+        let plan = preview_presentation_plan(
+            "app-owned-offscreen-copy-to-present",
+            "layout:unit".to_owned(),
+            "render-scene:unit".to_owned(),
+            "active-preview-scene:unit".to_owned(),
+            patch,
+            false,
+            false,
+            true,
+        );
+
+        assert_eq!(plan.product_result_owner, "preview_active_scene");
+        assert_eq!(plan.product_result_kind, "active_preview_scene_patch");
+        assert_eq!(plan.layout_identity, "layout:unit");
+        assert_eq!(plan.render_scene_identity, "render-scene:unit");
+        assert_eq!(plan.active_scene_identity, "active-preview-scene:unit");
+        assert!(!plan.proof_json_built_pre_present);
+        assert!(!plan.render_hook_proof_built_pre_present);
+        assert_eq!(plan.post_present_proof_requests.len(), 2);
+        assert_eq!(
+            plan.product_patch.active_scene_identity.as_deref(),
+            Some("active-preview-scene:unit")
         );
     }
 

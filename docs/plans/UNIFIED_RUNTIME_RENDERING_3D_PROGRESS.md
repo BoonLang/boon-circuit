@@ -1,19 +1,15 @@
 # Unified Runtime, Rendering, 3D, and Manufacturing Progress
 
-This ledger tracks the active unified `/goal` that continues the existing
+This ledger tracks historical unified `/goal` progress for the
 BYTES/MachinePlan migration into retained runtime/document/layout/rendering,
-shared native/browser WGPU, accessibility, 3D, and manufacturing.
-
-It does not replace `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`. The
-BYTES/MachinePlan ledger remains authoritative for that migration; this ledger
-links to it and records unified-phase progress and blockers.
+shared native/browser WGPU, accessibility, 3D, and manufacturing. The old
+38k-line BYTES progress ledger was retired on 2026-07-06; use current aggregate
+reports and the active native/runtime plans for live status.
 
 ## Contract
 
 - Goal prompt: `docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md`
 - Unified architecture: `docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md`
-- Active BYTES/MachinePlan ledger:
-  `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
 - Current HEAD at unified start:
   `271d295a6169ef020570fbb96429c1a8e0d5e296`
 - Branch at unified start: `main`

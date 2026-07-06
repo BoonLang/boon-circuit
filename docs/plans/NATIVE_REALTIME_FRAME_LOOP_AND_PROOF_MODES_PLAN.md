@@ -12908,18 +12908,15 @@ host-input follow-up cut:
   cuts stale compiled artifacts that predate the generic row-lookup contract
   instead of keeping another migration path alive.
 - Active docs were updated so they no longer describe the alias as a retained
-  compatibility path. Historical BYTES progress still exists because
-  `audit-goal-readiness` and the unified prompt currently consume that ledger;
-  retiring it requires a separate readiness-auditor replacement, not a casual
-  file delete.
+  compatibility path.
 - Focused verification for this slice:
   - `rg -n "address_lookup_field|source_payload_schema_row_lookup_field_uses_generic_name_with_legacy_alias" crates --glob '!target'`
     returns no matches;
   - `cargo check -q -p boon_compiler -p boon_plan_executor -p boon_runtime`;
   - `cargo test -q -p boon_ir source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`;
   - `cargo test -q -p boon_plan source_payload_schema_row_lookup_field_uses_generic_name -- --nocapture`.
-- Next cleanup chunk should be either a deliberate readiness-ledger/auditor
-  replacement that deletes the 38k-line historical BYTES progress file, or a
-  document protocol migration that removes the primary `source_binding` field
-  in favor of canonical multi-bindings. Do not nibble around those with more
+- The follow-up cleanup chunk deleted the retired `audit-goal-readiness` command
+  and the 38k-line historical BYTES progress file. The next large cut should be
+  a document protocol migration that removes the primary `source_binding` field
+  in favor of canonical multi-bindings. Do not nibble around that with more
   compatibility comments.

@@ -71,7 +71,6 @@ This is a hybrid **pipeline**, not a hybrid source model. There must not be two 
 This plan extends rather than replaces the useful parts of:
 
 - `docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md`
-- `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
 - `docs/plans/NATIVE_DEMAND_DRIVEN_RENDER_LOOP_PLAN.md`
 - `docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md`
 - `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
@@ -1992,7 +1991,9 @@ Deliverables:
 - retain explicit differential legacy mode temporarily;
 - ensure runtime emits typed semantic change batches.
 
-Exit gate: existing MachinePlan goal-readiness audit has no implementation blockers attributable to incomplete migration; any human/OS evidence remains honestly separated.
+Exit gate: the BYTES/MachinePlan aggregate and native GPU handoff aggregate have
+no implementation blockers attributable to incomplete migration; any human/OS
+evidence remains honestly separated.
 
 ### Phase 2 — Transactional UI/document changes and hot model
 

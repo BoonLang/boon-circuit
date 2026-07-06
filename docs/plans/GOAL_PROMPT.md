@@ -354,7 +354,7 @@ Short slash command:
 ```text
 /goal Complete the next unified architecture slice for /home/martinkavik/repos/boon-circuit without getting stuck in Cells micro-optimizations.
 
-Start by inspecting current HEAD, git status, AGENTS.md, docs/architecture/NATIVE_GPU_PIPELINE.md, docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md, docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md, docs/plans/GOAL_PROMPT.md, and current target reports. Treat stale reports as non-proof.
+Start by inspecting current HEAD, git status, AGENTS.md, docs/architecture/NATIVE_GPU_PIPELINE.md, docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md, docs/plans/GOAL_PROMPT.md, and current target reports. Treat stale reports as non-proof.
 
 Use subagents before implementation:
 - one for native GPU/report freshness and verifier debt,

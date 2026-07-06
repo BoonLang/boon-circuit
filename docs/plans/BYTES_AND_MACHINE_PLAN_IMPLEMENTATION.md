@@ -34,14 +34,9 @@ Non-negotiable architectural rules:
 - Do not weaken existing budgets or report gates just to obtain green output.
 - Do not fabricate visible Wayland, manual, GPU, hardware, or operator evidence. Mark unavailable checks blocked with exact reasons.
 
-Implement phase by phase and keep a progress ledger in docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md. For every phase record:
-- base/current commit
-- files changed
-- decisions/ADRs
-- commands run and exact status
-- report paths
-- open findings/blockers
-- whether the phase exit gate is truly satisfied
+Implement phase by phase and record durable status in active aggregate reports
+and current architecture/progress plans. Do not recreate the retired 38k-line
+BYTES progress ledger.
 
 Required execution sequence:
 
@@ -146,7 +141,6 @@ Required baseline/final checks include the current repository's real commands, a
 - cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
 - cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
 - cargo xtask verify-report-schema
-- cargo xtask audit-goal-readiness
 
 Also implement and run the new BYTES/MachinePlan gates described in docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md, including a fresh aggregate --check-existing gate. Test advertised xtask command registration and negative/tamper behavior.
 

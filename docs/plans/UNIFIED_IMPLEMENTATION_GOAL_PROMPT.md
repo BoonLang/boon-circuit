@@ -51,7 +51,6 @@ Before changing code:
    - AGENTS.md
    - docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md
    - docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md
-   - docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md
    - docs/plans/NATIVE_DEMAND_DRIVEN_RENDER_LOOP_PLAN.md
    - docs/plans/GOAL_PROMPT.md
    - docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md
@@ -68,7 +67,7 @@ Before changing code:
    - the actual default CLI execution path;
    - MachinePlan/PlanExecutor and legacy-executor call sites;
    - current document patch, layout, render-scene, WGPU, native host, report, and example paths;
-   - current reports and readiness-audit output.
+   - current aggregate reports and manifest-owned refresh output.
 
 3. Create or update:
 
@@ -76,7 +75,6 @@ Before changing code:
 
    It must include:
    - actual starting HEAD and dirty-worktree summary;
-   - links to the existing BYTES/MachinePlan ledger rather than copied task history;
    - phase/task IDs for the unified plan;
    - status: not-started / in-progress / blocked / implemented / verified;
    - changed files and symbols;
@@ -84,7 +82,9 @@ Before changing code:
    - blockers and evidence classification;
    - next executable task.
 
-4. Run the existing readiness/audit commands before implementation and record their real result. A component aggregate passing while audit-goal-readiness still fails is not completion.
+4. Run the existing aggregate/report-schema commands before implementation and
+   record their real result. A component aggregate passing while its
+   manifest-owned child reports are stale or failing is not completion.
 
 5. Update stale path/symbol assumptions in the plan/ledger when the code moved, but never silently reduce scope, remove negative gates, or reinterpret a blocker as success.
 
@@ -163,7 +163,8 @@ Required outcomes:
 - retain an explicit temporary legacy/differential flag if useful;
 - remove legacy code only after default-path soak and no-hidden-fallback verification.
 
-Do not describe the runtime as final while audit-goal-readiness reports runtime implementation blockers.
+Do not describe the runtime as final while the BYTES/MachinePlan aggregate or
+native GPU handoff aggregate reports runtime implementation blockers.
 
 TASK-0804A and related Cells benchmark blockers are not permission to loop
 forever. The headed Cells visible-click gate is currently closed by commit
@@ -547,7 +548,6 @@ Run focused checks continuously and full gates at phase boundaries. At minimum p
 - cargo xtask verify-bytes-machine-plan-all
 - cargo xtask verify-report-schema
 - cargo xtask audit-machine-readiness, if still advertised under that name
-- cargo xtask audit-goal-readiness
 - cargo xtask verify-platform-contract --report target/reports/native-gpu/platform-contract.json
 - cargo xtask verify-native-gpu-dependency-graph --report target/reports/native-gpu/dependency-graph.json
 - cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json

@@ -76,6 +76,19 @@ for old evidence.
   - `cargo test -q -p xtask product_status_uses_top_level_status_only -- --nocapture`
   - `cargo test -q -p xtask product_path_rejects_single_frame_timing_without_sustained_samples -- --nocapture`
 
+### 2026-07-06 - Retired Runtime Shell String Audits Cut
+
+- Removed broad `xtask` string-archaeology checks for already-deleted runtime
+  shell names and report fields.
+- Kept the positive contract that `LiveRuntime` product output roots call the
+  PlanExecutor session directly.
+- Updated `audit-genericity` to check the current source/project
+  PlanExecutor-backed LiveRuntime API and stopped treating report metadata or
+  Cells-specific verifier helpers as product runtime shortcuts.
+- Focused checks passed:
+  - `cargo xtask audit-genericity --report target/reports/genericity-audit.json`
+  - `cargo xtask verify-compiler-boundaries --report target/reports/compiler-boundaries.json`
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the

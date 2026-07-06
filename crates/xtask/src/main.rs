@@ -3444,17 +3444,13 @@ fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "custom_runtime_scenario_path",
             "ExecutableSurfaceKind::TodoMvc",
             "ExecutableSurfaceKind::Cells",
-            "LoadedRuntimeSurface::Todo",
-            "LoadedRuntimeSurface::Cells",
             "validate_executable_surface",
             "lower_todomvc_patch",
             "lower_cells_patch",
             "todomvc_summary",
-            "cells_summary",
             "todo_cells_specific_shortcut",
             "formula_state",
             "program.kind.as_str",
-            "parsed.kind",
         ] {
             let hits = haystack.matches(forbidden).count();
             push_audit_check(
@@ -3469,7 +3465,9 @@ fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let generic_runtime_api = runtime.contains("pub fn from_source(")
-        && runtime.contains("fn apply_generic_step")
+        && runtime.contains("pub fn from_project(")
+        && runtime.contains("plan_session: PlanExecutorLiveSession")
+        && runtime.contains("fn plan_session_mut(&mut self) -> &mut PlanExecutorLiveSession")
         && native.contains("generic-live-runtime");
     push_audit_check(
         &mut checks,
@@ -3477,8 +3475,10 @@ fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "audit-genericity:runtime:from-source-api",
         generic_runtime_api,
         format!("generic_runtime_api={generic_runtime_api}"),
-        (!generic_runtime_api)
-            .then(|| "runtime must expose a source-only generic LiveRuntime path".to_owned()),
+        (!generic_runtime_api).then(|| {
+            "runtime must expose generic PlanExecutor-backed LiveRuntime source/project paths"
+                .to_owned()
+        }),
     );
     write_static_gate_report(
         args,
@@ -3488,7 +3488,7 @@ fn audit_genericity(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         blockers,
         json!({
             "contract": "generic examples must execute through one LiveRuntime source/scenario path; static preview, future-generic false greens, and TodoMVC/Cells runtime surfaces are banned",
-            "remaining_legacy_runtime_surfaces": "not allowed in production runtime/native code; fixture-only names belong in examples, scenarios, tests, or docs"
+            "runtime_surface_policy": "product runtime/native code must not branch on TodoMVC or Cells surfaces"
         }),
     )
 }
@@ -3853,9 +3853,8 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         format!(
             "compiler_owns_runtime_scenario_report_context={compiler_owns_runtime_scenario_report_context}"
         ),
-        (!compiler_owns_runtime_scenario_report_context).then(|| {
-            "`boon_runtime` still exposes raw LoadedRuntime scenario report helpers".to_owned()
-        }),
+        (!compiler_owns_runtime_scenario_report_context)
+            .then(|| "`boon_runtime` still owns scenario report context".to_owned()),
     );
 
     let compiler_owns_machine_plan_backend_source =
@@ -4727,52 +4726,9 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && !plan_executor_source.contains("\"compare_legacy\": input.compare_legacy")
         && !runtime_source
             .contains("legacy comparison was removed from the product scenario-event path");
-    let live_runtime_loaded_engine_removed = !runtime_source
-        .contains("#[cfg(test)]\n    LoadedRuntime(LoadedRuntime)")
-        && !runtime_source.contains("enum LiveRuntimeEngine")
-        && !runtime_source.contains("engine: LiveRuntimeEngine")
-        && !runtime_source.contains("LiveRuntimeEngine::LoadedRuntime")
-        && !runtime_source.contains("LiveRuntimeEngine::PlanExecutor")
-        && !runtime_source.contains("fn new_legacy(")
-        && !runtime_source.contains("fn new_from_project_legacy(")
-        && !runtime_source.contains("fn from_source_legacy(")
-        && !runtime_source.contains("fn from_project_legacy(")
-        && !runtime_source.contains("fn from_project_legacy_profiled(");
-    let live_runtime_product_legacy_fallbacks_removed = runtime_source
-        .contains("plan_session: PlanExecutorLiveSession")
-        && runtime_source.contains("fn plan_session(&self) -> &PlanExecutorLiveSession")
-        && runtime_source
-            .contains("fn plan_session_mut(&mut self) -> &mut PlanExecutorLiveSession")
-        && !runtime_source.contains("fn require_plan_session(")
-        && !runtime_source.contains("fn require_plan_session_mut(")
-        && !runtime_source.contains("missing_plan_executor_session")
-        && !runtime_source.contains("LiveRuntime product build has no PlanExecutor session")
-        && !runtime_source.contains("fn apply_checked_step(")
-        && !runtime_source.contains("fn apply_checked_step_turn(")
-        && !runtime_source.contains("fn apply_checked_step_with_document_window(")
-        && !runtime_source.contains("fn apply_checked_step_with_summary_mode(")
-        && !runtime_source.contains("fn apply_checked_step_with_value_summaries(")
-        && !runtime_source.contains("event.into_step(self.next_step)")
-        && !runtime_source.contains("return self.apply_checked_step")
-        && !runtime_source.contains("if let Ok(runtime) = self.loaded_runtime_mut()");
-    let live_runtime_product_output_roots_plan_executor_only = !runtime_source
-        .contains("LiveRuntimeEngine::LoadedRuntime(runtime) => runtime.world_scene_output()")
-        && !runtime_source
-            .contains("LiveRuntimeEngine::LoadedRuntime(runtime) => runtime.solid_model_output()")
-        && runtime_source.contains("self.plan_session_mut().world_scene_output()")
+    let live_runtime_product_output_roots_plan_executor_only = runtime_source
+        .contains("self.plan_session_mut().world_scene_output()")
         && runtime_source.contains("self.plan_session_mut().solid_model_output()");
-    let loaded_runtime_shell_removed = !runtime_source.contains("struct LoadedRuntime")
-        && !runtime_source.contains("impl LoadedRuntime")
-        && !runtime_source.contains("struct LoadedRuntimeHarness")
-        && !runtime_source.contains("impl LoadedRuntimeHarness")
-        && !runtime_source.contains("trait ScenarioExecutor")
-        && !runtime_source.contains("impl ScenarioExecutor for LoadedRuntime")
-        && !runtime_source.contains("fn run_loaded_runtime_scenario");
-    let generic_scheduled_runtime_removed = !runtime_source
-        .contains("struct GenericScheduledRuntime")
-        && !runtime_source.contains("impl GenericScheduledRuntime")
-        && !runtime_source.contains("GenericScheduledRuntime::")
-        && runtime_source.contains("fn list_count_predicate_row_field(");
     let cli_retired_compare_aliases_absent = !cli_source.contains("diagnostic-compare-legacy")
         && !cli_source.contains("compare-legacy")
         && !cli_source.contains("\"legacy\" | \"semantic\"")
@@ -5970,33 +5926,11 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:live-runtime-loaded-engine-removed",
-        live_runtime_loaded_engine_removed,
-        format!("live_runtime_loaded_engine_removed={live_runtime_loaded_engine_removed}"),
-        (!live_runtime_loaded_engine_removed).then(|| {
-            "LiveRuntime loaded-runtime engine variant or constructors are still present".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:cli-retired-compare-aliases-absent",
         cli_retired_compare_aliases_absent,
         format!("cli_retired_compare_aliases_absent={cli_retired_compare_aliases_absent}"),
         (!cli_retired_compare_aliases_absent).then(|| {
             "boon_cli still contains retired legacy/compare control-plane aliases".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:live-runtime-product-legacy-fallbacks-removed",
-        live_runtime_product_legacy_fallbacks_removed,
-        format!(
-            "live_runtime_product_legacy_fallbacks_removed={live_runtime_product_legacy_fallbacks_removed}"
-        ),
-        (!live_runtime_product_legacy_fallbacks_removed).then(|| {
-            "LiveRuntime product methods still compile legacy fallback helpers".to_owned()
         }),
     );
     push_audit_check(
@@ -6008,28 +5942,9 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "live_runtime_product_output_roots_plan_executor_only={live_runtime_product_output_roots_plan_executor_only}"
         ),
         (!live_runtime_product_output_roots_plan_executor_only).then(|| {
-            "LiveRuntime product output roots still route through explicit LoadedRuntime diagnostics"
+            "LiveRuntime product output roots must call PlanExecutor session outputs directly"
                 .to_owned()
         }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:loaded-runtime-shell-removed",
-        loaded_runtime_shell_removed,
-        format!("loaded_runtime_shell_removed={loaded_runtime_shell_removed}"),
-        (!loaded_runtime_shell_removed).then(|| {
-            "LoadedRuntime shell or raw LoadedRuntime scenario helpers are still present".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:generic-scheduled-runtime-removed",
-        generic_scheduled_runtime_removed,
-        format!("generic_scheduled_runtime_removed={generic_scheduled_runtime_removed}"),
-        (!generic_scheduled_runtime_removed)
-            .then(|| "GenericScheduledRuntime test island is still present".to_owned()),
     );
     push_audit_check(
         &mut checks,
@@ -6987,10 +6902,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && runtime_source.contains("CompiledProgram::from_compiler_runtime_program")
         && !runtime_source.contains("fn new(ir: &TypedProgram, compiled: &CompiledProgram)")
         && !runtime_source.contains("_ir: &TypedProgram,\n        compiled: &CompiledProgram")
-        && !runtime_source.contains("LoadedRuntime::new(plan.ir.as_ref()")
-        && !runtime_source.contains("LoadedRuntime::new_profiled(plan.ir.as_ref()")
-        && !runtime_source.contains("GenericScheduledRuntime::new(&ir, &compiled)")
-        && !runtime_source.contains("GenericScheduledRuntime::new_profiled(ir, compiled)")
         && !runtime_source.contains("ir: Arc<TypedProgram>")
         && !runtime_source.contains("Arc::new(compiler_output.ir)")
         && !runtime_source.contains("plan.ir");
@@ -7957,10 +7868,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "scenario_events_command_report_assembly_extracted": plan_executor_scenario_events_command_report_assembly_extracted,
             "scenario_events_command_output_extracted": plan_executor_scenario_events_command_output_extracted,
             "scenario_events_product_retired_compare_absent": plan_executor_scenario_events_product_retired_compare_absent,
-            "live_runtime_loaded_engine_removed": live_runtime_loaded_engine_removed,
-            "live_runtime_product_legacy_fallbacks_removed": live_runtime_product_legacy_fallbacks_removed,
-            "loaded_runtime_shell_removed": loaded_runtime_shell_removed,
-            "generic_scheduled_runtime_removed": generic_scheduled_runtime_removed,
             "cli_retired_compare_aliases_absent": cli_retired_compare_aliases_absent,
             "native_control_plane_retired_schema_names_absent": native_control_plane_retired_schema_names_absent,
             "native_todomvc_input_parity_native_only": native_todomvc_input_parity_native_only,

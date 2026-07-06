@@ -38538,3 +38538,30 @@ Independent audit findings carried forward:
   current app-owned native proof path, remove source-replay acceptance from
   native runtime assertion evidence, and move Weston-specific input branches out
   of handoff into diagnostic/regression-only commands if they are still useful.
+
+## 2026-07-06 - Native Handoff Scoped Freshness and Input Contract Cut
+
+Status: implemented and focused-verified; aggregate refresh pending after
+commit.
+
+What changed:
+
+- Removed the old native handoff freshness fallback that let reports without
+  `worktree_fingerprints.native-gpu-handoff` compare only the full legacy
+  `worktree_fingerprint`. Missing scoped fingerprints now report
+  `basis=missing-scoped` and become refresh debt.
+- Updated `NATIVE_GPU_PIPELINE.md` to make that fail-closed scoped-fingerprint
+  behavior the architecture contract.
+- Tightened handoff label contracts so Cells visible-click and preview E2E
+  proof require the current app-owned/BoonDriver host-input route. Isolated
+  Weston remains diagnostic infrastructure, not handoff acceptance evidence.
+- Added focused negative tests proving isolated Weston no longer satisfies the
+  native handoff input label contracts.
+
+Fresh focused evidence before commit:
+
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p xtask report_worktree_freshness -- --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu_label_contract_rejects -- --nocapture`:
+  pass.
+- `cargo check -q -p xtask`: pass.

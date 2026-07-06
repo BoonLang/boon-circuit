@@ -1050,8 +1050,9 @@ progress ledgers and goal-prompt prose so plan-doc churn does not stale
 otherwise current product reports. Scoped fingerprint material must include the
 scoped committed `HEAD` tree/blob identity plus scoped dirty status and diff;
 status/diff-only scoped fingerprints are not sufficient freshness evidence
-after commits. Older reports without the scoped field fall back to the full
-worktree fingerprint.
+after commits. Older reports without the scoped field are refresh debt for the
+handoff aggregate; the full worktree fingerprint is preserved only as legacy
+diagnostic context and must not make a missing scoped fingerprint fresh.
 
 Native `xtask` reports also carry `verifier_identity`, a scoped verifier
 contract identity containing the identity kind, scheme version, command,

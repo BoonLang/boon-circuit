@@ -322,6 +322,65 @@ Remaining work:
   index hits, candidates, and zero-scan address lookup without reintroducing
   Cells-specific branches.
 
+## 2026-07-06 - PlanExecutor List Store Exact Lookup Slice
+
+Status: generic lookup cut implemented and verified with focused runtime,
+Cells source-replay, and runtime-finality evidence.
+
+What changed:
+
+- `PlanExecutorListStore` now owns a generic exact field lookup index keyed by
+  list id, field name, and canonical JSON value.
+- Mutating access through the existing deref-compatible store boundary clears
+  cached indexes, so the transitional compatibility surface cannot silently keep
+  stale lookup results.
+- Document `List/find` projection summaries now route through
+  `PlanExecutorListStore::exact_field_lookup` instead of open-coding a row
+  scan in the summary materializer.
+- Root `List/find_value` update branches now use the same store lookup when
+  runtime list state is available. The initial-list fallback remains only for
+  source-free initial/root lookup evaluation where no live store exists yet.
+- The implementation is generic over list id, field, and JSON value; it does
+  not branch on Cells or any example name.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_root_find_value_resolves_runtime_list_ref -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo run -q -p boon_cli -- run examples/cells.bn --scenario
+  examples/cells.scn --report
+  target/reports/bytes-plan/cells-scenario-events-full.json`: pass.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json
+  target/reports/bytes-plan/cells-scenario-events-full.json`: pass.
+
+Fresh Cells source-replay summary:
+
+- `status=pass`, `plan_executor_status=pass`, `exit_status=0`.
+- `comparison_status=not-requested`; the product source-replay path is no
+  longer carrying a legacy comparison oracle.
+- PlanExecutor command output reports `runtime_ast_eval_count=0`,
+  `executable_string_path_count=0`, `unknown_plan_op_count=0`, and
+  `graph_rebuild_count=0`.
+
+Remaining work:
+
+- Move summary currentness refresh and list projection materialization methods
+  fully onto `PlanExecutorListStore`, then remove the deref-based transitional
+  mutation surface.
+- Add explicit report counters for exact lookup index hits, misses, candidate
+  counts, and scan counts so native/Cells reports can prove zero-scan address
+  lookup directly.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

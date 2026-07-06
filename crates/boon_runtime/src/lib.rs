@@ -4239,7 +4239,7 @@ impl PlanExecutorRuntimeState {
                     source_id,
                     source_route_slot,
                     &event,
-                    Some(&self.list_store),
+                    Some(&mut self.list_store),
                     staged_state,
                     host_file_root,
                 )
@@ -5625,17 +5625,66 @@ type PlanListRowState = PlanExecutorListRowState;
 #[derive(Clone, Default)]
 struct PlanExecutorListStore {
     rows_by_list: BTreeMap<usize, Vec<PlanListRowState>>,
+    exact_field_indexes: BTreeMap<(usize, String), PlanExecutorExactFieldIndex>,
 }
 
 impl PlanExecutorListStore {
-    fn into_rows_by_list(self) -> BTreeMap<usize, Vec<PlanListRowState>> {
-        self.rows_by_list
+    fn exact_field_lookup(
+        &mut self,
+        list_id: usize,
+        field_name: &str,
+        expected: &JsonValue,
+    ) -> Option<usize> {
+        let key = (list_id, field_name.to_owned());
+        if !self.exact_field_indexes.contains_key(&key) {
+            let Some(rows) = self.rows_by_list.get(&list_id) else {
+                return None;
+            };
+            let index = PlanExecutorExactFieldIndex::from_rows(rows, field_name);
+            self.exact_field_indexes.insert(key.clone(), index);
+        }
+        self.exact_field_indexes
+            .get(&key)?
+            .first_row_index(expected)
+    }
+
+    fn invalidate_indexes(&mut self) {
+        self.exact_field_indexes.clear();
     }
 }
 
 impl From<BTreeMap<usize, Vec<PlanListRowState>>> for PlanExecutorListStore {
     fn from(rows_by_list: BTreeMap<usize, Vec<PlanListRowState>>) -> Self {
-        Self { rows_by_list }
+        Self {
+            rows_by_list,
+            exact_field_indexes: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PlanExecutorExactFieldIndex {
+    rows_by_value: BTreeMap<String, Vec<usize>>,
+}
+
+impl PlanExecutorExactFieldIndex {
+    fn from_rows(rows: &[PlanListRowState], field_name: &str) -> Self {
+        let mut rows_by_value: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (row_index, row) in rows.iter().enumerate() {
+            let Some(value) = row.fields.get(field_name) else {
+                continue;
+            };
+            let Ok(key) = serde_json::to_string(value) else {
+                continue;
+            };
+            rows_by_value.entry(key).or_default().push(row_index);
+        }
+        Self { rows_by_value }
+    }
+
+    fn first_row_index(&self, expected: &JsonValue) -> Option<usize> {
+        let key = serde_json::to_string(expected).ok()?;
+        self.rows_by_value.get(&key)?.first().copied()
     }
 }
 
@@ -5649,6 +5698,7 @@ impl Deref for PlanExecutorListStore {
 
 impl DerefMut for PlanExecutorListStore {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.invalidate_indexes();
         &mut self.rows_by_list
     }
 }
@@ -5680,7 +5730,7 @@ fn materialize_plan_list_retains(
 fn plan_executor_document_summary_with_limits(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_state: &mut PlanExecutorListStore,
     limits: SummaryLimits,
 ) -> JsonValue {
     let mut summary_root_state = plan_executor_summary_root_state(plan, root_state);
@@ -5949,7 +5999,7 @@ fn plan_executor_insert_direct_list_summaries(
 fn plan_executor_insert_projection_summaries(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_store: &mut PlanExecutorListStore,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
@@ -5974,23 +6024,17 @@ fn plan_executor_insert_projection_summaries(
                 value,
             } => {
                 let selector = plan_executor_projection_selector_value(plan, root_state, value);
-                let rows = list_state
-                    .get(&source_list.0)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let row_index = rows
-                    .iter()
-                    .position(|row| row_json_values_equal(row.fields.get(field), &selector));
+                let row_index = list_store.exact_field_lookup(source_list.0, field, &selector);
                 let projected = row_index
                     .and_then(|row_index| {
                         plan_executor_refresh_summary_row_current(
                             plan,
                             root_state,
-                            list_state,
+                            list_store,
                             source_list.0,
                             row_index,
                         );
-                        list_state
+                        list_store
                             .get(&source_list.0)
                             .and_then(|rows| rows.get(row_index))
                             .map(|row| plan_executor_row_document_json(plan, source_list.0, row))
@@ -6006,7 +6050,7 @@ fn plan_executor_insert_projection_summaries(
                 item_field,
                 label_field,
             } => {
-                let source_row_count = list_state
+                let source_row_count = list_store
                     .get(&source_list.0)
                     .map(Vec::len)
                     .unwrap_or_default();
@@ -6014,7 +6058,7 @@ fn plan_executor_insert_projection_summaries(
                     plan,
                     root_state,
                     source_list.0,
-                    list_state,
+                    list_store,
                     *size,
                     item_field,
                     label_field,
@@ -9609,7 +9653,7 @@ fn execute_root_scalar_update_branch(
     source_id: SourceId,
     source_route_slot: &boon_plan::SourceRoute,
     event: &LiveSourceEvent,
-    list_state: Option<&BTreeMap<usize, Vec<PlanListRowState>>>,
+    mut list_store: Option<&mut PlanExecutorListStore>,
     root_state: &PlanExecutorRootState,
     host_file_root: Option<&Path>,
 ) -> RuntimeResult<Option<RootExecutedUpdate>> {
@@ -10040,18 +10084,22 @@ fn execute_root_scalar_update_branch(
             )?;
             let field_name = plan_row_field_local_name(plan, *field_id);
             let target_name = plan_row_field_local_name(plan, *target_id);
-            let initial_rows;
-            let rows: &[PlanListRowState] =
-                if let Some(rows) = list_state.and_then(|lists| lists.get(&list_id.0)) {
-                    rows
-                } else {
-                    initial_rows = plan_initial_list_rows_for_root_lookup(plan, *list_id, op.id.0)?;
-                    &initial_rows
-                };
-            let value = rows
-                .iter()
-                .find(|row| row_json_values_equal(row.fields.get(&field_name), &expected))
-                .and_then(|row| row.fields.get(&target_name).cloned());
+            let value = if let Some(store) = list_store.as_deref_mut() {
+                store
+                    .exact_field_lookup(list_id.0, &field_name, &expected)
+                    .and_then(|row_index| {
+                        store
+                            .get(&list_id.0)
+                            .and_then(|rows| rows.get(row_index))
+                            .and_then(|row| row.fields.get(&target_name).cloned())
+                    })
+            } else {
+                let initial_rows = plan_initial_list_rows_for_root_lookup(plan, *list_id, op.id.0)?;
+                initial_rows
+                    .iter()
+                    .find(|row| row_json_values_equal(row.fields.get(&field_name), &expected))
+                    .and_then(|row| row.fields.get(&target_name).cloned())
+            };
             let value = match value {
                 Some(value) => value,
                 None => {
@@ -54094,6 +54142,51 @@ document: Document/new(root: Element/label(element: [], label: store.value))
                 .list_slots
                 .windows(2)
                 .all(|window| window[0].list_id < window[1].list_id)
+        );
+    }
+
+    #[test]
+    fn plan_executor_list_store_exact_lookup_invalidates_after_mutation() {
+        let mut first_fields = BTreeMap::new();
+        first_fields.insert("address".to_owned(), json!("A0"));
+        let mut second_fields = BTreeMap::new();
+        second_fields.insert("address".to_owned(), json!("B0"));
+        let mut store = PlanExecutorListStore::from(BTreeMap::from([(
+            7,
+            vec![
+                PlanListRowState {
+                    key: 10,
+                    generation: 0,
+                    fields: first_fields,
+                    private_bytes: BTreeMap::new(),
+                    fixed_bytes_banks: BTreeMap::new(),
+                },
+                PlanListRowState {
+                    key: 11,
+                    generation: 0,
+                    fields: second_fields,
+                    private_bytes: BTreeMap::new(),
+                    fixed_bytes_banks: BTreeMap::new(),
+                },
+            ],
+        )]));
+
+        assert_eq!(
+            store.exact_field_lookup(7, "address", &json!("B0")),
+            Some(1)
+        );
+        store
+            .get_mut(&7)
+            .unwrap()
+            .get_mut(1)
+            .unwrap()
+            .fields
+            .insert("address".to_owned(), json!("C0"));
+
+        assert_eq!(store.exact_field_lookup(7, "address", &json!("B0")), None);
+        assert_eq!(
+            store.exact_field_lookup(7, "address", &json!("C0")),
+            Some(1)
         );
     }
 

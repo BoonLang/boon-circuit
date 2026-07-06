@@ -2125,7 +2125,7 @@ fn semantic_output_roots(
             };
             let output_kind = match name.as_str() {
                 "document" => "document",
-                "scene" => "legacy_scene",
+                "scene" => "scene",
                 "world" => "world",
                 "manufacturing" => "manufacturing",
                 _ => return None,
@@ -2164,7 +2164,7 @@ fn output_root_values(
             };
             let output_kind = match name.as_str() {
                 "document" => "document",
-                "scene" => "legacy_scene",
+                "scene" => "scene",
                 "world" => "world",
                 "manufacturing" => "manufacturing",
                 _ => return None,

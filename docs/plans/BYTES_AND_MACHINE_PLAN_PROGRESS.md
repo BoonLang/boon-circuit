@@ -38740,3 +38740,21 @@ Fresh focused evidence before commit:
 - `cargo test -q -p xtask
   source_replay_product_status_uses_plan_executor_split_fields -- --nocapture`:
   pass.
+
+## 2026-07-06 - IR Scene Output Kind Drops Legacy Label
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Changed compiler semantic output-root and output-root-value metadata for a
+  `scene:` root from `output_kind=legacy_scene` to `output_kind=scene`.
+- Updated the active goal prompt so future cleanup does not keep chasing the
+  removed `legacy_scene` label.
+
+Fresh focused evidence before commit:
+
+- `rg -n "legacy_scene" crates docs/plans/GOAL_PROMPT.md docs/architecture
+  --glob '!target'`: no matches.
+- `cargo test -q -p boon_ir scene_view_bindings -- --nocapture`: pass.
+- `cargo check -q -p boon_ir`: pass.

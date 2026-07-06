@@ -60,6 +60,22 @@ for old evidence.
 - Focused tests were renamed to check the explicit native input recovery path
   instead of a runtime-sounding fallback.
 
+### 2026-07-06 - Verifier Product Status And Timing Fallback Cut
+
+- `xtask` aggregate status checks now use each child report's top-level
+  `status` as the product pass/fail bit. PlanExecutor-specific fields remain
+  schema-owned detail instead of a second product status lane.
+- Removed the native scroll product UX single-sample timing fallback from
+  `frame_input_to_present_ms`. Product scroll timing now requires sustained
+  `preview_perf_stats.input_to_present_ms_p50_p95_p99_max` samples.
+- Fresh aggregate check-existing evidence before this cut showed refresh debt
+  only: `target/reports/native-gpu-all.json` reported 17 refresh-debt children
+  and zero true blockers.
+- Focused checks passed:
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask product_status_uses_top_level_status_only -- --nocapture`
+  - `cargo test -q -p xtask product_path_rejects_single_frame_timing_without_sustained_samples -- --nocapture`
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the
@@ -170,7 +186,8 @@ Fresh focused evidence:
 1. Run compact native/BYTES aggregate summaries and use fresh taxonomy to choose
    refresh queue work versus true product blockers.
 2. Delete duplicate report/schema refresh paths that only preserve stale
-   fingerprints or old comparison contracts.
+   fingerprints, old comparison contracts, or weak diagnostic timing
+   substitutes.
 3. Move the current linear retained `ProductFrameGraph` toward a real
    renderer-owned dirty-resource scheduler.
 4. Re-run focused native Cells product-latency and proof-lane reports after the

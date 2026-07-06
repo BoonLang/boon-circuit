@@ -264,6 +264,10 @@ fn canonical_verifier_args(command: &str, args: &[String]) -> Vec<String> {
             index = index.saturating_add(1);
             continue;
         }
+        if command == "verify-native-gpu-present-floor" && arg == "--inner-app-window" {
+            index = index.saturating_add(1);
+            continue;
+        }
         canonical.push(arg.clone());
         index = index.saturating_add(1);
     }
@@ -33441,6 +33445,29 @@ mod tests {
         );
         assert!(!schema_accepts(report, "native-scoped-stale-identity"));
         let _ = fs::remove_file(command_path);
+    }
+
+    #[test]
+    fn present_floor_scoped_verifier_identity_ignores_inner_probe_arg() {
+        let args = vec![
+            "verify-native-gpu-present-floor".to_owned(),
+            "--inner-app-window".to_owned(),
+            "--report".to_owned(),
+            "target/reports/native-gpu/present-floor.json".to_owned(),
+        ];
+        let public_args = vec![
+            "verify-native-gpu-present-floor".to_owned(),
+            "--report".to_owned(),
+            "target/reports/native-gpu/present-floor.json".to_owned(),
+        ];
+        assert_eq!(
+            verifier_identity_for_command_args("verify-native-gpu-present-floor", "proof", &args),
+            verifier_identity_for_command_args(
+                "verify-native-gpu-present-floor",
+                "proof",
+                &public_args
+            )
+        );
     }
 
     fn program_hash_for_single_source(source_path: &str, source: &str) -> String {

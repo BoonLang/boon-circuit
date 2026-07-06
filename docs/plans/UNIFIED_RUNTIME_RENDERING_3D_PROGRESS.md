@@ -37123,6 +37123,9 @@ What changed:
 - Present-floor verifier identity now ignores the private `--inner-app-window`
   probe flag, keeping the public focus-safe manifest command and the inner
   implementation report aligned.
+- The shared report-schema verifier now uses the same present-floor identity
+  canonicalization as xtask, so report writing and schema validation no longer
+  disagree on the private inner probe argument.
 
 Fresh focused evidence:
 
@@ -37131,6 +37134,13 @@ Fresh focused evidence:
 - `cargo check -q -p xtask`: pass.
 - `cargo check -q -p boon_native_playground`: pass.
 - `cargo test -q -p xtask present_floor_ -- --nocapture`: pass.
+- `cargo test -q -p boon_report_schema
+  present_floor_scoped_verifier_identity_ignores_inner_probe_arg --
+  --nocapture`: pass.
+- `cargo xtask verify-report-schema
+  target/reports/native-gpu/present-floor.json`: pass with the patched schema.
+- `cargo xtask verify-report-schema
+  target/reports/native-gpu/preview-e2e-todo_mvc_physical.json`: pass.
 
 Remaining scope:
 

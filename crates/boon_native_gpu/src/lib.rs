@@ -49,6 +49,7 @@ const DOCUMENT_MONOSPACE_FONT_FAMILY: &str = "Liberation Mono";
 const MAX_CACHED_QUAD_BATCHES: usize = 4096;
 const MAX_CACHED_ASSET_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;
 const APP_OWNED_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const PRODUCT_FRAME_GRAPH_SCHEDULER_KIND: &str = "renderer_owned_product_frame_schedule_v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceFormat(pub String);
@@ -2154,6 +2155,34 @@ struct ProductFrameGraphPass {
 }
 
 impl ProductFrameGraphPass {
+    fn product(
+        pass_id: ProductFrameGraphPassId,
+        input: ProductFrameGraphResourceId,
+        output: ProductFrameGraphResourceId,
+    ) -> Self {
+        Self {
+            pass_id,
+            input,
+            output,
+            product_visible: true,
+            proof_or_readback: false,
+        }
+    }
+
+    fn metrics(
+        pass_id: ProductFrameGraphPassId,
+        input: ProductFrameGraphResourceId,
+        output: ProductFrameGraphResourceId,
+    ) -> Self {
+        Self {
+            pass_id,
+            input,
+            output,
+            product_visible: false,
+            proof_or_readback: false,
+        }
+    }
+
     fn metric(
         &self,
         duration_ms: f64,
@@ -2183,13 +2212,113 @@ struct ProductFrameGraph {
     passes: Vec<ProductFrameGraphPass>,
 }
 
-#[derive(Debug, Default)]
-struct ProductFrameGraphExecutor {
+impl ProductFrameGraph {
+    fn product_surface(text_run_count: usize) -> Self {
+        Self {
+            passes: vec![
+                ProductFrameGraphPass::product(
+                    ProductFrameGraphPassId::SceneKey,
+                    ProductFrameGraphResourceId::RenderScene,
+                    ProductFrameGraphResourceId::SceneCacheKey,
+                ),
+                ProductFrameGraphPass::product(
+                    ProductFrameGraphPassId::QuadPrepareUpload,
+                    ProductFrameGraphResourceId::RenderSceneItems,
+                    ProductFrameGraphResourceId::RetainedGpuBuffers,
+                ),
+                ProductFrameGraphPass::product(
+                    ProductFrameGraphPassId::UiDraw,
+                    ProductFrameGraphResourceId::RetainedGpuBuffers,
+                    ProductFrameGraphResourceId::ColorTarget,
+                ),
+                ProductFrameGraphPass::metrics(
+                    ProductFrameGraphPassId::RetainedMetrics,
+                    ProductFrameGraphResourceId::RenderScene,
+                    ProductFrameGraphResourceId::FrameMetrics,
+                ),
+                ProductFrameGraphPass::product(
+                    ProductFrameGraphPassId::TextDraw,
+                    if text_run_count == 0 {
+                        ProductFrameGraphResourceId::NoTextRuns
+                    } else {
+                        ProductFrameGraphResourceId::TextRuns
+                    },
+                    ProductFrameGraphResourceId::ColorTarget,
+                ),
+            ],
+        }
+    }
+
+    fn planned_pass_metrics(&self) -> Vec<RendererRenderGraphPassMetric> {
+        self.passes
+            .iter()
+            .map(|pass| pass.metric(0.0, RendererRenderGraphPassStats::default()))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProductFrameSchedule {
     graph: ProductFrameGraph,
+    planned_passes: Vec<RendererRenderGraphPassMetric>,
+    planned_resources: Vec<RendererRenderGraphResourceMetric>,
+    scheduler_kind: &'static str,
+}
+
+impl ProductFrameSchedule {
+    fn product_surface(text_run_count: usize) -> Self {
+        let graph = ProductFrameGraph::product_surface(text_run_count);
+        let planned_passes = graph.planned_pass_metrics();
+        let planned_resources = renderer_render_graph_resources_for_passes(&planned_passes);
+        Self {
+            graph,
+            planned_passes,
+            planned_resources,
+            scheduler_kind: PRODUCT_FRAME_GRAPH_SCHEDULER_KIND,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.graph.passes.len()
+    }
+
+    fn pass(&self, index: usize) -> Option<&ProductFrameGraphPass> {
+        self.graph.passes.get(index)
+    }
+
+    fn plan_hash(&self) -> String {
+        renderer_render_graph_plan_hash(&self.planned_passes)
+    }
+
+    fn planned_resources(&self) -> Vec<RendererRenderGraphResourceMetric> {
+        self.planned_resources.clone()
+    }
+
+    fn schedule_decisions(
+        &self,
+        resources: &[RendererRenderGraphResourceMetric],
+        dirty_upload_chunk_ids: &[String],
+    ) -> Vec<RendererRenderGraphScheduleDecisionMetric> {
+        product_frame_graph_schedule_decisions(resources, dirty_upload_chunk_ids)
+    }
+}
+
+#[derive(Debug)]
+struct ProductFrameGraphExecutor {
+    schedule: ProductFrameSchedule,
+    next_pass_index: usize,
     executed_passes: Vec<RendererRenderGraphPassMetric>,
 }
 
 impl ProductFrameGraphExecutor {
+    fn new(schedule: ProductFrameSchedule) -> Self {
+        Self {
+            schedule,
+            next_pass_index: 0,
+            executed_passes: Vec::new(),
+        }
+    }
+
     fn run_product_pass<T>(
         &mut self,
         pass_id: ProductFrameGraphPassId,
@@ -2219,25 +2348,71 @@ impl ProductFrameGraphExecutor {
         proof_or_readback: bool,
         run: impl FnOnce() -> Result<(T, RendererRenderGraphPassStats), RenderError>,
     ) -> Result<(T, f64), RenderError> {
-        let graph_pass = ProductFrameGraphPass {
-            pass_id,
-            input,
-            output,
-            product_visible,
-            proof_or_readback,
-        };
+        let graph_pass = self
+            .schedule
+            .pass(self.next_pass_index)
+            .ok_or_else(|| RenderError {
+                message: format!(
+                    "ProductFrameGraph schedule exhausted before pass `{}`",
+                    pass_id.label()
+                ),
+            })?;
+        if graph_pass.pass_id != pass_id
+            || graph_pass.input != input
+            || graph_pass.output != output
+            || graph_pass.product_visible != product_visible
+            || graph_pass.proof_or_readback != proof_or_readback
+        {
+            return Err(RenderError {
+                message: format!(
+                    "ProductFrameGraph schedule mismatch at pass {}: expected {} {}->{}, got {} {}->{}",
+                    self.next_pass_index,
+                    graph_pass.pass_id.label(),
+                    graph_pass.input.label(),
+                    graph_pass.output.label(),
+                    pass_id.label(),
+                    input.label(),
+                    output.label()
+                ),
+            });
+        }
+        let graph_pass = graph_pass.clone();
         let started = Instant::now();
         let (value, stats) = run()?;
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.executed_passes
             .push(graph_pass.metric(duration_ms, stats));
-        self.graph.passes.push(graph_pass);
+        self.next_pass_index += 1;
         Ok((value, duration_ms))
     }
 
-    fn into_passes(self) -> Vec<RendererRenderGraphPassMetric> {
-        self.executed_passes
+    fn finish(self) -> Result<ProductFrameExecution, RenderError> {
+        if self.next_pass_index != self.schedule.len() {
+            let missing = self
+                .schedule
+                .pass(self.next_pass_index)
+                .map(|pass| pass.pass_id.label())
+                .unwrap_or("unknown");
+            return Err(RenderError {
+                message: format!(
+                    "ProductFrameGraph schedule finished early at pass {} of {}; next pass `{}` was not executed",
+                    self.next_pass_index,
+                    self.schedule.len(),
+                    missing
+                ),
+            });
+        }
+        Ok(ProductFrameExecution {
+            schedule: self.schedule,
+            executed_passes: self.executed_passes,
+        })
     }
+}
+
+#[derive(Debug)]
+struct ProductFrameExecution {
+    schedule: ProductFrameSchedule,
+    executed_passes: Vec<RendererRenderGraphPassMetric>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2456,7 +2631,8 @@ fn encode_internal_scene_to_surface(
     let width = request.width;
     let height = request.height;
     let text_runs_shaped = scene.text_runs.len() as u32;
-    let mut render_graph = ProductFrameGraphExecutor::default();
+    let render_schedule = ProductFrameSchedule::product_surface(scene.text_runs.len());
+    let mut render_graph = ProductFrameGraphExecutor::new(render_schedule);
     let (scene_key, scene_key_ms) = render_graph.run_product_pass(
         ProductFrameGraphPassId::SceneKey,
         ProductFrameGraphResourceId::RenderScene,
@@ -2803,9 +2979,9 @@ fn encode_internal_scene_to_surface(
                 ))
             },
         )?;
-    let renderer_render_graph_passes = render_graph.into_passes();
-    let mut renderer_render_graph_resources =
-        renderer_render_graph_resources_for_passes(&renderer_render_graph_passes);
+    let render_execution = render_graph.finish()?;
+    let renderer_render_graph_passes = render_execution.executed_passes;
+    let mut renderer_render_graph_resources = render_execution.schedule.planned_resources();
     let renderer_render_graph_resource_signatures = renderer_render_graph_resource_signatures(
         scene_key,
         frame_seq,
@@ -2818,14 +2994,12 @@ fn encode_internal_scene_to_surface(
         &mut renderer_render_graph_resources,
         &renderer_render_graph_resource_signatures,
     );
-    let renderer_render_graph_schedule_decisions = product_frame_graph_schedule_decisions(
-        &renderer_render_graph_resources,
-        &dirty_upload_chunk_ids,
-    );
+    let renderer_render_graph_schedule_decisions = render_execution
+        .schedule
+        .schedule_decisions(&renderer_render_graph_resources, &dirty_upload_chunk_ids);
     let schedule_metrics =
         product_frame_graph_schedule_metrics(&renderer_render_graph_schedule_decisions);
-    let renderer_render_graph_plan_hash =
-        renderer_render_graph_plan_hash(&renderer_render_graph_passes);
+    let renderer_render_graph_plan_hash = render_execution.schedule.plan_hash();
     let renderer_render_graph_workload_hash =
         renderer_render_graph_workload_hash(&renderer_render_graph_passes);
     let renderer_render_graph_resource_lifetime_hash =
@@ -2859,7 +3033,7 @@ fn encode_internal_scene_to_surface(
         renderer_render_graph_retained_reused_resource_count: retained_state_metrics
             .reused_resource_count,
         renderer_render_graph_retained_state_resource_count: retained_state_metrics.resource_count,
-        renderer_render_graph_scheduler_kind: "retained_resource_decision_v1".to_owned(),
+        renderer_render_graph_scheduler_kind: render_execution.schedule.scheduler_kind.to_owned(),
         renderer_render_graph_schedule_hash: schedule_metrics.schedule_hash,
         renderer_render_graph_schedule_decision_count: schedule_metrics.decision_count,
         renderer_render_graph_dirty_resource_decision_count: schedule_metrics
@@ -8969,7 +9143,8 @@ mod tests {
 
     #[test]
     fn product_frame_graph_executor_emits_typed_pass_and_resource_metrics() {
-        let mut graph = ProductFrameGraphExecutor::default();
+        let schedule = ProductFrameSchedule::product_surface(1);
+        let mut graph = ProductFrameGraphExecutor::new(schedule);
         let (scene_key, _scene_key_ms) = graph
             .run_product_pass(
                 ProductFrameGraphPassId::SceneKey,
@@ -8987,6 +9162,40 @@ mod tests {
             )
             .expect("scene-key graph pass should run");
         assert_eq!(scene_key, 17);
+        graph
+            .run_product_pass(
+                ProductFrameGraphPassId::QuadPrepareUpload,
+                ProductFrameGraphResourceId::RenderSceneItems,
+                ProductFrameGraphResourceId::RetainedGpuBuffers,
+                || {
+                    Ok((
+                        (),
+                        RendererRenderGraphPassStats {
+                            upload_bytes: 128,
+                            dirty_chunk_count: 1,
+                            queue_write_count: 1,
+                            ..RendererRenderGraphPassStats::default()
+                        },
+                    ))
+                },
+            )
+            .expect("quad prepare graph pass should run");
+        graph
+            .run_product_pass(
+                ProductFrameGraphPassId::UiDraw,
+                ProductFrameGraphResourceId::RetainedGpuBuffers,
+                ProductFrameGraphResourceId::ColorTarget,
+                || {
+                    Ok((
+                        (),
+                        RendererRenderGraphPassStats {
+                            draw_call_count: 1,
+                            ..RendererRenderGraphPassStats::default()
+                        },
+                    ))
+                },
+            )
+            .expect("ui draw graph pass should run");
         let ((), _metrics_ms) = graph
             .run_metrics_pass(
                 ProductFrameGraphPassId::RetainedMetrics,
@@ -8995,19 +9204,36 @@ mod tests {
                 || Ok(((), RendererRenderGraphPassStats::default())),
             )
             .expect("retained-metrics graph pass should run");
+        graph
+            .run_product_pass(
+                ProductFrameGraphPassId::TextDraw,
+                ProductFrameGraphResourceId::TextRuns,
+                ProductFrameGraphResourceId::ColorTarget,
+                || {
+                    Ok((
+                        (),
+                        RendererRenderGraphPassStats {
+                            draw_call_count: 1,
+                            ..RendererRenderGraphPassStats::default()
+                        },
+                    ))
+                },
+            )
+            .expect("text draw graph pass should run");
 
-        let passes = graph.into_passes();
-        assert_eq!(passes.len(), 2);
+        let execution = graph.finish().expect("full graph schedule should finish");
+        let passes = execution.executed_passes;
+        assert_eq!(passes.len(), 5);
         assert_eq!(passes[0].pass_id, "renderer-scene-key");
         assert_eq!(passes[0].pass_kind, "scene_identity");
         assert_eq!(passes[0].read_resources, vec!["RenderScene"]);
         assert_eq!(passes[0].write_resources, vec!["SceneCacheKey"]);
         assert!(passes[0].product_visible);
         assert!(!passes[0].proof_or_readback);
-        assert_eq!(passes[1].pass_id, "renderer-retained-metrics");
-        assert_eq!(passes[1].pass_kind, "retained_metrics");
-        assert!(!passes[1].product_visible);
-        assert!(!passes[1].proof_or_readback);
+        assert_eq!(passes[3].pass_id, "renderer-retained-metrics");
+        assert_eq!(passes[3].pass_kind, "retained_metrics");
+        assert!(!passes[3].product_visible);
+        assert!(!passes[3].proof_or_readback);
 
         let resources = renderer_render_graph_resources_for_passes(&passes);
         assert!(resources.iter().any(|resource| {
@@ -9023,16 +9249,14 @@ mod tests {
 
     #[test]
     fn product_frame_graph_state_tracks_dirty_and_reused_resource_epochs() {
-        let mut graph = ProductFrameGraphExecutor::default();
-        let ((), _scene_key_ms) = graph
-            .run_product_pass(
+        let passes = vec![
+            ProductFrameGraphPass::product(
                 ProductFrameGraphPassId::SceneKey,
                 ProductFrameGraphResourceId::RenderScene,
                 ProductFrameGraphResourceId::SceneCacheKey,
-                || Ok(((), RendererRenderGraphPassStats::default())),
             )
-            .expect("scene-key graph pass should run");
-        let passes = graph.into_passes();
+            .metric(0.0, RendererRenderGraphPassStats::default()),
+        ];
         let mut resources = renderer_render_graph_resources_for_passes(&passes);
         let mut state = ProductFrameGraphState::default();
         let first_signatures = BTreeMap::from([
@@ -9181,6 +9405,81 @@ mod tests {
         assert_eq!(metrics.reuse_resource_decision_count, 1);
         assert_eq!(metrics.per_present_resource_decision_count, 2);
         assert_eq!(metrics.schedule_hash.len(), 64);
+    }
+
+    #[test]
+    fn product_frame_schedule_declares_resources_before_execution() {
+        let schedule = ProductFrameSchedule::product_surface(3);
+        assert_eq!(schedule.scheduler_kind, PRODUCT_FRAME_GRAPH_SCHEDULER_KIND);
+        assert_eq!(schedule.len(), 5);
+        assert_eq!(schedule.plan_hash().len(), 64);
+        let resources = schedule.planned_resources();
+        let resource_ids = resources
+            .iter()
+            .map(|resource| resource.resource_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(resource_ids.contains("RenderScene"));
+        assert!(resource_ids.contains("RenderSceneItems"));
+        assert!(resource_ids.contains("RetainedGpuBuffers"));
+        assert!(resource_ids.contains("ColorTarget"));
+        assert!(resource_ids.contains("FrameMetrics"));
+        assert!(resource_ids.contains("TextRuns"));
+        assert!(!resource_ids.contains("NoTextRuns"));
+    }
+
+    #[test]
+    fn product_frame_schedule_uses_no_text_resource_for_empty_text() {
+        let schedule = ProductFrameSchedule::product_surface(0);
+        let resources = schedule.planned_resources();
+        let resource_ids = resources
+            .iter()
+            .map(|resource| resource.resource_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(resource_ids.contains("NoTextRuns"));
+        assert!(!resource_ids.contains("TextRuns"));
+    }
+
+    #[test]
+    fn product_frame_graph_executor_rejects_out_of_order_pass() {
+        let schedule = ProductFrameSchedule::product_surface(1);
+        let mut executor = ProductFrameGraphExecutor::new(schedule);
+        let error = executor
+            .run_product_pass(
+                ProductFrameGraphPassId::UiDraw,
+                ProductFrameGraphResourceId::RetainedGpuBuffers,
+                ProductFrameGraphResourceId::ColorTarget,
+                || Ok(((), RendererRenderGraphPassStats::default())),
+            )
+            .expect_err("executor should reject a pass that skips the scheduled scene-key pass");
+        assert!(
+            error
+                .message
+                .contains("ProductFrameGraph schedule mismatch"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn product_frame_graph_executor_rejects_early_finish() {
+        let schedule = ProductFrameSchedule::product_surface(1);
+        let mut executor = ProductFrameGraphExecutor::new(schedule);
+        executor
+            .run_product_pass(
+                ProductFrameGraphPassId::SceneKey,
+                ProductFrameGraphResourceId::RenderScene,
+                ProductFrameGraphResourceId::SceneCacheKey,
+                || Ok((42_u64, RendererRenderGraphPassStats::default())),
+            )
+            .expect("first scheduled pass should run");
+        let error = executor
+            .finish()
+            .expect_err("executor should reject a partially executed schedule");
+        assert!(
+            error
+                .message
+                .contains("ProductFrameGraph schedule finished early"),
+            "{error:?}"
+        );
     }
 
     #[test]

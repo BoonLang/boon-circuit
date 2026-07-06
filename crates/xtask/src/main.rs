@@ -45859,7 +45859,7 @@ fn native_product_render_graph_object_contract(graph: &serde_json::Value) -> ser
     let renderer_graph_scheduler_kind_ok = graph
         .get("renderer_graph_scheduler_kind")
         .and_then(serde_json::Value::as_str)
-        == Some("retained_resource_decision_v1");
+        == Some("renderer_owned_product_frame_schedule_v1");
     let renderer_graph_schedule_hash_ok = graph
         .get("renderer_graph_schedule_hash")
         .and_then(serde_json::Value::as_str)
@@ -51355,7 +51355,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             let renderer_graph_scheduler_ok = graph
                 .get("renderer_graph_scheduler_kind")
                 .and_then(serde_json::Value::as_str)
-                == Some("retained_resource_decision_v1")
+                == Some("renderer_owned_product_frame_schedule_v1")
                 && graph
                     .get("renderer_graph_schedule_hash")
                     .and_then(serde_json::Value::as_str)
@@ -51465,7 +51465,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             let renderer_graph_scheduler_ok = graph
                 .get("renderer_graph_scheduler_kind")
                 .and_then(serde_json::Value::as_str)
-                == Some("retained_resource_decision_v1")
+                == Some("renderer_owned_product_frame_schedule_v1")
                 && graph
                     .get("renderer_graph_schedule_hash")
                     .and_then(serde_json::Value::as_str)
@@ -86878,7 +86878,7 @@ mod tests {
             "renderer_graph_retained_state_resource_count": 7,
             "renderer_graph_retained_dirty_resource_count": 2,
             "renderer_graph_retained_reused_resource_count": 5,
-            "renderer_graph_scheduler_kind": "retained_resource_decision_v1",
+            "renderer_graph_scheduler_kind": "renderer_owned_product_frame_schedule_v1",
             "renderer_graph_schedule_hash": "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012",
             "renderer_graph_schedule_decision_count": 7,
             "renderer_graph_dirty_resource_decision_count": 2,

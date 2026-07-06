@@ -32,8 +32,8 @@ for old evidence.
 | PlanExecutor authority | In progress | Current source inspection shows no `LoadedRuntime`, `LoadedRuntimeHarness`, or `GenericScheduledRuntime` implementation references in `crates/boon_runtime`; keep guarding this and replace stale docs/tests with PlanExecutor product coverage. |
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
-| ProductFrameGraph | In progress | Present/proof split exists, but renderer ownership and retained resource scheduling still need larger cuts. |
-| Test harness cleanup | In progress | Old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and ambiguous recovery labels remain high-value deletion targets. |
+| ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
+| Test harness cleanup | In progress | Old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -119,6 +119,43 @@ for old evidence.
   - proof lane status: pass, proof lag max: 0 frames;
   - broad harness click-to-formula p95 remains about 203 ms and is reported
     separately from product UX.
+
+### 2026-07-06 - Native Verifier Fallback Evidence Paths Cut
+
+- Removed the idle-wake post-idle IPC rescue path; app-owned post-idle input
+  evidence now passes or fails directly.
+- Removed Cells visible-click parent fallback reads from preview-loop sidecar
+  JSON. Product performance and commit evidence must be present in the live
+  probe payload.
+- Removed approximate product-frame matching by input latency. Cells
+  interaction verification now requires exact frame evidence keys.
+- Focused checks passed:
+  - `cargo check -q -p xtask`
+  - `cargo test -q -p xtask cells_visible_click_product_commit_match -- --nocapture`
+  - `cargo test -q -p xtask cells_visible_click_product_commit_scope -- --nocapture`
+  - `cargo test -q -p xtask post_present_proof_isolation -- --nocapture`
+  - `cargo test -q -p xtask native_idle_wake_target_helpers_accept_wrapped_press_intents -- --nocapture`
+
+### 2026-07-06 - ProductFrameGraph Schedule Boundary Added
+
+- `boon_native_gpu` now creates a `ProductFrameSchedule` before encoding a
+  product frame.
+- `ProductFrameGraphExecutor` consumes that schedule in order and fails on
+  out-of-order or partial execution instead of opportunistically defining the
+  graph as passes run.
+- Product graph plan/resource hashes are derived from the declared renderer
+  schedule; workload metrics remain execution output.
+- The scheduler kind is now
+  `renderer_owned_product_frame_schedule_v1`.
+- Independent review identified the next harness cleanup target: delete the
+  remaining isolated-Weston verifier-owned compositor family as one coherent
+  chunk, rather than preserving it as an alternate native evidence route.
+- Focused checks passed:
+  - `cargo check -q -p boon_native_gpu -p boon_native_playground -p boon_native_app_window -p xtask`
+  - `cargo test -q -p boon_native_gpu product_frame_schedule -- --nocapture`
+  - `cargo test -q -p boon_native_gpu product_frame_graph_executor -- --nocapture`
+  - `cargo test -q -p xtask product_render_graph -- --nocapture`
+  - `cargo test -q -p xtask cells_visible_click_product_commit_scope -- --nocapture`
 
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
@@ -227,12 +264,14 @@ Fresh focused evidence:
 
 ## Next Cuts
 
-1. Delete duplicate report/schema refresh paths that only preserve stale
+1. Delete the isolated-Weston verifier-owned compositor family and replace
+   affected native handoff labels with the headed hardware/app-owned path.
+2. Continue moving `ProductFrameGraph` ownership out of playground/report
+   adapters and into typed renderer DTOs.
+3. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints, old comparison contracts, or weak diagnostic timing
    substitutes.
-2. Move the current linear retained `ProductFrameGraph` toward a real
-   renderer-owned dirty-resource scheduler.
-3. Keep Cells product-latency and proof-lane reports fresh after each
+4. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

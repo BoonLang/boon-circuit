@@ -8012,13 +8012,8 @@ fn product_frame_commit_for_presented_frame(
     let product_result = render_frame_metrics.and_then(|metrics| metrics.product_result.clone());
     let product_result_source = if product_result.is_some() {
         "native_product_render_result"
-    } else if render_frame_metrics
-        .and_then(|metrics| metrics.product_frame.as_ref())
-        .is_some()
-    {
-        "render_frame_metrics_product_frame"
     } else {
-        "missing"
+        "missing_product_result"
     };
     let product_result_owner = product_result.as_ref().map(|result| result.owner.clone());
     let product_result_kind = product_result
@@ -8026,20 +8021,16 @@ fn product_frame_commit_for_presented_frame(
         .map(|result| result.result_kind.clone());
     let render_graph = product_result
         .as_ref()
-        .and_then(|result| result.render_graph.clone())
-        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.render_graph.clone()));
+        .and_then(|result| result.render_graph.clone());
     let present_plan = product_result
         .as_ref()
-        .and_then(|result| result.present_plan.clone())
-        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.present_plan.clone()));
+        .and_then(|result| result.present_plan.clone());
     let product_frame = product_result
         .as_ref()
-        .map(|result| result.product_frame.clone())
-        .or_else(|| render_frame_metrics.and_then(|metrics| metrics.product_frame.clone()));
+        .map(|result| result.product_frame.clone());
     let post_present_proof_requests = product_result
         .as_ref()
         .map(|result| result.post_present_proof_requests.clone())
-        .or_else(|| render_frame_metrics.map(|metrics| metrics.post_present_proof_requests.clone()))
         .unwrap_or_default();
     let pre_present_proof_request_count = post_present_proof_requests
         .iter()
@@ -10964,6 +10955,22 @@ mod tests {
         }
     }
 
+    fn test_product_result(
+        product_frame: NativeRenderedProductFrame,
+        post_present_proof_requests: Vec<NativePostPresentProofRequestSummary>,
+    ) -> NativeProductFrameResult {
+        NativeProductFrameResult {
+            schema_version: 1,
+            owner: "preview_active_scene".to_owned(),
+            result_kind: "active_preview_scene_patch".to_owned(),
+            product_frame,
+            render_graph: None,
+            present_plan: None,
+            render_graph_execution: None,
+            post_present_proof_requests,
+        }
+    }
+
     #[test]
     fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
         let mut base = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
@@ -11201,24 +11208,27 @@ mod tests {
             proof_request_id: None,
         };
         let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        let proof_requests = vec![NativePostPresentProofRequestSummary {
+            kind: NativePostPresentProofRequestKind::VisibleBoundText,
+            built_pre_present: false,
+            frame_local_snapshot_required: true,
+        }];
         state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
-            product_frame: Some(NativeRenderedProductFrame {
-                schema_version: 1,
-                render_target_kind: "visible-surface-direct".to_owned(),
-                visible_surface_rendered: true,
-                visible_present_path: true,
-                layout_identity: Some("layout:1".to_owned()),
-                render_scene_identity: Some("scene:1".to_owned()),
-                proof_json_built_pre_present: false,
-                render_hook_proof_built_pre_present: false,
-                post_present_proof_request_count: 1,
-                product_patch: None,
-            }),
-            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
-                kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                built_pre_present: false,
-                frame_local_snapshot_required: true,
-            }],
+            product_result: Some(test_product_result(
+                NativeRenderedProductFrame {
+                    schema_version: 1,
+                    render_target_kind: "visible-surface-direct".to_owned(),
+                    visible_surface_rendered: true,
+                    visible_present_path: true,
+                    layout_identity: Some("layout:1".to_owned()),
+                    render_scene_identity: Some("scene:1".to_owned()),
+                    proof_json_built_pre_present: false,
+                    render_hook_proof_built_pre_present: false,
+                    post_present_proof_request_count: proof_requests.len() as u32,
+                    product_patch: None,
+                },
+                proof_requests,
+            )),
             ..NativeRenderFrameMetrics::default()
         }));
 
@@ -11273,6 +11283,58 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn product_frame_commit_ignores_loose_product_frame_metrics() {
+        let key = FrameEvidenceKey {
+            frame_seq: 8,
+            content_revision: 11,
+            layout_revision: 3,
+            render_scene_revision: 5,
+            surface_id: SurfaceId("preview:test".to_owned()),
+            surface_epoch: 2,
+            input_event_seq: Some(13),
+            present_id: 18,
+            proof_request_id: None,
+        };
+        let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
+        state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
+            product_frame: Some(NativeRenderedProductFrame {
+                schema_version: 1,
+                render_target_kind: "visible-surface-direct".to_owned(),
+                visible_surface_rendered: true,
+                visible_present_path: true,
+                layout_identity: Some("layout:loose".to_owned()),
+                render_scene_identity: Some("scene:loose".to_owned()),
+                proof_json_built_pre_present: false,
+                render_hook_proof_built_pre_present: false,
+                post_present_proof_request_count: 1,
+                product_patch: None,
+            }),
+            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                built_pre_present: false,
+                frame_local_snapshot_required: true,
+            }],
+            ..NativeRenderFrameMetrics::default()
+        }));
+
+        let commit = product_frame_commit_for_presented_frame(
+            &state,
+            key,
+            NativeAdapterIdentity::default(),
+            NativeFrameLane::ProductInteraction,
+            Some(NativeSchedulerReason::HostInput),
+            None,
+            None,
+        );
+
+        assert_eq!(commit.product_result_source, "missing_product_result");
+        assert!(commit.product_frame.is_none());
+        assert_eq!(commit.post_present_proof_request_count, 0);
+        assert!(commit.post_present_proof_requests.is_empty());
+        assert_eq!(commit.pre_present_proof_request_count, 0);
     }
 
     #[test]
@@ -11685,24 +11747,27 @@ mod tests {
         state.note_present_completed(6.5);
         state.mark_presented_with_revisions(1, 2, 3, 4);
         state.current_frame_lane = Some(NativeFrameLane::ProductInteraction);
+        let proof_requests = vec![NativePostPresentProofRequestSummary {
+            kind: NativePostPresentProofRequestKind::VisibleBoundText,
+            built_pre_present: false,
+            frame_local_snapshot_required: true,
+        }];
         state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
-            product_frame: Some(NativeRenderedProductFrame {
-                schema_version: 1,
-                render_target_kind: "visible-surface-direct".to_owned(),
-                visible_surface_rendered: true,
-                visible_present_path: true,
-                layout_identity: Some("layout-proof-isolation".to_owned()),
-                render_scene_identity: Some("scene-proof-isolation".to_owned()),
-                proof_json_built_pre_present: false,
-                render_hook_proof_built_pre_present: false,
-                post_present_proof_request_count: 1,
-                product_patch: None,
-            }),
-            post_present_proof_requests: vec![NativePostPresentProofRequestSummary {
-                kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                built_pre_present: false,
-                frame_local_snapshot_required: true,
-            }],
+            product_result: Some(test_product_result(
+                NativeRenderedProductFrame {
+                    schema_version: 1,
+                    render_target_kind: "visible-surface-direct".to_owned(),
+                    visible_surface_rendered: true,
+                    visible_present_path: true,
+                    layout_identity: Some("layout-proof-isolation".to_owned()),
+                    render_scene_identity: Some("scene-proof-isolation".to_owned()),
+                    proof_json_built_pre_present: false,
+                    render_hook_proof_built_pre_present: false,
+                    post_present_proof_request_count: proof_requests.len() as u32,
+                    product_patch: None,
+                },
+                proof_requests,
+            )),
             ..NativeRenderFrameMetrics::default()
         }));
         let input_timing = state.take_frame_accepted_input_timing(Some(1));
@@ -12344,32 +12409,35 @@ mod tests {
         state.note_queue_submitted(153.0);
         state.note_submit_phase_durations(6.0, 7.0, 8.0);
         state.note_present_completed(160.0);
+        let proof_requests = vec![
+            NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::VisibleBoundText,
+                built_pre_present: true,
+                frame_local_snapshot_required: true,
+            },
+            NativePostPresentProofRequestSummary {
+                kind: NativePostPresentProofRequestKind::RenderHookReportJson,
+                built_pre_present: true,
+                frame_local_snapshot_required: true,
+            },
+        ];
         state.note_render_frame_metrics(Some(NativeRenderFrameMetrics {
             layout_ms: Some(0.25),
-            product_frame: Some(NativeRenderedProductFrame {
-                schema_version: 1,
-                render_target_kind: "visible-surface-direct".to_owned(),
-                visible_surface_rendered: true,
-                visible_present_path: true,
-                layout_identity: Some("layout-test".to_owned()),
-                render_scene_identity: Some("scene-test".to_owned()),
-                proof_json_built_pre_present: true,
-                render_hook_proof_built_pre_present: true,
-                post_present_proof_request_count: 2,
-                product_patch: None,
-            }),
-            post_present_proof_requests: vec![
-                NativePostPresentProofRequestSummary {
-                    kind: NativePostPresentProofRequestKind::VisibleBoundText,
-                    built_pre_present: true,
-                    frame_local_snapshot_required: true,
+            product_result: Some(test_product_result(
+                NativeRenderedProductFrame {
+                    schema_version: 1,
+                    render_target_kind: "visible-surface-direct".to_owned(),
+                    visible_surface_rendered: true,
+                    visible_present_path: true,
+                    layout_identity: Some("layout-test".to_owned()),
+                    render_scene_identity: Some("scene-test".to_owned()),
+                    proof_json_built_pre_present: true,
+                    render_hook_proof_built_pre_present: true,
+                    post_present_proof_request_count: proof_requests.len() as u32,
+                    product_patch: None,
                 },
-                NativePostPresentProofRequestSummary {
-                    kind: NativePostPresentProofRequestKind::RenderHookReportJson,
-                    built_pre_present: true,
-                    frame_local_snapshot_required: true,
-                },
-            ],
+                proof_requests,
+            )),
             ..NativeRenderFrameMetrics::default()
         }));
         let product_commit_key = frame_evidence_key_for_presented_frame(

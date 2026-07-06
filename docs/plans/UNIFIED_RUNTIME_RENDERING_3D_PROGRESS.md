@@ -37700,3 +37700,40 @@ Remaining scope:
 - The next verifier cut should move freshness and sidecar policy into the
   manifest/schema contract so unrelated commits do not force broad refresh
   churn when scoped verifier identity and artifact hashes are fresh.
+
+## 2026-07-06 - Product Commit Requires Typed Product Result
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- `NativeProductFrameCommit` now consumes product frame, render graph, present
+  plan, and post-present proof request data only from
+  `NativeProductFrameResult`.
+- Removed the app-window compatibility ladder that reconstructed product
+  commits from loose `NativeRenderFrameMetrics.product_frame`,
+  `render_graph`, `present_plan`, and `post_present_proof_requests`.
+- The explicit missing state is now `product_result_source:
+  missing_product_result`; loose metric product frames are ignored by product
+  commits.
+- Removed the Cells verifier fallback counter for metrics-product-frame product
+  results. Missing typed result is the only failure class.
+
+Fresh focused evidence:
+
+- `cargo check -q -p boon_native_app_window -p xtask`: pass.
+- `cargo test -q -p boon_native_app_window product_frame -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask cells_visible_click_product_contract -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask
+  cells_visible_click_product_commit_scope_requires_typed_product_result
+  -- --nocapture`: pass.
+
+Remaining scope:
+
+- This tightens product-commit ownership but does not yet move the
+  `NativeProductRenderGraphSummary` adapter out of `boon_native_playground`.
+- The next ProductFrameGraph cut is to expose a renderer-owned graph summary
+  from `boon_native_gpu` and make playground/app-window consume that typed
+  result instead of synthesizing graph authority in the render hook.

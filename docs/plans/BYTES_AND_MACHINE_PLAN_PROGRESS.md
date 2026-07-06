@@ -38416,6 +38416,35 @@ Remaining scope:
   but it does not eliminate every older plan item or all legacy terminology in
   historical docs.
 
+## 2026-07-06 - Scroll Aggregate Uses Product UX Timing Contract
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Tightened the native handoff scroll-speed label contract so
+  `speed_budget_timing_window = product-path-input-to-present` is validated by
+  product UX fields instead of the slower wall-clock/proof lane.
+- The contract now requires `ux_frame_budget_pass`,
+  `product_path_ux_timing.status = pass`,
+  `product_path_ux_timing.proof_latency_excluded = true`,
+  `speed_budget_frame_ms_p95 <= 16.7ms`, bounded stalls, and non-OS scroll model
+  evidence before accepting product-path scroll timing.
+- Wall-clock `preview_frame_ms_p95` remains reported and auditable, but it no
+  longer vetoes a product-lane scroll report when the product UX timing window
+  is explicitly selected and proven.
+
+Fresh focused evidence before commit:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo test -q -p xtask scroll_budget_contract -- --nocapture`: pass.
+- `cargo check -q -p xtask`: pass.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report
+  target/reports/native-gpu-all.json`: no true blockers after the contract
+  change; reports became stale for the changed verifier identity and must be
+  refreshed after commit.
+
 ## 2026-07-06 - Source Replay Retired `--engine` Compatibility Cut
 
 Status: implemented and focused-verified.

@@ -109,15 +109,30 @@ Fresh focused evidence:
 - `cargo test -q -p xtask dev_editor_scroll_budget_uses_dev_surface_adapter_flag -- --nocapture`:
   pass; 1 passed.
 
+### 2026-07-06 - Native Manifest Coverage Split Confirmed
+
+- Confirmed current `native_preview_manifest_scenario_evidence` separates
+  semantic `input_scenarios` from native preview acceptance.
+- Full semantic input scenarios are reported under
+  `semantic_input_scenario_coverage` and marked `delegated` when only native
+  route/runtime/visible-frame smoke is proven.
+- The hard preview E2E status is driven by native preview scenarios, initial
+  visible assertions, and scroll-focus evidence, not by full semantic replay.
+- Updated stale audit wording so failures no longer claim the native preview
+  gate must cover every manifest-declared scenario.
+
+Fresh focused evidence:
+
+- `cargo test -q -p xtask preview_e2e_delegates_full_manifest_inputs_when_native_smoke_passes -- --nocapture`:
+  pass; 1 passed.
+
 ## Next Cuts
 
-1. Split or delete manifest coverage logic that conflates full semantic scenario
-   coverage with the smaller native input proof subset.
-2. Remove remaining legacy `LoadedRuntime`/`GenericScheduledRuntime` fallback
+1. Remove remaining legacy `LoadedRuntime`/`GenericScheduledRuntime` fallback
    routes where `PlanExecutor` is the intended authority.
-3. Delete duplicate report/schema refresh paths that only preserve stale
+2. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints or old comparison contracts.
-4. Re-run focused native Cells product-latency and proof-lane reports after the
+3. Re-run focused native Cells product-latency and proof-lane reports after the
    harness is lean enough that reports are trustworthy.
 
 ## Completion Rules

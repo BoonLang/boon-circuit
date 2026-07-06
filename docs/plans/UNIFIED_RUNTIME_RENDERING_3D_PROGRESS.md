@@ -564,6 +564,49 @@ Remaining work:
 - Continue replacing raw list-store mutation with explicit store methods so
   index invalidation is precise instead of `DerefMut`-broad.
 
+## 2026-07-06 - PlanExecutor Store Mutation Boundary Slice
+
+Status: mutation entrypoint boundary cut implemented and verified.
+
+What changed:
+
+- List append execution now enters through
+  `PlanExecutorListStore::append_rows_for_derived_values`.
+- List remove execution now enters through
+  `PlanExecutorListStore::remove_rows_for_source_event`.
+- Indexed row update execution now enters through
+  `PlanExecutorListStore::execute_indexed_update_branch`.
+- Root-state-change indexed derived refresh now enters through
+  `PlanExecutorListStore::refresh_indexed_derived_after_root_changes`.
+- Each store mutation entrypoint invalidates exact lookup indexes before
+  mutating rows. This is still conservative, but the invalidation policy is now
+  centralized behind named store methods instead of anonymous raw-map mutation
+  calls.
+
+Fresh evidence:
+
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo test -q -p boon_runtime
+  list_find_and_chunk_project_generic_record_lists_without_grid_identity -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime`: pass.
+- `target/debug/xtask verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+
+Remaining work:
+
+- Remove or narrow the remaining `DerefMut` escape hatch once root scalar lookup
+  access and document-summary entrypoints are also expressed as store methods.
+- Refresh native handoff reports after the runtime/store code stops changing.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

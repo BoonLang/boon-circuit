@@ -65,9 +65,9 @@ use boon_plan::{
 use boon_plan_executor::{
     IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
     IndexedUpdateBranchExecution, IndexedUpdateTargetEvent, IndexedUpdateTargetOverride,
-    ListProjectionExecution, ListRetainExecution, ListRowDefaultFields, PlanExecutorBytes,
-    PlanExecutorListRow, PlanExecutorListRowState, PlanExecutorLiveSourceEvent,
-    PlanExecutorLiveSourceEventExpectedToml, PlanExecutorRootState,
+    ListAppendExecution, ListProjectionExecution, ListRemoveExecution, ListRetainExecution,
+    ListRowDefaultFields, PlanExecutorBytes, PlanExecutorListRow, PlanExecutorListRowState,
+    PlanExecutorLiveSourceEvent, PlanExecutorLiveSourceEventExpectedToml, PlanExecutorRootState,
     PlanExecutorScenarioCheckpointCellExpectation, PlanExecutorScenarioCheckpointErrorExpectation,
     PlanExecutorScenarioCheckpointInput, PlanExecutorScenarioStepMeta, RootBytesFixedMutation,
     RootBytesUpdateDispatchKind, RootExecutedUpdate, RootJsonSourceEvent,
@@ -4058,9 +4058,8 @@ impl PlanExecutorRuntimeState {
         );
         derived.extend(root_source_derived_commits);
 
-        let append_result = append_plan_list_rows_for_derived_values_with(
+        let append_result = self.list_store.append_rows_for_derived_values(
             plan,
-            &mut self.list_store,
             &mut self.list_next_keys,
             &mut self.list_append_row_bool_delta_lists,
             &derived_values,
@@ -4096,12 +4095,11 @@ impl PlanExecutorRuntimeState {
             source_epoch: generic_event.source_epoch,
             source_id: None,
         };
-        let remove_result = remove_plan_list_rows_for_source_event(
+        let remove_result = self.list_store.remove_rows_for_source_event(
             plan,
             source_id,
             source_route_slot,
             &remove_event,
-            &mut self.list_store,
         )?;
         for delta in &remove_result.semantic_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -4126,24 +4124,25 @@ impl PlanExecutorRuntimeState {
                     || generic_event.target_key.is_some()
                     || generic_event.address.is_some();
                 if targeted_or_scoped_indexed_update {
-                    let indexed = execute_indexed_update_branch(
-                        plan,
-                        op,
-                        source_id,
-                        source_route_slot,
-                        &generic_event,
-                        &mut self.list_store,
-                        &mut row_resolution_cache,
-                        &root_derived_values_before_updates,
-                        host_file_root,
-                    )
-                    .map_err(|error| -> Box<dyn std::error::Error> {
-                        format!(
-                            "PlanExecutor indexed update op {} for source {}: {error}",
-                            op.id.0, source_id.0
+                    let indexed = self
+                        .list_store
+                        .execute_indexed_update_branch(
+                            plan,
+                            op,
+                            source_id,
+                            source_route_slot,
+                            &generic_event,
+                            &mut row_resolution_cache,
+                            &root_derived_values_before_updates,
+                            host_file_root,
                         )
-                        .into()
-                    })?;
+                        .map_err(|error| -> Box<dyn std::error::Error> {
+                            format!(
+                                "PlanExecutor indexed update op {} for source {}: {error}",
+                                op.id.0, source_id.0
+                            )
+                            .into()
+                        })?;
                     pending_indexed_deltas.extend(indexed.semantic_deltas);
                     self.executed_update_branch_count += indexed.updated_row_count;
                     self.executed_indexed_update_count += indexed.updated_row_count;
@@ -4173,13 +4172,12 @@ impl PlanExecutorRuntimeState {
                             row_event.target_key = Some(target.key);
                             row_event.target_generation = Some(target.generation);
                             let mut per_row_resolution_cache = BTreeMap::new();
-                            execute_indexed_update_branch(
+                            self.list_store.execute_indexed_update_branch(
                                 plan,
                                 op,
                                 source_id,
                                 source_route_slot,
                                 &row_event,
-                                &mut self.list_store,
                                 &mut per_row_resolution_cache,
                                 &root_derived_values_before_updates,
                                 host_file_root,
@@ -4192,13 +4190,12 @@ impl PlanExecutorRuntimeState {
                                 .into()
                             })
                         } else {
-                            execute_indexed_update_branch(
+                            self.list_store.execute_indexed_update_branch(
                                 plan,
                                 op,
                                 source_id,
                                 source_route_slot,
                                 &generic_event,
-                                &mut self.list_store,
                                 &mut row_resolution_cache,
                                 &root_derived_values_before_updates,
                                 host_file_root,
@@ -4287,11 +4284,10 @@ impl PlanExecutorRuntimeState {
             changed_root_state_ids_from_update_reports(&root_update_commit_batch.update_reports);
         updates.extend(root_update_commit_batch.update_reports);
         self.executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
-        pending_indexed_deltas.extend(refresh_indexed_derived_fields_after_root_state_changes(
-            plan,
-            &mut self.list_store,
-            &changed_root_state_ids,
-        )?);
+        pending_indexed_deltas.extend(
+            self.list_store
+                .refresh_indexed_derived_after_root_changes(plan, &changed_root_state_ids)?,
+        );
         let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
         for delta in &pending_indexed_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -5732,6 +5728,78 @@ impl PlanExecutorListStore {
     ) -> RuntimeResult<()> {
         self.invalidate_indexes();
         refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, self)
+    }
+
+    fn append_rows_for_derived_values<E>(
+        &mut self,
+        plan: &MachinePlan,
+        list_next_keys: &mut BTreeMap<usize, u64>,
+        list_append_row_bool_delta_lists: &mut BTreeSet<usize>,
+        derived_values: &BTreeMap<FieldId, JsonValue>,
+        evaluator: E,
+    ) -> RuntimeResult<ListAppendExecution>
+    where
+        E: FnMut(
+            &MachinePlan,
+            &BTreeMap<usize, Vec<PlanListRowState>>,
+            &PlanListRowState,
+            &PlanRowExpression,
+        ) -> RuntimeResult<JsonValue>,
+    {
+        self.invalidate_indexes();
+        append_plan_list_rows_for_derived_values_with(
+            plan,
+            self,
+            list_next_keys,
+            list_append_row_bool_delta_lists,
+            derived_values,
+            evaluator,
+        )
+    }
+
+    fn remove_rows_for_source_event(
+        &mut self,
+        plan: &MachinePlan,
+        source_id: SourceId,
+        source_route_slot: &boon_plan::SourceRoute,
+        event: &PlanExecutorLiveSourceEvent<'_>,
+    ) -> RuntimeResult<ListRemoveExecution> {
+        self.invalidate_indexes();
+        remove_plan_list_rows_for_source_event(plan, source_id, source_route_slot, event, self)
+    }
+
+    fn execute_indexed_update_branch(
+        &mut self,
+        plan: &MachinePlan,
+        op: &boon_plan::PlanOp,
+        source_id: SourceId,
+        source_route_slot: &boon_plan::SourceRoute,
+        generic_event: &GenericSourceEvent<'_>,
+        row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
+        root_derived_values_before_updates: &BTreeMap<usize, JsonValue>,
+        host_file_root: Option<&Path>,
+    ) -> RuntimeResult<IndexedUpdateBranchExecution> {
+        self.invalidate_indexes();
+        execute_indexed_update_branch(
+            plan,
+            op,
+            source_id,
+            source_route_slot,
+            generic_event,
+            self,
+            row_resolution_cache,
+            root_derived_values_before_updates,
+            host_file_root,
+        )
+    }
+
+    fn refresh_indexed_derived_after_root_changes(
+        &mut self,
+        plan: &MachinePlan,
+        changed_root_state_ids: &BTreeSet<StateId>,
+    ) -> RuntimeResult<Vec<JsonValue>> {
+        self.invalidate_indexes();
+        refresh_indexed_derived_fields_after_root_state_changes(plan, self, changed_root_state_ids)
     }
 
     fn materialize_projections(

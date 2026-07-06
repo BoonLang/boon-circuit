@@ -38364,3 +38364,54 @@ Remaining scope:
 - Continue the ProductFrameGraph/proof-lane and PlanExecutor Cells
   currentness/list-index work. This checkpoint only fixes ownership and
   control-plane coupling.
+
+## 2026-07-06 - Cells Scroll UX Uses Product Interaction Timing
+
+Status: implemented and verified.
+
+What changed:
+
+- Fixed the native scroll-speed evidence selection so sustained
+  `product_interaction` samples can prove UX latency even when the final
+  telemetry snapshot has already returned to demand-driven idle. The previous
+  gate mixed timing lanes: it could promote a proof/window scalar into
+  `scroll_frame_ms_p95` while the product interaction samples were already
+  under budget.
+- Kept the guard against arbitrary idle summaries: product timing still
+  requires demand-driven mode, requested-animation burst evidence, sustained
+  input-to-present samples, and explicit `frame_lane=product_interaction`.
+- The scroll report now records both the final pacing state and whether the
+  product interaction lane was selected, so proof/readback and UX latency remain
+  separate and auditable.
+
+Fresh evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo test -q -p xtask product_path_timing_ -- --nocapture`: pass.
+- `target/debug/xtask verify-native-gpu-scroll-speed --example cells
+  --report target/reports/native-gpu/scroll-speed-cells.json`: pass.
+- `target/debug/xtask verify-report-schema
+  target/reports/native-gpu/scroll-speed-cells.json`: pass.
+- Fresh Cells scroll summary: `speed_budget_timing_window =
+  product-path-input-to-present`, `speed_budget_frame_ms_p95 = 2.183881`,
+  `wheel_to_visible_ms_p95 = 2.183881`, `frames_over_16_7_count = 0`, and
+  `product_path_ux_timing_proven = true`.
+- `target/debug/xtask run-report-refresh-queue
+  target/reports/native-gpu-all.json --until-clean --max-runs 1 --limit 20
+  --output-byte-limit 4096 --report
+  target/reports/native-gpu/refresh-queue-post-scroll-product-lane.json`: pass
+  with 16 refreshed native reports and 0 failures.
+- `target/debug/xtask verify-native-gpu-all --check-existing --report
+  target/reports/native-gpu-all.json`: pass with
+  `true_blocker_child_count = 0` and `refresh_debt_child_count = 0`.
+
+Remaining scope:
+
+- Do not treat proof/readback completion latency as product UX latency.
+  Product timing must continue to come from product-frame samples linked by
+  frame evidence; proof timing must stay separately reported.
+- The broader ProductFrameGraph/runtime cleanup is still active. This checkpoint
+  removes a false scroll blocker and makes the native handoff aggregate fresh,
+  but it does not eliminate every older plan item or all legacy terminology in
+  historical docs.

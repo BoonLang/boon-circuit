@@ -166,15 +166,11 @@ Current checkpoint:
   manually. Dry-runs are schema-valid and report that the aggregate rerun was
   intentionally skipped. Cells refreshes must stay PlanExecutor/product-only;
   public CLI legacy-compare refreshes are retired.
-- Hidden native-preview source replay side reports have been pulled into the
-  BYTES aggregate. TodoMVC, Cells, and physical TodoMVC native-preview replay
-  children refresh with canonical `boon_cli run ... --engine plan` commands and
-  are exposed through native `report_dependency_graph` edges when preview E2E
-  consumes them. After local code changes, the native aggregate can emit
-  upstream refresh commands for these reports directly instead of hiding the
-  dependency inside preview E2E. The handoff manifest now owns those
-  `upstream_dependencies`, so `verify-native-gpu-all` no longer relies on a
-  separate hardcoded native-preview replay dependency table.
+- Native handoff no longer consumes native-preview source replay side reports.
+  Preview E2E must prove native behavior from app-owned host input, runtime
+  outputs, retained ProductFrameGraph evidence, and WGPU/readback artifacts.
+  PlanExecutor source replay remains BYTES/MachinePlan semantic evidence only
+  and must not be reintroduced as a native `upstream_dependency`.
 - Native GPU handoff aggregate is not fresh in the current worktree. Its new
   failure taxonomy separates freshness-only schema/contract failures from
   product-contract failures. The handoff manifest now requires
@@ -185,15 +181,13 @@ Current checkpoint:
   children and no longer satisfy the handoff contract. After the scoped
   fingerprint, manifest dependency, and native aggregate schema WIP, the fresh
   aggregate report is schema-valid but still `status=fail`: after the
-  PlanExecutor source replay identity cut it reports `18` refresh-debt
-  children, `18` identity-fast refresh children, `0` fresh product-contract
-  children, `0` refresh-first product-contract children, `0` upstream
-  dependency refresh-debt reports, and `0` upstream true blockers.
-  This is refresh/control-plane debt, not fresh Cells product evidence. The
-  aggregate now emits
-  manifest-canonical `refresh_argv`, diagnostic `observed_argv`, and
-  `report_dependency_graph` upstream replay edges, so run queue-filtered
-  refreshes before broad handoff debugging.
+  native source-replay cut it reports `16` refresh-debt children and `0` true
+  blocker children. The only native `report_dependency_graph` edge is
+  `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical` with
+  kind `consumes-native-report`. This is refresh/control-plane debt, not fresh
+  Cells product evidence. The aggregate now emits manifest-canonical
+  `refresh_argv` and diagnostic `observed_argv`; run queue-filtered refreshes
+  before broad handoff debugging.
 - The native aggregate now fast-paths stale child identity. If a child report has
   stale git, worktree, or binary identity, `verify-native-gpu-all` records one
   `identity-freshness-fast-path` refresh-debt item and skips schema, semantic,
@@ -203,9 +197,9 @@ Current checkpoint:
   aggregate refresh plan first, then promote the renderer-owned retained
   `ProductFrameGraph`; do not restart Cells micro-optimization unless fresh
   product-latency evidence regresses.
-- Closed-loop refresh has now burned down the three BYTES-owned native-preview
-  source replay labels and the first eight native contract labels. Native
-  handoff still has remaining refresh debt for heavier product/window labels.
+- Native handoff no longer has BYTES-owned native-preview source replay labels
+  in its dependency graph. Native handoff still has remaining refresh debt for
+  heavier product/window labels.
 - The renderer graph has advanced from the old
   `executor_wrapped_product_passes` contract to a typed, renderer-owned linear
   `ProductFrameGraph` that reports
@@ -241,9 +235,9 @@ Current checkpoint:
   and verifier inputs and excludes progress/goal prose, so docs-only plan churn
   stops invalidating otherwise current native product reports.
 - Native handoff report dependencies now come from
-  `docs/architecture/native_gpu_handoff_manifest.json`, including the three
-  BYTES-owned native-preview source replay reports consumed by preview E2E.
-  Aggregate output includes those edges in `report_dependency_graph` and
+  `docs/architecture/native_gpu_handoff_manifest.json`. Native dependencies
+  are native-report edges only; PlanExecutor source replay is not native proof.
+  Aggregate output includes native edges in `report_dependency_graph` and
   `required_reports[].upstream_dependencies`.
 - `verify-report-schema` now has command-specific validation for
   `verify-native-gpu-all`: native handoff aggregate reports must match the
@@ -251,13 +245,10 @@ Current checkpoint:
   commands bounded and replayable, and keep refresh/product/dependency taxonomy
   counts consistent. A failing native aggregate can still be schema-valid when
   it honestly reports refresh debt or fresh blockers.
-- `run-report-refresh-queue` is now dependency-aware and schema-locked. Full
-  native refresh dry-runs select the three upstream BYTES source replay reports
-  first; a label-filtered `preview-e2e-cells` dry-run expands to
-  `cells-native-preview-source-replay` before `preview-e2e-cells`. These
-  native source-replay dependencies are owned by `verify-native-gpu-all` and
-  refreshed directly with `boon_cli run`, not routed through the BYTES
-  aggregate. Queue reports
+- `run-report-refresh-queue` is now dependency-aware and schema-locked. Native
+  refresh dry-runs expand only manifest-owned native-report dependencies, such
+  as `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical`.
+  Queue reports
   include `selection_mode`, dependency expansion/deferred counts,
   `refresh_phase_summaries`, ordered `refresh_execution_plan`,
   `selected_by_label_filter`, `boon_cli_prebuild`, and owner-aggregate rerun
@@ -286,14 +277,9 @@ Current checkpoint:
 - BYTES-owned `boon_cli` source replay reports now carry
   `worktree_fingerprint_scope=plan-executor-source-replay`,
   `worktree_scoped_fingerprint`, scoped `worktree_fingerprints`, and
-  `source_replay_identity`. The three native preview source replay reports for
-  TodoMVC, Cells, and physical TodoMVC have been regenerated and schema-checked.
-  The latest native aggregate reports all three upstream dependencies as
-  `schema_valid=true`, `worktree_fresh=true`,
-  `worktree_fingerprint_basis=scoped`,
-  `source_replay_identity_present=true`,
-  `source_replay_identity_fresh=true`, `freshness_debt=false`, and
-  `true_blocker=false`.
+  `source_replay_identity`. Those reports are validated by BYTES/MachinePlan
+  gates only; native aggregate freshness no longer checks
+  `source_replay_identity`.
 - Scoped worktree fingerprints now hash the scoped committed `HEAD` tree plus
   scoped dirty status/diff in both `boon_runtime` source-replay reports and
   `xtask` aggregate verification. The BYTES/MachinePlan aggregate now uses
@@ -355,16 +341,12 @@ Current checkpoint:
   coverage instead of only `boon-driver` evidence, and physical TodoMVC needs
   live-state plus app-window input provenance proof. Fix those harness gaps
   before using preview E2E failures as product renderer evidence.
-- Native handoff report dependencies now support both
-  `consumes-source-replay-report` and `consumes-native-report`. The manifest
-  models `todomvc-physical-reference-parity -> preview-e2e-todo_mvc_physical`,
-  `verify-native-gpu-all` emits that edge with owner `verify-native-gpu-all`,
-  and `run-report-refresh-queue` expands label-filtered refreshes through the
-  graph while deduplicating duplicate stale labels. The current parity dry-run
-  is schema-valid and selects exactly three reports in dependency order:
-  `todo-mvc-physical-native-preview-source-replay`,
-  `preview-e2e-todo_mvc_physical`, then
-  `todomvc-physical-reference-parity`.
+- Native handoff report dependencies now support native reports only. The
+  manifest models `todomvc-physical-reference-parity ->
+  preview-e2e-todo_mvc_physical`, `verify-native-gpu-all` emits that edge with
+  owner `verify-native-gpu-all`, and `run-report-refresh-queue` expands
+  label-filtered refreshes through the graph while deduplicating duplicate
+  stale labels.
 
 Short slash command:
 

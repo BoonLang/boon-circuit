@@ -33,7 +33,7 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
-| Test harness cleanup | In progress | Old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Cells visible-click no longer has an isolated-Weston fallback; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -157,6 +157,28 @@ for old evidence.
   - `cargo test -q -p xtask product_render_graph -- --nocapture`
   - `cargo test -q -p xtask cells_visible_click_product_commit_scope -- --nocapture`
 
+### 2026-07-06 - Cells Isolated-Weston Verifier Path Deleted
+
+- `verify-native-cells-visible-click-e2e` now requires the headed host-input /
+  hardware product path. Non-headed invocation fails the gate with a contract
+  blocker instead of silently selecting a verifier-owned isolated Weston path.
+- Deleted the obsolete isolated-Weston Cells visible-click implementation and
+  its now-dead latency summarizers/timing helpers instead of preserving them as
+  compatibility shims.
+- Kept negative contract fixtures that mention Weston input strings because
+  they prove handoff reports reject that evidence; they are not executable
+  product or verifier fallback paths.
+- Focused checks passed:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo check -q -p xtask`
+  - `cargo xtask verify-native-cells-visible-click-e2e --profile debug --report target/reports/native-gpu/cells-visible-click-debug-nonheaded-contract.json`:
+    expected fail with `headed-host-input-required-not-measured` and no Cells
+    isolated-Weston execution route.
+  - `cargo test -q -p xtask native_gpu_label_contract_rejects_cells_visible_click_address_selection_fallback -- --nocapture`
+  - `cargo test -q -p xtask native_gpu_handoff_requires_cells_visible_click_release_report -- --nocapture`
+  - `cargo test -q -p xtask native_mouse_position_wait -- --nocapture`
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the
@@ -264,8 +286,8 @@ Fresh focused evidence:
 
 ## Next Cuts
 
-1. Delete the isolated-Weston verifier-owned compositor family and replace
-   affected native handoff labels with the headed hardware/app-owned path.
+1. Delete the remaining isolated-Weston verifier-owned compositor family and
+   replace affected native handoff labels with headed hardware/app-owned paths.
 2. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
 3. Delete duplicate report/schema refresh paths that only preserve stale

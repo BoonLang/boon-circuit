@@ -37666,3 +37666,37 @@ Remaining scope:
 - The runtime/PlanExecutor Cells work remains generic list/currentness and
   dependency fanout ownership, with no Cells-specific runtime/compiler/render
   branches.
+
+## 2026-07-06 - Canonical Native Refresh Argv Only
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- Removed native handoff aggregate reconstruction of refresh argv from stale
+  child-report `command_argv`.
+- Native aggregate refresh debt, product-contract children, and true-blocker
+  children now expose only the manifest-canonical `refresh_argv` / `argv`.
+- Deleted the old observed-refresh replay helper and tests that blessed
+  inherited child-report flags. Child report `observed_command` remains as
+  diagnostic metadata, but it is not an executable refresh command.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask
+  manifest_refresh_argv_does_not_inherit_observed_cells_flags -- --nocapture`:
+  pass.
+- `cargo test -q -p xtask refresh_queue_dry_run_consumes_structured_argv
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu -- --nocapture`: pass.
+
+Remaining scope:
+
+- This reduces verifier control-plane ambiguity; it does not refresh native
+  handoff evidence or claim Cells performance.
+- The next verifier cut should move freshness and sidecar policy into the
+  manifest/schema contract so unrelated commits do not force broad refresh
+  churn when scoped verifier identity and artifact hashes are fresh.

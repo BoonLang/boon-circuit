@@ -24686,6 +24686,174 @@ fn generic_infix_value(left: BoonValue, op: &str, right: BoonValue) -> BoonValue
     }
 }
 
+fn text_all_chars_in(text: &str, chars: &str) -> bool {
+    !text.is_empty() && text.chars().all(|ch| chars.contains(ch))
+}
+
+pub fn parse_text_number(text: &str, radix: i64, leading: bool) -> Option<i64> {
+    let radix = radix.clamp(2, 36) as u32;
+    let mut trimmed = text.trim();
+    let negative = trimmed.starts_with('-');
+    if negative || trimmed.starts_with('+') {
+        trimmed = &trimmed[1..];
+    }
+    trimmed = match radix {
+        2 => trimmed
+            .strip_prefix("0b")
+            .or_else(|| trimmed.strip_prefix("0B"))
+            .unwrap_or(trimmed),
+        8 => trimmed
+            .strip_prefix("0o")
+            .or_else(|| trimmed.strip_prefix("0O"))
+            .unwrap_or(trimmed),
+        16 => trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed),
+        _ => trimmed,
+    };
+    let digits = if leading {
+        trimmed
+            .chars()
+            .take_while(|ch| ch.is_digit(radix))
+            .collect::<String>()
+    } else {
+        if !trimmed.chars().all(|ch| ch.is_digit(radix)) {
+            return None;
+        }
+        trimmed.to_owned()
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let value = i64::from_str_radix(&digits, radix).ok()?;
+    Some(if negative { -value } else { value })
+}
+
+pub fn number_bit_width(value: i64) -> i64 {
+    let magnitude = value.unsigned_abs();
+    (u64::BITS - magnitude.leading_zeros()).max(1) as i64
+}
+
+pub fn format_number_text(
+    value: i64,
+    radix: i64,
+    min_width: i64,
+    prefix: bool,
+    group_size: i64,
+    signed_width: i64,
+) -> String {
+    let radix = radix.clamp(2, 36) as u32;
+    let value = if signed_width > 0 {
+        twos_complement_signed(value, signed_width)
+    } else {
+        value
+    };
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let mut digits = format_unsigned_radix(magnitude, radix);
+    let min_width = min_width.max(0) as usize;
+    if digits.len() < min_width {
+        let mut padded = String::with_capacity(min_width);
+        padded.extend(std::iter::repeat('0').take(min_width - digits.len()));
+        padded.push_str(&digits);
+        digits = padded;
+    }
+    if group_size > 0 {
+        digits = grouped_digits(&digits, group_size as usize);
+    }
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    if prefix {
+        output.push_str(match radix {
+            2 => "0b",
+            8 => "0o",
+            16 => "0x",
+            _ => "",
+        });
+    }
+    output.push_str(&digits);
+    output
+}
+
+fn format_unsigned_radix(mut value: u64, radix: u32) -> String {
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = (value % u64::from(radix)) as u32;
+        digits.push(std::char::from_digit(digit, radix).unwrap_or('?'));
+        value /= u64::from(radix);
+    }
+    digits.iter().rev().collect()
+}
+
+fn grouped_digits(digits: &str, group_size: usize) -> String {
+    if group_size == 0 || digits.len() <= group_size {
+        return digits.to_owned();
+    }
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / group_size);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % group_size == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn twos_complement_signed(value: i64, width: i64) -> i64 {
+    let width = width.clamp(1, 63);
+    let value = value as u64;
+    let sign_bit = 1_u64 << (width - 1);
+    let mask = (1_u64 << width) - 1;
+    let masked = value & mask;
+    if masked & sign_bit == 0 {
+        masked as i64
+    } else {
+        (masked as i128 - (1_i128 << width)) as i64
+    }
+}
+
+pub fn number_to_codepoint_text(value: i64, min: i64, max: i64) -> String {
+    if value < min || value > max {
+        return ".".to_owned();
+    }
+    u32::try_from(value)
+        .ok()
+        .and_then(char::from_u32)
+        .filter(|ch| !ch.is_control())
+        .map(|ch| ch.to_string())
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+pub fn number_to_ascii_text(value: i64, width: i64) -> String {
+    if width < 8 {
+        return ".".to_owned();
+    }
+    let width = width.clamp(8, 64) as u32;
+    let byte_count = (width / 8).clamp(1, 8) as usize;
+    let value = value as u64;
+    let mut bytes = Vec::with_capacity(byte_count);
+    for index in (0..byte_count).rev() {
+        let byte = ((value >> (index * 8)) & 0xff) as u8;
+        if byte == 0 {
+            bytes.push(b'?');
+        } else if byte.is_ascii() && (byte.is_ascii_graphic() || byte == b' ') {
+            bytes.push(byte);
+        } else {
+            bytes.push(b'?');
+        }
+    }
+    while bytes.last() == Some(&b'?') && bytes.len() > 1 {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| ".".to_owned())
+}
+
 fn compare_i64(left: i64, op: &str, right: i64) -> bool {
     match op {
         ">" => left > right,

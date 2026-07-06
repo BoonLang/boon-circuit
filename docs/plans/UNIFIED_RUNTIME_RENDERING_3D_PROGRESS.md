@@ -37148,3 +37148,51 @@ Remaining scope:
   after this checkpoint commit, then rerun the manifest-backed native handoff
   aggregate. This slice removes report-shape ambiguity; it does not by itself
   complete the broader legacy runtime/harness deletion goal.
+
+## 2026-07-06 - Source-Route Runtime Callback Removed
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Removed the source-route runtime callback surface from PlanExecutor
+  orchestration. `run_plan_source_route` now delegates to
+  `execute_source_route_with_full_execution`, which either uses the plan-json
+  selected value or validates the selected result against full execution.
+- Deleted `SourceRouteRuntimeBranchExecutionInput`,
+  `assemble_source_route_runtime_branch_execution`, and the
+  `cpu-plan-source-route-runtime-branch-execution-v1` selected-output surface.
+- Source-route BYTES values now classify as `full-execution` instead of
+  `runtime-branch`; source-route full execution is the explicit fallback
+  surface rather than a runtime callback into `boon_runtime`.
+- Updated the compiler-boundary verifier and report schema to require
+  `source_route_runtime_callback_removed=true` instead of preserving the old
+  source-route runtime-branch extraction milestone.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_runtime -p
+  boon_report_schema -p xtask`: pass.
+- `cargo test -q -p boon_plan_executor source_route -- --nocapture`: pass;
+  6 passed.
+- `cargo test -q -p boon_runtime run_plan_route -- --nocapture`: pass; 2
+  passed.
+- Fresh `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh `target/debug/xtask verify-bytes-default-engine-readiness --report
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass with
+  `default_engine=plan`, `default_switch_allowed=true`, and TodoMVC/Cells
+  default-plan child reports passing schema.
+
+Remaining scope:
+
+- Root update execution still has a separate `RootRuntimeBranchUpdateInput`
+  path for root BYTES/host-effect work. This slice removes the source-route
+  callback ambiguity only; the next larger runtime cut should move or retire the
+  remaining root runtime-branch update surface.
+- The broader goal remains open: refresh-debt cleanup for the BYTES aggregate,
+  remaining verifier/control-plane fossils, and deeper ProductFrameGraph/native
+  presentation work still need separate verified slices.

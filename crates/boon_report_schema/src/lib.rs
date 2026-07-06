@@ -2964,7 +2964,7 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "scenario_events_command_output_extracted",
         "source_event_payload_bytes_artifact_report_extracted",
         "source_route_orchestration_extracted",
-        "source_route_runtime_branch_execution_extracted",
+        "source_route_runtime_callback_removed",
         "root_scenario_step_preparation_extracted",
         "source_derived_step_delta_bundle_extracted",
     ] {

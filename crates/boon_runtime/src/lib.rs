@@ -72,9 +72,7 @@ use boon_plan_executor::{
     PlanExecutorScenarioStepMeta, RootBytesFixedMutation, RootBytesUpdateDispatchKind,
     RootExecutedUpdate, RootJsonSourceEvent, RootRuntimeBranchUpdateInput,
     RootScenarioCommandOutputInput, RootUpdateCandidateTracker, ScenarioEventsCommandOutputInput,
-    SourceRouteCommandOutputInput, SourceRouteExecutionContext, SourceRouteExecutionSurface,
-    SourceRouteFullExecution, SourceRouteRuntimeBranchExecutionInput,
-    SourceRouteSourceEventReportInput,
+    SourceRouteCommandOutputInput, SourceRouteFullExecution, SourceRouteSourceEventReportInput,
     append_list_rows_for_derived_values_with as append_plan_list_rows_for_derived_values_with,
     assemble_initial_state_report as assemble_plan_initial_state_report,
     assemble_root_runtime_branch_update as assemble_plan_root_runtime_branch_update,
@@ -85,7 +83,6 @@ use boon_plan_executor::{
     assemble_scenario_events_command_output as assemble_plan_scenario_events_command_output,
     assemble_source_derived_step_deltas as assemble_plan_source_derived_step_deltas,
     assemble_source_route_command_output as assemble_plan_source_route_command_output,
-    assemble_source_route_runtime_branch_execution as assemble_plan_source_route_runtime_branch_execution,
     assert_live_source_event_matches_expected as assert_plan_live_source_event_matches_expected,
     assert_scenario_checkpoint as assert_plan_scenario_checkpoint,
     build_live_source_event_expected_toml as build_plan_live_source_event_expected_toml,
@@ -104,7 +101,7 @@ use boon_plan_executor::{
     evaluate_root_row_expression_derived_values as evaluate_plan_root_row_expression_derived_values,
     execute_indexed_update_batch_with as execute_plan_indexed_update_batch_with,
     execute_initial_state as execute_plan_initial_state_core,
-    execute_source_route_with_runtime_callbacks as execute_plan_source_route_with_runtime_callbacks,
+    execute_source_route_with_full_execution as execute_plan_source_route_with_full_execution,
     field_label as plan_field_label,
     indexed_field_has_fixed_byte_bank as plan_indexed_field_has_fixed_byte_bank,
     indexed_fixed_byte_bank_len as plan_indexed_fixed_byte_bank_len,
@@ -3660,46 +3657,11 @@ pub fn run_plan_source_route(
     let plan = compiled.plan;
     let root_json_event = root_json_source_event_from_live(&event);
     let host_file_root = source_path.parent();
-    let output = execute_plan_source_route_with_runtime_callbacks(
+    let output = execute_plan_source_route_with_full_execution(
         &plan,
         source_route,
         target_state,
         &root_json_event,
-        |route_context: &SourceRouteExecutionContext,
-         _execution_surface: &SourceRouteExecutionSurface,
-         source_route_json_execution_report: &JsonValue| {
-            let (root_state, _, _) = plan_root_scalar_initial_state(&plan)?;
-            let executed = execute_root_scalar_update_branch(
-                &plan,
-                &route_context.update_op,
-                route_context.selection.source_id,
-                &route_context.source_route_slot,
-                &event,
-                None,
-                &root_state,
-                host_file_root,
-            )?
-            .ok_or_else(|| {
-                format!(
-                    "selected update branch {} source guard did not match the supplied event",
-                    route_context.update_op.id.0
-                )
-            })?;
-            Ok(assemble_plan_source_route_runtime_branch_execution(
-                SourceRouteRuntimeBranchExecutionInput {
-                    value: executed.value,
-                    expression_kind: executed.expression_kind.to_owned(),
-                    source_payload_field: executed.source_payload_field,
-                    update_constant_id: executed.update_constant_id,
-                    update_constant_value: executed.update_constant_value,
-                    host_effect: executed.host_effect,
-                    state_write_core: executed.state_write_core,
-                    bytes_state_core: executed.bytes_state_core,
-                    runtime_branch_core: executed.executor_core,
-                },
-                source_route_json_execution_report,
-            ))
-        },
         || {
             let step = event.clone().into_step(0);
             let full_execution =

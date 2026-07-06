@@ -82,7 +82,7 @@ pub struct SourceRouteJsonExecution {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceRouteExecutionSurfaceKind {
     PlanJson,
-    RuntimeBranch,
+    FullExecution,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,19 +118,6 @@ pub struct SourceRouteSelectedExecution {
     pub executor_core: JsonValue,
     pub state_write_core: JsonValue,
     pub bytes_state_core: JsonValue,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SourceRouteRuntimeBranchExecutionInput {
-    pub value: JsonValue,
-    pub expression_kind: String,
-    pub source_payload_field: JsonValue,
-    pub update_constant_id: JsonValue,
-    pub update_constant_value: JsonValue,
-    pub host_effect: JsonValue,
-    pub state_write_core: JsonValue,
-    pub bytes_state_core: JsonValue,
-    pub runtime_branch_core: JsonValue,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12074,7 +12061,7 @@ pub fn validate_source_route_full_execution(
     plan: &MachinePlan,
     target_state_id: StateId,
     selected_update_op: &PlanOp,
-    selected_value: &JsonValue,
+    selected_value: Option<&JsonValue>,
     full_state_summary: &JsonValue,
     per_step: &[JsonValue],
 ) -> PlanExecutorResult<SourceRouteFullExecutionValidation> {
@@ -12110,7 +12097,7 @@ pub fn validate_source_route_full_execution(
                 selected_update_op.id.0
             )
         })?;
-        if &value != selected_value {
+        if selected_value.is_some_and(|selected_value| &value != selected_value) {
             return Err(format!(
                 "selected indexed route op {} produced {:?}, but full source-route execution produced {:?} for `{target_state_label}`",
                 selected_update_op.id.0, selected_value, value
@@ -12147,7 +12134,7 @@ pub fn validate_source_route_full_execution(
                 "full source-route execution did not produce target state `{target_state_label}`"
             )
         })?;
-    if &value != selected_value {
+    if selected_value.is_some_and(|selected_value| &value != selected_value) {
         return Err(format!(
             "selected route op {} produced {:?}, but full source-route execution produced {:?} for `{target_state_label}`",
             selected_update_op.id.0, selected_value, value
@@ -12194,7 +12181,7 @@ pub fn select_source_route_execution_surface(
     let kind = if execution.supported && !route_core_value_is_bytes {
         SourceRouteExecutionSurfaceKind::PlanJson
     } else {
-        SourceRouteExecutionSurfaceKind::RuntimeBranch
+        SourceRouteExecutionSurfaceKind::FullExecution
     };
     let executor_report = json!({
         "executor": "cpu-plan-source-route-execution-surface-v1",
@@ -12208,7 +12195,7 @@ pub fn select_source_route_execution_surface(
         "route_core_value_is_bytes": route_core_value_is_bytes,
         "execution_surface": match kind {
             SourceRouteExecutionSurfaceKind::PlanJson => "plan-json",
-            SourceRouteExecutionSurfaceKind::RuntimeBranch => "runtime-branch",
+            SourceRouteExecutionSurfaceKind::FullExecution => "full-execution",
         },
         "runtime_ast_eval_count": 0,
         "executable_string_path_count": 0,
@@ -12223,60 +12210,14 @@ pub fn select_source_route_execution_surface(
     })
 }
 
-pub fn assemble_source_route_runtime_branch_execution(
-    input: SourceRouteRuntimeBranchExecutionInput,
-    source_route_json_execution_report: &JsonValue,
-) -> SourceRouteSelectedExecution {
-    let runtime_branch_execution_core = json!({
-        "executor": "cpu-plan-source-route-runtime-branch-execution-v1",
-        "expression_kind": input.expression_kind.clone(),
-        "source_payload_field": input.source_payload_field.clone(),
-        "update_constant_id": input.update_constant_id.clone(),
-        "update_constant_value": input.update_constant_value.clone(),
-        "host_effect": input.host_effect.clone(),
-        "state_write_core": input.state_write_core.clone(),
-        "bytes_state_core": input.bytes_state_core.clone(),
-        "runtime_branch_core": input.runtime_branch_core.clone(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
-    let mut executor_core = source_route_json_execution_report.clone();
-    if let Some(object) = executor_core.as_object_mut() {
-        object.insert(
-            "runtime_branch_execution_core".to_owned(),
-            runtime_branch_execution_core,
-        );
-    }
-    SourceRouteSelectedExecution {
-        value: input.value,
-        expression_kind: input.expression_kind,
-        source_payload_field: input.source_payload_field,
-        update_constant_id: input.update_constant_id,
-        update_constant_value: input.update_constant_value,
-        host_effect: input.host_effect,
-        executor_core,
-        state_write_core: input.state_write_core,
-        bytes_state_core: input.bytes_state_core,
-    }
-}
-
-pub fn execute_source_route_with_runtime_callbacks<RuntimeBranch, FullExecution>(
+pub fn execute_source_route_with_full_execution<FullExecution>(
     plan: &MachinePlan,
     source_route: &str,
     target_state: &str,
     event: &RootJsonSourceEvent,
-    mut runtime_branch: RuntimeBranch,
     mut full_execution: FullExecution,
 ) -> PlanExecutorResult<SourceRouteOrchestration>
 where
-    RuntimeBranch: FnMut(
-        &SourceRouteExecutionContext,
-        &SourceRouteExecutionSurface,
-        &JsonValue,
-    ) -> PlanExecutorResult<SourceRouteSelectedExecution>,
     FullExecution: FnMut() -> PlanExecutorResult<SourceRouteFullExecution>,
 {
     let route_context = resolve_source_route_execution_context(plan, source_route, target_state)?;
@@ -12311,8 +12252,8 @@ where
         );
     }
 
-    let mut selected_executed = if execution_surface.kind
-        == SourceRouteExecutionSurfaceKind::PlanJson
+    let full_execution = full_execution()?;
+    let plan_json_selected = if execution_surface.kind == SourceRouteExecutionSurfaceKind::PlanJson
         || op.indexed
     {
         let value = source_route_json_execution.value.clone().ok_or_else(|| {
@@ -12331,7 +12272,7 @@ where
             .get("state_write_core")
             .cloned()
             .unwrap_or(JsonValue::Null);
-        SourceRouteSelectedExecution {
+        Some(SourceRouteSelectedExecution {
             value,
             expression_kind: expression_kind.to_owned(),
             source_payload_field: source_route_json_execution.source_payload_field.clone(),
@@ -12341,25 +12282,34 @@ where
             executor_core: source_route_json_execution_report.clone(),
             state_write_core,
             bytes_state_core: JsonValue::Null,
-        }
+        })
     } else {
-        runtime_branch(
-            &route_context,
-            &execution_surface,
-            &source_route_json_execution_report,
-        )?
+        None
     };
-    selected_executed.executor_core = source_route_json_execution_report.clone();
-
-    let full_execution = full_execution()?;
     let full_validation = validate_source_route_full_execution(
         plan,
         target_state_id,
         &op,
-        &selected_executed.value,
+        plan_json_selected.as_ref().map(|selected| &selected.value),
         &full_execution.state_summary,
         &full_execution.per_step,
     )?;
+    let mut selected_executed =
+        plan_json_selected.unwrap_or_else(|| SourceRouteSelectedExecution {
+            value: full_validation.value.clone(),
+            expression_kind: source_route_json_execution
+                .expression_kind
+                .unwrap_or("full_execution")
+                .to_owned(),
+            source_payload_field: source_route_json_execution.source_payload_field.clone(),
+            update_constant_id: source_route_json_execution.update_constant_id.clone(),
+            update_constant_value: source_route_json_execution.update_constant_value.clone(),
+            host_effect: JsonValue::Null,
+            executor_core: source_route_json_execution_report.clone(),
+            state_write_core: JsonValue::Null,
+            bytes_state_core: JsonValue::Null,
+        });
+    selected_executed.executor_core = source_route_json_execution_report.clone();
     let value = full_validation.value.clone();
     let state_summary = full_validation.state_summary.clone();
     let route_report = assemble_source_route_report(
@@ -19045,52 +18995,6 @@ mod tests {
     }
 
     #[test]
-    fn source_route_runtime_branch_execution_is_executor_owned() {
-        let output = assemble_source_route_runtime_branch_execution(
-            SourceRouteRuntimeBranchExecutionInput {
-                value: json!({
-                    "$boon_type": "BYTES",
-                    "byte_len": 4,
-                    "digest": "abc"
-                }),
-                expression_kind: "SourcePayload".to_owned(),
-                source_payload_field: json!("bytes"),
-                update_constant_id: JsonValue::Null,
-                update_constant_value: JsonValue::Null,
-                host_effect: json!({"kind": "FileWriteBytes"}),
-                state_write_core: JsonValue::Null,
-                bytes_state_core: json!({"executor": "cpu-plan-root-bytes-state-transition-v1"}),
-                runtime_branch_core: json!({"executor": "runtime-root-bytes-source-payload-v1"}),
-            },
-            &json!({
-                "executor": "cpu-plan-source-route-json-execution-v1",
-                "execution_surface_core": {
-                    "executor": "cpu-plan-source-route-execution-surface-v1"
-                }
-            }),
-        );
-
-        assert_eq!(output.expression_kind, "SourcePayload");
-        assert_eq!(output.source_payload_field, json!("bytes"));
-        assert_eq!(
-            output.executor_core["runtime_branch_execution_core"]["executor"],
-            "cpu-plan-source-route-runtime-branch-execution-v1"
-        );
-        assert_eq!(
-            output.executor_core["runtime_branch_execution_core"]["runtime_branch_core"]["executor"],
-            "runtime-root-bytes-source-payload-v1"
-        );
-        assert_eq!(
-            output.executor_core["execution_surface_core"]["executor"],
-            "cpu-plan-source-route-execution-surface-v1"
-        );
-        assert_eq!(
-            output.bytes_state_core["executor"],
-            "cpu-plan-root-bytes-state-transition-v1"
-        );
-    }
-
-    #[test]
     fn root_scenario_command_output_assembles_report_and_executor_core() {
         let output = assemble_root_scenario_command_output(RootScenarioCommandOutputInput {
             command_argv: vec![
@@ -19357,7 +19261,11 @@ mod tests {
             .expect("BYTES execution should classify");
         assert_eq!(
             bytes_surface.kind,
-            SourceRouteExecutionSurfaceKind::RuntimeBranch
+            SourceRouteExecutionSurfaceKind::FullExecution
+        );
+        assert_eq!(
+            bytes_surface.executor_report["execution_surface"],
+            "full-execution"
         );
         assert_eq!(
             bytes_surface.executor_report["route_core_value_is_bytes"],
@@ -20099,16 +20007,11 @@ mod tests {
                 .filter(|check| !check.pass)
                 .collect::<Vec<_>>()
         );
-        let mut runtime_branch_called = false;
-        let output = execute_source_route_with_runtime_callbacks(
+        let output = execute_source_route_with_full_execution(
             &plan,
             "store.input.change",
             "store.input",
             &event,
-            |_context, _surface, _json_report| {
-                runtime_branch_called = true;
-                Err("runtime branch should not run for JSON source-payload route".into())
-            },
             || {
                 Ok(SourceRouteFullExecution {
                     state_summary: json!({ "store.input": "hello" }),
@@ -20125,7 +20028,6 @@ mod tests {
         )
         .expect("source-route orchestration should execute through PlanExecutor");
 
-        assert!(!runtime_branch_called);
         assert_eq!(output.value, json!("hello"));
         assert_eq!(output.state_summary, json!({ "store.input": "hello" }));
         assert_eq!(output.route_surface["expression_kind"], "source_payload");

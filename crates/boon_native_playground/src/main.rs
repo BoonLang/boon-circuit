@@ -11793,22 +11793,26 @@ fn preview_product_frame_result(
         post_present_proof_request_count,
         product_patch: Some(presentation_plan.product_patch.clone()),
     };
-    let (render_graph, present_plan) = preview_compile_product_render_graph(
-        presentation_plan.render_target_kind,
-        Some(presentation_plan.active_scene_identity.clone()),
-        Some(presentation_plan.render_scene_identity.clone()),
-        Some(&presentation_plan.product_patch),
-        post_present_proof_request_count,
-        upload_bytes,
-        renderer_metrics,
-    );
+    let (render_graph, present_plan) = renderer_metrics
+        .and_then(|metrics| metrics.product_frame_graph.as_ref())
+        .map(|graph| {
+            preview_product_render_graph_from_renderer_report(
+                presentation_plan.render_target_kind,
+                Some(presentation_plan.active_scene_identity.clone()),
+                Some(presentation_plan.render_scene_identity.clone()),
+                Some(&presentation_plan.product_patch),
+                upload_bytes,
+                graph,
+            )
+        })
+        .unzip();
     boon_native_app_window::NativeProductFrameResult {
         schema_version: 1,
         owner: presentation_plan.product_result_owner.to_owned(),
         result_kind: presentation_plan.product_result_kind.to_owned(),
         product_frame,
-        render_graph: Some(render_graph),
-        present_plan: Some(present_plan),
+        render_graph,
+        present_plan,
         render_graph_execution: None,
         post_present_proof_requests: presentation_plan.post_present_proof_requests.clone(),
     }
@@ -11828,176 +11832,78 @@ fn preview_set_product_render_graph_encode_time_ms(
     }
 }
 
-fn preview_compile_product_render_graph(
+fn preview_product_render_graph_from_renderer_report(
     render_target_kind: &str,
     active_scene_identity: Option<String>,
     render_scene_identity: Option<String>,
     product_patch: Option<&boon_native_app_window::NativeProductPatchSummary>,
-    _post_present_proof_request_count: u32,
     upload_bytes: u64,
-    renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
+    renderer_graph: &boon_native_gpu::ProductFrameGraphReport,
 ) -> (
     boon_native_app_window::NativeProductRenderGraphSummary,
     boon_native_app_window::NativePresentPlanSummary,
 ) {
-    let mut passes = vec![
-        boon_native_app_window::NativeProductRenderGraphPassSummary {
-            schema_version: 1,
-            pass_id: "active-preview-scene".to_owned(),
-            pass_kind: "active_preview_scene".to_owned(),
-            source: "ActivePreviewScene".to_owned(),
-            target: render_target_kind.to_owned(),
-            product_visible: true,
-            proof_or_readback: false,
-        },
-    ];
-    if let Some(renderer_metrics) = renderer_metrics {
-        passes.extend(
-            renderer_metrics
-                .renderer_render_graph_passes
-                .iter()
-                .map(
-                    |pass| boon_native_app_window::NativeProductRenderGraphPassSummary {
-                        schema_version: 1,
-                        pass_id: format!("native-gpu:{}", pass.pass_id),
-                        pass_kind: pass.pass_kind.clone(),
-                        source: pass.input.clone(),
-                        target: pass.output.clone(),
-                        product_visible: pass.product_visible,
-                        proof_or_readback: pass.proof_or_readback,
-                    },
-                ),
-        );
-    }
-    if product_patch.is_some() {
-        passes.push(
-            boon_native_app_window::NativeProductRenderGraphPassSummary {
+    let passes = renderer_graph
+        .passes
+        .iter()
+        .map(
+            |pass| boon_native_app_window::NativeProductRenderGraphPassSummary {
                 schema_version: 1,
-                pass_id: "product-patch".to_owned(),
-                pass_kind: "product_patch".to_owned(),
-                source: "ProductPatch".to_owned(),
-                target: render_target_kind.to_owned(),
-                product_visible: true,
-                proof_or_readback: false,
+                pass_id: pass.pass_id.clone(),
+                pass_kind: pass.pass_kind.clone(),
+                source: pass.input.clone(),
+                target: pass.output.clone(),
+                product_visible: pass.product_visible,
+                proof_or_readback: pass.proof_or_readback,
             },
-        );
-    }
-    passes.push(
-        boon_native_app_window::NativeProductRenderGraphPassSummary {
-            schema_version: 1,
-            pass_id: "present".to_owned(),
-            pass_kind: "present".to_owned(),
-            source: render_target_kind.to_owned(),
-            target: "visible_surface".to_owned(),
-            product_visible: true,
-            proof_or_readback: false,
-        },
-    );
-    let proof_pass_count = passes.iter().filter(|pass| pass.proof_or_readback).count() as u32;
-    let product_pass_count = passes.len() as u32 - proof_pass_count;
+        )
+        .collect::<Vec<_>>();
+    let proof_pass_count = renderer_graph.proof_pass_count;
+    let product_pass_count = renderer_graph.product_pass_count;
     let cache_hit = product_patch.is_some_and(|patch| patch.source == "cached_scene");
     let dirty_chunk_count = product_patch
         .map(|patch| patch.touched_node_count)
         .unwrap_or(0);
-    let graph_fingerprint = format!(
-        "{render_target_kind}|{:?}|{:?}|{product_pass_count}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{:?}|{}",
-        active_scene_identity,
-        render_scene_identity,
-        product_patch.map(|patch| patch.patch_kind.as_str()),
-        product_patch.map(|patch| patch.source.as_str()),
-        product_patch.map(|patch| patch.direct_render_scene_patch),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_kind.as_str()),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_plan_hash.as_str()),
-        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
-        renderer_metrics.map(|metrics| {
-            metrics
-                .renderer_render_graph_resource_lifetime_hash
-                .as_str()
-        }),
-        renderer_metrics.map_or(0, |metrics| metrics.renderer_render_graph_resource_count),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_scheduler_kind.as_str()),
-        renderer_metrics.map_or(0, |metrics| metrics
-            .renderer_render_graph_schedule_decision_count)
-    );
-    let plan_hash = boon_runtime::sha256_bytes(graph_fingerprint.as_bytes());
-    let workload_fingerprint = format!(
-        "{:?}|{:?}|{dirty_chunk_count}|{upload_bytes}|{}|{:?}|{:?}",
-        active_scene_identity,
-        render_scene_identity,
-        u8::from(cache_hit),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_workload_hash.as_str()),
-        renderer_metrics.map(|metrics| metrics.renderer_render_graph_schedule_hash.as_str())
-    );
-    let workload_hash = boon_runtime::sha256_bytes(workload_fingerprint.as_bytes());
     let render_graph = boon_native_app_window::NativeProductRenderGraphSummary {
         schema_version: 1,
         status: "pass".to_owned(),
         owner: "preview_active_scene".to_owned(),
         graph_kind: "product_render_graph".to_owned(),
-        renderer_graph_kind: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_kind.clone())
+        renderer_graph_kind: Some(renderer_graph.graph_kind.clone())
             .filter(|kind| !kind.is_empty()),
-        renderer_graph_execution_kind: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_execution_kind.clone())
+        renderer_graph_execution_kind: Some(renderer_graph.execution_kind.clone())
             .filter(|kind| !kind.is_empty()),
-        renderer_graph_plan_hash: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_plan_hash.clone())
+        renderer_graph_plan_hash: Some(renderer_graph.plan_hash.clone())
             .filter(|hash| !hash.is_empty()),
-        renderer_graph_workload_hash: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_workload_hash.clone())
+        renderer_graph_workload_hash: Some(renderer_graph.workload_hash.clone())
             .filter(|hash| !hash.is_empty()),
-        renderer_graph_pass_count: renderer_metrics
-            .map_or(0, |metrics| metrics.renderer_render_graph_pass_count),
-        renderer_graph_product_pass_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_product_pass_count
-        }),
-        renderer_graph_proof_pass_count: renderer_metrics
-            .map_or(0, |metrics| metrics.renderer_render_graph_proof_pass_count),
-        renderer_graph_resource_count: renderer_metrics
-            .map_or(0, |metrics| metrics.renderer_render_graph_resource_count),
-        renderer_graph_product_resource_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_product_resource_count
-        }),
-        renderer_graph_resource_lifetime_hash: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_resource_lifetime_hash.clone())
+        renderer_graph_pass_count: renderer_graph.pass_count,
+        renderer_graph_product_pass_count: renderer_graph.product_pass_count,
+        renderer_graph_proof_pass_count: renderer_graph.proof_pass_count,
+        renderer_graph_resource_count: renderer_graph.resource_count,
+        renderer_graph_product_resource_count: renderer_graph.product_resource_count,
+        renderer_graph_resource_lifetime_hash: Some(renderer_graph.resource_lifetime_hash.clone())
             .filter(|hash| !hash.is_empty()),
-        renderer_graph_retained_resource_epoch_hash: renderer_metrics
-            .map(|metrics| {
-                metrics
-                    .renderer_render_graph_retained_resource_epoch_hash
-                    .clone()
-            })
-            .filter(|hash| !hash.is_empty()),
-        renderer_graph_retained_state_resource_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_retained_state_resource_count
-        }),
-        renderer_graph_retained_dirty_resource_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_retained_dirty_resource_count
-        }),
-        renderer_graph_retained_reused_resource_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_retained_reused_resource_count
-        }),
-        renderer_graph_scheduler_kind: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_scheduler_kind.clone())
+        renderer_graph_retained_resource_epoch_hash: Some(
+            renderer_graph.retained_resource_epoch_hash.clone(),
+        )
+        .filter(|hash| !hash.is_empty()),
+        renderer_graph_retained_state_resource_count: renderer_graph.retained_state_resource_count,
+        renderer_graph_retained_dirty_resource_count: renderer_graph.retained_dirty_resource_count,
+        renderer_graph_retained_reused_resource_count: renderer_graph
+            .retained_reused_resource_count,
+        renderer_graph_scheduler_kind: Some(renderer_graph.scheduler_kind.clone())
             .filter(|kind| !kind.is_empty()),
-        renderer_graph_schedule_hash: renderer_metrics
-            .map(|metrics| metrics.renderer_render_graph_schedule_hash.clone())
+        renderer_graph_schedule_hash: Some(renderer_graph.schedule_hash.clone())
             .filter(|hash| !hash.is_empty()),
-        renderer_graph_schedule_decision_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_schedule_decision_count
-        }),
-        renderer_graph_dirty_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_dirty_resource_decision_count
-        }),
-        renderer_graph_reuse_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_reuse_resource_decision_count
-        }),
-        renderer_graph_per_present_resource_decision_count: renderer_metrics.map_or(0, |metrics| {
-            metrics.renderer_render_graph_per_present_resource_decision_count
-        }),
+        renderer_graph_schedule_decision_count: renderer_graph.schedule_decision_count,
+        renderer_graph_dirty_resource_decision_count: renderer_graph.dirty_resource_decision_count,
+        renderer_graph_reuse_resource_decision_count: renderer_graph.reuse_resource_decision_count,
+        renderer_graph_per_present_resource_decision_count: renderer_graph
+            .per_present_resource_decision_count,
         active_scene_identity,
         render_scene_identity,
-        pass_count: passes.len() as u32,
+        pass_count: renderer_graph.pass_count,
         product_pass_count,
         proof_pass_count,
         dirty_chunk_count,
@@ -12006,10 +11912,17 @@ fn preview_compile_product_render_graph(
         cache_hit,
         proof_readback_in_product_graph: false,
         stale_epoch_rejection_count: 0,
-        plan_hash: plan_hash.clone(),
-        workload_hash: Some(workload_hash),
+        plan_hash: renderer_graph.plan_hash.clone(),
+        workload_hash: Some(renderer_graph.workload_hash.clone()).filter(|hash| !hash.is_empty()),
         passes,
     };
+    let present_plan_hash = boon_runtime::sha256_bytes(
+        format!(
+            "{}|{}|{}",
+            render_target_kind, render_graph.plan_hash, renderer_graph.schedule_hash
+        )
+        .as_bytes(),
+    );
     let present_plan = boon_native_app_window::NativePresentPlanSummary {
         schema_version: 1,
         status: "pass".to_owned(),
@@ -12021,7 +11934,7 @@ fn preview_compile_product_render_graph(
         product_pass_count,
         proof_pass_count,
         proof_readback_in_product_passes: false,
-        plan_hash,
+        plan_hash: present_plan_hash,
     };
     (render_graph, present_plan)
 }
@@ -64545,31 +64458,105 @@ mod tests {
         }
     }
 
+    fn test_product_frame_graph_report(
+        plan_hash: &str,
+        workload_hash: &str,
+    ) -> boon_native_gpu::ProductFrameGraphReport {
+        boon_native_gpu::ProductFrameGraphReport {
+            schema_version: 1,
+            owner: "boon_native_gpu".to_owned(),
+            graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
+            execution_kind: "retained_product_frame_graph_linear_v1".to_owned(),
+            plan_hash: plan_hash.to_owned(),
+            workload_hash: workload_hash.to_owned(),
+            pass_count: 2,
+            product_pass_count: 2,
+            proof_pass_count: 0,
+            resource_count: 3,
+            product_resource_count: 3,
+            resource_lifetime_hash: "resource-lifetime:test".to_owned(),
+            retained_resource_epoch_hash: "resource-epoch:test".to_owned(),
+            retained_dirty_resource_count: 1,
+            retained_reused_resource_count: 2,
+            retained_state_resource_count: 3,
+            scheduler_kind: "renderer_owned_product_frame_schedule_v1".to_owned(),
+            schedule_hash: "schedule:test".to_owned(),
+            schedule_decision_count: 3,
+            dirty_resource_decision_count: 1,
+            reuse_resource_decision_count: 1,
+            per_present_resource_decision_count: 1,
+            passes: vec![
+                boon_native_gpu::RendererRenderGraphPassMetric {
+                    schema_version: 1,
+                    pass_id: "renderer-scene-key".to_owned(),
+                    pass_kind: "scene_identity".to_owned(),
+                    input: "RenderScene".to_owned(),
+                    output: "SceneCacheKey".to_owned(),
+                    read_resources: vec!["RenderScene".to_owned()],
+                    write_resources: vec!["SceneCacheKey".to_owned()],
+                    product_visible: true,
+                    proof_or_readback: false,
+                    duration_ms: 0.1,
+                    upload_bytes: 0,
+                    dirty_chunk_count: 0,
+                    queue_write_count: 0,
+                    draw_call_count: 0,
+                },
+                boon_native_gpu::RendererRenderGraphPassMetric {
+                    schema_version: 1,
+                    pass_id: "renderer-ui-draw".to_owned(),
+                    pass_kind: "ui_draw_pass".to_owned(),
+                    input: "RetainedGpuBuffers".to_owned(),
+                    output: "ColorTarget".to_owned(),
+                    read_resources: vec!["RetainedGpuBuffers".to_owned()],
+                    write_resources: vec!["ColorTarget".to_owned()],
+                    product_visible: true,
+                    proof_or_readback: false,
+                    duration_ms: 0.2,
+                    upload_bytes: 128,
+                    dirty_chunk_count: 1,
+                    queue_write_count: 1,
+                    draw_call_count: 1,
+                },
+            ],
+            resources: Vec::new(),
+            schedule_decisions: Vec::new(),
+        }
+    }
+
     #[test]
-    fn product_render_graph_plan_hash_ignores_workload_and_post_present_proof_requests() {
-        let (low_work_graph, low_work_present) = preview_compile_product_render_graph(
+    fn product_render_graph_uses_renderer_owned_plan_and_workload_hashes() {
+        let low_report = test_product_frame_graph_report("plan:test", "workload:low");
+        let high_report = test_product_frame_graph_report("plan:test", "workload:high");
+        let (low_work_graph, low_work_present) = preview_product_render_graph_from_renderer_report(
             "surface-target",
             Some("active-scene".to_owned()),
             Some("render-scene".to_owned()),
             None,
-            0,
             128,
-            None,
+            &low_report,
         );
-        let (high_work_graph, high_work_present) = preview_compile_product_render_graph(
-            "surface-target",
-            Some("active-scene".to_owned()),
-            Some("render-scene".to_owned()),
-            None,
-            3,
-            8192,
-            None,
-        );
+        let (high_work_graph, high_work_present) =
+            preview_product_render_graph_from_renderer_report(
+                "surface-target",
+                Some("active-scene".to_owned()),
+                Some("render-scene".to_owned()),
+                None,
+                8192,
+                &high_report,
+            );
 
         assert_eq!(low_work_graph.plan_hash, high_work_graph.plan_hash);
-        assert_eq!(low_work_present.plan_hash, high_work_present.plan_hash);
         assert_ne!(low_work_graph.workload_hash, high_work_graph.workload_hash);
         assert_eq!(low_work_graph.pass_count, high_work_graph.pass_count);
+        assert_eq!(
+            low_work_graph.renderer_graph_plan_hash.as_deref(),
+            Some("plan:test")
+        );
+        assert_eq!(
+            low_work_graph.renderer_graph_scheduler_kind.as_deref(),
+            Some("renderer_owned_product_frame_schedule_v1")
+        );
         assert_eq!(
             low_work_graph.proof_pass_count,
             high_work_graph.proof_pass_count
@@ -64943,8 +64930,15 @@ mod tests {
             upload_bytes: Some(128),
             ..Default::default()
         };
+        let renderer_metrics = boon_native_gpu::FrameMetrics {
+            product_frame_graph: Some(test_product_frame_graph_report(
+                "plan:single-source",
+                "workload:single-source",
+            )),
+            ..Default::default()
+        };
 
-        preview_attach_product_proof_boundary(&mut metrics, &plan, None);
+        preview_attach_product_proof_boundary(&mut metrics, &plan, Some(&renderer_metrics));
 
         let product_result = metrics
             .product_result
@@ -64963,6 +64957,13 @@ mod tests {
         );
         assert!(product_result.render_graph.is_some());
         assert!(product_result.present_plan.is_some());
+        assert_eq!(
+            product_result
+                .render_graph
+                .as_ref()
+                .and_then(|graph| graph.renderer_graph_plan_hash.as_deref()),
+            Some("plan:single-source")
+        );
         assert_eq!(product_result.owner, "preview_active_scene");
         assert_eq!(product_result.result_kind, "active_preview_scene_patch");
     }

@@ -146,56 +146,44 @@ pub struct RendererRenderGraphScheduleDecisionMetric {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProductFrameGraphReport {
+    pub schema_version: u32,
+    pub owner: String,
+    pub graph_kind: String,
+    pub execution_kind: String,
+    pub plan_hash: String,
+    pub workload_hash: String,
+    pub pass_count: u32,
+    pub product_pass_count: u32,
+    pub proof_pass_count: u32,
+    pub resource_count: u32,
+    pub product_resource_count: u32,
+    pub resource_lifetime_hash: String,
+    pub retained_resource_epoch_hash: String,
+    pub retained_dirty_resource_count: u32,
+    pub retained_reused_resource_count: u32,
+    pub retained_state_resource_count: u32,
+    pub scheduler_kind: String,
+    pub schedule_hash: String,
+    pub schedule_decision_count: u32,
+    pub dirty_resource_decision_count: u32,
+    pub reuse_resource_decision_count: u32,
+    pub per_present_resource_decision_count: u32,
+    #[serde(default)]
+    pub passes: Vec<RendererRenderGraphPassMetric>,
+    #[serde(default)]
+    pub resources: Vec<RendererRenderGraphResourceMetric>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule_decisions: Vec<RendererRenderGraphScheduleDecisionMetric>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameMetrics {
     pub frame_seq: u64,
     #[serde(default)]
     pub render_scene_source: String,
-    #[serde(default)]
-    pub renderer_render_graph_kind: String,
-    #[serde(default)]
-    pub renderer_render_graph_execution_kind: String,
-    #[serde(default)]
-    pub renderer_render_graph_plan_hash: String,
-    #[serde(default)]
-    pub renderer_render_graph_workload_hash: String,
-    #[serde(default)]
-    pub renderer_render_graph_pass_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_product_pass_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_proof_pass_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_resource_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_product_resource_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_resource_lifetime_hash: String,
-    #[serde(default)]
-    pub renderer_render_graph_retained_resource_epoch_hash: String,
-    #[serde(default)]
-    pub renderer_render_graph_retained_dirty_resource_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_retained_reused_resource_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_retained_state_resource_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_scheduler_kind: String,
-    #[serde(default)]
-    pub renderer_render_graph_schedule_hash: String,
-    #[serde(default)]
-    pub renderer_render_graph_schedule_decision_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_dirty_resource_decision_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_reuse_resource_decision_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_per_present_resource_decision_count: u32,
-    #[serde(default)]
-    pub renderer_render_graph_passes: Vec<RendererRenderGraphPassMetric>,
-    #[serde(default)]
-    pub renderer_render_graph_resources: Vec<RendererRenderGraphResourceMetric>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub renderer_render_graph_schedule_decisions: Vec<RendererRenderGraphScheduleDecisionMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_frame_graph: Option<ProductFrameGraphReport>,
     #[serde(default)]
     pub document_scene_convert_ms: f64,
     #[serde(default)]
@@ -2875,47 +2863,54 @@ fn encode_internal_scene_to_surface(
         renderer_render_graph_workload_hash(&renderer_render_graph_passes);
     let renderer_render_graph_resource_lifetime_hash =
         renderer_render_graph_resource_lifetime_hash(&renderer_render_graph_resources);
+    let renderer_render_graph_kind = "boon_native_gpu_product_frame_graph".to_owned();
+    let renderer_render_graph_execution_kind = "retained_product_frame_graph_linear_v1".to_owned();
+    let renderer_render_graph_pass_count = renderer_render_graph_passes.len() as u32;
+    let renderer_render_graph_product_pass_count = renderer_render_graph_passes
+        .iter()
+        .filter(|pass| pass.product_visible)
+        .count() as u32;
+    let renderer_render_graph_proof_pass_count = renderer_render_graph_passes
+        .iter()
+        .filter(|pass| pass.proof_or_readback)
+        .count() as u32;
+    let renderer_render_graph_resource_count = renderer_render_graph_resources.len() as u32;
+    let renderer_render_graph_product_resource_count = renderer_render_graph_resources
+        .iter()
+        .filter(|resource| resource.product_visible)
+        .count() as u32;
+    let renderer_render_graph_scheduler_kind = render_execution.schedule.scheduler_kind.to_owned();
+    let product_frame_graph = ProductFrameGraphReport {
+        schema_version: 1,
+        owner: "boon_native_gpu".to_owned(),
+        graph_kind: renderer_render_graph_kind.clone(),
+        execution_kind: renderer_render_graph_execution_kind.clone(),
+        plan_hash: renderer_render_graph_plan_hash.clone(),
+        workload_hash: renderer_render_graph_workload_hash.clone(),
+        pass_count: renderer_render_graph_pass_count,
+        product_pass_count: renderer_render_graph_product_pass_count,
+        proof_pass_count: renderer_render_graph_proof_pass_count,
+        resource_count: renderer_render_graph_resource_count,
+        product_resource_count: renderer_render_graph_product_resource_count,
+        resource_lifetime_hash: renderer_render_graph_resource_lifetime_hash.clone(),
+        retained_resource_epoch_hash: retained_state_metrics.resource_epoch_hash.clone(),
+        retained_dirty_resource_count: retained_state_metrics.dirty_resource_count,
+        retained_reused_resource_count: retained_state_metrics.reused_resource_count,
+        retained_state_resource_count: retained_state_metrics.resource_count,
+        scheduler_kind: renderer_render_graph_scheduler_kind.clone(),
+        schedule_hash: schedule_metrics.schedule_hash.clone(),
+        schedule_decision_count: schedule_metrics.decision_count,
+        dirty_resource_decision_count: schedule_metrics.dirty_resource_decision_count,
+        reuse_resource_decision_count: schedule_metrics.reuse_resource_decision_count,
+        per_present_resource_decision_count: schedule_metrics.per_present_resource_decision_count,
+        passes: renderer_render_graph_passes.clone(),
+        resources: renderer_render_graph_resources.clone(),
+        schedule_decisions: renderer_render_graph_schedule_decisions.clone(),
+    };
     Ok(FrameMetrics {
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
-        renderer_render_graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
-        renderer_render_graph_execution_kind: "retained_product_frame_graph_linear_v1".to_owned(),
-        renderer_render_graph_plan_hash,
-        renderer_render_graph_workload_hash,
-        renderer_render_graph_pass_count: renderer_render_graph_passes.len() as u32,
-        renderer_render_graph_product_pass_count: renderer_render_graph_passes
-            .iter()
-            .filter(|pass| pass.product_visible)
-            .count() as u32,
-        renderer_render_graph_proof_pass_count: renderer_render_graph_passes
-            .iter()
-            .filter(|pass| pass.proof_or_readback)
-            .count() as u32,
-        renderer_render_graph_resource_count: renderer_render_graph_resources.len() as u32,
-        renderer_render_graph_product_resource_count: renderer_render_graph_resources
-            .iter()
-            .filter(|resource| resource.product_visible)
-            .count() as u32,
-        renderer_render_graph_resource_lifetime_hash,
-        renderer_render_graph_retained_resource_epoch_hash: retained_state_metrics
-            .resource_epoch_hash,
-        renderer_render_graph_retained_dirty_resource_count: retained_state_metrics
-            .dirty_resource_count,
-        renderer_render_graph_retained_reused_resource_count: retained_state_metrics
-            .reused_resource_count,
-        renderer_render_graph_retained_state_resource_count: retained_state_metrics.resource_count,
-        renderer_render_graph_scheduler_kind: render_execution.schedule.scheduler_kind.to_owned(),
-        renderer_render_graph_schedule_hash: schedule_metrics.schedule_hash,
-        renderer_render_graph_schedule_decision_count: schedule_metrics.decision_count,
-        renderer_render_graph_dirty_resource_decision_count: schedule_metrics
-            .dirty_resource_decision_count,
-        renderer_render_graph_reuse_resource_decision_count: schedule_metrics
-            .reuse_resource_decision_count,
-        renderer_render_graph_per_present_resource_decision_count: schedule_metrics
-            .per_present_resource_decision_count,
-        renderer_render_graph_passes,
-        renderer_render_graph_resources,
-        renderer_render_graph_schedule_decisions,
+        product_frame_graph: Some(product_frame_graph),
         document_scene_convert_ms: 0.0,
         document_scene_cache_hit: false,
         document_scene_cache_entry_count: 0,

@@ -733,10 +733,38 @@ Fresh focused evidence:
   - `cargo check -q -p xtask`: pass.
   - `cargo test -q -p xtask stale_path_ledger -- --nocapture`: pass; 3 passed.
 
+### 2026-07-06 - ProductFrameGraph Report Owned By Renderer Metrics
+
+- Added `boon_native_gpu::ProductFrameGraphReport` and made
+  `FrameMetrics.product_frame_graph` the single public carrier for renderer
+  graph identity, passes, resources, schedule decisions, retained resource
+  state, plan hash, and workload hash.
+- Deleted the flattened `renderer_render_graph_*` fields from
+  `boon_native_gpu::FrameMetrics`.
+- Replaced the playground's synthetic product render graph builder with a mapper
+  from the renderer-owned graph report into the current native product report
+  schema.
+- Removed the old synthetic active-scene/product-patch/present graph passes and
+  the missing-renderer test fallback.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_gpu -p boon_native_playground -p boon_native_app_window`:
+    pass.
+  - `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`:
+    pass; 5 passed.
+  - `cargo test -q -p boon_native_playground product_render_graph_uses_renderer_owned_plan_and_workload_hashes -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_product_metrics -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground preview_presentation_plan_owns_product_and_proof_boundary -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask product_render_graph -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
-1. Continue moving `ProductFrameGraph` ownership out of playground/report
-   adapters and into typed renderer DTOs.
+1. Delete app-window `render_graph_execution` synthesis and replace it with
+   commit/present timing owned by `NativeProductFrameCommit`; graph execution
+   now belongs to the renderer-owned `ProductFrameGraphReport`.
 2. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 

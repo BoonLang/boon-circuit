@@ -38635,3 +38635,48 @@ What changed:
   and bounded add-todo visual output from native layout/readback artifacts.
   Missing unvisited theme actions remain recorded as delegated full scenario
   coverage instead of failing the preview smoke gate.
+
+## 2026-07-06 - PlanExecutor Product Reports Drop Legacy Comparison Status
+
+Status: implemented and focused-verified; broad report refresh pending.
+
+What changed:
+
+- Removed the obsolete `comparison_status=not-requested` field from
+  PlanExecutor product command-report assembly for source-route, root-scenario,
+  and source-event scenario replay reports.
+- Removed the matching schema requirement and downstream readiness detail. The
+  product contract is now expressed by `plan_executor_status` plus
+  `accepted_for_product_status`; legacy comparison state must not be carried in
+  product reports.
+- Updated runtime/PlanExecutor tests to assert absence of the legacy comparison
+  field instead of preserving a disabled compatibility marker.
+- Updated the native GPU contract and active goal prompt so future cleanup does
+  not reintroduce `comparison_status` as a required product split field.
+
+Fresh focused evidence before commit:
+
+- `cargo fmt -- --check`: pass.
+- `cargo test -q -p boon_report_schema run_plan -- --nocapture`: pass.
+- `cargo test -q -p xtask
+  source_replay_product_status_uses_plan_executor_split_fields -- --nocapture`:
+  pass.
+- `cargo test -q -p boon_plan_executor command_output_assembles --
+  --nocapture`: pass.
+- `cargo test -q -p boon_plan_executor
+  scenario_events_report_without_legacy_compare_is_product_status --
+  --nocapture`: pass.
+- `cargo test -q -p boon_runtime
+  run_plan_route_reports_full_source_event_delta_batch -- --nocapture`: pass.
+- `cargo check -q -p boon_plan_executor -p boon_report_schema -p boon_runtime
+  -p xtask`: pass.
+- `git diff --check`: pass.
+
+Known verification limit:
+
+- `cargo test -q -p boon_runtime
+  cells_plan_executor_scenario_events_are_product_only -- --nocapture` was
+  stopped after it ran for more than three minutes. This is not counted as
+  passing evidence; it reinforces that broad Cells scenario replay is too costly
+  for every report-contract cleanup slice and should be covered by the larger
+  fresh native/report aggregate pass.

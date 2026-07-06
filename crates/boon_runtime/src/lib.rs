@@ -48659,7 +48659,7 @@ payload:
         assert_eq!(output.state_summary["store.new_todo_text"], "Test todo");
         assert_eq!(output.state_summary["store.selected_filter"], "All");
         assert_eq!(output.state_summary["store.new_todo_focused"], true);
-        assert_eq!(output.report["comparison_status"], "not-requested");
+        assert!(output.report.get("comparison_status").is_none());
         assert!(output.report.get("legacy_comparison").is_none());
         assert!(output.report.get("legacy_comparison_acceptance").is_none());
         assert_eq!(
@@ -48690,7 +48690,7 @@ payload:
     }
 
     fn assert_root_scenario_product_only(report: &JsonValue) {
-        assert_eq!(report["comparison_status"], "not-requested");
+        assert!(report.get("comparison_status").is_none());
         assert!(report.get("legacy_comparison").is_none());
         assert!(report.get("legacy_comparison_acceptance").is_none());
     }
@@ -48932,7 +48932,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
 
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.state_summary["store.flag"], true);
-        assert_eq!(output.report["comparison_status"], "not-requested");
+        assert!(output.report.get("comparison_status").is_none());
         assert!(output.report.get("legacy_comparison").is_none());
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
@@ -49004,9 +49004,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                     output.report.get("legacy_comparison_acceptance").is_none(),
                     "Cells product scenario events must not emit legacy acceptance policy"
                 );
-                assert_eq!(
-                    output.report["comparison_status"], "not-requested",
-                    "Cells product scenario events should report comparison as not requested"
+                assert!(
+                    output.report.get("comparison_status").is_none(),
+                    "Cells product scenario events must not emit legacy comparison status"
                 );
                 assert_eq!(
                     output.report["status"], "pass",

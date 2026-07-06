@@ -13,9 +13,10 @@ Values are equations.
 Collections are indexed equations over memory.
 ```
 
-The first target is a Rust static-graph interpreter with a native Ply
-playground. Rust/Zig codegen and hardware-oriented lowering come later, after
-the semantics are proven on TodoMVC and 7GUIs Cells.
+The current target is a PlanExecutor-backed runtime with a native GPU
+two-window playground. Rust/Zig codegen, browser/WASM, and hardware-oriented
+lowering come after the runtime, document, render, and verifier contracts are
+kept generic and fast on TodoMVC and 7GUIs Cells.
 
 ## Documents
 
@@ -29,8 +30,9 @@ the semantics are proven on TodoMVC and 7GUIs Cells.
 - [TodoMVC target shape](docs/examples/TODOMVC_CIRCUIT_STYLE.md)
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
-- [Example verification plan](docs/plans/EXAMPLE_VERIFICATION_PLAN.md)
-- [TodoMVC e2e test plan](docs/plans/TODOMVC_E2E_TEST_PLAN.md)
+- [Native GPU pipeline contract](docs/architecture/NATIVE_GPU_PIPELINE.md)
+- [Unified runtime/rendering/3D plan](docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md)
+- [Native realtime frame-loop and proof plan](docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md)
 - [Manual testing runbook](docs/plans/MANUAL_TESTING_RUNBOOK.md)
 - [`/goal` prompt](docs/plans/GOAL_PROMPT.md)
 
@@ -52,24 +54,23 @@ The first implementation is only convincing if these are true:
 2. TodoMVC with many rows does not grow runtime graph topology per row.
 3. Ordinary TodoMVC does not expose runtime identity, references, or row ids.
 4. Cells satisfies the 7GUIs behavior without hardcoded Rust app logic.
-5. LIST changes propagate as keyed deltas to Ply, not as whole snapshots.
+5. LIST changes propagate as keyed deltas to the document/native GPU pipeline,
+   not as whole snapshots.
 6. Browser/server runtime sync can exchange semantic deltas, not full state.
 7. Every stateful value has a visible next-state equation.
-8. TodoMVC is accepted through a headed native Ply replay and manual pass, not
-   only a semantic or headless test.
-9. Cells and future examples use the same headed/manual/semantic/speed/resource
-   verification contract.
+8. TodoMVC is accepted through app-owned native GPU host-event evidence, not
+   legacy Ply, browser, Xvfb, COSMIC screenshots, or fabricated manual proof.
+9. Cells and future examples use the same generic native/document/runtime
+   verification contract without example-specific runtime or renderer hacks.
 10. Normal interactions complete in a couple of milliseconds in release mode
     without excessive RAM or VRAM growth.
 
 ## Current Verification Shape
 
-The repo intentionally keeps the final aggregate gate honest. Semantic,
-headless, headed Ply, speed, negative, and report-schema checks can be generated
-by automation. The final aggregate gate now uses explicit `operator-e2e`
-reports generated from current full headed OS-input evidence, so Codex/operator
-verification does not get stuck waiting for human-only JSON. Real human reports
-remain separate follow-up evidence and must not be fabricated.
+The repo intentionally keeps the final aggregate gate honest. Native readiness
+is defined by `docs/architecture/native_gpu_handoff_manifest.json` and
+`docs/architecture/NATIVE_GPU_PIPELINE.md`. Human observation is useful product
+feedback after those gates pass, but it is not verifier proof.
 
 Useful commands while iterating:
 
@@ -79,20 +80,14 @@ cargo run -p boon_cli -- dump-ir examples/todomvc.bn
 cargo run -p boon_cli -- dump-ir examples/cells.bn
 cargo run -p boon_cli -- run examples/todomvc.bn --scenario examples/todomvc.scn
 cargo run -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
-BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-todomvc-headed-ply
-BOON_ALLOW_OS_POINTER_PROBE=1 cargo xtask verify-cells-headed-ply
-cargo xtask verify-todomvc-operator-e2e --report target/reports/todomvc-operator-e2e.json
-cargo xtask verify-cells-operator-e2e --report target/reports/cells-operator-e2e.json
-cargo xtask verify-todomvc-speed
-cargo xtask verify-cells-speed
+cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json
 cargo xtask verify-todomvc-negative
 cargo xtask verify-cells-negative
-cargo xtask verify-playground-custom-source
-cargo xtask verify-playground-background-launch --report target/reports/playground-background-launch.json
 cargo bench -p boon_runtime --bench todomvc -- --report target/reports/todomvc-bench.json --speed-report target/reports/todomvc-bench-speed.json
 cargo xtask bench-todomvc
 cargo xtask bench-example cells
 cargo xtask verify-report-schema
+cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 cargo xtask verify-runtime-finality
 cargo xtask audit-goal-readiness
 cargo xtask verify-todomvc-human --write-template

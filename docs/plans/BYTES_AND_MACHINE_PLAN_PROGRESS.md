@@ -38811,6 +38811,22 @@ What changed:
   generic native GPU contract rather than a removed report shape.
 - Deleted the old manual human-report command provenance unit test and helper
   exports that existed only for removed `prepare-*-human-report` commands.
+
+## 2026-07-06 - Retired Plan Files Deleted
+
+Status: implemented; focused verification pending.
+
+What changed:
+
+- Deleted retired plan stubs for legacy Ply/focus-free headed testing, old
+  example verification, old TodoMVC E2E, runtime-finality honesty, and the old
+  remove-view-document UI goal.
+- Deleted the historical 18k-line speedup execution checklist. Its stale
+  browser/Ply/native-web evidence was no longer an active source of truth and
+  kept pulling agents back into deleted verifier paths.
+- Updated README and unified architecture/prompt routing to point at the native
+  GPU contract, the active realtime frame-loop/proof plan, the unified progress
+  ledger, and the current `/goal` prompt.
 - `cargo test -q -p xtask
   native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input --
   --nocapture`: pass.

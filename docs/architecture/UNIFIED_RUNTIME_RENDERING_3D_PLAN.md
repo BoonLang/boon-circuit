@@ -72,9 +72,9 @@ This plan extends rather than replaces the useful parts of:
 
 - `docs/plans/BYTES_AND_MACHINE_PLAN_IMPLEMENTATION.md`
 - `docs/plans/BYTES_AND_MACHINE_PLAN_PROGRESS.md`
-- `docs/plans/RUNTIME_FINALITY_HONESTY_PLAN.md`
-- `docs/plans/REMOVE_VIEW_DOCUMENT_UI_GOAL.md`
 - `docs/plans/NATIVE_DEMAND_DRIVEN_RENDER_LOOP_PLAN.md`
+- `docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md`
+- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
 - `docs/plans/GOAL_PROMPT.md`
 - `docs/architecture/RUNTIME_MODEL.md`
 - `docs/architecture/LIST_MODEL.md`

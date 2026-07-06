@@ -433,6 +433,33 @@ Fresh focused evidence:
   - `cargo check -q -p xtask`: pass.
   - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 11 passed.
 
+### 2026-07-06 - Renderer Patch Encode Path Deleted
+
+- Deleted renderer-level `SurfaceRenderScenePatchRequest`,
+  `VisibleLayoutRenderer::encode_scene_patch`, standalone render-scene patch
+  encode helpers, the patch-specific GPU scene cache key, and the duplicate
+  copy-on-write patch conversion engine in `boon_native_gpu`.
+- `boon_native_gpu` now accepts a concrete `boon_document::RenderScene` for the
+  native UI path; patch materialization stays in `boon_native_playground` /
+  `boon_document`, where the retained document and overlay state live.
+- Updated preview and dev fast-patch paths to materialize/cache patched
+  render scenes before calling `encode_scene`, preserving retained patch
+  behavior without a second renderer input shape.
+- Deleted the GPU unit test that only proved the removed duplicate patch engine
+  matched `RenderScene::apply_patch`.
+- Fresh focused evidence:
+  - `cargo fmt -- --check`: pass.
+  - `cargo check -q -p boon_native_gpu -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_gpu renderer_helpers_accept_prelowered_render_scene_without_layout_frame -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_gpu product_frame_graph_executor_emits_typed_pass_and_resource_metrics -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground input_overlay_render_scene_patch -- --nocapture`:
+    pass; 3 passed.
+  - `cargo test -q -p boon_native_playground dev_render_scroll_patch -- --nocapture`:
+    pass; 4 passed.
+  - `git diff --check`: pass.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

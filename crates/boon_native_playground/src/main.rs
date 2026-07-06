@@ -11220,8 +11220,6 @@ fn native_gpu_app_owned_render_hook(
     let mut patched_scene_cache_written = false;
     let direct_input_overlay_render_scene_patch_enabled =
         input_overlay_render_scene_patch_enabled && product_present_fast_path;
-    let mut direct_input_overlay_render_scene_patch = None;
-    let mut direct_layout_render_scene_patch = None;
     let mut render_scene_encode_cache_key = render_scene_cache_key.clone();
     let render_scene_cache_hit: bool;
     if direct_input_overlay_render_scene_patch_enabled {
@@ -11297,26 +11295,39 @@ fn native_gpu_app_owned_render_hook(
             base_cache_key
         };
         let patch_build_started = Instant::now();
-        direct_input_overlay_render_scene_patch = Some(
-            preview_input_overlay_render_scene_patch_from_base(
-                layout_frame,
-                &visible_state.overlay_lookup,
-                hover_overlay,
-                focus_overlay,
-                &input_overlay_touched_nodes,
-                context.width,
-                context.height,
-                render_text_columns,
-            )
-            .ok_or("input overlay render scene patch was enabled but produced no patch")?,
-        );
-        if let Some(input_overlay_patch) = direct_input_overlay_render_scene_patch.as_ref() {
-            effective_render_scene_patch_hash =
-                render_scene_patch_hash(Some(&input_overlay_patch.patch));
-            render_scene_cache_key.4 = effective_render_scene_patch_hash.clone();
-        }
+        let input_overlay_patch = preview_input_overlay_render_scene_patch_from_base(
+            layout_frame,
+            &visible_state.overlay_lookup,
+            hover_overlay,
+            focus_overlay,
+            &input_overlay_touched_nodes,
+            context.width,
+            context.height,
+            render_text_columns,
+        )
+        .ok_or("input overlay render scene patch was enabled but produced no patch")?;
+        effective_render_scene_patch_hash =
+            render_scene_patch_hash(Some(&input_overlay_patch.patch));
+        render_scene_cache_key.4 = effective_render_scene_patch_hash.clone();
         input_overlay_render_scene_patch_build_ms = elapsed_ms(patch_build_started);
-        render_scene_encode_cache_key = base_cache_key;
+        if !render_scene_cache.contains_key(&render_scene_cache_key)
+            && let Some((base_layout_hash, _, base_scene)) =
+                render_scene_cache.get(&base_cache_key).cloned()
+        {
+            let mut patched_scene = base_scene;
+            patched_scene.apply_patch(&input_overlay_patch.patch)?;
+            let patched_scene_hash = render_scene_hash(&patched_scene);
+            if render_scene_cache.len() >= PREVIEW_RENDER_SCENE_CACHE_CAP
+                && let Some(oldest_key) = render_scene_cache.keys().next().cloned()
+            {
+                render_scene_cache.remove(&oldest_key);
+            }
+            render_scene_cache.insert(
+                render_scene_cache_key.clone(),
+                (base_layout_hash, patched_scene_hash, patched_scene),
+            );
+        }
+        render_scene_encode_cache_key = render_scene_cache_key.clone();
     } else if direct_layout_render_scene_patch_enabled {
         const PREVIEW_RENDER_SCENE_CACHE_CAP: usize = 128;
         let base_hash = layout_render_scene_patch_base_hash
@@ -11362,21 +11373,22 @@ fn native_gpu_app_owned_render_hook(
             );
             base_cache_key
         };
-        direct_layout_render_scene_patch = layout_render_scene_patch.clone();
+        let patched_base_cache_key = (
+            visible_state
+                .layout_frame_hash
+                .clone()
+                .unwrap_or_else(|| layout_cache_key.to_owned()),
+            context.width,
+            context.height,
+            current_render_scene_lowering_mode.to_owned(),
+            "none".to_owned(),
+        );
         if let (Some(layout_patch), Some(patched_layout_hash)) = (
-            direct_layout_render_scene_patch.as_ref(),
+            layout_render_scene_patch.as_ref(),
             visible_state.layout_frame_hash.as_ref(),
         ) {
             let patched_scene_cache_started = Instant::now();
-            let patched_base_cache_key = (
-                patched_layout_hash.clone(),
-                context.width,
-                context.height,
-                current_render_scene_lowering_mode.to_owned(),
-                "none".to_owned(),
-            );
-            if !context.input.real_os_events_observed
-                && !render_scene_cache.contains_key(&patched_base_cache_key)
+            if !render_scene_cache.contains_key(&patched_base_cache_key)
                 && let Some((_, _, base_scene)) = render_scene_cache.get(&base_cache_key).cloned()
             {
                 let mut patched_scene = base_scene;
@@ -11389,7 +11401,7 @@ fn native_gpu_app_owned_render_hook(
                     render_scene_cache.remove(&oldest_key);
                 }
                 render_scene_cache.insert(
-                    patched_base_cache_key,
+                    patched_base_cache_key.clone(),
                     (
                         patched_layout_hash.clone(),
                         patched_scene_hash,
@@ -11400,7 +11412,7 @@ fn native_gpu_app_owned_render_hook(
             }
             patched_scene_cache_ms = elapsed_ms(patched_scene_cache_started);
         }
-        render_scene_encode_cache_key = base_cache_key;
+        render_scene_encode_cache_key = patched_base_cache_key;
     } else {
         render_scene_cache_hit = render_scene_cache.contains_key(&render_scene_cache_key);
     }
@@ -11554,48 +11566,17 @@ fn native_gpu_app_owned_render_hook(
         .get(&render_scene_encode_cache_key)
         .ok_or("preview render scene cache was not initialized")?;
     let encode_scene_started = Instant::now();
-    let visible_metrics =
-        if let Some(input_overlay_patch) = direct_input_overlay_render_scene_patch.as_ref() {
-            renderer.encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
-                device: context.device,
-                queue: context.queue,
-                encoder: context.encoder,
-                view: context.surface_view,
-                scene: render_scene,
-                scene_identity: Some(cached_render_scene_hash),
-                patch: &input_overlay_patch.patch,
-                patch_identity: Some(render_scene_patch_hash),
-                format: context.surface_texture_format,
-                width: context.width,
-                height: context.height,
-            })?
-        } else if let Some(layout_patch) = direct_layout_render_scene_patch.as_ref() {
-            renderer.encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
-                device: context.device,
-                queue: context.queue,
-                encoder: context.encoder,
-                view: context.surface_view,
-                scene: render_scene,
-                scene_identity: Some(cached_render_scene_hash),
-                patch: layout_patch,
-                patch_identity: Some(render_scene_patch_hash),
-                format: context.surface_texture_format,
-                width: context.width,
-                height: context.height,
-            })?
-        } else {
-            renderer.encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
-                device: context.device,
-                queue: context.queue,
-                encoder: context.encoder,
-                view: context.surface_view,
-                scene: render_scene,
-                scene_identity: Some(cached_render_scene_hash),
-                format: context.surface_texture_format,
-                width: context.width,
-                height: context.height,
-            })?
-        };
+    let visible_metrics = renderer.encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
+        device: context.device,
+        queue: context.queue,
+        encoder: context.encoder,
+        view: context.surface_view,
+        scene: render_scene,
+        scene_identity: Some(cached_render_scene_hash),
+        format: context.surface_texture_format,
+        width: context.width,
+        height: context.height,
+    })?;
     let encode_scene_ms = elapsed_ms(encode_scene_started);
     let render_scene_hash_ms = 0.0_f64;
     let render_scene_identity = format!(
@@ -13167,17 +13148,17 @@ fn native_gpu_dev_visible_render_hook(
             let cache = render_scene_cache
                 .as_mut()
                 .ok_or_else(|| "dev render scene cache missing for direct patch".to_owned())?;
+            let base_layout_frame_hash = cache.layout_frame_hash.clone();
+            let render_scene_hash_value = render_scene_hash(&patched_scene);
             let encode_scene_started = Instant::now();
             let visible_metrics = renderer
-                .encode_scene_patch(boon_native_gpu::SurfaceRenderScenePatchRequest {
+                .encode_scene(boon_native_gpu::SurfaceRenderSceneRequest {
                     device: context.device,
                     queue: context.queue,
                     encoder: context.encoder,
                     view: context.surface_view,
-                    scene: &cache.render_scene,
-                    scene_identity: Some(&cache.render_scene_hash_value),
-                    patch: &patch,
-                    patch_identity: Some(&direct_patch_hash),
+                    scene: &patched_scene,
+                    scene_identity: Some(&render_scene_hash_value),
                     format: context.surface_texture_format,
                     width: context.width,
                     height: context.height,
@@ -13188,14 +13169,7 @@ fn native_gpu_dev_visible_render_hook(
             let layout_frame_hash = boon_runtime::sha256_bytes(
                 format!(
                     "dev-layout-render-scene-patch:{}:{}:{}",
-                    cache.layout_frame_hash, direct_patch_hash, content_revision
-                )
-                .as_bytes(),
-            );
-            let render_scene_hash_value = boon_runtime::sha256_bytes(
-                format!(
-                    "dev-render-scene-patch:{}:{}:{}",
-                    cache.render_scene_hash_value, direct_patch_hash, content_revision
+                    base_layout_frame_hash, direct_patch_hash, content_revision
                 )
                 .as_bytes(),
             );

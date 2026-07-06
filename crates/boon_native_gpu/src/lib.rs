@@ -4,10 +4,8 @@ use boon_document::{
     DocumentNodeId, DocumentNodeKind, Rect, StyleMap, StyleRichTextSpan, StyleValue,
     render_scene::{
         RenderAssetRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
-        RenderScene as DocumentRenderScene, RenderSceneItem as DocumentRenderSceneItem,
-        RenderScenePaintPatch, RenderScenePatch as DocumentRenderScenePatch,
-        RenderScenePatchOperation, RenderTextAlign, RenderTextColumnMeasurer, RenderTextRun,
-        RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
+        RenderScene as DocumentRenderScene, RenderTextAlign, RenderTextColumnMeasurer,
+        RenderTextRun, RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
         RenderVisualPrimitiveKind,
     },
 };
@@ -20,7 +18,6 @@ use glyphon::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -281,7 +278,6 @@ pub struct FrameMetrics {
 }
 
 const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE: &str = "document-render-scene";
-const RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE_PATCH: &str = "document-render-scene-patch";
 const RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE: &str = "internal-render-scene";
 const RENDER_SCENE_SOURCE_APP_OWNED_DOCUMENT_RENDER_SCENE: &str = "app-owned-document-render-scene";
 const RENDER_SCENE_SOURCE_APP_OWNED_WORLD_SCENE_PROJECTION: &str =
@@ -342,7 +338,6 @@ struct RenderSceneItem {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InternalRenderSceneCacheKey {
     scene_identity: String,
-    patch_identity: String,
     width: u32,
     height: u32,
 }
@@ -808,20 +803,6 @@ pub struct SurfaceRenderSceneRequest<'a> {
     pub view: &'a wgpu::TextureView,
     pub scene: &'a DocumentRenderScene,
     pub scene_identity: Option<&'a str>,
-    pub format: wgpu::TextureFormat,
-    pub width: u32,
-    pub height: u32,
-}
-
-pub struct SurfaceRenderScenePatchRequest<'a> {
-    pub device: &'a wgpu::Device,
-    pub queue: &'a wgpu::Queue,
-    pub encoder: &'a mut wgpu::CommandEncoder,
-    pub view: &'a wgpu::TextureView,
-    pub scene: &'a DocumentRenderScene,
-    pub scene_identity: Option<&'a str>,
-    pub patch: &'a DocumentRenderScenePatch,
-    pub patch_identity: Option<&'a str>,
     pub format: wgpu::TextureFormat,
     pub width: u32,
     pub height: u32,
@@ -1852,26 +1833,6 @@ impl VisibleLayoutRenderer {
             self.frame_seq,
         )
     }
-
-    pub fn encode_scene_patch(
-        &mut self,
-        request: SurfaceRenderScenePatchRequest<'_>,
-    ) -> Result<FrameMetrics, RenderError> {
-        self.frame_seq += 1;
-        encode_render_scene_patch_to_surface_with_pipeline(
-            request,
-            &self.pipeline,
-            &mut self.text,
-            &mut self.textures,
-            &mut self.internal_scene_cache,
-            &mut self.quad_buffers,
-            &mut self.quad_upload_ring,
-            &mut self.prepared_quads,
-            &mut self.previous_chunk_ids,
-            &mut self.product_frame_graph,
-            self.frame_seq,
-        )
-    }
 }
 
 pub fn encode_render_scene_to_surface(
@@ -1881,17 +1842,9 @@ pub fn encode_render_scene_to_surface(
     renderer.encode_scene(request)
 }
 
-pub fn encode_render_scene_patch_to_surface(
-    request: SurfaceRenderScenePatchRequest<'_>,
-) -> Result<FrameMetrics, RenderError> {
-    let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, request.format);
-    renderer.encode_scene_patch(request)
-}
-
 fn internal_render_scene_cache_key(
     scene: &DocumentRenderScene,
     scene_identity: Option<&str>,
-    patch_identity: Option<&str>,
     width: u32,
     height: u32,
 ) -> InternalRenderSceneCacheKey {
@@ -1899,7 +1852,6 @@ fn internal_render_scene_cache_key(
         scene_identity: scene_identity
             .map(str::to_owned)
             .unwrap_or_else(|| document_render_scene_fallback_identity(scene)),
-        patch_identity: patch_identity.unwrap_or("none").to_owned(),
         width,
         height,
     }
@@ -1945,7 +1897,7 @@ fn encode_render_scene_to_surface_with_pipeline(
     let height = request.height.clamp(1, 1080);
     let convert_started = Instant::now();
     let cache_key =
-        internal_render_scene_cache_key(request.scene, request.scene_identity, None, width, height);
+        internal_render_scene_cache_key(request.scene, request.scene_identity, width, height);
     let cache_hit = internal_scene_cache.contains_key(&cache_key);
     if !cache_hit {
         evict_internal_scene_cache_if_needed(internal_scene_cache);
@@ -1979,94 +1931,13 @@ fn encode_render_scene_to_surface_with_pipeline(
         prepared_quads,
         previous_chunk_ids,
         product_frame_graph,
-        render_scene_supplied_cache_key(request.scene_identity, None, width, height),
+        render_scene_supplied_cache_key(request.scene_identity, width, height),
         frame_seq,
     )?;
     metrics.document_scene_convert_ms = document_scene_convert_ms;
     metrics.document_scene_cache_hit = cache_hit;
     metrics.document_scene_cache_entry_count = cache_entry_count;
     metrics.render_scene_source = RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE.to_owned();
-    Ok(metrics)
-}
-
-fn encode_render_scene_patch_to_surface_with_pipeline(
-    request: SurfaceRenderScenePatchRequest<'_>,
-    pipeline: &wgpu::RenderPipeline,
-    text: &mut GlyphonTextState,
-    textures: &mut TextureState,
-    internal_scene_cache: &mut BTreeMap<InternalRenderSceneCacheKey, RenderScene>,
-    quad_buffers: &mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
-    quad_upload_ring: &mut QuadUploadRing,
-    prepared_quads: &mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
-    previous_chunk_ids: &mut BTreeSet<String>,
-    product_frame_graph: &mut ProductFrameGraphState,
-    frame_seq: u64,
-) -> Result<FrameMetrics, RenderError> {
-    let width = request.width.clamp(1, 1920);
-    let height = request.height.clamp(1, 1080);
-    let convert_started = Instant::now();
-    let cache_key = internal_render_scene_cache_key(
-        request.scene,
-        request.scene_identity,
-        request.patch_identity,
-        width,
-        height,
-    );
-    if request.patch_identity.is_none() {
-        return Err(RenderError {
-            message: "retained render-scene patch encode requires patch_identity".to_owned(),
-        });
-    }
-    let cache_hit = internal_scene_cache.contains_key(&cache_key);
-    if !cache_hit {
-        evict_internal_scene_cache_if_needed(internal_scene_cache);
-        internal_scene_cache.insert(
-            cache_key.clone(),
-            render_scene_from_document_scene_with_patch(
-                request.scene,
-                request.patch,
-                width,
-                height,
-            )?,
-        );
-    }
-    let cache_entry_count = internal_scene_cache.len() as u32;
-    let scene = internal_scene_cache
-        .get(&cache_key)
-        .ok_or_else(|| RenderError {
-            message: "internal render scene patch cache was not initialized".to_owned(),
-        })?;
-    let document_scene_convert_ms = convert_started.elapsed().as_secs_f64() * 1000.0;
-    let mut metrics = encode_internal_scene_to_surface(
-        SceneEncodeRequest {
-            device: request.device,
-            queue: request.queue,
-            encoder: request.encoder,
-            view: request.view,
-            width,
-            height,
-        },
-        scene,
-        pipeline,
-        text,
-        textures,
-        quad_buffers,
-        quad_upload_ring,
-        prepared_quads,
-        previous_chunk_ids,
-        product_frame_graph,
-        render_scene_supplied_cache_key(
-            request.scene_identity,
-            request.patch_identity,
-            width,
-            height,
-        ),
-        frame_seq,
-    )?;
-    metrics.document_scene_convert_ms = document_scene_convert_ms;
-    metrics.document_scene_cache_hit = cache_hit;
-    metrics.document_scene_cache_entry_count = cache_entry_count;
-    metrics.render_scene_source = RENDER_SCENE_SOURCE_DOCUMENT_RENDER_SCENE_PATCH.to_owned();
     Ok(metrics)
 }
 
@@ -3353,14 +3224,12 @@ fn render_scene_cache_key(scene: &RenderScene) -> u64 {
 
 fn render_scene_supplied_cache_key(
     scene_identity: Option<&str>,
-    patch_identity: Option<&str>,
     width: u32,
     height: u32,
 ) -> Option<u64> {
     let scene_identity = scene_identity?;
     let mut hasher = DefaultHasher::new();
     scene_identity.hash(&mut hasher);
-    patch_identity.unwrap_or("none").hash(&mut hasher);
     width.hash(&mut hasher);
     height.hash(&mut hasher);
     Some(hasher.finish())
@@ -3421,371 +3290,6 @@ fn render_scene_from_document_scene(
         quad_batches,
         text_runs: scene.text_runs.clone(),
     }
-}
-
-fn render_scene_from_document_scene_with_patch(
-    scene: &DocumentRenderScene,
-    patch: &DocumentRenderScenePatch,
-    width: u32,
-    height: u32,
-) -> Result<RenderScene, RenderError> {
-    let mut items = scene
-        .items
-        .iter()
-        .map(Cow::Borrowed)
-        .collect::<Vec<Cow<'_, DocumentRenderSceneItem>>>();
-    let mut visual_primitives = scene
-        .visual_primitives
-        .iter()
-        .map(Cow::Borrowed)
-        .collect::<Vec<Cow<'_, RenderVisualPrimitive>>>();
-    let mut text_runs = scene
-        .text_runs
-        .iter()
-        .map(Cow::Borrowed)
-        .collect::<Vec<Cow<'_, RenderTextRun>>>();
-
-    for operation in &patch.operations {
-        match operation {
-            RenderScenePatchOperation::Paint {
-                node,
-                paint,
-                style_identity,
-                retained_chunk_id,
-            } => patch_borrowed_document_paint_entries(
-                &mut items,
-                &mut visual_primitives,
-                &mut text_runs,
-                node,
-                paint,
-                *style_identity,
-                retained_chunk_id,
-            )?,
-            RenderScenePatchOperation::TextContent {
-                node,
-                text,
-                retained_chunk_id,
-            } => {
-                patch_borrowed_document_text_content_entries(
-                    &mut items,
-                    &mut text_runs,
-                    node,
-                    text,
-                    retained_chunk_id,
-                )?;
-            }
-            RenderScenePatchOperation::ReplaceNodeEntries {
-                nodes,
-                items: replacement_items,
-                visual_primitives: replacement_primitives,
-                text_runs: replacement_text_runs,
-            } => {
-                let node_set = nodes.iter().cloned().collect::<BTreeSet<_>>();
-                replace_borrowed_document_entries_for_nodes(
-                    &mut items,
-                    &node_set,
-                    replacement_items,
-                    |item| &item.node,
-                    |node, nodes| nodes.contains(node),
-                    true,
-                )?;
-                replace_borrowed_document_entries_for_nodes(
-                    &mut visual_primitives,
-                    &node_set,
-                    replacement_primitives,
-                    |primitive| &primitive.node,
-                    |node, nodes| nodes.contains(node),
-                    false,
-                )?;
-                replace_borrowed_document_entries_for_nodes(
-                    &mut text_runs,
-                    &node_set,
-                    replacement_text_runs,
-                    |text_run| &text_run.node,
-                    document_text_run_belongs_to_any_node,
-                    false,
-                )?;
-            }
-            RenderScenePatchOperation::RetagNodeEntries {
-                items: replacement_items,
-            } => {
-                patch_borrowed_document_retag_entries(
-                    &mut items,
-                    &mut visual_primitives,
-                    &mut text_runs,
-                    replacement_items,
-                )?;
-            }
-        }
-    }
-
-    let viewport = Rect {
-        x: scene.viewport.x,
-        y: scene.viewport.y,
-        width: scene.viewport.width.min(width as f32).max(1.0),
-        height: scene.viewport.height.min(height as f32).max(1.0),
-    };
-    let items = items
-        .iter()
-        .map(|item| RenderSceneItem {
-            node: item.node.clone(),
-            retained_chunk_id: document_item_retained_chunk_id(item),
-            source_kind: format!("{:?}", item.source_kind),
-            bounds: item.bounds,
-            clip: item.clip,
-            transform: item.transform,
-            style_identity: item.style_identity,
-            dependency_set: item.dependency_set.clone(),
-            texture_asset_refs: item.texture_asset_refs.clone(),
-            estimated_vertex_count: item.estimated_vertex_count,
-        })
-        .collect();
-    let quad_batches = quad_batches_from_visual_primitives_iter(
-        visual_primitives.iter().map(|primitive| primitive.as_ref()),
-        width as f32,
-        height as f32,
-    );
-    Ok(RenderScene {
-        viewport,
-        items,
-        rect_metrics: RectVertexMetrics {
-            visible_display_item_count: scene.metrics.visible_source_item_count,
-            rendered_rect_count: scene.metrics.rendered_rect_count,
-            cap_hit: scene.metrics.cap_hit,
-        },
-        quad_batches,
-        text_runs: text_runs
-            .iter()
-            .map(|text_run| text_run.as_ref().clone())
-            .collect(),
-    })
-}
-
-fn patch_borrowed_document_paint_entries<'a>(
-    items: &mut [Cow<'a, DocumentRenderSceneItem>],
-    visual_primitives: &mut [Cow<'a, RenderVisualPrimitive>],
-    text_runs: &mut [Cow<'a, RenderTextRun>],
-    node: &DocumentNodeId,
-    paint: &RenderScenePaintPatch,
-    style_identity: boon_document::ComputedStyleIdentity,
-    retained_chunk_id: &str,
-) -> Result<(), RenderError> {
-    let mut saw_item = false;
-    for item in items {
-        if item.node == *node {
-            let item = item.to_mut();
-            item.style_identity = style_identity;
-            item.retained_chunk_id = retained_chunk_id.to_owned();
-            saw_item = true;
-        }
-    }
-    if !saw_item {
-        return Err(RenderError {
-            message: format!(
-                "render scene paint patch references missing item `{}`",
-                node.0
-            ),
-        });
-    }
-    match paint {
-        RenderScenePaintPatch::FillColor { color } => {
-            let mut patched = false;
-            for primitive in visual_primitives {
-                if primitive.node == *node && primitive.primitive == RenderVisualPrimitiveKind::Fill
-                {
-                    let primitive = primitive.to_mut();
-                    primitive.color = *color;
-                    primitive.style_identity = style_identity;
-                    primitive.retained_chunk_id = retained_chunk_id.to_owned();
-                    patched = true;
-                }
-            }
-            if !patched {
-                return Err(RenderError {
-                    message: format!(
-                        "render scene paint patch references missing fill primitive `{}`",
-                        node.0
-                    ),
-                });
-            }
-        }
-        RenderScenePaintPatch::TextColor { color } => {
-            let mut patched = false;
-            for text_run in text_runs {
-                if text_run.node == *node {
-                    let text_run = text_run.to_mut();
-                    text_run.color = *color;
-                    text_run.paint_id = style_identity.paint_id;
-                    patched = true;
-                }
-            }
-            if !patched {
-                return Err(RenderError {
-                    message: format!(
-                        "render scene paint patch references missing text run `{}`",
-                        node.0
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn patch_borrowed_document_text_content_entries<'a>(
-    items: &mut [Cow<'a, DocumentRenderSceneItem>],
-    text_runs: &mut [Cow<'a, RenderTextRun>],
-    node: &DocumentNodeId,
-    text: &str,
-    retained_chunk_id: &str,
-) -> Result<(), RenderError> {
-    let mut saw_item = false;
-    for item in items {
-        if item.node == *node {
-            item.to_mut().retained_chunk_id = retained_chunk_id.to_owned();
-            saw_item = true;
-        }
-    }
-    if !saw_item {
-        return Err(RenderError {
-            message: format!(
-                "render scene text-content patch references missing item `{}`",
-                node.0
-            ),
-        });
-    }
-    let mut patched = false;
-    for text_run in text_runs {
-        if text_run.node == *node {
-            text_run.to_mut().text = text.to_owned();
-            patched = true;
-        }
-    }
-    if !patched {
-        return Err(RenderError {
-            message: format!(
-                "render scene text-content patch references missing text run `{}`",
-                node.0
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn patch_borrowed_document_retag_entries<'a>(
-    items: &mut [Cow<'a, DocumentRenderSceneItem>],
-    visual_primitives: &mut [Cow<'a, RenderVisualPrimitive>],
-    text_runs: &mut [Cow<'a, RenderTextRun>],
-    replacements: &'a [DocumentRenderSceneItem],
-) -> Result<(), RenderError> {
-    let mut updates =
-        BTreeMap::<DocumentNodeId, (String, boon_document::ComputedStyleIdentity)>::new();
-    for replacement in replacements {
-        let Some(item) = items.iter_mut().find(|item| item.node == replacement.node) else {
-            return Err(RenderError {
-                message: format!(
-                    "render scene retag patch references missing item `{}`",
-                    replacement.node.0
-                ),
-            });
-        };
-        *item = Cow::Borrowed(replacement);
-        updates.insert(
-            replacement.node.clone(),
-            (
-                replacement.retained_chunk_id.clone(),
-                replacement.style_identity,
-            ),
-        );
-    }
-    for primitive in visual_primitives {
-        let Some((retained_chunk_id, style_identity)) = updates.get(&primitive.node) else {
-            continue;
-        };
-        let primitive = primitive.to_mut();
-        primitive.retained_chunk_id = retained_chunk_id.clone();
-        primitive.style_identity = *style_identity;
-    }
-    for text_run in text_runs {
-        let Some((_, style_identity)) = updates.iter().find_map(|(node, update)| {
-            document_text_run_belongs_to_node(&text_run.node, node).then_some(update)
-        }) else {
-            continue;
-        };
-        text_run.to_mut().paint_id = style_identity.paint_id;
-    }
-    Ok(())
-}
-
-fn replace_borrowed_document_entries_for_nodes<'a, T: Clone>(
-    entries: &mut Vec<Cow<'a, T>>,
-    node_set: &BTreeSet<DocumentNodeId>,
-    replacements: &'a [T],
-    node_for_entry: impl Fn(&T) -> &DocumentNodeId,
-    entry_belongs_to_nodes: impl Fn(&DocumentNodeId, &BTreeSet<DocumentNodeId>) -> bool,
-    require_existing: bool,
-) -> Result<(), RenderError> {
-    let first = entries
-        .iter()
-        .position(|entry| entry_belongs_to_nodes(node_for_entry(entry.as_ref()), node_set));
-    if first.is_none() && require_existing && !replacements.is_empty() {
-        return Err(RenderError {
-            message: format!(
-                "render scene patch references missing node `{}`",
-                node_set
-                    .first()
-                    .map(|node| node.0.as_str())
-                    .unwrap_or("<empty>")
-            ),
-        });
-    }
-    let insert_at = first.unwrap_or(entries.len());
-    let original = std::mem::take(entries);
-    let mut inserted_nodes = BTreeSet::new();
-    for entry in original {
-        let node = node_for_entry(entry.as_ref()).clone();
-        if entry_belongs_to_nodes(&node, node_set) {
-            if inserted_nodes.insert(node.clone()) {
-                entries.extend(
-                    replacements
-                        .iter()
-                        .filter(|replacement| node_for_entry(replacement) == &node)
-                        .map(Cow::Borrowed),
-                );
-            }
-        } else {
-            entries.push(entry);
-        }
-    }
-    let remaining = replacements
-        .iter()
-        .filter(|replacement| !inserted_nodes.contains(node_for_entry(replacement)))
-        .map(Cow::Borrowed)
-        .collect::<Vec<_>>();
-    if !remaining.is_empty() {
-        entries.splice(insert_at..insert_at, remaining);
-    }
-    Ok(())
-}
-
-fn document_text_run_belongs_to_any_node(
-    text_run_node: &DocumentNodeId,
-    nodes: &BTreeSet<DocumentNodeId>,
-) -> bool {
-    nodes
-        .iter()
-        .any(|node| document_text_run_belongs_to_node(text_run_node, node))
-}
-
-fn document_text_run_belongs_to_node(
-    text_run_node: &DocumentNodeId,
-    node: &DocumentNodeId,
-) -> bool {
-    text_run_node == node
-        || text_run_node
-            .0
-            .strip_prefix(node.0.as_str())
-            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 fn document_item_retained_chunk_id(item: &boon_document::RenderSceneItem) -> String {
@@ -9480,198 +8984,6 @@ mod tests {
                 .contains("ProductFrameGraph schedule finished early"),
             "{error:?}"
         );
-    }
-
-    #[test]
-    fn document_render_scene_patch_conversion_matches_materialized_apply() {
-        let mut replacement_identity = test_style_identity();
-        replacement_identity.paint_id = 77;
-        replacement_identity.style_id = 77;
-        let mut fill_identity = test_style_identity();
-        fill_identity.paint_id = 17;
-        fill_identity.style_id = 17;
-        let mut text_paint_identity = test_style_identity();
-        text_paint_identity.paint_id = 29;
-        text_paint_identity.style_id = 29;
-        let mut retag_identity = test_style_identity();
-        retag_identity.paint_id = 41;
-        retag_identity.style_id = 41;
-        let item = |node: &str, x: f32, style_identity: ComputedStyleIdentity| {
-            boon_document::render_scene::RenderSceneItem {
-                node: DocumentNodeId(node.to_owned()),
-                retained_chunk_id: format!("chunk:{node}:{}", style_identity.paint_id),
-                source_kind: DocumentNodeKind::Stack,
-                bounds: Rect {
-                    x,
-                    y: 8.0,
-                    width: 36.0,
-                    height: 24.0,
-                },
-                clip: None,
-                transform: [1.0, 0.0, 0.0, 1.0, x, 8.0],
-                style_identity,
-                dependency_set: vec![format!("node:{node}")],
-                texture_asset_refs: Vec::new(),
-                estimated_vertex_count: 6,
-            }
-        };
-        let primitive =
-            |node: &str, x: f32, color: [u8; 4], style_identity: ComputedStyleIdentity| {
-                RenderVisualPrimitive {
-                    node: DocumentNodeId(node.to_owned()),
-                    retained_chunk_id: format!("chunk:{node}:{}", style_identity.paint_id),
-                    source_kind: DocumentNodeKind::Stack,
-                    primitive: RenderVisualPrimitiveKind::Fill,
-                    bounds: Rect {
-                        x,
-                        y: 8.0,
-                        width: 36.0,
-                        height: 24.0,
-                    },
-                    clip: None,
-                    radius: 0.0,
-                    stroke_width: 0.0,
-                    color,
-                    secondary_color: [0, 0, 0, 0],
-                    antialias: 0.0,
-                    control_points: Vec::new(),
-                    texture: RenderTextureRef::Solid,
-                    style_identity,
-                    dependency_set: vec![format!("primitive:{node}")],
-                }
-            };
-        let text_run = |node: &str, text: &str, x: f32, paint_id: u64| RenderTextRun {
-            node: DocumentNodeId(node.to_owned()),
-            font_id: 5,
-            paint_id,
-            bounds: Rect {
-                x,
-                y: 8.0,
-                width: 36.0,
-                height: 24.0,
-            },
-            clip: None,
-            text: text.to_owned(),
-            rich_spans: Vec::new(),
-            font_family: DOCUMENT_FONT_FAMILY.to_owned(),
-            font_style: RenderFontStyle::Normal,
-            font_weight: RenderFontWeight(400),
-            font_features: String::new(),
-            text_inset: 0.0,
-            text_clip_padding: 0.0,
-            color: [0, 0, 0, 255],
-            size: 12.0,
-            line_height: 16.0,
-            align: RenderTextAlign::Left,
-            vertical_align: RenderTextVerticalAlign::Center,
-            rotate_degrees: 0,
-        };
-        let base_identity = test_style_identity();
-        let base_scene = DocumentRenderScene {
-            viewport: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 220.0,
-                height: 80.0,
-            },
-            items: vec![
-                item("left", 8.0, base_identity),
-                item("middle", 52.0, base_identity),
-                item("right", 96.0, base_identity),
-                item("replacee", 140.0, base_identity),
-            ],
-            visual_primitives: vec![
-                primitive("left", 8.0, [20, 40, 60, 255], base_identity),
-                primitive("middle", 52.0, [80, 100, 120, 255], base_identity),
-                primitive("right", 96.0, [140, 160, 180, 255], base_identity),
-                primitive("replacee", 140.0, [30, 60, 90, 255], base_identity),
-            ],
-            quad_batches: Vec::new(),
-            text_runs: vec![
-                text_run("left", "L", 8.0, base_identity.paint_id),
-                text_run("middle:label", "M", 52.0, base_identity.paint_id),
-                text_run("right", "R", 96.0, base_identity.paint_id),
-                text_run("replacee:label", "X", 140.0, base_identity.paint_id),
-            ],
-            metrics: boon_document::render_scene::RenderSceneMetrics {
-                visible_source_item_count: 4,
-                visual_primitive_count: 4,
-                rendered_rect_count: 4,
-                cap_hit: false,
-            },
-        };
-        let patch = DocumentRenderScenePatch {
-            operations: vec![
-                RenderScenePatchOperation::Paint {
-                    node: DocumentNodeId("left".to_owned()),
-                    paint: RenderScenePaintPatch::FillColor {
-                        color: [220, 30, 40, 255],
-                    },
-                    style_identity: fill_identity,
-                    retained_chunk_id: "chunk:left:fill-paint".to_owned(),
-                },
-                RenderScenePatchOperation::Paint {
-                    node: DocumentNodeId("right".to_owned()),
-                    paint: RenderScenePaintPatch::TextColor {
-                        color: [10, 220, 90, 255],
-                    },
-                    style_identity: text_paint_identity,
-                    retained_chunk_id: "chunk:right:text-paint".to_owned(),
-                },
-                RenderScenePatchOperation::TextContent {
-                    node: DocumentNodeId("right".to_owned()),
-                    text: "R patched".to_owned(),
-                    retained_chunk_id: "chunk:right:text-content".to_owned(),
-                },
-                RenderScenePatchOperation::RetagNodeEntries {
-                    items: vec![item("middle", 52.0, retag_identity)],
-                },
-                RenderScenePatchOperation::ReplaceNodeEntries {
-                    nodes: vec![DocumentNodeId("replacee".to_owned())],
-                    items: vec![item("replacee", 140.0, replacement_identity)],
-                    visual_primitives: vec![primitive(
-                        "replacee",
-                        140.0,
-                        [220, 120, 40, 255],
-                        replacement_identity,
-                    )],
-                    text_runs: vec![text_run(
-                        "replacee:label",
-                        "patched",
-                        140.0,
-                        replacement_identity.paint_id,
-                    )],
-                },
-            ],
-        };
-
-        let mut materialized = base_scene.clone();
-        materialized.apply_patch(&patch).unwrap();
-        let expected = render_scene_from_document_scene(&materialized, 220, 80);
-        let actual =
-            render_scene_from_document_scene_with_patch(&base_scene, &patch, 220, 80).unwrap();
-
-        assert_eq!(actual.items.len(), expected.items.len());
-        for (actual, expected) in actual.items.iter().zip(expected.items.iter()) {
-            assert_eq!(actual.node, expected.node);
-            assert_eq!(actual.retained_chunk_id, expected.retained_chunk_id);
-            assert_eq!(actual.source_kind, expected.source_kind);
-            assert_eq!(actual.bounds, expected.bounds);
-            assert_eq!(actual.clip, expected.clip);
-            assert_eq!(actual.transform, expected.transform);
-            assert_eq!(actual.style_identity, expected.style_identity);
-            assert_eq!(actual.dependency_set, expected.dependency_set);
-            assert_eq!(actual.texture_asset_refs, expected.texture_asset_refs);
-            assert_eq!(
-                actual.estimated_vertex_count,
-                expected.estimated_vertex_count
-            );
-        }
-        assert_eq!(
-            flatten_quad_batches(&actual.quad_batches),
-            flatten_quad_batches(&expected.quad_batches)
-        );
-        assert_eq!(actual.text_runs, expected.text_runs);
     }
 
     #[test]

@@ -37275,3 +37275,56 @@ Remaining scope:
   `retired_cli_refresh_arg_skip_count` compatibility helper.
 - Root runtime-branch update execution and ProductFrameGraph/native presentation
   cleanup remain larger open architecture slices.
+
+## 2026-07-06 - BYTES Refresh Queue Canonicalized
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Removed BYTES aggregate refresh replay from stale child `command_argv`.
+  `verify-bytes-machine-plan-all` now builds refresh commands from the required
+  report table and canonical per-label source/scenario/step/route metadata.
+- Deleted the obsolete observed `boon_cli` refresh replay helper and its retired
+  CLI flag sanitizer. The refresh queue no longer strips `--compare-legacy`,
+  `--diagnostic-compare-legacy`, or `--engine` out of stale child reports.
+- Added a real `bytes-plan-phase0-baseline` xtask command so the historical
+  phase0 child has an executable canonical refresh command instead of a fake
+  command string.
+- Replaced the large BYTES source-payload route refresh command with a
+  deterministic 1025-byte hex payload. It no longer depends on a stale
+  `--payload-bytes-file` artifact path under a previous report directory.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p xtask`: pass.
+- `cargo test -q -p xtask bytes_required_reports_have_canonical_refresh_argv
+  -- --nocapture`: pass; 1 passed.
+- `cargo test -q -p xtask observed_xtask_refresh_argv -- --nocapture`: pass;
+  1 passed.
+- `cargo test -q -p xtask present_floor_refresh_command_drops_inner_probe_arg
+  -- --nocapture`: pass; 1 passed.
+- Fresh `target/debug/xtask bytes-plan-phase0-baseline --report
+  target/reports/bytes-plan/phase0-baseline-current.json`: pass.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/bytes-plan/phase0-baseline-current.json`: pass.
+- Fresh `target/debug/xtask verify-bytes-machine-plan-all --check-existing
+  --report target/reports/bytes-plan/bytes-machine-plan-all-current.json`:
+  expected fail with `refresh_debt_child_count=62`,
+  `true_blocker_child_count=0`, and 62 canonical refresh commands.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/bytes-plan/bytes-machine-plan-all-current.json`: pass.
+- Fresh `target/debug/xtask verify-compiler-boundaries --report
+  target/reports/compiler-boundaries.json`: pass.
+- Fresh `target/debug/xtask verify-report-schema
+  target/reports/compiler-boundaries.json`: pass.
+
+Remaining scope:
+
+- The BYTES aggregate still needs an actual refresh run to burn down the 62
+  stale children. This slice makes that refresh deterministic and independent
+  of stale observed command lines.
+- Root runtime-branch update execution and ProductFrameGraph/native presentation
+  cleanup remain larger open architecture slices.

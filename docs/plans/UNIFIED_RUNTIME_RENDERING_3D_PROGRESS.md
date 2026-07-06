@@ -33,7 +33,7 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Renderer-owned schedule construction now exists before pass execution; remaining work is to keep moving graph ownership out of playground/report adapters and into typed renderer DTOs. |
-| Test harness cleanup | In progress | Cells visible-click and preview E2E no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Cells visible-click, preview E2E, and scroll-speed no longer have isolated-Weston fallbacks; old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and the remaining isolated-Weston verifier-owned compositor paths remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
@@ -189,6 +189,17 @@ for old evidence.
 - The manifest preview E2E handoff labels already use release hardware args, so
   this removes stale alternate execution without changing the intended product
   route.
+- Focused checks passed:
+  - `cargo check -q -p xtask`
+
+### 2026-07-06 - Scroll-Speed Isolated-Weston Branch Deleted
+
+- `verify-native-gpu-scroll-speed` now uses the headed Wayland /
+  workspace-qualified product path. The env-forced/default isolated Weston
+  scroll branch and axis-specific Weston retry path were removed.
+- Deleted the now-dead isolated scroll proof promotion helpers and tests that
+  only validated that removed path. Negative contract fixtures that reject
+  isolated evidence remain.
 - Focused checks passed:
   - `cargo check -q -p xtask`
 

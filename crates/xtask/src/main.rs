@@ -28608,12 +28608,6 @@ fn run_isolated_weston_idle_wake_observation(
             })
             .or_else(|| native_preview_idle_input_target(layout_probe))
     });
-    let post_idle_source_event = post_idle_layout_probe
-        .as_ref()
-        .zip(post_idle_driver_target.as_ref())
-        .and_then(|(layout_probe, target)| {
-            native_source_event_for_target(layout_probe, target, post_idle_scenario_path.as_deref())
-        });
     let mut weston = Command::new("weston")
         .args([
             "--backend=headless-backend.so",
@@ -29234,78 +29228,6 @@ fn run_isolated_weston_idle_wake_observation(
                     "present_probe": present_probe,
                     "readback_probe": readback_probe
                 });
-                if post_idle_input_probe
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("pass")
-                    || post_idle_input_probe
-                        .pointer("/present_probe/elapsed_ms")
-                        .and_then(numeric_value_as_f64)
-                        .is_some_and(|elapsed_ms| elapsed_ms > 120.0)
-                {
-                    if let (Some(connect), Some(source_event)) =
-                        (preview_connect.as_deref(), post_idle_source_event.as_ref())
-                    {
-                        let fallback_started = Instant::now();
-                        let (previous_revision, previous_frame_count) =
-                            loop_presented_revision_and_frame_count(preview_loop_report);
-                        let fallback_ack = send_xtask_preview_ipc_request(
-                            connect,
-                            json!({
-                                "kind": "operator-host-input",
-                                "compact_response": true,
-                                "source_events": [source_event]
-                            }),
-                            Duration::from_secs(5),
-                        )
-                        .unwrap_or_else(
-                            |error| json!({"status": "ipc-error", "diagnostic": error.to_string()}),
-                        );
-                        let fallback_present = wait_for_loop_presented_change_since(
-                            preview_loop_report,
-                            previous_revision,
-                            previous_frame_count,
-                            fallback_started,
-                            Duration::from_secs(5),
-                        );
-                        let fallback_readback = wait_for_loop_readback_change(
-                            preview_loop_report,
-                            &click_frame_hash_before,
-                            Duration::from_secs(5),
-                        );
-                        post_idle_input_probe["fallback_host_event_probe"] = json!({
-                            "status": if fallback_ack.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                && fallback_present.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                                && fallback_readback.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-                            {
-                                "pass"
-                            } else {
-                                "fail"
-                            },
-                        "elapsed_ms": fallback_started.elapsed().as_secs_f64() * 1000.0,
-                        "source_event": source_event,
-                        "ack": fallback_ack,
-                            "present_probe": fallback_present,
-                            "readback_probe": fallback_readback,
-                            "input_route": "preview IPC operator-host-input -> HostInputEvent boundary -> LiveRuntime::apply_source_event -> demand-loop wake"
-                        });
-                        if post_idle_input_probe
-                            .pointer("/fallback_host_event_probe/status")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("pass")
-                        {
-                            post_idle_input_probe["status"] = json!("pass");
-                            post_idle_input_probe["present_probe"] = post_idle_input_probe
-                                .pointer("/fallback_host_event_probe/present_probe")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
-                            post_idle_input_probe["readback_probe"] = post_idle_input_probe
-                                .pointer("/fallback_host_event_probe/readback_probe")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
-                        }
-                    }
-                }
             }
         } else {
             post_idle_input_probe = json!({
@@ -47220,10 +47142,6 @@ fn verify_native_cells_visible_click_e2e(
             }),
         );
     }
-    let preview_loop_fallback_report = live_probe
-        .get("preview_loop_report")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|path| read_optional_json(Path::new(path)).ok().flatten());
     let live_probe_pass =
         live_probe.get("status").and_then(serde_json::Value::as_str) == Some("pass");
     let real_os_input = live_probe
@@ -47567,11 +47485,6 @@ fn verify_native_cells_visible_click_e2e(
     let preview_perf_stats = live_probe
         .get("preview_perf_stats")
         .cloned()
-        .or_else(|| {
-            preview_loop_fallback_report
-                .as_ref()
-                .and_then(|report| report.get("preview_perf_stats").cloned())
-        })
         .unwrap_or_else(|| json!({}));
     let preview_loop_input_to_present_ms_p95 = live_probe
         .get("preview_loop_input_to_present_ms_p95")
@@ -47586,21 +47499,11 @@ fn verify_native_cells_visible_click_e2e(
     let preview_loop_broad_missed_frame_count = live_probe
         .get("preview_loop_missed_frame_count")
         .or_else(|| preview_perf_stats.get("missed_frame_count"))
-        .or_else(|| {
-            preview_loop_fallback_report
-                .as_ref()
-                .and_then(|report| report.get("missed_frame_count"))
-        })
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(u64::MAX);
     let preview_loop_product_missed_frame_count = live_probe
         .get("preview_loop_product_missed_frame_count")
         .or_else(|| preview_perf_stats.get("product_missed_frame_count"))
-        .or_else(|| {
-            preview_loop_fallback_report
-                .as_ref()
-                .and_then(|report| report.pointer("/preview_perf_stats/product_missed_frame_count"))
-        })
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(preview_loop_broad_missed_frame_count);
     let preview_loop_render_loop_mode = live_probe
@@ -47625,10 +47528,8 @@ fn verify_native_cells_visible_click_e2e(
         .cloned()
         .or_else(|| preview_perf_stats.get("frame_evidence_key").cloned())
         .unwrap_or(serde_json::Value::Null);
-    let post_present_proof_isolation = cells_visible_click_post_present_proof_isolation(
-        &live_probe,
-        preview_loop_fallback_report.as_ref(),
-    );
+    let post_present_proof_isolation =
+        cells_visible_click_post_present_proof_isolation(&live_probe);
     let post_present_proof_isolation_pass = post_present_proof_isolation
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -47676,7 +47577,6 @@ fn verify_native_cells_visible_click_e2e(
     );
     let app_window_product_frames = cells_visible_click_app_window_product_commit_scope_summary(
         &live_probe,
-        preview_loop_fallback_report.as_ref(),
         target_sample_count,
         max_click_to_formula_ms,
         max_click_to_present_ms,
@@ -50153,62 +50053,6 @@ fn cells_visible_click_find_product_commit_by_key<'a>(
     })
 }
 
-fn cells_visible_click_key_u64(frame_key: &serde_json::Value, field: &str) -> Option<u64> {
-    frame_key.get(field).and_then(serde_json::Value::as_u64)
-}
-
-fn cells_visible_click_commit_key_matches_frame_context(
-    commit: &serde_json::Value,
-    frame_key: &serde_json::Value,
-) -> bool {
-    let Some(commit_key) = commit
-        .get("frame_evidence_key")
-        .filter(|value| value.is_object())
-    else {
-        return false;
-    };
-    commit_key.get("surface_id") == frame_key.get("surface_id")
-        && cells_visible_click_key_u64(commit_key, "surface_epoch")
-            == cells_visible_click_key_u64(frame_key, "surface_epoch")
-        && cells_visible_click_key_u64(commit_key, "content_revision")
-            == cells_visible_click_key_u64(frame_key, "content_revision")
-        && cells_visible_click_key_u64(commit_key, "layout_revision")
-            == cells_visible_click_key_u64(frame_key, "layout_revision")
-        && cells_visible_click_key_u64(commit_key, "render_scene_revision")
-            == cells_visible_click_key_u64(frame_key, "render_scene_revision")
-}
-
-fn cells_visible_click_find_product_commit_by_input_latency<'a>(
-    commits: &'a [serde_json::Value],
-    frame_key: Option<&serde_json::Value>,
-    input_to_present_ms: Option<f64>,
-) -> Option<&'a serde_json::Value> {
-    let frame_key = frame_key.filter(|value| value.is_object())?;
-    let input_event_seq = frame_key
-        .get("input_event_seq")
-        .and_then(serde_json::Value::as_u64)?;
-    let input_to_present_ms = input_to_present_ms.filter(|value| value.is_finite())?;
-    commits.iter().find(|commit| {
-        let commit_input_event_seq = commit
-            .get("input_event_seq")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                commit
-                    .pointer("/frame_evidence_key/input_event_seq")
-                    .and_then(serde_json::Value::as_u64)
-            });
-        let commit_input_to_present_ms = commit
-            .get("input_to_present_ms")
-            .and_then(numeric_value_as_f64);
-        commit.get("frame_lane").and_then(serde_json::Value::as_str) == Some("product_interaction")
-            && commit_input_to_present_ms
-                .is_some_and(|commit_ms| (commit_ms - input_to_present_ms).abs() <= 0.001)
-            && (commit_input_event_seq == Some(input_event_seq)
-                || (commit_input_event_seq.is_some_and(|seq| seq.abs_diff(input_event_seq) <= 1)
-                    && cells_visible_click_commit_key_matches_frame_context(commit, frame_key)))
-    })
-}
-
 fn cells_visible_click_find_product_commit_by_input_event<'a>(
     report: &'a serde_json::Value,
     input_event_seq: u64,
@@ -50276,7 +50120,7 @@ fn cells_visible_click_product_commit_for_interaction<'a>(
     }
     (
         None,
-        "latest_report_frame_fallback",
+        "missing_product_commit",
         accepted_input_event_wake_count,
     )
 }
@@ -50316,15 +50160,10 @@ fn cells_visible_click_latest_product_commit_after(
 
 fn cells_visible_click_post_present_proof_isolation(
     live_probe: &serde_json::Value,
-    preview_loop_report: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     live_probe
         .get("post_present_proof_isolation")
         .cloned()
-        .or_else(|| {
-            preview_loop_report
-                .and_then(|report| report.get("post_present_proof_isolation").cloned())
-        })
         .unwrap_or(serde_json::Value::Null)
 }
 
@@ -51071,7 +50910,7 @@ fn cells_visible_click_product_commit_match_from_report(
     report: &serde_json::Value,
     product_frame_key: Option<&serde_json::Value>,
     proof_frame_key: Option<&serde_json::Value>,
-    input_to_present_ms: Option<f64>,
+    _input_to_present_ms: Option<f64>,
 ) -> serde_json::Value {
     let commits = report
         .get("recent_product_frame_commits")
@@ -51082,23 +50921,14 @@ fn cells_visible_click_product_commit_match_from_report(
         cells_visible_click_find_product_commit_by_key(commits, product_frame_key);
     let exact_commit = exact_product_commit
         .or_else(|| cells_visible_click_find_product_commit_by_key(commits, proof_frame_key));
-    let latency_commit = exact_commit.or_else(|| {
-        cells_visible_click_find_product_commit_by_input_latency(
-            commits,
-            proof_frame_key.or(product_frame_key),
-            input_to_present_ms,
-        )
-    });
     let match_method = if exact_product_commit.is_some() {
         "exact_product_commit"
     } else if exact_commit.is_some() {
         "exact_proof_frame_commit"
-    } else if latency_commit.is_some() {
-        "input_event_seq_and_product_latency"
     } else {
         "missing_product_commit"
     };
-    let Some(commit) = latency_commit else {
+    let Some(commit) = exact_commit else {
         return json!({
             "status": "missing",
             "match_method": match_method,
@@ -51293,19 +51123,11 @@ fn cells_visible_click_product_commit_render_graph_pass(
 
 fn cells_visible_click_app_window_product_commit_scope_summary(
     live_probe: &serde_json::Value,
-    preview_loop_report: Option<&serde_json::Value>,
     required_sample_count: u64,
     budget_ms: f64,
     max_budget_ms: f64,
 ) -> serde_json::Value {
-    let Some(preview_loop_report) = preview_loop_report else {
-        return json!({
-            "status": "missing",
-            "source": "app_window_product_frame_commits",
-            "reason": "preview_loop_report missing; exact keyed product commits are required"
-        });
-    };
-    let commits = preview_loop_report
+    let commits = live_probe
         .get("recent_product_frame_commits")
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
@@ -51314,11 +51136,11 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         return json!({
             "status": "missing",
             "source": "app_window_product_frame_commits",
-            "reason": "preview_loop_report.recent_product_frame_commits missing or empty; exact keyed product commits are required",
+            "reason": "live_probe.recent_product_frame_commits missing or empty; exact keyed product commits are required",
             "required_sample_count": required_sample_count
         });
     }
-    let adapter_identity = cells_visible_click_adapter_identity_from_report(preview_loop_report);
+    let adapter_identity = cells_visible_click_adapter_identity_from_report(live_probe);
     let adapter_status = cells_visible_click_adapter_status(&adapter_identity);
 
     let samples = live_probe
@@ -51345,7 +51167,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
     let mut hard_failure_count = 0_u64;
     let mut exact_product_commit_match_count = 0_u64;
     let mut exact_proof_frame_commit_match_count = 0_u64;
-    let mut input_latency_fallback_match_count = 0_u64;
     let mut typed_product_patch_count = 0_u64;
     let mut typed_product_result_count = 0_u64;
     let mut product_result_missing_count = 0_u64;
@@ -51402,31 +51223,18 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             }));
             continue;
         };
-        let sample_product_input_to_present_ms = sample
-            .get("input_accept_to_present_ms")
-            .and_then(numeric_value_as_f64);
         let exact_product_key_commit =
             cells_visible_click_find_product_commit_by_key(commits, product_key);
         let exact_matching_commit = exact_product_key_commit
             .or_else(|| cells_visible_click_find_product_commit_by_key(commits, proof_key));
-        let fallback_matching_commit = exact_matching_commit.or_else(|| {
-            cells_visible_click_find_product_commit_by_input_latency(
-                commits,
-                proof_key.or(product_key),
-                sample_product_input_to_present_ms,
-            )
-        });
         let match_method = if exact_product_key_commit.is_some() {
             "exact_product_commit"
         } else if exact_matching_commit.is_some() {
             "exact_frame_evidence_key"
-        } else if fallback_matching_commit.is_some() {
-            "input_event_seq_and_product_latency"
         } else {
             "missing"
         };
-        let matching_commit = fallback_matching_commit;
-        let Some(commit) = matching_commit else {
+        let Some(commit) = exact_matching_commit else {
             missed_frame_count = missed_frame_count.saturating_add(1);
             hard_failure_count = hard_failure_count.saturating_add(1);
             sample_failures.push(json!({
@@ -51450,10 +51258,6 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
             "exact_frame_evidence_key" => {
                 exact_proof_frame_commit_match_count =
                     exact_proof_frame_commit_match_count.saturating_add(1);
-            }
-            "input_event_seq_and_product_latency" => {
-                input_latency_fallback_match_count =
-                    input_latency_fallback_match_count.saturating_add(1);
             }
             _ => {}
         }
@@ -52062,7 +51866,7 @@ fn cells_visible_click_app_window_product_commit_scope_summary(
         "product_frame_sample_count": matched_commit_count,
         "exact_product_commit_match_count": exact_product_commit_match_count,
         "exact_proof_frame_commit_match_count": exact_proof_frame_commit_match_count,
-        "input_latency_fallback_match_count": input_latency_fallback_match_count,
+        "input_latency_fallback_match_count": 0,
         "typed_product_patch_count": typed_product_patch_count,
         "typed_product_result_count": typed_product_result_count,
         "product_render_graph_count": product_render_graph_count,
@@ -54172,6 +53976,22 @@ fn run_headed_host_cells_visible_click_e2e(
         "present_probe_phase_ms": present_probe_phase_ms,
         "steady_present_probe_phase_ms": steady_present_probe_phase_ms,
         "preview_perf_stats": preview_perf_stats,
+        "post_present_proof_isolation": loop_json
+            .get("post_present_proof_isolation")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "recent_product_frame_commit_count": loop_json
+            .get("recent_product_frame_commit_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "recent_product_frame_commits": loop_json
+            .get("recent_product_frame_commits")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "last_product_frame_commit": loop_json
+            .get("last_product_frame_commit")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "preview_loop_input_to_present_ms_p95": preview_loop_input_to_present_ms_p95,
         "preview_loop_input_to_present_sample_count": preview_loop_input_to_present_sample_count,
         "preview_loop_present_path_ms_p95": preview_loop_present_path_ms_p95,
@@ -86015,91 +85835,6 @@ fn native_preview_driver_target_from_scenario(
     native_driver_target_from_region("hit_region", target)
 }
 
-fn native_source_event_for_target(
-    layout_probe: &serde_json::Value,
-    target: &serde_json::Value,
-    scenario_path: Option<&Path>,
-) -> Option<serde_json::Value> {
-    let layout_probe = native_layout_probe_payload(layout_probe);
-    let node = target.get("node").and_then(serde_json::Value::as_str)?;
-    let source_intents = layout_probe
-        .get("source_intent_assertions")
-        .and_then(serde_json::Value::as_array)?;
-    let source = source_intents
-        .iter()
-        .find(|intent| {
-            intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                && matches!(
-                    intent.get("intent").and_then(serde_json::Value::as_str),
-                    Some("press" | "click" | "change" | "key_down" | "input")
-                )
-        })
-        .or_else(|| {
-            source_intents.iter().find(|intent| {
-                intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                    && intent
-                        .get("source_path")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some()
-            })
-        })?
-        .get("source_path")
-        .and_then(serde_json::Value::as_str)?;
-    let address = source_intents
-        .iter()
-        .find(|intent| {
-            intent.get("node").and_then(serde_json::Value::as_str) == Some(node)
-                && matches!(
-                    intent.get("intent").and_then(serde_json::Value::as_str),
-                    Some("address" | "target")
-                )
-        })
-        .and_then(|intent| {
-            intent
-                .get("source_path")
-                .and_then(serde_json::Value::as_str)
-        });
-    let mut event = json!({
-        "source": source,
-        "targeting_basis": "source-intent-for-native-driver-target",
-        "node": node
-    });
-    if let Some(address) = address {
-        event["address"] = json!(address);
-        event["target_text"] = json!(address);
-    }
-    if let Some(expected) = scenario_path
-        .filter(|path| path.exists())
-        .and_then(|path| boon_runtime::parse_scenario(path).ok())
-        .and_then(|scenario| {
-            scenario.step.into_iter().find_map(|step| {
-                let expected = step.expected_source_event.clone()?;
-                let expected_source = expected.get("source")?.as_str()?;
-                if expected_source != source {
-                    return None;
-                }
-                let expected_address = expected.get("address").and_then(toml::Value::as_str);
-                if expected_address.is_some() && expected_address != address {
-                    return None;
-                }
-                let expected_target_text =
-                    expected.get("target_text").and_then(toml::Value::as_str);
-                if expected_target_text.is_some() && expected_target_text != address {
-                    return None;
-                }
-                Some(expected)
-            })
-        })
-    {
-        for key in ["text", "key", "address", "target_text"] {
-            if let Some(value) = expected.get(key).and_then(toml::Value::as_str) {
-                event[key] = json!(value);
-            }
-        }
-    }
-    Some(event)
-}
-
 fn native_region_axis(region: &serde_json::Value, axis: &str) -> f64 {
     region
         .pointer(&format!("/bounds/{axis}"))
@@ -87015,8 +86750,8 @@ mod tests {
     }
 
     #[test]
-    fn cells_visible_click_promotes_post_present_proof_isolation_from_preview_loop() {
-        let preview_loop = json!({
+    fn cells_visible_click_requires_live_probe_post_present_proof_isolation() {
+        let sidecar_only = json!({
             "post_present_proof_isolation": {
                 "status": "pass",
                 "product_path_status": "pass",
@@ -87026,20 +86761,14 @@ mod tests {
                 "proof_latency_reported_separately": true
             }
         });
-        let promoted =
-            cells_visible_click_post_present_proof_isolation(&json!({}), Some(&preview_loop));
+        let promoted = cells_visible_click_post_present_proof_isolation(&json!({}));
 
+        assert!(promoted.is_null());
         assert_eq!(
-            promoted
-                .get("proof_worker_status")
+            sidecar_only
+                .pointer("/post_present_proof_isolation/proof_worker_status")
                 .and_then(serde_json::Value::as_str),
             Some("lagging")
-        );
-        assert_eq!(
-            promoted
-                .get("product_latency_includes_proof_completion")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
         );
     }
 
@@ -87055,18 +86784,7 @@ mod tests {
                 "proof_latency_reported_separately": true
             }
         });
-        let preview_loop = json!({
-            "post_present_proof_isolation": {
-                "status": "pass",
-                "product_path_status": "pass",
-                "proof_worker_status": "lagging",
-                "product_latency_includes_proof_completion": false,
-                "product_blocks_on_proof_subscribers": false,
-                "proof_latency_reported_separately": true
-            }
-        });
-        let promoted =
-            cells_visible_click_post_present_proof_isolation(&live_probe, Some(&preview_loop));
+        let promoted = cells_visible_click_post_present_proof_isolation(&live_probe);
 
         assert_eq!(
             promoted
@@ -87675,6 +87393,7 @@ mod tests {
             "render_scene_revision": 4
         });
         let live_probe = json!({
+            "adapter_identity": cells_visible_click_test_software_adapter(),
             "click_samples": [{
                 "index": 0,
                 "target_address": "A2",
@@ -87682,10 +87401,7 @@ mod tests {
                 "input_accept_to_present_ms": 8.0,
                 "input_accept_to_formula_visible_ms": 8.0,
                 "product_formula_state_current": true
-            }]
-        });
-        let preview_loop_report = json!({
-            "adapter_identity": cells_visible_click_test_software_adapter(),
+            }],
             "recent_product_frame_commits": [{
                 "frame_lane": "product_interaction",
                 "input_event_seq": 4,
@@ -87725,13 +87441,8 @@ mod tests {
             }]
         });
 
-        let summary = cells_visible_click_app_window_product_commit_scope_summary(
-            &live_probe,
-            Some(&preview_loop_report),
-            1,
-            16.7,
-            33.4,
-        );
+        let summary =
+            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
 
         assert_eq!(summary["timing_status"], json!("pass"));
         assert_eq!(summary["status"], json!("fail"));
@@ -87763,6 +87474,7 @@ mod tests {
             "render_scene_revision": 5
         });
         let live_probe = json!({
+            "adapter_identity": cells_visible_click_test_hardware_adapter(),
             "click_samples": [{
                 "index": 0,
                 "target_address": "A2",
@@ -87770,10 +87482,7 @@ mod tests {
                 "input_accept_to_present_ms": 8.0,
                 "input_accept_to_formula_visible_ms": 8.0,
                 "product_formula_state_current": true
-            }]
-        });
-        let preview_loop_report = json!({
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
+            }],
             "recent_product_frame_commits": [{
                 "frame_lane": "product_interaction",
                 "input_event_seq": 5,
@@ -87798,13 +87507,8 @@ mod tests {
             }]
         });
 
-        let summary = cells_visible_click_app_window_product_commit_scope_summary(
-            &live_probe,
-            Some(&preview_loop_report),
-            1,
-            16.7,
-            33.4,
-        );
+        let summary =
+            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
 
         assert_eq!(summary["status"], json!("fail"));
         assert_eq!(summary["timing_status"], json!("fail"));
@@ -87830,6 +87534,7 @@ mod tests {
             "render_scene_revision": 6
         });
         let live_probe = json!({
+            "adapter_identity": cells_visible_click_test_hardware_adapter(),
             "click_samples": [{
                 "index": 0,
                 "target_address": "A2",
@@ -87837,10 +87542,7 @@ mod tests {
                 "input_accept_to_present_ms": 8.0,
                 "input_accept_to_formula_visible_ms": 8.0,
                 "product_formula_state_current": true
-            }]
-        });
-        let preview_loop_report = json!({
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
+            }],
             "recent_product_frame_commits": [{
                 "frame_lane": "product_interaction",
                 "input_event_seq": 6,
@@ -87866,13 +87568,8 @@ mod tests {
             }]
         });
 
-        let summary = cells_visible_click_app_window_product_commit_scope_summary(
-            &live_probe,
-            Some(&preview_loop_report),
-            1,
-            16.7,
-            33.4,
-        );
+        let summary =
+            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
 
         assert_eq!(summary["status"], json!("fail"));
         assert_eq!(summary["timing_status"], json!("fail"));
@@ -87937,7 +87634,7 @@ mod tests {
     }
 
     #[test]
-    fn cells_visible_click_product_commit_match_accepts_nearby_input_generation_for_same_frame_context()
+    fn cells_visible_click_product_commit_match_rejects_nearby_input_generation_even_for_same_frame_context()
      {
         let commit_key = json!({
             "frame_seq": 350,
@@ -87985,21 +87682,8 @@ mod tests {
             Some(10.838645),
         );
 
-        assert_eq!(matched["status"], json!("pass"));
-        assert_eq!(
-            matched["match_method"],
-            json!("input_event_seq_and_product_latency")
-        );
-        assert_eq!(matched["product_frame_evidence_key"], visible_product_key);
-        assert_eq!(
-            matched["requested_product_frame_evidence_key"],
-            visible_product_key
-        );
-        assert_eq!(
-            matched["matched_product_commit_frame_evidence_key"],
-            report["recent_product_frame_commits"][0]["frame_evidence_key"]
-        );
-        assert_eq!(matched["proof_lag_frames"], json!(3));
+        assert_eq!(matched["status"], json!("missing"));
+        assert_eq!(matched["match_method"], json!("missing_product_commit"));
     }
 
     #[test]
@@ -91547,16 +91231,6 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
         assert_eq!(
             target.get("node").and_then(serde_json::Value::as_str),
             Some("increment")
-        );
-        let event = native_source_event_for_target(&layout, &target, Some(&scenario_path))
-            .expect("wrapped Counter target should resolve a source event");
-        assert_eq!(
-            event.get("source").and_then(serde_json::Value::as_str),
-            Some("store.sources.increment_button.press")
-        );
-        assert_eq!(
-            event.get("target_text").and_then(serde_json::Value::as_str),
-            Some("+")
         );
     }
 

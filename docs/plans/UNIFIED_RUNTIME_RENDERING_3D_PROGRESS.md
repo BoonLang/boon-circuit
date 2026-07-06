@@ -621,6 +621,34 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground render_scene_sidecar -- --nocapture`:
     pass; 3 passed.
 
+### 2026-07-06 - Retired Native Wrapper Gates Deleted
+
+- Deleted non-manifest native wrapper commands that re-read other native reports
+  or old screenshot/parity artifacts:
+  `verify-native-two-window-content`,
+  `verify-native-todomvc-reference-parity`,
+  `verify-native-todomvc-input-parity`,
+  `verify-native-example-speed`, and
+  `verify-native-dev-editor-speed`.
+- Removed their command registrations, default report paths, blocker-audit
+  command allowlist entries, and stale debug-readiness dependencies.
+- Deleted the old TodoMVC screenshot/reference comparator helpers left behind
+  by those wrappers. The manifest-owned
+  `verify-native-todomvc-physical-reference-parity` remains.
+- Updated the architecture audit to assert the retired TodoMVC input parity
+  wrapper is deleted instead of checking that its old body had become
+  native-only.
+- Updated refresh-queue dependency tests to use manifest-owned native reports
+  instead of the retired two-window wrapper.
+- Fresh focused evidence:
+  - `cargo check -q -p xtask`: pass.
+  - `cargo test -q -p xtask advertised_xtask_commands_are_unique -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask refresh_queue_selection_expands_report_dependency_graph_edges -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p xtask native_gpu_handoff_manifest -- --nocapture`:
+    pass; 3 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

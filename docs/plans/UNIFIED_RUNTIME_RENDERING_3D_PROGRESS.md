@@ -37370,3 +37370,68 @@ Remaining scope:
 - Continue the larger architecture cuts: remaining runtime execution ambiguity,
   ProductFrameGraph/native presentation ownership, and Cells/native performance
   proof separation.
+
+## 2026-07-06 - BYTES Scoped Proof Identity Added
+
+Status: implemented and focused checks pass.
+
+What changed:
+
+- Added a BYTES/MachinePlan scoped verifier contract:
+  `bytes-machine-plan-control-plane-2026-07-06.1`. It uses the existing
+  `verifier_identity` report field shape but has a separate contract version
+  from native GPU reports.
+- Added the `bytes-machine-plan` worktree fingerprint scope over Cargo and the
+  compiler/runtime/PlanExecutor/CLI crates. Ordinary docs/plan edits no longer
+  have to invalidate BYTES child reports once those reports are reminted with
+  the new identity fields.
+- `boon_cli dump-plan`, `boon_cli run-plan`,
+  `boon_cli run-plan-route`, `boon_cli run-plan-root-scalar-scenario`, and
+  `boon_cli run` source-replay reports now insert BYTES verifier identity.
+  `xtask` BYTES gates written through `write_static_gate_report` now insert the
+  same scoped identity automatically.
+- `verify-bytes-machine-plan-all` now treats a fresh scoped verifier identity
+  plus fresh scoped worktree fingerprint as control-plane freshness authority
+  for git/binary churn, while still requiring schema validity, product status,
+  artifact hashes, and PlanExecutor no-fallback counters.
+- Interrupted a full BYTES closed-loop refresh after it spent minutes inside
+  `verify-bytes-default-engine-readiness`, specifically
+  `boon_cli run examples/cells.bn --scenario examples/cells.scn`. That proved
+  the queue still has a slow nested Cells replay and should not be the default
+  way to handle identity churn.
+
+Fresh focused evidence:
+
+- `cargo fmt -- --check`: pass.
+- `cargo check -q -p boon_runtime -p boon_cli -p boon_report_schema -p xtask`:
+  pass.
+- `cargo test -q -p boon_report_schema
+  common_report_shape_accepts_bytes_scoped_verifier_identity_with_stale_binary_hash
+  -- --nocapture`: pass; 1 passed.
+- `cargo test -q -p xtask
+  bytes_verifier_identity_accepts_boon_cli_run_plan_args -- --nocapture`:
+  pass; 1 passed.
+- Fresh `boon_cli dump-plan examples/bytes_initial.bn` smoke report:
+  schema-valid, `verifier_identity` present, scope `bytes-machine-plan`.
+- Fresh `boon_cli run-plan examples/bytes_initial.bn` smoke report:
+  schema-valid, `verifier_identity` present, scope `bytes-machine-plan`; a copy
+  with a deliberately stale `binary_hash` is still accepted by
+  `verify-report-schema` because the verifier identity is fresh.
+- Fresh `xtask bytes-plan-phase0-baseline` smoke report: schema-valid,
+  `verifier_identity` present, scope `bytes-machine-plan`.
+- Fresh `verify-bytes-machine-plan-all --check-existing` remains an expected
+  fail with `refresh_debt_child_count=62`, `true_blocker_child_count=0`, and no
+  child reports with verifier identity yet. Existing children predate this cut
+  and must be reminted once before the scoped identity can suppress future
+  unrelated churn.
+
+Remaining scope:
+
+- Remint BYTES children in smaller label batches, avoiding the slow nested Cells
+  default-engine replay until that verifier is split or made bounded.
+- Split `verify-bytes-default-engine-readiness` so it does not run the full
+  Cells scenario in the identity-refresh path. Cells runtime performance should
+  be measured by the dedicated native/product gates, not hidden inside a BYTES
+  control-plane freshness queue.
+- After representative children carry `verifier_identity`, verify that unrelated
+  docs/plan edits do not move them back into refresh debt.

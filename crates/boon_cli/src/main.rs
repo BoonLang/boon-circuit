@@ -479,7 +479,7 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let plan_hash = verification.plan_hash.clone();
     let plan_version = plan.version;
     let capability_summary = plan.capability_summary.clone();
-    let report_value = json!({
+    let mut report_value = json!({
         "status": report_status,
         "report_version": 1,
         "generated_at_utc": current_unix_seconds().to_string(),
@@ -542,6 +542,7 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "artifact_sha256s": [],
         "machine_plan": plan,
     });
+    boon_runtime::insert_bytes_machine_plan_identity(&mut report_value);
     if let Some(report) = report {
         write_json(&report, &report_value)?;
     }

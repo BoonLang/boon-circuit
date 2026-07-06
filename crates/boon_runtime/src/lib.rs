@@ -3586,7 +3586,7 @@ pub fn run_plan_initial_state(
     let report_context = compiled.report_context();
     let plan = compiled.plan;
     let output = execute_machine_plan_initial_state_inner(&plan)?;
-    let report = json!({
+    let mut report = json!({
         "status": "pass",
         "report_version": 1,
         "command": "run-plan",
@@ -3633,6 +3633,7 @@ pub fn run_plan_initial_state(
         "artifact_sha256s": [],
         "plan_executor": output.executor_report,
     });
+    insert_bytes_machine_plan_identity(&mut report);
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -3726,7 +3727,8 @@ pub fn run_plan_source_route(
             plan_executor: output.executor_report.clone(),
             inline_byte_limit: SOURCE_EVENT_INLINE_BYTES_LIMIT,
         })?;
-    let report = command_output.report;
+    let mut report = command_output.report;
+    insert_bytes_machine_plan_identity(&mut report);
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -3790,7 +3792,8 @@ pub fn run_plan_root_scalar_scenario(
             semantic_deltas: output.semantic_deltas.clone(),
             plan_executor: output.executor_report.clone(),
         });
-    let report = command_output.report;
+    let mut report = command_output.report;
+    insert_bytes_machine_plan_identity(&mut report);
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -3865,6 +3868,7 @@ pub fn run_plan_scenario_events(
     let mut report = command_output.report;
     insert_plan_executor_source_replay_worktree_fields(&mut report);
     insert_plan_executor_source_replay_identity(&mut report);
+    insert_bytes_machine_plan_identity(&mut report);
     if let Some(report_path) = report_path {
         write_json(report_path, &report)?;
     }
@@ -42133,8 +42137,24 @@ fn git_commit() -> String {
 
 pub const PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE: &str =
     "plan-executor-source-replay";
+pub const BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE: &str = "bytes-machine-plan";
 
 pub fn plan_executor_source_replay_worktree_fingerprint_paths() -> &'static [&'static str] {
+    &[
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/boon_cli",
+        "crates/boon_compiler",
+        "crates/boon_ir",
+        "crates/boon_parser",
+        "crates/boon_plan",
+        "crates/boon_plan_executor",
+        "crates/boon_runtime",
+        "crates/boon_typecheck",
+    ]
+}
+
+pub fn bytes_machine_plan_worktree_fingerprint_paths() -> &'static [&'static str] {
     &[
         "Cargo.lock",
         "Cargo.toml",
@@ -42153,6 +42173,10 @@ const PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND: &str = "plan-executor-source-re
 const PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_SCHEME_VERSION: u64 = 1;
 const PLAN_EXECUTOR_SOURCE_REPLAY_CONTRACT_VERSION: &str =
     "plan-executor-source-replay-2026-07-05.1";
+const VERIFIER_IDENTITY_KIND: &str = "xtask-verifier-contract";
+const VERIFIER_IDENTITY_SCHEME_VERSION: u64 = 1;
+const BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION: &str =
+    "bytes-machine-plan-control-plane-2026-07-06.1";
 
 fn canonical_plan_executor_source_replay_args(args: &[String]) -> Vec<String> {
     let mut canonical = Vec::new();
@@ -42308,6 +42332,165 @@ fn plan_executor_source_replay_worktree_fingerprint() -> String {
             worktree_fingerprint_for_paths(plan_executor_source_replay_worktree_fingerprint_paths())
         })
         .clone()
+}
+
+fn bytes_machine_plan_worktree_fingerprint() -> String {
+    static BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT: OnceLock<String> = OnceLock::new();
+    BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT
+        .get_or_init(|| {
+            worktree_fingerprint_for_paths(bytes_machine_plan_worktree_fingerprint_paths())
+        })
+        .clone()
+}
+
+fn command_supports_bytes_machine_plan_identity(command: &str) -> bool {
+    matches!(
+        command,
+        "dump-plan"
+            | "run-plan"
+            | "run-plan-route"
+            | "run-plan-root-scalar-scenario"
+            | "run-plan-scenario-events"
+    )
+}
+
+fn canonical_machine_plan_verifier_args(command: &str, args: &[String]) -> Vec<String> {
+    let mut start = args
+        .iter()
+        .position(|arg| arg == command)
+        .map_or(0, |index| index.saturating_add(1));
+    if command == "run-plan-scenario-events" && start == 0 {
+        start = args
+            .iter()
+            .position(|arg| arg == "run")
+            .map_or(0, |index| index.saturating_add(1));
+    }
+    if start == 0
+        && args
+            .first()
+            .and_then(|arg| Path::new(arg).file_stem())
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|stem| stem == "boon_cli" || stem == "boon_cli.exe")
+    {
+        start = 1;
+        if args
+            .get(start)
+            .is_some_and(|arg| arg == command || arg == "run")
+        {
+            start = start.saturating_add(1);
+        }
+    }
+    let mut canonical = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--report" {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            index = index.saturating_add(1);
+            continue;
+        }
+        canonical.push(arg.clone());
+        index = index.saturating_add(1);
+    }
+    canonical
+}
+
+fn machine_plan_verifier_identity_for_report(report: &JsonValue) -> Option<JsonValue> {
+    let command = report.get("command").and_then(JsonValue::as_str)?;
+    if !command_supports_bytes_machine_plan_identity(command) {
+        return None;
+    }
+    let measurement_mode = report.get("measurement_mode").and_then(JsonValue::as_str)?;
+    let args = report.get("command_argv").and_then(JsonValue::as_array)?;
+    let args = args
+        .iter()
+        .map(|arg| arg.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let canonical_args = canonical_machine_plan_verifier_args(command, &args);
+    let canonical_args_hash = sha256_bytes(canonical_args.join("\0").as_bytes());
+    let mut material = Vec::new();
+    let scheme_version = VERIFIER_IDENTITY_SCHEME_VERSION.to_string();
+    for part in [
+        VERIFIER_IDENTITY_KIND,
+        scheme_version.as_str(),
+        command,
+        measurement_mode,
+        BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION,
+    ] {
+        material.extend_from_slice(part.as_bytes());
+        material.push(0);
+    }
+    for arg in &canonical_args {
+        material.extend_from_slice(arg.as_bytes());
+        material.push(0);
+    }
+    let identity_hash = sha256_bytes(&material);
+    Some(json!({
+        "kind": VERIFIER_IDENTITY_KIND,
+        "scheme_version": VERIFIER_IDENTITY_SCHEME_VERSION,
+        "command": command,
+        "measurement_mode": measurement_mode,
+        "contract_version": BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION,
+        "canonical_args": canonical_args,
+        "canonical_args_hash": canonical_args_hash,
+        "identity_hash": identity_hash,
+        "binary_hash_policy": "binary-hash-may-be-superseded-by-matching-verifier-identity"
+    }))
+}
+
+pub fn insert_bytes_machine_plan_identity(report: &mut JsonValue) {
+    let Some(object) = report.as_object_mut() else {
+        return;
+    };
+    let command = object
+        .get("command")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if command != "run-plan-scenario-events"
+        && command_supports_bytes_machine_plan_identity(command)
+    {
+        let full = object
+            .get("worktree_fingerprint")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(worktree_fingerprint);
+        let scoped = bytes_machine_plan_worktree_fingerprint();
+        let mut fingerprints = object
+            .get("worktree_fingerprints")
+            .and_then(JsonValue::as_object)
+            .cloned()
+            .unwrap_or_default();
+        fingerprints.insert("full".to_owned(), json!(full.clone()));
+        fingerprints.insert(
+            BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE.to_owned(),
+            json!(scoped.clone()),
+        );
+        object.insert("worktree_fingerprint".to_owned(), json!(full));
+        object.insert(
+            "worktree_fingerprint_scope".to_owned(),
+            json!(BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE),
+        );
+        object.insert("worktree_scoped_fingerprint".to_owned(), json!(scoped));
+        object.insert(
+            "worktree_fingerprints".to_owned(),
+            JsonValue::Object(fingerprints),
+        );
+        object.insert(
+            "worktree_fingerprint_scope_inputs".to_owned(),
+            json!({
+                BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE:
+                    bytes_machine_plan_worktree_fingerprint_paths()
+            }),
+        );
+    }
+    if let Some(identity) = machine_plan_verifier_identity_for_report(report) {
+        if let Some(object) = report.as_object_mut() {
+            object.insert("verifier_identity".to_owned(), identity);
+        }
+    }
 }
 
 fn insert_plan_executor_source_replay_worktree_fields(report: &mut JsonValue) {

@@ -219,13 +219,20 @@ pub fn report_schema_hash() -> String {
 const VERIFIER_IDENTITY_KIND: &str = "xtask-verifier-contract";
 const VERIFIER_IDENTITY_SCHEME_VERSION: u64 = 1;
 const NATIVE_GPU_VERIFIER_CONTRACT_VERSION: &str = "native-gpu-control-plane-2026-07-05.1";
+const BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION: &str =
+    "bytes-machine-plan-control-plane-2026-07-06.1";
 
 fn verifier_identity_contract_version(command: &str) -> Option<&'static str> {
-    command_supports_scoped_verifier_identity(command)
-        .then_some(NATIVE_GPU_VERIFIER_CONTRACT_VERSION)
+    if command_supports_native_scoped_verifier_identity(command) {
+        Some(NATIVE_GPU_VERIFIER_CONTRACT_VERSION)
+    } else if command_supports_bytes_scoped_verifier_identity(command) {
+        Some(BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION)
+    } else {
+        None
+    }
 }
 
-fn command_supports_scoped_verifier_identity(command: &str) -> bool {
+fn command_supports_native_scoped_verifier_identity(command: &str) -> bool {
     command == "verify-platform-contract"
         || command == "verify-wgpu-readback"
         || command == "verify-wgpu-retained-arenas"
@@ -235,20 +242,47 @@ fn command_supports_scoped_verifier_identity(command: &str) -> bool {
         || command.starts_with("verify-native-gpu-")
 }
 
+fn command_supports_bytes_scoped_verifier_identity(command: &str) -> bool {
+    matches!(
+        command,
+        "dump-plan"
+            | "run-plan"
+            | "run-plan-route"
+            | "run-plan-root-scalar-scenario"
+            | "run-plan-scenario-events"
+            | "bytes-plan-phase0-baseline"
+            | "verify-build-bytes-boundary"
+            | "verify-bytes-machine-plan-all"
+    ) || command.starts_with("verify-bytes-")
+}
+
 fn canonical_verifier_args(command: &str, args: &[String]) -> Vec<String> {
     let mut start = args
         .iter()
         .position(|arg| arg == command)
         .map_or(0, |index| index.saturating_add(1));
+    if command == "run-plan-scenario-events" && start == 0 {
+        start = args
+            .iter()
+            .position(|arg| arg == "run")
+            .map_or(0, |index| index.saturating_add(1));
+    }
     if start == 0
         && args
             .first()
             .and_then(|arg| Path::new(arg).file_stem())
             .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|stem| stem == "xtask" || stem == "xtask.exe")
+            .is_some_and(|stem| {
+                stem == "xtask"
+                    || stem == "xtask.exe"
+                    || stem == "boon_cli"
+                    || stem == "boon_cli.exe"
+            })
     {
         start = 1;
-        if args.get(start).is_some_and(|arg| arg == command) {
+        if args.get(start).is_some_and(|arg| {
+            arg == command || (command == "run-plan-scenario-events" && arg == "run")
+        }) {
             start = start.saturating_add(1);
         }
     }
@@ -33440,6 +33474,56 @@ mod tests {
 
         verify_common_report_shape(&report, &temp_report_path("native-scoped-common")).unwrap();
         assert!(schema_accepts(report, "native-scoped-stale-binary"));
+        let _ = fs::remove_file(command_path);
+    }
+
+    #[test]
+    fn common_report_shape_accepts_bytes_scoped_verifier_identity_with_stale_binary_hash() {
+        let command_path = temp_report_path("bytes-command-binary-scoped-ok");
+        fs::write(&command_path, b"test bytes command binary").unwrap();
+        assert!(command_path.is_file());
+        let args = vec![
+            command_path.display().to_string(),
+            "run-plan".to_owned(),
+            "examples/bytes_initial.bn".to_owned(),
+            "--report".to_owned(),
+            "ignored-report-path.json".to_owned(),
+        ];
+        let mut report = base_report();
+        report["command"] = json!("run-plan");
+        report["command_argv"] = json!(args);
+        report["binary_path"] = json!(command_path.display().to_string());
+        report["binary_hash"] =
+            json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        report["verifier_identity"] = verifier_identity_for_command_args(
+            "run-plan",
+            "proof",
+            report
+                .get("command_argv")
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .pointer("/verifier_identity/contract_version")
+                .and_then(JsonValue::as_str),
+            Some(BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION)
+        );
+        assert!(
+            !report
+                .pointer("/verifier_identity/canonical_args")
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str() == Some("--report"))
+        );
+
+        verify_common_report_shape(&report, &temp_report_path("bytes-scoped-common")).unwrap();
         let _ = fs::remove_file(command_path);
     }
 

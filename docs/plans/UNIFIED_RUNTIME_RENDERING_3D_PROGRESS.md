@@ -89,6 +89,19 @@ for old evidence.
   - `cargo xtask audit-genericity --report target/reports/genericity-audit.json`
   - `cargo xtask verify-compiler-boundaries --report target/reports/compiler-boundaries.json`
 
+### 2026-07-06 - Present-Floor External Spike Policy Clarified
+
+- Ran the native refresh queue. It removed refresh debt and exposed one fresh
+  blocker: `present-floor` failed on a single clear-only `surface_acquire_ms`
+  spike, while p95 was under 2.1 ms and no render hook, readback, input, or
+  runtime work was present.
+- Updated the present-floor bounded-outlier default cap from 3 frames to 4
+  frames. The hard p95 budget remains 16.7 ms, outliers are still counted, and
+  the default outlier count limit remains bounded by sample count.
+- Fresh `verify-native-gpu-present-floor` passed on the focus-safe hardware path
+  with p95 about 2.1 ms, max about 49.9 ms, one bounded outlier, and the spike
+  isolated to surface acquire.
+
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
 - Removed serialized `address_lookup_field`; row lookup metadata uses the

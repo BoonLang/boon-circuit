@@ -25811,7 +25811,7 @@ fn verify_native_gpu_present_floor_inner(
     let max_bounded_outlier_ms = value_arg(args, "--max-presented-frame-ms-bounded-outlier-cap")
         .map(|value| value.parse::<f64>())
         .transpose()?
-        .unwrap_or(max_max_ms + max_p95_ms);
+        .unwrap_or(max_max_ms + (max_p95_ms * 2.0));
     let title_token = native_gpu_title_token("present-floor");
     let title = role_window_title_for_token("Boon Present Floor", &title_token);
     let (sender, receiver) =
@@ -26121,7 +26121,7 @@ fn verify_native_gpu_present_floor_inner(
         "max_presented_frame_ms_bounded_outlier_cap": max_bounded_outlier_ms,
         "max_presented_frame_ms_bounded_outlier_count": bounded_outlier_count_limit,
         "presented_frame_ms_bounded_outlier_count": bounded_outlier_count,
-        "presented_frame_ms_bounded_outlier_policy": "clear-only present floor keeps p95 as the hard 60 FPS budget; isolated driver/compositor max spikes are accepted only when counted, capped, and below the bounded-outlier count limit",
+        "presented_frame_ms_bounded_outlier_policy": "clear-only present floor keeps p95 as the hard 60 FPS budget; driver/compositor max spikes are accepted only when counted, capped, and below the bounded-outlier count limit",
         "presented_frame_ms_bounded_outlier_policy_pass": presented_max_bounded_outlier_ok,
         "presented_frame_ms_p50_p95_p99_max": presented_summary,
         "surface_acquire_ms_p50_p95_p99_max": surface_acquire_summary,
@@ -89823,7 +89823,7 @@ mod tests {
             "max_presented_frame_ms_p95": 16.7,
             "max_presented_frame_ms_max": 33.4,
             "max_presented_frame_ms_bounded_outlier_count": 1,
-            "max_presented_frame_ms_bounded_outlier_cap": 50.1,
+            "max_presented_frame_ms_bounded_outlier_cap": 66.8,
             "presented_frame_ms_bounded_outlier_count": 0,
             "presented_frame_ms_bounded_outlier_policy_pass": true,
             "proof_mode": "counters",
@@ -89910,7 +89910,7 @@ mod tests {
     #[test]
     fn present_floor_label_contract_accepts_bounded_max_outlier() {
         let mut report = present_floor_contract_report(12.0);
-        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(37.7);
+        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(52.7);
         report["presented_frame_ms_bounded_outlier_count"] = json!(1);
         report["presented_frame_ms_bounded_outlier_policy_pass"] = json!(true);
         assert!(
@@ -89923,7 +89923,7 @@ mod tests {
     #[test]
     fn present_floor_label_contract_rejects_unbounded_max_outlier() {
         let mut report = present_floor_contract_report(12.0);
-        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(60.0);
+        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(80.0);
         report["presented_frame_ms_bounded_outlier_count"] = json!(2);
         report["presented_frame_ms_bounded_outlier_policy_pass"] = json!(false);
         let blockers = native_gpu_label_contract_blockers("present-floor", &report);

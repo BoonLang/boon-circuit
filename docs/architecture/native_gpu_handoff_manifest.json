@@ -88,19 +88,7 @@
         ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0,
-      "upstream_dependencies": [
-        {
-          "kind": "consumes-source-replay-report",
-          "label": "todomvc-native-preview-source-replay",
-          "path": "target/reports/bytes-plan/todomvc-scenario-events-full.json",
-          "command": "run-plan-scenario-events",
-          "required_argv": [],
-          "measurement_mode": "proof",
-          "owner_aggregate": "verify-native-gpu-all",
-          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
-        }
-      ]
+      "max_sidecar_bytes": 0
     },
     {
       "label": "preview-e2e-cells",
@@ -112,19 +100,7 @@
         ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0,
-      "upstream_dependencies": [
-        {
-          "kind": "consumes-source-replay-report",
-          "label": "cells-native-preview-source-replay",
-          "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
-          "command": "run-plan-scenario-events",
-          "required_argv": [],
-          "measurement_mode": "proof",
-          "owner_aggregate": "verify-native-gpu-all",
-          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
-        }
-      ]
+      "max_sidecar_bytes": 0
     },
     {
       "label": "preview-e2e-todo_mvc_physical",
@@ -136,19 +112,7 @@
         ["--require-hardware-adapter", ""]
       ],
       "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0,
-      "upstream_dependencies": [
-        {
-          "kind": "consumes-source-replay-report",
-          "label": "todo-mvc-physical-native-preview-source-replay",
-          "path": "target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json",
-          "command": "run-plan-scenario-events",
-          "required_argv": [],
-          "measurement_mode": "proof",
-          "owner_aggregate": "verify-native-gpu-all",
-          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
-        }
-      ]
+      "max_sidecar_bytes": 0
     },
     {
       "label": "todomvc-physical-reference-parity",

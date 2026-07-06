@@ -2409,3 +2409,12 @@ The governing implementation principle is:
 - Removed the fresh per-call `QuadUploadRing` and `ProductFrameGraphState` fallbacks from product encoding.
 - Render-scene patch encoding now requires a `patch_identity`, so patch caching cannot silently collapse to an uncached one-off path.
 - Focused verification for this checkpoint: `cargo fmt -- --check`, `cargo build -q -p xtask`, `cargo test -q -p boon_native_gpu product_frame_graph -- --nocapture`, `cargo test -q -p boon_native_playground product_render_graph -- --nocapture`, `cargo xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`, `target/debug/xtask verify-report-schema target/reports/native-gpu/architecture.json`, and `git diff --check`.
+
+### 2026-07-06 — Native handoff no longer consumes source replay
+
+- Removed the three PlanExecutor source-replay upstream dependencies from the native GPU handoff manifest. Preview E2E native reports now stand on native route/runtime/output/product-render-graph/WGPU evidence only.
+- Deleted the native preview helper that converted `run-plan-scenario-events` reports into native scenario evidence.
+- Rewrote TodoMVC input parity and physical TodoMVC content evidence to fail closed on native post-input output/layout/readback evidence instead of using a source-replay render/content bridge.
+- Narrowed native manifest upstream dependency parsing to `consumes-native-report` only; source-replay identity freshness remains a BYTES/MachinePlan concern, not native handoff proof.
+- Fresh check-existing aggregate state after this cut: `verify-native-gpu-all` reports refresh debt only (`refresh_debt_child_count=16`, `true_blocker_child_count=0`) and the native `report_dependency_graph` contains only the physical reference parity native-report edge.
+- Focused verification for this checkpoint: `cargo fmt -- --check`, `cargo build -q -p xtask`, `cargo test -q -p xtask native_gpu_handoff -- --nocapture`, `cargo test -q -p xtask refresh_queue -- --nocapture`, `cargo test -q -p xtask native_preview -- --nocapture`, `target/debug/xtask verify-native-gpu-architecture --report target/reports/native-gpu/architecture.json`, `target/debug/xtask verify-report-schema target/reports/native-gpu/architecture.json`, `target/debug/xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json`, and `git diff --check`.

@@ -1007,19 +1007,22 @@ must link every required native GPU report by path and sha256, and it is the
 native GPU acceptance aggregate for this architecture. Its required report list
 comes from the manifest, which is the single source of truth for handoff report
 labels, paths, commands, required arguments, inline JSON byte budgets, and JSON
-sidecar byte budgets. It also owns native handoff upstream report dependencies:
-if a native report consumes a BYTES/PlanExecutor source replay report, that edge
-must appear in `upstream_dependencies` in
-`docs/architecture/native_gpu_handoff_manifest.json` and in the aggregate
-`report_dependency_graph`.
+sidecar byte budgets. It also owns native handoff upstream report dependencies
+through `upstream_dependencies` in
+`docs/architecture/native_gpu_handoff_manifest.json` and the aggregate
+`report_dependency_graph`. Native handoff dependencies must be native reports.
+PlanExecutor source replay is semantic/runtime evidence owned by the
+BYTES/MachinePlan verifier, not native GPU proof, and must not be used as a
+preview E2E upstream or as a substitute for app-owned host-input, retained
+runtime/output, product-render-graph, or WGPU/readback evidence.
 
-Some native gates consume non-native side reports, such as PlanExecutor source
-replay reports used by preview E2E proof. Those dependencies must be explicit
-in the aggregate's report dependency graph, must name their owning aggregate,
-and must contribute bounded `refresh_commands[].argv` entries when stale. A
-native product failure must not depend on an untracked side report; refresh
-upstream report dependencies first, rerun the aggregate, and only then debug
-fresh product-contract blockers.
+Some native gates consume other native side reports. Those dependencies must be
+explicit in the aggregate's report dependency graph, must name
+`verify-native-gpu-all` as their owning aggregate, and must contribute bounded
+`refresh_commands[].argv` entries when stale. A native product failure must not
+depend on an untracked side report; refresh upstream native report dependencies
+first, rerun the aggregate, and only then debug fresh product-contract
+blockers.
 
 The aggregate control plane must classify stale identity before data-plane
 validation. If a child report was generated for a stale git commit, stale
@@ -1061,17 +1064,13 @@ matches. Reports without `verifier_identity` fall back to the legacy
 forcing product verifier reruns without weakening stale-report detection for
 reports that have no scoped identity.
 
-PlanExecutor source replay reports consumed by native gates must distinguish
-execution from comparison. `plan_executor_status` and
+PlanExecutor source replay reports must distinguish execution from comparison in
+the BYTES/MachinePlan verifier. `plan_executor_status` and
 `accepted_for_product_status` describe whether the PlanExecutor replay is usable
-as product/source-replay evidence; `comparison_status` describes optional legacy
-oracle parity. The compatibility top-level `status` may remain stricter for
-older compare gates and must not be the only signal used to classify native
-product behavior. Native preview E2E must reject missing split status fields;
-old replay reports without `plan_executor_status=pass` and
-`accepted_for_product_status=pass` are refresh debt, not product proof.
+as semantic product evidence; `comparison_status` describes optional legacy
+oracle parity. Native preview E2E does not consume those reports.
 
-PlanExecutor source replay reports also carry source-replay freshness evidence
+PlanExecutor source replay reports carry source-replay freshness evidence
 separate from native verifier identity. `run-plan-scenario-events` reports keep
 the legacy full `worktree_fingerprint`, but also include
 `worktree_fingerprint_scope=plan-executor-source-replay`, scoped entries in
@@ -1081,13 +1080,11 @@ produce source replay behavior; source and scenario contents remain checked by
 their own hashes and MachinePlan recomputation. `source_replay_identity` binds
 the command, measurement mode, canonical arguments with `--report` removed,
 source hash, scenario hash, target profile, plan hash/version, selected step
-surface, and PlanExecutor coverage surface. Native aggregates must treat missing
-or stale source replay identity as upstream refresh debt, not a native product
-blocker. The BYTES/MachinePlan owner aggregate applies the same rule to
-`run-plan-scenario-events` children: a child may use the
-`plan-executor-source-replay` scoped fingerprint and fresh
+surface, and PlanExecutor coverage surface. The BYTES/MachinePlan aggregate may
+use the `plan-executor-source-replay` scoped fingerprint and fresh
 `source_replay_identity` instead of exact full-worktree/git matching; missing or
-stale source-replay identity remains refresh debt.
+stale source-replay identity remains BYTES/MachinePlan refresh debt, not a
+native GPU product blocker.
 
 The preferred unattended refresh controller is `xtask
 run-report-refresh-queue ... --until-clean --max-runs N`. It executes selected

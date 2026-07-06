@@ -56665,7 +56665,6 @@ fn report_json_sidecar_pointers(command: &str) -> &'static [&'static str] {
         ],
         "run-report-refresh-queue" => &[
             "/closed_loop_cycles",
-            "/owner_aggregate_reruns",
             "/results",
             "/post_refresh_aggregate/remaining_refresh_commands",
             "/post_refresh_aggregate/remaining_selected_refresh_commands",
@@ -60198,9 +60197,6 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
     let selected_label_set = selected_labels.iter().cloned().collect::<BTreeSet<_>>();
     let full_queue_mode = labels.is_empty() && limit == usize::MAX;
     let mut post_aggregate_report = None::<serde_json::Value>;
-    let selected_has_upstream_phase = selected
-        .iter()
-        .any(|entry| refresh_entry_phase(entry) == "upstream-dependency");
     let initial_execution = run_refresh_queue_entries(
         COMMAND,
         &aggregate_path,
@@ -60219,7 +60215,6 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
     let mut pass_count = initial_execution.pass_count;
     let mut fail_count = initial_execution.fail_count;
     let boon_cli_prebuild = initial_execution.boon_cli_prebuild.clone();
-    let owner_aggregate_reruns = initial_execution.owner_aggregate_reruns.clone();
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -60510,12 +60505,6 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
                 "missing_argv_count": cycle_execution.missing_argv_count,
                 "invalid_command_count": cycle_execution.invalid_command_count,
                 "boon_cli_prebuild": cycle_execution.boon_cli_prebuild,
-                "owner_aggregate_rerun_requested": cycle_selected
-                    .iter()
-                    .any(|entry| refresh_entry_phase(entry) == "upstream-dependency"),
-                "owner_aggregate_rerun_executed": !cycle_execution.owner_aggregate_reruns.is_empty(),
-                "owner_aggregate_rerun_count": cycle_execution.owner_aggregate_reruns.len(),
-                "owner_aggregate_reruns": cycle_execution.owner_aggregate_reruns,
             });
             if cycle_execution.fail_count > 0
                 || cycle_execution.missing_argv_count > 0
@@ -60642,10 +60631,6 @@ fn run_report_refresh_queue(args: &[String]) -> Result<(), Box<dyn std::error::E
             "refresh_phase_summaries": refresh_plan.phase_summaries,
             "refresh_execution_plan": refresh_plan.execution_plan,
             "boon_cli_prebuild": boon_cli_prebuild,
-            "owner_aggregate_rerun_requested": selected_has_upstream_phase,
-            "owner_aggregate_rerun_executed": !owner_aggregate_reruns.is_empty(),
-            "owner_aggregate_rerun_count": owner_aggregate_reruns.len(),
-            "owner_aggregate_reruns": owner_aggregate_reruns,
             "full_queue_mode": full_queue_mode,
             "skipped_label_count": skipped_label_count,
             "run_count": run_count,
@@ -60672,7 +60657,6 @@ fn bounded_command_text(bytes: &[u8], max_bytes: usize) -> (String, bool) {
 struct RefreshQueueCycleExecution {
     results: Vec<serde_json::Value>,
     boon_cli_prebuild: serde_json::Value,
-    owner_aggregate_reruns: Vec<serde_json::Value>,
     run_count: usize,
     pass_count: usize,
     fail_count: usize,
@@ -60931,10 +60915,6 @@ fn refresh_entry_phase(entry: &serde_json::Value) -> String {
         .get("owner_aggregate")
         .and_then(serde_json::Value::as_str)
         .is_some()
-        || entry
-            .get("post_owner_aggregate")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
     {
         return "upstream-dependency".to_owned();
     }
@@ -61148,10 +61128,6 @@ fn run_refresh_queue_entries(
         command,
     );
     execution.boon_cli_prebuild = boon_cli_prebuild;
-    let selected_has_upstream_phase = selected
-        .iter()
-        .any(|entry| refresh_entry_phase(entry) == "upstream-dependency");
-    let mut owner_aggregate_rerun_done = false;
     for (index, entry) in selected.iter().enumerate() {
         let label = entry
             .get("label")
@@ -61173,17 +61149,6 @@ fn run_refresh_queue_entries(
                 "reason": "boon-cli-prebuild-failed"
             }));
             continue;
-        }
-        if refresh_queue_should_rerun_owner_aggregate_before_entry(
-            selected_has_upstream_phase,
-            owner_aggregate_rerun_done,
-            execution.fail_count,
-            dry_run,
-            entry,
-        ) {
-            execution.owner_aggregate_reruns =
-                rerun_refresh_entry_owner_aggregates(selected, output_byte_limit, checks, blockers);
-            owner_aggregate_rerun_done = true;
         }
         let Some(mut argv) = entry
             .get("argv")
@@ -61357,173 +61322,7 @@ fn run_refresh_queue_entries(
             }
         }
     }
-    if refresh_queue_should_rerun_owner_aggregate_after_entries(
-        selected_has_upstream_phase,
-        owner_aggregate_rerun_done,
-        execution.fail_count,
-        dry_run,
-    ) {
-        execution.owner_aggregate_reruns =
-            rerun_refresh_entry_owner_aggregates(selected, output_byte_limit, checks, blockers);
-    }
     execution
-}
-
-fn refresh_queue_should_rerun_owner_aggregate_before_entry(
-    selected_has_upstream_phase: bool,
-    owner_aggregate_rerun_done: bool,
-    fail_count: usize,
-    dry_run: bool,
-    entry: &serde_json::Value,
-) -> bool {
-    !dry_run
-        && selected_has_upstream_phase
-        && !owner_aggregate_rerun_done
-        && fail_count == 0
-        && refresh_entry_phase(entry) != "upstream-dependency"
-}
-
-fn refresh_queue_should_rerun_owner_aggregate_after_entries(
-    selected_has_upstream_phase: bool,
-    owner_aggregate_rerun_done: bool,
-    fail_count: usize,
-    dry_run: bool,
-) -> bool {
-    !dry_run && selected_has_upstream_phase && !owner_aggregate_rerun_done && fail_count == 0
-}
-
-fn rerun_refresh_entry_owner_aggregates(
-    selected: &[serde_json::Value],
-    output_byte_limit: usize,
-    checks: &mut Vec<serde_json::Value>,
-    blockers: &mut Vec<String>,
-) -> Vec<serde_json::Value> {
-    let mut owners = BTreeSet::<(String, String)>::new();
-    for entry in selected {
-        if refresh_entry_phase(entry) != "upstream-dependency" {
-            continue;
-        }
-        let owner_command = entry
-            .get("owner_aggregate")
-            .or_else(|| entry.get("post_owner_aggregate"))
-            .and_then(serde_json::Value::as_str);
-        let owner_path = entry
-            .get("owner_aggregate_report_path")
-            .or_else(|| entry.get("post_owner_aggregate_report_path"))
-            .and_then(serde_json::Value::as_str);
-        let (Some(owner_command), Some(owner_path)) = (owner_command, owner_path) else {
-            push_audit_check(
-                checks,
-                blockers,
-                format!(
-                    "run-report-refresh-queue:owner-aggregate-metadata:{}",
-                    refresh_entry_label(entry)
-                ),
-                false,
-                "upstream refresh entry is missing explicit owner aggregate metadata",
-                Some(format!(
-                    "refresh entry `{}` is marked upstream but has no explicit owner_aggregate/owner_aggregate_report_path",
-                    refresh_entry_label(entry)
-                )),
-            );
-            continue;
-        };
-        owners.insert((owner_command.to_owned(), owner_path.to_owned()));
-    }
-
-    owners
-        .into_iter()
-        .map(|(owner_command, owner_path)| {
-            match rerun_named_aggregate_report(&owner_command, Path::new(&owner_path), output_byte_limit) {
-                Ok(summary) => summary,
-                Err(error) => {
-                    push_audit_check(
-                        checks,
-                        blockers,
-                        format!("run-report-refresh-queue:owner-aggregate-rerun:{owner_command}"),
-                        false,
-                        error.to_string(),
-                        Some(format!(
-                            "owner aggregate `{owner_command}` at `{owner_path}` could not be rerun: {error}"
-                        )),
-                    );
-                    json!({
-                        "owner_aggregate": owner_command,
-                        "owner_aggregate_report_path": owner_path,
-                        "rerun_executed": false,
-                        "error": error.to_string()
-                    })
-                }
-            }
-        })
-        .collect()
-}
-
-fn rerun_named_aggregate_report(
-    command: &str,
-    aggregate_path: &Path,
-    output_byte_limit: usize,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    if !matches!(
-        command,
-        "verify-native-gpu-all" | "verify-bytes-machine-plan-all"
-    ) {
-        return Err(format!("unsupported owner aggregate command `{command}`").into());
-    }
-    let argv = vec![
-        current_binary_path(),
-        command.to_owned(),
-        "--check-existing".to_owned(),
-        "--report".to_owned(),
-        aggregate_path.display().to_string(),
-    ];
-    let started = Instant::now();
-    let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let (stdout, stdout_truncated) = bounded_command_text(&output.stdout, output_byte_limit);
-    let (stderr, stderr_truncated) = bounded_command_text(&output.stderr, output_byte_limit);
-    let aggregate_after = read_json(aggregate_path).ok();
-    Ok(json!({
-        "owner_aggregate": command,
-        "owner_aggregate_report_path": aggregate_path.display().to_string(),
-        "rerun_executed": true,
-        "argv": argv,
-        "command": shell_join_args(&argv),
-        "exit_status": output.status.to_string(),
-        "exit_code": output.status.code(),
-        "exit_success": output.status.success(),
-        "elapsed_ms": elapsed_ms,
-        "stdout": stdout,
-        "stdout_truncated": stdout_truncated,
-        "stderr": stderr,
-        "stderr_truncated": stderr_truncated,
-        "status": aggregate_after
-            .as_ref()
-            .and_then(|post| post.get("status"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("missing"),
-        "sha256": cached_sha256_file(aggregate_path).unwrap_or_else(|_| "missing".to_owned()),
-        "refresh_debt_child_count": aggregate_after
-            .as_ref()
-            .map(aggregate_refresh_debt_child_count)
-            .unwrap_or(0),
-        "product_contract_child_count": aggregate_after
-            .as_ref()
-            .map(|post| aggregate_count_field(post, "product_contract_child_count"))
-            .unwrap_or(0),
-        "refresh_first_product_contract_child_count": aggregate_after
-            .as_ref()
-            .map(|post| aggregate_count_field(post, "refresh_first_product_contract_child_count"))
-            .unwrap_or(0),
-        "true_blocker_child_count": aggregate_after
-            .as_ref()
-            .map(|post| aggregate_count_field(post, "true_blocker_child_count"))
-            .unwrap_or(0),
-        "remaining_refresh_command_count": aggregate_after
-            .as_ref()
-            .map(|post| aggregate_refresh_commands(post).len())
-            .unwrap_or(0),
-    }))
 }
 
 fn rerun_owner_aggregate_report(
@@ -76349,52 +76148,6 @@ mod tests {
             plan.selection_mode,
             "dependency-order-full-queue".to_owned()
         );
-    }
-
-    #[test]
-    fn refresh_queue_owner_aggregate_boundary_runs_between_upstream_and_consumer() {
-        let upstream = json!({
-            "label": "cells-visible-click-e2e-release",
-            "refresh_phase": "upstream-dependency"
-        });
-        let consumer = json!({
-            "label": "preview-e2e-cells",
-            "refresh_phase": "native-consumer"
-        });
-        assert!(!refresh_queue_should_rerun_owner_aggregate_before_entry(
-            true, false, 0, false, &upstream
-        ));
-        assert!(refresh_queue_should_rerun_owner_aggregate_before_entry(
-            true, false, 0, false, &consumer
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_before_entry(
-            true, true, 0, false, &consumer
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_before_entry(
-            true, false, 1, false, &consumer
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_before_entry(
-            true, false, 0, true, &consumer
-        ));
-    }
-
-    #[test]
-    fn refresh_queue_owner_aggregate_boundary_runs_after_upstream_only_selection() {
-        assert!(refresh_queue_should_rerun_owner_aggregate_after_entries(
-            true, false, 0, false
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_after_entries(
-            true, true, 0, false
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_after_entries(
-            true, false, 1, false
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_after_entries(
-            true, false, 0, true
-        ));
-        assert!(!refresh_queue_should_rerun_owner_aggregate_after_entries(
-            false, false, 0, false
-        ));
     }
 
     #[test]

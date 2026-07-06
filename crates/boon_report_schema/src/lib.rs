@@ -9754,69 +9754,6 @@ fn verify_report_refresh_queue_report(report: &JsonValue, report_path: &Path) ->
             report_path,
             &format!("closed_loop_cycles[{index}].boon_cli_prebuild"),
         )?;
-        if cycle.get("owner_aggregate_rerun_requested").is_some()
-            || cycle.get("owner_aggregate_rerun_executed").is_some()
-            || cycle.get("owner_aggregate_rerun_count").is_some()
-            || cycle.get("owner_aggregate_reruns").is_some()
-        {
-            let owner_requested = cycle
-                .get("owner_aggregate_rerun_requested")
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| {
-                    format!(
-                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_requested",
-                        report_path.display()
-                    )
-                })?;
-            let owner_executed = cycle
-                .get("owner_aggregate_rerun_executed")
-                .and_then(JsonValue::as_bool)
-                .ok_or_else(|| {
-                    format!(
-                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_executed",
-                        report_path.display()
-                    )
-                })?;
-            let owner_count = cycle
-                .get("owner_aggregate_rerun_count")
-                .and_then(JsonValue::as_u64)
-                .ok_or_else(|| {
-                    format!(
-                        "{} closed_loop_cycles[{index}] missing owner_aggregate_rerun_count",
-                        report_path.display()
-                    )
-                })?;
-            let owner_reruns = cycle
-                .get("owner_aggregate_reruns")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| {
-                    format!(
-                        "{} closed_loop_cycles[{index}] missing owner_aggregate_reruns",
-                        report_path.display()
-                    )
-                })?;
-            if owner_count != owner_reruns.len() as u64 {
-                return Err(format!(
-                    "{} closed_loop_cycles[{index}] owner_aggregate_rerun_count does not match owner_aggregate_reruns length",
-                    report_path.display()
-                )
-                .into());
-            }
-            if dry_run && owner_executed {
-                return Err(format!(
-                    "{} closed_loop_cycles[{index}] dry-run cannot execute owner aggregate reruns",
-                    report_path.display()
-                )
-                .into());
-            }
-            if owner_executed && !owner_requested {
-                return Err(format!(
-                    "{} closed_loop_cycles[{index}] owner aggregate rerun cannot execute unless requested",
-                    report_path.display()
-                )
-                .into());
-            }
-        }
     }
     let results = report_array_or_json_sidecar(report, report_path, "/results")?;
     if results.len() as u64 != total_result_count {
@@ -10024,56 +9961,6 @@ fn verify_report_refresh_queue_report(report: &JsonValue, report_path: &Path) ->
         report_path,
         "boon_cli_prebuild",
     )?;
-    let owner_rerun_requested = report
-        .get("owner_aggregate_rerun_requested")
-        .and_then(JsonValue::as_bool)
-        .ok_or_else(|| {
-            format!(
-                "{} missing owner_aggregate_rerun_requested",
-                report_path.display()
-            )
-        })?;
-    let owner_rerun_executed = report
-        .get("owner_aggregate_rerun_executed")
-        .and_then(JsonValue::as_bool)
-        .ok_or_else(|| {
-            format!(
-                "{} missing owner_aggregate_rerun_executed",
-                report_path.display()
-            )
-        })?;
-    let owner_rerun_count = report
-        .get("owner_aggregate_rerun_count")
-        .and_then(JsonValue::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "{} missing owner_aggregate_rerun_count",
-                report_path.display()
-            )
-        })?;
-    let owner_reruns =
-        report_array_or_json_sidecar(report, report_path, "/owner_aggregate_reruns")?;
-    if owner_rerun_count != owner_reruns.len() as u64 {
-        return Err(format!(
-            "{} owner_aggregate_rerun_count does not match owner_aggregate_reruns length",
-            report_path.display()
-        )
-        .into());
-    }
-    if dry_run && owner_rerun_executed {
-        return Err(format!(
-            "{} dry-run queue cannot execute owner aggregate reruns",
-            report_path.display()
-        )
-        .into());
-    }
-    if owner_rerun_executed && !owner_rerun_requested {
-        return Err(format!(
-            "{} owner aggregate rerun cannot execute unless requested",
-            report_path.display()
-        )
-        .into());
-    }
     let rerun_requested = report
         .get("post_refresh_aggregate_rerun_requested")
         .and_then(JsonValue::as_bool)
@@ -32512,10 +32399,6 @@ mod tests {
             "status": "skipped-dry-run",
             "argv": ["cargo", "build", "-p", "boon_cli"]
         });
-        report["owner_aggregate_rerun_requested"] = json!(true);
-        report["owner_aggregate_rerun_executed"] = json!(false);
-        report["owner_aggregate_rerun_count"] = json!(0);
-        report["owner_aggregate_reruns"] = json!([]);
         report["selected_labels"] = json!(["cells-native-preview-source-replay"]);
         report["full_queue_mode"] = json!(false);
         report["skipped_label_count"] = json!(2);
@@ -32941,15 +32824,7 @@ mod tests {
                 "required": false,
                 "executed": false,
                 "status": "not-required"
-            },
-            "owner_aggregate_rerun_requested": true,
-            "owner_aggregate_rerun_executed": true,
-            "owner_aggregate_rerun_count": 1,
-            "owner_aggregate_reruns": [{
-                "owner_aggregate": "verify-native-gpu-all",
-                "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
-                "rerun_executed": true
-            }]
+            }
         }]);
         report["run_count"] = json!(2);
         report["pass_count"] = json!(2);

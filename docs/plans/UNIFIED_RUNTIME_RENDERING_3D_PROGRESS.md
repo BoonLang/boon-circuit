@@ -485,15 +485,49 @@ Fresh focused evidence:
     pass; 3 passed.
   - `git diff --check`: pass.
 
+### 2026-07-06 - Refresh Queue Owner-Rerun Lane Deleted
+
+- Deleted the separate refresh-queue owner-aggregate rerun lane. The queue now
+  has one aggregate rerun concept: the existing post-refresh / closed-loop
+  aggregate rerun.
+- Removed `owner_aggregate_rerun_*` fields from refresh-queue reports,
+  sidecarization, schema validation, fixtures, and closed-loop cycle reports.
+- Deleted the owner-rerun execution helpers and tests that only validated the
+  removed interstitial rerun between upstream dependencies and consumers.
+- Kept dependency ordering and final aggregate rerun behavior intact; upstream
+  refresh entries still run before their consumers, and closed-loop mode remains
+  the deterministic way to prove burndown.
+- Independent audits identified the next larger cuts:
+  non-manifest `verify-native-gpu-regression-all` report lists, remaining
+  BYTES/`boon_cli` refresh compatibility outside native handoff, and
+  LayoutFrame-keyed render-scene cache compatibility in the playground.
+- Fresh focused evidence:
+  - `cargo fmt -- --check`: pass.
+  - `cargo check -q -p xtask -p boon_report_schema`: pass.
+  - `cargo test -q -p xtask refresh_queue -- --nocapture`: pass; 10 passed.
+  - `cargo test -q -p boon_report_schema refresh_queue -- --nocapture`:
+    pass; 9 passed.
+  - `cargo test -q -p boon_report_schema native_gpu_all_schema -- --nocapture`:
+    pass; 8 passed.
+  - `cargo xtask run-report-refresh-queue --aggregate target/reports/native-gpu-all.json --dry-run --report target/reports/report-refresh-queue.json`:
+    pass.
+  - `cargo xtask verify-report-schema target/reports/report-refresh-queue.json`:
+    pass.
+  - `git diff --check`: pass.
+
 ## Next Cuts
 
-1. Delete larger stale-report/control-plane branches instead of wrapping them:
-   BYTES compatibility in native aggregate code, diagnostic timing substitutes,
-   and any stale fingerprint refresh paths not named by the native handoff
-   manifest.
-2. Continue moving `ProductFrameGraph` ownership out of playground/report
+1. Delete the non-manifest `verify-native-gpu-regression-all` aggregate or
+   replace it with an explicit manifest if it is still product-critical. Do not
+   keep a second native report list that drifts from
+   `native_gpu_handoff_manifest.json`.
+2. Cut remaining BYTES/`boon_cli` refresh compatibility from native
+   control-plane code where it is not required by a current BYTES aggregate.
+3. Continue moving `ProductFrameGraph` ownership out of playground/report
    adapters and into typed renderer DTOs.
-3. Keep Cells product-latency and proof-lane reports fresh after each
+4. Promote `DocumentRenderSnapshot` to scene-first identity and remove
+   LayoutFrame-hash-keyed render-scene patch cache compatibility.
+5. Keep Cells product-latency and proof-lane reports fresh after each
    architecture cut.
 
 ## Completion Rules

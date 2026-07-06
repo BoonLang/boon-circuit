@@ -38606,3 +38606,18 @@ What changed:
   proof must use the product app-owned/BoonDriver input route.
 - Added a focused negative test proving isolated Weston scroll evidence no
   longer satisfies the common scroll handoff hot-path contract.
+
+## 2026-07-06 - Preview E2E Hardware Supervisor Timeout Raised
+
+Status: implemented; physical TodoMVC refresh pending.
+
+What changed:
+
+- After removing synthetic physical TodoMVC runtime proof, the refreshed
+  hardware-backed preview E2E exposed a control-plane timeout: the dev role wrote
+  live preview runtime outputs shortly after the supervisor had already failed
+  the report as `missing-report`.
+- Raised the generic hardware preview E2E role-report timeout from 60s to 120s
+  so large multi-unit examples can finish the bounded dev IPC/source-event probe
+  and report real `apply_source_event` outputs instead of relying on route-only
+  synthetic proof.

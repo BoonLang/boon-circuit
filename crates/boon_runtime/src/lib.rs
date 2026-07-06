@@ -4161,7 +4161,6 @@ impl PlanExecutorRuntimeState {
             if op.indexed {
                 let targeted_or_scoped_indexed_update = source_route_slot.scoped
                     || generic_event.target_key.is_some()
-                    || generic_event.target_text.is_some()
                     || generic_event.address.is_some();
                 if targeted_or_scoped_indexed_update {
                     let indexed = execute_indexed_update_branch(
@@ -4198,7 +4197,10 @@ impl PlanExecutorRuntimeState {
                         source: generic_event.source.to_owned(),
                         list_id: generic_event.list_id.map(str::to_owned),
                         target_key: generic_event.target_key,
-                        target_text: generic_event.target_text.map(str::to_owned),
+                        target_text: source_route_slot
+                            .scoped
+                            .then(|| generic_event.target_text.map(str::to_owned))
+                            .flatten(),
                         address: generic_event.address.map(str::to_owned),
                     },
                     &indexed_target_rows,
@@ -5684,7 +5686,7 @@ fn plan_executor_document_summary_with_limits(
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     limits: SummaryLimits,
 ) -> JsonValue {
-    let summary_root_state = plan_executor_summary_root_state(plan, root_state);
+    let mut summary_root_state = plan_executor_summary_root_state(plan, root_state);
     let mut root = plan_executor_nested_root_summary(&summary_root_state);
     let mut materialization = Vec::new();
     plan_executor_insert_direct_list_summaries(
@@ -5694,6 +5696,12 @@ fn plan_executor_document_summary_with_limits(
         limits,
         &mut root,
         &mut materialization,
+    );
+    plan_executor_refresh_root_count_summaries(
+        plan,
+        list_state,
+        &mut summary_root_state,
+        &mut root,
     );
     plan_executor_insert_root_row_expression_summaries(
         plan,
@@ -5719,6 +5727,12 @@ fn plan_executor_document_summary_with_limits(
         &mut root,
         &mut materialization,
     );
+    plan_executor_refresh_root_count_summaries(
+        plan,
+        list_state,
+        &mut summary_root_state,
+        &mut root,
+    );
     root.insert(
         "source_binding_count".to_owned(),
         json!(plan_executor_source_binding_count(plan, list_state)),
@@ -5730,6 +5744,24 @@ fn plan_executor_document_summary_with_limits(
         );
     }
     JsonValue::Object(root)
+}
+
+fn plan_executor_refresh_root_count_summaries(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    summary_root_state: &mut serde_json::Map<String, JsonValue>,
+    root: &mut serde_json::Map<String, JsonValue>,
+) {
+    let public_rows = plan_list_row_state_public_rows(list_state);
+    let Ok(values) = evaluate_root_pure_number_compare_values_core(plan, &public_rows) else {
+        return;
+    };
+    for (field_id, value) in values {
+        let target = plan_derived_field_label(plan, field_id);
+        summary_root_state.insert(target.clone(), value.clone());
+        insert_nested_json(root, &target, value.clone());
+        root.insert(row_field_name(&target).to_owned(), value);
+    }
 }
 
 fn plan_executor_insert_root_row_expression_summaries(

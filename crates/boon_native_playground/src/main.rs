@@ -7880,6 +7880,21 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         json!({"preview_child_pid": preview_pid, "dev_child_pid": dev_pid}),
     );
     let dev_cmdline = wait_for_proc_cmdline(dev_pid, "--role", "dev");
+    if let Some(path) = live_state_report.as_deref() {
+        write_live_state_report(
+            path,
+            &example,
+            &title_token,
+            &preview_title,
+            &dev_title,
+            preview_pid,
+            dev_pid,
+            &preview_report,
+            &dev_report,
+            &preview_loop_report,
+            &dev_loop_report,
+        )?;
+    }
 
     if !probe {
         let preview_status = preview.wait()?;
@@ -7992,21 +8007,6 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "dev_report": dev_report
         }),
     );
-    if let Some(path) = live_state_report.as_deref() {
-        write_live_state_report(
-            path,
-            &example,
-            &title_token,
-            &preview_title,
-            &dev_title,
-            preview_pid,
-            dev_pid,
-            &preview_report,
-            &dev_report,
-            &preview_loop_report,
-            &dev_loop_report,
-        )?;
-    }
     write_desktop_progress(
         supervisor_progress_report.as_deref(),
         "waiting-dev-exit",
@@ -34600,10 +34600,17 @@ fn document_eval_expr_value(
             document_eval_function_call(function, args, expressions, context)
         }
         AstExprKind::Infix { left, op, right } => {
-            let left = document_eval_expr_value(expressions.get(*left)?, expressions, context)
-                .unwrap_or(Value::Null);
-            let right = document_eval_expr_value(expressions.get(*right)?, expressions, context)
-                .unwrap_or(Value::Null);
+            let left = document_eval_expr_value(expressions.get(*left)?, expressions, context);
+            let right = document_eval_expr_value(expressions.get(*right)?, expressions, context);
+            if left.is_none() || right.is_none() {
+                return match op.as_str() {
+                    "==" => Some(Value::Bool(false)),
+                    "!=" => Some(Value::Bool(true)),
+                    _ => None,
+                };
+            }
+            let left = left?;
+            let right = right?;
             document_eval_infix(&left, op, &right)
         }
         AstExprKind::Pipe { input, op, args } => {
@@ -36515,14 +36522,15 @@ fn document_eval_pipe_value_from_input(
         "Text/trim" => input
             .as_str()
             .map(|text| Value::String(text.trim().to_owned())),
-        "Text/concat" => input.as_str().map(|text| {
+        "Text/concat" => {
+            let text = json_value_to_document_text(&input);
             let with = document_call_arg_text(args, "with", expressions, context)
                 .or_else(|| document_call_arg_text(args, "value", expressions, context))
                 .unwrap_or_default();
             let separator =
                 document_call_arg_text(args, "separator", expressions, context).unwrap_or_default();
-            Value::String(format!("{text}{separator}{with}"))
-        }),
+            Some(Value::String(format!("{text}{separator}{with}")))
+        }
         "Text/to_uppercase" => input
             .as_str()
             .map(|text| Value::String(text.to_ascii_uppercase())),
@@ -51925,7 +51933,7 @@ fn write_live_state_report(
             "dev_loop_report": dev_loop_report,
             "display_server": display_server(),
             "display_connection": display_connection(),
-            "note": "written after both native child role reports exist and before either child window is intentionally closed"
+            "note": "written after both native child processes and report paths are known, before waiting on role report completion"
         }),
     )?;
     Ok(())
@@ -72549,7 +72557,7 @@ FUNCTION cache_read_replay_app() {
         .collect::<Vec<_>>();
         assert_eq!(
             &boon_runtime::source_units_hash(&units)[..12],
-            "bdbec020594d",
+            "ab7695fed639",
             "test should exercise the same relative-path project identity as preview E2E"
         );
         let mut runtime = boon_runtime::LiveRuntime::from_project("physical-layout-rows", &units)

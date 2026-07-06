@@ -37046,3 +37046,63 @@ Remaining scope:
 - This completes the Cells visible-click proof/product split slice. The broader
   goal still needs the native handoff aggregate and remaining architecture
   cleanup gates refreshed before completion can be claimed.
+
+## 2026-07-06 - Physical TodoMVC PlanExecutor Native Proof Path Fixed
+
+Status: implemented and verified for the focused physical TodoMVC native
+preview E2E gate.
+
+What changed:
+
+- Fixed physical TodoMVC source issues that were hidden by the old mixed
+  verifier path: row selection now reads `store.selected_todo_id`, and the
+  active-count footer uses supported explicit Boon branches instead of an
+  unsupported inline template shape.
+- Fixed generic document evaluation for scalar `Text/concat` input and missing
+  equality operands, so unresolved row-local fields do not make every row look
+  selected.
+- Fixed PlanExecutor document summaries so scalar list-count fields are restored
+  after retained/list-view materialization. This prevents report-only row arrays
+  from overwriting product state such as `store.active_count`.
+- Fixed unscoped PlanExecutor indexed update routing so visible hit-test
+  `target_text` remains evidence and does not disable bulk indexed updates such
+  as TodoMVC toggle-all.
+- Promoted app-window input adapter/provenance evidence from child role reports
+  into the native E2E report generically, without example-specific input hacks.
+
+Fresh evidence:
+
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_plan_executor indexed_update_batch_execution_is_executor_owned -- --nocapture`: pass.
+- `cargo test -q -p boon_native_playground physical_todomvc_toggle_all_completes_then_clears_every_row -- --nocapture`: pass.
+- Fresh `cargo run -q -p boon_cli -- run examples/todo_mvc_physical/RUN.bn
+  --scenario examples/todo_mvc_physical.scn --report
+  target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`:
+  pass.
+- Fresh `cargo xtask verify-report-schema
+  target/reports/bytes-plan/todo_mvc_physical-scenario-events-full.json`:
+  pass.
+- Fresh `cargo xtask verify-native-gpu-preview-e2e --example
+  todo_mvc_physical --profile release --require-hardware-adapter --report
+  target/reports/native-gpu/preview-e2e-todo_mvc_physical.json`: pass.
+- Fresh `cargo xtask verify-report-schema
+  target/reports/native-gpu/preview-e2e-todo_mvc_physical.json`: pass.
+- Native report summary: `status=pass`, blockers `0`,
+  `physical_todomvc_preview_content_evidence.status=pass`,
+  `missing_initial_labels=[]`, `clear_completed_count=1`,
+  `added_todo_visual_pass=true`, `add_source_replay_pass=true`,
+  `clear_completed_source_replay_pass=true`,
+  `missing_theme_sources=[]`, `source_scenario_replay_evidence.status=pass`,
+  `source_action_replay_pass=true`, `replay_fresh=true`,
+  `native_input_adapter_installed=true`,
+  `native_per_window_input_provenance_installed=true`,
+  `app_owned_window_input=true`, and product render graph enabled.
+
+Remaining scope:
+
+- This fixes the physical TodoMVC proof/control-plane slice and removes another
+  mixed stale-replay/native-proof failure mode. The broader architecture goal
+  still needs the manifest-backed native handoff aggregate and the next legacy
+  runtime/harness deletion slice before completion can be claimed.

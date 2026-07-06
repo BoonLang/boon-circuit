@@ -10105,9 +10105,6 @@ pub fn select_unscoped_indexed_update_targets(
     if event.target_key.is_some() {
         return Ok(skip(&mut executor_report, "event-target-key"));
     }
-    if event.target_text.is_some() {
-        return Ok(skip(&mut executor_report, "event-target-text"));
-    }
     if event.address.is_some() {
         return Ok(skip(&mut executor_report, "event-address"));
     }
@@ -23230,6 +23227,7 @@ mod tests {
         )]);
         let event = IndexedUpdateTargetEvent {
             source: "store.toggle_all".to_owned(),
+            target_text: Some("visible toggle label".to_owned()),
             ..IndexedUpdateTargetEvent::default()
         };
         let mut callback_targets = Vec::new();

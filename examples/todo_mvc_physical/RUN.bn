@@ -627,7 +627,7 @@ FUNCTION todo_element(todo) {
             material: Theme/material(of: Interactive[hovered: element.hovered])
             ...Theme/material(of: TodoRowFrame)
         ]
-        items: selected_todo_id == todo.id |> WHILE {
+        items: store.selected_todo_id == todo.id |> WHILE {
             True => LIST {
                 editing_todo_title_element(todo: todo)
                     |> SOURCE { todo.todo_elements.editing_todo_title_element }
@@ -865,10 +865,10 @@ FUNCTION active_items_count_text() {
             text_inset: 0
             vertical_align: Center
         ]
-        text: store.active_count |> WHEN { count => BLOCK {
-                maybe_s: count == 1 |> WHEN { True => Text/empty(), False => TEXT { s } }
-                TEXT { {count} item{maybe_s} left }
-            }}
+        text: store.active_count == 1 |> WHILE {
+            True => TEXT { 1 item left }
+            False => store.active_count |> Text/concat(with: TEXT { items left }, separator: " ")
+        }
     )
 }
 

@@ -38565,3 +38565,29 @@ Fresh focused evidence before commit:
 - `cargo test -q -p xtask native_gpu_label_contract_rejects -- --nocapture`:
   pass.
 - `cargo check -q -p xtask`: pass.
+
+## 2026-07-06 - Native Runtime Proof Requires Preview-Side Outputs
+
+Status: implemented and focused-verified; aggregate refresh pending after
+commit.
+
+What changed:
+
+- Removed the physical TodoMVC shortcut that synthesized
+  `native_runtime_assertion_evidence.status=pass` from generic source-intent
+  route reachability with empty outputs.
+- Removed the matching physical-only dev-probe and operator-route ack bypasses.
+- Tightened `native_runtime_assertion_proves_live_preview_route` so native
+  runtime proof must come from a live preview `apply_source_event` route with
+  non-empty runtime assertions and outputs. Route reachability remains useful
+  host-input evidence, but it is not runtime mutation proof.
+- Added a focused negative fixture proving `LiveRuntime::source_intent_route`
+  with empty outputs is rejected as native runtime proof.
+
+Fresh focused evidence before commit:
+
+- `cargo test -q -p xtask
+  native_runtime_assertion_requires_live_preview_route_not_source_replay
+  -- --nocapture`: pass.
+- `cargo test -q -p xtask native_gpu_label_contract_rejects -- --nocapture`:
+  pass.

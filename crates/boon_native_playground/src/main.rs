@@ -11771,6 +11771,23 @@ fn preview_attach_product_proof_boundary(
     presentation_plan: &PreviewPresentationPlan,
     renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
 ) {
+    let product_result = preview_product_frame_result(
+        presentation_plan,
+        renderer_metrics,
+        metrics.upload_bytes.unwrap_or(0),
+    );
+    metrics.product_frame = Some(product_result.product_frame.clone());
+    metrics.render_graph = product_result.render_graph.clone();
+    metrics.present_plan = product_result.present_plan.clone();
+    metrics.post_present_proof_requests = product_result.post_present_proof_requests.clone();
+    metrics.product_result = Some(product_result);
+}
+
+fn preview_product_frame_result(
+    presentation_plan: &PreviewPresentationPlan,
+    renderer_metrics: Option<&boon_native_gpu::FrameMetrics>,
+    upload_bytes: u64,
+) -> boon_native_app_window::NativeProductFrameResult {
     let post_present_proof_request_count =
         presentation_plan.post_present_proof_requests.len() as u32;
     let product_frame = boon_native_app_window::NativeRenderedProductFrame {
@@ -11785,29 +11802,25 @@ fn preview_attach_product_proof_boundary(
         post_present_proof_request_count,
         product_patch: Some(presentation_plan.product_patch.clone()),
     };
-    metrics.product_frame = Some(product_frame.clone());
     let (render_graph, present_plan) = preview_compile_product_render_graph(
         presentation_plan.render_target_kind,
         Some(presentation_plan.active_scene_identity.clone()),
         Some(presentation_plan.render_scene_identity.clone()),
         Some(&presentation_plan.product_patch),
         post_present_proof_request_count,
-        metrics.upload_bytes.unwrap_or(0),
+        upload_bytes,
         renderer_metrics,
     );
-    metrics.render_graph = Some(render_graph.clone());
-    metrics.present_plan = Some(present_plan.clone());
-    metrics.product_result = Some(boon_native_app_window::NativeProductFrameResult {
+    boon_native_app_window::NativeProductFrameResult {
         schema_version: 1,
         owner: presentation_plan.product_result_owner.to_owned(),
         result_kind: presentation_plan.product_result_kind.to_owned(),
-        product_frame: product_frame.clone(),
+        product_frame,
         render_graph: Some(render_graph),
         present_plan: Some(present_plan),
         render_graph_execution: None,
         post_present_proof_requests: presentation_plan.post_present_proof_requests.clone(),
-    });
-    metrics.post_present_proof_requests = presentation_plan.post_present_proof_requests.clone();
+    }
 }
 
 fn preview_set_product_render_graph_encode_time_ms(
@@ -64909,6 +64922,64 @@ mod tests {
             plan.product_patch.active_scene_identity.as_deref(),
             Some("active-preview-scene:unit")
         );
+    }
+
+    #[test]
+    fn product_frame_result_is_single_source_for_metric_slots() {
+        let patch = preview_product_patch_summary(PreviewProductPatchSummaryInput {
+            active_scene_identity: Some("active-preview-scene:single-source".to_owned()),
+            route_identity: Some("route:single-source".to_owned()),
+            retained_bound_sync_stats: None,
+            hover_overlay: &PreviewHoverOverlayState::default(),
+            focus_overlay: &PreviewFocusOverlayState::default(),
+            touched_nodes: &BTreeSet::new(),
+            input_overlay_render_scene_patch_enabled: false,
+            direct_input_overlay_render_scene_patch_enabled: false,
+            layout_render_scene_patch_applied: false,
+            direct_layout_render_scene_patch_enabled: false,
+            render_scene_cache_hit: true,
+            proof_json_required: false,
+            latest_report_required: false,
+        });
+        let plan = preview_presentation_plan(
+            "app-owned-offscreen-copy-to-present",
+            "layout:single-source".to_owned(),
+            "render-scene:single-source".to_owned(),
+            "active-preview-scene:single-source".to_owned(),
+            patch,
+            false,
+            false,
+            false,
+        );
+        let mut metrics = boon_native_app_window::NativeRenderFrameMetrics {
+            upload_bytes: Some(128),
+            ..Default::default()
+        };
+
+        preview_attach_product_proof_boundary(&mut metrics, &plan, None);
+
+        let product_result = metrics
+            .product_result
+            .as_ref()
+            .expect("product result should be attached");
+        assert_eq!(
+            metrics.product_frame.as_ref(),
+            Some(&product_result.product_frame)
+        );
+        assert_eq!(
+            metrics.render_graph.as_ref(),
+            product_result.render_graph.as_ref()
+        );
+        assert_eq!(
+            metrics.present_plan.as_ref(),
+            product_result.present_plan.as_ref()
+        );
+        assert_eq!(
+            metrics.post_present_proof_requests,
+            product_result.post_present_proof_requests
+        );
+        assert_eq!(product_result.owner, "preview_active_scene");
+        assert_eq!(product_result.result_kind, "active_preview_scene_patch");
     }
 
     #[test]

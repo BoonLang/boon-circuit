@@ -661,6 +661,26 @@ Fresh focused evidence:
   - `cargo test -q -p boon_native_playground app_owned_readback_reuse_requires_matching_render_frame_hash -- --nocapture`:
     pass; 1 passed.
 
+### 2026-07-06 - Product Result Owns Preview Product Frame Slots
+
+- Refactored the preview product proof boundary so it builds one
+  `NativeProductFrameResult` first, then copies that result's product frame,
+  render graph, present plan, and post-present proof requests into the legacy
+  metric slots.
+- This keeps the current report schema stable while making the typed product
+  result the authoritative owner of ProductFrameGraph identity in the
+  playground render hook.
+- Added a focused test asserting the metric slots are sourced from the product
+  result instead of independently assembled summaries.
+- Fresh focused evidence:
+  - `cargo check -q -p boon_native_playground`: pass.
+  - `cargo test -q -p boon_native_playground product_frame_result_is_single_source_for_metric_slots -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground preview_presentation_plan_owns_product_and_proof_boundary -- --nocapture`:
+    pass; 1 passed.
+  - `cargo test -q -p boon_native_playground product_render_graph_plan_hash_ignores_workload_and_post_present_proof_requests -- --nocapture`:
+    pass; 1 passed.
+
 ## Next Cuts
 
 1. Continue moving `ProductFrameGraph` ownership out of playground/report

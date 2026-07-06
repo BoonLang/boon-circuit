@@ -5700,6 +5700,41 @@ impl PlanExecutorListStore {
     fn lookup_stats_report(&self) -> JsonValue {
         self.lookup_stats.report_json()
     }
+
+    fn refresh_summary_row_current(
+        &mut self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+        list_id: usize,
+        row_index: usize,
+    ) {
+        let Some(list_slot) = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id.0 == list_id)
+            .cloned()
+        else {
+            return;
+        };
+        let list_label = plan_list_label(plan, list_id);
+        refresh_indexed_derived_fields_for_row_with_options(
+            plan,
+            &list_slot,
+            &list_label,
+            self,
+            row_index,
+            IndexedDerivedRefreshOptions {
+                suppress_recursive_cycle_values: false,
+                sort_cycle_error_first: true,
+                evaluate_demand_current_ops: true,
+                emit_demand_current_deltas: false,
+                changed_root_states: None,
+                root_state: Some(root_state),
+            },
+        )
+        .expect("PlanExecutor document summary currentness refresh failed");
+    }
 }
 
 impl From<BTreeMap<usize, Vec<PlanListRowState>>> for PlanExecutorListStore {
@@ -6034,15 +6069,15 @@ fn plan_executor_nested_root_summary(
 fn plan_executor_insert_direct_list_summaries(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_store: &mut PlanExecutorListStore,
     limits: SummaryLimits,
     root: &mut serde_json::Map<String, JsonValue>,
     materialization: &mut Vec<JsonValue>,
 ) {
-    let list_ids = list_state.keys().copied().collect::<Vec<_>>();
+    let list_ids = list_store.keys().copied().collect::<Vec<_>>();
     for list_id in list_ids {
         let list = plan_list_label(plan, list_id);
-        let row_count = list_state.get(&list_id).map(Vec::len).unwrap_or_default();
+        let row_count = list_store.get(&list_id).map(Vec::len).unwrap_or_default();
         let row_end = limits
             .list_rows
             .map_or(row_count, |limit| {
@@ -6051,10 +6086,8 @@ fn plan_executor_insert_direct_list_summaries(
             .min(row_count);
         let mut visible_rows = Vec::with_capacity(row_end.saturating_sub(limits.list_row_start));
         for row_index in limits.list_row_start..row_end {
-            plan_executor_refresh_summary_row_current(
-                plan, root_state, list_state, list_id, row_index,
-            );
-            if let Some(row) = list_state
+            list_store.refresh_summary_row_current(plan, root_state, list_id, row_index);
+            if let Some(row) = list_store
                 .get(&list_id)
                 .and_then(|rows| rows.get(row_index))
             {
@@ -6109,10 +6142,9 @@ fn plan_executor_insert_projection_summaries(
                 let row_index = list_store.exact_field_lookup(source_list.0, field, &selector);
                 let projected = row_index
                     .and_then(|row_index| {
-                        plan_executor_refresh_summary_row_current(
+                        list_store.refresh_summary_row_current(
                             plan,
                             root_state,
-                            list_store,
                             source_list.0,
                             row_index,
                         );
@@ -6211,7 +6243,7 @@ fn plan_executor_windowed_chunk_projection(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
     list_id: usize,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    list_store: &mut PlanExecutorListStore,
     columns: usize,
     item_field: &str,
     label_field: &str,
@@ -6220,7 +6252,7 @@ fn plan_executor_windowed_chunk_projection(
     if columns == 0 {
         return Vec::new();
     }
-    let row_count = list_state.get(&list_id).map(Vec::len).unwrap_or_default();
+    let row_count = list_store.get(&list_id).map(Vec::len).unwrap_or_default();
     let total_rows = row_count.div_ceil(columns);
     let row_end = limits
         .chunk_rows
@@ -6244,8 +6276,8 @@ fn plan_executor_windowed_chunk_projection(
             if index >= row_count {
                 break;
             }
-            plan_executor_refresh_summary_row_current(plan, root_state, list_state, list_id, index);
-            if let Some(cell) = list_state.get(&list_id).and_then(|rows| rows.get(index)) {
+            list_store.refresh_summary_row_current(plan, root_state, list_id, index);
+            if let Some(cell) = list_store.get(&list_id).and_then(|rows| rows.get(index)) {
                 cells.push(plan_executor_row_document_json(plan, list_id, cell));
             }
         }
@@ -6253,41 +6285,6 @@ fn plan_executor_windowed_chunk_projection(
         projected_rows.push(JsonValue::Object(row_object));
     }
     projected_rows
-}
-
-fn plan_executor_refresh_summary_row_current(
-    plan: &MachinePlan,
-    root_state: &serde_json::Map<String, JsonValue>,
-    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
-    list_id: usize,
-    row_index: usize,
-) {
-    let Some(list_slot) = plan
-        .storage_layout
-        .list_slots
-        .iter()
-        .find(|slot| slot.list_id.0 == list_id)
-        .cloned()
-    else {
-        return;
-    };
-    let list_label = plan_list_label(plan, list_id);
-    refresh_indexed_derived_fields_for_row_with_options(
-        plan,
-        &list_slot,
-        &list_label,
-        list_state,
-        row_index,
-        IndexedDerivedRefreshOptions {
-            suppress_recursive_cycle_values: false,
-            sort_cycle_error_first: true,
-            evaluate_demand_current_ops: true,
-            emit_demand_current_deltas: false,
-            changed_root_states: None,
-            root_state: Some(root_state),
-        },
-    )
-    .expect("PlanExecutor document summary currentness refresh failed");
 }
 
 fn plan_executor_row_document_json(

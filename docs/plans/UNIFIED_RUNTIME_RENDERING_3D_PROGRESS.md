@@ -438,6 +438,44 @@ Remaining work:
 - Move summary currentness refresh and projection materialization fully onto
   store methods, then remove the deref mutation compatibility surface.
 
+## 2026-07-06 - PlanExecutor Store Currentness Boundary Slice
+
+Status: currentness ownership cut implemented and verified with focused runtime
+tests plus runtime finality.
+
+What changed:
+
+- The document-summary demand-current row barrier now lives on
+  `PlanExecutorListStore::refresh_summary_row_current`.
+- Direct list summaries, `List/find` projection summaries, and windowed
+  `List/chunk` projection summaries now call the store method instead of a
+  free helper over a raw list map.
+- The old `plan_executor_refresh_summary_row_current` free helper was deleted.
+  Currentness refresh for document materialization is now colocated with the
+  store lookup/index boundary.
+
+Fresh evidence:
+
+- `cargo check -q -p boon_runtime`: pass.
+- `cargo test -q -p boon_runtime live_runtime -- --nocapture`: pass,
+  `15 passed`.
+- `cargo test -q -p boon_runtime
+  plan_executor_list_store_exact_lookup_invalidates_after_mutation -- --nocapture`:
+  pass.
+- `cargo run -q -p xtask -- verify-runtime-finality --report
+  target/reports/runtime-finality.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/runtime-finality.json`: pass.
+- `cargo fmt -- --check`: pass.
+- `git diff --check`: pass.
+
+Remaining work:
+
+- Move projection and retain materialization wrappers fully onto
+  `PlanExecutorListStore` methods.
+- Remove the transitional `DerefMut` raw-map mutation surface once append,
+  remove, indexed update, and startup refresh paths have explicit store methods.
+
 ## 2026-07-05 - Native Refresh Queue And Sidecar Schema Checkpoint
 
 Status: control-plane/schema slice implemented; native handoff remains open.

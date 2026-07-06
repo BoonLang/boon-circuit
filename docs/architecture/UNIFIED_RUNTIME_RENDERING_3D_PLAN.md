@@ -1975,8 +1975,10 @@ Deliverables:
 - inspect actual `HEAD`, worktree, `AGENTS.md`, active plans, ledgers, and current reports;
 - map current code paths to this plan;
 - record release/debug baselines for TodoMVC, full Cells, idle rendering, scroll, text edit, and GPU uploads;
-- create `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md` with task IDs, evidence links, blockers, and status definitions;
-- cross-link—not duplicate—the BYTES/MachinePlan ledger.
+- keep `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md` as a compact live
+  status with current blockers, latest useful evidence, and next tasks;
+- do not recreate historical append-only ledgers; use git history for old
+  BYTES/MachinePlan evidence.
 
 Exit gate: baseline reports are reproducible and no current user changes were reset.
 

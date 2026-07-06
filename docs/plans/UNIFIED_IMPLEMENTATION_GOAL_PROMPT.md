@@ -69,18 +69,20 @@ Before changing code:
    - current document patch, layout, render-scene, WGPU, native host, report, and example paths;
    - current aggregate reports and manifest-owned refresh output.
 
-3. Create or update:
+3. Create or update the compact live status:
 
    docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md
 
    It must include:
-   - actual starting HEAD and dirty-worktree summary;
-   - phase/task IDs for the unified plan;
+   - current strategy and active contracts;
    - status: not-started / in-progress / blocked / implemented / verified;
-   - changed files and symbols;
-   - exact commands and report paths;
+   - changed files/symbols only for the latest coherent checkpoint;
+   - exact commands and report paths only for fresh evidence that remains useful;
    - blockers and evidence classification;
    - next executable task.
+
+   Keep this file short. Do not recreate historical append-only ledgers; use git
+   history for old evidence.
 
 4. Run the existing aggregate/report-schema commands before implementation and
    record their real result. A component aggregate passing while its

@@ -1000,8 +1000,8 @@ fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
     &[
         "bytes-default-engine:cli-build",
         "bytes-default-engine:source-default-plan",
-        "bytes-default-engine:todomvc-default-plan",
-        "bytes-default-engine:cells-default-plan",
+        "bytes-default-engine:default-dispatch-smoke",
+        "bytes-default-engine:product-replay-delegated-to-aggregate",
         "bytes-default-engine:phase10-switch-ready",
     ]
 }
@@ -1186,6 +1186,15 @@ fn verify_bytes_default_engine_readiness_report(
         )
         .into());
     }
+    if report.get("readiness_scope").and_then(JsonValue::as_str)
+        != Some("default-engine-control-plane-only")
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness readiness_scope must be default-engine-control-plane-only",
+            report_path.display()
+        )
+        .into());
+    }
     let expected = expected_bytes_default_engine_check_ids();
     let required = report
         .get("required_check_ids")
@@ -1317,6 +1326,89 @@ fn verify_bytes_default_engine_readiness_report(
         )
         .into());
     }
+    if report
+        .get("product_replay_coverage_owner")
+        .and_then(JsonValue::as_str)
+        != Some("bytes-machine-plan-aggregate")
+    {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness must delegate full product replay coverage to the BYTES aggregate",
+            report_path.display()
+        )
+        .into());
+    }
+    let delegated_reports = report
+        .get("delegated_product_replay_reports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} verify-bytes-default-engine-readiness delegated_product_replay_reports is missing",
+                report_path.display()
+            )
+        })?;
+    let expected_delegated_reports = vec![
+        (
+            "todomvc-native-preview-source-replay",
+            "target/reports/bytes-plan/todomvc-scenario-events-full.json",
+        ),
+        (
+            "cells-native-preview-source-replay",
+            "target/reports/bytes-plan/cells-scenario-events-full.json",
+        ),
+    ];
+    if delegated_reports.len() != expected_delegated_reports.len() {
+        return Err(format!(
+            "{} verify-bytes-default-engine-readiness delegated_product_replay_reports length is wrong",
+            report_path.display()
+        )
+        .into());
+    }
+    for (delegated, (expected_label, expected_path)) in
+        delegated_reports.iter().zip(expected_delegated_reports)
+    {
+        if delegated.get("label").and_then(JsonValue::as_str) != Some(expected_label)
+            || delegated.get("path").and_then(JsonValue::as_str) != Some(expected_path)
+            || delegated.get("command").and_then(JsonValue::as_str)
+                != Some("run-plan-scenario-events")
+            || delegated.get("owner_aggregate").and_then(JsonValue::as_str)
+                != Some("verify-bytes-machine-plan-all")
+            || delegated
+                .get("owner_aggregate_report_path")
+                .and_then(JsonValue::as_str)
+                != Some("target/reports/bytes-plan/bytes-machine-plan-all.json")
+        {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness delegated product replay report `{expected_label}` is not declared correctly",
+                report_path.display()
+            )
+            .into());
+        }
+        let coverage_required = delegated
+            .get("coverage_required")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "{} verify-bytes-default-engine-readiness delegated product replay `{expected_label}` missing coverage_required",
+                    report_path.display()
+                )
+            })?
+            .iter()
+            .map(|item| item.as_str().unwrap_or(""))
+            .collect::<Vec<_>>();
+        if coverage_required
+            != [
+                "covers_all_source_events",
+                "covers_assertion_only_steps",
+                "full_scenario_parity",
+            ]
+        {
+            return Err(format!(
+                "{} verify-bytes-default-engine-readiness delegated product replay `{expected_label}` has wrong coverage_required",
+                report_path.display()
+            )
+            .into());
+        }
+    }
 
     let children = report
         .get("child_reports")
@@ -1327,14 +1419,12 @@ fn verify_bytes_default_engine_readiness_report(
                 report_path.display()
             )
         })?;
-    let expected_children = vec![
-        (
-            "todomvc-default-plan",
-            "default",
-            "run-plan-scenario-events",
-        ),
-        ("cells-default-plan", "default", "run-plan-scenario-events"),
-    ];
+    let expected_children = vec![(
+        "default-dispatch-smoke",
+        "default",
+        "run-plan-scenario-events",
+        "default-cli-small-source-replay",
+    )];
     if children.len() != expected_children.len() {
         return Err(format!(
             "{} verify-bytes-default-engine-readiness child_reports length is wrong",
@@ -1342,13 +1432,31 @@ fn verify_bytes_default_engine_readiness_report(
         )
         .into());
     }
-    for (child, (expected_id, expected_engine, expected_command)) in
+    for (child, (expected_id, expected_engine, expected_command, expected_coverage_mode)) in
         children.iter().zip(expected_children)
     {
         if child.get("id").and_then(JsonValue::as_str) != Some(expected_id)
             || child.get("engine").and_then(JsonValue::as_str) != Some(expected_engine)
             || child.get("expected_command").and_then(JsonValue::as_str) != Some(expected_command)
             || child.get("command").and_then(JsonValue::as_str) != Some(expected_command)
+            || child.get("coverage_mode").and_then(JsonValue::as_str)
+                != Some(expected_coverage_mode)
+            || child
+                .get("product_replay_scope")
+                .and_then(JsonValue::as_str)
+                != Some("small-default-dispatch-smoke")
+            || child
+                .get("plan_executor_status")
+                .and_then(JsonValue::as_str)
+                != Some("pass")
+            || child
+                .get("accepted_for_product_status")
+                .and_then(JsonValue::as_str)
+                != Some("pass")
+            || child
+                .get("event_step_count")
+                .and_then(JsonValue::as_u64)
+                .is_none_or(|count| count > 2)
             || child.get("status").and_then(JsonValue::as_str) != Some("pass")
             || child.get("process_success").and_then(JsonValue::as_bool) != Some(true)
             || child.get("schema_valid").and_then(JsonValue::as_bool) != Some(true)
@@ -32076,6 +32184,146 @@ mod tests {
         report["negative_cases"] = json!(negative_cases);
         report["per_step_pass_fail"] = json!(per_step);
         report
+    }
+
+    fn bytes_default_engine_readiness_report(child_path: &Path) -> JsonValue {
+        let mut report = base_report();
+        let required_ids = expected_bytes_default_engine_check_ids();
+        report["command"] = json!("verify-bytes-default-engine-readiness");
+        report["command_argv"] = json!(["xtask", "verify-bytes-default-engine-readiness"]);
+        report["readiness_mode"] = json!("post-switch-plan-default");
+        report["readiness_scope"] = json!("default-engine-control-plane-only");
+        report["required_check_ids"] = json!(required_ids);
+        report["default_engine"] = json!("plan");
+        report["default_switch_allowed"] = json!(true);
+        report["default_switch_blocker"] = JsonValue::Null;
+        report["diagnostic_comparison_mode"] = json!("not-run-not-required-for-product-readiness");
+        report["explicit_compare_case_count"] = json!(0);
+        report["product_replay_coverage_owner"] = json!("bytes-machine-plan-aggregate");
+        report["delegated_product_replay_reports"] = json!([
+            {
+                "label": "todomvc-native-preview-source-replay",
+                "path": "target/reports/bytes-plan/todomvc-scenario-events-full.json",
+                "command": "run-plan-scenario-events",
+                "owner_aggregate": "verify-bytes-machine-plan-all",
+                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
+                "coverage_required": [
+                    "covers_all_source_events",
+                    "covers_assertion_only_steps",
+                    "full_scenario_parity"
+                ]
+            },
+            {
+                "label": "cells-native-preview-source-replay",
+                "path": "target/reports/bytes-plan/cells-scenario-events-full.json",
+                "command": "run-plan-scenario-events",
+                "owner_aggregate": "verify-bytes-machine-plan-all",
+                "owner_aggregate_report_path": "target/reports/bytes-plan/bytes-machine-plan-all.json",
+                "coverage_required": [
+                    "covers_all_source_events",
+                    "covers_assertion_only_steps",
+                    "full_scenario_parity"
+                ]
+            }
+        ]);
+        report["child_reports"] = json!([
+            {
+                "id": "default-dispatch-smoke",
+                "source": "examples/root_scalar_plan_ops.bn",
+                "scenario": "examples/root_scalar_plan_ops.scn",
+                "engine": "default",
+                "path": child_path.display().to_string(),
+                "expected_command": "run-plan-scenario-events",
+                "coverage_mode": "default-cli-small-source-replay",
+                "product_replay_scope": "small-default-dispatch-smoke",
+                "process_success": true,
+                "schema_valid": true,
+                "schema_error": null,
+                "status": "pass",
+                "command": "run-plan-scenario-events",
+                "plan_executor_status": "pass",
+                "accepted_for_product_status": "pass",
+                "event_step_count": 2,
+                "argv_matches_expected_command": true
+            }
+        ]);
+        report["per_step_pass_fail"] = json!(
+            required_ids
+                .iter()
+                .map(|id| json!({
+                    "id": id,
+                    "pass": true,
+                    "detail": format!("schema test check {id} passed")
+                }))
+                .collect::<Vec<_>>()
+        );
+        report
+    }
+
+    #[test]
+    fn bytes_default_engine_readiness_schema_requires_bounded_control_plane_scope() {
+        let child_path = temp_report_path("default-engine-child");
+        fs::write(&child_path, b"child placeholder").unwrap();
+        let report = bytes_default_engine_readiness_report(&child_path);
+        assert!(schema_accepts(
+            report.clone(),
+            "bytes-default-engine-bounded-valid"
+        ));
+
+        let mut old_cells_child = report.clone();
+        old_cells_child["required_check_ids"] = json!([
+            "bytes-default-engine:cli-build",
+            "bytes-default-engine:source-default-plan",
+            "bytes-default-engine:todomvc-default-plan",
+            "bytes-default-engine:cells-default-plan",
+            "bytes-default-engine:phase10-switch-ready"
+        ]);
+        old_cells_child["per_step_pass_fail"] = json!([
+            {"id": "bytes-default-engine:cli-build", "pass": true, "detail": "ok"},
+            {"id": "bytes-default-engine:source-default-plan", "pass": true, "detail": "ok"},
+            {"id": "bytes-default-engine:todomvc-default-plan", "pass": true, "detail": "ok"},
+            {"id": "bytes-default-engine:cells-default-plan", "pass": true, "detail": "ok"},
+            {"id": "bytes-default-engine:phase10-switch-ready", "pass": true, "detail": "ok"}
+        ]);
+        old_cells_child["child_reports"] = json!([
+            {
+                "id": "todomvc-default-plan",
+                "engine": "default",
+                "path": child_path.display().to_string(),
+                "expected_command": "run-plan-scenario-events",
+                "command": "run-plan-scenario-events",
+                "status": "pass",
+                "process_success": true,
+                "schema_valid": true,
+                "argv_matches_expected_command": true
+            },
+            {
+                "id": "cells-default-plan",
+                "engine": "default",
+                "path": child_path.display().to_string(),
+                "expected_command": "run-plan-scenario-events",
+                "command": "run-plan-scenario-events",
+                "status": "pass",
+                "process_success": true,
+                "schema_valid": true,
+                "argv_matches_expected_command": true
+            }
+        ]);
+        assert!(!schema_accepts(
+            old_cells_child,
+            "bytes-default-engine-reject-old-cells-child"
+        ));
+
+        let mut missing_delegation = report;
+        missing_delegation
+            .as_object_mut()
+            .unwrap()
+            .remove("delegated_product_replay_reports");
+        assert!(!schema_accepts(
+            missing_delegation,
+            "bytes-default-engine-missing-delegation"
+        ));
+        let _ = fs::remove_file(child_path);
     }
 
     fn bytes_byte_bank_layout_report() -> JsonValue {

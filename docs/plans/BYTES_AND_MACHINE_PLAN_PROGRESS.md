@@ -38209,3 +38209,50 @@ Next cut:
 - Return to native/product performance and stale native Cells report refresh.
 - Continue deleting obsolete diagnostic legacy comparison/control-plane paths;
   do not recreate `LoadedRuntime` or `GenericScheduledRuntime` compatibility.
+
+## 2026-07-06 - Default-Engine Readiness Split From Product Replay
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- `verify-bytes-default-engine-readiness` is now a default-engine
+  control-plane gate. It builds `boon_cli`, verifies the source default is
+  PlanExecutor, and runs one small `boon_cli run` default-dispatch smoke using
+  `examples/root_scalar_plan_ops.bn` / `examples/root_scalar_plan_ops.scn`.
+- Removed the nested TodoMVC/Cells full scenario child replays from this
+  readiness verifier. The report schema now rejects the old
+  `todomvc-default-plan` / `cells-default-plan` child shape.
+- Added explicit delegated product replay metadata. Full TodoMVC and Cells
+  source replay coverage remains owned by the BYTES aggregate children
+  `todomvc-native-preview-source-replay` and
+  `cells-native-preview-source-replay`, with required coverage fields
+  `covers_all_source_events`, `covers_assertion_only_steps`, and
+  `full_scenario_parity`.
+- The readiness child must report PlanExecutor product status, accepted product
+  status, and at most two source-event steps. This keeps refresh/control-plane
+  work bounded without hiding Cells coverage.
+
+Fresh focused evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema
+  bytes_default_engine_readiness_schema_requires_bounded_control_plane_scope
+  -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- Fresh report summary:
+  `status=pass`, `readiness_scope=default-engine-control-plane-only`, one
+  `default-dispatch-smoke` child, and delegated TodoMVC/Cells product replay
+  reports owned by `verify-bytes-machine-plan-all`.
+
+Remaining scope:
+
+- Refresh/remint the BYTES aggregate children in bounded batches. The default
+  readiness gate is no longer the source of the slow nested Cells replay, but
+  the canonical full Cells source replay still needs to stay fresh as its own
+  aggregate child.
+- Continue native/product performance and ProductFrameGraph work; do not use
+  this control-plane gate as a Cells 60 FPS claim.

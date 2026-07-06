@@ -37435,3 +37435,45 @@ Remaining scope:
   control-plane freshness queue.
 - After representative children carry `verifier_identity`, verify that unrelated
   docs/plan edits do not move them back into refresh debt.
+
+## 2026-07-06 - Default-Engine Readiness Split From Product Replay
+
+Status: implemented and focused-verified.
+
+What changed:
+
+- `verify-bytes-default-engine-readiness` now proves the default CLI
+  PlanExecutor switch with one small default-dispatch source replay:
+  `examples/root_scalar_plan_ops.bn` / `examples/root_scalar_plan_ops.scn`.
+- Removed the nested TodoMVC/Cells full scenario child replays from the
+  readiness verifier and schema. The schema now rejects the old
+  `todomvc-default-plan` / `cells-default-plan` readiness shape.
+- Added machine-checkable delegation metadata: full TodoMVC and Cells product
+  source replay belongs to `verify-bytes-machine-plan-all`, specifically
+  `todomvc-native-preview-source-replay` and
+  `cells-native-preview-source-replay`.
+- The default-dispatch smoke child is bounded by contract: PlanExecutor status
+  pass, accepted product status pass, and at most two source-event steps.
+
+Fresh focused evidence:
+
+- `cargo check -q -p xtask -p boon_report_schema`: pass.
+- `cargo test -q -p boon_report_schema
+  bytes_default_engine_readiness_schema_requires_bounded_control_plane_scope
+  -- --nocapture`: pass.
+- `cargo run -q -p xtask -- verify-bytes-default-engine-readiness --report
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- `cargo run -q -p xtask -- verify-report-schema
+  target/reports/bytes-plan/bytes-default-engine-readiness.json`: pass.
+- Fresh readiness summary:
+  `status=pass`, `readiness_scope=default-engine-control-plane-only`, one
+  `default-dispatch-smoke` child, and delegated TodoMVC/Cells replay coverage
+  owned by the BYTES aggregate.
+
+Remaining scope:
+
+- Continue BYTES aggregate refresh in bounded batches; default-engine readiness
+  no longer pulls Cells into every refresh, but the canonical full Cells replay
+  remains required as its own aggregate child.
+- Continue ProductFrameGraph/native presentation and Cells UX latency work; this
+  control-plane split is not a Cells 60 FPS claim.

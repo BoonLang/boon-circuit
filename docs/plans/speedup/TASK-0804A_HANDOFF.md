@@ -59,7 +59,7 @@ Fresh 2026-06-27 focused Cells state:
 - The latest local `verify-native-cells-visible-click-e2e --profile release`
   rerun selects the expected cells and exposes the expected formula/value text
   for `64` real OS click targets, with `simple_source_click_count=64`,
-  `generic_fallback_count=0`, and zero unbounded click-to-present outliers, but
+  `native_input_overlay_recovery_count=0`, and zero unbounded click-to-present outliers, but
   still narrowly fails the strict full input-wake budget:
   `input_wake_to_formula_visible_ms_p95=16.99711600000228` against `16.7ms`.
 - `verify-native-gpu-idle-wake --example cells --idle-ms 1500` passes with
@@ -341,7 +341,7 @@ isolated Weston harness, but it still does not meet the 60 FPS budget:
 - `verify-native-cells-visible-click-e2e --profile release` still fails.
 - All 32 measured samples select the expected cell and expose the expected
   formula/value text.
-- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `simple_source_click_count=32`, `native_input_overlay_recovery_count=0`.
 - The verifier now keeps surface-readback hashes and external render-proof
   hashes in separate domains and requires a newer native input wake count, so a
   stale frame/proof cannot satisfy the current click.
@@ -539,7 +539,7 @@ Latest release visible-click report:
 
 - `status="fail"`.
 - `target_count=32`, `timing_sample_count_complete=true`.
-- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `simple_source_click_count=32`, `native_input_overlay_recovery_count=0`.
 - Route lookup is no longer a meaningful hot path in this run:
   `route_table_lookup_ms p95=0.0`, max about `0.148ms`.
 - Recent simple-source native click handling is under budget:
@@ -613,7 +613,7 @@ Fresh release visible-click report:
 - `cargo xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
   still fails.
 - `target_count=32`, `timing_sample_count_complete=true`.
-- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `simple_source_click_count=32`, `native_input_overlay_recovery_count=0`.
 - The report shows no stale input-generation proofs:
   `stale_for_latest_input=false` for all sampled generation probes.
 - Current failing timing:
@@ -700,7 +700,7 @@ Fresh evidence:
 Latest release visible-click report:
 
 - `target_count=32`, `timing_sample_count_complete=true`.
-- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `simple_source_click_count=32`, `native_input_overlay_recovery_count=0`.
 - `click_to_formula_visible_ms_p95=52.666079`,
   `click_to_formula_visible_ms_max=60.145939`.
 - `click_to_present_ms_p95=49.247813`,
@@ -825,7 +825,7 @@ Latest release visible-click report:
 
 - `status="pass"`.
 - `target_count=32`, `timing_sample_count_complete=true`.
-- `simple_source_click_count=32`, `generic_fallback_count=0`.
+- `simple_source_click_count=32`, `native_input_overlay_recovery_count=0`.
 - `click_to_formula_visible_ms_p95=26.565813`,
   `click_to_formula_visible_ms_max=27.557629`.
 - `input_wake_to_formula_visible_ms_p95=15.85446200000115`,
@@ -909,7 +909,7 @@ Latest report facts:
   `fallback_host_event_probe`.
 - Release visible-click:
   `target_count=32`, `simple_source_click_count=32`,
-  `generic_fallback_count=0`,
+  `native_input_overlay_recovery_count=0`,
   `click_to_formula_visible_ms_p95=25.920653`,
   `click_to_formula_visible_ms_max=26.708242`,
   `input_wake_to_formula_visible_ms_p95=16.390971999999238`, and
@@ -998,7 +998,7 @@ Fresh evidence:
 - `cargo build -q -p xtask` passed with existing native GPU dead-code warnings.
 - `target/debug/xtask verify-native-cells-visible-click-e2e --profile release --report target/reports/native-gpu/cells-visible-click-e2e-release.json`
   passed with `target_count=64`, `simple_source_click_count=64`,
-  `generic_fallback_count=0`, `input_wake_to_formula_visible_ms_p95=16.67486799999915`,
+  `native_input_overlay_recovery_count=0`, `input_wake_to_formula_visible_ms_p95=16.67486799999915`,
   `click_to_formula_visible_ms_p95=28.815178`, one bounded driver-to-wake
   outlier, and zero unbounded outliers.
 - The visible-click render-loop proof reports `draw_calls=9`,

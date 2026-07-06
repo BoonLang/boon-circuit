@@ -7,8 +7,8 @@ source of truth.
 ## Current Contracts
 
 - Native GPU contract: `docs/architecture/NATIVE_GPU_PIPELINE.md`
-- Unified implementation prompt:
-  `docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md`
+- Unified architecture summary:
+  `docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md`
 - Native performance/render-graph plan:
   `docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md`
 - Compact live status:

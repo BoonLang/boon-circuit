@@ -43981,7 +43981,7 @@ fn preview_apply_real_window_input_with_units(
     focus_overlay_ms += elapsed_ms(focus_overlay_started);
     record_preview_native_input_timing(PreviewNativeInputTimingSample {
         scope: preview_current_interaction_timing_scope(),
-        fast_path: "generic_fallback",
+        fast_path: "native_input_overlay_recovery",
         resolve_source: None,
         route_table_key_source: None,
         shared_lock_wait_ms: 0.0,
@@ -93717,7 +93717,7 @@ document:
     }
 
     #[test]
-    fn pending_deferred_source_work_flushes_without_generic_fallback_on_passive_motion() {
+    fn pending_deferred_source_work_flushes_without_overlay_recovery_on_passive_motion() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
         let live_runtime = cells_live_runtime(
@@ -93777,7 +93777,7 @@ document:
 
         assert!(
             input_state.pending_live_events.is_empty(),
-            "pending deferred source work should be flushed before the broad fallback path"
+            "pending deferred source work should be flushed before the broad native input recovery path"
         );
         assert_eq!(
             live_runtime.lock().unwrap().document_state_summary()["store"]["selected_address"],
@@ -93794,8 +93794,8 @@ document:
         assert!(
             !timings
                 .iter()
-                .any(|sample| sample.fast_path == "generic_fallback"),
-            "pending source work plus passive motion must not fall into the broad generic fallback: {timings:?}"
+                .any(|sample| sample.fast_path == "native_input_overlay_recovery"),
+            "pending source work plus passive motion must not fall into broad native input recovery: {timings:?}"
         );
     }
 
@@ -94392,7 +94392,7 @@ document:
     }
 
     #[test]
-    fn cells_release_after_press_selection_is_absorbed_without_generic_fallback() {
+    fn cells_release_after_press_selection_is_absorbed_without_overlay_recovery() {
         let cells_path = repo_path("examples/cells.bn");
         let cells_source = boon_runtime::source_text_for_path(&cells_path).unwrap();
         let live_runtime = cells_live_runtime(
@@ -94485,8 +94485,8 @@ document:
         assert!(
             !timings
                 .iter()
-                .any(|sample| sample.fast_path == "generic_fallback"),
-            "release after press selection must not fall through to generic fallback: {timings:?}"
+                .any(|sample| sample.fast_path == "native_input_overlay_recovery"),
+            "release after press selection must not fall through to native input recovery: {timings:?}"
         );
     }
 
@@ -94559,7 +94559,7 @@ document:
         );
         assert!(
             timings.is_empty(),
-            "stale sampled state with no source event should be absorbed before generic fallback: {timings:?}"
+            "stale sampled state with no source event should be absorbed before native input recovery: {timings:?}"
         );
         let summary_after_stale = live_runtime.lock().unwrap().document_state_summary();
         assert_eq!(summary_after_stale["store"]["selected_address"], "B0");

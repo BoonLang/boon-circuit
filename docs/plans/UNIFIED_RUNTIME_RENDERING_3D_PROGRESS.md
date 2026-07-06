@@ -9,7 +9,7 @@ for old evidence.
 
 - Native GPU contract: `docs/architecture/NATIVE_GPU_PIPELINE.md`
 - Unified architecture: `docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md`
-- Goal prompt: `docs/plans/UNIFIED_IMPLEMENTATION_GOAL_PROMPT.md`
+- Goal prompt: `docs/plans/GOAL_PROMPT.md`
 - Frame loop/proof plan:
   `docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md`
 - Runtime/list/cells handoff: `docs/plans/speedup/TASK-0804A_HANDOFF.md`
@@ -33,10 +33,32 @@ for old evidence.
 | Native GPU contract | In progress | `docs/architecture/NATIVE_GPU_PIPELINE.md` is the source of truth. Multiwindow now requires surface-scoped proof. |
 | Cells 60 FPS | In progress | Runtime list scans/currentness were improved earlier, but current acceptance still needs fresh product-latency and proof-lane evidence after cleanup. |
 | ProductFrameGraph | In progress | Present/proof split exists, but renderer ownership and retained resource scheduling still need larger cuts. |
-| Test harness cleanup | In progress | Old proof aliases, stale report acceptance, source-replay refresh debt, and duplicate verifier paths remain high-value deletion targets. |
+| Test harness cleanup | In progress | Old proof aliases, stale report acceptance, source-replay refresh debt, duplicate verifier paths, and ambiguous recovery labels remain high-value deletion targets. |
 | 3D/manufacturing | In progress | Existing work remains useful, but it should not distract from runtime/render/harness cleanup until the active goal is stable. |
 
 ## Latest Checkpoints
+
+### 2026-07-06 - Stale Unified Architecture Bulk Removed
+
+- Replaced the 2,423-line historical unified architecture snapshot with a
+  compact active contract.
+- Deleted the obsolete 691-line duplicate slash prompt file;
+  `docs/plans/GOAL_PROMPT.md` is the single current prompt entrypoint.
+- Kept the current non-negotiables: PlanExecutor product path, ProductRenderGraph
+  direction, surface-scoped native proof, separate proof lane, no example
+  shortcuts, and delete-not-quarantine cleanup policy.
+- This removes stale planning detail as an implementation cost; old evidence
+  remains available through git history.
+
+### 2026-07-06 - Native Input Recovery Label Clarified
+
+- Removed the misleading `generic_fallback` native input timing label from the
+  broad overlay/recovery path.
+- Cells visible-click summaries now export
+  `native_input_overlay_recovery_count`; the old ambiguous count key is not
+  preserved as an alias.
+- Focused tests were renamed to check the explicit native input recovery path
+  instead of a runtime-sounding fallback.
 
 ### 2026-07-06 - Row Lookup Alias Compatibility Removed
 
@@ -147,14 +169,11 @@ Fresh focused evidence:
 
 1. Run compact native/BYTES aggregate summaries and use fresh taxonomy to choose
    refresh queue work versus true product blockers.
-2. Audit native layout/input recovery paths that still report generic fallback
-   labels; either prove them as explicit retained-layout recovery or rename/cut
-   them so they cannot be confused with runtime fallback.
-3. Delete duplicate report/schema refresh paths that only preserve stale
+2. Delete duplicate report/schema refresh paths that only preserve stale
    fingerprints or old comparison contracts.
-4. Move the current linear retained `ProductFrameGraph` toward a real
+3. Move the current linear retained `ProductFrameGraph` toward a real
    renderer-owned dirty-resource scheduler.
-5. Re-run focused native Cells product-latency and proof-lane reports after the
+4. Re-run focused native Cells product-latency and proof-lane reports after the
    harness is lean enough that reports are trustworthy.
 
 ## Completion Rules

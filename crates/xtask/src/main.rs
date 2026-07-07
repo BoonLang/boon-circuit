@@ -36177,6 +36177,157 @@ fn native_product_present_plan_object_contract(plan: &serde_json::Value) -> serd
     })
 }
 
+#[derive(Clone, Copy)]
+struct NativeRoleReport<'a> {
+    value: Option<&'a serde_json::Value>,
+}
+
+impl<'a> NativeRoleReport<'a> {
+    fn new(value: Option<&'a serde_json::Value>) -> Self {
+        Self { value }
+    }
+
+    fn value(self) -> Option<&'a serde_json::Value> {
+        self.value
+    }
+
+    fn field(self, key: &str) -> Option<&'a serde_json::Value> {
+        self.value.and_then(|report| report.get(key))
+    }
+
+    fn value_or(self, key: &str, default: serde_json::Value) -> serde_json::Value {
+        self.field(key).cloned().unwrap_or(default)
+    }
+
+    fn status_value(self) -> serde_json::Value {
+        self.value_or("status", json!("missing"))
+    }
+
+    fn summary_or_missing(self, key: &str) -> serde_json::Value {
+        self.value_or(key, missing_p50_p95_max_summary())
+    }
+
+    fn bool_true(self, key: &str) -> bool {
+        self.field(key).and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    fn str_or(self, key: &str, default: &str) -> String {
+        self.field(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default)
+            .to_owned()
+    }
+
+    fn u64_or(self, key: &str, default: u64) -> u64 {
+        self.field(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default)
+    }
+
+    fn f64_or(self, key: &str, default: f64) -> f64 {
+        self.field(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(default)
+    }
+}
+
+fn missing_p50_p95_max_summary() -> serde_json::Value {
+    json!({"p50": null, "p95": null, "max": null, "sample_count": 0})
+}
+
+fn role_report_steps_all_pass(report: Option<&serde_json::Value>) -> bool {
+    report
+        .and_then(|report| report.get("per_step_pass_fail"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|steps| {
+            !steps.is_empty()
+                && steps
+                    .iter()
+                    .all(|step| step.get("pass").and_then(serde_json::Value::as_bool) == Some(true))
+        })
+}
+
+fn push_native_role_report_shell_checks(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    prefix: &str,
+    role_description: &str,
+    role_report: &Path,
+    role_output: Option<&std::process::Output>,
+    role_report_json: Option<&serde_json::Value>,
+    include_stderr: bool,
+) {
+    let role_exit_success = role_output.is_some_and(|output| output.status.success());
+    let status = role_output
+        .map(|output| output.status.to_string())
+        .unwrap_or_else(|| "not-run".to_owned());
+    let detail = if include_stderr {
+        let stderr = role_output
+            .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_owned())
+            .unwrap_or_else(|| "not-run".to_owned());
+        format!("status={status:?}, stderr={stderr}")
+    } else {
+        format!("status={status:?}")
+    };
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{prefix}:role-exit-success"),
+        role_exit_success,
+        detail,
+        (!role_exit_success).then(|| {
+            format!(
+                "boon_native_playground {role_description} role failed; report={}",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_report_present = role_report_json.is_some();
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{prefix}:role-report-present"),
+        role_report_present,
+        format!("report={}", role_report.display()),
+        (!role_report_present).then(|| {
+            format!(
+                "{role_description} role did not write `{}`",
+                role_report.display()
+            )
+        }),
+    );
+
+    let role_status_pass = role_report_json
+        .and_then(|report| report.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{prefix}:role-status-pass"),
+        role_status_pass,
+        format!(
+            "status={:?}",
+            role_report_json
+                .and_then(|report| report.get("status"))
+                .and_then(serde_json::Value::as_str)
+        ),
+        (!role_status_pass).then(|| format!("{role_description} role report status was not pass")),
+    );
+
+    let role_checks_all_pass = role_report_steps_all_pass(role_report_json);
+    push_audit_check(
+        checks,
+        blockers,
+        format!("{prefix}:role-checks-pass"),
+        role_checks_all_pass,
+        "role per_step_pass_fail entries all pass",
+        (!role_checks_all_pass)
+            .then(|| format!("{role_description} role contained a failing step")),
+    );
+}
+
 fn verify_native_counter_interaction_speed(
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -36250,96 +36401,21 @@ fn verify_native_counter_interaction_speed(
     } else {
         None
     };
-    let role_exit_success = role_output
-        .as_ref()
-        .is_some_and(|output| output.status.success());
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "counter-interaction-speed:role-exit-success",
-        role_exit_success,
-        format!(
-            "status={:?}",
-            role_output
-                .as_ref()
-                .map(|output| output.status.to_string())
-                .unwrap_or_else(|| "not-run".to_owned())
-        ),
-        (!role_exit_success).then(|| {
-            format!(
-                "boon_native_playground interaction-speed role failed; report={}",
-                role_report.display()
-            )
-        }),
-    );
-
     let role_report_json = read_optional_json(&role_report)?;
-    let role_report_present = role_report_json.is_some();
-    push_audit_check(
+    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+    push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
-        "counter-interaction-speed:role-report-present",
-        role_report_present,
-        format!("report={}", role_report.display()),
-        (!role_report_present).then(|| {
-            format!(
-                "interaction-speed role did not write `{}`",
-                role_report.display()
-            )
-        }),
+        "counter-interaction-speed",
+        "interaction-speed",
+        &role_report,
+        role_output.as_ref(),
+        role_data.value(),
+        false,
     );
 
-    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
-        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "counter-interaction-speed:role-status-pass",
-        role_status_pass,
-        format!(
-            "status={:?}",
-            role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .and_then(serde_json::Value::as_str)
-        ),
-        (!role_status_pass).then(|| "interaction-speed role report status was not pass".to_owned()),
-    );
-
-    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
-        report
-            .get("per_step_pass_fail")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|steps| {
-                !steps.is_empty()
-                    && steps.iter().all(|step| {
-                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                    })
-            })
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "counter-interaction-speed:role-checks-pass",
-        role_checks_all_pass,
-        "role per_step_pass_fail entries all pass",
-        (!role_checks_all_pass)
-            .then(|| "interaction-speed role contained a failing step".to_owned()),
-    );
-
-    let observed_final = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("final_count"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing")
-        .to_owned();
-    let observed_expected = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("expected_count"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing")
-        .to_owned();
+    let observed_final = role_data.str_or("final_count", "missing");
+    let observed_expected = role_data.str_or("expected_count", "missing");
     let final_count_ok = observed_final == event_count_arg && observed_expected == event_count_arg;
     push_audit_check(
         &mut checks,
@@ -36356,11 +36432,7 @@ fn verify_native_counter_interaction_speed(
         }),
     );
 
-    let render_update_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("preview_shared_render_update_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
+    let render_update_count = role_data.u64_or("preview_shared_render_update_count", 0);
     let render_update_ok = render_update_count >= event_count;
     push_audit_check(
         &mut checks,
@@ -36375,16 +36447,8 @@ fn verify_native_counter_interaction_speed(
         }),
     );
 
-    let interaction_total_ms = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("interaction_total_ms"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::INFINITY);
-    let interaction_per_event_ms = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("interaction_per_event_ms"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::INFINITY);
+    let interaction_total_ms = role_data.f64_or("interaction_total_ms", f64::INFINITY);
+    let interaction_per_event_ms = role_data.f64_or("interaction_per_event_ms", f64::INFINITY);
     let latency_ok = interaction_total_ms <= max_total_ms;
     push_audit_check(
         &mut checks,
@@ -36420,11 +36484,7 @@ fn verify_native_counter_interaction_speed(
             "playground_binary_path": binary_path,
             "playground_binary_hash": file_hash("target/debug/boon_native_playground"),
             "role_report": role_report,
-            "role_report_status": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
+            "role_report_status": role_data.status_value(),
             "event_count": event_count,
             "final_count": observed_final,
             "expected_count": observed_expected,
@@ -36545,120 +36605,31 @@ fn verify_native_cells_interaction_speed(
     } else {
         None
     };
-    let role_exit_success = role_output
-        .as_ref()
-        .is_some_and(|output| output.status.success());
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "cells-interaction-speed:role-exit-success",
-        role_exit_success,
-        format!(
-            "status={:?}",
-            role_output
-                .as_ref()
-                .map(|output| output.status.to_string())
-                .unwrap_or_else(|| "not-run".to_owned())
-        ),
-        (!role_exit_success).then(|| {
-            format!(
-                "boon_native_playground interaction-speed role failed; report={}",
-                role_report.display()
-            )
-        }),
-    );
-
     let role_report_json = read_optional_json(&role_report)?;
-    let role_report_present = role_report_json.is_some();
-    push_audit_check(
+    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+    push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
-        "cells-interaction-speed:role-report-present",
-        role_report_present,
-        format!("report={}", role_report.display()),
-        (!role_report_present).then(|| {
-            format!(
-                "interaction-speed role did not write `{}`",
-                role_report.display()
-            )
-        }),
+        "cells-interaction-speed",
+        "interaction-speed",
+        &role_report,
+        role_output.as_ref(),
+        role_data.value(),
+        false,
     );
 
-    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
-        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "cells-interaction-speed:role-status-pass",
-        role_status_pass,
-        format!(
-            "status={:?}",
-            role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .and_then(serde_json::Value::as_str)
-        ),
-        (!role_status_pass).then(|| "interaction-speed role report status was not pass".to_owned()),
-    );
-
-    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
-        report
-            .get("per_step_pass_fail")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|steps| {
-                !steps.is_empty()
-                    && steps.iter().all(|step| {
-                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                    })
-            })
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "cells-interaction-speed:role-checks-pass",
-        role_checks_all_pass,
-        "role per_step_pass_fail entries all pass",
-        (!role_checks_all_pass)
-            .then(|| "interaction-speed role contained a failing step".to_owned()),
-    );
-
-    let real_window_click_shape_pass = role_report_json.as_ref().is_some_and(|report| {
-        report
-            .get("real_window_click_shape_pass")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    });
-    let simple_click_button_shape_rejects = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("simple_click_button_shape_rejects"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let simple_source_click_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("simple_source_click_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let selection_formula_retained_patch_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selection_formula_retained_patch_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let selection_formula_retained_touched_node_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selection_formula_retained_touched_node_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let selection_formula_full_layout_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selection_formula_full_layout_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let selection_formula_retained_patch_summary = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selection_formula_retained_patch_summary"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let real_window_click_shape_pass = role_data.bool_true("real_window_click_shape_pass");
+    let simple_click_button_shape_rejects =
+        role_data.u64_or("simple_click_button_shape_rejects", 0);
+    let simple_source_click_count = role_data.u64_or("simple_source_click_count", 0);
+    let selection_formula_retained_patch_count =
+        role_data.u64_or("selection_formula_retained_patch_count", 0);
+    let selection_formula_retained_touched_node_count =
+        role_data.u64_or("selection_formula_retained_touched_node_count", 0);
+    let selection_formula_full_layout_count =
+        role_data.u64_or("selection_formula_full_layout_count", u64::MAX);
+    let selection_formula_retained_patch_summary =
+        role_data.value_or("selection_formula_retained_patch_summary", json!({}));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -36687,22 +36658,9 @@ fn verify_native_cells_interaction_speed(
         }),
     );
 
-    let workflow_coverage_pass = role_report_json.as_ref().is_some_and(|report| {
-        report
-            .get("workflow_coverage_pass")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    });
-    let workflow_event_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("workflow_event_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let workflow_checks = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("workflow_checks"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let workflow_coverage_pass = role_data.bool_true("workflow_coverage_pass");
+    let workflow_event_count = role_data.u64_or("workflow_event_count", 0);
+    let workflow_checks = role_data.value_or("workflow_checks", json!([]));
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -36716,12 +36674,7 @@ fn verify_native_cells_interaction_speed(
         }),
     );
 
-    let selected_address = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selected_address"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing")
-        .to_owned();
+    let selected_address = role_data.str_or("selected_address", "missing");
     let final_state_observed = selected_address != "missing";
     push_audit_check(
         &mut checks,
@@ -36733,16 +36686,8 @@ fn verify_native_cells_interaction_speed(
             .then(|| "Cells interaction role did not expose a final selected address".to_owned()),
     );
 
-    let p95_ms = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("interaction_latency_ms_p95"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::INFINITY);
-    let max_ms = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("interaction_latency_ms_max"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(f64::INFINITY);
+    let p95_ms = role_data.f64_or("interaction_latency_ms_p95", f64::INFINITY);
+    let max_ms = role_data.f64_or("interaction_latency_ms_max", f64::INFINITY);
     let p95_ok = p95_ms <= max_p95_ms;
     push_audit_check(
         &mut checks,
@@ -36770,16 +36715,8 @@ fn verify_native_cells_interaction_speed(
         }),
     );
 
-    let render_update_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("preview_shared_render_update_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let measured_event_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("event_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(event_count);
+    let render_update_count = role_data.u64_or("preview_shared_render_update_count", 0);
+    let measured_event_count = role_data.u64_or("event_count", event_count);
     let render_update_ok = render_update_count >= measured_event_count;
     push_audit_check(
         &mut checks,
@@ -36799,56 +36736,17 @@ fn verify_native_cells_interaction_speed(
     } else {
         Vec::new()
     };
-    let click_interaction_timing = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("click_interaction_timing_ms"))
-        .cloned()
-        .unwrap_or_else(|| json!(null));
-    let click_native_input_timing = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("click_native_input_timing_ms"))
-        .cloned()
-        .unwrap_or_else(|| json!(null));
-    let interaction_timing_samples = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("interaction_timing_samples"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let native_input_timing_samples = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("native_input_timing_samples"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let native_input_reject_counts = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("native_input_reject_counts"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let logical_cell_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("logical_cell_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let materialized_cell_count_max = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("materialized_cell_count_max"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let rendered_cell_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("rendered_cell_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let formula_evaluated_cell_count_max = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("formula_evaluated_cell_count_max"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let formula_recomputed_field_count_max = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("formula_recomputed_field_count_max"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
+    let click_interaction_timing = role_data.value_or("click_interaction_timing_ms", json!(null));
+    let click_native_input_timing = role_data.value_or("click_native_input_timing_ms", json!(null));
+    let interaction_timing_samples = role_data.value_or("interaction_timing_samples", json!([]));
+    let native_input_timing_samples = role_data.value_or("native_input_timing_samples", json!([]));
+    let native_input_reject_counts = role_data.value_or("native_input_reject_counts", json!({}));
+    let logical_cell_count = role_data.u64_or("logical_cell_count", 0);
+    let materialized_cell_count_max = role_data.u64_or("materialized_cell_count_max", 0);
+    let rendered_cell_count = role_data.u64_or("rendered_cell_count", 0);
+    let formula_evaluated_cell_count_max = role_data.u64_or("formula_evaluated_cell_count_max", 0);
+    let formula_recomputed_field_count_max =
+        role_data.u64_or("formula_recomputed_field_count_max", 0);
     write_native_gate_report(
         args,
         "verify-native-cells-interaction-speed",
@@ -36865,41 +36763,17 @@ fn verify_native_cells_interaction_speed(
             "playground_binary_path": binary_path,
             "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
             "role_report": role_report,
-            "role_report_status": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
+            "role_report_status": role_data.status_value(),
             "event_count": measured_event_count,
             "requested_event_count": event_count,
             "workflow_event_count": workflow_event_count,
             "workflow_coverage_pass": workflow_coverage_pass,
             "workflow_checks": workflow_checks,
-            "workflow_event_records": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("workflow_event_records"))
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "operator_host_input": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("operator_host_input"))
-                .cloned()
-                .unwrap_or_else(|| json!(false)),
-            "real_os_input": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("real_os_input"))
-                .cloned()
-                .unwrap_or_else(|| json!(false)),
-            "evidence_tier": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("evidence_tier"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
-            "input_injection_method": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("input_injection_method"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
+            "workflow_event_records": role_data.value_or("workflow_event_records", json!([])),
+            "operator_host_input": role_data.value_or("operator_host_input", json!(false)),
+            "real_os_input": role_data.value_or("real_os_input", json!(false)),
+            "evidence_tier": role_data.value_or("evidence_tier", json!("missing")),
+            "input_injection_method": role_data.value_or("input_injection_method", json!("missing")),
             "real_window_click_shape_pass": real_window_click_shape_pass,
             "simple_source_click_count": simple_source_click_count,
             "simple_click_button_shape_rejects": simple_click_button_shape_rejects,
@@ -36907,32 +36781,16 @@ fn verify_native_cells_interaction_speed(
             "selection_formula_retained_patch_count": selection_formula_retained_patch_count,
             "selection_formula_retained_touched_node_count": selection_formula_retained_touched_node_count,
             "selection_formula_full_layout_count": selection_formula_full_layout_count,
-            "workflow_latency_ms_p95": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("workflow_latency_ms_p95"))
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(f64::INFINITY),
-            "workflow_latency_ms_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("workflow_latency_ms_max"))
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(f64::INFINITY),
+            "workflow_latency_ms_p95": role_data.f64_or("workflow_latency_ms_p95", f64::INFINITY),
+            "workflow_latency_ms_max": role_data.f64_or("workflow_latency_ms_max", f64::INFINITY),
             "selected_address": selected_address,
             "logical_cell_count": logical_cell_count,
             "materialized_cell_count_max": materialized_cell_count_max,
             "rendered_cell_count": rendered_cell_count,
             "formula_evaluated_cell_count_max": formula_evaluated_cell_count_max,
             "formula_recomputed_field_count_max": formula_recomputed_field_count_max,
-            "formula_evaluated_cell_samples": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("formula_evaluated_cell_samples"))
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "materialization_reports": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("materialization_reports"))
-                .cloned()
-                .unwrap_or_else(|| json!([])),
+            "formula_evaluated_cell_samples": role_data.value_or("formula_evaluated_cell_samples", json!([])),
+            "materialization_reports": role_data.value_or("materialization_reports", json!([])),
             "interaction_latency_ms_p95": p95_ms,
             "interaction_latency_ms_max": max_ms,
             "preview_shared_render_update_count": render_update_count,
@@ -36940,24 +36798,12 @@ fn verify_native_cells_interaction_speed(
             "max_max_ms": max_max_ms,
             "click_interaction_timing_ms": click_interaction_timing,
             "click_native_input_timing_ms": click_native_input_timing,
-            "interaction_timing_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("interaction_timing_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
+            "interaction_timing_count": role_data.u64_or("interaction_timing_count", 0),
             "interaction_timing_samples": interaction_timing_samples,
-            "native_input_timing_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("native_input_timing_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
+            "native_input_timing_count": role_data.u64_or("native_input_timing_count", 0),
             "native_input_timing_samples": native_input_timing_samples,
             "native_input_reject_counts": native_input_reject_counts,
-            "stage_counters": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("stage_counters"))
-                .cloned()
-                .unwrap_or_else(|| json!(null)),
+            "stage_counters": role_data.value_or("stage_counters", json!(null)),
             "targets": {
                 "debug": {
                     "focus_p95_ms": 120.0,
@@ -46015,112 +45861,24 @@ fn verify_native_gpu_novywave_interaction_speed(
     } else {
         None
     };
-    let role_exit_success = role_output
-        .as_ref()
-        .is_some_and(|output| output.status.success());
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "novywave-interaction-speed:role-exit-success",
-        role_exit_success,
-        format!(
-            "status={:?}, stderr={}",
-            role_output
-                .as_ref()
-                .map(|output| output.status.to_string())
-                .unwrap_or_else(|| "not-run".to_owned()),
-            role_output
-                .as_ref()
-                .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_owned())
-                .unwrap_or_else(|| "not-run".to_owned())
-        ),
-        (!role_exit_success).then(|| {
-            format!(
-                "boon_native_playground NovyWave interaction-speed role failed; report={}",
-                role_report.display()
-            )
-        }),
-    );
-
     let role_report_json = read_optional_json(&role_report)?;
-    let role_report_present = role_report_json.is_some();
-    push_audit_check(
+    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+    push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
-        "novywave-interaction-speed:role-report-present",
-        role_report_present,
-        format!("report={}", role_report.display()),
-        (!role_report_present).then(|| {
-            format!(
-                "NovyWave interaction-speed role did not write `{}`",
-                role_report.display()
-            )
-        }),
-    );
-    let role_status_pass = role_report_json.as_ref().is_some_and(|report| {
-        report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "novywave-interaction-speed:role-status-pass",
-        role_status_pass,
-        format!(
-            "status={:?}",
-            role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .and_then(serde_json::Value::as_str)
-        ),
-        (!role_status_pass)
-            .then(|| "NovyWave interaction-speed role status was not pass".to_owned()),
-    );
-    let role_checks_all_pass = role_report_json.as_ref().is_some_and(|report| {
-        report
-            .get("per_step_pass_fail")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|steps| {
-                !steps.is_empty()
-                    && steps.iter().all(|step| {
-                        step.get("pass").and_then(serde_json::Value::as_bool) == Some(true)
-                    })
-            })
-    });
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "novywave-interaction-speed:role-checks-pass",
-        role_checks_all_pass,
-        "role per_step_pass_fail entries all pass",
-        (!role_checks_all_pass)
-            .then(|| "NovyWave interaction-speed role contained a failing step".to_owned()),
+        "novywave-interaction-speed",
+        "NovyWave interaction-speed",
+        &role_report,
+        role_output.as_ref(),
+        role_data.value(),
+        true,
     );
 
-    let input_to_visible = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("input_to_visible_ms_p50_p95_max"))
-        .cloned()
-        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
-    let hover_to_overlay = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("hover_to_overlay_ms_p50_p95_max"))
-        .cloned()
-        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
-    let click_to_cursor = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("click_to_cursor_ms_p50_p95_max"))
-        .cloned()
-        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
-    let divider_drag = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("divider_drag_to_layout_ms_p50_p95_max"))
-        .cloned()
-        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
-    let resize_to_present = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("resize_to_present_ms_p50_p95_max"))
-        .cloned()
-        .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0}));
+    let input_to_visible = role_data.summary_or_missing("input_to_visible_ms_p50_p95_max");
+    let hover_to_overlay = role_data.summary_or_missing("hover_to_overlay_ms_p50_p95_max");
+    let click_to_cursor = role_data.summary_or_missing("click_to_cursor_ms_p50_p95_max");
+    let divider_drag = role_data.summary_or_missing("divider_drag_to_layout_ms_p50_p95_max");
+    let resize_to_present = role_data.summary_or_missing("resize_to_present_ms_p50_p95_max");
     let latency_checks = [
         (
             "novywave-interaction-speed:input-to-visible-p95-budget",
@@ -46169,12 +45927,7 @@ fn verify_native_gpu_novywave_interaction_speed(
         );
     }
 
-    let selected_rows = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("selected_rows_order_label"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing")
-        .to_owned();
+    let selected_rows = role_data.str_or("selected_rows_order_label", "missing");
     let selected_rows_ok = selected_rows == "A[3:0], B[3:0]";
     push_audit_check(
         &mut checks,
@@ -46188,21 +45941,9 @@ fn verify_native_gpu_novywave_interaction_speed(
             )
         }),
     );
-    let hot_path_png_write_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("hot_path_png_write_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let hot_path_report_write_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("hot_path_report_write_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
-    let hover_persist_write_count = role_report_json
-        .as_ref()
-        .and_then(|report| report.get("hover_persist_write_count"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
+    let hot_path_png_write_count = role_data.u64_or("hot_path_png_write_count", u64::MAX);
+    let hot_path_report_write_count = role_data.u64_or("hot_path_report_write_count", u64::MAX);
+    let hover_persist_write_count = role_data.u64_or("hover_persist_write_count", u64::MAX);
     for (id, observed, key) in [
         (
             "novywave-interaction-speed:no-hot-path-png-writes",
@@ -46230,13 +45971,7 @@ fn verify_native_gpu_novywave_interaction_speed(
             (!pass).then(|| format!("{key} must be 0 in the interaction hot path")),
         );
     }
-    let role_field_or_null = |key: &str| {
-        role_report_json
-            .as_ref()
-            .and_then(|report| report.get(key))
-            .cloned()
-            .unwrap_or_else(|| json!(null))
-    };
+    let role_field_or_null = |key: &str| role_data.value_or(key, json!(null));
     let renderer_upload_probe = role_field_or_null("renderer_upload_probe");
     let renderer_upload_probe_pass = renderer_upload_probe
         .get("status")
@@ -46341,11 +46076,7 @@ fn verify_native_gpu_novywave_interaction_speed(
             "playground_binary_path": binary_path,
             "playground_binary_hash": boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()),
             "role_report": role_report,
-            "role_report_status": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("status"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
+            "role_report_status": role_data.status_value(),
             "event_count": event_count,
             "max_p95_ms": max_p95_ms,
             "max_max_ms": max_max_ms,
@@ -46355,46 +46086,14 @@ fn verify_native_gpu_novywave_interaction_speed(
             "click_to_cursor_ms_p50_p95_max": click_to_cursor,
             "divider_drag_to_layout_ms_p50_p95_max": divider_drag,
             "resize_to_present_ms_p50_p95_max": resize_to_present,
-            "runtime_apply_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_apply_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "runtime_step_apply_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_step_apply_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "runtime_state_summary_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_state_summary_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "runtime_lock_wait_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_lock_wait_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "layout_rebuild_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("layout_rebuild_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "document_eval_lower_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("document_eval_lower_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "text_measure_and_layout_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("text_measure_and_layout_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
-            "function_registry_ms_p50_p95_max": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("function_registry_ms_p50_p95_max"))
-                .cloned()
-                .unwrap_or_else(|| json!({"p50": null, "p95": null, "max": null, "sample_count": 0})),
+            "runtime_apply_ms_p50_p95_max": role_data.summary_or_missing("runtime_apply_ms_p50_p95_max"),
+            "runtime_step_apply_ms_p50_p95_max": role_data.summary_or_missing("runtime_step_apply_ms_p50_p95_max"),
+            "runtime_state_summary_ms_p50_p95_max": role_data.summary_or_missing("runtime_state_summary_ms_p50_p95_max"),
+            "runtime_lock_wait_ms_p50_p95_max": role_data.summary_or_missing("runtime_lock_wait_ms_p50_p95_max"),
+            "layout_rebuild_ms_p50_p95_max": role_data.summary_or_missing("layout_rebuild_ms_p50_p95_max"),
+            "document_eval_lower_ms_p50_p95_max": role_data.summary_or_missing("document_eval_lower_ms_p50_p95_max"),
+            "text_measure_and_layout_ms_p50_p95_max": role_data.summary_or_missing("text_measure_and_layout_ms_p50_p95_max"),
+            "function_registry_ms_p50_p95_max": role_data.summary_or_missing("function_registry_ms_p50_p95_max"),
             "stage_counters": role_field_or_null("stage_counters"),
             "render_scene_patch_counts": role_field_or_null("render_scene_patch_counts"),
             "paint_space_patch_reject_counts": role_field_or_null("paint_space_patch_reject_counts"),
@@ -46413,65 +46112,21 @@ fn verify_native_gpu_novywave_interaction_speed(
             "click_native_input_timing_ms": click_native_input_timing,
             "hover_native_input_timing_ms": hover_native_input_timing,
             "divider_native_input_timing_ms": divider_native_input_timing,
-            "interaction_profile_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("interaction_profile_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            "interaction_timing_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("interaction_timing_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            "runtime_root_list_cause_summary": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_root_list_cause_summary"))
-                .cloned()
-                .unwrap_or_else(|| json!(null)),
-            "runtime_dirty_frontier_cause_summary": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("runtime_dirty_frontier_cause_summary"))
-                .cloned()
-                .unwrap_or_else(|| json!(null)),
-            "interaction_timing_samples": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("interaction_timing_samples"))
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "native_input_timing_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("native_input_timing_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            "native_input_timing_samples": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("native_input_timing_samples"))
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "preview_blocked_on_ipc_count": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("preview_blocked_on_ipc_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::MAX),
+            "interaction_profile_count": role_data.u64_or("interaction_profile_count", 0),
+            "interaction_timing_count": role_data.u64_or("interaction_timing_count", 0),
+            "runtime_root_list_cause_summary": role_data.value_or("runtime_root_list_cause_summary", json!(null)),
+            "runtime_dirty_frontier_cause_summary": role_data.value_or("runtime_dirty_frontier_cause_summary", json!(null)),
+            "interaction_timing_samples": role_data.value_or("interaction_timing_samples", json!([])),
+            "native_input_timing_count": role_data.u64_or("native_input_timing_count", 0),
+            "native_input_timing_samples": role_data.value_or("native_input_timing_samples", json!([])),
+            "preview_blocked_on_ipc_count": role_data.u64_or("preview_blocked_on_ipc_count", u64::MAX),
             "hot_path_png_write_count": hot_path_png_write_count,
             "hot_path_report_write_count": hot_path_report_write_count,
             "hover_persist_write_count": hover_persist_write_count,
             "selected_rows_order_label": selected_rows,
-            "keyboard_cursor_label": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("keyboard_cursor_label"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
-            "zoom_center_label": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("zoom_center_label"))
-                .cloned()
-                .unwrap_or_else(|| json!("missing")),
-            "ui_state_persistence_disabled_for_benchmark": role_report_json
-                .as_ref()
-                .and_then(|report| report.get("ui_state_persistence_disabled_for_benchmark"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            "keyboard_cursor_label": role_data.value_or("keyboard_cursor_label", json!("missing")),
+            "zoom_center_label": role_data.value_or("zoom_center_label", json!("missing")),
+            "ui_state_persistence_disabled_for_benchmark": role_data.bool_true("ui_state_persistence_disabled_for_benchmark"),
             "artifact_sha256s": role_artifact
         }),
     )
@@ -49338,6 +48993,19 @@ fn workspace_relative_path(path: &str) -> PathBuf {
 
 fn native_gpu_handoff_manifest_path() -> PathBuf {
     workspace_relative_path(NATIVE_GPU_HANDOFF_MANIFEST_PATH)
+}
+
+fn native_gpu_handoff_command_is_manifest_owned(command: &str) -> bool {
+    static COMMANDS: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
+    COMMANDS
+        .get_or_init(|| {
+            native_gpu_handoff_manifest_reports()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|report| report.command)
+                .collect()
+        })
+        .contains(command)
 }
 
 fn native_report_sidecar_total_raw_bytes(report: &serde_json::Value) -> u64 {
@@ -69888,12 +69556,22 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let summary_path = dir.join("schema.json");
     let mut artifact_hashes = Vec::new();
     let mut validation_failures = Vec::new();
+    let native_handoff_report_paths =
+        native_gpu_handoff_manifest_report_paths().unwrap_or_default();
     for path in collect_report_json_paths(dir)? {
         if path == summary_path {
             continue;
         }
         seen += 1;
         if let Ok(metadata) = fs::metadata(&path) {
+            if schema_summary_native_gpu_large_non_handoff_report(
+                &path,
+                metadata.len(),
+                &native_handoff_report_paths,
+            ) {
+                stale_historical_reports += 1;
+                continue;
+            }
             if schema_summary_large_report_is_stale_historical_fast(&path, metadata.len())? {
                 stale_historical_reports += 1;
                 continue;
@@ -69913,7 +69591,15 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        if status == "fail" && schema_summary_report_is_stale_historical(&report) {
+            stale_historical_reports += 1;
+            continue;
+        }
         if status == "pass" && schema_summary_report_is_stale_historical(&report) {
+            stale_historical_reports += 1;
+            continue;
+        }
+        if schema_summary_legacy_pre_contract_report(&path, &report, &native_handoff_report_paths) {
             stale_historical_reports += 1;
             continue;
         }
@@ -70021,7 +69707,7 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn recursive_schema_stale_historical_report_error(message: &str) -> bool {
-    message.contains(" has stale binary_hash ")
+    message.contains("stale binary_hash")
         || message.contains(" has stale `source_hash` ")
         || message.contains(" has stale source_hash ")
         || message.contains(" has stale screenshot_sha256 ")
@@ -70065,6 +69751,50 @@ fn schema_summary_large_report_is_stale_historical_fast(
     Ok(git_stale || worktree_stale)
 }
 
+fn native_gpu_handoff_manifest_report_paths()
+-> Result<BTreeSet<PathBuf>, Box<dyn std::error::Error>> {
+    Ok(native_gpu_handoff_manifest_reports()?
+        .into_iter()
+        .map(|report| report.path)
+        .collect())
+}
+
+fn schema_summary_native_gpu_large_non_handoff_report(
+    path: &Path,
+    byte_len: u64,
+    native_handoff_report_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    const LARGE_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+    byte_len >= LARGE_REPORT_BYTES
+        && path.starts_with(Path::new("target/reports/native-gpu"))
+        && !path.starts_with(Path::new("target/reports/native-gpu/roles"))
+        && !native_handoff_report_paths.contains(path)
+}
+
+fn schema_summary_legacy_pre_contract_report(
+    path: &Path,
+    report: &serde_json::Value,
+    native_handoff_report_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    if native_handoff_report_paths.contains(path)
+        || report.get("report_version").is_some()
+        || report.get("command").is_some()
+    {
+        return false;
+    }
+    let status_known = matches!(
+        report.get("status").and_then(serde_json::Value::as_str),
+        Some("pass" | "fail")
+    );
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    status_known
+        && ((path.starts_with(Path::new("target/reports/native-gpu"))
+            && name.starts_with("headed-scenario-"))
+            || name.ends_with("-ir-debug.json"))
+}
+
 fn json_string_field_from_prefix(prefix: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\"");
     let start = prefix.find(&needle)?;
@@ -70089,28 +69819,18 @@ fn json_string_field_from_prefix(prefix: &str, field: &str) -> Option<String> {
 }
 
 fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
-    matches!(
-        report.get("command").and_then(serde_json::Value::as_str),
-        Some(
+    let Some(command) = report.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    native_gpu_handoff_command_is_manifest_owned(command)
+        || matches!(
+            command,
             "verify-report-schema"
                 | "run-report-refresh-queue"
-                | "verify-platform-contract"
                 | "boon-native-playground-role"
-                | "verify-native-gpu-dependency-graph"
-                | "verify-native-gpu-architecture"
-                | "verify-native-gpu-layout-contract"
-                | "verify-native-gpu-shaders"
-                | "verify-native-gpu-multiwindow"
-                | "verify-native-gpu-ipc-backpressure"
-                | "verify-native-gpu-observability"
-                | "verify-native-gpu-present-floor"
-                | "verify-native-gpu-preview-e2e"
                 | "verify-native-gpu-novywave-visual"
                 | "verify-native-gpu-novywave-interaction-speed"
-                | "verify-native-gpu-scroll-speed"
                 | "verify-wgpu-retained-arenas"
-                | "verify-native-gpu-negative"
-                | "verify-native-gpu-all"
                 | "verify-runtime-change-sets"
                 | "verify-document-batch-patches"
                 | "verify-retained-layout-deltas"
@@ -70123,17 +69843,14 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
                 | "verify-native-product-render-graph"
-                | "verify-native-todomvc-physical-reference-parity"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-interaction-speed"
-                | "verify-native-cells-visible-click-e2e"
                 | "verify-boon-driver-schema"
                 | "verify-boon-driver-e2e"
                 | "verify-boon-driver-dev-window"
                 | "verify-boon-driver-speed"
                 | "verify-boon-driver-all"
         )
-    )
 }
 
 fn report_command_is(report: &serde_json::Value, expected: &str) -> bool {
@@ -72613,6 +72330,78 @@ mod tests {
         assert!(architecture.contains(NATIVE_GPU_HANDOFF_MANIFEST_PATH));
         assert!(!agents.contains("cargo xtask verify-platform-contract --report"));
         assert!(!architecture.contains("cargo xtask verify-platform-contract --report"));
+    }
+
+    #[test]
+    fn blocker_audit_treats_manifest_commands_as_manifest_owned() {
+        assert!(report_is_blocker_audit(&json!({
+            "command": "verify-native-gpu-preview-e2e"
+        })));
+        assert!(report_is_blocker_audit(&json!({
+            "command": "verify-native-cells-visible-click-e2e"
+        })));
+        assert!(report_is_blocker_audit(&json!({
+            "command": "verify-native-gpu-novywave-visual"
+        })));
+        assert!(!report_is_blocker_audit(&json!({
+            "command": "verify-obsolete-native-proof"
+        })));
+    }
+
+    #[test]
+    fn schema_summary_large_native_gpu_skip_excludes_handoff_and_roles() {
+        let mut handoff_paths = BTreeSet::new();
+        handoff_paths.insert(PathBuf::from(
+            "target/reports/native-gpu/cells-visible-click-e2e-release.json",
+        ));
+        assert!(schema_summary_native_gpu_large_non_handoff_report(
+            Path::new("target/reports/native-gpu/cells-visible-click-e2e-experiment.json"),
+            20 * 1024 * 1024,
+            &handoff_paths
+        ));
+        assert!(!schema_summary_native_gpu_large_non_handoff_report(
+            Path::new("target/reports/native-gpu/cells-visible-click-e2e-release.json"),
+            20 * 1024 * 1024,
+            &handoff_paths
+        ));
+        assert!(!schema_summary_native_gpu_large_non_handoff_report(
+            Path::new("target/reports/native-gpu/roles/preview-loop.json"),
+            20 * 1024 * 1024,
+            &handoff_paths
+        ));
+        assert!(!schema_summary_native_gpu_large_non_handoff_report(
+            Path::new("target/reports/native-gpu/cells-visible-click-e2e-experiment.json"),
+            1024,
+            &handoff_paths
+        ));
+    }
+
+    #[test]
+    fn schema_summary_legacy_pre_contract_skip_is_narrow() {
+        let handoff_paths = BTreeSet::from([PathBuf::from(
+            "target/reports/native-gpu/preview-e2e-cells.json",
+        )]);
+        let legacy = json!({"status": "pass"});
+        assert!(schema_summary_legacy_pre_contract_report(
+            Path::new("target/reports/native-gpu/headed-scenario-cells-basic-headed.json"),
+            &legacy,
+            &handoff_paths
+        ));
+        assert!(schema_summary_legacy_pre_contract_report(
+            Path::new("target/reports/novywave-ir-debug.json"),
+            &legacy,
+            &handoff_paths
+        ));
+        assert!(!schema_summary_legacy_pre_contract_report(
+            Path::new("target/reports/native-gpu/preview-e2e-cells.json"),
+            &legacy,
+            &handoff_paths
+        ));
+        assert!(!schema_summary_legacy_pre_contract_report(
+            Path::new("target/reports/native-gpu/headed-scenario-cells-basic-headed.json"),
+            &json!({"status": "pass", "report_version": 1, "command": "verify-native-gpu-preview-e2e"}),
+            &handoff_paths
+        ));
     }
 
     #[test]

@@ -18,6 +18,23 @@ const PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS: &[&str] = &[
     "graph_rebuild_count",
     "graph_clones_per_item",
 ];
+const BASE_RUNTIME_REPORT_FIELDS: &[&str] = &[
+    "report_version",
+    "generated_at_utc",
+    "command",
+    "command_argv",
+    "measurement_mode",
+    "exit_status",
+    "git_commit",
+    "binary_hash",
+    "source_hash",
+    "scenario_hash",
+    "program_hash",
+    "budget_hash",
+    "graph_node_count",
+    "per_step_pass_fail",
+    "artifact_sha256s",
+];
 
 static REPORT_BINARY_HASH_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
 
@@ -635,6 +652,120 @@ fn verify_pass_report_schema_spec(
     verify_artifact_hashes(report, path)
 }
 
+fn require_report_fields(report: &JsonValue, path: &Path, fields: &[&str]) -> RuntimeResult<()> {
+    for key in fields {
+        if report.get(*key).is_none() {
+            return Err(format!("{} missing required report field `{key}`", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+fn string_array_field<'a>(
+    report: &'a JsonValue,
+    report_path: &Path,
+    command: &str,
+    field: &str,
+) -> RuntimeResult<Vec<&'a str>> {
+    report
+        .get(field)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{} {command} {field} is missing", report_path.display()))?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                format!(
+                    "{} {command} {field} contains a non-string id",
+                    report_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn require_string_id_array(
+    report: &JsonValue,
+    report_path: &Path,
+    command: &str,
+    field: &str,
+    expected: &[&str],
+) -> RuntimeResult<()> {
+    let actual = string_array_field(report, report_path, command, field)?;
+    if actual.as_slice() != expected {
+        return Err(format!(
+            "{} {command} {field} does not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_passing_step_ids(
+    report: &JsonValue,
+    report_path: &Path,
+    command: &str,
+    expected: &[&str],
+    require_detail: bool,
+) -> RuntimeResult<()> {
+    let steps = report
+        .get("per_step_pass_fail")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} {command} per_step_pass_fail is missing",
+                report_path.display()
+            )
+        })?;
+    let mut actual_ids = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let object = step.as_object().ok_or_else(|| {
+            format!(
+                "{} {command} per_step_pass_fail[{index}] is not an object",
+                report_path.display()
+            )
+        })?;
+        let id = object
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{} {command} per_step_pass_fail[{index}] missing id",
+                    report_path.display()
+                )
+            })?;
+        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
+            return Err(format!(
+                "{} {command} check `{id}` is not passing",
+                report_path.display()
+            )
+            .into());
+        }
+        if require_detail
+            && object
+                .get("detail")
+                .and_then(JsonValue::as_str)
+                .is_none_or(|detail| detail.trim().is_empty())
+        {
+            return Err(format!(
+                "{} {command} check `{id}` has empty detail",
+                report_path.display()
+            )
+            .into());
+        }
+        actual_ids.push(id);
+    }
+    if actual_ids.as_slice() != expected {
+        return Err(format!(
+            "{} {command} per_step_pass_fail ids do not match the schema contract",
+            report_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
     if report.get("command").and_then(JsonValue::as_str) == Some("compile-artifact") {
@@ -655,28 +786,7 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_bytecode_report(&report, path)?;
         return Ok(());
     }
-    let required = [
-        "report_version",
-        "generated_at_utc",
-        "command",
-        "command_argv",
-        "measurement_mode",
-        "exit_status",
-        "git_commit",
-        "binary_hash",
-        "source_hash",
-        "scenario_hash",
-        "program_hash",
-        "budget_hash",
-        "graph_node_count",
-        "per_step_pass_fail",
-        "artifact_sha256s",
-    ];
-    for key in required {
-        if report.get(key).is_none() {
-            return Err(format!("{} missing required report field `{key}`", path.display()).into());
-        }
-    }
+    require_report_fields(&report, path, BASE_RUNTIME_REPORT_FIELDS)?;
     if report_command_is(&report, "dump-plan") {
         verify_machine_plan_report(&report, path)?;
         verify_measurement_mode(&report, path)?;
@@ -790,27 +900,7 @@ pub fn verify_report_schema_negative_probe(path: &Path) -> RuntimeResult<()> {
         )
         .into());
     }
-    for key in [
-        "report_version",
-        "generated_at_utc",
-        "command",
-        "command_argv",
-        "measurement_mode",
-        "exit_status",
-        "git_commit",
-        "binary_hash",
-        "source_hash",
-        "scenario_hash",
-        "program_hash",
-        "budget_hash",
-        "graph_node_count",
-        "per_step_pass_fail",
-        "artifact_sha256s",
-    ] {
-        if report.get(key).is_none() {
-            return Err(format!("{} missing required report field `{key}`", path.display()).into());
-        }
-    }
+    require_report_fields(&report, path, BASE_RUNTIME_REPORT_FIELDS)?;
     verify_common_report_shape(&report, path)?;
     verify_measurement_mode(&report, path)?;
     verify_report_file_hash(&report, path, "source_path", "source_hash")?;
@@ -978,91 +1068,20 @@ fn expected_bytes_default_engine_check_ids() -> &'static [&'static str] {
 
 fn verify_bytes_type_system_report(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
     let expected = expected_bytes_type_system_check_ids();
-    let required_ids = report
-        .get("required_check_ids")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-type-system required_check_ids is missing",
-                report_path.display()
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-type-system required_check_ids contains a non-string id",
-                    report_path.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if required_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-type-system required_check_ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
-
-    let checks = report
-        .get("per_step_pass_fail")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-type-system per_step_pass_fail is missing",
-                report_path.display()
-            )
-        })?;
-    let mut check_ids = Vec::with_capacity(checks.len());
-    for (index, check) in checks.iter().enumerate() {
-        let object = check.as_object().ok_or_else(|| {
-            format!(
-                "{} verify-bytes-type-system per_step_pass_fail[{index}] is not an object",
-                report_path.display()
-            )
-        })?;
-        let id = object
-            .get("id")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-type-system per_step_pass_fail[{index}] missing id",
-                    report_path.display()
-                )
-            })?;
-        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} verify-bytes-type-system check `{id}` is not passing",
-                report_path.display()
-            )
-            .into());
-        }
-        let detail = object
-            .get("detail")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-type-system check `{id}` missing detail",
-                    report_path.display()
-                )
-            })?;
-        if detail.trim().is_empty() {
-            return Err(format!(
-                "{} verify-bytes-type-system check `{id}` has empty detail",
-                report_path.display()
-            )
-            .into());
-        }
-        check_ids.push(id);
-    }
-    if check_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-type-system per_step_pass_fail ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_string_id_array(
+        report,
+        report_path,
+        "verify-bytes-type-system",
+        "required_check_ids",
+        expected,
+    )?;
+    require_passing_step_ids(
+        report,
+        report_path,
+        "verify-bytes-type-system",
+        expected,
+        true,
+    )?;
 
     let type_results = report
         .get("type_results")
@@ -1166,85 +1185,20 @@ fn verify_bytes_default_engine_readiness_report(
         .into());
     }
     let expected = expected_bytes_default_engine_check_ids();
-    let required = report
-        .get("required_check_ids")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-default-engine-readiness required_check_ids is missing",
-                report_path.display()
-            )
-        })?;
-    let required = required
-        .iter()
-        .map(|item| {
-            item.as_str().ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-default-engine-readiness required_check_ids contains a non-string id",
-                    report_path.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if required != expected {
-        return Err(format!(
-            "{} verify-bytes-default-engine-readiness required_check_ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
-
-    let steps = report
-        .get("per_step_pass_fail")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-default-engine-readiness per_step_pass_fail is missing",
-                report_path.display()
-            )
-        })?;
-    let mut actual_ids = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        let step = step.as_object().ok_or_else(|| {
-            format!(
-                "{} verify-bytes-default-engine-readiness per_step_pass_fail[{index}] is not an object",
-                report_path.display()
-            )
-        })?;
-        let id = step.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
-            format!(
-                "{} verify-bytes-default-engine-readiness per_step_pass_fail[{index}] missing id",
-                report_path.display()
-            )
-        })?;
-        if step.get("pass").and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} verify-bytes-default-engine-readiness check `{id}` is not passing",
-                report_path.display()
-            )
-            .into());
-        }
-        if step
-            .get("detail")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            return Err(format!(
-                "{} verify-bytes-default-engine-readiness check `{id}` has empty detail",
-                report_path.display()
-            )
-            .into());
-        }
-        actual_ids.push(id);
-    }
-    if actual_ids != expected {
-        return Err(format!(
-            "{} verify-bytes-default-engine-readiness per_step_pass_fail ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_string_id_array(
+        report,
+        report_path,
+        "verify-bytes-default-engine-readiness",
+        "required_check_ids",
+        expected,
+    )?;
+    require_passing_step_ids(
+        report,
+        report_path,
+        "verify-bytes-default-engine-readiness",
+        expected,
+        true,
+    )?;
 
     if report.get("default_engine").and_then(JsonValue::as_str) != Some("plan") {
         return Err(format!(
@@ -1432,32 +1386,13 @@ fn verify_bytes_negative_report(report: &JsonValue, report_path: &Path) -> Runti
         .into());
     }
 
-    let required_ids = report
-        .get("required_negative_cases")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-negative required_negative_cases is missing",
-                report_path.display()
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-negative required_negative_cases contains a non-string id",
-                    report_path.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if required_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-negative required_negative_cases do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_string_id_array(
+        report,
+        report_path,
+        "verify-bytes-negative",
+        "required_negative_cases",
+        expected,
+    )?;
 
     let negative_cases = report
         .get("negative_cases")
@@ -1555,48 +1490,13 @@ fn verify_bytes_negative_report(report: &JsonValue, report_path: &Path) -> Runti
         .into());
     }
 
-    let checks = report
-        .get("per_step_pass_fail")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-negative per_step_pass_fail is missing",
-                report_path.display()
-            )
-        })?;
-    let mut check_ids = Vec::with_capacity(checks.len());
-    for (index, check) in checks.iter().enumerate() {
-        let object = check.as_object().ok_or_else(|| {
-            format!(
-                "{} verify-bytes-negative per_step_pass_fail[{index}] is not an object",
-                report_path.display()
-            )
-        })?;
-        let id = object
-            .get("id")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-negative per_step_pass_fail[{index}] missing id",
-                    report_path.display()
-                )
-            })?;
-        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} verify-bytes-negative per_step_pass_fail `{id}` is not passing",
-                report_path.display()
-            )
-            .into());
-        }
-        check_ids.push(id);
-    }
-    if check_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-negative per_step_pass_fail ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_passing_step_ids(
+        report,
+        report_path,
+        "verify-bytes-negative",
+        expected,
+        false,
+    )?;
 
     Ok(())
 }
@@ -1645,32 +1545,13 @@ fn verify_bytes_machine_plan_adversarial_report(
         )
         .into());
     }
-    let required_ids = report
-        .get("required_adversarial_cases")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-machine-plan-adversarial missing required_adversarial_cases",
-                report_path.display()
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-machine-plan-adversarial required_adversarial_cases contains a non-string id",
-                    report_path.display()
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if required_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-machine-plan-adversarial required_adversarial_cases do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_string_id_array(
+        report,
+        report_path,
+        "verify-bytes-machine-plan-adversarial",
+        "required_adversarial_cases",
+        expected,
+    )?;
     let adversarial_cases = report
         .get("adversarial_cases")
         .and_then(JsonValue::as_array)
@@ -1735,48 +1616,13 @@ fn verify_bytes_machine_plan_adversarial_report(
         )
         .into());
     }
-    let checks = report
-        .get("per_step_pass_fail")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-machine-plan-adversarial missing per_step_pass_fail",
-                report_path.display()
-            )
-        })?;
-    let mut check_ids = Vec::with_capacity(checks.len());
-    for (index, check) in checks.iter().enumerate() {
-        let object = check.as_object().ok_or_else(|| {
-            format!(
-                "{} verify-bytes-machine-plan-adversarial per_step_pass_fail[{index}] is not an object",
-                report_path.display()
-            )
-        })?;
-        let id = object
-            .get("id")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{} verify-bytes-machine-plan-adversarial per_step_pass_fail[{index}] missing id",
-                    report_path.display()
-                )
-            })?;
-        if object.get("pass").and_then(JsonValue::as_bool) != Some(true) {
-            return Err(format!(
-                "{} verify-bytes-machine-plan-adversarial check `{id}` is not passing",
-                report_path.display()
-            )
-            .into());
-        }
-        check_ids.push(id);
-    }
-    if check_ids.as_slice() != expected {
-        return Err(format!(
-            "{} verify-bytes-machine-plan-adversarial per_step_pass_fail ids do not match the schema contract",
-            report_path.display()
-        )
-        .into());
-    }
+    require_passing_step_ids(
+        report,
+        report_path,
+        "verify-bytes-machine-plan-adversarial",
+        expected,
+        false,
+    )?;
     Ok(())
 }
 
@@ -32245,15 +32091,27 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn native_gpu_schema_rejects_missing_frame_evidence_key() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_readback_artifact"]
-            .as_object_mut()
-            .unwrap()
-            .remove("frame_evidence_key");
-        assert!(!schema_accepts(report, "native-frame-evidence-missing-key"));
+    macro_rules! native_gpu_rejects {
+        ($name:ident, $label:literal, |$report:ident| $mutate:block) => {
+            #[test]
+            fn $name() {
+                let mut $report = native_gpu_report_with_frame_evidence();
+                $mutate
+                assert!(!schema_accepts($report, $label));
+            }
+        };
     }
+
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_missing_frame_evidence_key,
+        "native-frame-evidence-missing-key",
+        |report| {
+            report["last_interactive_readback_artifact"]
+                .as_object_mut()
+                .unwrap()
+                .remove("frame_evidence_key");
+        }
+    );
 
     #[test]
     fn refresh_queue_schema_accepts_closed_loop_dry_run() {
@@ -32490,31 +32348,27 @@ mod tests {
         assert!(!schema_accepts(report, "refresh-queue-failed-child"));
     }
 
-    #[test]
-    fn native_gpu_schema_rejects_app_owned_present_target_proof_without_frame_evidence() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_readback_artifact"]["capture_method"] =
-            json!("wgpu-app-owned-present-target-copy-to-visible-surface-readback");
-        report["last_interactive_readback_artifact"]
-            .as_object_mut()
-            .unwrap()
-            .remove("frame_evidence_key");
-        assert!(!schema_accepts(
-            report,
-            "native-app-owned-target-frame-evidence-missing-key"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_app_owned_present_target_proof_without_frame_evidence,
+        "native-app-owned-target-frame-evidence-missing-key",
+        |report| {
+            report["last_interactive_readback_artifact"]["capture_method"] =
+                json!("wgpu-app-owned-present-target-copy-to-visible-surface-readback");
+            report["last_interactive_readback_artifact"]
+                .as_object_mut()
+                .unwrap()
+                .remove("frame_evidence_key");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_mismatched_frame_evidence_key() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_readback_artifact"]["frame_evidence_key"]["content_revision"] =
-            json!(6);
-        assert!(!schema_accepts(
-            report,
-            "native-frame-evidence-mismatched-key"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_mismatched_frame_evidence_key,
+        "native-frame-evidence-mismatched-key",
+        |report| {
+            report["last_interactive_readback_artifact"]["frame_evidence_key"]["content_revision"] =
+                json!(6);
+        }
+    );
 
     #[test]
     fn native_gpu_schema_rejects_mismatched_top_level_layer_revisions() {
@@ -32533,175 +32387,174 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn native_gpu_schema_rejects_hash_only_readback_proof() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_readback_artifact"]
-            .as_object_mut()
-            .unwrap()
-            .remove("frame_evidence_key");
-        report["last_interactive_readback_artifact"]["sha256"] = json!("hash-only-proof");
-        assert!(!schema_accepts(report, "native-frame-evidence-hash-only"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_hash_only_readback_proof,
+        "native-frame-evidence-hash-only",
+        |report| {
+            report["last_interactive_readback_artifact"]
+                .as_object_mut()
+                .unwrap()
+                .remove("frame_evidence_key");
+            report["last_interactive_readback_artifact"]["sha256"] = json!("hash-only-proof");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_lagged_ux_proof() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["rendered_frame_count"] = json!(4);
-        report["proof_lag_frames"] = json!(1);
-        report["frame_evidence_key"]["frame_seq"] = json!(4);
-        report["frame_evidence_key"]["present_id"] = json!(4);
-        report["preview_perf_stats"]["frame_seq"] = json!(4);
-        report["preview_perf_stats"]["frame_evidence_key"]["frame_seq"] = json!(4);
-        report["preview_perf_stats"]["frame_evidence_key"]["present_id"] = json!(4);
-        assert!(!schema_accepts(report, "native-lagged-ux-proof"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_lagged_ux_proof,
+        "native-lagged-ux-proof",
+        |report| {
+            report["rendered_frame_count"] = json!(4);
+            report["proof_lag_frames"] = json!(1);
+            report["frame_evidence_key"]["frame_seq"] = json!(4);
+            report["frame_evidence_key"]["present_id"] = json!(4);
+            report["preview_perf_stats"]["frame_seq"] = json!(4);
+            report["preview_perf_stats"]["frame_evidence_key"]["frame_seq"] = json!(4);
+            report["preview_perf_stats"]["frame_evidence_key"]["present_id"] = json!(4);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_pending_ux_readback() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_surface_readback_pending"] = json!(true);
-        report["last_interactive_readback_artifact"]["readback_poll_status"] = json!("pending");
-        assert!(!schema_accepts(report, "native-pending-ux-readback"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_pending_ux_readback,
+        "native-pending-ux-readback",
+        |report| {
+            report["last_interactive_surface_readback_pending"] = json!(true);
+            report["last_interactive_readback_artifact"]["readback_poll_status"] = json!("pending");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_same_frame_proof_identity_mismatch() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["last_interactive_readback_artifact"]["frame_evidence_key"]["proof_request_id"] =
-            json!(99);
-        assert!(!schema_accepts(
-            report,
-            "native-same-frame-proof-identity-mismatch"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_same_frame_proof_identity_mismatch,
+        "native-same-frame-proof-identity-mismatch",
+        |report| {
+            report["last_interactive_readback_artifact"]["frame_evidence_key"]["proof_request_id"] =
+                json!(99);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_preview_perf_missing_percentile_summary() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["preview_perf_stats"]
-            .as_object_mut()
-            .unwrap()
-            .remove("input_to_present_ms_p50_p95_p99_max");
-        assert!(!schema_accepts(
-            report,
-            "native-preview-perf-missing-summary"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_preview_perf_missing_percentile_summary,
+        "native-preview-perf-missing-summary",
+        |report| {
+            report["preview_perf_stats"]
+                .as_object_mut()
+                .unwrap()
+                .remove("input_to_present_ms_p50_p95_p99_max");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_continuous_probe_ux_report() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["render_loop_mode"] = json!("continuous_probe");
-        assert!(!schema_accepts(report, "native-frame-evidence-probe-ux"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_continuous_probe_ux_report,
+        "native-frame-evidence-probe-ux",
+        |report| {
+            report["render_loop_mode"] = json!("continuous_probe");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_proof_required_visible_update() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["proof_required_for_visible_update"] = json!(true);
-        assert!(!schema_accepts(
-            report,
-            "native-proof-required-visible-update"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_proof_required_visible_update,
+        "native-proof-required-visible-update",
+        |report| {
+            report["proof_required_for_visible_update"] = json!(true);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_below_host_input_injection() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["input_injection_method"] = json!("direct-runtime-route-below-host-event");
-        assert!(!schema_accepts(report, "native-below-host-input"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_below_host_input_injection,
+        "native-below-host-input",
+        |report| {
+            report["input_injection_method"] = json!("direct-runtime-route-below-host-event");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_preview_ipc_blocking() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["preview_blocked_on_ipc_count"] = json!(1);
-        assert!(!schema_accepts(report, "native-preview-ipc-blocking"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_preview_ipc_blocking,
+        "native-preview-ipc-blocking",
+        |report| {
+            report["preview_blocked_on_ipc_count"] = json!(1);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_passive_scroll_runtime_dispatch() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["command"] = json!("verify-native-gpu-scroll-speed");
-        report["runtime_dispatch_on_passive_scroll"] = json!(true);
-        report["runtime_dispatch_count_for_passive_scroll"] = json!(1);
-        assert!(!schema_accepts(
-            report,
-            "native-passive-scroll-runtime-dispatch"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_passive_scroll_runtime_dispatch,
+        "native-passive-scroll-runtime-dispatch",
+        |report| {
+            report["command"] = json!("verify-native-gpu-scroll-speed");
+            report["runtime_dispatch_on_passive_scroll"] = json!(true);
+            report["runtime_dispatch_count_for_passive_scroll"] = json!(1);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_dev_perf_hot_path_query() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["preview_perf_hot_path_query_count"] = json!(1);
-        report["dev_perf_row_queries_ipc_from_render_hook"] = json!(true);
-        assert!(!schema_accepts(report, "native-dev-perf-hot-path-query"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_dev_perf_hot_path_query,
+        "native-dev-perf-hot-path-query",
+        |report| {
+            report["preview_perf_hot_path_query_count"] = json!(1);
+            report["dev_perf_row_queries_ipc_from_render_hook"] = json!(true);
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_incomplete_dev_perf_hot_path_guards() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["dev_hot_path_counters"] = json!({
-            "preview_perf_hot_path_query_count": 0
-        });
-        assert!(!schema_accepts(
-            report,
-            "native-dev-perf-hot-path-guards-incomplete"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_incomplete_dev_perf_hot_path_guards,
+        "native-dev-perf-hot-path-guards-incomplete",
+        |report| {
+            report["dev_hot_path_counters"] = json!({
+                "preview_perf_hot_path_query_count": 0
+            });
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_render_hook_offscreen_proof_hot_path() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["command"] = json!("verify-native-gpu-scroll-speed");
-        report["preview_surface_proof"] = json!({
-            "external_render_proof": {
-                "status": "pass",
-                "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
-                "offscreen_app_owned_scene_readback_skipped": false
-            }
-        });
-        assert!(!schema_accepts(
-            report,
-            "native-render-hook-offscreen-proof-hot-path"
-        ));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_render_hook_offscreen_proof_hot_path,
+        "native-render-hook-offscreen-proof-hot-path",
+        |report| {
+            report["command"] = json!("verify-native-gpu-scroll-speed");
+            report["preview_surface_proof"] = json!({
+                "external_render_proof": {
+                    "status": "pass",
+                    "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
+                    "offscreen_app_owned_scene_readback_skipped": false
+                }
+            });
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_desktop_screenshot_proof() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["visual_capture_method"] = json!("desktop-screenshot");
-        assert!(!schema_accepts(report, "native-desktop-screenshot-proof"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_desktop_screenshot_proof,
+        "native-desktop-screenshot-proof",
+        |report| {
+            report["visual_capture_method"] = json!("desktop-screenshot");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_nested_private_runtime_dispatch() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["native_host_input_route_evidence"] = json!({
-            "private_runtime_dispatch_used": true
-        });
-        assert!(!schema_accepts(report, "native-nested-private-dispatch"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_nested_private_runtime_dispatch,
+        "native-nested-private-dispatch",
+        |report| {
+            report["native_host_input_route_evidence"] = json!({
+                "private_runtime_dispatch_used": true
+            });
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_browser_proof_substitution() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["browser_render_executed"] = json!(true);
-        report["browser_capture_method"] =
-            json!("headless-chromium-webgpu-app-owned-copyTextureToBuffer");
-        assert!(!schema_accepts(report, "native-browser-proof-substitution"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_browser_proof_substitution,
+        "native-browser-proof-substitution",
+        |report| {
+            report["browser_render_executed"] = json!(true);
+            report["browser_capture_method"] =
+                json!("headless-chromium-webgpu-app-owned-copyTextureToBuffer");
+        }
+    );
 
-    #[test]
-    fn native_gpu_schema_rejects_cosmic_toplevel_proof() {
-        let mut report = native_gpu_report_with_frame_evidence();
-        report["cosmic_toplevel_probe"] = json!({
-            "status": "pass"
-        });
-        assert!(!schema_accepts(report, "native-cosmic-toplevel-proof"));
-    }
+    native_gpu_rejects!(
+        native_gpu_schema_rejects_cosmic_toplevel_proof,
+        "native-cosmic-toplevel-proof",
+        |report| {
+            report["cosmic_toplevel_probe"] = json!({
+                "status": "pass"
+            });
+        }
+    );
 
     fn native_gpu_negative_report() -> JsonValue {
         let ids = native_gpu_product_path_negative_case_ids();

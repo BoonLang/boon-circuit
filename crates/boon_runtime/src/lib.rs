@@ -23078,9 +23078,7 @@ impl RuntimeListStore {
     }
 
     fn replace_memory(&mut self, name: &str, memory: ListMemory) -> RuntimeResult<()> {
-        let slot = self
-            .slot_mut(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        let slot = self.slot_mut_required(name)?;
         slot.memory = memory;
         slot.root_identity_epoch = slot.root_identity_epoch.wrapping_add(1);
         slot.root_source_identities.clear();
@@ -23094,9 +23092,7 @@ impl RuntimeListStore {
         rows: Vec<RuntimeRowSnapshot>,
         source_identities: Vec<Option<RootListViewFieldSourceIdentity>>,
     ) -> RuntimeResult<bool> {
-        let slot = self
-            .slot_mut(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        let slot = self.slot_mut_required(name)?;
         let can_patch = !source_identities.is_empty()
             && source_identities.iter().all(Option::is_some)
             && source_identities.len() == rows.len()
@@ -23117,9 +23113,7 @@ impl RuntimeListStore {
         name: &str,
         source_identities: &[Option<RootListViewFieldSourceIdentity>],
     ) -> RuntimeResult<bool> {
-        let slot = self
-            .slot(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        let slot = self.slot_required(name)?;
         Ok(!source_identities.is_empty()
             && source_identities.iter().all(Option::is_some)
             && source_identities.len() == slot.memory.len()
@@ -23131,9 +23125,7 @@ impl RuntimeListStore {
         name: &str,
         source_identities: &[Option<RootListViewFieldSourceIdentity>],
     ) -> RuntimeResult<bool> {
-        let slot = self
-            .slot(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        let slot = self.slot_required(name)?;
         Ok(slot.root_source_identities != source_identities)
     }
 
@@ -23142,9 +23134,7 @@ impl RuntimeListStore {
         name: &str,
         index: usize,
     ) -> RuntimeResult<Option<&RootListViewFieldSourceIdentity>> {
-        let slot = self
-            .slot(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?;
+        let slot = self.slot_required(name)?;
         Ok(slot
             .root_source_identities
             .get(index)
@@ -23152,9 +23142,7 @@ impl RuntimeListStore {
     }
 
     fn root_identity_epoch(&self, name: &str) -> RuntimeResult<u64> {
-        self.slot(name)
-            .map(|slot| slot.root_identity_epoch)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`").into())
+        Ok(self.slot_required(name)?.root_identity_epoch)
     }
 
     fn capacity(&self, name: &str) -> Option<usize> {
@@ -23176,9 +23164,7 @@ impl RuntimeListStore {
     }
 
     fn push_spare(&mut self, name: &str, row: RuntimeRowSnapshot) -> RuntimeResult<()> {
-        self.spare_rows_mut(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`"))?
-            .push(row);
+        self.spare_rows_mut_required(name)?.push(row);
         Ok(())
     }
 
@@ -23192,6 +23178,23 @@ impl RuntimeListStore {
 
     fn slot_mut(&mut self, name: &str) -> Option<&mut RuntimeListSlot> {
         self.list_slots.iter_mut().find(|slot| slot.name == name)
+    }
+
+    fn slot_required(&self, name: &str) -> RuntimeResult<&RuntimeListSlot> {
+        self.slot(name)
+            .ok_or_else(|| format!("generic runtime has no list `{name}`").into())
+    }
+
+    fn slot_mut_required(&mut self, name: &str) -> RuntimeResult<&mut RuntimeListSlot> {
+        self.slot_mut(name)
+            .ok_or_else(|| format!("generic runtime has no list `{name}`").into())
+    }
+
+    fn spare_rows_mut_required(
+        &mut self,
+        name: &str,
+    ) -> RuntimeResult<&mut Vec<RuntimeRowSnapshot>> {
+        Ok(&mut self.slot_mut_required(name)?.spare_rows)
     }
 
     fn list_slot_index(&self, list_id: ListSlotId) -> Result<usize, usize> {
@@ -25734,9 +25737,10 @@ impl GenericCircuitRuntime {
             .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let additional = count - spare_len;
-        let spare_rows = self.lists.spare_rows_mut(list).ok_or_else(|| {
-            format!("generic runtime has no list `{list}`")
-        })?;
+        let spare_rows = self
+            .lists
+            .spare_rows_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
         spare_rows.reserve(additional + count);
         let mut append_source_values = BTreeMap::new();
         append_source_values.insert(trigger.to_owned(), String::new());
@@ -25951,9 +25955,7 @@ impl GenericCircuitRuntime {
         from: usize,
         to: usize,
     ) -> RuntimeResult<GenericListRowCommit> {
-        let (key, generation) = self
-            .list_memory_mut(list)?
-            .move_index(from, to)?;
+        let (key, generation) = self.list_memory_mut(list)?.move_index(from, to)?;
         Ok(GenericListRowCommit {
             list: list.to_owned(),
             key,

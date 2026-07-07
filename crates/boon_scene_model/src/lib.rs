@@ -1,54 +1,29 @@
 use std::collections::BTreeMap;
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct CameraId(pub u64);
+macro_rules! numeric_ids {
+    ($ty:ty; $($name:ident),+ $(,)?) => {
+        $(
+            #[derive(
+                Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+            )]
+            pub struct $name(pub $ty);
+        )+
+    };
+}
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct LightId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct InstanceId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct GeometryLogicalId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct GeometryRevision(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct AppearanceMaterialId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PhysicalMaterialId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PartId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct FeatureId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PickId(pub u32);
+numeric_ids!(
+    u64;
+    CameraId,
+    LightId,
+    InstanceId,
+    GeometryLogicalId,
+    GeometryRevision,
+    AppearanceMaterialId,
+    PhysicalMaterialId,
+    PartId,
+    FeatureId,
+);
+numeric_ids!(u32; PickId);
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WorldScene {

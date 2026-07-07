@@ -1,69 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct SolidNodeId(pub u64);
+macro_rules! u64_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(
+                Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+            )]
+            pub struct $name(pub u64);
+        )+
+    };
+}
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct GeometryLogicalId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct FeatureId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct RegionId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct ProfileId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct CurveId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct EvaluatorId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct ImportedSolidId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct AppearanceMaterialId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PhysicalMaterialId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PartId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct PartInstanceId(pub u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
-)]
-pub struct AssemblyId(pub u64);
+u64_ids!(
+    SolidNodeId,
+    GeometryLogicalId,
+    FeatureId,
+    RegionId,
+    ProfileId,
+    CurveId,
+    EvaluatorId,
+    ImportedSolidId,
+    AppearanceMaterialId,
+    PhysicalMaterialId,
+    PartId,
+    PartInstanceId,
+    AssemblyId,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Units {

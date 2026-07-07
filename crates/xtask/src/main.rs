@@ -25055,11 +25055,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
 
     let build = build_native_playground_for_profile(&profile)?;
     let launched_binary_path = build.binary_path.clone();
-    let launched_binary_hash = if build.success {
-        file_hash(launched_binary_path.to_string_lossy().as_ref())
-    } else {
-        "missing".to_owned()
-    };
+    let launched_binary_hash = file_hash_when_or_missing(build.success, &launched_binary_path);
     push_native_playground_build_check(
         &mut checks,
         &mut blockers,
@@ -26142,11 +26138,7 @@ fn verify_native_gpu_preview_e2e_hello_3d(
     let manifest_scenario_hash = file_hash(&entry.scenario);
     let build = build_native_playground_for_profile("debug")?;
     let launched_binary_path = build.binary_path.clone();
-    let launched_binary_hash = if build.success {
-        file_hash(launched_binary_path.to_string_lossy().as_ref())
-    } else {
-        "missing".to_owned()
-    };
+    let launched_binary_hash = file_hash_when_or_missing(build.success, &launched_binary_path);
     push_native_playground_build_check(
         &mut checks,
         &mut blockers,
@@ -26400,11 +26392,7 @@ fn verify_native_gpu_preview_e2e_hello_3d(
             "evidence_tier": boon_driver::TIER_BOON_DRIVER,
             "host_synthetic_evidence_tier": boon_driver::TIER_HOST_SYNTHETIC,
             "role_report": role_report,
-            "role_report_sha256": if role_report.exists() {
-                file_hash(role_report.to_string_lossy().as_ref())
-            } else {
-                "missing".to_owned()
-            },
+            "role_report_sha256": existing_file_hash_or_missing(&role_report),
             "role_report_json": role_report_json,
             "external_render_proof": external_proof,
             "world_scene_orbit_probe": orbit_probe,
@@ -28212,11 +28200,7 @@ fn novywave_visual_artifact_evidence() -> serde_json::Value {
     let metrics = read_json(metrics_path).ok();
     let current_worktree_fingerprint = worktree_fingerprint();
     let playground_binary_path = Path::new("target/debug/boon_native_playground");
-    let current_playground_binary_hash = if playground_binary_path.exists() {
-        file_hash(playground_binary_path.to_string_lossy().as_ref())
-    } else {
-        "missing".to_owned()
-    };
+    let current_playground_binary_hash = existing_file_hash_or_missing(playground_binary_path);
     let playground_binary_modified_unix_ms = playground_binary_path
         .metadata()
         .ok()
@@ -36806,7 +36790,7 @@ fn verify_native_cells_interaction_speed(
             "source_files_hash": source_hash,
             "scenario_hash": file_hash("examples/cells.scn"),
             "playground_binary_path": binary_path,
-            "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
+            "playground_binary_hash": file_hash_when_or_missing(profile_ok, &binary_path),
             "role_report": role_report,
             "role_report_status": role_data.status_value(),
             "event_count": measured_event_count,
@@ -37080,12 +37064,7 @@ fn verify_native_cells_visible_click_e2e(
                 "source_files_hash": source_hash,
                 "scenario_hash": file_hash(&entry.scenario),
                 "playground_binary_path": binary_path,
-                "playground_binary_hash": if profile_ok {
-                    boon_runtime::sha256_file(&binary_path)
-                        .unwrap_or_else(|_| "missing".to_owned())
-                } else {
-                    "missing".to_owned()
-                },
+                "playground_binary_hash": file_hash_when_or_missing(profile_ok, &binary_path),
                 "target_count": click_targets.len(),
                 "click_targets": click_targets
                     .iter()
@@ -38104,7 +38083,7 @@ fn verify_native_cells_visible_click_e2e(
             "source_files_hash": source_hash,
             "scenario_hash": file_hash(&entry.scenario),
             "playground_binary_path": binary_path,
-            "playground_binary_hash": if profile_ok { boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()) } else { "missing".to_owned() },
+            "playground_binary_hash": file_hash_when_or_missing(profile_ok, &binary_path),
             "target_count": live_probe
                 .get("target_count")
                 .cloned()
@@ -46099,7 +46078,7 @@ fn verify_native_gpu_novywave_interaction_speed(
             "scenario_hash": file_hash(&entry.scenario),
             "source_files": source_files,
             "playground_binary_path": binary_path,
-            "playground_binary_hash": boon_runtime::sha256_file(&binary_path).unwrap_or_else(|_| "missing".to_owned()),
+            "playground_binary_hash": existing_file_hash_or_missing(&binary_path),
             "role_report": role_report,
             "role_report_status": role_data.status_value(),
             "event_count": event_count,
@@ -46460,11 +46439,7 @@ fn verify_boon_driver_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Err
             "plan_scenario_report": runtime_report_path,
             "plan_scenario_report_sha256": file_hash(runtime_report_path.to_string_lossy().as_ref()),
             "native_preview_e2e_report": native_report_path,
-            "native_preview_e2e_report_sha256": if native_report_path.exists() {
-                file_hash(native_report_path.to_string_lossy().as_ref())
-            } else {
-                "missing".to_owned()
-            },
+            "native_preview_e2e_report_sha256": existing_file_hash_or_missing(&native_report_path),
             "native_preview_proof": proof,
             "boon_driver_proof": scenario_proof,
         }),
@@ -46546,11 +46521,7 @@ fn verify_boon_driver_dev_window(args: &[String]) -> Result<(), Box<dyn std::err
             "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
             "does_not_satisfy_real_window": true,
             "native_dev_window_report": native_report_path,
-            "native_dev_window_report_sha256": if native_report_path.exists() {
-                file_hash(native_report_path.to_string_lossy().as_ref())
-            } else {
-                "missing".to_owned()
-            },
+            "native_dev_window_report_sha256": existing_file_hash_or_missing(&native_report_path),
             "boon_driver_proof": proof,
         }),
     )
@@ -46617,11 +46588,7 @@ fn verify_boon_driver_speed(args: &[String]) -> Result<(), Box<dyn std::error::E
             "observed_evidence_tier": boon_driver::TIER_BOON_DRIVER,
             "does_not_satisfy_real_window": true,
             "native_scroll_speed_report": native_report_path,
-            "native_scroll_speed_report_sha256": if native_report_path.exists() {
-                file_hash(native_report_path.to_string_lossy().as_ref())
-            } else {
-                "missing".to_owned()
-            },
+            "native_scroll_speed_report_sha256": existing_file_hash_or_missing(&native_report_path),
             "boon_driver_proof": proof,
         }),
     )
@@ -70489,11 +70456,7 @@ fn native_gpu_operator_input_driver_attempt(
         "injection_boundary": "after app_window OS-event normalization, before document hit/focus/scroll routing",
         "requires_private_runtime_dispatch": false,
         "real_window_input_environment_report": environment_report,
-        "real_window_input_environment_report_sha256": if environment_report.exists() {
-            file_hash(environment_report.to_string_lossy().as_ref())
-        } else {
-            "missing".to_owned()
-        },
+        "real_window_input_environment_report_sha256": existing_file_hash_or_missing(&environment_report),
         "reason": "portable verifier uses host events because current machine policy/capability report does not prove safe real-window input synthesis"
     })
 }
@@ -70956,6 +70919,22 @@ fn artifact_hash(path: &Path) -> Result<serde_json::Value, Box<dyn std::error::E
 
 fn file_hash(path: &str) -> String {
     boon_runtime::sha256_file(Path::new(path)).unwrap_or_else(|_| "missing".to_owned())
+}
+
+fn existing_file_hash_or_missing(path: &Path) -> String {
+    if path.exists() {
+        file_hash(path.to_string_lossy().as_ref())
+    } else {
+        "missing".to_owned()
+    }
+}
+
+fn file_hash_when_or_missing(condition: bool, path: &Path) -> String {
+    if condition {
+        existing_file_hash_or_missing(path)
+    } else {
+        "missing".to_owned()
+    }
 }
 
 fn manifest_runtime_source_files(entry: &boon_runtime::ExampleManifestEntry) -> Vec<String> {

@@ -1332,11 +1332,17 @@ pub struct DocumentState {
     frame: DocumentFrame,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct DocumentHotNodeId(pub u32);
+macro_rules! document_numeric_ids {
+    ($ty:ty; $($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            pub struct $name(pub $ty);
+        )+
+    };
+}
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct DocumentHotNodeGeneration(pub u64);
+document_numeric_ids!(u32; DocumentHotNodeId);
+document_numeric_ids!(u64; DocumentHotNodeGeneration);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DocumentHotNodeRef {
@@ -1358,8 +1364,7 @@ pub struct DocumentHotIdTable {
     pub next_id: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct DocumentInternId(pub u32);
+document_numeric_ids!(u32; DocumentInternId);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocumentInternTable {

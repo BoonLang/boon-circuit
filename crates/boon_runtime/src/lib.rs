@@ -65,8 +65,7 @@ use boon_plan::{
 use boon_plan_executor::{
     IndexedBytesReadEvaluation, IndexedBytesWriteEvaluation, IndexedRowView,
     IndexedUpdateBranchExecution, IndexedUpdateTargetEvent, IndexedUpdateTargetOverride,
-    ListAppendExecution, ListProjectionExecution, ListRemoveExecution, ListRetainExecution,
-    ListRowDefaultFields, PlanExecutorBytes, PlanExecutorListRow, PlanExecutorListRowState,
+    PlanExecutorBytes, PlanExecutorListRowState, PlanExecutorListStore,
     PlanExecutorLiveSourceEvent, PlanExecutorLiveSourceEventExpectedToml, PlanExecutorRootState,
     PlanExecutorScenarioCheckpointCellExpectation, PlanExecutorScenarioCheckpointErrorExpectation,
     PlanExecutorScenarioCheckpointInput, PlanExecutorScenarioStepMeta, RootBytesFixedMutation,
@@ -74,7 +73,6 @@ use boon_plan_executor::{
     RootRuntimeBranchUpdateInput, RootScenarioCommandOutputInput, RootUpdateCandidateTracker,
     ScenarioEventsCommandOutputInput, SourceRouteCommandOutputInput, SourceRouteFullExecution,
     SourceRouteSourceEventReportInput,
-    append_list_rows_for_derived_values_with as append_plan_list_rows_for_derived_values_with,
     assemble_initial_state_report as assemble_plan_initial_state_report,
     assemble_root_runtime_branch_update as assemble_plan_root_runtime_branch_update,
     assemble_root_scenario_command_output as assemble_plan_root_scenario_command_output,
@@ -104,25 +102,19 @@ use boon_plan_executor::{
     execute_initial_state as execute_plan_initial_state_core,
     execute_source_route_with_full_execution as execute_plan_source_route_with_full_execution,
     field_label as plan_field_label,
-    indexed_field_has_fixed_byte_bank as plan_indexed_field_has_fixed_byte_bank,
     indexed_fixed_byte_bank_len as plan_indexed_fixed_byte_bank_len,
     indexed_state_has_fixed_byte_bank as plan_indexed_state_has_fixed_byte_bank,
     initial_list_next_keys as initial_plan_list_next_keys,
+    initialize_list_state as initialize_plan_list_state,
     initialize_root_state as initialize_plan_root_state, list_label as plan_list_label,
-    list_row_default_fields as plan_list_row_default_fields,
     list_row_state_public_rows as plan_list_row_state_public_rows,
     list_row_state_report_fields as plan_list_row_state_report_fields,
     list_row_with_root_values as plan_executor_row_with_root_values, local_field_name,
-    materialize_list_projections as materialize_plan_list_projections_core,
-    materialize_list_retains as materialize_plan_list_retains_core,
     plan_constant_bytes_for_storage_slot as plan_executor_constant_bytes_for_storage_slot,
     plan_constant_json_value as plan_executor_constant_json_value,
-    plan_constant_value_bytes as plan_executor_constant_value_bytes,
     plan_constant_value_json_value as plan_executor_constant_value_json_value,
     prepare_root_scenario_step as prepare_plan_root_scenario_step,
-    refresh_list_row_bool_not_fields as refresh_plan_list_row_bool_not_fields,
     refresh_startup_list_row_fields_for_all_lists_with_root_state as refresh_plan_startup_list_row_fields_for_all_lists,
-    remove_list_rows_for_source_event as remove_plan_list_rows_for_source_event,
     root_bytes_update_dispatch_kind as plan_root_bytes_update_dispatch_kind,
     row_expression_applies_to_list as plan_row_expression_applies_to_list,
     row_expression_row_input_missing as plan_row_expression_row_input_missing,
@@ -156,7 +148,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
-use std::ops::{Bound, Deref};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3937,7 +3929,7 @@ impl PlanExecutorRuntimeState {
     fn new(plan: &MachinePlan) -> RuntimeResult<Self> {
         let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
             plan_root_scalar_initial_state(plan)?;
-        let mut list_store = PlanExecutorListStore::from(plan_initial_list_state(plan)?);
+        let mut list_store = PlanExecutorListStore::from(initialize_plan_list_state(plan)?);
         list_store.refresh_startup_fields(plan, &root_state.root_state)?;
         let initial_list_derived_values = root_pure_number_compare_values(plan, &list_store)?
             .into_iter()
@@ -4124,25 +4116,24 @@ impl PlanExecutorRuntimeState {
                     || generic_event.target_key.is_some()
                     || generic_event.address.is_some();
                 if targeted_or_scoped_indexed_update {
-                    let indexed = self
-                        .list_store
-                        .execute_indexed_update_branch(
-                            plan,
-                            op,
-                            source_id,
-                            source_route_slot,
-                            &generic_event,
-                            &mut row_resolution_cache,
-                            &root_derived_values_before_updates,
-                            host_file_root,
+                    let indexed = plan_executor_list_store_execute_indexed_update_branch(
+                        plan,
+                        op,
+                        source_id,
+                        source_route_slot,
+                        &generic_event,
+                        &mut self.list_store,
+                        &mut row_resolution_cache,
+                        &root_derived_values_before_updates,
+                        host_file_root,
+                    )
+                    .map_err(|error| -> Box<dyn std::error::Error> {
+                        format!(
+                            "PlanExecutor indexed update op {} for source {}: {error}",
+                            op.id.0, source_id.0
                         )
-                        .map_err(|error| -> Box<dyn std::error::Error> {
-                            format!(
-                                "PlanExecutor indexed update op {} for source {}: {error}",
-                                op.id.0, source_id.0
-                            )
-                            .into()
-                        })?;
+                        .into()
+                    })?;
                     pending_indexed_deltas.extend(indexed.semantic_deltas);
                     self.executed_update_branch_count += indexed.updated_row_count;
                     self.executed_indexed_update_count += indexed.updated_row_count;
@@ -4172,12 +4163,13 @@ impl PlanExecutorRuntimeState {
                             row_event.target_key = Some(target.key);
                             row_event.target_generation = Some(target.generation);
                             let mut per_row_resolution_cache = BTreeMap::new();
-                            self.list_store.execute_indexed_update_branch(
+                            plan_executor_list_store_execute_indexed_update_branch(
                                 plan,
                                 op,
                                 source_id,
                                 source_route_slot,
                                 &row_event,
+                                &mut self.list_store,
                                 &mut per_row_resolution_cache,
                                 &root_derived_values_before_updates,
                                 host_file_root,
@@ -4190,12 +4182,13 @@ impl PlanExecutorRuntimeState {
                                 .into()
                             })
                         } else {
-                            self.list_store.execute_indexed_update_branch(
+                            plan_executor_list_store_execute_indexed_update_branch(
                                 plan,
                                 op,
                                 source_id,
                                 source_route_slot,
                                 &generic_event,
+                                &mut self.list_store,
                                 &mut row_resolution_cache,
                                 &root_derived_values_before_updates,
                                 host_file_root,
@@ -4226,23 +4219,23 @@ impl PlanExecutorRuntimeState {
             let mut runtime_branch = |op: &boon_plan::PlanOp,
                                       staged_state: &PlanExecutorRootState|
              -> RuntimeResult<Option<RootExecutedUpdate>> {
-                self.list_store
-                    .execute_root_scalar_update_branch(
-                        plan,
-                        op,
-                        source_id,
-                        source_route_slot,
-                        &event,
-                        staged_state,
-                        host_file_root,
+                execute_root_scalar_update_branch(
+                    plan,
+                    op,
+                    source_id,
+                    source_route_slot,
+                    &event,
+                    Some(&mut self.list_store),
+                    staged_state,
+                    host_file_root,
+                )
+                .map_err(|error| -> Box<dyn std::error::Error> {
+                    format!(
+                        "PlanExecutor root update op {} for source {}: {error}",
+                        op.id.0, source_id.0
                     )
-                    .map_err(|error| -> Box<dyn std::error::Error> {
-                        format!(
-                            "PlanExecutor root update op {} for source {}: {error}",
-                            op.id.0, source_id.0
-                        )
-                        .into()
-                    })
+                    .into()
+                })
             };
             let collection = collect_plan_root_update_candidate_for_step(
                 plan,
@@ -4285,8 +4278,11 @@ impl PlanExecutorRuntimeState {
         updates.extend(root_update_commit_batch.update_reports);
         self.executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
         pending_indexed_deltas.extend(
-            self.list_store
-                .refresh_indexed_derived_after_root_changes(plan, &changed_root_state_ids)?,
+            plan_executor_list_store_refresh_indexed_derived_after_root_changes(
+                plan,
+                &mut self.list_store,
+                &changed_root_state_ids,
+            )?,
         );
         let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
         for delta in &pending_indexed_deltas {
@@ -4448,8 +4444,12 @@ impl PlanExecutorRuntimeState {
     }
 
     fn document_state_summary(&mut self, plan: &MachinePlan, limits: SummaryLimits) -> JsonValue {
-        self.list_store
-            .document_summary_with_limits(plan, &self.root_state.root_state, limits)
+        plan_executor_document_summary_with_limits(
+            plan,
+            &self.root_state.root_state,
+            &mut self.list_store,
+            limits,
+        )
     }
 }
 
@@ -5479,7 +5479,7 @@ fn execute_machine_plan_initial_state_inner(
     let core_execution = execute_plan_initial_state_core(plan)?;
     let initialized_state_count = core_execution.initialized_state_count;
     let source_route_metadata_count = core_execution.source_route_metadata_count;
-    let mut list_store = PlanExecutorListStore::from(plan_initial_list_state(plan)?);
+    let mut list_store = PlanExecutorListStore::from(initialize_plan_list_state(plan)?);
     let plan_hash = core_execution.plan_hash;
     let state_summary = core_execution.state_summary;
     list_store.refresh_startup_fields(plan, state_summary.as_object().unwrap())?;
@@ -5620,347 +5620,83 @@ fn root_bytes_view_access_json(
 
 type PlanListRowState = PlanExecutorListRowState;
 
-#[derive(Clone, Default)]
-struct PlanExecutorListStore {
-    rows_by_list: BTreeMap<usize, Vec<PlanListRowState>>,
-    exact_field_indexes: BTreeMap<(usize, String), PlanExecutorExactFieldIndex>,
-    lookup_stats: PlanExecutorListLookupStats,
-}
-
-impl PlanExecutorListStore {
-    fn exact_field_lookup(
-        &mut self,
-        list_id: usize,
-        field_name: &str,
-        expected: &JsonValue,
-    ) -> Option<usize> {
-        self.lookup_stats.exact_lookup_count =
-            self.lookup_stats.exact_lookup_count.saturating_add(1);
-        let key = (list_id, field_name.to_owned());
-        if !self.exact_field_indexes.contains_key(&key) {
-            let Some(rows) = self.rows_by_list.get(&list_id) else {
-                self.lookup_stats.exact_lookup_miss_count =
-                    self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
-                return None;
-            };
-            let index = PlanExecutorExactFieldIndex::from_rows(rows, field_name);
-            self.lookup_stats.exact_index_build_count =
-                self.lookup_stats.exact_index_build_count.saturating_add(1);
-            self.lookup_stats.exact_index_build_row_count = self
-                .lookup_stats
-                .exact_index_build_row_count
-                .saturating_add(rows.len() as u64);
-            self.exact_field_indexes.insert(key.clone(), index);
-        }
-        let candidate_count = self
-            .exact_field_indexes
-            .get(&key)?
-            .candidate_count(expected);
-        self.lookup_stats.exact_lookup_candidate_count = self
-            .lookup_stats
-            .exact_lookup_candidate_count
-            .saturating_add(candidate_count as u64);
-        let row_index = self
-            .exact_field_indexes
-            .get(&key)?
-            .first_row_index(expected);
-        if row_index.is_some() {
-            self.lookup_stats.exact_lookup_hit_count =
-                self.lookup_stats.exact_lookup_hit_count.saturating_add(1);
-        } else {
-            self.lookup_stats.exact_lookup_miss_count =
-                self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
-        }
-        row_index
-    }
-
-    fn invalidate_indexes(&mut self) {
-        self.exact_field_indexes.clear();
-    }
-
-    fn lookup_stats_report(&self) -> JsonValue {
-        self.lookup_stats.report_json()
-    }
-
-    fn refresh_summary_row_current(
-        &mut self,
-        plan: &MachinePlan,
-        root_state: &serde_json::Map<String, JsonValue>,
-        list_id: usize,
-        row_index: usize,
-    ) {
-        let Some(list_slot) = plan
-            .storage_layout
-            .list_slots
-            .iter()
-            .find(|slot| slot.list_id.0 == list_id)
-            .cloned()
-        else {
-            return;
-        };
-        let list_label = plan_list_label(plan, list_id);
-        refresh_indexed_derived_fields_for_row_with_options(
-            plan,
-            &list_slot,
-            &list_label,
-            &mut self.rows_by_list,
-            row_index,
-            IndexedDerivedRefreshOptions {
-                suppress_recursive_cycle_values: false,
-                sort_cycle_error_first: true,
-                evaluate_demand_current_ops: true,
-                emit_demand_current_deltas: false,
-                changed_root_states: None,
-                root_state: Some(root_state),
-            },
-        )
-        .expect("PlanExecutor document summary currentness refresh failed");
-    }
-
-    fn refresh_startup_fields(
-        &mut self,
-        plan: &MachinePlan,
-        root_state: &serde_json::Map<String, JsonValue>,
-    ) -> RuntimeResult<()> {
-        self.invalidate_indexes();
-        refresh_plan_startup_list_row_fields_for_all_lists(plan, root_state, &mut self.rows_by_list)
-    }
-
-    fn append_rows_for_derived_values<E>(
-        &mut self,
-        plan: &MachinePlan,
-        list_next_keys: &mut BTreeMap<usize, u64>,
-        list_append_row_bool_delta_lists: &mut BTreeSet<usize>,
-        derived_values: &BTreeMap<FieldId, JsonValue>,
-        evaluator: E,
-    ) -> RuntimeResult<ListAppendExecution>
-    where
-        E: FnMut(
-            &MachinePlan,
-            &BTreeMap<usize, Vec<PlanListRowState>>,
-            &PlanListRowState,
-            &PlanRowExpression,
-        ) -> RuntimeResult<JsonValue>,
-    {
-        self.invalidate_indexes();
-        append_plan_list_rows_for_derived_values_with(
-            plan,
-            &mut self.rows_by_list,
-            list_next_keys,
-            list_append_row_bool_delta_lists,
-            derived_values,
-            evaluator,
-        )
-    }
-
-    fn remove_rows_for_source_event(
-        &mut self,
-        plan: &MachinePlan,
-        source_id: SourceId,
-        source_route_slot: &boon_plan::SourceRoute,
-        event: &PlanExecutorLiveSourceEvent<'_>,
-    ) -> RuntimeResult<ListRemoveExecution> {
-        self.invalidate_indexes();
-        remove_plan_list_rows_for_source_event(
-            plan,
-            source_id,
-            source_route_slot,
-            event,
-            &mut self.rows_by_list,
-        )
-    }
-
-    fn set_row_field(
-        &mut self,
-        list_id: usize,
-        row_index: usize,
-        field: impl Into<String>,
-        value: JsonValue,
-    ) -> RuntimeResult<()> {
-        self.invalidate_indexes();
-        let row = self
-            .rows_by_list
-            .get_mut(&list_id)
-            .and_then(|rows| rows.get_mut(row_index))
-            .ok_or_else(|| {
-                format!("PlanExecutor list store has no row {row_index} in list {list_id}")
-            })?;
-        row.fields.insert(field.into(), value);
-        Ok(())
-    }
-
-    fn execute_indexed_update_branch(
-        &mut self,
-        plan: &MachinePlan,
-        op: &boon_plan::PlanOp,
-        source_id: SourceId,
-        source_route_slot: &boon_plan::SourceRoute,
-        generic_event: &GenericSourceEvent<'_>,
-        row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
-        root_derived_values_before_updates: &BTreeMap<usize, JsonValue>,
-        host_file_root: Option<&Path>,
-    ) -> RuntimeResult<IndexedUpdateBranchExecution> {
-        self.invalidate_indexes();
-        execute_indexed_update_branch(
-            plan,
-            op,
-            source_id,
-            source_route_slot,
-            generic_event,
-            &mut self.rows_by_list,
-            row_resolution_cache,
-            root_derived_values_before_updates,
-            host_file_root,
-        )
-    }
-
-    fn refresh_indexed_derived_after_root_changes(
-        &mut self,
-        plan: &MachinePlan,
-        changed_root_state_ids: &BTreeSet<StateId>,
-    ) -> RuntimeResult<Vec<JsonValue>> {
-        self.invalidate_indexes();
-        refresh_indexed_derived_fields_after_root_state_changes(
-            plan,
-            &mut self.rows_by_list,
-            changed_root_state_ids,
-        )
-    }
-
-    fn execute_root_scalar_update_branch(
-        &mut self,
-        plan: &MachinePlan,
-        op: &boon_plan::PlanOp,
-        source_id: SourceId,
-        source_route_slot: &boon_plan::SourceRoute,
-        event: &LiveSourceEvent,
-        root_state: &PlanExecutorRootState,
-        host_file_root: Option<&Path>,
-    ) -> RuntimeResult<Option<RootExecutedUpdate>> {
-        execute_root_scalar_update_branch(
-            plan,
-            op,
-            source_id,
-            source_route_slot,
-            event,
-            Some(self),
-            root_state,
-            host_file_root,
-        )
-    }
-
-    fn document_summary_with_limits(
-        &mut self,
-        plan: &MachinePlan,
-        root_state: &serde_json::Map<String, JsonValue>,
-        limits: SummaryLimits,
-    ) -> JsonValue {
-        plan_executor_document_summary_with_limits(plan, root_state, self, limits)
-    }
-
-    fn materialize_projections(
-        &self,
-        plan: &MachinePlan,
-        root_state: &serde_json::Map<String, JsonValue>,
-    ) -> RuntimeResult<ListProjectionExecution> {
-        let executor_rows = self.public_rows_for_materialization();
-        materialize_plan_list_projections_core(plan, root_state, &executor_rows)
-    }
-
-    fn materialize_retains(
-        &self,
-        plan: &MachinePlan,
-        root_state: &serde_json::Map<String, JsonValue>,
-    ) -> RuntimeResult<ListRetainExecution> {
-        let executor_rows = self.public_rows_for_materialization();
-        materialize_plan_list_retains_core(plan, root_state, &executor_rows)
-    }
-
-    fn public_rows_for_materialization(&self) -> BTreeMap<usize, Vec<PlanExecutorListRow>> {
-        plan_list_row_state_public_rows(&self.rows_by_list)
-    }
-}
-
-impl From<BTreeMap<usize, Vec<PlanListRowState>>> for PlanExecutorListStore {
-    fn from(rows_by_list: BTreeMap<usize, Vec<PlanListRowState>>) -> Self {
-        Self {
-            rows_by_list,
-            exact_field_indexes: BTreeMap::new(),
-            lookup_stats: PlanExecutorListLookupStats::default(),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct PlanExecutorListLookupStats {
-    exact_lookup_count: u64,
-    exact_lookup_hit_count: u64,
-    exact_lookup_miss_count: u64,
-    exact_lookup_candidate_count: u64,
-    exact_lookup_row_scan_count: u64,
-    exact_index_build_count: u64,
-    exact_index_build_row_count: u64,
-}
-
-impl PlanExecutorListLookupStats {
-    fn report_json(&self) -> JsonValue {
-        json!({
-            "exact_lookup_count": self.exact_lookup_count,
-            "exact_lookup_hit_count": self.exact_lookup_hit_count,
-            "exact_lookup_miss_count": self.exact_lookup_miss_count,
-            "exact_lookup_candidate_count": self.exact_lookup_candidate_count,
-            "exact_lookup_row_scan_count": self.exact_lookup_row_scan_count,
-            "exact_index_build_count": self.exact_index_build_count,
-            "exact_index_build_row_count": self.exact_index_build_row_count,
-        })
-    }
-}
-
-#[derive(Clone, Default)]
-struct PlanExecutorExactFieldIndex {
-    rows_by_value: BTreeMap<String, Vec<usize>>,
-}
-
-impl PlanExecutorExactFieldIndex {
-    fn from_rows(rows: &[PlanListRowState], field_name: &str) -> Self {
-        let mut rows_by_value: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (row_index, row) in rows.iter().enumerate() {
-            let Some(value) = row.fields.get(field_name) else {
-                continue;
-            };
-            let Ok(key) = serde_json::to_string(value) else {
-                continue;
-            };
-            rows_by_value.entry(key).or_default().push(row_index);
-        }
-        Self { rows_by_value }
-    }
-
-    fn first_row_index(&self, expected: &JsonValue) -> Option<usize> {
-        let key = serde_json::to_string(expected).ok()?;
-        self.rows_by_value.get(&key)?.first().copied()
-    }
-
-    fn candidate_count(&self, expected: &JsonValue) -> usize {
-        let Ok(key) = serde_json::to_string(expected) else {
-            return 0;
-        };
-        self.rows_by_value.get(&key).map(Vec::len).unwrap_or(0)
-    }
-}
-
-impl Deref for PlanExecutorListStore {
-    type Target = BTreeMap<usize, Vec<PlanListRowState>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rows_by_list
-    }
-}
-
 fn plan_executor_list_row_report_fields(
     row: &PlanListRowState,
 ) -> RuntimeResult<BTreeMap<String, JsonValue>> {
     Ok(plan_list_row_state_report_fields(row))
+}
+
+fn plan_executor_list_store_refresh_summary_row_current(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_store: &mut PlanExecutorListStore,
+    list_id: usize,
+    row_index: usize,
+) {
+    let Some(list_slot) = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id.0 == list_id)
+        .cloned()
+    else {
+        return;
+    };
+    let list_label = plan_list_label(plan, list_id);
+    refresh_indexed_derived_fields_for_row_with_options(
+        plan,
+        &list_slot,
+        &list_label,
+        list_store.rows_by_list_mut(),
+        row_index,
+        IndexedDerivedRefreshOptions {
+            suppress_recursive_cycle_values: false,
+            sort_cycle_error_first: true,
+            evaluate_demand_current_ops: true,
+            emit_demand_current_deltas: false,
+            changed_root_states: None,
+            root_state: Some(root_state),
+        },
+    )
+    .expect("PlanExecutor document summary currentness refresh failed");
+}
+
+fn plan_executor_list_store_execute_indexed_update_branch(
+    plan: &MachinePlan,
+    op: &boon_plan::PlanOp,
+    source_id: SourceId,
+    source_route_slot: &boon_plan::SourceRoute,
+    generic_event: &GenericSourceEvent<'_>,
+    list_store: &mut PlanExecutorListStore,
+    row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
+    root_derived_values_before_updates: &BTreeMap<usize, JsonValue>,
+    host_file_root: Option<&Path>,
+) -> RuntimeResult<IndexedUpdateBranchExecution> {
+    list_store.invalidate_indexes();
+    execute_indexed_update_branch(
+        plan,
+        op,
+        source_id,
+        source_route_slot,
+        generic_event,
+        list_store.rows_by_list_mut(),
+        row_resolution_cache,
+        root_derived_values_before_updates,
+        host_file_root,
+    )
+}
+
+fn plan_executor_list_store_refresh_indexed_derived_after_root_changes(
+    plan: &MachinePlan,
+    list_store: &mut PlanExecutorListStore,
+    changed_root_state_ids: &BTreeSet<StateId>,
+) -> RuntimeResult<Vec<JsonValue>> {
+    list_store.invalidate_indexes();
+    refresh_indexed_derived_fields_after_root_state_changes(
+        plan,
+        list_store.rows_by_list_mut(),
+        changed_root_state_ids,
+    )
 }
 
 fn plan_executor_document_summary_with_limits(
@@ -6205,7 +5941,9 @@ fn plan_executor_insert_direct_list_summaries(
             .min(row_count);
         let mut visible_rows = Vec::with_capacity(row_end.saturating_sub(limits.list_row_start));
         for row_index in limits.list_row_start..row_end {
-            list_store.refresh_summary_row_current(plan, root_state, list_id, row_index);
+            plan_executor_list_store_refresh_summary_row_current(
+                plan, root_state, list_store, list_id, row_index,
+            );
             if let Some(row) = list_store
                 .get(&list_id)
                 .and_then(|rows| rows.get(row_index))
@@ -6261,9 +5999,10 @@ fn plan_executor_insert_projection_summaries(
                 let row_index = list_store.exact_field_lookup(source_list.0, field, &selector);
                 let projected = row_index
                     .and_then(|row_index| {
-                        list_store.refresh_summary_row_current(
+                        plan_executor_list_store_refresh_summary_row_current(
                             plan,
                             root_state,
+                            list_store,
                             source_list.0,
                             row_index,
                         );
@@ -6395,7 +6134,9 @@ fn plan_executor_windowed_chunk_projection(
             if index >= row_count {
                 break;
             }
-            list_store.refresh_summary_row_current(plan, root_state, list_id, index);
+            plan_executor_list_store_refresh_summary_row_current(
+                plan, root_state, list_store, list_id, index,
+            );
             if let Some(cell) = list_store.get(&list_id).and_then(|rows| rows.get(index)) {
                 cells.push(plan_executor_row_document_json(plan, list_id, cell));
             }
@@ -8662,7 +8403,7 @@ fn plan_initial_list_rows_for_root_lookup(
     list_id: boon_plan::ListId,
     op_id: usize,
 ) -> RuntimeResult<Vec<PlanListRowState>> {
-    let mut lists = plan_initial_list_state(plan)?;
+    let mut lists = initialize_plan_list_state(plan)?;
     let root_state = initialize_plan_root_state(plan)?;
     refresh_plan_initial_list_state_with_root_context(plan, &root_state.root_state, &mut lists)?;
     lists.remove(&list_id.0).ok_or_else(|| {
@@ -10507,124 +10248,6 @@ fn plan_root_scalar_initial_state(
     let executor_report = root_state.executor_report.clone();
     let initialized_state_count = root_state.initialized_state_count;
     Ok((root_state, executor_report, initialized_state_count))
-}
-
-fn plan_initial_list_state(
-    plan: &MachinePlan,
-) -> RuntimeResult<BTreeMap<usize, Vec<PlanListRowState>>> {
-    let mut lists = BTreeMap::new();
-    for slot in &plan.storage_layout.list_slots {
-        let mut rows = Vec::new();
-        for (index, initial_row) in slot.initial_rows.iter().enumerate() {
-            let mut fields = BTreeMap::new();
-            let mut private_bytes = BTreeMap::new();
-            let mut fixed_bytes_banks = BTreeMap::new();
-            for field in &initial_row.fields {
-                let field_id = field.field_id.ok_or_else(|| {
-                    format!(
-                        "initial row field `{}` for list {} has no typed field id",
-                        field.name, slot.list_id.0
-                    )
-                })?;
-                let field_name = local_field_name(&plan_semantic_field_label(plan, field_id.0));
-                let field_context = format!(
-                    "initial row field `{}` for list {}",
-                    field.name, slot.list_id.0
-                );
-                fields.insert(
-                    field_name.clone(),
-                    plan_executor_constant_value_json_value(&field.value, &field_context)?,
-                );
-                if let Some(bytes) =
-                    plan_executor_constant_value_bytes(&field.value, &field_context)?
-                {
-                    if plan_indexed_field_has_fixed_byte_bank(plan, slot.scope_id, &field_name) {
-                        fixed_bytes_banks.insert(field_name.clone(), bytes.inline_bytes().to_vec());
-                    }
-                    private_bytes.insert(field_name, bytes);
-                }
-            }
-            let key = index as u64 + 1;
-            let generation = 1;
-            let _ = refresh_plan_list_row_bool_not_fields(
-                plan,
-                slot,
-                &plan_list_label(plan, slot.list_id.0),
-                key,
-                generation,
-                &mut fields,
-            )?;
-            rows.push(PlanListRowState {
-                key,
-                generation,
-                fields,
-                private_bytes,
-                fixed_bytes_banks,
-            });
-        }
-        if matches!(slot.initializer_kind, boon_plan::ListInitializerKind::Range) {
-            let range = slot.range.ok_or_else(|| {
-                format!(
-                    "range list `{}` has no typed range bounds",
-                    plan_list_label(plan, slot.list_id.0)
-                )
-            })?;
-            let count = if range.from <= range.to {
-                usize::try_from(range.to.saturating_sub(range.from).saturating_add(1))
-                    .map_err(|_| "List/range row count is out of range")?
-            } else {
-                0
-            };
-            for (offset, value) in (range.from..=range.to).take(count).enumerate() {
-                let mut fields = BTreeMap::new();
-                let text = value.to_string();
-                fields.insert("index".to_owned(), JsonValue::String(text.clone()));
-                fields.insert("value".to_owned(), JsonValue::String(text));
-                let (defaults, default_bytes, default_fixed_banks) =
-                    plan_executor_list_row_default_fields_to_runtime(plan_list_row_default_fields(
-                        plan, slot,
-                    )?);
-                for (field, value) in defaults {
-                    fields.entry(field).or_insert(value);
-                }
-                let private_bytes = default_bytes;
-                let fixed_bytes_banks = default_fixed_banks;
-                let key = offset as u64 + 1;
-                let generation = 1;
-                let _ = refresh_plan_list_row_bool_not_fields(
-                    plan,
-                    slot,
-                    &plan_list_label(plan, slot.list_id.0),
-                    key,
-                    generation,
-                    &mut fields,
-                )?;
-                rows.push(PlanListRowState {
-                    key,
-                    generation,
-                    fields,
-                    private_bytes,
-                    fixed_bytes_banks,
-                });
-            }
-        }
-        lists.insert(slot.list_id.0, rows);
-    }
-    Ok(lists)
-}
-
-fn plan_executor_list_row_default_fields_to_runtime(
-    defaults: ListRowDefaultFields,
-) -> (
-    BTreeMap<String, JsonValue>,
-    BTreeMap<String, PlanExecutorBytes>,
-    BTreeMap<String, Vec<u8>>,
-) {
-    (
-        defaults.fields,
-        defaults.private_bytes,
-        defaults.fixed_byte_banks,
-    )
 }
 
 fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -> String {

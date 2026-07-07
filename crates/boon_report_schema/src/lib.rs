@@ -11723,11 +11723,18 @@ enum ExpectedBytesFileWriteFabricatedPlanMutation {
     OutputNotText,
 }
 
-struct ExpectedBytesFileWriteFabricatedPlanCase {
+trait ExpectedBytesFileFabricatedPlanMutation: Copy {
+    fn as_str(self) -> &'static str;
+}
+
+struct ExpectedBytesFileFabricatedPlanCase<M> {
     id: &'static str,
     category: &'static str,
-    mutation: ExpectedBytesFileWriteFabricatedPlanMutation,
+    mutation: M,
 }
+
+type ExpectedBytesFileWriteFabricatedPlanCase =
+    ExpectedBytesFileFabricatedPlanCase<ExpectedBytesFileWriteFabricatedPlanMutation>;
 
 fn expected_bytes_file_write_fabricated_plan_cases() -> Vec<ExpectedBytesFileWriteFabricatedPlanCase>
 {
@@ -11818,14 +11825,52 @@ fn verify_bytes_file_write_fabricated_plan_negative_evidence(
     source_plan: &boon_plan::MachinePlan,
 ) -> RuntimeResult<()> {
     let expected = expected_bytes_file_write_fabricated_plan_cases();
+    verify_bytes_file_fabricated_plan_negative_evidence(
+        report,
+        report_path,
+        checks,
+        source_plan,
+        BytesFileFabricatedPlanSpec {
+            command: "verify-bytes-file-write-plan",
+            op_label: "File/write_bytes",
+            verifier_check_label: "FileWriteBytes",
+            well_formed_check_id: "file-write-bytes-ops-well-formed",
+            cases: &expected,
+            mutate_plan: mutate_expected_bytes_file_write_plan,
+        },
+    )
+}
+
+type BytesFileFabricatedPlanMutator<M> = fn(&mut boon_plan::MachinePlan, M) -> RuntimeResult<()>;
+
+struct BytesFileFabricatedPlanSpec<'a, M> {
+    command: &'static str,
+    op_label: &'static str,
+    verifier_check_label: &'static str,
+    well_formed_check_id: &'static str,
+    cases: &'a [ExpectedBytesFileFabricatedPlanCase<M>],
+    mutate_plan: BytesFileFabricatedPlanMutator<M>,
+}
+
+fn verify_bytes_file_fabricated_plan_negative_evidence<M>(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+    source_plan: &boon_plan::MachinePlan,
+    spec: BytesFileFabricatedPlanSpec<'_, M>,
+) -> RuntimeResult<()>
+where
+    M: ExpectedBytesFileFabricatedPlanMutation,
+{
     if report
         .get("fabricated_plan_negative_case_count")
         .and_then(JsonValue::as_u64)
-        != Some(expected.len() as u64)
+        != Some(spec.cases.len() as u64)
     {
         return Err(format!(
-            "{} verify-bytes-file-write-plan fabricated_plan_negative_case_count is missing or wrong",
-            report_path.display()
+            "{} {} fabricated_plan_negative_case_count is missing or wrong",
+            report_path.display(),
+            spec.command
         )
         .into());
     }
@@ -11838,14 +11883,16 @@ fn verify_bytes_file_write_fabricated_plan_negative_evidence(
                 report_path.display()
             )
         })?;
-    if cases.len() != expected.len() {
+    if cases.len() != spec.cases.len() {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case array length does not match expected matrix",
-            report_path.display()
+            "{} fabricated {} negative case array length does not match expected matrix",
+            report_path.display(),
+            spec.op_label
         )
         .into());
     }
-    let expected_ids = expected
+    let expected_ids = spec
+        .cases
         .iter()
         .map(|case| case.id.to_owned())
         .collect::<BTreeSet<_>>();
@@ -11857,57 +11904,66 @@ fn verify_bytes_file_write_fabricated_plan_negative_evidence(
                 .map(str::to_owned)
                 .ok_or_else(|| {
                     format!(
-                        "{} fabricated File/write_bytes negative case missing id",
-                        report_path.display()
+                        "{} fabricated {} negative case missing id",
+                        report_path.display(),
+                        spec.op_label
                     )
                 })
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
     if actual_ids != expected_ids {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case ids do not match expected matrix",
-            report_path.display()
+            "{} fabricated {} negative case ids do not match expected matrix",
+            report_path.display(),
+            spec.op_label
         )
         .into());
     }
 
     let base_plan_hash = boon_plan::plan_sha256(source_plan).map_err(|error| {
         format!(
-            "{} cannot hash source plan while checking fabricated File/write_bytes negatives: {error}",
-            report_path.display()
+            "{} cannot hash source plan while checking fabricated {} negatives: {error}",
+            report_path.display(),
+            spec.op_label
         )
     })?;
-    for expected_case in &expected {
+    for expected_case in spec.cases {
         let case = cases
             .iter()
             .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
             .ok_or_else(|| {
                 format!(
-                    "{} missing fabricated File/write_bytes negative case `{}`",
+                    "{} missing fabricated {} negative case `{}`",
                     report_path.display(),
+                    spec.op_label,
                     expected_case.id
                 )
             })?;
-        verify_bytes_file_write_fabricated_plan_negative_case(
+        verify_bytes_file_fabricated_plan_negative_case(
             case,
             expected_case,
             source_plan,
             &base_plan_hash,
             report_path,
             checks,
+            &spec,
         )?;
     }
     Ok(())
 }
 
-fn verify_bytes_file_write_fabricated_plan_negative_case(
+fn verify_bytes_file_fabricated_plan_negative_case<M>(
     case: &JsonValue,
-    expected: &ExpectedBytesFileWriteFabricatedPlanCase,
+    expected: &ExpectedBytesFileFabricatedPlanCase<M>,
     source_plan: &boon_plan::MachinePlan,
     base_plan_hash: &str,
     report_path: &Path,
     checks: &[JsonValue],
-) -> RuntimeResult<()> {
+    spec: &BytesFileFabricatedPlanSpec<'_, M>,
+) -> RuntimeResult<()>
+where
+    M: ExpectedBytesFileFabricatedPlanMutation,
+{
     let allowed_keys = [
         "id",
         "category",
@@ -11933,16 +11989,18 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
     .collect::<BTreeSet<_>>();
     let object = case.as_object().ok_or_else(|| {
         format!(
-            "{} fabricated File/write_bytes negative case `{}` is not an object",
+            "{} fabricated {} negative case `{}` is not an object",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
     })?;
     for key in object.keys() {
         if !allowed_keys.contains(key.as_str()) {
             return Err(format!(
-                "{} fabricated File/write_bytes negative case `{}` has unsupported key `{key}`",
+                "{} fabricated {} negative case `{}` has unsupported key `{key}`",
                 report_path.display(),
+                spec.op_label,
                 expected.id
             )
             .into());
@@ -11963,8 +12021,9 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
     ] {
         if case.get(key).and_then(JsonValue::as_str) != Some(value) {
             return Err(format!(
-                "{} fabricated File/write_bytes negative case `{}` has wrong `{key}`",
+                "{} fabricated {} negative case `{}` has wrong `{key}`",
                 report_path.display(),
+                spec.op_label,
                 expected.id
             )
             .into());
@@ -11974,27 +12033,30 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
         || case.get("rejected").and_then(JsonValue::as_bool) != Some(true)
     {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case `{}` has wrong execution/rejection boundary",
+            "{} fabricated {} negative case `{}` has wrong execution/rejection boundary",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
         .into());
     }
 
     let mut mutated_plan = source_plan.clone();
-    mutate_expected_bytes_file_write_plan(&mut mutated_plan, expected.mutation)?;
+    (spec.mutate_plan)(&mut mutated_plan, expected.mutation)?;
     let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan).map_err(|error| {
         format!(
-            "{} cannot hash fabricated File/write_bytes negative `{}`: {error}",
+            "{} cannot hash fabricated {} negative `{}`: {error}",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
     })?;
     for hash_key in ["mutated_plan_hash", "fabricated_plan_hash"] {
         if case.get(hash_key).and_then(JsonValue::as_str) != Some(mutated_plan_hash.as_str()) {
             return Err(format!(
-                "{} fabricated File/write_bytes negative case `{}` has wrong `{hash_key}`",
+                "{} fabricated {} negative case `{}` has wrong `{hash_key}`",
                 report_path.display(),
+                spec.op_label,
                 expected.id
             )
             .into());
@@ -12003,30 +12065,34 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
 
     let verification = boon_plan::verify_plan(&mutated_plan).map_err(|error| {
         format!(
-            "{} cannot verify fabricated File/write_bytes negative `{}`: {error}",
+            "{} cannot verify fabricated {} negative `{}`: {error}",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
     })?;
     if verification.status != "fail" {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case `{}` unexpectedly verifies",
+            "{} fabricated {} negative case `{}` unexpectedly verifies",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
         .into());
     }
     let expected_verification_json = serde_json::to_value(&verification).map_err(|error| {
         format!(
-            "{} cannot serialize verification for fabricated File/write_bytes negative `{}`: {error}",
+            "{} cannot serialize verification for fabricated {} negative `{}`: {error}",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
     })?;
     if case.get("boon_plan_verification") != Some(&expected_verification_json) {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case `{}` has stale or forged verification",
+            "{} fabricated {} negative case `{}` has stale or forged verification",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
         .into());
@@ -12039,8 +12105,9 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
             != Some(verification.error_count as u64)
     {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case `{}` has wrong verification summary",
+            "{} fabricated {} negative case `{}` has wrong verification summary",
             report_path.display(),
+            spec.op_label,
             expected.id
         )
         .into());
@@ -12053,12 +12120,14 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
         .collect::<Vec<_>>();
     if !failed_check_ids
         .iter()
-        .any(|id| id == "file-write-bytes-ops-well-formed")
+        .any(|id| id == spec.well_formed_check_id)
     {
         return Err(format!(
-            "{} fabricated File/write_bytes negative case `{}` was not rejected by the FileWriteBytes verifier check",
+            "{} fabricated {} negative case `{}` was not rejected by the {} verifier check",
             report_path.display(),
-            expected.id
+            spec.op_label,
+            expected.id,
+            spec.verifier_check_label
         )
         .into());
     }
@@ -12070,8 +12139,9 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
     ] {
         if case.get(ids_key) != Some(&failed_check_ids_json) {
             return Err(format!(
-                "{} fabricated File/write_bytes negative case `{}` has wrong `{ids_key}`",
+                "{} fabricated {} negative case `{}` has wrong `{ids_key}`",
                 report_path.display(),
+                spec.op_label,
                 expected.id
             )
             .into());
@@ -12083,15 +12153,16 @@ fn verify_bytes_file_write_fabricated_plan_negative_case(
             && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
     }) {
         return Err(format!(
-            "{} missing passing fabricated File/write_bytes negative check `{check_id}`",
-            report_path.display()
+            "{} missing passing fabricated {} negative check `{check_id}`",
+            report_path.display(),
+            spec.op_label
         )
         .into());
     }
     Ok(())
 }
 
-impl ExpectedBytesFileWriteFabricatedPlanMutation {
+impl ExpectedBytesFileFabricatedPlanMutation for ExpectedBytesFileWriteFabricatedPlanMutation {
     fn as_str(self) -> &'static str {
         match self {
             Self::MissingBytesOperand => "missing_bytes_operand",
@@ -12117,12 +12188,30 @@ fn mutate_expected_bytes_file_write_plan(
     plan: &mut boon_plan::MachinePlan,
     mutation: ExpectedBytesFileWriteFabricatedPlanMutation,
 ) -> RuntimeResult<()> {
-    let (region_index, op_index) = expected_bytes_file_write_plan_op_location(plan)?;
-    let path_constant_id =
-        expected_bytes_file_write_path_constant_id(plan, region_index, op_index)?;
-    let bytes_input_state_id =
-        expected_bytes_file_write_input_state_id(plan, region_index, op_index)?;
-    let output_state_id = expected_bytes_file_write_output_state_id(plan, region_index, op_index)?;
+    let op_label = "FileWriteBytes";
+    let (region_index, op_index) = expected_bytes_file_plan_op_location(
+        plan,
+        boon_plan::PlanExpressionKind::FileWriteBytes,
+        op_label,
+    )?;
+    let path_constant_id = expected_bytes_file_path_constant_id(
+        plan,
+        region_index,
+        op_index,
+        op_label,
+        1,
+        "bytes state and path constant inputs",
+    )?;
+    let bytes_input_state_id = expected_bytes_file_state_input_id(
+        plan,
+        region_index,
+        op_index,
+        op_label,
+        0,
+        "bytes state and path constant inputs",
+    )?;
+    let output_state_id =
+        expected_bytes_file_output_state_id(plan, region_index, op_index, op_label)?;
     let source_id = plan
         .source_routes
         .first()
@@ -12132,10 +12221,10 @@ fn mutate_expected_bytes_file_write_plan(
         })?;
     match mutation {
         ExpectedBytesFileWriteFabricatedPlanMutation::MissingBytesOperand => {
-            expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+            expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)?.clear();
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::ExtraPathOperand => {
-            expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)?
+            expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)?
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
@@ -12143,13 +12232,13 @@ fn mutate_expected_bytes_file_write_plan(
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
-            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathInputMissing => {
             let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
-            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::RowFieldPathForeignList => {
@@ -12164,11 +12253,11 @@ fn mutate_expected_bytes_file_write_plan(
             if !op.inputs.contains(&field_ref) {
                 op.inputs.push(field_ref.clone());
             }
-            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![boon_plan::ValueRef::State(bytes_input_state_id), field_ref];
         }
         ExpectedBytesFileWriteFabricatedPlanMutation::MissingPathConstant => {
-            *expected_bytes_file_write_ordered_inputs_mut(plan, region_index, op_index)? = vec![
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? = vec![
                 boon_plan::ValueRef::State(bytes_input_state_id),
                 boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(999_999)),
             ];
@@ -12352,8 +12441,10 @@ fn plan_constant_value_for_expected_type(
     }
 }
 
-fn expected_bytes_file_write_plan_op_location(
+fn expected_bytes_file_plan_op_location(
     plan: &boon_plan::MachinePlan,
+    expression_kind: boon_plan::PlanExpressionKind,
+    op_label: &str,
 ) -> RuntimeResult<(usize, usize)> {
     plan.regions
         .iter()
@@ -12367,70 +12458,78 @@ fn expected_bytes_file_write_plan_op_location(
                     matches!(
                         &op.kind,
                         boon_plan::PlanOpKind::UpdateBranch {
-                            expression_kind: boon_plan::PlanExpressionKind::FileWriteBytes,
+                            expression_kind: found,
                             ..
-                        }
+                        } if *found == expression_kind
                     )
                 })
                 .map(|(op_index, _)| (region_index, op_index))
         })
-        .ok_or_else(|| "source plan has no FileWriteBytes op".into())
+        .ok_or_else(|| format!("source plan has no {op_label} op").into())
 }
 
-fn expected_bytes_file_write_path_constant_id(
+fn expected_bytes_file_path_constant_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
+    op_label: &str,
+    input_index: usize,
+    expected_shape: &str,
 ) -> RuntimeResult<boon_plan::PlanConstantId> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
         &plan.regions[region_index].ops[op_index].kind
     else {
-        return Err("FileWriteBytes op is not an update branch".into());
+        return Err(format!("{op_label} op is not an update branch").into());
     };
-    let [_, boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
-        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
-    };
-    Ok(*path_constant_id)
+    match ordered_inputs.get(input_index) {
+        Some(boon_plan::ValueRef::Constant(path_constant_id)) => Ok(*path_constant_id),
+        _ => Err(format!("{op_label} op does not have {expected_shape}").into()),
+    }
 }
 
-fn expected_bytes_file_write_input_state_id(
+fn expected_bytes_file_state_input_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
+    op_label: &str,
+    input_index: usize,
+    expected_shape: &str,
 ) -> RuntimeResult<boon_plan::StateId> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
         &plan.regions[region_index].ops[op_index].kind
     else {
-        return Err("FileWriteBytes op is not an update branch".into());
+        return Err(format!("{op_label} op is not an update branch").into());
     };
-    let [boon_plan::ValueRef::State(state_id), _] = ordered_inputs.as_slice() else {
-        return Err("FileWriteBytes op does not have bytes state and path constant inputs".into());
-    };
-    Ok(*state_id)
+    match ordered_inputs.get(input_index) {
+        Some(boon_plan::ValueRef::State(state_id)) => Ok(*state_id),
+        _ => Err(format!("{op_label} op does not have {expected_shape}").into()),
+    }
 }
 
-fn expected_bytes_file_write_output_state_id(
+fn expected_bytes_file_output_state_id(
     plan: &boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
+    op_label: &str,
 ) -> RuntimeResult<boon_plan::StateId> {
     let Some(boon_plan::ValueRef::State(state_id)) =
         plan.regions[region_index].ops[op_index].output.as_ref()
     else {
-        return Err("FileWriteBytes op does not have a state output".into());
+        return Err(format!("{op_label} op does not have a state output").into());
     };
     Ok(*state_id)
 }
 
-fn expected_bytes_file_write_ordered_inputs_mut(
-    plan: &mut boon_plan::MachinePlan,
+fn expected_bytes_file_ordered_inputs_mut<'a>(
+    plan: &'a mut boon_plan::MachinePlan,
     region_index: usize,
     op_index: usize,
-) -> RuntimeResult<&mut Vec<boon_plan::ValueRef>> {
+    op_label: &str,
+) -> RuntimeResult<&'a mut Vec<boon_plan::ValueRef>> {
     let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
         &mut plan.regions[region_index].ops[op_index].kind
     else {
-        return Err("FileWriteBytes op is not an update branch".into());
+        return Err(format!("{op_label} op is not an update branch").into());
     };
     Ok(ordered_inputs)
 }
@@ -14005,11 +14104,8 @@ enum ExpectedBytesFileReadFabricatedPlanMutation {
     OutputNotBytes,
 }
 
-struct ExpectedBytesFileReadFabricatedPlanCase {
-    id: &'static str,
-    category: &'static str,
-    mutation: ExpectedBytesFileReadFabricatedPlanMutation,
-}
+type ExpectedBytesFileReadFabricatedPlanCase =
+    ExpectedBytesFileFabricatedPlanCase<ExpectedBytesFileReadFabricatedPlanMutation>;
 
 fn expected_bytes_file_read_fabricated_plan_cases() -> Vec<ExpectedBytesFileReadFabricatedPlanCase>
 {
@@ -14100,280 +14196,23 @@ fn verify_bytes_file_read_fabricated_plan_negative_evidence(
     source_plan: &boon_plan::MachinePlan,
 ) -> RuntimeResult<()> {
     let expected = expected_bytes_file_read_fabricated_plan_cases();
-    if report
-        .get("fabricated_plan_negative_case_count")
-        .and_then(JsonValue::as_u64)
-        != Some(expected.len() as u64)
-    {
-        return Err(format!(
-            "{} verify-bytes-file-read-plan fabricated_plan_negative_case_count is missing or wrong",
-            report_path.display()
-        )
-        .into());
-    }
-    let cases = report
-        .get("fabricated_plan_negative_cases")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} fabricated_plan_negative_cases is not an array",
-                report_path.display()
-            )
-        })?;
-    if cases.len() != expected.len() {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case array length does not match expected matrix",
-            report_path.display()
-        )
-        .into());
-    }
-    let expected_ids = expected
-        .iter()
-        .map(|case| case.id.to_owned())
-        .collect::<BTreeSet<_>>();
-    let actual_ids = cases
-        .iter()
-        .map(|case| {
-            case.get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    format!(
-                        "{} fabricated File/read_bytes negative case missing id",
-                        report_path.display()
-                    )
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if actual_ids != expected_ids {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case ids do not match expected matrix",
-            report_path.display()
-        )
-        .into());
-    }
-
-    let base_plan_hash = boon_plan::plan_sha256(source_plan).map_err(|error| {
-        format!(
-            "{} cannot hash source plan while checking fabricated negatives: {error}",
-            report_path.display()
-        )
-    })?;
-    for expected_case in &expected {
-        let case = cases
-            .iter()
-            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
-            .ok_or_else(|| {
-                format!(
-                    "{} missing fabricated File/read_bytes negative case `{}`",
-                    report_path.display(),
-                    expected_case.id
-                )
-            })?;
-        verify_bytes_file_read_fabricated_plan_negative_case(
-            case,
-            expected_case,
-            source_plan,
-            &base_plan_hash,
-            report_path,
-            checks,
-        )?;
-    }
-    Ok(())
+    verify_bytes_file_fabricated_plan_negative_evidence(
+        report,
+        report_path,
+        checks,
+        source_plan,
+        BytesFileFabricatedPlanSpec {
+            command: "verify-bytes-file-read-plan",
+            op_label: "File/read_bytes",
+            verifier_check_label: "FileReadBytes",
+            well_formed_check_id: "file-read-bytes-ops-well-formed",
+            cases: &expected,
+            mutate_plan: mutate_expected_bytes_file_read_plan,
+        },
+    )
 }
 
-fn verify_bytes_file_read_fabricated_plan_negative_case(
-    case: &JsonValue,
-    expected: &ExpectedBytesFileReadFabricatedPlanCase,
-    source_plan: &boon_plan::MachinePlan,
-    base_plan_hash: &str,
-    report_path: &Path,
-    checks: &[JsonValue],
-) -> RuntimeResult<()> {
-    let allowed_keys = [
-        "id",
-        "category",
-        "stage",
-        "mutation",
-        "target_profile",
-        "evidence_level",
-        "runtime_executed",
-        "runtime_non_execution_reason",
-        "base_plan_hash",
-        "fabricated_plan_hash",
-        "mutated_plan_hash",
-        "expected_verification_status",
-        "actual_verification_status",
-        "expected_failed_check_ids",
-        "actual_failed_check_ids",
-        "failed_check_ids",
-        "error_count",
-        "boon_plan_verification",
-        "rejected",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let object = case.as_object().ok_or_else(|| {
-        format!(
-            "{} fabricated File/read_bytes negative case `{}` is not an object",
-            report_path.display(),
-            expected.id
-        )
-    })?;
-    for key in object.keys() {
-        if !allowed_keys.contains(key.as_str()) {
-            return Err(format!(
-                "{} fabricated File/read_bytes negative case `{}` has unsupported key `{key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    for (key, value) in [
-        ("category", expected.category),
-        ("stage", "machine-plan-verifier"),
-        ("mutation", expected.mutation.as_str()),
-        ("target_profile", "software_default"),
-        ("evidence_level", "verifier-only"),
-        (
-            "runtime_non_execution_reason",
-            "fabricated MachinePlan is checked with boon_plan::verify_plan only",
-        ),
-        ("base_plan_hash", base_plan_hash),
-        ("expected_verification_status", "fail"),
-    ] {
-        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
-            return Err(format!(
-                "{} fabricated File/read_bytes negative case `{}` has wrong `{key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    if case.get("runtime_executed").and_then(JsonValue::as_bool) != Some(false)
-        || case.get("rejected").and_then(JsonValue::as_bool) != Some(true)
-    {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case `{}` has wrong execution/rejection boundary",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-
-    let mut mutated_plan = source_plan.clone();
-    mutate_expected_bytes_file_read_plan(&mut mutated_plan, expected.mutation)?;
-    let mutated_plan_hash = boon_plan::plan_sha256(&mutated_plan).map_err(|error| {
-        format!(
-            "{} cannot hash fabricated File/read_bytes negative `{}`: {error}",
-            report_path.display(),
-            expected.id
-        )
-    })?;
-    for hash_key in ["mutated_plan_hash", "fabricated_plan_hash"] {
-        if case.get(hash_key).and_then(JsonValue::as_str) != Some(mutated_plan_hash.as_str()) {
-            return Err(format!(
-                "{} fabricated File/read_bytes negative case `{}` has wrong `{hash_key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-
-    let verification = boon_plan::verify_plan(&mutated_plan).map_err(|error| {
-        format!(
-            "{} cannot verify fabricated File/read_bytes negative `{}`: {error}",
-            report_path.display(),
-            expected.id
-        )
-    })?;
-    if verification.status != "fail" {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case `{}` unexpectedly verifies",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let expected_verification_json = serde_json::to_value(&verification).map_err(|error| {
-        format!(
-            "{} cannot serialize verification for fabricated File/read_bytes negative `{}`: {error}",
-            report_path.display(),
-            expected.id
-        )
-    })?;
-    if case.get("boon_plan_verification") != Some(&expected_verification_json) {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case `{}` has stale or forged verification",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    if case
-        .get("actual_verification_status")
-        .and_then(JsonValue::as_str)
-        != Some(verification.status.as_str())
-        || case.get("error_count").and_then(JsonValue::as_u64)
-            != Some(verification.error_count as u64)
-    {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case `{}` has wrong verification summary",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let failed_check_ids = verification
-        .checks
-        .iter()
-        .filter(|check| !check.pass)
-        .map(|check| check.id.clone())
-        .collect::<Vec<_>>();
-    if !failed_check_ids
-        .iter()
-        .any(|id| id == "file-read-bytes-ops-well-formed")
-    {
-        return Err(format!(
-            "{} fabricated File/read_bytes negative case `{}` was not rejected by the FileReadBytes verifier check",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let failed_check_ids_json = json!(failed_check_ids);
-    for ids_key in [
-        "expected_failed_check_ids",
-        "actual_failed_check_ids",
-        "failed_check_ids",
-    ] {
-        if case.get(ids_key) != Some(&failed_check_ids_json) {
-            return Err(format!(
-                "{} fabricated File/read_bytes negative case `{}` has wrong `{ids_key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    let check_id = format!("fabricated-plan-negative-{}-rejected", expected.id);
-    if !checks.iter().any(|check| {
-        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
-            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
-    }) {
-        return Err(format!(
-            "{} missing passing fabricated negative check `{check_id}`",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-impl ExpectedBytesFileReadFabricatedPlanMutation {
+impl ExpectedBytesFileFabricatedPlanMutation for ExpectedBytesFileReadFabricatedPlanMutation {
     fn as_str(self) -> &'static str {
         match self {
             Self::MissingPathOperand => "missing_path_operand",
@@ -14399,9 +14238,22 @@ fn mutate_expected_bytes_file_read_plan(
     plan: &mut boon_plan::MachinePlan,
     mutation: ExpectedBytesFileReadFabricatedPlanMutation,
 ) -> RuntimeResult<()> {
-    let (region_index, op_index) = expected_bytes_file_read_plan_op_location(plan)?;
-    let path_constant_id = expected_bytes_file_read_path_constant_id(plan, region_index, op_index)?;
-    let output_state_id = expected_bytes_file_read_output_state_id(plan, region_index, op_index)?;
+    let op_label = "FileReadBytes";
+    let (region_index, op_index) = expected_bytes_file_plan_op_location(
+        plan,
+        boon_plan::PlanExpressionKind::FileReadBytes,
+        op_label,
+    )?;
+    let path_constant_id = expected_bytes_file_path_constant_id(
+        plan,
+        region_index,
+        op_index,
+        op_label,
+        0,
+        "one path constant input",
+    )?;
+    let output_state_id =
+        expected_bytes_file_output_state_id(plan, region_index, op_index, op_label)?;
     let source_id = plan
         .source_routes
         .first()
@@ -14411,10 +14263,10 @@ fn mutate_expected_bytes_file_read_plan(
         })?;
     match mutation {
         ExpectedBytesFileReadFabricatedPlanMutation::MissingPathOperand => {
-            expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?.clear();
+            expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)?.clear();
         }
         ExpectedBytesFileReadFabricatedPlanMutation::ExtraPathOperand => {
-            expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)?
+            expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)?
                 .push(boon_plan::ValueRef::Constant(path_constant_id));
         }
         ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathOpNotIndexed => {
@@ -14422,13 +14274,13 @@ fn mutate_expected_bytes_file_read_plan(
             let op = &mut plan.regions[region_index].ops[op_index];
             op.indexed = false;
             op.inputs.push(field_ref.clone());
-            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![field_ref];
         }
         ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathInputMissing => {
             let field_ref = boon_plan::ValueRef::Field(boon_plan::FieldId(999_999));
             plan.regions[region_index].ops[op_index].indexed = true;
-            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![field_ref];
         }
         ExpectedBytesFileReadFabricatedPlanMutation::RowFieldPathForeignList => {
@@ -14443,11 +14295,11 @@ fn mutate_expected_bytes_file_read_plan(
             if !op.inputs.contains(&field_ref) {
                 op.inputs.push(field_ref.clone());
             }
-            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![field_ref];
         }
         ExpectedBytesFileReadFabricatedPlanMutation::MissingPathConstant => {
-            *expected_bytes_file_read_ordered_inputs_mut(plan, region_index, op_index)? =
+            *expected_bytes_file_ordered_inputs_mut(plan, region_index, op_index, op_label)? =
                 vec![boon_plan::ValueRef::Constant(boon_plan::PlanConstantId(
                     999_999,
                 ))];
@@ -14525,73 +14377,6 @@ fn mutate_expected_bytes_file_read_plan(
         }
     }
     Ok(())
-}
-
-fn expected_bytes_file_read_plan_op_location(
-    plan: &boon_plan::MachinePlan,
-) -> RuntimeResult<(usize, usize)> {
-    plan.regions
-        .iter()
-        .enumerate()
-        .find_map(|(region_index, region)| {
-            region
-                .ops
-                .iter()
-                .enumerate()
-                .find(|(_, op)| {
-                    matches!(
-                        &op.kind,
-                        boon_plan::PlanOpKind::UpdateBranch {
-                            expression_kind: boon_plan::PlanExpressionKind::FileReadBytes,
-                            ..
-                        }
-                    )
-                })
-                .map(|(op_index, _)| (region_index, op_index))
-        })
-        .ok_or_else(|| "source plan has no FileReadBytes op".into())
-}
-
-fn expected_bytes_file_read_path_constant_id(
-    plan: &boon_plan::MachinePlan,
-    region_index: usize,
-    op_index: usize,
-) -> RuntimeResult<boon_plan::PlanConstantId> {
-    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
-        &plan.regions[region_index].ops[op_index].kind
-    else {
-        return Err("FileReadBytes op is not an update branch".into());
-    };
-    let [boon_plan::ValueRef::Constant(path_constant_id)] = ordered_inputs.as_slice() else {
-        return Err("FileReadBytes op does not have one path constant input".into());
-    };
-    Ok(*path_constant_id)
-}
-
-fn expected_bytes_file_read_output_state_id(
-    plan: &boon_plan::MachinePlan,
-    region_index: usize,
-    op_index: usize,
-) -> RuntimeResult<boon_plan::StateId> {
-    let Some(boon_plan::ValueRef::State(state_id)) =
-        plan.regions[region_index].ops[op_index].output.as_ref()
-    else {
-        return Err("FileReadBytes op does not have a state output".into());
-    };
-    Ok(*state_id)
-}
-
-fn expected_bytes_file_read_ordered_inputs_mut(
-    plan: &mut boon_plan::MachinePlan,
-    region_index: usize,
-    op_index: usize,
-) -> RuntimeResult<&mut Vec<boon_plan::ValueRef>> {
-    let boon_plan::PlanOpKind::UpdateBranch { ordered_inputs, .. } =
-        &mut plan.regions[region_index].ops[op_index].kind
-    else {
-        return Err("FileReadBytes op is not an update branch".into());
-    };
-    Ok(ordered_inputs)
 }
 
 fn file_read_path_is_safe_relative(value: &str) -> bool {

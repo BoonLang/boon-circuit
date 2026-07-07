@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1165,6 +1166,247 @@ impl PlanExecutorListRowState {
             generation: self.generation,
             fields: self.fields.clone(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct PlanExecutorListStore {
+    rows_by_list: BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    exact_field_indexes: BTreeMap<(usize, String), PlanExecutorExactFieldIndex>,
+    lookup_stats: PlanExecutorListLookupStats,
+}
+
+impl PlanExecutorListStore {
+    pub fn exact_field_lookup(
+        &mut self,
+        list_id: usize,
+        field_name: &str,
+        expected: &JsonValue,
+    ) -> Option<usize> {
+        self.lookup_stats.exact_lookup_count =
+            self.lookup_stats.exact_lookup_count.saturating_add(1);
+        let key = (list_id, field_name.to_owned());
+        if !self.exact_field_indexes.contains_key(&key) {
+            let Some(rows) = self.rows_by_list.get(&list_id) else {
+                self.lookup_stats.exact_lookup_miss_count =
+                    self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
+                return None;
+            };
+            let index = PlanExecutorExactFieldIndex::from_rows(rows, field_name);
+            self.lookup_stats.exact_index_build_count =
+                self.lookup_stats.exact_index_build_count.saturating_add(1);
+            self.lookup_stats.exact_index_build_row_count = self
+                .lookup_stats
+                .exact_index_build_row_count
+                .saturating_add(rows.len() as u64);
+            self.exact_field_indexes.insert(key.clone(), index);
+        }
+        let candidate_count = self
+            .exact_field_indexes
+            .get(&key)?
+            .candidate_count(expected);
+        self.lookup_stats.exact_lookup_candidate_count = self
+            .lookup_stats
+            .exact_lookup_candidate_count
+            .saturating_add(candidate_count as u64);
+        let row_index = self
+            .exact_field_indexes
+            .get(&key)?
+            .first_row_index(expected);
+        if row_index.is_some() {
+            self.lookup_stats.exact_lookup_hit_count =
+                self.lookup_stats.exact_lookup_hit_count.saturating_add(1);
+        } else {
+            self.lookup_stats.exact_lookup_miss_count =
+                self.lookup_stats.exact_lookup_miss_count.saturating_add(1);
+        }
+        row_index
+    }
+
+    pub fn lookup_stats_report(&self) -> JsonValue {
+        self.lookup_stats.report_json()
+    }
+
+    pub fn refresh_startup_fields(
+        &mut self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> PlanExecutorResult<()> {
+        self.invalidate_indexes();
+        refresh_startup_list_row_fields_for_all_lists_with_root_state(
+            plan,
+            root_state,
+            &mut self.rows_by_list,
+        )
+    }
+
+    pub fn append_rows_for_derived_values<E>(
+        &mut self,
+        plan: &MachinePlan,
+        list_next_keys: &mut BTreeMap<usize, u64>,
+        list_append_row_bool_delta_lists: &mut BTreeSet<usize>,
+        derived_values: &BTreeMap<FieldId, JsonValue>,
+        evaluator: E,
+    ) -> PlanExecutorResult<ListAppendExecution>
+    where
+        E: FnMut(
+            &MachinePlan,
+            &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+            &PlanExecutorListRowState,
+            &PlanRowExpression,
+        ) -> PlanExecutorResult<JsonValue>,
+    {
+        self.invalidate_indexes();
+        append_list_rows_for_derived_values_with(
+            plan,
+            &mut self.rows_by_list,
+            list_next_keys,
+            list_append_row_bool_delta_lists,
+            derived_values,
+            evaluator,
+        )
+    }
+
+    pub fn remove_rows_for_source_event(
+        &mut self,
+        plan: &MachinePlan,
+        source_id: SourceId,
+        source_route_slot: &boon_plan::SourceRoute,
+        event: &PlanExecutorLiveSourceEvent<'_>,
+    ) -> PlanExecutorResult<ListRemoveExecution> {
+        self.invalidate_indexes();
+        remove_list_rows_for_source_event(
+            plan,
+            source_id,
+            source_route_slot,
+            event,
+            &mut self.rows_by_list,
+        )
+    }
+
+    pub fn set_row_field(
+        &mut self,
+        list_id: usize,
+        row_index: usize,
+        field: impl Into<String>,
+        value: JsonValue,
+    ) -> PlanExecutorResult<()> {
+        self.invalidate_indexes();
+        let row = self
+            .rows_by_list
+            .get_mut(&list_id)
+            .and_then(|rows| rows.get_mut(row_index))
+            .ok_or_else(|| {
+                format!("PlanExecutor list store has no row {row_index} in list {list_id}")
+            })?;
+        row.fields.insert(field.into(), value);
+        Ok(())
+    }
+
+    pub fn materialize_projections(
+        &self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> PlanExecutorResult<ListProjectionExecution> {
+        let executor_rows = self.public_rows_for_materialization();
+        materialize_list_projections(plan, root_state, &executor_rows)
+    }
+
+    pub fn materialize_retains(
+        &self,
+        plan: &MachinePlan,
+        root_state: &serde_json::Map<String, JsonValue>,
+    ) -> PlanExecutorResult<ListRetainExecution> {
+        let executor_rows = self.public_rows_for_materialization();
+        materialize_list_retains(plan, root_state, &executor_rows)
+    }
+
+    pub fn public_rows_for_materialization(&self) -> BTreeMap<usize, Vec<PlanExecutorListRow>> {
+        list_row_state_public_rows(&self.rows_by_list)
+    }
+
+    pub fn rows_by_list_mut(&mut self) -> &mut BTreeMap<usize, Vec<PlanExecutorListRowState>> {
+        &mut self.rows_by_list
+    }
+
+    pub fn invalidate_indexes(&mut self) {
+        self.exact_field_indexes.clear();
+    }
+}
+
+impl From<BTreeMap<usize, Vec<PlanExecutorListRowState>>> for PlanExecutorListStore {
+    fn from(rows_by_list: BTreeMap<usize, Vec<PlanExecutorListRowState>>) -> Self {
+        Self {
+            rows_by_list,
+            exact_field_indexes: BTreeMap::new(),
+            lookup_stats: PlanExecutorListLookupStats::default(),
+        }
+    }
+}
+
+impl Deref for PlanExecutorListStore {
+    type Target = BTreeMap<usize, Vec<PlanExecutorListRowState>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows_by_list
+    }
+}
+
+#[derive(Clone, Default)]
+struct PlanExecutorListLookupStats {
+    exact_lookup_count: u64,
+    exact_lookup_hit_count: u64,
+    exact_lookup_miss_count: u64,
+    exact_lookup_candidate_count: u64,
+    exact_lookup_row_scan_count: u64,
+    exact_index_build_count: u64,
+    exact_index_build_row_count: u64,
+}
+
+impl PlanExecutorListLookupStats {
+    fn report_json(&self) -> JsonValue {
+        json!({
+            "exact_lookup_count": self.exact_lookup_count,
+            "exact_lookup_hit_count": self.exact_lookup_hit_count,
+            "exact_lookup_miss_count": self.exact_lookup_miss_count,
+            "exact_lookup_candidate_count": self.exact_lookup_candidate_count,
+            "exact_lookup_row_scan_count": self.exact_lookup_row_scan_count,
+            "exact_index_build_count": self.exact_index_build_count,
+            "exact_index_build_row_count": self.exact_index_build_row_count,
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct PlanExecutorExactFieldIndex {
+    rows_by_value: BTreeMap<String, Vec<usize>>,
+}
+
+impl PlanExecutorExactFieldIndex {
+    fn from_rows(rows: &[PlanExecutorListRowState], field_name: &str) -> Self {
+        let mut rows_by_value: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (row_index, row) in rows.iter().enumerate() {
+            let Some(value) = row.fields.get(field_name) else {
+                continue;
+            };
+            let Ok(key) = serde_json::to_string(value) else {
+                continue;
+            };
+            rows_by_value.entry(key).or_default().push(row_index);
+        }
+        Self { rows_by_value }
+    }
+
+    fn first_row_index(&self, expected: &JsonValue) -> Option<usize> {
+        let key = serde_json::to_string(expected).ok()?;
+        self.rows_by_value.get(&key)?.first().copied()
+    }
+
+    fn candidate_count(&self, expected: &JsonValue) -> usize {
+        let Ok(key) = serde_json::to_string(expected) else {
+            return 0;
+        };
+        self.rows_by_value.get(&key).map(Vec::len).unwrap_or(0)
     }
 }
 
@@ -18415,6 +18657,105 @@ pub fn list_row_default_fields(
         fixed_byte_banks,
         executor_report,
     })
+}
+
+pub fn initialize_list_state(
+    plan: &MachinePlan,
+) -> PlanExecutorResult<BTreeMap<usize, Vec<PlanExecutorListRowState>>> {
+    let mut lists = BTreeMap::new();
+    for slot in &plan.storage_layout.list_slots {
+        let mut rows = Vec::new();
+        for (index, initial_row) in slot.initial_rows.iter().enumerate() {
+            let mut fields = BTreeMap::new();
+            let mut private_bytes = BTreeMap::new();
+            let mut fixed_bytes_banks = BTreeMap::new();
+            for field in &initial_row.fields {
+                let field_id = field.field_id.ok_or_else(|| {
+                    format!(
+                        "initial row field `{}` for list {} has no typed field id",
+                        field.name, slot.list_id.0
+                    )
+                })?;
+                let field_name = local_field_name(&semantic_field_label(plan, field_id.0));
+                let field_context = format!(
+                    "initial row field `{}` for list {}",
+                    field.name, slot.list_id.0
+                );
+                fields.insert(
+                    field_name.clone(),
+                    plan_constant_value_json_value(&field.value, &field_context)?,
+                );
+                if let Some(bytes) = plan_constant_value_bytes(&field.value, &field_context)? {
+                    if indexed_field_has_fixed_byte_bank(plan, slot.scope_id, &field_name) {
+                        fixed_bytes_banks.insert(field_name.clone(), bytes.inline_bytes().to_vec());
+                    }
+                    private_bytes.insert(field_name, bytes);
+                }
+            }
+            let key = index as u64 + 1;
+            let generation = 1;
+            let _ = refresh_list_row_bool_not_fields(
+                plan,
+                slot,
+                &list_label(plan, slot.list_id.0),
+                key,
+                generation,
+                &mut fields,
+            )?;
+            rows.push(PlanExecutorListRowState {
+                key,
+                generation,
+                fields,
+                private_bytes,
+                fixed_bytes_banks,
+            });
+        }
+        if matches!(slot.initializer_kind, boon_plan::ListInitializerKind::Range) {
+            let range = slot.range.ok_or_else(|| {
+                format!(
+                    "range list `{}` has no typed range bounds",
+                    list_label(plan, slot.list_id.0)
+                )
+            })?;
+            let count = if range.from <= range.to {
+                usize::try_from(range.to.saturating_sub(range.from).saturating_add(1))
+                    .map_err(|_| "List/range row count is out of range")?
+            } else {
+                0
+            };
+            for (offset, value) in (range.from..=range.to).take(count).enumerate() {
+                let mut fields = BTreeMap::new();
+                let text = value.to_string();
+                fields.insert("index".to_owned(), JsonValue::String(text.clone()));
+                fields.insert("value".to_owned(), JsonValue::String(text));
+                let defaults = list_row_default_fields(plan, slot)?;
+                for (field, value) in defaults.fields {
+                    fields.entry(field).or_insert(value);
+                }
+                let private_bytes = defaults.private_bytes;
+                let fixed_bytes_banks = defaults.fixed_byte_banks;
+                let key = offset as u64 + 1;
+                let generation = 1;
+                let _ = refresh_list_row_bool_not_fields(
+                    plan,
+                    slot,
+                    &list_label(plan, slot.list_id.0),
+                    key,
+                    generation,
+                    &mut fields,
+                )?;
+                rows.push(PlanExecutorListRowState {
+                    key,
+                    generation,
+                    fields,
+                    private_bytes,
+                    fixed_bytes_banks,
+                });
+            }
+        }
+        lists.insert(slot.list_id.0, rows);
+    }
+    Ok(lists)
 }
 
 fn plan_constant_executor_bytes_for_slot(

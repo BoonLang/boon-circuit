@@ -19,7 +19,6 @@ members = [
     "crates/boon_solid_model",
     "crates/boon_manufacturing",
     "crates/boon_3mf",
-    "crates/boon_mesh_export",
     "crates/boon_native_gpu",
     "crates/boon_native_app_window",
     "crates/boon_native_playground",
@@ -52,7 +51,6 @@ boon_scene_model = { path = "crates/boon_scene_model" }
 boon_solid_model = { path = "crates/boon_solid_model" }
 boon_manufacturing = { path = "crates/boon_manufacturing" }
 boon_3mf = { path = "crates/boon_3mf" }
-boon_mesh_export = { path = "crates/boon_mesh_export" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
 accesskit = "0.24.0"

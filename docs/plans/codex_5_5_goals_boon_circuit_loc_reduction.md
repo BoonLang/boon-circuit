@@ -135,7 +135,7 @@ Steps:
    EOF_TARGETS
 7. Build a candidate map in target/loc-reduction/candidate-map.md with these categories:
    - KEEP_CORE: parser, typecheck, IR, plan, PlanExecutor/runtime, compiler, report schema, CLI, TodoMVC, Cells, todo_mvc_physical support, native GPU two-window support.
-   - DELETE_ONLY_IF_PROVEN_UNUSED: boon_scene_model, boon_solid_model, boon_manufacturing, boon_3mf, boon_mesh_export, stale docs/plans, obsolete Ply/browser/Xvfb/COSMIC proof references, obsolete native playground paths not used by the manifest-backed native flow.
+   - DELETE_ONLY_IF_PROVEN_UNUSED: boon_scene_model, boon_solid_model, boon_manufacturing, boon_3mf, stale docs/plans, obsolete Ply/browser/Xvfb/COSMIC proof references, obsolete native playground paths not used by the manifest-backed native flow.
    - CONSOLIDATE_ONLY_IF_GATES_STAY_STRICT: boon_plan_executor vs boon_runtime, boon_report_schema helpers, duplicate report writers, duplicated native setup/report paths, repeated xtask verification runners.
 8. For every DELETE_ONLY_IF_PROVEN_UNUSED crate, run:
    cargo tree --workspace -i <crate-name> > target/loc-reduction/<crate-name>-reverse-tree.txt 2>&1 || true
@@ -160,7 +160,7 @@ Context and constraints:
 - The active direction is PlanExecutor-backed runtime plus native GPU two-window playground.
 - TodoMVC, Cells, and todo_mvc_physical support are protected.
 - Native GPU handoff truth is docs/architecture/native_gpu_handoff_manifest.json.
-- Do not delete boon_scene_model, boon_solid_model, boon_manufacturing, boon_3mf, or boon_mesh_export unless cargo tree and git grep prove the deletion is safe or the same responsibility is moved into a kept crate in the same patch.
+- Do not delete boon_scene_model, boon_solid_model, boon_manufacturing, or boon_3mf unless cargo tree and git grep prove the deletion is safe or the same responsibility is moved into a kept crate in the same patch.
 
 Steps:
 1. Read target/loc-reduction/candidate-map.md and target/loc-reduction/local-targets.md if they exist. If missing, run the measurement/candidate commands from goal 1 first.
@@ -247,7 +247,7 @@ Task: finish the LOC-reduction cleanup and produce an honest final line-count re
 
 Steps:
 1. Search stale references:
-   git grep -n -E 'boon_3mf|boon_mesh_export|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping|one phase per branch|feature branch|Python tooling|\.py|second native.*handoff|native GPU checklist' -- . ':!target' || true
+   git grep -n -E 'boon_3mf|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping|one phase per branch|feature branch|Python tooling|\.py|second native.*handoff|native GPU checklist' -- . ':!target' || true
 2. Delete stale docs only when they point to removed code or obsolete proof paths. Do not delete active native GPU docs.
 3. Ensure only v3 LOC plan remains in docs/plans if any LOC plan is committed.
 4. Run formatting/checking appropriate to the repo. If cargo fmt would explode intentionally compressed physical line counts, report that and ask whether formatting is desired; do not use minification as a LOC-reduction tactic.

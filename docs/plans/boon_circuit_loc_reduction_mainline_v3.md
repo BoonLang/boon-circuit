@@ -235,7 +235,6 @@ Potential deletion candidates only after proof:
 
 ```text
 crates/boon_3mf
-crates/boon_mesh_export
 crates/boon_manufacturing
 crates/boon_solid_model
 crates/boon_scene_model
@@ -889,7 +888,6 @@ Candidates:
 
 ```text
 boon_3mf
-boon_mesh_export
 boon_manufacturing
 boon_solid_model
 boon_scene_model
@@ -1016,7 +1014,7 @@ Goal: remove stale references after code deletion.
 Search for removed features and commands:
 
 ```bash
-git grep -n -E 'boon_3mf|boon_mesh_export|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping' -- . ':!target' || true
+git grep -n -E 'boon_3mf|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping' -- . ':!target' || true
 ```
 
 Only delete stale docs that refer to removed code or obsolete proof paths.

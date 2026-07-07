@@ -5802,6 +5802,58 @@ pub trait RootUpdateStateOwner: RootBytesStateOwner {
     fn insert_root_state_value(&mut self, label: &str, value: JsonValue);
 }
 
+macro_rules! impl_root_bytes_owner {
+    ($target:ty) => {
+        impl RootBytesEnvironment for $target {
+            fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
+                self.private_bytes.get(&state_id.0)
+            }
+
+            fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
+                self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
+            }
+        }
+
+        impl RootBytesStateOwner for $target {
+            fn private_bytes_state_count(&self) -> usize {
+                self.private_bytes.len()
+            }
+
+            fn fixed_byte_bank_count(&self) -> usize {
+                self.fixed_byte_banks.len()
+            }
+
+            fn insert_private_bytes_for_state(
+                &mut self,
+                state_id: StateId,
+                bytes: PlanExecutorBytes,
+            ) {
+                self.private_bytes.insert(state_id.0, bytes);
+            }
+
+            fn remove_private_bytes_for_state(&mut self, state_id: StateId) {
+                self.private_bytes.remove(&state_id.0);
+            }
+
+            fn remove_fixed_byte_bank_for_state(&mut self, state_id: StateId) {
+                self.fixed_byte_banks.remove(&state_id.0);
+            }
+
+            fn fixed_byte_bank_mut_for_state(&mut self, state_id: StateId) -> Option<&mut Vec<u8>> {
+                self.fixed_byte_banks.get_mut(&state_id.0)
+            }
+
+            fn take_fixed_byte_bank_for_state(&mut self, state_id: StateId) -> Option<Vec<u8>> {
+                self.fixed_byte_banks.remove(&state_id.0)
+            }
+
+            fn insert_fixed_byte_bank_for_state(&mut self, state_id: StateId, bytes: Vec<u8>) {
+                self.fixed_byte_banks.insert(state_id.0, bytes);
+            }
+        }
+    };
+}
+
 pub struct RootBytesStateMaps<'a> {
     private_bytes: &'a mut BTreeMap<usize, PlanExecutorBytes>,
     fixed_byte_banks: &'a mut BTreeMap<usize, Vec<u8>>,
@@ -5819,49 +5871,7 @@ impl<'a> RootBytesStateMaps<'a> {
     }
 }
 
-impl RootBytesEnvironment for RootBytesStateMaps<'_> {
-    fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
-        self.private_bytes.get(&state_id.0)
-    }
-
-    fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
-        self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
-    }
-}
-
-impl RootBytesStateOwner for RootBytesStateMaps<'_> {
-    fn private_bytes_state_count(&self) -> usize {
-        self.private_bytes.len()
-    }
-
-    fn fixed_byte_bank_count(&self) -> usize {
-        self.fixed_byte_banks.len()
-    }
-
-    fn insert_private_bytes_for_state(&mut self, state_id: StateId, bytes: PlanExecutorBytes) {
-        self.private_bytes.insert(state_id.0, bytes);
-    }
-
-    fn remove_private_bytes_for_state(&mut self, state_id: StateId) {
-        self.private_bytes.remove(&state_id.0);
-    }
-
-    fn remove_fixed_byte_bank_for_state(&mut self, state_id: StateId) {
-        self.fixed_byte_banks.remove(&state_id.0);
-    }
-
-    fn fixed_byte_bank_mut_for_state(&mut self, state_id: StateId) -> Option<&mut Vec<u8>> {
-        self.fixed_byte_banks.get_mut(&state_id.0)
-    }
-
-    fn take_fixed_byte_bank_for_state(&mut self, state_id: StateId) -> Option<Vec<u8>> {
-        self.fixed_byte_banks.remove(&state_id.0)
-    }
-
-    fn insert_fixed_byte_bank_for_state(&mut self, state_id: StateId, bytes: Vec<u8>) {
-        self.fixed_byte_banks.insert(state_id.0, bytes);
-    }
-}
+impl_root_bytes_owner!(RootBytesStateMaps<'_>);
 
 pub struct RootUpdateStateMaps<'a> {
     root_state: &'a mut JsonMap<String, JsonValue>,
@@ -5883,49 +5893,7 @@ impl<'a> RootUpdateStateMaps<'a> {
     }
 }
 
-impl RootBytesEnvironment for RootUpdateStateMaps<'_> {
-    fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
-        self.private_bytes.get(&state_id.0)
-    }
-
-    fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
-        self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
-    }
-}
-
-impl RootBytesStateOwner for RootUpdateStateMaps<'_> {
-    fn private_bytes_state_count(&self) -> usize {
-        self.private_bytes.len()
-    }
-
-    fn fixed_byte_bank_count(&self) -> usize {
-        self.fixed_byte_banks.len()
-    }
-
-    fn insert_private_bytes_for_state(&mut self, state_id: StateId, bytes: PlanExecutorBytes) {
-        self.private_bytes.insert(state_id.0, bytes);
-    }
-
-    fn remove_private_bytes_for_state(&mut self, state_id: StateId) {
-        self.private_bytes.remove(&state_id.0);
-    }
-
-    fn remove_fixed_byte_bank_for_state(&mut self, state_id: StateId) {
-        self.fixed_byte_banks.remove(&state_id.0);
-    }
-
-    fn fixed_byte_bank_mut_for_state(&mut self, state_id: StateId) -> Option<&mut Vec<u8>> {
-        self.fixed_byte_banks.get_mut(&state_id.0)
-    }
-
-    fn take_fixed_byte_bank_for_state(&mut self, state_id: StateId) -> Option<Vec<u8>> {
-        self.fixed_byte_banks.remove(&state_id.0)
-    }
-
-    fn insert_fixed_byte_bank_for_state(&mut self, state_id: StateId, bytes: Vec<u8>) {
-        self.fixed_byte_banks.insert(state_id.0, bytes);
-    }
-}
+impl_root_bytes_owner!(RootUpdateStateMaps<'_>);
 
 impl RootUpdateStateOwner for RootUpdateStateMaps<'_> {
     fn insert_root_state_value(&mut self, label: &str, value: JsonValue) {
@@ -5933,49 +5901,7 @@ impl RootUpdateStateOwner for RootUpdateStateMaps<'_> {
     }
 }
 
-impl RootBytesEnvironment for PlanExecutorRootState {
-    fn private_bytes_for_state(&self, state_id: StateId) -> Option<&PlanExecutorBytes> {
-        self.private_bytes.get(&state_id.0)
-    }
-
-    fn fixed_byte_bank_for_state(&self, state_id: StateId) -> Option<&[u8]> {
-        self.fixed_byte_banks.get(&state_id.0).map(Vec::as_slice)
-    }
-}
-
-impl RootBytesStateOwner for PlanExecutorRootState {
-    fn private_bytes_state_count(&self) -> usize {
-        self.private_bytes.len()
-    }
-
-    fn fixed_byte_bank_count(&self) -> usize {
-        self.fixed_byte_banks.len()
-    }
-
-    fn insert_private_bytes_for_state(&mut self, state_id: StateId, bytes: PlanExecutorBytes) {
-        self.private_bytes.insert(state_id.0, bytes);
-    }
-
-    fn remove_private_bytes_for_state(&mut self, state_id: StateId) {
-        self.private_bytes.remove(&state_id.0);
-    }
-
-    fn remove_fixed_byte_bank_for_state(&mut self, state_id: StateId) {
-        self.fixed_byte_banks.remove(&state_id.0);
-    }
-
-    fn fixed_byte_bank_mut_for_state(&mut self, state_id: StateId) -> Option<&mut Vec<u8>> {
-        self.fixed_byte_banks.get_mut(&state_id.0)
-    }
-
-    fn take_fixed_byte_bank_for_state(&mut self, state_id: StateId) -> Option<Vec<u8>> {
-        self.fixed_byte_banks.remove(&state_id.0)
-    }
-
-    fn insert_fixed_byte_bank_for_state(&mut self, state_id: StateId, bytes: Vec<u8>) {
-        self.fixed_byte_banks.insert(state_id.0, bytes);
-    }
-}
+impl_root_bytes_owner!(PlanExecutorRootState);
 
 impl RootUpdateStateOwner for PlanExecutorRootState {
     fn insert_root_state_value(&mut self, label: &str, value: JsonValue) {

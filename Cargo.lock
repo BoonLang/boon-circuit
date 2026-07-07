@@ -635,17 +635,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boon_mesh_export"
-version = "0.1.0"
-dependencies = [
- "boon_manufacturing",
- "boon_solid_model",
- "earcutr",
- "serde",
- "sha2",
-]
-
-[[package]]
 name = "boon_native_app_window"
 version = "0.1.0"
 dependencies = [
@@ -4183,7 +4172,6 @@ dependencies = [
  "boon_host",
  "boon_ir",
  "boon_manufacturing",
- "boon_mesh_export",
  "boon_native_app_window",
  "boon_native_gpu",
  "boon_parser",

@@ -26,89 +26,95 @@ const BYTES_FILE_WRITE_PLAN_FIXTURE_DIR: &str = "target/generated/bytes-file-wri
 const BYTES_FILE_WRITE_PLAN_SOURCE_REL: &str = "bytes_file_write_plan_ops.bn";
 const BYTES_FILE_WRITE_PLAN_SCENARIO_REL: &str = "bytes_file_write_plan_ops.scn";
 const BYTES_FILE_WRITE_PLAN_OUTPUT_REL: &str = "outputs/payload.bin";
-const XTASK_COMMANDS: &[&str] = &[
-    "bytes-plan-phase0-baseline",
-    "verify-example-negative",
-    "verify-bytes-type-system",
-    "verify-bytes-default-engine-readiness",
-    "verify-bytes-negative",
-    "verify-bytes-file-read-plan",
-    "verify-bytes-file-write-plan",
-    "verify-bytes-storage-profile",
-    "verify-bytes-fixed-warm-tick",
-    "verify-bytes-byte-bank-layout",
-    "verify-bytes-machine-plan-adversarial",
-    "verify-build-bytes-boundary",
-    "verify-bytes-machine-plan-all",
-    "run-report-refresh-queue",
-    "verify-compiler-boundaries",
-    "verify-foundation",
-    "verify-report-schema",
-    "verify-compiled-artifact",
-    "verify-compiled-artifact-inspection",
-    "verify-compiled-artifact-scenario",
-    "verify-bytecode",
-    "check-bridge",
-    "verify-novywave-bridge-scenario",
-    "verify-runtime-production-hardening",
-    "verify-runtime-finality",
-    "verify-scenario-manifest-integrity",
-    "audit-genericity",
-    "verify-playground-genericity",
-    "playground-watch",
-    "verify-boon-source-syntax",
-    "verify-boon-driver-schema",
-    "verify-boon-driver-e2e",
-    "verify-boon-driver-dev-window",
-    "verify-boon-driver-speed",
-    "verify-boon-driver-all",
-    "audit-machine-readiness",
-    "verify-todomvc-negative",
-    "explain-todomvc-hardware",
-    "verify-cells-negative",
-    "shaders",
-    "verify-platform-contract",
-    "verify-native-gpu-dependency-graph",
-    "verify-native-gpu-architecture",
-    "verify-native-gpu-layout-contract",
-    "verify-native-gpu-shaders",
-    "verify-native-gpu-multiwindow",
-    "verify-native-gpu-ipc-backpressure",
-    "verify-native-gpu-observability",
-    "verify-native-gpu-world-scene",
-    "verify-runtime-change-sets",
-    "verify-document-batch-patches",
-    "verify-retained-layout-deltas",
-    "verify-text-cache-layers",
-    "verify-render-patch-contract",
-    "verify-wgpu-readback",
-    "verify-wgpu-retained-arenas",
-    "verify-native-gpu-present-floor",
-    "verify-native-gpu-stale-path-ledger",
-    "verify-native-gpu-preview-e2e",
-    "verify-native-dev-window-editor",
-    "verify-native-example-tabs",
-    "verify-native-editor-format",
-    "verify-native-product-render-graph",
-    "verify-native-counter-interaction-speed",
-    "verify-native-cells-interaction-speed",
-    "verify-native-cells-visible-click-e2e",
-    "verify-native-todomvc-physical-reference-parity",
-    "verify-native-gpu-novywave-visual",
-    "verify-native-gpu-novywave-interaction-speed",
-    "verify-native-gpu-scroll-speed",
-    "verify-native-gpu-negative",
-    "verify-native-gpu-all",
-    "verify-world-scene",
-    "verify-3d-hello-cube",
-    "verify-solid-graph",
-    "verify-3d-printable-bracket",
-    "verify-3d-parametric-car",
-    "verify-manufacturing-slices",
-    "verify-3mf-export",
-    "verify-semantic-scene",
-    "verify-accessibility-adapters",
-    "verify-unified-architecture-all",
+type XtaskResult = Result<(), Box<dyn std::error::Error>>;
+type XtaskCommandHandler = fn(&[String]) -> XtaskResult;
+
+type XtaskCommandSpec = (&'static str, XtaskCommandHandler);
+
+#[rustfmt::skip]
+const XTASK_COMMANDS: &[XtaskCommandSpec] = &[
+    ("bytes-plan-phase0-baseline", bytes_plan_phase0_baseline),
+    ("verify-example-negative", verify_negative),
+    ("verify-bytes-type-system", verify_bytes_type_system),
+    ("verify-bytes-default-engine-readiness", verify_bytes_default_engine_readiness),
+    ("verify-bytes-negative", verify_bytes_negative),
+    ("verify-bytes-file-read-plan", verify_bytes_file_read_plan),
+    ("verify-bytes-file-write-plan", verify_bytes_file_write_plan),
+    ("verify-bytes-storage-profile", verify_bytes_storage_profile),
+    ("verify-bytes-fixed-warm-tick", verify_bytes_fixed_warm_tick),
+    ("verify-bytes-byte-bank-layout", verify_bytes_byte_bank_layout),
+    ("verify-bytes-machine-plan-adversarial", verify_bytes_machine_plan_adversarial),
+    ("verify-build-bytes-boundary", verify_build_bytes_boundary),
+    ("verify-bytes-machine-plan-all", verify_bytes_machine_plan_all),
+    ("run-report-refresh-queue", run_report_refresh_queue),
+    ("verify-compiler-boundaries", verify_compiler_boundaries),
+    ("verify-foundation", verify_foundation),
+    ("verify-report-schema", verify_reports_schema),
+    ("verify-compiled-artifact", verify_compiled_artifact),
+    ("verify-compiled-artifact-inspection", verify_compiled_artifact_inspection),
+    ("verify-compiled-artifact-scenario", verify_compiled_artifact_scenario),
+    ("verify-bytecode", verify_bytecode),
+    ("check-bridge", check_bridge),
+    ("verify-novywave-bridge-scenario", verify_novywave_bridge_scenario),
+    ("verify-runtime-production-hardening", verify_runtime_production_hardening),
+    ("verify-runtime-finality", verify_runtime_finality),
+    ("verify-scenario-manifest-integrity", verify_scenario_manifest_integrity),
+    ("audit-genericity", audit_genericity),
+    ("verify-playground-genericity", verify_playground_genericity),
+    ("playground-watch", playground_watch),
+    ("verify-boon-source-syntax", verify_boon_source_syntax),
+    ("verify-boon-driver-schema", verify_boon_driver_schema),
+    ("verify-boon-driver-e2e", verify_boon_driver_e2e),
+    ("verify-boon-driver-dev-window", verify_boon_driver_dev_window),
+    ("verify-boon-driver-speed", verify_boon_driver_speed),
+    ("verify-boon-driver-all", verify_boon_driver_all),
+    ("audit-machine-readiness", audit_machine_readiness),
+    ("verify-todomvc-negative", verify_todomvc_negative),
+    ("explain-todomvc-hardware", explain_todomvc_hardware),
+    ("verify-cells-negative", verify_cells_negative),
+    ("shaders", generate_native_gpu_shader_bindings),
+    ("verify-platform-contract", verify_native_platform_contract),
+    ("verify-native-gpu-dependency-graph", verify_native_gpu_dependency_graph),
+    ("verify-native-gpu-architecture", verify_native_gpu_architecture),
+    ("verify-native-gpu-layout-contract", verify_native_gpu_layout_contract),
+    ("verify-native-gpu-shaders", verify_native_gpu_shaders),
+    ("verify-native-gpu-multiwindow", verify_native_gpu_multiwindow),
+    ("verify-native-gpu-ipc-backpressure", verify_native_gpu_ipc_backpressure),
+    ("verify-native-gpu-observability", verify_native_gpu_observability),
+    ("verify-native-gpu-world-scene", verify_native_gpu_world_scene),
+    ("verify-runtime-change-sets", verify_runtime_change_sets),
+    ("verify-document-batch-patches", verify_document_batch_patches),
+    ("verify-retained-layout-deltas", verify_retained_layout_deltas),
+    ("verify-text-cache-layers", verify_text_cache_layers),
+    ("verify-render-patch-contract", verify_render_patch_contract),
+    ("verify-wgpu-readback", verify_wgpu_readback),
+    ("verify-wgpu-retained-arenas", verify_wgpu_retained_arenas),
+    ("verify-native-gpu-present-floor", verify_native_gpu_present_floor),
+    ("verify-native-gpu-stale-path-ledger", verify_native_gpu_stale_path_ledger),
+    ("verify-native-gpu-preview-e2e", verify_native_gpu_preview_e2e),
+    ("verify-native-dev-window-editor", verify_native_dev_window_editor),
+    ("verify-native-example-tabs", verify_native_example_tabs),
+    ("verify-native-editor-format", verify_native_editor_format),
+    ("verify-native-product-render-graph", verify_native_product_render_graph),
+    ("verify-native-counter-interaction-speed", verify_native_counter_interaction_speed),
+    ("verify-native-cells-interaction-speed", verify_native_cells_interaction_speed),
+    ("verify-native-cells-visible-click-e2e", verify_native_cells_visible_click_e2e),
+    ("verify-native-todomvc-physical-reference-parity", verify_native_todomvc_physical_reference_parity),
+    ("verify-native-gpu-novywave-visual", verify_native_gpu_novywave_visual),
+    ("verify-native-gpu-novywave-interaction-speed", verify_native_gpu_novywave_interaction_speed),
+    ("verify-native-gpu-scroll-speed", verify_native_gpu_scroll_speed),
+    ("verify-native-gpu-negative", verify_native_gpu_negative),
+    ("verify-native-gpu-all", verify_native_gpu_all),
+    ("verify-world-scene", verify_world_scene),
+    ("verify-3d-hello-cube", verify_3d_hello_cube),
+    ("verify-solid-graph", verify_solid_graph),
+    ("verify-3d-printable-bracket", verify_3d_printable_bracket),
+    ("verify-3d-parametric-car", verify_3d_parametric_car),
+    ("verify-manufacturing-slices", verify_manufacturing_slices),
+    ("verify-3mf-export", verify_3mf_export),
+    ("verify-semantic-scene", verify_semantic_scene),
+    ("verify-accessibility-adapters", verify_accessibility_adapters),
+    ("verify-unified-architecture-all", verify_unified_architecture_all),
 ];
 
 fn main() {
@@ -129,93 +135,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_help();
             Ok(())
         }
-        "verify-example-negative" => verify_negative(&args),
-        "verify-bytes-type-system" => verify_bytes_type_system(&args),
-        "verify-bytes-default-engine-readiness" => verify_bytes_default_engine_readiness(&args),
-        "verify-bytes-negative" => verify_bytes_negative(&args),
-        "verify-bytes-file-read-plan" => verify_bytes_file_read_plan(&args),
-        "verify-bytes-file-write-plan" => verify_bytes_file_write_plan(&args),
-        "verify-bytes-storage-profile" => verify_bytes_storage_profile(&args),
-        "verify-bytes-fixed-warm-tick" => verify_bytes_fixed_warm_tick(&args),
-        "verify-bytes-byte-bank-layout" => verify_bytes_byte_bank_layout(&args),
-        "verify-bytes-machine-plan-adversarial" => verify_bytes_machine_plan_adversarial(&args),
-        "verify-build-bytes-boundary" => verify_build_bytes_boundary(&args),
-        "verify-bytes-machine-plan-all" => verify_bytes_machine_plan_all(&args),
-        "bytes-plan-phase0-baseline" => bytes_plan_phase0_baseline(&args),
-        "run-report-refresh-queue" => run_report_refresh_queue(&args),
-        "verify-compiler-boundaries" => verify_compiler_boundaries(&args),
-        "verify-foundation" => verify_foundation(&args),
-        "verify-report-schema" => verify_reports_schema(&args),
-        "verify-compiled-artifact" => verify_compiled_artifact(&args),
-        "verify-compiled-artifact-inspection" => verify_compiled_artifact_inspection(&args),
-        "verify-compiled-artifact-scenario" => verify_compiled_artifact_scenario(&args),
-        "verify-bytecode" => verify_bytecode(&args),
-        "check-bridge" => check_bridge(&args),
-        "verify-novywave-bridge-scenario" => verify_novywave_bridge_scenario(&args),
-        "verify-runtime-production-hardening" => verify_runtime_production_hardening(&args),
-        "verify-runtime-finality" => verify_runtime_finality(&args),
-        "verify-scenario-manifest-integrity" => verify_scenario_manifest_integrity(&args),
-        "audit-genericity" => audit_genericity(&args),
-        "verify-playground-genericity" => verify_playground_genericity(&args),
-        "playground-watch" => playground_watch(&args),
-        "verify-boon-source-syntax" => verify_boon_source_syntax(&args),
-        "verify-boon-driver-schema" => verify_boon_driver_schema(&args),
-        "verify-boon-driver-e2e" => verify_boon_driver_e2e(&args),
-        "verify-boon-driver-dev-window" => verify_boon_driver_dev_window(&args),
-        "verify-boon-driver-speed" => verify_boon_driver_speed(&args),
-        "verify-boon-driver-all" => verify_boon_driver_all(&args),
-        "audit-machine-readiness" => audit_machine_readiness(&args),
-        "verify-todomvc-negative" => verify_negative_name("todomvc"),
-        "explain-todomvc-hardware" => explain_hardware("todomvc", &args),
-        "verify-cells-negative" => verify_negative_name("cells"),
-        "shaders" => generate_native_gpu_shader_bindings(&args),
-        "verify-platform-contract" => verify_native_platform_contract(&args),
-        "verify-native-gpu-dependency-graph" => verify_native_gpu_dependency_graph(&args),
-        "verify-native-gpu-architecture" => verify_native_gpu_architecture(&args),
-        "verify-native-gpu-layout-contract" => verify_native_gpu_layout_contract(&args),
-        "verify-native-gpu-shaders" => verify_native_gpu_shaders(&args),
-        "verify-native-gpu-multiwindow" => verify_native_gpu_multiwindow(&args),
-        "verify-native-gpu-ipc-backpressure" => verify_native_gpu_ipc_backpressure(&args),
-        "verify-native-gpu-observability" => verify_native_gpu_observability(&args),
-        "verify-native-gpu-world-scene" => verify_native_gpu_world_scene(&args),
-        "verify-runtime-change-sets" => verify_runtime_change_sets(&args),
-        "verify-document-batch-patches" => verify_document_batch_patches(&args),
-        "verify-retained-layout-deltas" => verify_retained_layout_deltas(&args),
-        "verify-text-cache-layers" => verify_text_cache_layers(&args),
-        "verify-render-patch-contract" => verify_render_patch_contract(&args),
-        "verify-wgpu-readback" => verify_wgpu_readback(&args),
-        "verify-wgpu-retained-arenas" => verify_wgpu_retained_arenas(&args),
-        "verify-native-gpu-present-floor" => verify_native_gpu_present_floor(&args),
-        "verify-native-gpu-stale-path-ledger" => verify_native_gpu_stale_path_ledger(&args),
-        "verify-native-gpu-preview-e2e" => verify_native_gpu_preview_e2e(&args),
-        "verify-native-dev-window-editor" => verify_native_dev_window_editor(&args),
-        "verify-native-example-tabs" => verify_native_example_tabs(&args),
-        "verify-native-editor-format" => verify_native_editor_format(&args),
-        "verify-native-product-render-graph" => verify_native_product_render_graph(&args),
-        "verify-native-counter-interaction-speed" => verify_native_counter_interaction_speed(&args),
-        "verify-native-cells-interaction-speed" => verify_native_cells_interaction_speed(&args),
-        "verify-native-cells-visible-click-e2e" => verify_native_cells_visible_click_e2e(&args),
-        "verify-native-todomvc-physical-reference-parity" => {
-            verify_native_todomvc_physical_reference_parity(&args)
+        command => {
+            let Some(spec) = XTASK_COMMANDS.iter().find(|spec| spec.0 == command) else {
+                return Err(format!("unknown xtask command `{command}`").into());
+            };
+            (spec.1)(&args)
         }
-        "verify-native-gpu-novywave-visual" => verify_native_gpu_novywave_visual(&args),
-        "verify-native-gpu-novywave-interaction-speed" => {
-            verify_native_gpu_novywave_interaction_speed(&args)
-        }
-        "verify-native-gpu-scroll-speed" => verify_native_gpu_scroll_speed(&args),
-        "verify-native-gpu-negative" => verify_native_gpu_negative(&args),
-        "verify-native-gpu-all" => verify_native_gpu_all(&args),
-        "verify-world-scene" => verify_world_scene(&args),
-        "verify-3d-hello-cube" => verify_3d_hello_cube(&args),
-        "verify-solid-graph" => verify_solid_graph(&args),
-        "verify-3d-printable-bracket" => verify_3d_printable_bracket(&args),
-        "verify-3d-parametric-car" => verify_3d_parametric_car(&args),
-        "verify-manufacturing-slices" => verify_manufacturing_slices(&args),
-        "verify-3mf-export" => verify_3mf_export(&args),
-        "verify-semantic-scene" => verify_semantic_scene(&args),
-        "verify-accessibility-adapters" => verify_accessibility_adapters(&args),
-        "verify-unified-architecture-all" => verify_unified_architecture_all(&args),
-        other => Err(format!("unknown xtask command `{other}`").into()),
     }
 }
 
@@ -227,8 +152,24 @@ fn print_help() {
     println!();
     println!("Commands:");
     for command in XTASK_COMMANDS {
-        println!("  {command}");
+        println!("  {}", command.0);
     }
+}
+
+fn xtask_command_exists(command: &str) -> bool {
+    XTASK_COMMANDS.iter().any(|spec| spec.0 == command)
+}
+
+fn verify_todomvc_negative(_args: &[String]) -> XtaskResult {
+    verify_negative_name("todomvc")
+}
+
+fn verify_cells_negative(_args: &[String]) -> XtaskResult {
+    verify_negative_name("cells")
+}
+
+fn explain_todomvc_hardware(args: &[String]) -> XtaskResult {
+    explain_hardware("todomvc", args)
 }
 
 fn check_bridge(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -12468,84 +12409,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         }),
     );
 
-    let selected_body_stl = boon_mesh_export::export_ascii_stl_from_layers(&selected_body_print);
-    let selected_body_stl_repeat =
-        boon_mesh_export::export_ascii_stl_from_layers(&selected_body_print);
-    let selected_body_stl_validation =
-        boon_mesh_export::validate_ascii_stl_package(&selected_body_stl);
-    let selected_body_binary_stl =
-        boon_mesh_export::export_binary_stl_from_layers(&selected_body_print);
-    let selected_body_binary_stl_repeat =
-        boon_mesh_export::export_binary_stl_from_layers(&selected_body_print);
-    let selected_body_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&selected_body_binary_stl);
-    let selected_body_stl_topology =
-        boon_mesh_export::validate_layer_prism_topology(&selected_body_print);
-    let selected_body_stl_export_topology =
-        boon_mesh_export::validate_export_triangle_stream_topology(&selected_body_print);
-    let selected_body_stl_ok = selected_body_print.status
-        == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && selected_body_print.metrics.printable_part_count == 1
-        && selected_body_print.metrics.printable_instance_count == 1
-        && selected_body_print.metrics.layer_count > 0
-        && selected_body_print.metrics.polygon_count > 0
-        && selected_body_print.metrics.unsupported_operation_count == 0
-        && selected_body_print.artifact_hash == selected_body_print_repeat.artifact_hash
-        && !selected_body_print.visual_mesh_used_for_manufacturing
-        && selected_body_stl.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_binary_stl.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_binary_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_stl.ascii == selected_body_stl_repeat.ascii
-        && selected_body_stl.artifact_hash == selected_body_stl_repeat.artifact_hash
-        && selected_body_binary_stl.bytes == selected_body_binary_stl_repeat.bytes
-        && selected_body_binary_stl.artifact_hash == selected_body_binary_stl_repeat.artifact_hash
-        && selected_body_stl.source_manufacturing_artifact_hash
-            == selected_body_print.artifact_hash
-        && selected_body_binary_stl.source_manufacturing_artifact_hash
-            == selected_body_print.artifact_hash
-        && selected_body_stl.metrics.layer_count == selected_body_print.metrics.layer_count
-        && selected_body_stl.metrics.polygon_count == selected_body_print.metrics.polygon_count
-        && selected_body_stl.metrics.triangle_count > selected_body_print.metrics.polygon_count
-        && selected_body_stl.metrics.rejected_hole_count == 0
-        && selected_body_binary_stl.metrics.triangle_count
-            == selected_body_stl.metrics.triangle_count
-        && selected_body_binary_stl.metrics.byte_count
-            == 84 + selected_body_binary_stl.metrics.triangle_count * 50
-        && selected_body_stl_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_stl_topology.boundary_edge_count == 0
-        && selected_body_stl_topology.non_manifold_edge_count == 0
-        && selected_body_stl_topology.degenerate_triangle_count == 0
-        && selected_body_stl_export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_body_stl_export_topology.triangle_count
-            == selected_body_stl.metrics.triangle_count
-        && selected_body_stl_export_topology.boundary_edge_count == 0
-        && selected_body_stl_export_topology.non_manifold_edge_count == 0
-        && selected_body_stl_export_topology.degenerate_triangle_count == 0
-        && !selected_body_stl.visual_mesh_used_for_manufacturing
-        && !selected_body_binary_stl.visual_mesh_used_for_manufacturing;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "3d-parametric-car:selected-body-stl-export",
-        selected_body_stl_ok,
-        format!(
-            "print_status={:?}, print_metrics={:?}, ascii_status={:?}, ascii_metrics={:?}, binary_status={:?}, binary_metrics={:?}, topology={:?}, export_topology={:?}",
-            selected_body_print.status,
-            selected_body_print.metrics,
-            selected_body_stl.status,
-            selected_body_stl.metrics,
-            selected_body_binary_stl.status,
-            selected_body_binary_stl.metrics,
-            selected_body_stl_topology,
-            selected_body_stl_export_topology
-        ),
-        (!selected_body_stl_ok).then(|| {
-            "selected parametric car body export must produce deterministic ASCII/binary STL from authoritative manufacturing layers without visual mesh evidence"
-                .to_owned()
-        }),
-    );
-
     let selected_wheel_part_instance = boon_solid_model::PartInstanceId(wheel_instance.0);
     let selected_wheel_request = boon_manufacturing::PrintCompileRequest::for_selected_instances(
         &runtime_output.bundle,
@@ -12658,85 +12521,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         }),
     );
 
-    let selected_wheel_stl = boon_mesh_export::export_ascii_stl_from_layers(&selected_wheel_print);
-    let selected_wheel_stl_repeat =
-        boon_mesh_export::export_ascii_stl_from_layers(&selected_wheel_print);
-    let selected_wheel_stl_validation =
-        boon_mesh_export::validate_ascii_stl_package(&selected_wheel_stl);
-    let selected_wheel_binary_stl =
-        boon_mesh_export::export_binary_stl_from_layers(&selected_wheel_print);
-    let selected_wheel_binary_stl_repeat =
-        boon_mesh_export::export_binary_stl_from_layers(&selected_wheel_print);
-    let selected_wheel_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&selected_wheel_binary_stl);
-    let selected_wheel_stl_topology =
-        boon_mesh_export::validate_layer_prism_topology(&selected_wheel_print);
-    let selected_wheel_stl_export_topology =
-        boon_mesh_export::validate_export_triangle_stream_topology(&selected_wheel_print);
-    let selected_wheel_stl_ok = selected_wheel_print.status
-        == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && selected_wheel_print.metrics.printable_part_count == 1
-        && selected_wheel_print.metrics.printable_instance_count == 1
-        && selected_wheel_print.metrics.layer_count > 0
-        && selected_wheel_print.metrics.polygon_count > 0
-        && selected_wheel_print.metrics.unsupported_operation_count == 0
-        && selected_wheel_print.artifact_hash == selected_wheel_print_repeat.artifact_hash
-        && !selected_wheel_print.visual_mesh_used_for_manufacturing
-        && selected_wheel_stl.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_binary_stl.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_binary_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_stl.ascii == selected_wheel_stl_repeat.ascii
-        && selected_wheel_stl.artifact_hash == selected_wheel_stl_repeat.artifact_hash
-        && selected_wheel_binary_stl.bytes == selected_wheel_binary_stl_repeat.bytes
-        && selected_wheel_binary_stl.artifact_hash
-            == selected_wheel_binary_stl_repeat.artifact_hash
-        && selected_wheel_stl.source_manufacturing_artifact_hash
-            == selected_wheel_print.artifact_hash
-        && selected_wheel_binary_stl.source_manufacturing_artifact_hash
-            == selected_wheel_print.artifact_hash
-        && selected_wheel_stl.metrics.layer_count == selected_wheel_print.metrics.layer_count
-        && selected_wheel_stl.metrics.polygon_count == selected_wheel_print.metrics.polygon_count
-        && selected_wheel_stl.metrics.triangle_count > selected_wheel_print.metrics.polygon_count
-        && selected_wheel_stl.metrics.rejected_hole_count == 0
-        && selected_wheel_binary_stl.metrics.triangle_count
-            == selected_wheel_stl.metrics.triangle_count
-        && selected_wheel_binary_stl.metrics.byte_count
-            == 84 + selected_wheel_binary_stl.metrics.triangle_count * 50
-        && selected_wheel_stl_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_stl_topology.boundary_edge_count == 0
-        && selected_wheel_stl_topology.non_manifold_edge_count == 0
-        && selected_wheel_stl_topology.degenerate_triangle_count == 0
-        && selected_wheel_stl_export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && selected_wheel_stl_export_topology.triangle_count
-            == selected_wheel_stl.metrics.triangle_count
-        && selected_wheel_stl_export_topology.boundary_edge_count == 0
-        && selected_wheel_stl_export_topology.non_manifold_edge_count == 0
-        && selected_wheel_stl_export_topology.degenerate_triangle_count == 0
-        && !selected_wheel_stl.visual_mesh_used_for_manufacturing
-        && !selected_wheel_binary_stl.visual_mesh_used_for_manufacturing;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "3d-parametric-car:selected-wheel-stl-export",
-        selected_wheel_stl_ok,
-        format!(
-            "print_status={:?}, print_metrics={:?}, ascii_status={:?}, ascii_metrics={:?}, binary_status={:?}, binary_metrics={:?}, topology={:?}, export_topology={:?}",
-            selected_wheel_print.status,
-            selected_wheel_print.metrics,
-            selected_wheel_stl.status,
-            selected_wheel_stl.metrics,
-            selected_wheel_binary_stl.status,
-            selected_wheel_binary_stl.metrics,
-            selected_wheel_stl_topology,
-            selected_wheel_stl_export_topology
-        ),
-        (!selected_wheel_stl_ok).then(|| {
-            "selected parametric car wheel export must produce deterministic ASCII/binary STL from authoritative manufacturing layers without visual mesh evidence"
-                .to_owned()
-        }),
-    );
-
     let selected_window_part_instance = boon_solid_model::PartInstanceId(window_instance.0);
     let selected_window_print = boon_manufacturing::compile_print_job(
         &runtime_output.bundle,
@@ -12778,14 +12562,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
     let selected_visual_only_package = boon_3mf::export_3mf_entry_set(&selected_window_print);
     let selected_visual_only_validation =
         boon_3mf::validate_3mf_package(&selected_visual_only_package);
-    let selected_visual_only_stl =
-        boon_mesh_export::export_ascii_stl_from_layers(&selected_window_print);
-    let selected_visual_only_stl_validation =
-        boon_mesh_export::validate_ascii_stl_package(&selected_visual_only_stl);
-    let selected_visual_only_binary_stl =
-        boon_mesh_export::export_binary_stl_from_layers(&selected_window_print);
-    let selected_visual_only_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&selected_visual_only_binary_stl);
     let selected_visual_only_export_negative_ok = selected_window_print.status
         == boon_manufacturing::ManufacturingCompileStatus::Fail
         && selected_visual_only_package.status == boon_3mf::ThreeMfExportStatus::Fail
@@ -12802,53 +12578,20 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "missing-slices")
-        && !selected_visual_only_package.visual_mesh_used_for_manufacturing
-        && selected_visual_only_stl.status == boon_mesh_export::StlExportStatus::Fail
-        && selected_visual_only_stl_validation.status == boon_mesh_export::StlExportStatus::Fail
-        && selected_visual_only_stl.ascii.is_empty()
-        && selected_visual_only_stl.metrics.triangle_count == 0
-        && selected_visual_only_stl.metrics.byte_count == 0
-        && selected_visual_only_stl
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "manufacturing-output-not-pass")
-        && selected_visual_only_stl
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "missing-layers")
-        && !selected_visual_only_stl.visual_mesh_used_for_manufacturing
-        && selected_visual_only_binary_stl.status == boon_mesh_export::StlExportStatus::Fail
-        && selected_visual_only_binary_stl_validation.status
-            == boon_mesh_export::StlExportStatus::Fail
-        && selected_visual_only_binary_stl.bytes.is_empty()
-        && selected_visual_only_binary_stl.metrics.triangle_count == 0
-        && selected_visual_only_binary_stl.metrics.byte_count == 0
-        && selected_visual_only_binary_stl
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "manufacturing-output-not-pass")
-        && selected_visual_only_binary_stl
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "missing-layers")
-        && !selected_visual_only_binary_stl.visual_mesh_used_for_manufacturing;
+        && !selected_visual_only_package.visual_mesh_used_for_manufacturing;
     push_audit_check(
         &mut checks,
         &mut blockers,
         "3d-parametric-car:selected-visual-only-export-negative",
         selected_visual_only_export_negative_ok,
         format!(
-            "print_status={:?}, three_mf_status={:?}, three_mf_metrics={:?}, stl_status={:?}, stl_metrics={:?}, binary_stl_status={:?}, binary_stl_metrics={:?}",
+            "print_status={:?}, three_mf_status={:?}, three_mf_metrics={:?}",
             selected_window_print.status,
             selected_visual_only_package.status,
-            selected_visual_only_package.metrics,
-            selected_visual_only_stl.status,
-            selected_visual_only_stl.metrics,
-            selected_visual_only_binary_stl.status,
-            selected_visual_only_binary_stl.metrics
+            selected_visual_only_package.metrics
         ),
         (!selected_visual_only_export_negative_ok).then(|| {
-            "selected visual-only parametric car windows must fail 3MF/STL export without package entries, STL bytes, or visual-mesh fallback"
+            "selected visual-only parametric car windows must fail 3MF export without package entries or visual-mesh fallback"
                 .to_owned()
         }),
     );
@@ -13103,25 +12846,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "selected_body_three_mf_artifact_hash": selected_body_package.artifact_hash,
         "selected_body_three_mf_source_manufacturing_artifact_hash": selected_body_package.source_manufacturing_artifact_hash,
         "selected_body_three_mf_visual_mesh_used": selected_body_package.visual_mesh_used_for_manufacturing,
-        "selected_body_stl_status": format!("{:?}", selected_body_stl.status),
-        "selected_body_stl_validation_status": format!("{:?}", selected_body_stl_validation.status),
-        "selected_body_stl_layer_count": selected_body_stl.metrics.layer_count,
-        "selected_body_stl_polygon_count": selected_body_stl.metrics.polygon_count,
-        "selected_body_stl_triangle_count": selected_body_stl.metrics.triangle_count,
-        "selected_body_stl_byte_count": selected_body_stl.metrics.byte_count,
-        "selected_body_stl_artifact_hash": selected_body_stl.artifact_hash,
-        "selected_body_stl_source_manufacturing_artifact_hash": selected_body_stl.source_manufacturing_artifact_hash,
-        "selected_body_stl_topology_status": format!("{:?}", selected_body_stl_topology.status),
-        "selected_body_stl_topology_boundary_edge_count": selected_body_stl_topology.boundary_edge_count,
-        "selected_body_stl_export_topology_status": format!("{:?}", selected_body_stl_export_topology.status),
-        "selected_body_stl_export_topology_triangle_count": selected_body_stl_export_topology.triangle_count,
-        "selected_body_stl_export_topology_boundary_edge_count": selected_body_stl_export_topology.boundary_edge_count,
-        "selected_body_binary_stl_status": format!("{:?}", selected_body_binary_stl.status),
-        "selected_body_binary_stl_validation_status": format!("{:?}", selected_body_binary_stl_validation.status),
-        "selected_body_binary_stl_triangle_count": selected_body_binary_stl.metrics.triangle_count,
-        "selected_body_binary_stl_byte_count": selected_body_binary_stl.metrics.byte_count,
-        "selected_body_binary_stl_artifact_hash": selected_body_binary_stl.artifact_hash,
-        "selected_body_stl_visual_mesh_used": selected_body_stl.visual_mesh_used_for_manufacturing || selected_body_binary_stl.visual_mesh_used_for_manufacturing,
         "selected_wheel_three_mf_status": format!("{:?}", selected_wheel_package.status),
         "selected_wheel_three_mf_validation_status": format!("{:?}", selected_wheel_package_validation.status),
         "selected_wheel_three_mf_importer_smoke_status": format!("{:?}", selected_wheel_importer_smoke.status),
@@ -13141,25 +12865,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "selected_wheel_three_mf_artifact_hash": selected_wheel_package.artifact_hash,
         "selected_wheel_three_mf_source_manufacturing_artifact_hash": selected_wheel_package.source_manufacturing_artifact_hash,
         "selected_wheel_three_mf_visual_mesh_used": selected_wheel_package.visual_mesh_used_for_manufacturing,
-        "selected_wheel_stl_status": format!("{:?}", selected_wheel_stl.status),
-        "selected_wheel_stl_validation_status": format!("{:?}", selected_wheel_stl_validation.status),
-        "selected_wheel_stl_layer_count": selected_wheel_stl.metrics.layer_count,
-        "selected_wheel_stl_polygon_count": selected_wheel_stl.metrics.polygon_count,
-        "selected_wheel_stl_triangle_count": selected_wheel_stl.metrics.triangle_count,
-        "selected_wheel_stl_byte_count": selected_wheel_stl.metrics.byte_count,
-        "selected_wheel_stl_artifact_hash": selected_wheel_stl.artifact_hash,
-        "selected_wheel_stl_source_manufacturing_artifact_hash": selected_wheel_stl.source_manufacturing_artifact_hash,
-        "selected_wheel_stl_topology_status": format!("{:?}", selected_wheel_stl_topology.status),
-        "selected_wheel_stl_topology_boundary_edge_count": selected_wheel_stl_topology.boundary_edge_count,
-        "selected_wheel_stl_export_topology_status": format!("{:?}", selected_wheel_stl_export_topology.status),
-        "selected_wheel_stl_export_topology_triangle_count": selected_wheel_stl_export_topology.triangle_count,
-        "selected_wheel_stl_export_topology_boundary_edge_count": selected_wheel_stl_export_topology.boundary_edge_count,
-        "selected_wheel_binary_stl_status": format!("{:?}", selected_wheel_binary_stl.status),
-        "selected_wheel_binary_stl_validation_status": format!("{:?}", selected_wheel_binary_stl_validation.status),
-        "selected_wheel_binary_stl_triangle_count": selected_wheel_binary_stl.metrics.triangle_count,
-        "selected_wheel_binary_stl_byte_count": selected_wheel_binary_stl.metrics.byte_count,
-        "selected_wheel_binary_stl_artifact_hash": selected_wheel_binary_stl.artifact_hash,
-        "selected_wheel_stl_visual_mesh_used": selected_wheel_stl.visual_mesh_used_for_manufacturing || selected_wheel_binary_stl.visual_mesh_used_for_manufacturing,
         "selected_visual_only_manufacturing_status": format!("{:?}", selected_window_print.status),
         "selected_visual_only_manufacturing_layer_count": selected_window_print.metrics.layer_count,
         "selected_visual_only_manufacturing_polygon_count": selected_window_print.metrics.polygon_count,
@@ -13173,17 +12878,6 @@ fn verify_3d_parametric_car(args: &[String]) -> Result<(), Box<dyn std::error::E
         "selected_visual_only_three_mf_opc_zip_byte_count": selected_visual_only_package.opc_zip_bytes.len(),
         "selected_visual_only_three_mf_diagnostic_codes": selected_visual_only_package.diagnostics.iter().map(|diagnostic| diagnostic.code.clone()).collect::<Vec<_>>(),
         "selected_visual_only_three_mf_visual_mesh_used": selected_visual_only_package.visual_mesh_used_for_manufacturing,
-        "selected_visual_only_stl_status": format!("{:?}", selected_visual_only_stl.status),
-        "selected_visual_only_stl_validation_status": format!("{:?}", selected_visual_only_stl_validation.status),
-        "selected_visual_only_stl_triangle_count": selected_visual_only_stl.metrics.triangle_count,
-        "selected_visual_only_stl_byte_count": selected_visual_only_stl.metrics.byte_count,
-        "selected_visual_only_stl_diagnostic_codes": selected_visual_only_stl.diagnostics.iter().map(|diagnostic| diagnostic.code.clone()).collect::<Vec<_>>(),
-        "selected_visual_only_binary_stl_status": format!("{:?}", selected_visual_only_binary_stl.status),
-        "selected_visual_only_binary_stl_validation_status": format!("{:?}", selected_visual_only_binary_stl_validation.status),
-        "selected_visual_only_binary_stl_triangle_count": selected_visual_only_binary_stl.metrics.triangle_count,
-        "selected_visual_only_binary_stl_byte_count": selected_visual_only_binary_stl.metrics.byte_count,
-        "selected_visual_only_binary_stl_diagnostic_codes": selected_visual_only_binary_stl.diagnostics.iter().map(|diagnostic| diagnostic.code.clone()).collect::<Vec<_>>(),
-        "selected_visual_only_stl_visual_mesh_used": selected_visual_only_stl.visual_mesh_used_for_manufacturing || selected_visual_only_binary_stl.visual_mesh_used_for_manufacturing,
         "split_preparation_status": format!("{:?}", split_preparation.status),
         "split_suggested_segment_count": split_preparation.suggested_segment_count,
         "split_connector_pair_count": split_preparation.connector_pair_count,
@@ -15710,118 +15404,6 @@ fn verify_3mf_export(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     write_static_gate_report(args, "verify-3mf-export", report, checks, blockers, extra)
 }
 
-struct SolidGraphStlFixtureEvidence {
-    ok: bool,
-    detail: String,
-    report: JsonValue,
-}
-
-fn solid_graph_stl_fixture_evidence(
-    label: &str,
-    bundle: boon_solid_model::SolidModelBundle,
-    expects_holes: bool,
-) -> SolidGraphStlFixtureEvidence {
-    let print = boon_manufacturing::compile_print_job(
-        &bundle,
-        boon_manufacturing::PrintCompileRequest::default_for_bundle(&bundle),
-    );
-    let package = boon_mesh_export::export_ascii_stl_from_layers(&print);
-    let repeat = boon_mesh_export::export_ascii_stl_from_layers(&print);
-    let validation = boon_mesh_export::validate_ascii_stl_package(&package);
-    let binary = boon_mesh_export::export_binary_stl_from_layers(&print);
-    let binary_repeat = boon_mesh_export::export_binary_stl_from_layers(&print);
-    let binary_validation = boon_mesh_export::validate_binary_stl_package(&binary);
-    let topology = boon_mesh_export::validate_layer_prism_topology(&print);
-    let export_topology = boon_mesh_export::validate_export_triangle_stream_topology(&print);
-    let hole_expectation_ok = if expects_holes {
-        print.metrics.hole_count > 0
-    } else {
-        print.metrics.hole_count == 0
-    };
-    let ok = print.status == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && print.metrics.unsupported_operation_count == 0
-        && hole_expectation_ok
-        && package.status == boon_mesh_export::StlExportStatus::Pass
-        && validation.status == boon_mesh_export::StlExportStatus::Pass
-        && binary.status == boon_mesh_export::StlExportStatus::Pass
-        && binary_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && package.ascii == repeat.ascii
-        && package.artifact_hash == repeat.artifact_hash
-        && binary.bytes == binary_repeat.bytes
-        && binary.artifact_hash == binary_repeat.artifact_hash
-        && package.metrics.layer_count == print.metrics.layer_count
-        && package.metrics.polygon_count == print.metrics.polygon_count
-        && package.metrics.preserved_hole_count == print.metrics.hole_count
-        && package.metrics.rejected_hole_count == 0
-        && binary.metrics.preserved_hole_count == print.metrics.hole_count
-        && binary.metrics.rejected_hole_count == 0
-        && binary.metrics.triangle_count == package.metrics.triangle_count
-        && binary.metrics.byte_count == 84 + binary.metrics.triangle_count * 50
-        && topology.status == boon_mesh_export::StlExportStatus::Pass
-        && topology.checked_prism_count == print.metrics.polygon_count
-        && topology.triangle_count >= package.metrics.triangle_count
-        && topology.boundary_edge_count == 0
-        && topology.non_manifold_edge_count == 0
-        && topology.degenerate_triangle_count == 0
-        && export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && export_topology.checked_prism_count == print.metrics.polygon_count
-        && export_topology.triangle_count == package.metrics.triangle_count
-        && export_topology.raw_triangle_count <= topology.triangle_count
-        && export_topology.raw_triangle_count >= export_topology.triangle_count
-        && export_topology.boundary_edge_count == 0
-        && export_topology.non_manifold_edge_count == 0
-        && export_topology.degenerate_triangle_count == 0
-        && package.source_manufacturing_artifact_hash == print.artifact_hash
-        && binary.source_manufacturing_artifact_hash == print.artifact_hash
-        && !print.visual_mesh_used_for_manufacturing
-        && !package.visual_mesh_used_for_manufacturing
-        && !binary.visual_mesh_used_for_manufacturing;
-
-    let detail = format!(
-        "label={label}, print_status={:?}, stl_status={:?}, binary_status={:?}, validation={:?}, binary_validation={:?}, print_metrics={:?}, stl_metrics={:?}, topology={:?}, export_topology={:?}",
-        print.status,
-        package.status,
-        binary.status,
-        validation.status,
-        binary_validation.status,
-        print.metrics,
-        package.metrics,
-        topology,
-        export_topology
-    );
-    let report = json!({
-        "label": label,
-        "ok": ok,
-        "print_status": format!("{:?}", print.status),
-        "stl_status": format!("{:?}", package.status),
-        "binary_stl_status": format!("{:?}", binary.status),
-        "validation_status": format!("{:?}", validation.status),
-        "binary_validation_status": format!("{:?}", binary_validation.status),
-        "layer_count": package.metrics.layer_count,
-        "polygon_count": package.metrics.polygon_count,
-        "hole_count": print.metrics.hole_count,
-        "preserved_hole_count": package.metrics.preserved_hole_count,
-        "rejected_hole_count": package.metrics.rejected_hole_count,
-        "triangle_count": package.metrics.triangle_count,
-        "binary_triangle_count": binary.metrics.triangle_count,
-        "byte_count": package.metrics.byte_count,
-        "binary_byte_count": binary.metrics.byte_count,
-        "topology_status": format!("{:?}", topology.status),
-        "topology_boundary_edge_count": topology.boundary_edge_count,
-        "topology_non_manifold_edge_count": topology.non_manifold_edge_count,
-        "topology_degenerate_triangle_count": topology.degenerate_triangle_count,
-        "export_topology_status": format!("{:?}", export_topology.status),
-        "export_topology_boundary_edge_count": export_topology.boundary_edge_count,
-        "export_topology_non_manifold_edge_count": export_topology.non_manifold_edge_count,
-        "export_topology_degenerate_triangle_count": export_topology.degenerate_triangle_count,
-        "artifact_hash": package.artifact_hash,
-        "binary_artifact_hash": binary.artifact_hash,
-        "source_manufacturing_artifact_hash": package.source_manufacturing_artifact_hash,
-        "visual_mesh_used": package.visual_mesh_used_for_manufacturing,
-    });
-    SolidGraphStlFixtureEvidence { ok, detail, report }
-}
-
 fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
@@ -15835,10 +15417,6 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         std::fs::read_to_string("crates/boon_manufacturing/src/lib.rs").unwrap_or_default();
     let three_mf_cargo = std::fs::read_to_string("crates/boon_3mf/Cargo.toml").unwrap_or_default();
     let three_mf_lib = std::fs::read_to_string("crates/boon_3mf/src/lib.rs").unwrap_or_default();
-    let mesh_export_cargo =
-        std::fs::read_to_string("crates/boon_mesh_export/Cargo.toml").unwrap_or_default();
-    let mesh_export_lib =
-        std::fs::read_to_string("crates/boon_mesh_export/src/lib.rs").unwrap_or_default();
     let xtask_cargo = std::fs::read_to_string("crates/xtask/Cargo.toml")?;
 
     for required in [
@@ -15848,8 +15426,6 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         "boon_manufacturing = { path = \"crates/boon_manufacturing\" }",
         "crates/boon_3mf",
         "boon_3mf = { path = \"crates/boon_3mf\" }",
-        "crates/boon_mesh_export",
-        "boon_mesh_export = { path = \"crates/boon_mesh_export\" }",
     ] {
         let present = workspace.contains(required);
         push_audit_check(
@@ -15946,33 +15522,6 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             (!present).then(|| format!("boon_3mf missing `{required}`")),
         );
     }
-    for required in [
-        "pub struct StlPackage",
-        "pub struct BinaryStlPackage",
-        "pub struct StlMetrics",
-        "pub struct StlValidationReport",
-        "pub struct StlTopologyReport",
-        "pub fn export_ascii_stl_from_layers",
-        "pub fn export_binary_stl_from_layers",
-        "pub fn validate_ascii_stl_package",
-        "pub fn validate_binary_stl_package",
-        "pub fn validate_layer_prism_topology",
-        "pub fn validate_export_triangle_stream_topology",
-        "authoritative-manufacturing-layer-ascii-stl-hole-preserving",
-        "authoritative-manufacturing-layer-binary-stl-hole-preserving",
-        "preserved_hole_count",
-        "hole-triangulation-failed",
-    ] {
-        let present = mesh_export_lib.contains(required);
-        push_audit_check(
-            &mut checks,
-            &mut blockers,
-            format!("mesh-export:model-symbol:{required}"),
-            present,
-            format!("boon_mesh_export contains `{required}`={present}"),
-            (!present).then(|| format!("boon_mesh_export missing `{required}`")),
-        );
-    }
     for forbidden in [
         "wgpu::",
         "glyphon::",
@@ -15994,32 +15543,6 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             present.then(|| {
                 format!(
                     "boon_solid_model must not depend on platform/runtime/UI marker `{forbidden}`"
-                )
-            }),
-        );
-    }
-    for forbidden in [
-        "wgpu::",
-        "glyphon::",
-        "app_window",
-        "accesskit::",
-        "web_sys::",
-        "wasm_bindgen::",
-        "boon_native_",
-        "boon_runtime",
-        "boon_document",
-        "boon_scene_model",
-    ] {
-        let present = mesh_export_lib.contains(forbidden) || mesh_export_cargo.contains(forbidden);
-        push_audit_check(
-            &mut checks,
-            &mut blockers,
-            format!("mesh-export:platform-neutral-forbid:{forbidden}"),
-            !present,
-            format!("boon_mesh_export contains `{forbidden}`={present}"),
-            present.then(|| {
-                format!(
-                    "boon_mesh_export must not depend on platform/runtime/UI/visual marker `{forbidden}`"
                 )
             }),
         );
@@ -16135,26 +15658,6 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
                 .to_owned()
         }),
     );
-    let mesh_export_deps_ok = mesh_export_cargo.contains("boon_manufacturing.workspace = true")
-        && mesh_export_cargo.contains("serde.workspace = true")
-        && !mesh_export_cargo.contains("boon_scene_model")
-        && !mesh_export_cargo.contains("wgpu")
-        && xtask_cargo.contains("boon_mesh_export.workspace = true");
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:dependency-light-manufacturing-only",
-        mesh_export_deps_ok,
-        format!(
-            "mesh_export_deps_ok={mesh_export_deps_ok}, xtask_dep={}",
-            xtask_cargo.contains("boon_mesh_export.workspace = true")
-        ),
-        (!mesh_export_deps_ok).then(|| {
-            "STL compatibility export should depend on manufacturing models, not scene/native/runtime crates"
-                .to_owned()
-        }),
-    );
-
     let bracket = boon_solid_model::SolidModelBundle::printable_bracket_fixture();
     let (solid_metrics, assembly_metrics) = bracket.metrics();
     let validation = bracket.validate();
@@ -18776,281 +18279,6 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let car_stl_package = boon_mesh_export::export_ascii_stl_from_layers(&car_print_output);
-    let car_stl_repeat = boon_mesh_export::export_ascii_stl_from_layers(&car_print_output);
-    let car_stl_validation = boon_mesh_export::validate_ascii_stl_package(&car_stl_package);
-    let car_binary_stl_package = boon_mesh_export::export_binary_stl_from_layers(&car_print_output);
-    let car_binary_stl_repeat = boon_mesh_export::export_binary_stl_from_layers(&car_print_output);
-    let car_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&car_binary_stl_package);
-    let car_stl_topology = boon_mesh_export::validate_layer_prism_topology(&car_print_output);
-    let car_stl_export_topology =
-        boon_mesh_export::validate_export_triangle_stream_topology(&car_print_output);
-    let car_stl_ok = car_print_output.status
-        == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && car_print_output.metrics.hole_count == 0
-        && car_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && car_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && car_stl_package.scope == "authoritative-manufacturing-layer-ascii-stl-hole-preserving"
-        && car_stl_package.metrics.layer_count == car_print_output.metrics.layer_count
-        && car_stl_package.metrics.polygon_count == car_print_output.metrics.polygon_count
-        && car_stl_package.metrics.preserved_hole_count == 0
-        && car_stl_package.metrics.rejected_hole_count == 0
-        && car_stl_package.metrics.triangle_count > car_print_output.metrics.polygon_count
-        && car_stl_package.metrics.byte_count > 0
-        && car_stl_package.artifact_hash == car_stl_repeat.artifact_hash
-        && car_stl_package.ascii == car_stl_repeat.ascii
-        && car_binary_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && car_binary_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && car_binary_stl_package.scope
-            == "authoritative-manufacturing-layer-binary-stl-hole-preserving"
-        && car_binary_stl_package.metrics.triangle_count == car_stl_package.metrics.triangle_count
-        && car_binary_stl_package.metrics.preserved_hole_count == 0
-        && car_binary_stl_package.metrics.rejected_hole_count == 0
-        && car_binary_stl_package.metrics.byte_count
-            == 84 + car_binary_stl_package.metrics.triangle_count * 50
-        && car_binary_stl_package.artifact_hash == car_binary_stl_repeat.artifact_hash
-        && car_binary_stl_package.bytes == car_binary_stl_repeat.bytes
-        && car_stl_package.artifact_hash.starts_with("sha256:")
-        && car_binary_stl_package.artifact_hash.starts_with("sha256:")
-        && car_stl_package.source_manufacturing_artifact_hash == car_print_output.artifact_hash
-        && car_binary_stl_package.source_manufacturing_artifact_hash
-            == car_print_output.artifact_hash
-        && !car_stl_package.visual_mesh_used_for_manufacturing;
-    let car_stl_ok = car_stl_ok && !car_binary_stl_package.visual_mesh_used_for_manufacturing;
-    let car_stl_ok = car_stl_ok
-        && car_stl_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && car_stl_topology.checked_prism_count == car_print_output.metrics.polygon_count
-        && car_stl_topology.triangle_count >= car_stl_package.metrics.triangle_count
-        && car_stl_topology.boundary_edge_count == 0
-        && car_stl_topology.non_manifold_edge_count == 0
-        && car_stl_topology.degenerate_triangle_count == 0
-        && car_stl_export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && car_stl_export_topology.triangle_count == car_stl_package.metrics.triangle_count
-        && car_stl_export_topology.raw_triangle_count <= car_stl_topology.triangle_count
-        && car_stl_export_topology.raw_triangle_count >= car_stl_export_topology.triangle_count
-        && car_stl_export_topology.boundary_edge_count == 0
-        && car_stl_export_topology.non_manifold_edge_count == 0
-        && car_stl_export_topology.degenerate_triangle_count == 0;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "parametric-car:stl-exports-manufacturing-layers",
-        car_stl_ok,
-        format!(
-            "stl_status={:?}, metrics={:?}, validation={:?}, diagnostics={:?}, topology={:?}, export_topology={:?}",
-            car_stl_package.status,
-            car_stl_package.metrics,
-            car_stl_validation,
-            car_stl_package.diagnostics,
-            car_stl_topology,
-            car_stl_export_topology
-        ),
-        (!car_stl_ok).then(|| {
-            "parametric car manufacturing layers must export deterministic ASCII STL without using visual meshes"
-                .to_owned()
-        }),
-    );
-
-    let bracket_stl_fixture = boon_solid_model::SolidModelBundle::printable_bracket_fixture();
-    let bracket_stl_print = boon_manufacturing::compile_print_job(
-        &bracket_stl_fixture,
-        boon_manufacturing::PrintCompileRequest::default_for_bundle(&bracket_stl_fixture),
-    );
-    let bracket_stl_package = boon_mesh_export::export_ascii_stl_from_layers(&bracket_stl_print);
-    let bracket_stl_validation = boon_mesh_export::validate_ascii_stl_package(&bracket_stl_package);
-    let bracket_binary_stl_package =
-        boon_mesh_export::export_binary_stl_from_layers(&bracket_stl_print);
-    let bracket_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&bracket_binary_stl_package);
-    let bracket_stl_topology = boon_mesh_export::validate_layer_prism_topology(&bracket_stl_print);
-    let bracket_stl_export_topology =
-        boon_mesh_export::validate_export_triangle_stream_topology(&bracket_stl_print);
-    let bracket_stl_hole_preserving_ok = bracket_stl_print.status
-        == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && bracket_stl_print.metrics.hole_count > 0
-        && bracket_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_stl_package.metrics.preserved_hole_count == bracket_stl_print.metrics.hole_count
-        && bracket_stl_package.metrics.rejected_hole_count == 0
-        && bracket_stl_package.metrics.triangle_count > bracket_stl_print.metrics.polygon_count
-        && bracket_stl_package.metrics.byte_count > 0
-        && bracket_stl_package.artifact_hash.starts_with("sha256:")
-        && bracket_stl_package.source_manufacturing_artifact_hash
-            == bracket_stl_print.artifact_hash
-        && !bracket_stl_package.visual_mesh_used_for_manufacturing
-        && bracket_binary_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_binary_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_binary_stl_package.metrics.preserved_hole_count
-            == bracket_stl_print.metrics.hole_count
-        && bracket_binary_stl_package.metrics.rejected_hole_count == 0
-        && bracket_binary_stl_package.metrics.triangle_count
-            == bracket_stl_package.metrics.triangle_count
-        && bracket_binary_stl_package.metrics.byte_count
-            == 84 + bracket_binary_stl_package.metrics.triangle_count * 50
-        && bracket_binary_stl_package.source_manufacturing_artifact_hash
-            == bracket_stl_print.artifact_hash
-        && !bracket_binary_stl_package.visual_mesh_used_for_manufacturing;
-    let bracket_stl_hole_preserving_ok = bracket_stl_hole_preserving_ok
-        && bracket_stl_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_stl_topology.checked_prism_count == bracket_stl_print.metrics.polygon_count
-        && bracket_stl_topology.triangle_count >= bracket_stl_package.metrics.triangle_count
-        && bracket_stl_topology.boundary_edge_count == 0
-        && bracket_stl_topology.non_manifold_edge_count == 0
-        && bracket_stl_topology.degenerate_triangle_count == 0
-        && bracket_stl_export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && bracket_stl_export_topology.triangle_count == bracket_stl_package.metrics.triangle_count
-        && bracket_stl_export_topology.raw_triangle_count <= bracket_stl_topology.triangle_count
-        && bracket_stl_export_topology.raw_triangle_count
-            >= bracket_stl_export_topology.triangle_count
-        && bracket_stl_export_topology.boundary_edge_count == 0
-        && bracket_stl_export_topology.non_manifold_edge_count == 0
-        && bracket_stl_export_topology.degenerate_triangle_count == 0;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:stl-preserves-hole-bearing-layers",
-        bracket_stl_hole_preserving_ok,
-        format!(
-            "stl_status={:?}, metrics={:?}, validation={:?}, diagnostics={:?}, topology={:?}, export_topology={:?}",
-            bracket_stl_package.status,
-            bracket_stl_package.metrics,
-            bracket_stl_validation,
-            bracket_stl_package.diagnostics,
-            bracket_stl_topology,
-            bracket_stl_export_topology
-        ),
-        (!bracket_stl_hole_preserving_ok).then(|| {
-            "STL compatibility export must preserve hole-bearing manufacturing layers through cap triangulation and hole-wall facets"
-                .to_owned()
-        }),
-    );
-
-    let slot_stl_fixture = boon_solid_model::SolidModelBundle::box_slot_difference_fixture();
-    let slot_stl_print = boon_manufacturing::compile_print_job(
-        &slot_stl_fixture,
-        boon_manufacturing::PrintCompileRequest::default_for_bundle(&slot_stl_fixture),
-    );
-    let slot_stl_package = boon_mesh_export::export_ascii_stl_from_layers(&slot_stl_print);
-    let slot_stl_repeat = boon_mesh_export::export_ascii_stl_from_layers(&slot_stl_print);
-    let slot_stl_validation = boon_mesh_export::validate_ascii_stl_package(&slot_stl_package);
-    let slot_binary_stl_package = boon_mesh_export::export_binary_stl_from_layers(&slot_stl_print);
-    let slot_binary_stl_repeat = boon_mesh_export::export_binary_stl_from_layers(&slot_stl_print);
-    let slot_binary_stl_validation =
-        boon_mesh_export::validate_binary_stl_package(&slot_binary_stl_package);
-    let slot_stl_topology = boon_mesh_export::validate_layer_prism_topology(&slot_stl_print);
-    let slot_stl_export_topology =
-        boon_mesh_export::validate_export_triangle_stream_topology(&slot_stl_print);
-    let slot_stl_hole_preserving_ok = slot_stl_print.status
-        == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && slot_stl_print.metrics.polygon_count == slot_stl_print.metrics.layer_count
-        && slot_stl_print.metrics.hole_count == slot_stl_print.metrics.layer_count
-        && slot_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_stl_package.metrics.preserved_hole_count == slot_stl_print.metrics.hole_count
-        && slot_stl_package.metrics.rejected_hole_count == 0
-        && slot_stl_package.artifact_hash == slot_stl_repeat.artifact_hash
-        && slot_stl_package.ascii == slot_stl_repeat.ascii
-        && slot_stl_package.source_manufacturing_artifact_hash == slot_stl_print.artifact_hash
-        && !slot_stl_package.visual_mesh_used_for_manufacturing
-        && slot_binary_stl_package.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_binary_stl_validation.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_binary_stl_package.metrics.preserved_hole_count
-            == slot_stl_print.metrics.hole_count
-        && slot_binary_stl_package.metrics.rejected_hole_count == 0
-        && slot_binary_stl_package.metrics.triangle_count
-            == slot_stl_package.metrics.triangle_count
-        && slot_binary_stl_package.metrics.byte_count
-            == 84 + slot_binary_stl_package.metrics.triangle_count * 50
-        && slot_binary_stl_package.artifact_hash == slot_binary_stl_repeat.artifact_hash
-        && slot_binary_stl_package.bytes == slot_binary_stl_repeat.bytes
-        && slot_binary_stl_package.source_manufacturing_artifact_hash
-            == slot_stl_print.artifact_hash
-        && !slot_binary_stl_package.visual_mesh_used_for_manufacturing;
-    let slot_stl_hole_preserving_ok = slot_stl_hole_preserving_ok
-        && slot_stl_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_stl_topology.checked_prism_count == slot_stl_print.metrics.polygon_count
-        && slot_stl_topology.boundary_edge_count == 0
-        && slot_stl_topology.non_manifold_edge_count == 0
-        && slot_stl_topology.degenerate_triangle_count == 0
-        && slot_stl_export_topology.status == boon_mesh_export::StlExportStatus::Pass
-        && slot_stl_export_topology.triangle_count == slot_stl_package.metrics.triangle_count
-        && slot_stl_export_topology.raw_triangle_count <= slot_stl_topology.triangle_count
-        && slot_stl_export_topology.raw_triangle_count >= slot_stl_export_topology.triangle_count
-        && slot_stl_export_topology.boundary_edge_count == 0
-        && slot_stl_export_topology.non_manifold_edge_count == 0
-        && slot_stl_export_topology.degenerate_triangle_count == 0;
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:box-slot-difference-stl-preserves-rectangular-hole-layers",
-        slot_stl_hole_preserving_ok,
-        format!(
-            "stl_status={:?}, metrics={:?}, validation={:?}, diagnostics={:?}, topology={:?}, export_topology={:?}",
-            slot_stl_package.status,
-            slot_stl_package.metrics,
-            slot_stl_validation,
-            slot_stl_package.diagnostics,
-            slot_stl_topology,
-            slot_stl_export_topology
-        ),
-        (!slot_stl_hole_preserving_ok).then(|| {
-            "STL compatibility export must preserve rectangular slot holes from authoritative manufacturing layers without visual mesh fallback"
-                .to_owned()
-        }),
-    );
-
-    let shell_box_stl_evidence = solid_graph_stl_fixture_evidence(
-        "shell-box",
-        boon_solid_model::SolidModelBundle::shell_box_fixture(),
-        true,
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:shell-box-stl-preserves-authoritative-hollow-layers",
-        shell_box_stl_evidence.ok,
-        shell_box_stl_evidence.detail.clone(),
-        (!shell_box_stl_evidence.ok).then(|| {
-            "STL compatibility export must preserve supported shell hollow layers and holes without visual mesh fallback"
-                .to_owned()
-        }),
-    );
-
-    let extruded_rectangle_stl_evidence = solid_graph_stl_fixture_evidence(
-        "extruded-rectangle",
-        boon_solid_model::SolidModelBundle::extruded_rectangle_fixture(),
-        false,
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:extruded-rectangle-stl-preserves-authoritative-profile-layers",
-        extruded_rectangle_stl_evidence.ok,
-        extruded_rectangle_stl_evidence.detail.clone(),
-        (!extruded_rectangle_stl_evidence.ok).then(|| {
-            "STL compatibility export must preserve supported extruded profile layers without visual mesh fallback"
-                .to_owned()
-        }),
-    );
-
-    let revolved_ring_stl_evidence = solid_graph_stl_fixture_evidence(
-        "revolved-ring",
-        boon_solid_model::SolidModelBundle::revolved_ring_fixture(),
-        true,
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "mesh-export:revolved-ring-stl-preserves-authoritative-annulus-layers",
-        revolved_ring_stl_evidence.ok,
-        revolved_ring_stl_evidence.detail.clone(),
-        (!revolved_ring_stl_evidence.ok).then(|| {
-            "STL compatibility export must preserve supported revolved annulus layers and holes without visual mesh fallback"
-                .to_owned()
-        }),
-    );
-
     let car_split_three_mf_packages = boon_3mf::export_split_3mf_entry_sets_with_preparation(
         &car_print_output,
         &car_split_print_output,
@@ -20224,93 +19452,6 @@ manufacturing: Assembly/new(
             "parametric_car_three_mf_importer_smoke_placeholder_mesh_object_count": car_three_mf_importer_smoke.metrics.placeholder_mesh_object_count,
             "parametric_car_three_mf_importer_smoke_preparation_metadata_decoded": car_three_mf_importer_smoke.metrics.preparation_metadata_decoded,
             "parametric_car_three_mf_importer_smoke_source_hash_matches": car_three_mf_importer_smoke.metrics.source_hash_matches,
-            "parametric_car_stl_status": format!("{:?}", car_stl_package.status),
-            "parametric_car_stl_scope": car_stl_package.scope,
-            "parametric_car_stl_validation_status": format!("{:?}", car_stl_validation.status),
-            "parametric_car_stl_layer_count": car_stl_package.metrics.layer_count,
-            "parametric_car_stl_polygon_count": car_stl_package.metrics.polygon_count,
-            "parametric_car_stl_triangle_count": car_stl_package.metrics.triangle_count,
-            "parametric_car_stl_byte_count": car_stl_package.metrics.byte_count,
-            "parametric_car_stl_preserved_hole_count": car_stl_package.metrics.preserved_hole_count,
-            "parametric_car_stl_rejected_hole_count": car_stl_package.metrics.rejected_hole_count,
-            "parametric_car_stl_source_manufacturing_artifact_hash": car_stl_package.source_manufacturing_artifact_hash,
-            "parametric_car_stl_topology_status": format!("{:?}", car_stl_topology.status),
-            "parametric_car_stl_topology_checked_prism_count": car_stl_topology.checked_prism_count,
-            "parametric_car_stl_topology_triangle_count": car_stl_topology.triangle_count,
-            "parametric_car_stl_topology_boundary_edge_count": car_stl_topology.boundary_edge_count,
-            "parametric_car_stl_topology_non_manifold_edge_count": car_stl_topology.non_manifold_edge_count,
-            "parametric_car_stl_topology_degenerate_triangle_count": car_stl_topology.degenerate_triangle_count,
-            "parametric_car_stl_export_topology_status": format!("{:?}", car_stl_export_topology.status),
-            "parametric_car_stl_export_topology_triangle_count": car_stl_export_topology.triangle_count,
-            "parametric_car_stl_export_topology_raw_triangle_count": car_stl_export_topology.raw_triangle_count,
-            "parametric_car_stl_export_topology_culled_internal_triangle_pair_count": car_stl_export_topology.culled_internal_triangle_pair_count,
-            "parametric_car_stl_export_topology_culled_duplicate_triangle_count": car_stl_export_topology.culled_duplicate_triangle_count,
-            "parametric_car_stl_export_topology_boundary_edge_count": car_stl_export_topology.boundary_edge_count,
-            "parametric_car_stl_export_topology_non_manifold_edge_count": car_stl_export_topology.non_manifold_edge_count,
-            "parametric_car_stl_export_topology_degenerate_triangle_count": car_stl_export_topology.degenerate_triangle_count,
-            "parametric_car_stl_export_topology_boundary_edge_samples": car_stl_export_topology.boundary_edge_samples,
-            "parametric_car_stl_export_topology_non_manifold_edge_samples": car_stl_export_topology.non_manifold_edge_samples,
-            "parametric_car_binary_stl_status": format!("{:?}", car_binary_stl_package.status),
-            "parametric_car_binary_stl_scope": car_binary_stl_package.scope,
-            "parametric_car_binary_stl_validation_status": format!("{:?}", car_binary_stl_validation.status),
-            "parametric_car_binary_stl_triangle_count": car_binary_stl_package.metrics.triangle_count,
-            "parametric_car_binary_stl_byte_count": car_binary_stl_package.metrics.byte_count,
-            "parametric_car_binary_stl_preserved_hole_count": car_binary_stl_package.metrics.preserved_hole_count,
-            "parametric_car_binary_stl_rejected_hole_count": car_binary_stl_package.metrics.rejected_hole_count,
-            "mesh_export_hole_preserving_status": format!("{:?}", bracket_stl_package.status),
-            "mesh_export_hole_preserving_validation_status": format!("{:?}", bracket_stl_validation.status),
-            "mesh_export_hole_preserving_preserved_hole_count": bracket_stl_package.metrics.preserved_hole_count,
-            "mesh_export_hole_preserving_rejected_hole_count": bracket_stl_package.metrics.rejected_hole_count,
-            "mesh_export_hole_preserving_triangle_count": bracket_stl_package.metrics.triangle_count,
-            "mesh_export_hole_preserving_topology_status": format!("{:?}", bracket_stl_topology.status),
-            "mesh_export_hole_preserving_topology_checked_prism_count": bracket_stl_topology.checked_prism_count,
-            "mesh_export_hole_preserving_topology_triangle_count": bracket_stl_topology.triangle_count,
-            "mesh_export_hole_preserving_topology_boundary_edge_count": bracket_stl_topology.boundary_edge_count,
-            "mesh_export_hole_preserving_topology_non_manifold_edge_count": bracket_stl_topology.non_manifold_edge_count,
-            "mesh_export_hole_preserving_topology_degenerate_triangle_count": bracket_stl_topology.degenerate_triangle_count,
-            "mesh_export_hole_preserving_export_topology_status": format!("{:?}", bracket_stl_export_topology.status),
-            "mesh_export_hole_preserving_export_topology_triangle_count": bracket_stl_export_topology.triangle_count,
-            "mesh_export_hole_preserving_export_topology_raw_triangle_count": bracket_stl_export_topology.raw_triangle_count,
-            "mesh_export_hole_preserving_export_topology_culled_internal_triangle_pair_count": bracket_stl_export_topology.culled_internal_triangle_pair_count,
-            "mesh_export_hole_preserving_export_topology_culled_duplicate_triangle_count": bracket_stl_export_topology.culled_duplicate_triangle_count,
-            "mesh_export_hole_preserving_export_topology_boundary_edge_count": bracket_stl_export_topology.boundary_edge_count,
-            "mesh_export_hole_preserving_export_topology_non_manifold_edge_count": bracket_stl_export_topology.non_manifold_edge_count,
-            "mesh_export_hole_preserving_export_topology_degenerate_triangle_count": bracket_stl_export_topology.degenerate_triangle_count,
-            "mesh_export_hole_preserving_export_topology_boundary_edge_samples": bracket_stl_export_topology.boundary_edge_samples,
-            "mesh_export_hole_preserving_export_topology_non_manifold_edge_samples": bracket_stl_export_topology.non_manifold_edge_samples,
-            "mesh_export_binary_hole_preserving_status": format!("{:?}", bracket_binary_stl_package.status),
-            "mesh_export_binary_hole_preserving_validation_status": format!("{:?}", bracket_binary_stl_validation.status),
-            "mesh_export_binary_hole_preserving_preserved_hole_count": bracket_binary_stl_package.metrics.preserved_hole_count,
-            "mesh_export_binary_hole_preserving_rejected_hole_count": bracket_binary_stl_package.metrics.rejected_hole_count,
-            "mesh_export_binary_hole_preserving_triangle_count": bracket_binary_stl_package.metrics.triangle_count,
-            "mesh_export_binary_hole_preserving_byte_count": bracket_binary_stl_package.metrics.byte_count,
-            "box_slot_difference_stl_status": format!("{:?}", slot_stl_package.status),
-            "box_slot_difference_stl_validation_status": format!("{:?}", slot_stl_validation.status),
-            "box_slot_difference_stl_layer_count": slot_stl_package.metrics.layer_count,
-            "box_slot_difference_stl_polygon_count": slot_stl_package.metrics.polygon_count,
-            "box_slot_difference_stl_preserved_hole_count": slot_stl_package.metrics.preserved_hole_count,
-            "box_slot_difference_stl_rejected_hole_count": slot_stl_package.metrics.rejected_hole_count,
-            "box_slot_difference_stl_triangle_count": slot_stl_package.metrics.triangle_count,
-            "box_slot_difference_stl_byte_count": slot_stl_package.metrics.byte_count,
-            "box_slot_difference_stl_topology_status": format!("{:?}", slot_stl_topology.status),
-            "box_slot_difference_stl_topology_checked_prism_count": slot_stl_topology.checked_prism_count,
-            "box_slot_difference_stl_topology_triangle_count": slot_stl_topology.triangle_count,
-            "box_slot_difference_stl_topology_boundary_edge_count": slot_stl_topology.boundary_edge_count,
-            "box_slot_difference_stl_topology_non_manifold_edge_count": slot_stl_topology.non_manifold_edge_count,
-            "box_slot_difference_stl_topology_degenerate_triangle_count": slot_stl_topology.degenerate_triangle_count,
-            "box_slot_difference_stl_export_topology_status": format!("{:?}", slot_stl_export_topology.status),
-            "box_slot_difference_stl_export_topology_triangle_count": slot_stl_export_topology.triangle_count,
-            "box_slot_difference_stl_export_topology_raw_triangle_count": slot_stl_export_topology.raw_triangle_count,
-            "box_slot_difference_binary_stl_status": format!("{:?}", slot_binary_stl_package.status),
-            "box_slot_difference_binary_stl_validation_status": format!("{:?}", slot_binary_stl_validation.status),
-            "box_slot_difference_binary_stl_preserved_hole_count": slot_binary_stl_package.metrics.preserved_hole_count,
-            "box_slot_difference_binary_stl_rejected_hole_count": slot_binary_stl_package.metrics.rejected_hole_count,
-            "box_slot_difference_binary_stl_triangle_count": slot_binary_stl_package.metrics.triangle_count,
-            "box_slot_difference_binary_stl_byte_count": slot_binary_stl_package.metrics.byte_count,
-            "shell_box_stl_evidence": shell_box_stl_evidence.report,
-            "extruded_rectangle_stl_evidence": extruded_rectangle_stl_evidence.report,
-            "revolved_ring_stl_evidence": revolved_ring_stl_evidence.report,
-            "mesh_export_profile_stl_status": if shell_box_stl_evidence.ok && extruded_rectangle_stl_evidence.ok && revolved_ring_stl_evidence.ok { "shell-extrude-and-revolve-authoritative-layer-stl-pass" } else { "fail" },
             "visual_compiler_status": visual_proxy_report.visual_compiler_status,
             "visual_proxy_geometry_count": visual_proxy_metrics.geometry_count,
             "visual_proxy_instance_count": visual_proxy_metrics.instance_count,
@@ -20409,7 +19550,7 @@ manufacturing: Assembly/new(
             "three_mf_negative_validation_status": format!("{:?}", negative_three_mf_validation.status),
             "native_web_3d_parity_status": "not-covered-by-this-report",
             "u8_status": "solidgraph-assembly-generic-boon-output-mixed-proxy-and-exact-primitive-visual",
-            "u9_status": "direct-solidgraph-layer-3mf-opc-zip-and-profile-hole-preserving-stl"
+            "u9_status": "direct-solidgraph-layer-3mf-opc-zip-and-profile-holes"
     });
     if let Some(extra) = solid_graph_extra.as_object_mut() {
         extra.insert(
@@ -50713,7 +49854,7 @@ fn native_gpu_handoff_manifest_reports()
             .get("command")
             .and_then(serde_json::Value::as_str)
             .ok_or("native GPU handoff report missing command")?;
-        if !XTASK_COMMANDS.contains(&command) {
+        if !xtask_command_exists(command) {
             return Err(format!(
                 "native GPU handoff report `{label}` references unknown xtask command `{command}`"
             )
@@ -50853,7 +49994,7 @@ fn parse_native_gpu_manifest_upstream_dependencies(
             .ok_or_else(|| {
                 format!("native GPU handoff report `{native_label}` upstream dependency `{label}` missing command")
             })?;
-        if !XTASK_COMMANDS.contains(&command) {
+        if !xtask_command_exists(command) {
             return Err(format!(
                 "native GPU handoff report `{native_label}` upstream native dependency `{label}` references unknown xtask command `{command}`"
             )
@@ -54785,22 +53926,14 @@ fn write_static_gate_report(
 }
 
 fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
+    if let Some(path) = native_gpu_manifest_default_report_path(command, args) {
+        return path;
+    }
     let name = match command {
-        "verify-platform-contract" => "platform-contract",
-        "verify-native-gpu-dependency-graph" => "dependency-graph",
-        "verify-native-gpu-architecture" => "architecture",
-        "verify-native-gpu-layout-contract" => "layout-contract",
-        "verify-native-gpu-shaders" => "shaders",
-        "verify-native-gpu-multiwindow" => "multiwindow",
-        "verify-native-gpu-ipc-backpressure" => "ipc-backpressure",
-        "verify-native-gpu-observability" => "observability",
         "verify-wgpu-readback" => "wgpu-readback",
         "verify-wgpu-retained-arenas" => "wgpu-retained-arenas",
         "verify-native-gpu-preview-e2e" => match value_arg(args, "--example").as_deref() {
             Some("counter") => "preview-e2e-counter",
-            Some("todomvc") => "preview-e2e-todomvc",
-            Some("cells") => "preview-e2e-cells",
-            Some("todo_mvc_physical") => "preview-e2e-todo_mvc_physical",
             Some("novywave") => "preview-e2e-novywave",
             Some("hello_3d") => "preview-e2e-hello_3d",
             _ => "preview-e2e",
@@ -54849,8 +53982,6 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("release") => "cells-visible-click-e2e-release",
             _ => "cells-visible-click-e2e-debug",
         },
-        "verify-native-gpu-present-floor" => "present-floor",
-        "verify-native-todomvc-physical-reference-parity" => "todomvc-physical-reference-parity",
         "verify-native-gpu-novywave-visual" => "novywave-visual",
         "verify-native-gpu-novywave-interaction-speed" => "novywave-interaction-speed",
         "verify-native-gpu-scroll-speed" => {
@@ -54859,11 +53990,47 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
                 "target/reports/native-gpu/scroll-speed-{label}.json"
             ));
         }
-        "verify-native-gpu-negative" => "negative",
         "verify-native-gpu-all" => return PathBuf::from("target/reports/native-gpu-all.json"),
         _ => command,
     };
     PathBuf::from(format!("target/reports/native-gpu/{name}.json"))
+}
+
+fn native_gpu_manifest_default_report_path(command: &str, args: &[String]) -> Option<PathBuf> {
+    let reports = native_gpu_handoff_manifest_reports().ok()?;
+    let mut empty_flag_match = None;
+    for report in reports {
+        if report.command != command {
+            continue;
+        }
+        if report.required_argv.is_empty()
+            || native_manifest_required_argv_satisfied(args, report.required_argv)
+        {
+            return Some(report.path);
+        }
+        if report
+            .required_argv
+            .iter()
+            .all(|(_flag, value)| value.is_empty())
+        {
+            empty_flag_match.get_or_insert(report.path);
+        }
+    }
+    empty_flag_match
+}
+
+fn native_manifest_required_argv_satisfied(
+    args: &[String],
+    required_argv: &[(&str, &str)],
+) -> bool {
+    required_argv.iter().all(|(flag, value)| {
+        if value.is_empty() {
+            args.iter().any(|arg| arg == flag)
+        } else {
+            args.windows(2)
+                .any(|pair| pair[0] == *flag && pair[1] == *value)
+        }
+    })
 }
 
 fn native_gpu_report_rejects(report: &serde_json::Value) -> bool {
@@ -59310,7 +58477,7 @@ fn refresh_queue_command_allowed(
     };
     let xtask_refresh_command_allowed = || {
         executable.starts_with("xtask")
-            && XTASK_COMMANDS.contains(&command)
+            && xtask_command_exists(command)
             && command != runner_command
             && command != "verify-native-gpu-all"
             && command != "verify-bytes-machine-plan-all"
@@ -72142,7 +71309,11 @@ mod tests {
     fn advertised_xtask_commands_are_unique() {
         let mut seen = BTreeSet::new();
         for command in XTASK_COMMANDS {
-            assert!(seen.insert(*command), "duplicate xtask command `{command}`");
+            assert!(
+                seen.insert(command.0),
+                "duplicate xtask command `{}`",
+                command.0
+            );
         }
     }
 
@@ -73406,7 +72577,7 @@ mod tests {
                 "duplicate path {}",
                 report.path.display()
             );
-            assert!(XTASK_COMMANDS.contains(&report.command));
+            assert!(xtask_command_exists(report.command));
             assert!(report.max_report_bytes > 0);
             let mut upstream_labels = BTreeSet::new();
             for dependency in report.upstream_dependencies {
@@ -73418,7 +72589,7 @@ mod tests {
                 );
                 assert_eq!(dependency.measurement_mode, "proof");
                 assert_eq!(dependency.kind, "consumes-native-report");
-                assert!(XTASK_COMMANDS.contains(&dependency.command));
+                assert!(xtask_command_exists(dependency.command));
                 assert_eq!(dependency.owner_aggregate, "verify-native-gpu-all");
             }
         }

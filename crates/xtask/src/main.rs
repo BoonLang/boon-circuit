@@ -3049,10 +3049,8 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut generation = 0u64;
     loop {
         generation = generation.saturating_add(1);
-        let build = Command::new("cargo")
-            .args(["build", "-p", "boon_native_playground"])
-            .status()?;
-        if !build.success() {
+        let build = build_native_playground_for_profile("debug")?;
+        if !build.success {
             write_json(
                 &report,
                 &json!({
@@ -3061,7 +3059,7 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "measurement_mode": "diagnostic",
                     "example": entry.id,
                     "generation": generation,
-                    "build_status": build.to_string(),
+                    "build_status": build.status.clone(),
                     "watch_roots": watch_roots,
                     "watch_file_count": snapshot.len(),
                     "blockers": ["cargo build -p boon_native_playground failed"]
@@ -3092,8 +3090,8 @@ fn playground_watch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "measurement_mode": "diagnostic",
                 "example": entry.id,
                 "source_path": entry.source,
-                "binary_path": "target/debug/boon_native_playground",
-                "binary_hash": file_hash("target/debug/boon_native_playground"),
+                "binary_path": build.binary_path.display().to_string(),
+                "binary_hash": file_hash(build.binary_path.to_string_lossy().as_ref()),
                 "generation": generation,
                 "watch_roots": watch_roots,
                 "watch_file_count": snapshot.len(),
@@ -13354,50 +13352,84 @@ fn verify_wgpu_retained_arenas(args: &[String]) -> Result<(), Box<dyn std::error
     )
 }
 
-fn run_focused_cargo_test(
-    checks: &mut Vec<serde_json::Value>,
-    blockers: &mut Vec<String>,
+#[derive(Clone, Copy)]
+struct FocusedCargoTestSpec {
     id: &'static str,
     package: &'static str,
     filter: &'static str,
     blocker: &'static str,
+    lib_only: bool,
+}
+
+impl FocusedCargoTestSpec {
+    const fn lib(
+        id: &'static str,
+        package: &'static str,
+        filter: &'static str,
+        blocker: &'static str,
+    ) -> Self {
+        Self {
+            id,
+            package,
+            filter,
+            blocker,
+            lib_only: true,
+        }
+    }
+
+    const fn any(
+        id: &'static str,
+        package: &'static str,
+        filter: &'static str,
+        blocker: &'static str,
+    ) -> Self {
+        Self {
+            id,
+            package,
+            filter,
+            blocker,
+            lib_only: false,
+        }
+    }
+}
+
+fn run_focused_cargo_test(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    spec: FocusedCargoTestSpec,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let status = Command::new("cargo")
-        .args(["test", "-p", package, "--lib", filter, "--", "--nocapture"])
-        .status()?;
+    let mut args = vec!["test", "-p", spec.package];
+    if spec.lib_only {
+        args.push("--lib");
+    }
+    args.extend([spec.filter, "--", "--nocapture"]);
+    let status = Command::new("cargo").args(&args).status()?;
     let pass = status.success();
+    let scope = if spec.lib_only { "--lib " } else { "" };
     push_audit_check(
         checks,
         blockers,
-        id,
+        spec.id,
         pass,
-        format!("cargo test -p {package} --lib {filter} status={status}"),
-        (!pass).then(|| blocker.to_owned()),
+        format!(
+            "cargo test -p {} {scope}{} status={status}",
+            spec.package, spec.filter
+        ),
+        (!pass).then(|| spec.blocker.to_owned()),
     );
     Ok(pass)
 }
 
-fn run_focused_cargo_test_any_target(
+fn run_focused_cargo_tests(
     checks: &mut Vec<serde_json::Value>,
     blockers: &mut Vec<String>,
-    id: &'static str,
-    package: &'static str,
-    filter: &'static str,
-    blocker: &'static str,
+    specs: &[FocusedCargoTestSpec],
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let status = Command::new("cargo")
-        .args(["test", "-p", package, filter, "--", "--nocapture"])
-        .status()?;
-    let pass = status.success();
-    push_audit_check(
-        checks,
-        blockers,
-        id,
-        pass,
-        format!("cargo test -p {package} {filter} status={status}"),
-        (!pass).then(|| blocker.to_owned()),
-    );
-    Ok(pass)
+    let mut all_passed = true;
+    for spec in specs {
+        all_passed &= run_focused_cargo_test(checks, blockers, *spec)?;
+    }
+    Ok(all_passed)
 }
 
 fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -13431,36 +13463,35 @@ fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error:
                 .to_owned()
         }),
     );
-    let product_scenario_events = run_focused_cargo_test(
+    let focused_tests_pass = run_focused_cargo_tests(
         &mut checks,
         &mut blockers,
-        "runtime-change-sets:plan-scenario-events-product-deltas",
-        "boon_runtime",
-        "run_plan_route_reports_full_source_event_delta_batch",
-        "PlanExecutor route execution must emit product semantic deltas without retired comparison fields",
+        &[
+            FocusedCargoTestSpec::lib(
+                "runtime-change-sets:plan-scenario-events-product-deltas",
+                "boon_runtime",
+                "run_plan_route_reports_full_source_event_delta_batch",
+                "PlanExecutor route execution must emit product semantic deltas without retired comparison fields",
+            ),
+            FocusedCargoTestSpec::lib(
+                "runtime-change-sets:plan-field-set-delta-coalescing",
+                "boon_runtime",
+                "plan_field_set_delta_coalescing_keeps_last_same_target_only",
+                "PlanExecutor field-set delta coalescing must keep only the last same-target field update",
+            ),
+            FocusedCargoTestSpec::lib(
+                "runtime-change-sets:scenario-requires-semantic-and-render-patches",
+                "boon_runtime",
+                "scenario_delta_expectations_reject_missing_semantic_or_render_patch",
+                "scenario expectations must reject missing semantic or render patch evidence",
+            ),
+        ],
     )?;
-    let plan_delta_coalescing = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "runtime-change-sets:plan-field-set-delta-coalescing",
-        "boon_runtime",
-        "plan_field_set_delta_coalescing_keeps_last_same_target_only",
-        "PlanExecutor field-set delta coalescing must keep only the last same-target field update",
-    )?;
-    let render_expectations = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "runtime-change-sets:scenario-requires-semantic-and-render-patches",
-        "boon_runtime",
-        "scenario_delta_expectations_reject_missing_semantic_or_render_patch",
-        "scenario expectations must reject missing semantic or render patch evidence",
-    )?;
-    let status =
-        if source_ok && product_scenario_events && plan_delta_coalescing && render_expectations {
-            "runtime-semantic-render-change-sets-pass"
-        } else {
-            "runtime-change-set-proof-incomplete"
-        };
+    let status = if source_ok && focused_tests_pass {
+        "runtime-semantic-render-change-sets-pass"
+    } else {
+        "runtime-change-set-proof-incomplete"
+    };
     write_static_gate_report(
         args,
         "verify-runtime-change-sets",
@@ -13565,80 +13596,61 @@ fn verify_document_batch_patches(args: &[String]) -> Result<(), Box<dyn std::err
                 .to_owned()
         }),
     );
-    let batch_tests = run_focused_cargo_test(
+    let focused_tests_pass = run_focused_cargo_tests(
         &mut checks,
         &mut blockers,
-        "document-batch-patches:atomic-batch-tests",
-        "boon_document",
-        "document_batch",
-        "document batch tests must prove atomic commit, merged dirty facts, and rollback",
+        &[
+            FocusedCargoTestSpec::lib(
+                "document-batch-patches:atomic-batch-tests",
+                "boon_document",
+                "document_batch",
+                "document batch tests must prove atomic commit, merged dirty facts, and rollback",
+            ),
+            FocusedCargoTestSpec::lib(
+                "document-batch-patches:owned-frame-batch-tests",
+                "boon_document",
+                "owned_frame_batch",
+                "owned-frame batch tests must match stateful batch patch results",
+            ),
+            FocusedCargoTestSpec::lib(
+                "document-batch-patches:trusted-nonstructural-batch-tests",
+                "boon_document",
+                "trusted_nonstructural_owned_frame_batch",
+                "trusted nonstructural owned-frame batch tests must pass and reject structural patches",
+            ),
+            FocusedCargoTestSpec::any(
+                "document-batch-patches:native-preview-semantic-bridge-test",
+                "boon_native_playground",
+                "data_binding_targets_lower_to_atomic_ui_semantic_change_batch",
+                "native preview data-binding bridge must lower into UiSemanticChange batches",
+            ),
+            FocusedCargoTestSpec::lib(
+                "document-batch-patches:multi-binding-typed-routes-test",
+                "boon_document",
+                "typed_binding_index_preserves_multiple_bindings_per_node",
+                "document typed indexes must preserve multiple interaction bindings per node",
+            ),
+            FocusedCargoTestSpec::lib(
+                "document-batch-patches:binding-at-document-test",
+                "boon_document",
+                "document_batch_set_binding_at_updates_secondary_binding_only",
+                "document semantic batches must update secondary bindings by ordinal without rewriting the primary binding",
+            ),
+            FocusedCargoTestSpec::any(
+                "document-batch-patches:binding-at-native-lowering-test",
+                "boon_native_playground",
+                "source_intent_data_binding_lowers_to_secondary_binding_ordinal",
+                "native runtime render-patch lowering must emit ordinal binding updates for secondary source intents",
+            ),
+            FocusedCargoTestSpec::any(
+                "document-batch-patches:retained-partial-snapshot-rejection-test",
+                "boon_native_playground",
+                "retained_patch_rejects_cached_snapshot_smaller_than_active_proof",
+                "native retained patching must reject cached partial frames when the active proof expects a larger frame",
+            ),
+        ],
     )?;
-    let owned_batch_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:owned-frame-batch-tests",
-        "boon_document",
-        "owned_frame_batch",
-        "owned-frame batch tests must match stateful batch patch results",
-    )?;
-    let trusted_batch_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:trusted-nonstructural-batch-tests",
-        "boon_document",
-        "trusted_nonstructural_owned_frame_batch",
-        "trusted nonstructural owned-frame batch tests must pass and reject structural patches",
-    )?;
-    let native_bridge_tests = run_focused_cargo_test_any_target(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:native-preview-semantic-bridge-test",
-        "boon_native_playground",
-        "data_binding_targets_lower_to_atomic_ui_semantic_change_batch",
-        "native preview data-binding bridge must lower into UiSemanticChange batches",
-    )?;
-    let multi_binding_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:multi-binding-typed-routes-test",
-        "boon_document",
-        "typed_binding_index_preserves_multiple_bindings_per_node",
-        "document typed indexes must preserve multiple interaction bindings per node",
-    )?;
-    let binding_at_document_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:binding-at-document-test",
-        "boon_document",
-        "document_batch_set_binding_at_updates_secondary_binding_only",
-        "document semantic batches must update secondary bindings by ordinal without rewriting the primary binding",
-    )?;
-    let binding_at_native_tests = run_focused_cargo_test_any_target(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:binding-at-native-lowering-test",
-        "boon_native_playground",
-        "source_intent_data_binding_lowers_to_secondary_binding_ordinal",
-        "native runtime render-patch lowering must emit ordinal binding updates for secondary source intents",
-    )?;
-    let retained_partial_snapshot_tests = run_focused_cargo_test_any_target(
-        &mut checks,
-        &mut blockers,
-        "document-batch-patches:retained-partial-snapshot-rejection-test",
-        "boon_native_playground",
-        "retained_patch_rejects_cached_snapshot_smaller_than_active_proof",
-        "native retained patching must reject cached partial frames when the active proof expects a larger frame",
-    )?;
-    let status = if source_ok
-        && batch_tests
-        && owned_batch_tests
-        && trusted_batch_tests
-        && native_bridge_tests
-        && multi_binding_tests
-        && binding_at_document_tests
-        && binding_at_native_tests
-        && retained_partial_snapshot_tests
-    {
+    let status = if source_ok && focused_tests_pass {
         "document-batch-patches-pass"
     } else {
         "document-batch-patch-proof-incomplete"
@@ -13700,23 +13712,25 @@ fn verify_retained_layout_deltas(args: &[String]) -> Result<(), Box<dyn std::err
                 .to_owned()
         }),
     );
-    let key_tests = run_focused_cargo_test(
+    let focused_tests_pass = run_focused_cargo_tests(
         &mut checks,
         &mut blockers,
-        "retained-layout-deltas:key-dirty-reason-tests",
-        "boon_document",
-        "retained_layout_keys_ignore_paint_only_changes_but_track_layout_inputs",
-        "retained layout keys must ignore paint-only changes and track layout inputs",
+        &[
+            FocusedCargoTestSpec::lib(
+                "retained-layout-deltas:key-dirty-reason-tests",
+                "boon_document",
+                "retained_layout_keys_ignore_paint_only_changes_but_track_layout_inputs",
+                "retained layout keys must ignore paint-only changes and track layout inputs",
+            ),
+            FocusedCargoTestSpec::lib(
+                "retained-layout-deltas:cache-reuse-tests",
+                "boon_document",
+                "retained_layout_cache_reuses_paint_only_geometry_and_refreshes_layout_dirty_nodes",
+                "retained layout cache must reuse paint-only geometry and refresh dirty nodes",
+            ),
+        ],
     )?;
-    let cache_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "retained-layout-deltas:cache-reuse-tests",
-        "boon_document",
-        "retained_layout_cache_reuses_paint_only_geometry_and_refreshes_layout_dirty_nodes",
-        "retained layout cache must reuse paint-only geometry and refresh dirty nodes",
-    )?;
-    let status = if source_ok && key_tests && cache_tests {
+    let status = if source_ok && focused_tests_pass {
         "retained-layout-deltas-pass"
     } else {
         "retained-layout-delta-proof-incomplete"
@@ -13760,15 +13774,17 @@ fn verify_text_cache_layers(args: &[String]) -> Result<(), Box<dyn std::error::E
                 .to_owned()
         }),
     );
-    let reuse_tests = run_focused_cargo_test(
+    let focused_tests_pass = run_focused_cargo_tests(
         &mut checks,
         &mut blockers,
-        "text-cache-layers:reuse-count-tests",
-        "boon_native_gpu",
-        "text_cache_reuse_counts_report_hits_misses_and_evictions",
-        "text cache reuse-count tests must prove hits, misses, and evictions",
+        &[FocusedCargoTestSpec::lib(
+            "text-cache-layers:reuse-count-tests",
+            "boon_native_gpu",
+            "text_cache_reuse_counts_report_hits_misses_and_evictions",
+            "text cache reuse-count tests must prove hits, misses, and evictions",
+        )],
     )?;
-    let status = if source_ok && reuse_tests {
+    let status = if source_ok && focused_tests_pass {
         "text-cache-layers-pass"
     } else {
         "text-cache-layer-proof-incomplete"
@@ -13838,36 +13854,31 @@ fn verify_render_patch_contract(args: &[String]) -> Result<(), Box<dyn std::erro
                 .to_owned()
         }),
     );
-    let document_patch_tests = run_focused_cargo_test(
+    let focused_tests_pass = run_focused_cargo_tests(
         &mut checks,
         &mut blockers,
-        "render-patch-contract:document-render-scene-patch-tests",
-        "boon_document",
-        "render_scene_patch",
-        "document render-scene patch tests must pass",
+        &[
+            FocusedCargoTestSpec::lib(
+                "render-patch-contract:document-render-scene-patch-tests",
+                "boon_document",
+                "render_scene_patch",
+                "document render-scene patch tests must pass",
+            ),
+            FocusedCargoTestSpec::lib(
+                "render-patch-contract:runtime-scenario-render-patch-tests",
+                "boon_runtime",
+                "scenario_delta_expectations_reject_missing_semantic_or_render_patch",
+                "runtime scenario tests must reject missing render patch evidence",
+            ),
+            FocusedCargoTestSpec::lib(
+                "render-patch-contract:native-gpu-render-scene-patch-tests",
+                "boon_native_gpu",
+                "document_render_scene_patch_conversion_matches_materialized_apply",
+                "native GPU render-scene patch conversion must match materialized document patch apply",
+            ),
+        ],
     )?;
-    let runtime_patch_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "render-patch-contract:runtime-scenario-render-patch-tests",
-        "boon_runtime",
-        "scenario_delta_expectations_reject_missing_semantic_or_render_patch",
-        "runtime scenario tests must reject missing render patch evidence",
-    )?;
-    let native_gpu_patch_tests = run_focused_cargo_test(
-        &mut checks,
-        &mut blockers,
-        "render-patch-contract:native-gpu-render-scene-patch-tests",
-        "boon_native_gpu",
-        "document_render_scene_patch_conversion_matches_materialized_apply",
-        "native GPU render-scene patch conversion must match materialized document patch apply",
-    )?;
-    let status = if source_ok
-        && native_gpu_patch_variants_ok
-        && document_patch_tests
-        && runtime_patch_tests
-        && native_gpu_patch_tests
-    {
+    let status = if source_ok && native_gpu_patch_variants_ok && focused_tests_pass {
         "render-patch-contract-pass"
     } else {
         "render-patch-contract-proof-incomplete"
@@ -22240,21 +22251,18 @@ fn verify_native_gpu_multiwindow(args: &[String]) -> Result<(), Box<dyn std::err
         }),
     );
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("debug")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "native-gpu-multiwindow:playground-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
 
-    if build.success() && wayland && launcher_available {
+    if build.success && wayland && launcher_available {
         let launch = run_workspace_desktop_probe_launch(
-            Path::new("target/debug/boon_native_playground"),
+            &build.binary_path,
             "todomvc",
             &native_gpu_title_token("multiwindow"),
             &supervisor_report,
@@ -22611,22 +22619,19 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
         }),
     );
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("debug")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "native-gpu-ipc:playground-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
 
     let mut cosmic_launch_proof = json!({"status": "not-run"});
-    if build.success() && wayland && launcher_available {
+    if build.success && wayland && launcher_available {
         let launch = run_workspace_desktop_probe_launch(
-            Path::new("target/debug/boon_native_playground"),
+            &build.binary_path,
             "todomvc",
             &native_gpu_title_token("ipc-backpressure"),
             &supervisor_report,
@@ -22946,22 +22951,19 @@ fn verify_native_gpu_observability(args: &[String]) -> Result<(), Box<dyn std::e
         }),
     );
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("debug")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "native-gpu-observability:playground-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
 
     let mut cosmic_launch_proof = json!({"status": "not-run"});
-    if build.success() && wayland && launcher_available {
+    if build.success && wayland && launcher_available {
         let launch = run_workspace_desktop_probe_launch(
-            Path::new("target/debug/boon_native_playground"),
+            &build.binary_path,
             "todomvc",
             &native_gpu_title_token("observability"),
             &supervisor_report,
@@ -25051,35 +25053,21 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         None,
     );
 
-    let release_build = profile == "release";
-    let build = if release_build {
-        Command::new("cargo")
-            .args(["build", "--release", "-p", "boon_native_playground"])
-            .status()?
-    } else {
-        Command::new("cargo")
-            .args(["build", "-p", "boon_native_playground"])
-            .status()?
-    };
-    let launched_binary_path = if release_build {
-        PathBuf::from("target/release/boon_native_playground")
-    } else {
-        PathBuf::from("target/debug/boon_native_playground")
-    };
-    let launched_binary_hash = if build.success() {
+    let build = build_native_playground_for_profile(&profile)?;
+    let launched_binary_path = build.binary_path.clone();
+    let launched_binary_hash = if build.success {
         file_hash(launched_binary_path.to_string_lossy().as_ref())
     } else {
         "missing".to_owned()
     };
-    push_audit_check(
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:playground-build"),
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
-    if build.success() && example == "novywave" {
+    if build.success && example == "novywave" {
         let visual_artifact_test = Command::new("cargo")
             .args([
                 "test",
@@ -25103,7 +25091,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         );
     }
 
-    let layout_probe = if build.success() {
+    let layout_probe = if build.success {
         run_native_layout_probe(&launched_binary_path, &source_path, &layout_probe_report)?
     } else {
         json!({"status": "not-run", "reason": "boon_native_playground build failed"})
@@ -25112,7 +25100,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
     let native_input_driver_attempt =
         native_gpu_operator_input_driver_attempt("preview-e2e", &example, driver_target.clone());
 
-    if build.success() && wayland {
+    if build.success && wayland {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -25249,7 +25237,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         "launched_binary_path": launched_binary_path,
         "launched_binary_hash": launched_binary_hash,
         "profile": profile,
-        "release_build": release_build,
+        "release_build": profile == "release",
         "hardware_adapter_required": require_hardware_adapter,
         "allow_software_adapter_diagnostic": allow_software_adapter_diagnostic,
         "adapter_policy": if require_hardware_adapter {
@@ -26152,22 +26140,19 @@ fn verify_native_gpu_preview_e2e_hello_3d(
     let manifest_hash = file_hash(manifest_path.to_string_lossy().as_ref());
     let manifest_scenario_path = PathBuf::from(&entry.scenario);
     let manifest_scenario_hash = file_hash(&entry.scenario);
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    let launched_binary_path = PathBuf::from("target/debug/boon_native_playground");
-    let launched_binary_hash = if build.success() {
+    let build = build_native_playground_for_profile("debug")?;
+    let launched_binary_path = build.binary_path.clone();
+    let launched_binary_hash = if build.success {
         file_hash(launched_binary_path.to_string_lossy().as_ref())
     } else {
         "missing".to_owned()
     };
-    push_audit_check(
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "native-gpu-preview-e2e-hello_3d:playground-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
 
     let role_report_arg = role_report
@@ -26179,7 +26164,7 @@ fn verify_native_gpu_preview_e2e_hello_3d(
         .ok_or("hello_3d source path is not UTF-8")?
         .to_owned();
     let role_run = run_native_role_command(
-        build.success(),
+        build.success,
         &launched_binary_path,
         &role_report,
         |command| {
@@ -27926,16 +27911,13 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
     let mut blockers = Vec::new();
     std::fs::create_dir_all("target/artifacts/native-gpu/tests")?;
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("debug")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "native-gpu-novywave-visual:playground-debug-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
 
     let promoted_tests = [
@@ -27953,7 +27935,7 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
         ),
     ];
     let mut test_results = Vec::new();
-    if build.success() {
+    if build.success {
         for (test_name, contract) in promoted_tests {
             let status = Command::new("cargo")
                 .args([
@@ -30665,21 +30647,18 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         (!wayland).then(|| "native scroll proof requires a Wayland session".to_owned()),
     );
 
-    let speed_binary = "./target/release/boon_native_playground";
-    let build = Command::new("cargo")
-        .args(["build", "--release", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("release")?;
+    let speed_binary = build.binary_path.to_string_lossy().to_string();
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-scroll-{label}:playground-release-build"),
-        build.success(),
-        format!("cargo build --release -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build release boon_native_playground".to_owned()),
+        &build,
+        "failed to build release boon_native_playground",
     );
 
-    let layout_probe = if build.success() && selector_valid {
-        run_native_layout_probe(Path::new(speed_binary), &source_path, &layout_probe_report)?
+    let layout_probe = if build.success && selector_valid {
+        run_native_layout_probe(Path::new(&speed_binary), &source_path, &layout_probe_report)?
     } else {
         json!({"status": "not-run", "reason": "boon_native_playground build failed or scroll selector invalid"})
     };
@@ -30688,7 +30667,7 @@ fn verify_native_gpu_scroll_speed(args: &[String]) -> Result<(), Box<dyn std::er
         native_gpu_operator_input_driver_attempt("scroll-speed", &label, driver_target.clone());
     let measured_surface_key = "preview_surface_proof";
 
-    if build.success() && wayland && selector_valid {
+    if build.success && wayland && selector_valid {
         let launcher_available = command_available("cosmic-background-launch");
         push_audit_check(
             &mut checks,
@@ -36292,6 +36271,52 @@ fn native_role_report_artifacts(
     }
 }
 
+struct NativePlaygroundBuild {
+    success: bool,
+    status: String,
+    command: String,
+    binary_path: PathBuf,
+}
+
+fn build_native_playground_for_profile(
+    profile: &str,
+) -> Result<NativePlaygroundBuild, Box<dyn std::error::Error>> {
+    let mut args = vec!["build"];
+    if profile == "release" {
+        args.push("--release");
+    }
+    args.extend(["-p", "boon_native_playground"]);
+    let status = Command::new("cargo").args(&args).status()?;
+    let binary_path = if profile == "release" {
+        PathBuf::from("target/release/boon_native_playground")
+    } else {
+        PathBuf::from("target/debug/boon_native_playground")
+    };
+    Ok(NativePlaygroundBuild {
+        success: status.success(),
+        status: status.to_string(),
+        command: format!("cargo {}", args.join(" ")),
+        binary_path,
+    })
+}
+
+fn push_native_playground_build_check(
+    checks: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    id: impl Into<String>,
+    build: &NativePlaygroundBuild,
+    blocker: &'static str,
+) {
+    push_audit_check(
+        checks,
+        blockers,
+        id,
+        build.success,
+        format!("{} status={}", build.command, build.status),
+        (!build.success).then(|| blocker.to_owned()),
+    );
+}
+
 fn push_native_role_report_shell_checks(
     checks: &mut Vec<serde_json::Value>,
     blockers: &mut Vec<String>,
@@ -36409,24 +36434,20 @@ fn verify_native_counter_interaction_speed(
     let role_report =
         fresh_native_role_report_path(&artifacts_dir, "counter-interaction-speed-role.json")?;
 
-    let build = Command::new("cargo")
-        .args(["build", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("debug")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "counter-interaction-speed:playground-build",
-        build.success(),
-        format!("cargo build -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
-
-    let binary_path = PathBuf::from("target/debug/boon_native_playground");
+    let binary_path = build.binary_path.clone();
     let event_count_arg = event_count.to_string();
     let max_total_ms_arg = max_total_ms.to_string();
     let role_report_arg = role_report.display().to_string();
     let role_run = run_native_role_command(
-        build.success() && example_ok,
+        build.success && example_ok,
         &binary_path,
         &role_report,
         |command| {
@@ -36597,31 +36618,21 @@ fn verify_native_cells_interaction_speed(
         format!("cells-interaction-speed-{profile}-role.json"),
     )?;
 
-    let mut build_args = vec!["build", "-p", "boon_native_playground"];
-    if profile == "release" {
-        build_args.push("--release");
-    }
-    let build = Command::new("cargo").args(&build_args).status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile(&profile)?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "cells-interaction-speed:playground-build",
-        build.success(),
-        format!("cargo {} status={build}", build_args.join(" ")),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
-
-    let binary_path = if profile == "release" {
-        PathBuf::from("target/release/boon_native_playground")
-    } else {
-        PathBuf::from("target/debug/boon_native_playground")
-    };
+    let binary_path = build.binary_path.clone();
     let event_count_arg = event_count.to_string();
     let max_p95_ms_arg = max_p95_ms.to_string();
     let max_max_ms_arg = max_max_ms.to_string();
     let role_report_arg = role_report.display().to_string();
     let role_run = run_native_role_command(
-        build.success() && profile_ok && generic_source_ok,
+        build.success && profile_ok && generic_source_ok,
         &binary_path,
         &role_report,
         |command| {
@@ -36957,24 +36968,15 @@ fn verify_native_cells_visible_click_e2e(
     let source = boon_runtime::source_text_for_entry(&entry)?;
     let source_files = manifest_source_files(&entry);
     let source_hash = source_hash_for_report_source_files(&source_files, &source)?;
-    let mut build_args = vec!["build", "-p", "boon_native_playground"];
-    if profile == "release" {
-        build_args.push("--release");
-    }
-    let build = Command::new("cargo").args(&build_args).status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile(&profile)?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "cells-visible-click-e2e:playground-build",
-        build.success(),
-        format!("cargo {} status={build}", build_args.join(" ")),
-        (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
+        &build,
+        "failed to build boon_native_playground",
     );
-    let binary_path = if profile == "release" {
-        PathBuf::from("target/release/boon_native_playground")
-    } else {
-        PathBuf::from("target/debug/boon_native_playground")
-    };
+    let binary_path = build.binary_path.clone();
     push_audit_check(
         &mut checks,
         &mut blockers,
@@ -36986,7 +36988,7 @@ fn verify_native_cells_visible_click_e2e(
             "Cells visible click E2E no longer supports the verifier-owned isolated Weston fallback; run release hardware product mode or pass --headed-host-input".to_owned()
         }),
     );
-    let live_probe = if build.success() && profile_ok && headed_host_input_mode {
+    let live_probe = if build.success && profile_ok && headed_host_input_mode {
         run_headed_host_cells_visible_click_e2e(
             &binary_path,
             &click_targets,
@@ -45848,51 +45850,47 @@ fn verify_native_gpu_novywave_interaction_speed(
     let role_report =
         fresh_native_role_report_path(&artifacts_dir, format!("{role_report_stem}-role.json"))?;
 
-    let build = Command::new("cargo")
-        .args(["build", "--release", "-p", "boon_native_playground"])
-        .status()?;
-    push_audit_check(
+    let build = build_native_playground_for_profile("release")?;
+    push_native_playground_build_check(
         &mut checks,
         &mut blockers,
         "novywave-interaction-speed:playground-release-build",
-        build.success(),
-        format!("cargo build --release -p boon_native_playground status={build}"),
-        (!build.success()).then(|| "failed to build release boon_native_playground".to_owned()),
+        &build,
+        "failed to build release boon_native_playground",
     );
 
-    let binary_path = PathBuf::from("target/release/boon_native_playground");
+    let binary_path = build.binary_path.clone();
     let event_count_arg = event_count.to_string();
     let max_p95_ms_arg = max_p95_ms.to_string();
     let max_max_ms_arg = max_max_ms.to_string();
     let max_resize_p95_ms_arg = max_resize_p95_ms.to_string();
     let role_report_arg = role_report.display().to_string();
     let record_hot_path_profiles = args.iter().any(|arg| arg == "--record-hot-path-profiles");
-    let role_run =
-        run_native_role_command(build.success(), &binary_path, &role_report, |command| {
-            command
-                .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
-                .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
-                .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
-                .args([
-                    "--role",
-                    "interaction-speed",
-                    "--example",
-                    "novywave",
-                    "--event-count",
-                    &event_count_arg,
-                    "--max-p95-ms",
-                    &max_p95_ms_arg,
-                    "--max-max-ms",
-                    &max_max_ms_arg,
-                    "--max-resize-p95-ms",
-                    &max_resize_p95_ms_arg,
-                    "--report",
-                    &role_report_arg,
-                ]);
-            if record_hot_path_profiles {
-                command.arg("--record-hot-path-profiles");
-            }
-        })?;
+    let role_run = run_native_role_command(build.success, &binary_path, &role_report, |command| {
+        command
+            .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+            .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
+            .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
+            .args([
+                "--role",
+                "interaction-speed",
+                "--example",
+                "novywave",
+                "--event-count",
+                &event_count_arg,
+                "--max-p95-ms",
+                &max_p95_ms_arg,
+                "--max-max-ms",
+                &max_max_ms_arg,
+                "--max-resize-p95-ms",
+                &max_resize_p95_ms_arg,
+                "--report",
+                &role_report_arg,
+            ]);
+        if record_hot_path_profiles {
+            command.arg("--record-hot-path-profiles");
+        }
+    })?;
     let role_data = NativeRoleReport::new(role_run.report_json.as_ref());
     push_native_role_report_shell_checks(
         &mut checks,

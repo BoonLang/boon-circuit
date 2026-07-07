@@ -42023,6 +42023,73 @@ fn current_binary_path() -> String {
 mod tests {
     use super::*;
 
+    const CORE_COMPILED_ARTIFACT_EXAMPLES: [&str; 3] = ["counter", "todomvc", "cells"];
+
+    struct TestTempRoot {
+        path: PathBuf,
+    }
+
+    impl TestTempRoot {
+        fn new(label: &str) -> Self {
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("unnamed");
+            let path = std::env::temp_dir()
+                .join(format!("boon-{label}-{}-{thread_name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.path.join(path)
+        }
+    }
+
+    impl Drop for TestTempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct CompiledArtifactFixture {
+        artifact: CompiledArtifact,
+        compiled: CompiledProgram,
+    }
+
+    fn compiled_artifact_fixture(
+        temp_root: &TestTempRoot,
+        example: &str,
+    ) -> CompiledArtifactFixture {
+        let (source, _, _) = example_paths(example).unwrap();
+        let artifact_path = temp_root.join(format!("{example}.boonc"));
+        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
+        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+        let ir = lower(&parsed).unwrap();
+        let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        CompiledArtifactFixture { artifact, compiled }
+    }
+
+    fn for_core_compiled_artifacts(
+        temp_root: &TestTempRoot,
+        mut check: impl FnMut(&str, &CompiledArtifactFixture),
+    ) {
+        for example in CORE_COMPILED_ARTIFACT_EXAMPLES {
+            let fixture = compiled_artifact_fixture(temp_root, example);
+            check(example, &fixture);
+        }
+    }
+
+    fn for_core_compiled_programs(mut check: impl FnMut(&str, &TypedProgram, &CompiledProgram)) {
+        for example in CORE_COMPILED_ARTIFACT_EXAMPLES {
+            let (source, _, _) = example_paths(example).unwrap();
+            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
+            let ir = lower(&parsed).unwrap();
+            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+            check(example, &ir, &compiled);
+        }
+    }
+
     #[test]
     fn source_units_hash_preserves_single_file_hash_compatibility() {
         let source = "document: Document/new(child: TEXT { ok })";
@@ -42696,12 +42763,7 @@ FUNCTION icon_code(item) {
 
     #[test]
     fn compiled_artifact_emission_is_deterministic_and_schema_valid() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-test");
         let artifact = temp_root.join("todomvc.boonc");
         let report = temp_root.join("todomvc-compile-report.json");
         let first = emit_compiled_artifact(
@@ -42835,17 +42897,11 @@ FUNCTION icon_code(item) {
                 .as_array()
                 .is_some_and(|sections| !sections.is_empty())
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_decodes_cells_generic_derived_runtime_plan_without_ast() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-generic-derived-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-generic-derived-test");
         let artifact_path = temp_root.join("cells.boonc");
         emit_compiled_artifact(Path::new("../../examples/cells.bn"), &artifact_path, None).unwrap();
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
@@ -42875,40 +42931,30 @@ FUNCTION icon_code(item) {
             error.contains("function_count"),
             "wrong generic-derived count should fail decoding, got {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_decodes_storage_initialization_runtime_plan_without_ast() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-storage-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-storage-test");
 
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _, _) = example_paths(example).unwrap();
-            let artifact_path = temp_root.join(format!("{example}.boonc"));
-            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-            let decoded = artifact.runtime_storage_initialization_plan().unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
-
+        for_core_compiled_artifacts(&temp_root, |example, fixture| {
+            let decoded = fixture
+                .artifact
+                .runtime_storage_initialization_plan()
+                .unwrap();
             assert_eq!(
                 decoded.root_slots.len(),
-                compiled.storage_initialization.root_slots.len(),
+                fixture.compiled.storage_initialization.root_slots.len(),
                 "decoded root slot count differs for {example}"
             );
             assert_eq!(
                 decoded.list_slots.len(),
-                compiled.storage_initialization.list_slots.len(),
+                fixture.compiled.storage_initialization.list_slots.len(),
                 "decoded list slot count differs for {example}"
             );
             let decoded_storage = decoded.instantiate_storage().unwrap();
-            let planned_storage = compiled
+            let planned_storage = fixture
+                .compiled
                 .storage_initialization
                 .instantiate_storage()
                 .unwrap();
@@ -42943,7 +42989,7 @@ FUNCTION icon_code(item) {
                     decoded_slot.name
                 );
             }
-        }
+        });
 
         let artifact_path = temp_root.join("cells.boonc");
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
@@ -42984,54 +43030,46 @@ FUNCTION icon_code(item) {
             error.contains("field_id"),
             "wrong row-template field id should fail decoding, got {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_decodes_document_lowering_runtime_tables_without_ast() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-document-lowering-decode-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-document-lowering-decode-test");
 
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _, _) = example_paths(example).unwrap();
-            let artifact_path = temp_root.join(format!("{example}.boonc"));
-            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-            let decoded = artifact.runtime_document_lowering_tables().unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        for_core_compiled_artifacts(&temp_root, |example, fixture| {
+            let decoded = fixture.artifact.runtime_document_lowering_tables().unwrap();
 
             assert_eq!(
-                decoded.root_summary_paths, compiled.document_lowering.root_summary_paths,
+                decoded.root_summary_paths, fixture.compiled.document_lowering.root_summary_paths,
                 "decoded root summary paths differ for {example}"
             );
             assert_eq!(
-                decoded.list_summary_fields, compiled.document_lowering.list_summary_fields,
+                decoded.list_summary_fields, fixture.compiled.document_lowering.list_summary_fields,
                 "decoded list summary fields differ for {example}"
             );
             assert_eq!(
-                decoded.dynamic_list_view_lists, compiled.document_lowering.dynamic_list_view_lists,
+                decoded.dynamic_list_view_lists,
+                fixture.compiled.document_lowering.dynamic_list_view_lists,
                 "decoded dynamic list-view set differs for {example}"
             );
             assert_eq!(
                 decoded.projection_storage_resolutions,
-                compiled.document_lowering.projection_storage_resolutions,
+                fixture
+                    .compiled
+                    .document_lowering
+                    .projection_storage_resolutions,
                 "decoded projection storage resolutions differ for {example}"
             );
             assert_eq!(
-                decoded.render_slot_table_hash, compiled.document_lowering.render_slot_table_hash,
+                decoded.render_slot_table_hash,
+                fixture.compiled.document_lowering.render_slot_table_hash,
                 "decoded render slot table hash differs for {example}"
             );
             assert_eq!(
-                decoded.render_slot_count, compiled.document_lowering.render_slot_count,
+                decoded.render_slot_count, fixture.compiled.document_lowering.render_slot_count,
                 "decoded render slot count differs for {example}"
             );
-        }
+        });
 
         let artifact_path = temp_root.join("todomvc.boonc");
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
@@ -43060,27 +43098,14 @@ FUNCTION icon_code(item) {
             error.contains("root_patch_target_kind"),
             "wrong render patch lowering constant should fail decoding, got {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-non-route-tables-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-non-route-tables-test");
 
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _scenario, _) = example_paths(example).unwrap();
-            let artifact_path = temp_root.join(format!("{example}.boonc"));
-            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-            let decoded = artifact.runtime_non_route_tables().unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        for_core_compiled_artifacts(&temp_root, |example, fixture| {
+            let decoded = fixture.artifact.runtime_non_route_tables().unwrap();
 
             assert_eq!(
                 decoded
@@ -43089,7 +43114,8 @@ FUNCTION icon_code(item) {
                     .iter()
                     .map(|path| path.as_ref())
                     .collect::<Vec<_>>(),
-                compiled
+                fixture
+                    .compiled
                     .symbols
                     .paths
                     .iter()
@@ -43099,30 +43125,30 @@ FUNCTION icon_code(item) {
             );
             assert_eq!(
                 scalar_equation_plan_artifact(&decoded.scalar_equations),
-                scalar_equation_plan_artifact(&compiled.scalar_equations),
+                scalar_equation_plan_artifact(&fixture.compiled.scalar_equations),
                 "decoded scalar equations differ for {example}"
             );
             assert_eq!(
                 derived_equation_plan_artifact(&decoded.derived_equations),
-                derived_equation_plan_artifact(&compiled.derived_equations),
+                derived_equation_plan_artifact(&fixture.compiled.derived_equations),
                 "decoded derived text transforms differ for {example}"
             );
             assert_eq!(
                 list_equation_plan_artifact(&decoded.list_equations),
-                list_equation_plan_artifact(&compiled.list_equations),
+                list_equation_plan_artifact(&fixture.compiled.list_equations),
                 "decoded list equations differ for {example}"
             );
             assert_eq!(
                 list_projection_plan_artifact(&decoded.list_projections),
-                list_projection_plan_artifact(&compiled.list_projections),
+                list_projection_plan_artifact(&fixture.compiled.list_projections),
                 "decoded list projections differ for {example}"
             );
             assert_eq!(
                 list_source_binding_plan_artifact(&decoded.list_source_bindings),
-                list_source_binding_plan_artifact(&compiled.list_source_bindings),
+                list_source_binding_plan_artifact(&fixture.compiled.list_source_bindings),
                 "decoded list source bindings differ for {example}"
             );
-        }
+        });
 
         let artifact_path = temp_root.join("todomvc.boonc");
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
@@ -43158,34 +43184,20 @@ FUNCTION icon_code(item) {
             error.contains("not_a_list_operation"),
             "wrong list operation kind should fail decoding, got {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_decodes_source_routes_and_action_table_without_ast() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-source-routes-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-source-routes-test");
 
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _scenario, _) = example_paths(example).unwrap();
-            let artifact_path = temp_root.join(format!("{example}.boonc"));
-            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-            let decoded = artifact.runtime_source_routes().unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
-
+        for_core_compiled_artifacts(&temp_root, |example, fixture| {
+            let decoded = fixture.artifact.runtime_source_routes().unwrap();
             assert_eq!(
                 source_route_plan_artifact(&decoded),
-                source_route_plan_artifact(&compiled.source_routes),
+                source_route_plan_artifact(&fixture.compiled.source_routes),
                 "decoded source routes differ for {example}"
             );
-        }
+        });
 
         let artifact_path = temp_root.join("todomvc.boonc");
         let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
@@ -43366,56 +43378,42 @@ FUNCTION icon_code(item) {
             error.contains("not_a_list_predicate"),
             "bad list-remove predicate should fail decoding, got {error}"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_instantiates_plan_executor_without_source_or_ir() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-runtime-load-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-runtime-load-test");
 
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _, _) = example_paths(example).unwrap();
-            let artifact_path = temp_root.join(format!("{example}.boonc"));
-            emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-            let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
+        for_core_compiled_artifacts(&temp_root, |example, fixture| {
             assert_eq!(
-                artifact.body["typed_ir_required_for_mvp_loader"],
+                fixture.artifact.body["typed_ir_required_for_mvp_loader"],
                 json!(false),
                 "{example} artifact should not require typed IR for runtime loading"
             );
             assert_eq!(
-                artifact.body["runtime_plan"]["source_free_runtime_instantiation_ready"],
+                fixture.artifact.body["runtime_plan"]["source_free_runtime_instantiation_ready"],
                 json!(true),
                 "{example} artifact should declare source-free runtime instantiation readiness"
             );
-            let artifact_compiled = CompiledProgram::from_artifact(&artifact).unwrap();
+            let artifact_compiled = CompiledProgram::from_artifact(&fixture.artifact).unwrap();
             assert_eq!(
                 artifact_compiled.report()["compiled_from_typed_ir"],
                 json!(false),
                 "{example} artifact-backed CompiledProgram report should be honest"
             );
-            let source_compiled = CompiledProgram::from_ir(
-                &lower(&parse_source_path_or_manifest_project(&source).unwrap()).unwrap(),
-            )
-            .unwrap();
             assert_eq!(
                 artifact_compiled.report()["runtime_symbol_count"],
-                source_compiled.report()["runtime_symbol_count"],
+                fixture.compiled.report()["runtime_symbol_count"],
                 "{example} decoded runtime symbol count should match source compilation"
             );
             assert_eq!(
                 artifact_compiled.report()["source_route_op_streams"],
-                source_compiled.report()["source_route_op_streams"],
+                fixture.compiled.report()["source_route_op_streams"],
                 "{example} decoded source-route op streams should match source compilation"
             );
 
-            let mut runtime = PlanExecutorLiveSession::from_compiled_artifact(&artifact).unwrap();
+            let mut runtime =
+                PlanExecutorLiveSession::from_compiled_artifact(&fixture.artifact).unwrap();
             let summary = runtime.state_summary();
             match example {
                 "counter" => {
@@ -43449,7 +43447,7 @@ FUNCTION icon_code(item) {
                 }
                 _ => unreachable!(),
             }
-        }
+        });
 
         let source = temp_root.join("source-deleted-counter.bn");
         std::fs::copy("../../examples/counter.bn", &source).unwrap();
@@ -43462,8 +43460,6 @@ FUNCTION icon_code(item) {
             runtime.state_summary().is_object(),
             "artifact runtime load must not depend on source file access"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     fn assert_compiled_artifact_scenario_paths_match_source_plan_executor(
@@ -43471,12 +43467,7 @@ FUNCTION icon_code(item) {
         source: &Path,
         scenario: &Path,
     ) {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-scenario-{label}-{}",
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new(&format!("compiled-artifact-scenario-{label}"));
         let artifact_path = temp_root.join(format!("{label}.boonc"));
 
         emit_compiled_artifact(source, &artifact_path, None).unwrap();
@@ -43524,8 +43515,6 @@ FUNCTION icon_code(item) {
                 .len() as u64,
             "{label} artifact scenario should execute the same selected PlanExecutor steps"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     fn assert_compiled_artifact_example_scenario_matches_source_plan_executor(example: &str) {
@@ -43556,12 +43545,7 @@ FUNCTION icon_code(item) {
 
     #[test]
     fn compiled_artifact_runs_single_file_scenario_after_source_is_deleted() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-source-deleted-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-source-deleted");
         let source = temp_root.join("todomvc.bn");
         std::fs::copy("../../examples/todomvc.bn", &source).unwrap();
         let scenario = Path::new("../../examples/todomvc.scn");
@@ -43583,8 +43567,6 @@ FUNCTION icon_code(item) {
             source_output.state_summary, artifact_output.state_summary,
             "deleted-source artifact scenario final state must match source PlanExecutor"
         );
-
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
@@ -43803,12 +43785,7 @@ FUNCTION decorate(value) {
 
     #[test]
     fn compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_load() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-load-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-load-test");
         let source = temp_root.join("counter.bn");
         std::fs::copy("../../examples/counter.bn", &source).unwrap();
         let artifact = temp_root.join("counter.boonc");
@@ -43956,16 +43933,11 @@ FUNCTION decorate(value) {
             loaded["compiled_artifact"]["sha256"].as_str(),
             Some(sha256_file(&artifact).unwrap().as_str())
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn runtime_storage_initialization_plan_matches_ir_storage() {
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _, _) = example_paths(example).unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        for_core_compiled_programs(|example, ir, compiled| {
             let legacy = GenericCircuitRuntime::new(&ir).unwrap();
             let planned = compiled
                 .storage_initialization
@@ -44008,16 +43980,12 @@ FUNCTION decorate(value) {
                     planned_slot.name
                 );
             }
-        }
+        });
     }
 
     #[test]
     fn document_lowering_runtime_tables_drive_runtime_summary_metadata() {
-        for example in ["counter", "todomvc", "cells"] {
-            let (source, _, _) = example_paths(example).unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
+        for_core_compiled_programs(|example, _ir, compiled| {
             let expected_root_state_paths = compiled.root_state_paths.clone();
             let expected_list_summary_fields = compiled.list_summary_fields.clone();
             let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
@@ -44035,17 +44003,12 @@ FUNCTION decorate(value) {
                 expected_dynamic_list_view_lists,
                 "document dynamic list-view list set differs for {example}"
             );
-        }
+        });
     }
 
     #[test]
     fn compiled_artifact_rejects_non_ast_free_runtime_plan() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-runtime-plan-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-runtime-plan-test");
         let artifact = temp_root.join("counter.boonc");
         emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
         let mut artifact_json: JsonValue =
@@ -44057,17 +44020,11 @@ FUNCTION decorate(value) {
             error.to_string().contains("runtime_plan must be AST-free"),
             "unexpected runtime_plan validation error: {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
     fn compiled_artifact_rejects_non_ast_free_document_lowering_plan() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "boon-compiled-artifact-document-lowering-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        std::fs::create_dir_all(&temp_root).unwrap();
+        let temp_root = TestTempRoot::new("compiled-artifact-document-lowering-test");
         let artifact = temp_root.join("counter.boonc");
         emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
         let mut artifact_json: JsonValue =
@@ -44082,7 +44039,6 @@ FUNCTION decorate(value) {
                 .contains("runtime_plan document_lowering must be AST-free"),
             "unexpected document lowering validation error: {error}"
         );
-        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[test]
